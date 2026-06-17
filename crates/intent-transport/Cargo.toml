@@ -1,0 +1,11 @@
+[package]
+name = "intent-transport"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "UDS/TCP/TLS listeners, JSON-RPC router, auth, heartbeat, lifecycle, mDNS (§16)"
+
+[dependencies]
+intent-core = { path = "../intent-core" }
+intent-services = { path = "../intent-services" }

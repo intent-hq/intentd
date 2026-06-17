@@ -8,3 +8,15 @@ description = "Intent backend daemon — local-first JSON-RPC daemon for the Int
 
 [dependencies]
 clap = { workspace = true }
+
+intent-core = { path = "../intent-core" }
+intent-store = { path = "../intent-store" }
+intent-services = { path = "../intent-services" }
+intent-acp = { path = "../intent-acp" }
+intent-providers = { path = "../intent-providers" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol" }
+intent-git = { path = "../intent-git" }
+intent-context = { path = "../intent-context" }
+intent-pty = { path = "../intent-pty" }
+intent-search = { path = "../intent-search" }
+intent-transport = { path = "../intent-transport" }

@@ -1,0 +1,11 @@
+[package]
+name = "intent-acp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "ACP client, session multiplexing, and agent→BE MCP server"
+
+[dependencies]
+intent-core = { path = "../intent-core" }
+intent-providers = { path = "../intent-providers" }

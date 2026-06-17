@@ -1,0 +1,11 @@
+[package]
+name = "intent-search"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "BE-owned search.*: ripgrep-equivalent content/path search + store adapters (§14)"
+
+[dependencies]
+intent-core = { path = "../intent-core" }
+intent-store = { path = "../intent-store" }

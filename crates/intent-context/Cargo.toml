@@ -1,0 +1,10 @@
+[package]
+name = "intent-context"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "ContextEngine implementation (AuggieContextEngine) + discovery"
+
+[dependencies]
+intent-core = { path = "../intent-core" }

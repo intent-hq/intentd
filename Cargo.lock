@@ -105,10 +105,109 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "intent-acp"
+version = "0.1.0"
+dependencies = [
+ "intent-core",
+ "intent-providers",
+]
+
+[[package]]
+name = "intent-context"
+version = "0.1.0"
+dependencies = [
+ "intent-core",
+]
+
+[[package]]
+name = "intent-core"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "intent-git"
+version = "0.1.0"
+dependencies = [
+ "intent-core",
+]
+
+[[package]]
+name = "intent-providers"
+version = "0.1.0"
+dependencies = [
+ "intent-core",
+]
+
+[[package]]
+name = "intent-pty"
+version = "0.1.0"
+dependencies = [
+ "intent-core",
+]
+
+[[package]]
+name = "intent-search"
+version = "0.1.0"
+dependencies = [
+ "intent-core",
+ "intent-store",
+]
+
+[[package]]
+name = "intent-services"
+version = "0.1.0"
+dependencies = [
+ "intent-acp",
+ "intent-context",
+ "intent-core",
+ "intent-git",
+ "intent-providers",
+ "intent-pty",
+ "intent-search",
+ "intent-sourcecontrol",
+ "intent-store",
+]
+
+[[package]]
+name = "intent-sourcecontrol"
+version = "0.1.0"
+dependencies = [
+ "intent-core",
+]
+
+[[package]]
+name = "intent-store"
+version = "0.1.0"
+dependencies = [
+ "intent-core",
+]
+
+[[package]]
+name = "intent-transport"
+version = "0.1.0"
+dependencies = [
+ "intent-core",
+ "intent-services",
+]
+
+[[package]]
 name = "intentd"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "intent-acp",
+ "intent-context",
+ "intent-core",
+ "intent-git",
+ "intent-providers",
+ "intent-pty",
+ "intent-search",
+ "intent-services",
+ "intent-sourcecontrol",
+ "intent-store",
+ "intent-transport",
 ]
 
 [[package]]
@@ -156,6 +255,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
