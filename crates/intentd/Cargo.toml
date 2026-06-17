@@ -1,0 +1,10 @@
+[package]
+name = "intentd"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Intent backend daemon — local-first JSON-RPC daemon for the Intent domain model"
+
+[dependencies]
+clap = { workspace = true }
