@@ -8,6 +8,11 @@ description = "Intent backend daemon — local-first JSON-RPC daemon for the Int
 
 [dependencies]
 clap = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 intent-core = { path = "../intent-core" }
 intent-store = { path = "../intent-store" }
@@ -20,3 +25,6 @@ intent-context = { path = "../intent-context" }
 intent-pty = { path = "../intent-pty" }
 intent-search = { path = "../intent-search" }
 intent-transport = { path = "../intent-transport" }
+
+[dev-dependencies]
+uuid = { workspace = true }

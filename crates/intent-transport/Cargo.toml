@@ -9,3 +9,10 @@ description = "UDS/TCP/TLS listeners, JSON-RPC router, auth, heartbeat, lifecycl
 [dependencies]
 intent-core = { path = "../intent-core" }
 intent-services = { path = "../intent-services" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }

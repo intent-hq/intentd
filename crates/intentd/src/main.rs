@@ -1,24 +1,208 @@
+//! intentd — the Intent backend daemon and its own control client (§5.7).
+//!
+//! This binary is the composition root (§3.2 rule 5): it is the only place that
+//! wires concrete implementations together (store → services → transport).
+
+use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use intent_core::{Config, WorkspaceApi};
+use intent_services::Services;
+use intent_store::Store;
+use intent_transport::serve_uds;
+use serde_json::{json, Value};
 
-/// intentd — the Intent backend daemon (bootstrap skeleton).
+mod client;
+use client::rpc_call;
+
+/// intentd — local-first JSON-RPC daemon for the Intent domain model.
 #[derive(Debug, Parser)]
 #[command(name = "intentd", version, about, long_about = None)]
-struct Cli {}
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-fn main() {
-    Cli::parse();
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Start the daemon and serve JSON-RPC over a Unix-domain socket.
+    Serve {
+        /// Transport to listen on (only `uds` is supported in this slice).
+        #[arg(long, default_value = "uds")]
+        listen: String,
+    },
+    /// One-shot JSON-RPC call to a running daemon; prints the JSON result.
+    Call {
+        /// JSON-RPC method, e.g. `workspace.list`.
+        method: String,
+        /// Params as a JSON object string, e.g. `{"workspaceId":"ws-1"}`.
+        #[arg(long)]
+        params: Option<String>,
+    },
+    /// Probe daemon liveness and print basic info.
+    Status,
+    /// Diagnostics: data-dir writable + SQLite openable/migrations current.
+    Doctor,
+}
 
-    // Composition root: the binary is the only place that wires concrete
-    // implementations together (§3.2 rule 5). Stub only — nothing is started.
-    let services = Arc::new(intent_services::Services);
-    let _acp = intent_acp::AcpClient::new(services.clone());
+#[tokio::main]
+async fn main() -> ExitCode {
+    init_tracing();
+    match Cli::parse().command {
+        Command::Serve { listen } => to_exit(cmd_serve(&listen).await),
+        Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
+        Command::Status => cmd_status().await,
+        Command::Doctor => cmd_doctor().await,
+    }
+}
 
-    println!("intentd {}", env!("CARGO_PKG_VERSION"));
-    println!();
-    println!("Usage: intentd [OPTIONS]");
-    println!();
-    println!("The Intent backend daemon is not yet implemented.");
-    println!("This is a bootstrap skeleton; run with --help or --version.");
+fn to_exit(result: anyhow::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+fn resolve_config() -> anyhow::Result<Config> {
+    Config::resolve().map_err(|e| anyhow::anyhow!(e.to_string()))
+}
+
+async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
+    if listen != "uds" {
+        anyhow::bail!("unsupported --listen '{listen}'; only 'uds' is supported");
+    }
+    let config = resolve_config()?;
+    std::fs::create_dir_all(&config.data_dir)?;
+    let store = Store::open(&config.db_path)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+    tracing::info!(socket = %config.socket_path.display(), "starting intentd");
+    serve_uds(services, &config.socket_path, shutdown_signal()).await?;
+    Ok(())
+}
+
+async fn cmd_call(method: &str, params: Option<&str>) -> anyhow::Result<()> {
+    let config = resolve_config()?;
+    let params: Value = match params {
+        Some(s) => {
+            serde_json::from_str(s).map_err(|e| anyhow::anyhow!("invalid --params JSON: {e}"))?
+        }
+        None => json!({}),
+    };
+    let response = rpc_call(&config.socket_path, method, params).await?;
+    if let Some(error) = response.get("error") {
+        eprintln!("{}", serde_json::to_string_pretty(error)?);
+        anyhow::bail!("rpc error");
+    }
+    let result = response.get("result").cloned().unwrap_or(Value::Null);
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+async fn cmd_status() -> ExitCode {
+    let config = match resolve_config() {
+        Ok(c) => c,
+        Err(e) => return to_exit(Err(e)),
+    };
+    match rpc_call(&config.socket_path, "workspace.list", json!({})).await {
+        Ok(resp) if resp.get("result").is_some() => {
+            let count = resp["result"]["workspaces"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+            println!("intentd: up");
+            println!("  socket: {}", config.socket_path.display());
+            println!("  workspaces: {count}");
+            ExitCode::SUCCESS
+        }
+        Ok(resp) => {
+            println!("intentd: up (rpc error)");
+            if let Some(e) = resp.get("error") {
+                println!("  error: {e}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(_) => {
+            println!("intentd: down");
+            println!("  socket: {} (not reachable)", config.socket_path.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn cmd_doctor() -> ExitCode {
+    let config = match resolve_config() {
+        Ok(c) => c,
+        Err(e) => return to_exit(Err(e)),
+    };
+    let mut ok = true;
+
+    match check_data_dir_writable(&config) {
+        Ok(()) => println!("[ok] data dir writable: {}", config.data_dir.display()),
+        Err(e) => {
+            ok = false;
+            println!("[FAIL] data dir not writable: {e}");
+        }
+    }
+
+    match Store::open(&config.db_path).await {
+        Ok(_) => println!(
+            "[ok] sqlite openable + migrations current: {}",
+            config.db_path.display()
+        ),
+        Err(e) => {
+            ok = false;
+            println!("[FAIL] sqlite/migrations: {e}");
+        }
+    }
+
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn check_data_dir_writable(config: &Config) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&config.data_dir)?;
+    let probe = config.data_dir.join(".intentd-doctor-probe");
+    std::fs::write(&probe, b"ok")?;
+    std::fs::remove_file(&probe)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+    tracing::info!("shutdown signal received");
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }

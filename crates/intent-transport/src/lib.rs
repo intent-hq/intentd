@@ -2,15 +2,17 @@
 //!
 //! Depends ONLY on `intent-core` and `intent-services` (§3.2 rule 2); it never
 //! touches `intent-store` directly. This guarantees the WS router and the agent
-//! MCP server share one code path. Stub only — tokio/axum/rustls/mdns are pulled
-//! when transport lands in Wave 3.
+//! MCP server share one code path. This slice implements the UDS listener and
+//! the transport-agnostic JSON-RPC router; TLS/auth/mdns remain stubs.
 
 pub use intent_core::Result;
 pub use intent_services::Services;
 
-pub mod listener {
-    //! UDS/TCP listeners — stub.
-}
+pub use listener::serve_uds;
+pub use router::handle_message;
+
+pub mod listener;
+pub mod router;
 
 pub mod tls {
     //! TLS termination + SHA-256 fingerprint pinning — stub.
@@ -18,10 +20,6 @@ pub mod tls {
 
 pub mod auth {
     //! Bearer auth + origin allow-list — stub.
-}
-
-pub mod router {
-    //! JSON-RPC method router over the services surface — stub.
 }
 
 pub mod heartbeat {
