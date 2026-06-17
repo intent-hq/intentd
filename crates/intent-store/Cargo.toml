@@ -8,3 +8,10 @@ description = "SQLite + file-tree persistence (repositories, migrations, locking
 
 [dependencies]
 intent-core = { path = "../intent-core" }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+uuid = { workspace = true }

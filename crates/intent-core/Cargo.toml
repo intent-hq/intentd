@@ -8,3 +8,8 @@ description = "Intent domain vocabulary: ids, errors, config, events, and cross-
 
 [dependencies]
 thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+directories = { workspace = true }
