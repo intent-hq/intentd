@@ -3,12 +3,13 @@
 use intent_core::{
     AuthorType, BoxFuture, Comment, CommentAddResult, CommentAnchor, CommentAnchorType,
     CommentLocation, CommentRespondResult, CommentRespondThread, CommentStatus, CommentType,
-    CommentWire, ContentType, Error, Note, NoteAddInput, NoteAddResult, NoteCreate,
+    CommentWire, ContentType, Error, Event, EventQueryParams, EventSubscribeResult,
+    EventUnsubscribeResult, FileActivity, Note, NoteAddInput, NoteAddResult, NoteCreate,
     NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
     NoteId, NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult,
     NoteVisibility, ReadAssetResult, Result, TaskUpdateResult, Workspace, WorkspaceActivity,
-    WorkspaceApi, WorkspaceAttention, WorkspaceCreate, WorkspaceId, WorkspaceStatus,
-    WorkspaceUpdate,
+    WorkspaceApi, WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary, WorkspaceId,
+    WorkspaceStatus, WorkspaceUpdate,
 };
 use serde_json::Value;
 
@@ -458,6 +459,117 @@ impl WorkspaceApi for FakeApi {
             })
         })
     }
+
+    fn event_recent_files(
+        &self,
+        _workspace_id: WorkspaceId,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
+        Box::pin(async move {
+            Ok(vec![FileActivity {
+                path: format!("limit={}", limit.unwrap_or(-1)),
+                relative_path: "r".to_string(),
+                action: "modify".to_string(),
+                timestamp: "t0".to_string(),
+                actor: Some("agent:x".to_string()),
+                additions: None,
+                deletions: None,
+            }])
+        })
+    }
+
+    fn event_agent_activity(
+        &self,
+        _workspace_id: WorkspaceId,
+        agent_id: Option<String>,
+        minutes_ago: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({ "agentId": agent_id, "minutesAgo": minutes_ago }))
+        })
+    }
+
+    fn event_workspace_summary(
+        &self,
+        _workspace_id: WorkspaceId,
+        minutes_ago: Option<i64>,
+    ) -> BoxFuture<'_, Result<WorkspaceEventSummary>> {
+        Box::pin(async move {
+            Ok(WorkspaceEventSummary {
+                recent_files: vec![],
+                active_agents: vec![],
+                event_rate: minutes_ago.unwrap_or(-1) as f64,
+                top_changed_files: vec![],
+            })
+        })
+    }
+
+    fn event_directory_changes(
+        &self,
+        _workspace_id: WorkspaceId,
+        dir: String,
+        _limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
+        Box::pin(async move {
+            Ok(vec![FileActivity {
+                path: dir,
+                relative_path: "r".to_string(),
+                action: "modify".to_string(),
+                timestamp: "t0".to_string(),
+                actor: Some("agent:x".to_string()),
+                additions: None,
+                deletions: None,
+            }])
+        })
+    }
+
+    fn event_query(
+        &self,
+        _workspace_id: WorkspaceId,
+        params: EventQueryParams,
+    ) -> BoxFuture<'_, Result<Vec<Event>>> {
+        Box::pin(async move {
+            // Echo the extracted eventType into a single event so the router
+            // wiring of `EventQueryParams` is observable.
+            Ok(vec![Event {
+                id: "e1".to_string(),
+                workspace_id: WorkspaceId::from("ws-1"),
+                timestamp: "t0".to_string(),
+                event_type: params.event_type.unwrap_or_default(),
+                actor: Default::default(),
+                session_id: None,
+                correlation_id: None,
+                parent_event_id: None,
+                data: serde_json::json!({}),
+            }])
+        })
+    }
+
+    fn event_subscribe(
+        &self,
+        _workspace_id: WorkspaceId,
+        event_types: Vec<String>,
+    ) -> BoxFuture<'_, Result<EventSubscribeResult>> {
+        Box::pin(async move {
+            Ok(EventSubscribeResult {
+                subscription_id: "sub-fake".to_string(),
+                event_types,
+            })
+        })
+    }
+
+    fn event_unsubscribe(
+        &self,
+        _workspace_id: WorkspaceId,
+        subscription_id: String,
+    ) -> BoxFuture<'_, Result<EventUnsubscribeResult>> {
+        Box::pin(async move {
+            Ok(EventUnsubscribeResult {
+                ok: true,
+                subscription_id,
+            })
+        })
+    }
 }
 
 async fn call(msg: &str) -> Option<Value> {
@@ -903,4 +1015,120 @@ async fn task_comment_methods_missing_note_id_is_minus_32602() {
             "{method}"
         );
     }
+}
+
+#[tokio::test]
+async fn event_query_methods_route_and_pass_params() {
+    // recentFiles passes `limit` through.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"event.recentFiles","params":{"workspaceId":"ws-1","limit":7}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"][0]["path"], serde_json::json!("limit=7"));
+
+    // agentActivity echoes agentId + minutesAgo.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"event.agentActivity","params":{"workspaceId":"ws-1","agentId":"a1","minutesAgo":15}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["agentId"], serde_json::json!("a1"));
+    assert_eq!(v["result"]["minutesAgo"], serde_json::json!(15));
+
+    // workspaceSummary echoes minutesAgo into eventRate.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":3,"method":"event.workspaceSummary","params":{"workspaceId":"ws-1","minutesAgo":42}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["eventRate"], serde_json::json!(42.0));
+
+    // directoryChanges requires `dir` and echoes it back.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":4,"method":"event.directoryChanges","params":{"workspaceId":"ws-1","dir":"src/"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"][0]["path"], serde_json::json!("src/"));
+
+    // query passes EventQueryParams (eventType echoed into the result event).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":5,"method":"event.query","params":{"workspaceId":"ws-1","eventType":"file:changed"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"][0]["type"], serde_json::json!("file:changed"));
+}
+
+#[tokio::test]
+async fn event_directory_changes_requires_dir() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"event.directoryChanges","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: dir")
+    );
+}
+
+#[tokio::test]
+async fn event_subscribe_validates_event_types() {
+    // Missing eventTypes → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"event.subscribe","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: eventTypes")
+    );
+
+    // Present but not an array → -32602 with the array message.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"event.subscribe","params":{"workspaceId":"ws-1","eventTypes":"agent:*"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("eventTypes must be an array")
+    );
+
+    // A valid array routes through and echoes the resolved types.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":3,"method":"event.subscribe","params":{"workspaceId":"ws-1","eventTypes":["agent:*"]}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["subscriptionId"], serde_json::json!("sub-fake"));
+    assert_eq!(v["result"]["eventTypes"], serde_json::json!(["agent:*"]));
+}
+
+#[tokio::test]
+async fn event_unsubscribe_requires_subscription_id() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"event.unsubscribe","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: subscriptionId")
+    );
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"event.unsubscribe","params":{"workspaceId":"ws-1","subscriptionId":"s1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["subscriptionId"], serde_json::json!("s1"));
 }

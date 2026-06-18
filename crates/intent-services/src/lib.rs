@@ -6,26 +6,31 @@
 //! implements the read-only `WorkspaceApi` surface (`workspace.list` /
 //! `note.list`) over `intent-store`.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use intent_core::{
-    now_iso, parse_iso, AgentId, AuthorType, BoxFuture, Comment, CommentAddResult, CommentAnchor,
-    CommentAnchorType, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
-    CommentLocation, CommentRespondResult, CommentRespondThread, CommentStatus,
-    CommentThreadSummary, CommentType, CommentWire, ContentType, Note, NoteAddInput, NoteAddResult,
-    NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
-    NoteEditResult, NoteId, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, TaskAssignAgentResult,
-    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult,
-    TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult,
-    TaskUpdateResult, TaskUpdateStatusResult, Workspace, WorkspaceActivity, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    iso_minutes_ago, now_iso, parse_iso, ActorType, AgentId, AuthorType, BoxFuture, Comment,
+    CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
+    CommentGetThreadResult, CommentListResult, CommentLocation, CommentRespondResult,
+    CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType, CommentWire,
+    ContentType, Event, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
+    FileActivity, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteSetContentResult,
+    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, Workspace,
+    WorkspaceActivity, WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary, WorkspaceId,
+    WorkspaceStatus, WorkspaceUpdate,
 };
-use intent_store::Store;
+use intent_store::{EventQuery, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
 
+mod event_ops;
 pub mod events;
 mod note_ops;
 
@@ -44,6 +49,10 @@ pub struct Services {
     /// `None` until configured by the composition root; `note.readAsset` errors
     /// when unset.
     assets_root: Option<PathBuf>,
+    /// Live ids minted by the deprecated `event.subscribe` alias so that
+    /// `event.unsubscribe` can report found/not-found. This is the service-style
+    /// surface only; WS streaming is the separate `events.*` fast-path (§6).
+    event_subscriptions: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Services {
@@ -52,6 +61,7 @@ impl Services {
         Self {
             store,
             assets_root: None,
+            event_subscriptions: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -1490,6 +1500,192 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => Err(e),
             }
+        })
+    }
+
+    fn event_recent_files(
+        &self,
+        workspace_id: WorkspaceId,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // TS `recentFiles(limit)` peer: `limit || 10` (0 is falsy → 10).
+            let limit = limit.filter(|&l| l != 0).unwrap_or(10);
+            let events = store.recent_files(&workspace_id, limit).await?;
+            Ok(events
+                .iter()
+                .map(event_ops::file_activity_combined)
+                .collect())
+        })
+    }
+
+    fn event_agent_activity(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<String>,
+        minutes_ago: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            if let Some(agent_id) = agent_id {
+                // `getAgentFiles(agentId, 100)`: file:changed by that agent.
+                let events = store
+                    .query_events(&EventQuery {
+                        workspace_id: Some(workspace_id),
+                        event_types: vec![intent_core::events::FILE_CHANGED.to_string()],
+                        actor_type: Some(ActorType::Agent),
+                        actor_id: Some(agent_id),
+                        limit: Some(100),
+                        ..Default::default()
+                    })
+                    .await?;
+                let files: Vec<FileActivity> =
+                    events.iter().map(event_ops::file_activity_named).collect();
+                serde_json::to_value(files)
+                    .map_err(|e| Error::Internal(format!("serialize agent files failed: {e}")))
+            } else {
+                // `getAgentActivity(minutesAgo || 30)`: agent events in-window.
+                let minutes = minutes_ago.filter(|&m| m != 0).unwrap_or(30);
+                let events = store
+                    .query_events(&EventQuery {
+                        workspace_id: Some(workspace_id),
+                        actor_type: Some(ActorType::Agent),
+                        since: Some(iso_minutes_ago(minutes)),
+                        ..Default::default()
+                    })
+                    .await?;
+                let activity = event_ops::aggregate_agent_activity(&events);
+                serde_json::to_value(activity)
+                    .map_err(|e| Error::Internal(format!("serialize agent activity failed: {e}")))
+            }
+        })
+    }
+
+    fn event_workspace_summary(
+        &self,
+        workspace_id: WorkspaceId,
+        minutes_ago: Option<i64>,
+    ) -> BoxFuture<'_, Result<WorkspaceEventSummary>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // TS `workspaceSummary(minutesAgo || 60)`.
+            let minutes = minutes_ago.filter(|&m| m != 0).unwrap_or(60);
+            let events = store
+                .query_events(&EventQuery {
+                    workspace_id: Some(workspace_id),
+                    since: Some(iso_minutes_ago(minutes)),
+                    ..Default::default()
+                })
+                .await?;
+            Ok(event_ops::build_workspace_summary(&events, minutes))
+        })
+    }
+
+    fn event_directory_changes(
+        &self,
+        workspace_id: WorkspaceId,
+        dir: String,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            if dir.is_empty() {
+                return Err(Error::Internal("Directory path is required".to_string()));
+            }
+            // TS `directoryChanges(dir, limit || 20)`.
+            let limit = limit.filter(|&l| l != 0).unwrap_or(20);
+            let events = store.directory_changes(&workspace_id, &dir, limit).await?;
+            Ok(events
+                .iter()
+                .map(event_ops::file_activity_combined)
+                .collect())
+        })
+    }
+
+    fn event_query(
+        &self,
+        workspace_id: WorkspaceId,
+        params: EventQueryParams,
+    ) -> BoxFuture<'_, Result<Vec<Event>>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Mirror `buildQueryFilters`: each option is applied only when
+            // truthy (empty strings / 0 are skipped); `limit || 50`.
+            let mut q = EventQuery {
+                workspace_id: Some(workspace_id),
+                limit: Some(params.limit.filter(|&l| l != 0).unwrap_or(50)),
+                ..Default::default()
+            };
+            if let Some(t) = params.event_type.filter(|s| !s.is_empty()) {
+                q.event_types = vec![t];
+            }
+            if let Some(at) = params.actor_type.filter(|s| !s.is_empty()) {
+                // An unrecognized actorType matches nothing (TS equals filter).
+                match serde_json::from_value::<ActorType>(serde_json::Value::String(at)) {
+                    Ok(parsed) => q.actor_type = Some(parsed),
+                    Err(_) => return Ok(Vec::new()),
+                }
+            }
+            if let Some(aid) = params.actor_id.filter(|s| !s.is_empty()) {
+                q.actor_id = Some(aid);
+            }
+            if let Some(p) = params.path.filter(|s| !s.is_empty()) {
+                q.path_prefix = Some(p);
+            }
+            if let Some(m) = params.minutes_ago.filter(|&m| m != 0) {
+                q.since = Some(iso_minutes_ago(m));
+            }
+            store.query_events(&q).await
+        })
+    }
+
+    fn event_subscribe(
+        &self,
+        _workspace_id: WorkspaceId,
+        event_types: Vec<String>,
+    ) -> BoxFuture<'_, Result<EventSubscribeResult>> {
+        let subs = self.event_subscriptions.clone();
+        Box::pin(async move {
+            if event_types.is_empty() {
+                return Err(Error::Internal(
+                    "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string(),
+                ));
+            }
+            // Bare `*` expands to the category wildcards (`resolveSubscriptionEventTypes`).
+            let resolved = events::resolve_event_types(&event_types);
+            let subscription_id = uuid::Uuid::new_v4().to_string();
+            subs.lock()
+                .expect("event subscription registry poisoned")
+                .insert(subscription_id.clone());
+            Ok(EventSubscribeResult {
+                subscription_id,
+                event_types: resolved,
+            })
+        })
+    }
+
+    fn event_unsubscribe(
+        &self,
+        _workspace_id: WorkspaceId,
+        subscription_id: String,
+    ) -> BoxFuture<'_, Result<EventUnsubscribeResult>> {
+        let subs = self.event_subscriptions.clone();
+        Box::pin(async move {
+            if subscription_id.is_empty() {
+                return Err(Error::Internal("subscriptionId is required".to_string()));
+            }
+            let removed = subs
+                .lock()
+                .expect("event subscription registry poisoned")
+                .remove(&subscription_id);
+            if !removed {
+                return Err(Error::Internal("Subscription not found".to_string()));
+            }
+            Ok(EventUnsubscribeResult {
+                ok: true,
+                subscription_id,
+            })
         })
     }
 }

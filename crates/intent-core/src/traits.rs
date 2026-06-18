@@ -7,12 +7,13 @@ use crate::error::{Error, Result};
 use crate::ids::{NoteId, WorkspaceId};
 use crate::model::{
     CommentAddResult, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
-    CommentRespondResult, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
-    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteSetContentResult,
-    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, ReadAssetResult, TaskAssignAgentResult,
+    CommentRespondResult, Event, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
+    FileActivity, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteSetContentResult, NoteTaskRow,
+    NoteUpdateInput, NoteUpdateMetadataResult, ReadAssetResult, TaskAssignAgentResult,
     TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult,
     TaskMarkAsTaskResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    Workspace, WorkspaceCreate, WorkspaceUpdate,
+    Workspace, WorkspaceCreate, WorkspaceEventSummary, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -525,6 +526,109 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::comment_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `event.recentFiles`: most-recently changed files (PROTOCOL §5.10).
+    fn event_recent_files(
+        &self,
+        workspace_id: WorkspaceId,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
+        let _ = (workspace_id, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::event_recent_files not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `event.agentActivity`: per-agent files (with `agentId`) or aggregated
+    /// agent activity (without). The union result is returned as raw JSON
+    /// (`FileActivity[]` or `AgentActivity[]`) (PROTOCOL §5.10).
+    fn event_agent_activity(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<String>,
+        minutes_ago: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, minutes_ago);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::event_agent_activity not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `event.workspaceSummary`: aggregated activity summary (PROTOCOL §5.10).
+    fn event_workspace_summary(
+        &self,
+        workspace_id: WorkspaceId,
+        minutes_ago: Option<i64>,
+    ) -> BoxFuture<'_, Result<WorkspaceEventSummary>> {
+        let _ = (workspace_id, minutes_ago);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::event_workspace_summary not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `event.directoryChanges`: recent `file:changed` under a prefix (§5.10).
+    fn event_directory_changes(
+        &self,
+        workspace_id: WorkspaceId,
+        dir: String,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
+        let _ = (workspace_id, dir, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::event_directory_changes not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `event.query`: filtered event query over the append-only log (§5.10).
+    fn event_query(
+        &self,
+        workspace_id: WorkspaceId,
+        params: EventQueryParams,
+    ) -> BoxFuture<'_, Result<Vec<Event>>> {
+        let _ = (workspace_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::event_query not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `event.subscribe` (deprecated alias): service-style subscription result;
+    /// does NOT wire WS streaming (use `events.subscribe`) (PROTOCOL §5.10/§6).
+    fn event_subscribe(
+        &self,
+        workspace_id: WorkspaceId,
+        event_types: Vec<String>,
+    ) -> BoxFuture<'_, Result<EventSubscribeResult>> {
+        let _ = (workspace_id, event_types);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::event_subscribe not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `event.unsubscribe` (deprecated alias): service-style result (§5.10/§6).
+    fn event_unsubscribe(
+        &self,
+        workspace_id: WorkspaceId,
+        subscription_id: String,
+    ) -> BoxFuture<'_, Result<EventUnsubscribeResult>> {
+        let _ = (workspace_id, subscription_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::event_unsubscribe not implemented".to_string(),
             ))
         })
     }

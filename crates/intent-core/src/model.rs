@@ -800,6 +800,91 @@ pub struct Event {
     pub data: serde_json::Value,
 }
 
+/// One file-change activity row (§5.10; `agent-event-tools.ts` `FileActivity`).
+/// Returned by `event.recentFiles` / `event.directoryChanges` and embedded in
+/// `event.workspaceSummary`. `actor` is `"type:name"` for the workspace-wide
+/// helpers and the bare actor name for the per-agent variant; absent optionals
+/// are omitted from the wire to match the TS `JSON.stringify` shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileActivity {
+    pub path: String,
+    pub relative_path: String,
+    pub action: String,
+    pub timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additions: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<serde_json::Value>,
+}
+
+/// Aggregated per-agent activity (§5.10; `agent-event-tools.ts` `AgentActivity`).
+/// Returned by `event.agentActivity` (no `agentId`) and embedded in
+/// `event.workspaceSummary.activeAgents`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentActivity {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    pub event_count: i64,
+    pub tool_calls: i64,
+    pub files_modified: Vec<String>,
+    pub last_active: String,
+}
+
+/// One entry of `event.workspaceSummary.topChangedFiles` (§5.10).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopChangedFile {
+    pub path: String,
+    pub change_count: i64,
+}
+
+/// `event.workspaceSummary` result (§5.10; `WorkspaceActivity` in
+/// `agent-event-tools.ts`, renamed here to avoid colliding with the
+/// lifecycle [`WorkspaceActivity`] enum).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceEventSummary {
+    pub recent_files: Vec<FileActivity>,
+    pub active_agents: Vec<AgentActivity>,
+    pub event_rate: f64,
+    pub top_changed_files: Vec<TopChangedFile>,
+}
+
+/// `event.subscribe` (deprecated alias) service result (§5.10 / §6). Mirrors the
+/// `ws.event.subscribe` peer return `{ subscriptionId, eventTypes }`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventSubscribeResult {
+    pub subscription_id: String,
+    pub event_types: Vec<String>,
+}
+
+/// `event.unsubscribe` (deprecated alias) service result (§5.10 / §6). Mirrors
+/// the `ws.event.unsubscribe` peer return `{ ok: true, subscriptionId }`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventUnsubscribeResult {
+    pub ok: bool,
+    pub subscription_id: String,
+}
+
+/// Filter inputs for `event.query` (§5.10). Built by the transport router from
+/// request params and consumed by the service layer; not serialized on the wire.
+#[derive(Debug, Clone, Default)]
+pub struct EventQueryParams {
+    pub event_type: Option<String>,
+    pub actor_type: Option<String>,
+    pub actor_id: Option<String>,
+    pub path: Option<String>,
+    pub minutes_ago: Option<i64>,
+    pub limit: Option<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

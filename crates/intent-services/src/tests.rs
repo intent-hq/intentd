@@ -539,3 +539,257 @@ async fn comment_respond_suggestion_nests_diff_and_threads() {
         .expect("delete");
     assert!(del.success);
 }
+
+// ---- event.* query/aggregation methods (M2.4) ----
+
+use intent_core::{ActorType, EventActor};
+use intent_store::NewEvent;
+
+/// Insert a `file:changed` event for `agent` at `ts` (newest inserted last).
+async fn insert_file_event(
+    svc: &Services,
+    ws: &WorkspaceId,
+    actor_type: ActorType,
+    actor_id: Option<&str>,
+    ts: &str,
+    path: &str,
+) {
+    svc.store()
+        .insert_event(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: ts.to_string(),
+            event_type: "file:changed".to_string(),
+            actor: EventActor {
+                actor_type,
+                id: actor_id.map(|s| s.to_string()),
+                name: actor_id.map(|s| format!("name-{s}")),
+                ..Default::default()
+            },
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            data: serde_json::json!({ "path": path, "relativePath": path, "action": "modify" }),
+        })
+        .await
+        .expect("insert event");
+}
+
+async fn event_setup() -> (TempDb, Services, WorkspaceId) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    (tmp, Services::new(store), ws)
+}
+
+#[tokio::test]
+async fn recent_files_limits_and_orders_newest_first() {
+    let (_tmp, svc, ws) = event_setup().await;
+    insert_file_event(
+        &svc,
+        &ws,
+        ActorType::Agent,
+        Some("a"),
+        "2026-01-01T00:00:01Z",
+        "a.rs",
+    )
+    .await;
+    insert_file_event(
+        &svc,
+        &ws,
+        ActorType::Tool,
+        None,
+        "2026-01-01T00:00:02Z",
+        "b.rs",
+    )
+    .await;
+    insert_file_event(
+        &svc,
+        &ws,
+        ActorType::User,
+        Some("u"),
+        "2026-01-01T00:00:03Z",
+        "c.rs",
+    )
+    .await;
+
+    let files = svc
+        .event_recent_files(ws.clone(), Some(2))
+        .await
+        .expect("recent");
+    assert_eq!(files.len(), 2);
+    // Newest first; combined "type:name" actor (absent name → undefined).
+    assert_eq!(files[0].path, "c.rs");
+    assert_eq!(files[0].actor.as_deref(), Some("user:name-u"));
+    assert_eq!(files[1].path, "b.rs");
+    assert_eq!(files[1].actor.as_deref(), Some("tool:undefined"));
+}
+
+#[tokio::test]
+async fn agent_activity_files_branch_vs_aggregate_branch() {
+    let (_tmp, svc, ws) = event_setup().await;
+    let ts = intent_core::now_iso();
+    insert_file_event(&svc, &ws, ActorType::Agent, Some("a1"), &ts, "x.rs").await;
+    insert_file_event(&svc, &ws, ActorType::Agent, Some("a2"), &ts, "y.rs").await;
+
+    // With agentId → FileActivity[] for that agent, bare actor name.
+    let by_agent = svc
+        .event_agent_activity(ws.clone(), Some("a1".to_string()), None)
+        .await
+        .expect("agent files");
+    let arr = by_agent.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["path"], "x.rs");
+    assert_eq!(arr[0]["actor"], "name-a1");
+
+    // Without agentId → aggregated AgentActivity[] over the recent window.
+    let agg = svc
+        .event_agent_activity(ws.clone(), None, Some(60))
+        .await
+        .expect("agent activity");
+    let agg_arr = agg.as_array().expect("array");
+    assert_eq!(agg_arr.len(), 2);
+    let ids: Vec<&str> = agg_arr
+        .iter()
+        .map(|a| a["agentId"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"a1") && ids.contains(&"a2"));
+}
+
+#[tokio::test]
+async fn workspace_summary_aggregates_recent_window() {
+    let (_tmp, svc, ws) = event_setup().await;
+    let ts = intent_core::now_iso();
+    insert_file_event(&svc, &ws, ActorType::Agent, Some("a1"), &ts, "a.rs").await;
+    insert_file_event(&svc, &ws, ActorType::Agent, Some("a1"), &ts, "a.rs").await;
+    insert_file_event(&svc, &ws, ActorType::User, Some("u"), &ts, "b.rs").await;
+
+    let summary = svc
+        .event_workspace_summary(ws.clone(), Some(60))
+        .await
+        .expect("summary");
+    assert_eq!(summary.recent_files.len(), 3);
+    // Only agent-typed events feed activeAgents.
+    assert_eq!(summary.active_agents.len(), 1);
+    assert_eq!(summary.active_agents[0].agent_id, "a1");
+    assert_eq!(summary.top_changed_files[0].path, "a.rs");
+    assert_eq!(summary.top_changed_files[0].change_count, 2);
+}
+
+#[tokio::test]
+async fn directory_changes_filters_by_prefix_and_requires_dir() {
+    let (_tmp, svc, ws) = event_setup().await;
+    insert_file_event(
+        &svc,
+        &ws,
+        ActorType::Agent,
+        Some("a"),
+        "2026-01-01T00:00:01Z",
+        "src/a.rs",
+    )
+    .await;
+    insert_file_event(
+        &svc,
+        &ws,
+        ActorType::Agent,
+        Some("a"),
+        "2026-01-01T00:00:02Z",
+        "docs/b.md",
+    )
+    .await;
+
+    let changes = svc
+        .event_directory_changes(ws.clone(), "src/".to_string(), None)
+        .await
+        .expect("dir");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].path, "src/a.rs");
+
+    let err = svc
+        .event_directory_changes(ws.clone(), String::new(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Internal(m) if m == "Directory path is required"));
+}
+
+#[tokio::test]
+async fn query_filters_and_defaults_limit_50() {
+    let (_tmp, svc, ws) = event_setup().await;
+    insert_file_event(
+        &svc,
+        &ws,
+        ActorType::Agent,
+        Some("a"),
+        "2026-01-01T00:00:01Z",
+        "a.rs",
+    )
+    .await;
+    insert_file_event(
+        &svc,
+        &ws,
+        ActorType::User,
+        Some("u"),
+        "2026-01-01T00:00:02Z",
+        "b.rs",
+    )
+    .await;
+
+    // Filter by actorType=user → only the user event.
+    let only_user = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                actor_type: Some("user".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query");
+    assert_eq!(only_user.len(), 1);
+    assert_eq!(only_user[0].actor.actor_type, ActorType::User);
+
+    // An unknown actorType matches nothing.
+    let none = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                actor_type: Some("nope".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query");
+    assert!(none.is_empty());
+}
+
+#[tokio::test]
+async fn subscribe_resolves_star_and_unsubscribe_roundtrips() {
+    let (_tmp, svc, ws) = event_setup().await;
+    // Empty eventTypes → error (TS resolveSubscriptionEventTypes guard).
+    let err = svc.event_subscribe(ws.clone(), vec![]).await.unwrap_err();
+    assert!(matches!(err, Error::Internal(m) if m.contains("eventTypes is required")));
+
+    // Bare `*` expands to the category wildcards.
+    let sub = svc
+        .event_subscribe(ws.clone(), vec!["*".to_string()])
+        .await
+        .expect("subscribe");
+    assert!(sub.event_types.contains(&"agent:*".to_string()));
+    assert!(sub.event_types.contains(&"file:*".to_string()));
+
+    // Unsubscribe removes it; a second call reports not-found.
+    let un = svc
+        .event_unsubscribe(ws.clone(), sub.subscription_id.clone())
+        .await
+        .expect("unsub");
+    assert!(un.ok);
+    let again = svc
+        .event_unsubscribe(ws.clone(), sub.subscription_id.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(again, Error::Internal(m) if m == "Subscription not found"));
+
+    // Empty subscriptionId → error.
+    let empty = svc.event_unsubscribe(ws, String::new()).await.unwrap_err();
+    assert!(matches!(empty, Error::Internal(m) if m == "subscriptionId is required"));
+}
