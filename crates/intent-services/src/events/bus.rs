@@ -45,6 +45,14 @@ impl EventBus {
         &self.store
     }
 
+    /// Number of live subscribers (active delivery tasks). Read-only
+    /// observability used to assert per-connection subscription cleanup; each
+    /// [`EventBus::subscribe`] adds one and dropping the [`Subscription`]
+    /// removes it.
+    pub fn subscriber_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
+
     /// Append `ev` to the durable log, then broadcast the persisted event to
     /// live subscribers. The broadcast is best-effort: with no subscribers the
     /// send is a no-op, and the event is already durably stored either way.
