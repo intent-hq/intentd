@@ -89,7 +89,8 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+    let services: Arc<dyn WorkspaceApi> =
+        Arc::new(Services::new(store).with_assets_root(config.data_dir.join("assets")));
     tracing::info!(socket = %config.socket_path.display(), "starting intentd");
     serve_uds(services, &config.socket_path, shutdown_signal()).await?;
     Ok(())

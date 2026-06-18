@@ -1,9 +1,11 @@
 //! Router error-matrix + dispatch unit tests using a fake `WorkspaceApi`.
 
 use intent_core::{
-    BoxFuture, ContentType, Error, Note, NoteId, NoteVisibility, Result, Workspace,
-    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceCreate, WorkspaceId,
-    WorkspaceStatus, WorkspaceUpdate,
+    BoxFuture, ContentType, Error, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
+    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility,
+    ReadAssetResult, Result, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
+    WorkspaceCreate, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use serde_json::Value;
 
@@ -159,6 +161,200 @@ impl WorkspaceApi for FakeApi {
                 return Err(Error::NotFound("workspace".to_string()));
             }
             Ok(vec![sample_note(&id)])
+        })
+    }
+
+    fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
+        Box::pin(async move {
+            if note_id.as_str() == "missing" {
+                return Err(Error::NotFound("note".to_string()));
+            }
+            let mut note = sample_note(&workspace_id);
+            note.id = note_id;
+            Ok(note)
+        })
+    }
+
+    fn create_note(
+        &self,
+        workspace_id: WorkspaceId,
+        input: NoteCreate,
+    ) -> BoxFuture<'_, Result<Note>> {
+        Box::pin(async move {
+            let mut note = sample_note(&workspace_id);
+            note.id = NoteId::from("created");
+            note.title = input.title;
+            Ok(note)
+        })
+    }
+
+    fn update_note(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        input: NoteUpdateInput,
+    ) -> BoxFuture<'_, Result<Note>> {
+        Box::pin(async move {
+            if note_id.as_str() == "missing" {
+                return Err(Error::NotFound("note".to_string()));
+            }
+            let mut note = sample_note(&workspace_id);
+            note.id = note_id;
+            if let Some(t) = input.title {
+                note.title = t;
+            }
+            Ok(note)
+        })
+    }
+
+    fn add_to_note(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        input: NoteAddInput,
+    ) -> BoxFuture<'_, Result<NoteAddResult>> {
+        Box::pin(async move {
+            Ok(NoteAddResult {
+                ok: true,
+                note_id,
+                added_length: input.content.chars().count(),
+                total_length: input.content.chars().count(),
+                position: "at end".to_string(),
+                old_content: String::new(),
+                new_content: input.content,
+                converted_count: 0,
+                created_task_note_ids: vec![],
+            })
+        })
+    }
+
+    fn edit_note(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        input: NoteEditInput,
+    ) -> BoxFuture<'_, Result<NoteEditResult>> {
+        Box::pin(async move {
+            Ok(NoteEditResult {
+                ok: true,
+                note_id,
+                old_text_length: input.old.chars().count(),
+                new_text_length: input.new.chars().count(),
+                match_position: 0,
+                old_content: String::new(),
+                new_content: input.new,
+                converted_count: 0,
+                created_task_note_ids: vec![],
+            })
+        })
+    }
+
+    fn edit_note_lines(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        input: NoteEditLinesInput,
+    ) -> BoxFuture<'_, Result<NoteEditLinesResult>> {
+        Box::pin(async move {
+            Ok(NoteEditLinesResult {
+                ok: true,
+                note_id,
+                start_line: input.start,
+                end_line: input.end,
+                total_lines_before: 1,
+                total_lines_after: 1,
+                old_content: String::new(),
+                new_content: input.content,
+                converted_count: 0,
+                created_task_note_ids: vec![],
+            })
+        })
+    }
+
+    fn set_note_content(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        content: String,
+        _confirm_replacement: bool,
+    ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
+        Box::pin(async move {
+            Ok(NoteSetContentResult {
+                ok: true,
+                note_id,
+                title: "Title".to_string(),
+                previous_title: Some("Title".to_string()),
+                updated_at: "t1".to_string(),
+                old_content: Some(String::new()),
+                new_content: content,
+                converted_count: 0,
+                created_task_note_ids: vec![],
+            })
+        })
+    }
+
+    fn update_note_metadata(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        title: Option<String>,
+        tags: Option<Vec<String>>,
+    ) -> BoxFuture<'_, Result<NoteUpdateMetadataResult>> {
+        Box::pin(async move {
+            Ok(NoteUpdateMetadataResult {
+                ok: true,
+                note_id,
+                title,
+                tags,
+                updated_at: Some("t1".to_string()),
+                skipped: None,
+                reason: None,
+            })
+        })
+    }
+
+    fn delete_note(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<NoteDeleteResult>> {
+        Box::pin(async move {
+            Ok(NoteDeleteResult {
+                ok: true,
+                note_id,
+                deleted: true,
+            })
+        })
+    }
+
+    fn list_note_tasks(
+        &self,
+        _workspace_id: WorkspaceId,
+        _note_id: NoteId,
+    ) -> BoxFuture<'_, Result<Vec<NoteTaskRow>>> {
+        Box::pin(async move {
+            Ok(vec![NoteTaskRow {
+                line_number: 1,
+                text: "task".to_string(),
+                status: "todo".to_string(),
+                task_note_id: None,
+                linked_task_note_id: None,
+            }])
+        })
+    }
+
+    fn read_asset(
+        &self,
+        _workspace_id: WorkspaceId,
+        asset: String,
+    ) -> BoxFuture<'_, Result<ReadAssetResult>> {
+        Box::pin(async move {
+            Ok(ReadAssetResult {
+                asset_id: asset,
+                mime_type: "image/png".to_string(),
+                data: "AAAA".to_string(),
+                size_kb: 1,
+            })
         })
     }
 }
@@ -369,4 +565,132 @@ async fn workspace_mutations_missing_id_is_minus_32602() {
         let v = call(&msg).await.unwrap();
         assert_eq!(err_code(&v), -32602, "{method}");
     }
+}
+
+#[tokio::test]
+async fn note_get_returns_note_object() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.get","params":{"workspaceId":"ws-1","noteId":"n9"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["note"]["id"], serde_json::json!("n9"));
+}
+
+#[tokio::test]
+async fn note_get_not_found_is_minus_32602_with_message() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.get","params":{"workspaceId":"ws-1","noteId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(v["error"]["message"], serde_json::json!("Note not found"));
+}
+
+#[tokio::test]
+async fn note_create_wraps_note_with_title() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.create","params":{"workspaceId":"ws-1","title":"Hi"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["note"]["title"], serde_json::json!("Hi"));
+}
+
+#[tokio::test]
+async fn note_add_returns_bare_result_object() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.add","params":{"workspaceId":"ws-1","noteId":"n1","content":"hi"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["noteId"], serde_json::json!("n1"));
+    assert_eq!(v["result"]["newContent"], serde_json::json!("hi"));
+}
+
+#[tokio::test]
+async fn note_list_tasks_returns_bare_array() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.listTasks","params":{"workspaceId":"ws-1","noteId":"n1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v["result"].is_array());
+    assert_eq!(v["result"][0]["status"], serde_json::json!("todo"));
+}
+
+#[tokio::test]
+async fn note_delete_returns_ok_shape() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.delete","params":{"workspaceId":"ws-1","noteId":"n1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["deleted"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn note_read_asset_returns_flat_shape() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.readAsset","params":{"workspaceId":"ws-1","asset":"img.png"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["assetId"], serde_json::json!("img.png"));
+    assert_eq!(v["result"]["mimeType"], serde_json::json!("image/png"));
+    assert_eq!(v["result"]["sizeKb"], serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn note_methods_missing_note_id_is_minus_32602() {
+    for method in [
+        "note.get",
+        "note.add",
+        "note.edit",
+        "note.editLines",
+        "note.setContent",
+        "note.updateMetadata",
+        "note.delete",
+        "note.listTasks",
+    ] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"workspaceId":"ws-1"}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "{method}");
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!("Missing required parameter: noteId"),
+            "{method}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn note_methods_missing_workspace_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"note.get","params":{"noteId":"n1"}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("workspaceId is required")
+    );
+}
+
+#[tokio::test]
+async fn note_edit_missing_new_param_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.edit","params":{"workspaceId":"ws-1","noteId":"n1","old":"a"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: new")
+    );
 }
