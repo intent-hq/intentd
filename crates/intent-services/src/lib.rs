@@ -37,7 +37,7 @@ mod note_ops;
 #[cfg(test)]
 mod tests;
 
-pub use events::{EventBus, Subscription, SubscriptionFilter};
+pub use events::{EventBus, FileWatcher, Subscription, SubscriptionFilter};
 
 /// Aggregate service handle wired by the binary composition root. It implements
 /// `WorkspaceApi` so it can be handed to `intent-acp` as `Arc<dyn WorkspaceApi>`

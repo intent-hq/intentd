@@ -1,0 +1,351 @@
+//! Filesystem watcher → `file:changed` events (§10).
+//!
+//! Ports the workspace file-watch slice from `~/src/intent/`: the `notify`
+//! recursive watch + per-path debounce of
+//! `workspace/main/change-detection/file-watcher.ts` (`fileWatcherDebounce`,
+//! `handleFileEvent`) and the canonical wire shape of
+//! `events/types.ts` `FileChangedEvent` — every mutation is a single
+//! `file:changed` event whose `data.action` is `create|modify|delete|rename`
+//! (`file:created/deleted/renamed` stay reserved-but-unused, per
+//! [`intent_core::events`]). Raw FS callbacks (sync, off-runtime) feed a tokio
+//! debounce task that coalesces rapid changes per path before publishing to the
+//! [`EventBus`].
+
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
+
+use intent_core::{now_iso, ActorType, EventActor, WorkspaceId};
+use intent_store::NewEvent;
+use notify::event::{EventKind, ModifyKind};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use serde_json::json;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+use super::bus::EventBus;
+
+/// Per-path debounce window. Matches the TS `fileWatcherDebounce` (300 ms): an
+/// event is published `DEBOUNCE` after the *last* raw change for that path.
+const DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Directory names ignored at any depth, mirroring the `IGNORE_PATTERNS` of
+/// `unified-workspace-watcher.ts` plus the `.workspace-notes` additions of
+/// `tracking.config.ts`. A path is dropped if any component matches.
+const IGNORED_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    ".nuxt",
+    ".cache",
+    ".parcel-cache",
+    ".vscode",
+    ".idea",
+    "coverage",
+    ".nyc_output",
+    ".pytest_cache",
+    "__pycache__",
+    "venv",
+    "vendor",
+    ".svn",
+    ".hg",
+    "CVS",
+    ".sass-cache",
+    "tmp",
+    "temp",
+    ".tmp",
+    ".temp",
+    ".augment",
+    ".workspace-notes",
+    ".workspace-notes.backup",
+    ".workspace",
+];
+
+/// The `data.action` discriminant of a `file:changed` event. Serializes to the
+/// lowercase TS values (`change.action.toLowerCase()`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Modify,
+    Rename,
+    Create,
+    Delete,
+}
+
+impl Action {
+    fn as_str(self) -> &'static str {
+        match self {
+            Action::Create => "create",
+            Action::Modify => "modify",
+            Action::Delete => "delete",
+            Action::Rename => "rename",
+        }
+    }
+
+    /// Coalescing precedence: when several raw events land on one path inside
+    /// the debounce window, the highest-rank action wins (a create+modify reads
+    /// as `create`; anything ending in removal reads as `delete`).
+    fn rank(self) -> u8 {
+        match self {
+            Action::Modify => 0,
+            Action::Rename => 1,
+            Action::Create => 2,
+            Action::Delete => 3,
+        }
+    }
+}
+
+/// Map a `notify` event kind to an [`Action`]; `None` for access/other kinds
+/// that carry no mutation (they are dropped, matching the TS adapter which only
+/// forwards add/change/unlink).
+fn action_for(kind: &EventKind) -> Option<Action> {
+    match kind {
+        EventKind::Create(_) => Some(Action::Create),
+        EventKind::Remove(_) => Some(Action::Delete),
+        EventKind::Modify(ModifyKind::Name(_)) => Some(Action::Rename),
+        EventKind::Modify(_) => Some(Action::Modify),
+        EventKind::Any => Some(Action::Modify),
+        EventKind::Access(_) | EventKind::Other => None,
+    }
+}
+
+/// True when `relative` lives under an ignored directory (component match).
+fn should_ignore(relative: &Path) -> bool {
+    relative.components().any(|c| match c {
+        Component::Normal(name) => name.to_str().is_some_and(|n| IGNORED_DIRS.contains(&n)),
+        _ => false,
+    })
+}
+
+/// Workspace-relative, forward-slash path for the event payload, or `None` when
+/// `abs` is outside `root` (defensive; `notify` only reports under `root`).
+fn relative_path(root: &Path, abs: &Path) -> Option<String> {
+    let rel = abs.strip_prefix(root).ok()?;
+    let joined = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    Some(joined)
+}
+
+/// A live recursive watch over one workspace path. Holds the `notify` watcher
+/// (the OS subscription ends when it drops) and the debounce task (aborted on
+/// drop), so dropping the [`FileWatcher`] tears the whole pipeline down — the
+/// clean-shutdown contract for `serve`.
+pub struct FileWatcher {
+    _watcher: RecommendedWatcher,
+    task: JoinHandle<()>,
+}
+
+impl Drop for FileWatcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl FileWatcher {
+    /// Start watching `root` recursively, publishing debounced `file:changed`
+    /// events for `workspace_id` to `bus`. The `notify` callback is synchronous
+    /// and runs off the tokio runtime, so it forwards raw events over an
+    /// unbounded channel to the async debounce loop.
+    pub fn start(bus: EventBus, workspace_id: WorkspaceId, root: PathBuf) -> notify::Result<Self> {
+        // Canonicalize so the relative-path strip works against the paths the OS
+        // reports (macOS FSEvents resolves `/var/...` → `/private/var/...`).
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<notify::Event>();
+        let mut watcher =
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if let Ok(event) = res {
+                    let _ = raw_tx.send(event);
+                }
+            })?;
+        watcher.watch(&root, RecursiveMode::Recursive)?;
+        let task = tokio::spawn(debounce_loop(bus, workspace_id, root, raw_rx));
+        Ok(Self {
+            _watcher: watcher,
+            task,
+        })
+    }
+}
+
+/// Coalesce raw FS events per path within [`DEBOUNCE`], then publish one
+/// `file:changed` per path. A path is flushed `DEBOUNCE` after its last raw
+/// event (timer reset on each new event, as in the TS `handleFileEvent`).
+async fn debounce_loop(
+    bus: EventBus,
+    workspace_id: WorkspaceId,
+    root: PathBuf,
+    mut raw_rx: mpsc::UnboundedReceiver<notify::Event>,
+) {
+    let mut pending: HashMap<String, (Action, tokio::time::Instant)> = HashMap::new();
+    loop {
+        let next_deadline = pending.values().map(|(_, at)| *at).min();
+        tokio::select! {
+            maybe = raw_rx.recv() => match maybe {
+                Some(event) => ingest(&root, &event, &mut pending),
+                // Watcher dropped: flush whatever is pending, then stop.
+                None => {
+                    flush_all(&bus, &workspace_id, &mut pending).await;
+                    return;
+                }
+            },
+            _ = sleep_until(next_deadline), if next_deadline.is_some() => {
+                flush_due(&bus, &workspace_id, &mut pending).await;
+            }
+        }
+    }
+}
+
+/// Fold one raw event into `pending`, resetting each affected path's deadline.
+fn ingest(
+    root: &Path,
+    event: &notify::Event,
+    pending: &mut HashMap<String, (Action, tokio::time::Instant)>,
+) {
+    let Some(action) = action_for(&event.kind) else {
+        return;
+    };
+    let deadline = tokio::time::Instant::now() + DEBOUNCE;
+    for abs in &event.paths {
+        let Some(rel) = relative_path(root, abs) else {
+            continue;
+        };
+        if rel.is_empty() || should_ignore(Path::new(&rel)) {
+            continue;
+        }
+        let merged = match pending.get(&rel) {
+            Some((existing, _)) if existing.rank() >= action.rank() => *existing,
+            _ => action,
+        };
+        pending.insert(rel, (merged, deadline));
+    }
+}
+
+async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Publish + remove every path whose debounce deadline has elapsed.
+async fn flush_due(
+    bus: &EventBus,
+    workspace_id: &WorkspaceId,
+    pending: &mut HashMap<String, (Action, tokio::time::Instant)>,
+) {
+    let now = tokio::time::Instant::now();
+    let due: Vec<String> = pending
+        .iter()
+        .filter(|(_, (_, at))| *at <= now)
+        .map(|(p, _)| p.clone())
+        .collect();
+    for path in due {
+        if let Some((action, _)) = pending.remove(&path) {
+            publish(bus, workspace_id, &path, action).await;
+        }
+    }
+}
+
+/// Drain every pending path unconditionally (shutdown flush).
+async fn flush_all(
+    bus: &EventBus,
+    workspace_id: &WorkspaceId,
+    pending: &mut HashMap<String, (Action, tokio::time::Instant)>,
+) {
+    for (path, (action, _)) in std::mem::take(pending) {
+        publish(bus, workspace_id, &path, action).await;
+    }
+}
+
+/// Emit one `file:changed` event matching the TS `FileChangedEvent` wire shape:
+/// `data.{path,relativePath,action}` (both paths workspace-relative) attributed
+/// to the system actor.
+async fn publish(bus: &EventBus, workspace_id: &WorkspaceId, relative: &str, action: Action) {
+    let event = NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: intent_core::events::FILE_CHANGED.to_string(),
+        actor: EventActor {
+            actor_type: ActorType::System,
+            id: Some("system".to_string()),
+            name: Some("System".to_string()),
+            ..Default::default()
+        },
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        data: json!({
+            "path": relative,
+            "relativePath": relative,
+            "action": action.as_str(),
+        }),
+    };
+    if let Err(e) = bus.publish(&event).await {
+        tracing::warn!(error = %e, path = relative, "failed to publish file:changed event");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+
+    #[test]
+    fn action_for_maps_notify_kinds() {
+        assert_eq!(
+            action_for(&EventKind::Create(CreateKind::File)),
+            Some(Action::Create)
+        );
+        assert_eq!(
+            action_for(&EventKind::Remove(RemoveKind::File)),
+            Some(Action::Delete)
+        );
+        assert_eq!(
+            action_for(&EventKind::Modify(ModifyKind::Name(RenameMode::Both))),
+            Some(Action::Rename)
+        );
+        assert_eq!(
+            action_for(&EventKind::Modify(ModifyKind::Data(
+                notify::event::DataChange::Content
+            ))),
+            Some(Action::Modify)
+        );
+        assert_eq!(action_for(&EventKind::Other), None);
+    }
+
+    #[test]
+    fn action_precedence_keeps_strongest() {
+        // Delete > Create > Rename > Modify.
+        assert!(Action::Delete.rank() > Action::Create.rank());
+        assert!(Action::Create.rank() > Action::Rename.rank());
+        assert!(Action::Rename.rank() > Action::Modify.rank());
+    }
+
+    #[test]
+    fn should_ignore_matches_noise_dirs() {
+        assert!(should_ignore(Path::new("node_modules/foo.js")));
+        assert!(should_ignore(Path::new("src/.git/index")));
+        assert!(should_ignore(Path::new("target/debug/x")));
+        assert!(should_ignore(Path::new(".workspace-notes/n.md")));
+        assert!(!should_ignore(Path::new("src/main.rs")));
+        assert!(!should_ignore(Path::new("README.md")));
+    }
+
+    #[test]
+    fn relative_path_strips_root_and_uses_forward_slashes() {
+        let root = Path::new("/ws/root");
+        assert_eq!(
+            relative_path(root, Path::new("/ws/root/src/main.rs")).as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(relative_path(root, Path::new("/other/x")), None);
+    }
+}
