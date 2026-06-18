@@ -26,10 +26,13 @@ use intent_store::Store;
 
 pub use intent_core::{Error, Result, WorkspaceApi};
 
+pub mod events;
 mod note_ops;
 
 #[cfg(test)]
 mod tests;
+
+pub use events::{EventBus, Subscription, SubscriptionFilter};
 
 /// Aggregate service handle wired by the binary composition root. It implements
 /// `WorkspaceApi` so it can be handed to `intent-acp` as `Arc<dyn WorkspaceApi>`
