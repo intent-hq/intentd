@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use intent_core::{Config, WorkspaceApi};
-use intent_services::Services;
+use intent_services::{EventBus, Services};
 use intent_store::Store;
 use intent_transport::serve_uds;
 use serde_json::{json, Value};
@@ -89,10 +89,13 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // The event bus shares the store with the services surface so subscribers
+    // see the same durable event log that future mutations will publish to.
+    let bus = EventBus::new(store.clone());
     let services: Arc<dyn WorkspaceApi> =
         Arc::new(Services::new(store).with_assets_root(config.data_dir.join("assets")));
     tracing::info!(socket = %config.socket_path.display(), "starting intentd");
-    serve_uds(services, &config.socket_path, shutdown_signal()).await?;
+    serve_uds(services, bus, &config.socket_path, shutdown_signal()).await?;
     Ok(())
 }
 

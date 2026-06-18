@@ -11,6 +11,7 @@ pub use intent_services::Services;
 pub use listener::serve_uds;
 pub use router::handle_message;
 
+mod events;
 pub mod listener;
 pub mod router;
 
