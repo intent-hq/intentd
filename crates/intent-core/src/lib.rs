@@ -27,7 +27,8 @@ pub use error::{Error, Result};
 pub use events::Event;
 pub use ids::{AgentId, NoteId, WorkspaceId};
 pub use model::{
-    ContentType, Note, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceAttention,
-    WorkspaceStatus,
+    AuthorType, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentThread,
+    CommentType, ContentType, Note, NoteVisibility, TaskMetadata, TaskStatus, Workspace,
+    WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
 };
 pub use traits::{BoxFuture, ContextEngine, WorkspaceApi};

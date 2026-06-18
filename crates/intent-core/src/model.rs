@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{NoteId, WorkspaceId};
+use crate::ids::{AgentId, NoteId, WorkspaceId};
 
 /// Workspace lifecycle (§9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -107,8 +107,150 @@ pub struct Note {
     pub is_default: bool,
     pub parent_id: Option<NoteId>,
     pub visibility: NoteVisibility,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub task: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskMetadata>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Task workflow status (§9.1). Serializes to the `snake_case` strings the TS
+/// app uses (`not_started`, `in_progress`, …); these are also the stored forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    #[default]
+    NotStarted,
+    Waiting,
+    DiscussionNeeded,
+    InProgress,
+    ReviewRequired,
+    Complete,
+    Cancelled,
+}
+
+/// Task-note metadata (§9.1). Present iff a [`Note`] is a task; serialized into
+/// the note's `task_json` column. Field names/optionality match the TS
+/// `TaskMetadata` so the wire object is identical.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskMetadata {
+    pub status: TaskStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assigned_agent_ids: Vec<AgentId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_order: Option<i64>,
+}
+
+/// Comment discriminant (§9.1). Serializes to the TS wire form (e.g.
+/// `change-request`) and is stored verbatim in the `comment.kind` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommentType {
+    #[default]
+    Comment,
+    Suggestion,
+    ChangeRequest,
+    Question,
+    Session,
+}
+
+/// Comment lifecycle status (§9.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommentStatus {
+    #[default]
+    Open,
+    Resolved,
+    Accepted,
+    Rejected,
+    Pending,
+}
+
+/// Comment author kind (§9.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthorType {
+    #[default]
+    User,
+    Agent,
+}
+
+/// Anchor positioning kind for [`CommentAnchor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommentAnchorType {
+    #[default]
+    Range,
+    Point,
+}
+
+/// Where a comment attaches in a note (§9.1). Matches the TS `CommentAnchor`
+/// shape (`type` + optional `startId`/`endId`/`pointId`); stored as
+/// `comment.anchor_json`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentAnchor {
+    #[serde(rename = "type")]
+    pub kind: CommentAnchorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_id: Option<String>,
+}
+
+/// Comment entity (§9.1; the TS `CommentV2` union flattened). The Rust field
+/// `kind` serializes as `type` to match the TS wire (Rust reserves `type`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Comment {
+    pub id: String,
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_id: Option<NoteId>,
+    #[serde(rename = "type")]
+    pub kind: CommentType,
+    pub content: String,
+    pub author: String,
+    pub author_type: AuthorType,
+    pub status: CommentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    pub anchor: CommentAnchor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion_original: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion_proposed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A comment thread: the comments sharing one `thread_id`, ordered by creation
+/// time. Mirrors the TS `comment.getThread` result (`{ threadId, comments }`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentThread {
+    pub thread_id: String,
+    pub comments: Vec<Comment>,
 }
