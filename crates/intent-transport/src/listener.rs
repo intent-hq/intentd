@@ -5,19 +5,30 @@
 //! JSON-RPC frames. One task is spawned per connection and many requests may be
 //! handled on a single connection. Runs until the `shutdown` future resolves,
 //! then removes the socket file.
+//!
+//! UDS is Unix-only. The listener is gated behind `#[cfg(unix)]`; on other
+//! platforms (e.g. Windows) the crate still builds and `serve_uds` returns an
+//! `Unsupported` error at runtime. A Windows transport (TCP/TLS) is deferred to
+//! M5 and intentionally not provided here.
 
 use std::future::Future;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
 use intent_core::WorkspaceApi;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
+#[cfg(unix)]
 use crate::router::handle_message;
 
 /// Serve JSON-RPC over a UDS until `shutdown` resolves.
+#[cfg(unix)]
 pub async fn serve_uds<F>(
     api: Arc<dyn WorkspaceApi>,
     socket_path: &Path,
@@ -64,6 +75,7 @@ where
 }
 
 /// Read newline-delimited requests from one connection and write responses.
+#[cfg(unix)]
 async fn handle_connection(stream: UnixStream, api: Arc<dyn WorkspaceApi>) -> std::io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -85,4 +97,21 @@ async fn handle_connection(stream: UnixStream, api: Arc<dyn WorkspaceApi>) -> st
         }
     }
     Ok(())
+}
+
+/// Non-Unix fallback: UDS is unavailable, so report a clear runtime error
+/// instead of failing to compile. A real Windows transport (TCP/TLS) is M5.
+#[cfg(not(unix))]
+pub async fn serve_uds<F>(
+    _api: Arc<dyn WorkspaceApi>,
+    _socket_path: &Path,
+    _shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()>,
+{
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "UDS transport is not supported on this platform",
+    ))
 }
