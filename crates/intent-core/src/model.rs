@@ -744,11 +744,190 @@ pub struct CommentDeleteResult {
     pub message: String,
 }
 
+/// Event actor kind (§9.1, `events/types.ts` `ActorType`). Serializes to its
+/// lowercase string form, matching the TS wire values used by the iOS client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActorType {
+    #[default]
+    User,
+    Agent,
+    System,
+    External,
+    Tool,
+}
+
+/// Who originated an event (§9.1; `events/types.ts` `EventActor`). The `type`
+/// field is required; the rest are optional and omitted from the wire when
+/// absent, matching the TS shape. Stored as the `event.actor` JSON column.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventActor {
+    #[serde(rename = "type")]
+    pub actor_type: ActorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Append-only workspace event (§9.1 / §10; `events/types.ts`
+/// `WorkspaceEventBase`). `event_type` serializes as `type` and the
+/// type-specific payload lives in `data`, matching the TS/iOS wire shape.
+/// Persisted to the insert-only `event` table; never updated or deleted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Event {
+    pub id: String,
+    pub workspace_id: WorkspaceId,
+    pub timestamp: String,
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub actor: EventActor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_event_id: Option<String>,
+    #[serde(default)]
+    pub data: serde_json::Value,
+}
+
+/// One file-change activity row (§5.10; `agent-event-tools.ts` `FileActivity`).
+/// Returned by `event.recentFiles` / `event.directoryChanges` and embedded in
+/// `event.workspaceSummary`. `actor` is `"type:name"` for the workspace-wide
+/// helpers and the bare actor name for the per-agent variant; absent optionals
+/// are omitted from the wire to match the TS `JSON.stringify` shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileActivity {
+    pub path: String,
+    pub relative_path: String,
+    pub action: String,
+    pub timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additions: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<serde_json::Value>,
+}
+
+/// Aggregated per-agent activity (§5.10; `agent-event-tools.ts` `AgentActivity`).
+/// Returned by `event.agentActivity` (no `agentId`) and embedded in
+/// `event.workspaceSummary.activeAgents`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentActivity {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    pub event_count: i64,
+    pub tool_calls: i64,
+    pub files_modified: Vec<String>,
+    pub last_active: String,
+}
+
+/// One entry of `event.workspaceSummary.topChangedFiles` (§5.10).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopChangedFile {
+    pub path: String,
+    pub change_count: i64,
+}
+
+/// `event.workspaceSummary` result (§5.10; `WorkspaceActivity` in
+/// `agent-event-tools.ts`, renamed here to avoid colliding with the
+/// lifecycle [`WorkspaceActivity`] enum).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceEventSummary {
+    pub recent_files: Vec<FileActivity>,
+    pub active_agents: Vec<AgentActivity>,
+    pub event_rate: f64,
+    pub top_changed_files: Vec<TopChangedFile>,
+}
+
+/// `event.subscribe` (deprecated alias) service result (§5.10 / §6). Mirrors the
+/// `ws.event.subscribe` peer return `{ subscriptionId, eventTypes }`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventSubscribeResult {
+    pub subscription_id: String,
+    pub event_types: Vec<String>,
+}
+
+/// `event.unsubscribe` (deprecated alias) service result (§5.10 / §6). Mirrors
+/// the `ws.event.unsubscribe` peer return `{ ok: true, subscriptionId }`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventUnsubscribeResult {
+    pub ok: bool,
+    pub subscription_id: String,
+}
+
+/// Filter inputs for `event.query` (§5.10). Built by the transport router from
+/// request params and consumed by the service layer; not serialized on the wire.
+#[derive(Debug, Clone, Default)]
+pub struct EventQueryParams {
+    pub event_type: Option<String>,
+    pub actor_type: Option<String>,
+    pub actor_id: Option<String>,
+    pub path: Option<String>,
+    pub minutes_ago: Option<i64>,
+    pub limit: Option<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use serde_json::json;
+
+    #[test]
+    fn event_wire_shape_matches_ts() {
+        // Mirrors `WorkspaceEventBase` + `EventActor` in events/types.ts: the
+        // discriminant is `type`, ids/timestamps are camelCase, and absent
+        // optionals are omitted.
+        let event = Event {
+            id: "01900000-0000-7000-8000-000000000000".to_string(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "file:changed".to_string(),
+            actor: EventActor {
+                actor_type: ActorType::Agent,
+                id: Some("agent-7".to_string()),
+                model: Some("opus".to_string()),
+                ..Default::default()
+            },
+            session_id: Some("sess-1".to_string()),
+            correlation_id: None,
+            parent_event_id: None,
+            data: json!({ "path": "src/a.rs", "action": "modify" }),
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({
+                "id": "01900000-0000-7000-8000-000000000000",
+                "workspaceId": "ws-1",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "file:changed",
+                "actor": { "type": "agent", "id": "agent-7", "model": "opus" },
+                "sessionId": "sess-1",
+                "data": { "path": "src/a.rs", "action": "modify" }
+            })
+        );
+        // Round-trips back to an equal value.
+        let back: Event = serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
+        assert_eq!(back, event);
+    }
 
     #[test]
     fn content_type_wire_forms_match_ts() {

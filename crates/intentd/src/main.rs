@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use intent_core::{Config, WorkspaceApi};
-use intent_services::Services;
+use intent_services::{EventBus, FileWatcher, Services};
 use intent_store::Store;
 use intent_transport::serve_uds;
 use serde_json::{json, Value};
@@ -89,11 +89,58 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_assets_root(config.data_dir.join("assets")));
+    // The event bus shares the store with the services surface so subscribers
+    // see the same durable event log that future mutations will publish to.
+    let bus = EventBus::new(store.clone());
+    // The services surface publishes CRUD change events onto the same bus that
+    // transport subscriptions read, so a mutation on one connection streams to
+    // subscribers on another (§10).
+    let services: Arc<dyn WorkspaceApi> = Arc::new(
+        Services::new(store)
+            .with_assets_root(config.data_dir.join("assets"))
+            .with_event_bus(bus.clone()),
+    );
+    // Start a filesystem watcher per active workspace with a resolvable on-disk
+    // path; each publishes debounced `file:changed` events to the shared bus.
+    // The handles are held for the lifetime of `serve` and torn down on return.
+    let _watchers = start_workspace_watchers(&bus, services.as_ref()).await;
     tracing::info!(socket = %config.socket_path.display(), "starting intentd");
-    serve_uds(services, &config.socket_path, shutdown_signal()).await?;
+    serve_uds(services, bus, &config.socket_path, shutdown_signal()).await?;
     Ok(())
+}
+
+/// Start a [`FileWatcher`] for every non-archived workspace that exposes an
+/// existing on-disk path (`path`, falling back to `worktree_path`). Returns the
+/// live handles; dropping them stops the watchers (clean shutdown).
+async fn start_workspace_watchers(bus: &EventBus, services: &dyn WorkspaceApi) -> Vec<FileWatcher> {
+    let workspaces = match services.list_workspaces(false).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not list workspaces for file watching");
+            return Vec::new();
+        }
+    };
+    let mut watchers = Vec::new();
+    for ws in workspaces {
+        let Some(root) = ws.path.clone().or_else(|| ws.worktree_path.clone()) else {
+            continue;
+        };
+        let path = std::path::PathBuf::from(&root);
+        if !path.is_dir() {
+            continue;
+        }
+        match FileWatcher::start(bus.clone(), ws.id.clone(), path) {
+            Ok(w) => {
+                tracing::info!(workspace = %ws.id, path = %root, "watching workspace files");
+                watchers.push(w);
+            }
+            Err(e) => {
+                tracing::warn!(workspace = %ws.id, path = %root, error = %e, "file watcher start failed")
+            }
+        }
+    }
+    tracing::info!(count = watchers.len(), "file watchers started");
+    watchers
 }
 
 async fn cmd_call(method: &str, params: Option<&str>) -> anyhow::Result<()> {

@@ -13,8 +13,11 @@ use sqlx::{Row, SqlitePool};
 pub use intent_core::{Error, Result};
 
 mod comment_repo;
+mod event_repo;
 mod note_repo;
 mod workspace_repo;
+
+pub use event_repo::{EventQuery, NewEvent};
 
 #[cfg(test)]
 mod tests;

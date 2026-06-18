@@ -19,6 +19,9 @@ intent-search = { path = "../intent-search" }
 base64 = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+tokio = { workspace = true }
+notify = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

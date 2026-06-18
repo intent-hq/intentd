@@ -4,12 +4,14 @@
 use std::path::PathBuf;
 
 use intent_core::{
-    now_iso, AgentId, AuthorType, Comment, CommentAnchor, CommentAnchorType, CommentStatus,
-    CommentType, ContentType, Note, NoteId, NoteVisibility, TaskMetadata, TaskStatus, Workspace,
-    WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    events, now_iso, ActorType, AgentId, AuthorType, Comment, CommentAnchor, CommentAnchorType,
+    CommentStatus, CommentType, ContentType, EventActor, Note, NoteId, NoteVisibility,
+    TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
+    WorkspaceStatus,
 };
+use serde_json::json;
 
-use crate::Store;
+use crate::{EventQuery, NewEvent, Store};
 
 /// A unique temp DB path that cleans up its `.db`/`-wal`/`-shm` files on drop.
 struct TempDb {
@@ -74,8 +76,8 @@ async fn migration_status_reports_current_after_open() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let status = store.migration_status().await.expect("migration status");
     assert!(status.is_current(), "fresh open must apply all migrations");
-    assert_eq!(status.expected, vec![1, 2]);
-    assert_eq!(status.applied, vec![1, 2]);
+    assert_eq!(status.expected, vec![1, 2, 3]);
+    assert_eq!(status.applied, vec![1, 2, 3]);
 }
 
 #[tokio::test]
@@ -356,4 +358,167 @@ async fn comment_round_trip_update_delete_and_thread() {
             .len(),
         1
     );
+}
+
+fn file_event(ws: &WorkspaceId, ts: &str, path: &str, actor: EventActor) -> NewEvent {
+    NewEvent {
+        workspace_id: ws.clone(),
+        timestamp: ts.to_string(),
+        event_type: events::FILE_CHANGED.to_string(),
+        actor,
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        data: json!({ "path": path, "action": "modify" }),
+    }
+}
+
+#[tokio::test]
+async fn event_round_trip_and_queries() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let other = WorkspaceId::new();
+
+    let user = EventActor {
+        actor_type: ActorType::User,
+        id: Some("u1".to_string()),
+        name: Some("Alice".to_string()),
+        email: Some("alice@example.com".to_string()),
+        ..Default::default()
+    };
+    let agent = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-7".to_string()),
+        model: Some("opus".to_string()),
+        ..Default::default()
+    };
+
+    // Insert returns a UUIDv7 id and round-trips actor + data.
+    let inserted = store
+        .insert_event(&file_event(
+            &ws,
+            "2026-01-01T00:00:01Z",
+            "src/a.rs",
+            user.clone(),
+        ))
+        .await
+        .expect("insert e1");
+    assert_eq!(inserted.id.len(), 36, "UUIDv7 string id");
+    assert_eq!(inserted.actor, user);
+    assert_eq!(
+        inserted.data,
+        json!({ "path": "src/a.rs", "action": "modify" })
+    );
+
+    store
+        .insert_event(&file_event(
+            &ws,
+            "2026-01-01T00:00:02Z",
+            "docs/readme.md",
+            agent.clone(),
+        ))
+        .await
+        .expect("insert e2");
+    store
+        .insert_event(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: "2026-01-01T00:00:03Z".to_string(),
+            event_type: events::AGENT_TOOL_CALL.to_string(),
+            actor: agent.clone(),
+            session_id: Some("sess-1".to_string()),
+            correlation_id: None,
+            parent_event_id: None,
+            data: json!({ "tool": "edit" }),
+        })
+        .await
+        .expect("insert e3");
+    // A different workspace must never leak into ws queries.
+    store
+        .insert_event(&file_event(
+            &other,
+            "2026-01-01T00:00:09Z",
+            "src/z.rs",
+            user,
+        ))
+        .await
+        .expect("insert other");
+
+    // recent_files: newest first, scoped to workspace, only file:changed.
+    let recent = store.recent_files(&ws, 10).await.expect("recent");
+    assert_eq!(recent.len(), 2);
+    assert_eq!(recent[0].timestamp, "2026-01-01T00:00:02Z");
+    assert_eq!(recent[1].timestamp, "2026-01-01T00:00:01Z");
+
+    // events_by_workspace: all three ws events, newest first; no leak.
+    let all = store.events_by_workspace(&ws, 10).await.expect("by ws");
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].timestamp, "2026-01-01T00:00:03Z");
+
+    // events_by_type filters on the taxonomy string.
+    let edits = store
+        .events_by_type(&ws, events::FILE_CHANGED, 10)
+        .await
+        .expect("by type");
+    assert_eq!(edits.len(), 2);
+    let calls = store
+        .events_by_type(&ws, events::AGENT_TOOL_CALL, 10)
+        .await
+        .expect("by type tool-call");
+    assert_eq!(calls.len(), 1);
+
+    // directory_changes: prefix filter on data.path.
+    let in_src = store
+        .directory_changes(&ws, "src/", 10)
+        .await
+        .expect("dir changes");
+    assert_eq!(in_src.len(), 1);
+    assert_eq!(in_src[0].data["path"], json!("src/a.rs"));
+
+    // generic query: by actor type + session_id + time window.
+    let by_agent = store
+        .query_events(&EventQuery {
+            workspace_id: Some(ws.clone()),
+            actor_type: Some(ActorType::Agent),
+            ..Default::default()
+        })
+        .await
+        .expect("by actor");
+    assert_eq!(by_agent.len(), 2);
+
+    let by_session = store
+        .query_events(&EventQuery {
+            workspace_id: Some(ws.clone()),
+            session_id: Some("sess-1".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("by session");
+    assert_eq!(by_session.len(), 1);
+    assert_eq!(by_session[0].data, json!({ "tool": "edit" }));
+
+    let windowed = store
+        .query_events(&EventQuery {
+            workspace_id: Some(ws.clone()),
+            since: Some("2026-01-01T00:00:02Z".to_string()),
+            until: Some("2026-01-01T00:00:02Z".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("windowed");
+    assert_eq!(windowed.len(), 1);
+    assert_eq!(windowed[0].timestamp, "2026-01-01T00:00:02Z");
+
+    // limit + offset paginate the newest-first stream.
+    let page = store
+        .query_events(&EventQuery {
+            workspace_id: Some(ws.clone()),
+            limit: Some(1),
+            offset: Some(1),
+            ..Default::default()
+        })
+        .await
+        .expect("page");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].timestamp, "2026-01-01T00:00:02Z");
 }

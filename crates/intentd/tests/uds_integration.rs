@@ -9,7 +9,7 @@ use intent_core::{
     now_iso, Config, ContentType, Note, NoteId, NoteVisibility, Workspace, WorkspaceActivity,
     WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
-use intent_services::Services;
+use intent_services::{EventBus, Services};
 use intent_store::Store;
 use intent_transport::serve_uds;
 use serde_json::{json, Value};
@@ -104,11 +104,12 @@ async fn uds_slice_end_to_end() {
     }
 
     let store = Store::open(&config.db_path).await.expect("reopen store");
+    let bus = EventBus::new(store.clone());
     let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
-        serve_uds(services, &socket, async move {
+        serve_uds(services, bus, &socket, async move {
             let _ = rx.await;
         })
         .await

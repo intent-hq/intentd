@@ -7,8 +7,8 @@
 //! transport (UDS today, WS/TLS later) shares one code path.
 
 use intent_core::{
-    Error, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput,
-    WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
+    Error, EventQueryParams, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId,
+    NoteUpdateInput, WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
 };
 use serde_json::{json, Map, Value};
 
@@ -504,6 +504,80 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        "event.recentFiles" => {
+            let ws = require_ws_note(params)?;
+            let result = api
+                .event_recent_files(ws, opt_int(params, "limit"))
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "event.agentActivity" => {
+            let ws = require_ws_note(params)?;
+            let agent_id = opt_str(params, "agentId");
+            let minutes_ago = opt_int(params, "minutesAgo");
+            let result = api
+                .event_agent_activity(ws, agent_id, minutes_ago)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "event.workspaceSummary" => {
+            let ws = require_ws_note(params)?;
+            let result = api
+                .event_workspace_summary(ws, opt_int(params, "minutesAgo"))
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "event.directoryChanges" => {
+            let ws = require_ws_note(params)?;
+            let dir = require_str_param(params, "dir")?;
+            let result = api
+                .event_directory_changes(ws, dir, opt_int(params, "limit"))
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "event.query" => {
+            let ws = require_ws_note(params)?;
+            let query = EventQueryParams {
+                event_type: opt_str(params, "eventType"),
+                actor_type: opt_str(params, "actorType"),
+                actor_id: opt_str(params, "actorId"),
+                path: opt_str(params, "path"),
+                minutes_ago: opt_int(params, "minutesAgo"),
+                limit: opt_int(params, "limit"),
+            };
+            let result = api.event_query(ws, query).await.map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "event.subscribe" => {
+            let ws = require_ws_note(params)?;
+            require_present(params, "eventTypes")?;
+            let event_types = match params.get("eventTypes") {
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+                _ => return Err(rpc(INVALID_PARAMS, "eventTypes must be an array")),
+            };
+            let result = api
+                .event_subscribe(ws, event_types)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "event.unsubscribe" => {
+            let ws = require_ws_note(params)?;
+            let subscription_id = require_str_param(params, "subscriptionId")?;
+            let result = api
+                .event_unsubscribe(ws, subscription_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }
@@ -547,6 +621,16 @@ fn require_present(params: &Map<String, Value>, name: &str) -> Result<(), RpcErr
 /// Optional string param (absent/null/non-string → `None`).
 fn opt_str(params: &Map<String, Value>, name: &str) -> Option<String> {
     params.get(name).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Optional integer param from a JSON number (absent/non-number → `None`).
+/// Used by the `event.*` `limit` / `minutesAgo` knobs, whose defaults are
+/// applied in the service layer (`value || default`).
+fn opt_int(params: &Map<String, Value>, name: &str) -> Option<i64> {
+    match params.get(name) {
+        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        _ => None,
+    }
 }
 
 /// Normalize a `tags` param (array or comma string) into trimmed, non-empty
