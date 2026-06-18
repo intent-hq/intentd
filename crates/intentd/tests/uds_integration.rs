@@ -161,6 +161,84 @@ async fn uds_slice_end_to_end() {
     .await;
     assert_eq!(resp["error"]["code"], json!(-32601));
 
+    // (e) workspace.* CRUD lifecycle: create → get → update → archive →
+    //     unarchive → dismissAttention → delete (PROTOCOL §5.1).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":5,"method":"workspace.create","params":{"title":"Lifecycle WS"}}"#,
+    )
+    .await;
+    let new_id = resp["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+    assert_eq!(resp["result"]["workspace"]["title"], json!("Lifecycle WS"));
+
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"workspace.get","params":{{"workspaceId":"{new_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["workspace"]["id"], json!(new_id));
+
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"workspace.update","params":{{"workspaceId":"{new_id}","title":"Renamed"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["workspace"]["title"], json!("Renamed"));
+
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"workspace.archive","params":{{"workspaceId":"{new_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"workspace.unarchive","params":{{"workspaceId":"{new_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"workspace.dismissAttention","params":{{"workspaceId":"{new_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["workspace"]["attention"], json!("none"));
+
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":11,"method":"workspace.delete","params":{{"workspaceId":"{new_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+
+    // (f) get after delete → -32602 "Workspace not found".
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":12,"method":"workspace.get","params":{{"workspaceId":"{new_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(resp["error"]["message"], json!("Workspace not found"));
+
     let _ = tx.send(());
     let _ = server.await;
     let _ = std::fs::remove_dir_all(&dir);

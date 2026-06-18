@@ -103,6 +103,57 @@ async fn workspace_round_trip_and_archive_filter() {
 }
 
 #[tokio::test]
+async fn workspace_get_update_delete() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&id, "Original", false))
+        .await
+        .expect("insert");
+
+    // get
+    let got = store.get_workspace(&id).await.expect("get");
+    assert_eq!(got.title, "Original");
+
+    // missing get → NotFound
+    let missing = store.get_workspace(&WorkspaceId::from("nope")).await;
+    assert!(matches!(missing, Err(intent_core::Error::NotFound(_))));
+
+    // update (full row replace)
+    let mut updated = got.clone();
+    updated.title = "Renamed".to_string();
+    updated.attention = WorkspaceAttention::None;
+    updated.tags = vec!["x".to_string()];
+    store.update_workspace(&updated).await.expect("update");
+    let reread = store.get_workspace(&id).await.expect("reget");
+    assert_eq!(reread.title, "Renamed");
+    assert_eq!(reread.attention, WorkspaceAttention::None);
+    assert_eq!(reread.tags, vec!["x".to_string()]);
+
+    // update missing → NotFound
+    let mut ghost = updated.clone();
+    ghost.id = WorkspaceId::from("nope");
+    assert!(matches!(
+        store.update_workspace(&ghost).await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+
+    // delete
+    store.delete_workspace(&id).await.expect("delete");
+    assert!(matches!(
+        store.get_workspace(&id).await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+    // delete missing → NotFound
+    assert!(matches!(
+        store.delete_workspace(&id).await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+}
+
+#[tokio::test]
 async fn note_round_trip() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");

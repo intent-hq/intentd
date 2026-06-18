@@ -6,7 +6,7 @@
 //! `-32700/-32600/-32601/-32602/-32603` error matrix all live here so every
 //! transport (UDS today, WS/TLS later) shares one code path.
 
-use intent_core::{Error, WorkspaceApi, WorkspaceId};
+use intent_core::{Error, WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate};
 use serde_json::{json, Map, Value};
 
 const PARSE_ERROR: i32 = -32700;
@@ -146,6 +146,54 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(json!({ "workspaces": workspaces }))
         }
+        "workspace.get" => {
+            let id = require_workspace_id(params)?;
+            let ws = api.get_workspace(id).await.map_err(workspace_err)?;
+            Ok(json!({ "workspace": ws }))
+        }
+        "workspace.create" => {
+            let input: WorkspaceCreate = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| rpc(INVALID_PARAMS, format!("invalid params: {e}")))?;
+            let ws = api.create_workspace(input).await.map_err(workspace_err)?;
+            Ok(json!({ "workspace": ws }))
+        }
+        "workspace.update" => {
+            let id = require_workspace_id(params)?;
+            let mut rest = params.clone();
+            rest.remove("workspaceId");
+            let update: WorkspaceUpdate = serde_json::from_value(Value::Object(rest))
+                .map_err(|e| rpc(INVALID_PARAMS, format!("invalid params: {e}")))?;
+            let ws = api
+                .update_workspace(id, update)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "workspace": ws }))
+        }
+        "workspace.delete" => {
+            let id = require_workspace_id(params)?;
+            api.delete_workspace(id).await.map_err(workspace_err)?;
+            Ok(json!({ "success": true }))
+        }
+        "workspace.archive" => {
+            let id = require_workspace_id(params)?;
+            api.archive_workspace(id).await.map_err(workspace_err)?;
+            Ok(json!({ "success": true }))
+        }
+        "workspace.unarchive" => {
+            let id = require_workspace_id(params)?;
+            api.unarchive_workspace(id).await.map_err(workspace_err)?;
+            Ok(json!({ "success": true }))
+        }
+        "workspace.dismissAttention" => {
+            let id = require_workspace_id(params)?;
+            let ws = api.dismiss_attention(id).await.map_err(workspace_err)?;
+            Ok(json!({ "workspace": ws }))
+        }
+        "workspace.markSeen" => {
+            let id = require_workspace_id(params)?;
+            let ws = api.mark_seen(id).await.map_err(workspace_err)?;
+            Ok(json!({ "workspace": ws }))
+        }
         "note.list" => {
             let ws_id = match params.get("workspaceId").and_then(Value::as_str) {
                 Some(s) if !s.is_empty() => WorkspaceId::from(s),
@@ -155,6 +203,27 @@ async fn dispatch(
             Ok(json!({ "notes": notes }))
         }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+/// Extract a required `workspaceId` string param, or `-32602` with the exact
+/// message the TS handler emits via `requireParam` (PROTOCOL §5.1).
+fn require_workspace_id(params: &Map<String, Value>) -> Result<WorkspaceId, RpcErr> {
+    match params.get("workspaceId").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => Ok(WorkspaceId::from(s)),
+        _ => Err(rpc(
+            INVALID_PARAMS,
+            "Missing required parameter: workspaceId",
+        )),
+    }
+}
+
+/// Map a domain [`Error`] for `workspace.*` methods: a missing workspace surfaces
+/// as `-32602 "Workspace not found"`, matching the TS handler (PROTOCOL §5.1).
+fn workspace_err(e: Error) -> RpcErr {
+    match e {
+        Error::NotFound(_) => rpc(INVALID_PARAMS, "Workspace not found"),
+        other => domain_to_rpc(other),
     }
 }
 

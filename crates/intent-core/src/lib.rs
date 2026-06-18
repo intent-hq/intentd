@@ -29,6 +29,6 @@ pub use ids::{AgentId, NoteId, WorkspaceId};
 pub use model::{
     AuthorType, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentThread,
     CommentType, ContentType, Note, NoteVisibility, TaskMetadata, TaskStatus, Workspace,
-    WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
+    WorkspaceActivity, WorkspaceAttention, WorkspaceCreate, WorkspaceStatus, WorkspaceUpdate,
 };
 pub use traits::{BoxFuture, ContextEngine, WorkspaceApi};

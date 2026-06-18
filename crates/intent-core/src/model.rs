@@ -94,6 +94,59 @@ pub struct Workspace {
     pub archived_at: Option<String>,
 }
 
+/// Wire input for `workspace.create` (PROTOCOL §5.1). All fields are optional;
+/// the service fills ids/timestamps/defaults. Unknown fields (e.g.
+/// `initialAgent`) are ignored — initial-agent activation is fire-and-forget and
+/// not part of this persistence slice.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WorkspaceCreate {
+    pub title: Option<String>,
+    pub status_message: Option<String>,
+    pub branch: Option<String>,
+    pub base_ref: Option<String>,
+    pub base_commit_sha: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub path: Option<String>,
+    pub repository_owner: Option<String>,
+    pub repository_name: Option<String>,
+    pub worktree_path: Option<String>,
+    pub scope: Option<String>,
+    pub skip_worktree: Option<bool>,
+    pub setup_script: Option<String>,
+    pub is_remote: Option<bool>,
+    pub default_model: Option<String>,
+}
+
+/// Wire input for `workspace.update` (PROTOCOL §5.1). Every field is optional;
+/// an absent field leaves the stored value unchanged (`workspaceId` is supplied
+/// separately by the router).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WorkspaceUpdate {
+    pub title: Option<String>,
+    pub status_message: Option<String>,
+    pub branch: Option<String>,
+    pub base_ref: Option<String>,
+    pub base_commit_sha: Option<String>,
+    pub status: Option<WorkspaceStatus>,
+    pub tags: Option<Vec<String>>,
+    pub path: Option<String>,
+    pub repository_owner: Option<String>,
+    pub repository_name: Option<String>,
+    pub worktree_path: Option<String>,
+    pub scope: Option<String>,
+    pub skip_worktree: Option<bool>,
+    pub setup_script: Option<String>,
+    pub is_remote: Option<bool>,
+    pub default_model: Option<String>,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
+    pub last_activity: Option<String>,
+    pub attention: Option<WorkspaceAttention>,
+    pub archived: Option<bool>,
+}
+
 /// Note entity (§9.1). `task` carries serialized task metadata when the note is
 /// a task; this slice treats it opaquely (stored as `task_json` TEXT).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

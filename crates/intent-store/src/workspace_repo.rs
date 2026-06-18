@@ -50,6 +50,75 @@ impl Store {
         Ok(())
     }
 
+    /// Fetch a single workspace by id, or `NotFound`.
+    pub async fn get_workspace(&self, id: &WorkspaceId) -> Result<Workspace> {
+        let sql = format!("SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id = ?");
+        let row = sqlx::query(&sql)
+            .bind(&id.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get workspace failed: {e}")))?;
+        match row {
+            Some(r) => map_workspace_row(&r),
+            None => Err(Error::NotFound(format!("workspace {id}"))),
+        }
+    }
+
+    /// Update an existing workspace (full row replace, except `id`), or
+    /// `NotFound`. `activity` is derived and never persisted (§9.9).
+    pub async fn update_workspace(&self, ws: &Workspace) -> Result<()> {
+        let res = sqlx::query(
+            "UPDATE workspace SET title=?, branch=?, base_ref=?, base_commit_sha=?, status=?, \
+             status_message=?, attention=?, repository_owner=?, repository_name=?, \
+             worktree_path=?, scope=?, skip_worktree=?, is_remote=?, default_model=?, \
+             pr_number=?, pr_url=?, archived=?, archived_at=?, tags=?, created_at=?, \
+             updated_at=?, last_activity=? WHERE id=?",
+        )
+        .bind(&ws.title)
+        .bind(&ws.branch)
+        .bind(&ws.base_ref)
+        .bind(&ws.base_commit_sha)
+        .bind(enum_to_db(&ws.status)?)
+        .bind(&ws.status_message)
+        .bind(enum_to_db(&ws.attention)?)
+        .bind(&ws.repository_owner)
+        .bind(&ws.repository_name)
+        .bind(&ws.worktree_path)
+        .bind(&ws.scope)
+        .bind(ws.skip_worktree as i64)
+        .bind(ws.is_remote as i64)
+        .bind(&ws.default_model)
+        .bind(ws.pr_number.map(|n| n as i64))
+        .bind(&ws.pr_url)
+        .bind(ws.archived as i64)
+        .bind(&ws.archived_at)
+        .bind(tags_to_db(&ws.tags)?)
+        .bind(&ws.created_at)
+        .bind(&ws.updated_at)
+        .bind(&ws.last_activity)
+        .bind(&ws.id.0)
+        .execute(self.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("update workspace failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {}", ws.id)));
+        }
+        Ok(())
+    }
+
+    /// Delete a workspace by id, or `NotFound`.
+    pub async fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
+        let res = sqlx::query("DELETE FROM workspace WHERE id = ?")
+            .bind(&id.0)
+            .execute(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("delete workspace failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(())
+    }
+
     /// List workspaces, filtering archived rows unless `include_archived`.
     pub async fn list_workspaces(&self, include_archived: bool) -> Result<Vec<Workspace>> {
         let sql = if include_archived {
