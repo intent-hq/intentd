@@ -36,12 +36,15 @@ pub enum WorkspaceAttention {
     ReviewRequired,
 }
 
-/// Note body content type (§9.1).
+/// Note body content type (§9.1). `PlainText` serializes as `plain_text` to
+/// match the TS `ContentType` enum (`src/shared/types.ts`); the others are their
+/// lowercase names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ContentType {
     #[default]
     Markdown,
+    #[serde(rename = "plain_text")]
     PlainText,
     Json,
     Code,
@@ -253,4 +256,23 @@ pub struct Comment {
 pub struct CommentThread {
     pub thread_id: String,
     pub comments: Vec<Comment>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_type_wire_forms_match_ts() {
+        // Mirrors `ContentType` in src/shared/types.ts: plain_text (not plaintext).
+        for (variant, wire) in [
+            (ContentType::Markdown, "\"markdown\""),
+            (ContentType::PlainText, "\"plain_text\""),
+            (ContentType::Json, "\"json\""),
+            (ContentType::Code, "\"code\""),
+        ] {
+            assert_eq!(serde_json::to_string(&variant).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<ContentType>(wire).unwrap(), variant);
+        }
+    }
 }
