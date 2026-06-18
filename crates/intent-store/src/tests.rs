@@ -69,6 +69,16 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
 }
 
 #[tokio::test]
+async fn migration_status_reports_current_after_open() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let status = store.migration_status().await.expect("migration status");
+    assert!(status.is_current(), "fresh open must apply all migrations");
+    assert_eq!(status.expected, vec![1, 2]);
+    assert_eq!(status.applied, vec![1, 2]);
+}
+
+#[tokio::test]
 async fn workspace_round_trip_and_archive_filter() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");

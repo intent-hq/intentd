@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 
 pub use intent_core::{Error, Result};
 
@@ -47,6 +47,36 @@ impl Store {
     /// Borrow the underlying connection pool.
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Compare the migrations embedded in the binary against the versions
+    /// recorded as applied in `_sqlx_migrations`, for `intentd doctor` (§5.7).
+    pub async fn migration_status(&self) -> Result<MigrationStatus> {
+        let expected: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
+        let applied: Vec<i64> =
+            sqlx::query("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| Error::Internal(format!("query migrations failed: {e}")))?
+                .iter()
+                .map(|row| row.get::<i64, _>("version"))
+                .collect();
+        Ok(MigrationStatus { expected, applied })
+    }
+}
+
+/// Migration diagnostics: the versions embedded in the binary (`expected`) and
+/// the versions recorded as applied in `_sqlx_migrations` (`applied`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationStatus {
+    pub expected: Vec<i64>,
+    pub applied: Vec<i64>,
+}
+
+impl MigrationStatus {
+    /// True when every embedded migration version has been applied.
+    pub fn is_current(&self) -> bool {
+        self.expected.iter().all(|v| self.applied.contains(v))
     }
 }
 

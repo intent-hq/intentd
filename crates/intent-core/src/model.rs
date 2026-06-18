@@ -748,6 +748,8 @@ pub struct CommentDeleteResult {
 mod tests {
     use super::*;
 
+    use serde_json::json;
+
     #[test]
     fn content_type_wire_forms_match_ts() {
         // Mirrors `ContentType` in src/shared/types.ts: plain_text (not plaintext).
@@ -760,5 +762,141 @@ mod tests {
             assert_eq!(serde_json::to_string(&variant).unwrap(), wire);
             assert_eq!(serde_json::from_str::<ContentType>(wire).unwrap(), variant);
         }
+    }
+
+    /// A regular comment with `anchorContext` and no suggestion fields must
+    /// serialize to the camelCase `CommentV2` wire shape (`type`, `authorType`,
+    /// `createdAt`, nested `anchorContext`) the iOS client expects (§5.3).
+    #[test]
+    fn comment_wire_regular_camel_case_parity() {
+        let comment = Comment {
+            id: "c1".to_string(),
+            thread_id: "t1".to_string(),
+            note_id: Some(NoteId::from("note-1")),
+            kind: CommentType::Comment,
+            content: "hello".to_string(),
+            author: "Agent".to_string(),
+            author_type: AuthorType::Agent,
+            status: CommentStatus::Open,
+            parent_id: None,
+            anchor: CommentAnchor {
+                kind: CommentAnchorType::Range,
+                start_id: Some("c1".to_string()),
+                end_id: Some("c1".to_string()),
+                point_id: None,
+            },
+            anchor_text: Some("Seed".to_string()),
+            anchor_before: Some("be".to_string()),
+            anchor_after: Some("af".to_string()),
+            suggestion_original: None,
+            suggestion_proposed: None,
+            agent_id: None,
+            created_at: "t0".to_string(),
+            updated_at: "t0".to_string(),
+        };
+        let value = serde_json::to_value(CommentWire::from_comment(&comment)).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "id": "c1",
+                "threadId": "t1",
+                "noteId": "note-1",
+                "type": "comment",
+                "content": "hello",
+                "author": "Agent",
+                "authorType": "agent",
+                "status": "open",
+                "anchor": { "type": "range", "startId": "c1", "endId": "c1" },
+                "anchorText": "Seed",
+                "anchorContext": { "before": "be", "after": "af" },
+                "createdAt": "t0",
+                "updatedAt": "t0"
+            })
+        );
+    }
+
+    /// A suggestion comment nests `suggestionDiff` and omits `anchorContext`
+    /// when no anchor context is present (matches `comment-loader.ts`).
+    #[test]
+    fn comment_wire_suggestion_nests_suggestion_diff() {
+        let comment = Comment {
+            id: "c2".to_string(),
+            thread_id: "t1".to_string(),
+            note_id: Some(NoteId::from("note-1")),
+            kind: CommentType::Suggestion,
+            content: "try this".to_string(),
+            author: "Agent".to_string(),
+            author_type: AuthorType::Agent,
+            status: CommentStatus::Open,
+            parent_id: Some("c1".to_string()),
+            anchor: CommentAnchor::default(),
+            anchor_text: None,
+            anchor_before: None,
+            anchor_after: None,
+            suggestion_original: Some("Seed".to_string()),
+            suggestion_proposed: Some("Sprout".to_string()),
+            agent_id: None,
+            created_at: "t0".to_string(),
+            updated_at: "t0".to_string(),
+        };
+        let value = serde_json::to_value(CommentWire::from_comment(&comment)).unwrap();
+        assert_eq!(value["type"], json!("suggestion"));
+        assert_eq!(value["parentId"], json!("c1"));
+        assert_eq!(
+            value["suggestionDiff"],
+            json!({ "original": "Seed", "proposed": "Sprout" })
+        );
+        assert!(value.get("anchorContext").is_none());
+        assert!(value.get("suggestion_original").is_none());
+    }
+
+    /// `comment.add` echoes a camelCase `commentId` + nested `location`
+    /// (`anchoredText`), matching the TS `ws.comment.add` return (§5.3).
+    #[test]
+    fn comment_add_result_camel_case_parity() {
+        let result = CommentAddResult {
+            success: true,
+            message: "Comment successfully anchored to \"Seed\"".to_string(),
+            comment_id: "c1".to_string(),
+            anchored: true,
+            location: CommentLocation {
+                line: 1,
+                anchored_text: "Seed".to_string(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            json!({
+                "success": true,
+                "message": "Comment successfully anchored to \"Seed\"",
+                "commentId": "c1",
+                "anchored": true,
+                "location": { "line": 1, "anchoredText": "Seed" }
+            })
+        );
+    }
+
+    /// `task.update` returns `lineNumber` (camelCase) + a checkbox status word.
+    #[test]
+    fn task_update_result_camel_case_parity() {
+        let result = TaskUpdateResult {
+            ok: true,
+            note_id: NoteId::from("task-1"),
+            line_number: 3,
+            previous_text: "old".to_string(),
+            new_text: "new".to_string(),
+            status: "done".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            json!({
+                "ok": true,
+                "noteId": "task-1",
+                "lineNumber": 3,
+                "previousText": "old",
+                "newText": "new",
+                "status": "done"
+            })
+        );
     }
 }

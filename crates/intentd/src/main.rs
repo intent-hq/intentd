@@ -161,10 +161,27 @@ async fn cmd_doctor() -> ExitCode {
     }
 
     match Store::open(&config.db_path).await {
-        Ok(_) => println!(
-            "[ok] sqlite openable + migrations current: {}",
-            config.db_path.display()
-        ),
+        Ok(store) => {
+            println!("[ok] sqlite openable: {}", config.db_path.display());
+            match store.migration_status().await {
+                Ok(status) if status.is_current() => println!(
+                    "[ok] migrations current: {} applied {:?}",
+                    status.applied.len(),
+                    status.applied
+                ),
+                Ok(status) => {
+                    ok = false;
+                    println!(
+                        "[FAIL] migrations not current: expected {:?}, applied {:?}",
+                        status.expected, status.applied
+                    );
+                }
+                Err(e) => {
+                    ok = false;
+                    println!("[FAIL] migration status: {e}");
+                }
+            }
+        }
         Err(e) => {
             ok = false;
             println!("[FAIL] sqlite/migrations: {e}");
