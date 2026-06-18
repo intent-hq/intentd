@@ -11,6 +11,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
+use intent_core::events::{
+    COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, TASK_STATUS_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED,
+};
 use intent_core::{
     iso_minutes_ago, now_iso, parse_iso, ActorType, AgentId, AuthorType, BoxFuture, Comment,
     CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
@@ -26,7 +30,7 @@ use intent_core::{
     WorkspaceActivity, WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary, WorkspaceId,
     WorkspaceStatus, WorkspaceUpdate,
 };
-use intent_store::{EventQuery, Store};
+use intent_store::{EventQuery, NewEvent, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
 
@@ -53,6 +57,10 @@ pub struct Services {
     /// `event.unsubscribe` can report found/not-found. This is the service-style
     /// surface only; WS streaming is the separate `events.*` fast-path (§6).
     event_subscriptions: Arc<Mutex<HashSet<String>>>,
+    /// Shared event bus that CRUD mutations publish change events onto (§10).
+    /// `None` until wired by the composition root; when unset, mutations persist
+    /// as before but emit no events (keeps read-only/test wiring unchanged).
+    event_bus: Option<EventBus>,
 }
 
 impl Services {
@@ -62,12 +70,21 @@ impl Services {
             store,
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashSet::new())),
+            event_bus: None,
         }
     }
 
     /// Configure the note-asset root directory (for `note.readAsset`).
     pub fn with_assets_root(mut self, root: PathBuf) -> Self {
         self.assets_root = Some(root);
+        self
+    }
+
+    /// Wire the event bus so CRUD mutations publish change events (§10). The bus
+    /// must share the same [`Store`] as this services handle so the broadcast and
+    /// the durable log stay consistent.
+    pub fn with_event_bus(mut self, bus: EventBus) -> Self {
+        self.event_bus = Some(bus);
         self
     }
 
@@ -189,6 +206,121 @@ fn fresh_task_metadata(status: TaskStatus, now: &str, peer_order: Option<i64>) -
     };
     apply_status_transition(&mut task, status, now);
     task
+}
+
+/// The `system` actor used for change events emitted by daemon-side mutations.
+/// Mirrors the TS fallback `{ type: 'system', id: 'system', name: 'System' }`
+/// used by `createWorkspaceEvent` when no provenance actor is present; agent
+/// provenance attribution is wired in a later milestone.
+fn system_actor() -> intent_core::EventActor {
+    intent_core::EventActor {
+        actor_type: ActorType::System,
+        id: Some("system".to_string()),
+        name: Some("System".to_string()),
+        ..Default::default()
+    }
+}
+
+/// Build a `note:created`/`note:updated`/`note:deleted` change event with the
+/// TS-parity payload `{ noteId, title, action }` (`notes.service.ts`).
+fn note_change_event(
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    title: &str,
+    event_type: &str,
+    action: &str,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: event_type.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        data: serde_json::json!({
+            "noteId": note_id.as_str(),
+            "title": title,
+            "action": action,
+        }),
+    }
+}
+
+/// Build a `task:status-changed` change event with the TS-parity payload
+/// `{ noteId, noteTitle, previousStatus, newStatus, changedAt }` (the system
+/// actor leaves `agentId` undefined, so it is omitted) (`notes.service.ts`).
+fn task_status_changed_event(
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    note_title: &str,
+    previous_status: TaskStatus,
+    new_status: TaskStatus,
+    changed_at: &str,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: TASK_STATUS_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        data: serde_json::json!({
+            "noteId": note_id.as_str(),
+            "noteTitle": note_title,
+            "previousStatus": status_word(previous_status),
+            "newStatus": status_word(new_status),
+            "changedAt": changed_at,
+        }),
+    }
+}
+
+/// Build a `workspace:attention-changed` change event with the self-sufficient
+/// payload `{ workspaceId, attention }` (PROTOCOL §6.5 / IMPLEMENTATION_SPEC §10.1).
+fn attention_changed_event(workspace_id: &WorkspaceId, attention: WorkspaceAttention) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_ATTENTION_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "attention": attention,
+        }),
+    }
+}
+
+/// Build a `comment:added` change event with the self-sufficient payload
+/// `{ noteId, commentId }` (PROTOCOL §6.5; intentd carries the ids so a client
+/// can locate/fetch the new comment).
+fn comment_added_event(workspace_id: &WorkspaceId, note_id: &NoteId, comment_id: &str) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: COMMENT_ADDED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        data: serde_json::json!({
+            "noteId": note_id.as_str(),
+            "commentId": comment_id,
+        }),
+    }
+}
+
+/// Publish a change event onto the bus when one is wired, logging (not failing)
+/// on error — the durable mutation has already succeeded by this point.
+async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
+    let Some(bus) = bus else {
+        return;
+    };
+    if let Err(e) = bus.publish(&event).await {
+        tracing::warn!(error = %e, "failed to publish change event");
+    }
 }
 
 impl Services {
@@ -389,17 +521,25 @@ impl WorkspaceApi for Services {
 
     fn dismiss_attention(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             let mut ws = store.get_workspace(&id).await?;
+            let changed = ws.attention != WorkspaceAttention::None;
             ws.attention = WorkspaceAttention::None;
             ws.updated_at = now_iso();
             store.update_workspace(&ws).await?;
+            // Self-sufficient `workspace:attention-changed` so every client clears
+            // the blue dot together (PROTOCOL §6.5); emit only on an actual change.
+            if changed {
+                publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
+            }
             Ok(ws)
         })
     }
 
     fn mark_seen(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             let mut ws = store.get_workspace(&id).await?;
             // "Seen" clears the unread flag; review-required attention persists.
@@ -407,6 +547,7 @@ impl WorkspaceApi for Services {
                 ws.attention = WorkspaceAttention::None;
                 ws.updated_at = now_iso();
                 store.update_workspace(&ws).await?;
+                publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
             }
             Ok(ws)
         })
@@ -429,6 +570,7 @@ impl WorkspaceApi for Services {
         input: NoteCreate,
     ) -> BoxFuture<'_, Result<Note>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             let now = now_iso();
             let note = Note {
@@ -448,6 +590,17 @@ impl WorkspaceApi for Services {
                 updated_at: now,
             };
             store.insert_note(&note).await?;
+            publish_event(
+                &bus,
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_CREATED,
+                    "create",
+                ),
+            )
+            .await;
             Ok(note)
         })
     }
@@ -459,6 +612,7 @@ impl WorkspaceApi for Services {
         input: NoteUpdateInput,
     ) -> BoxFuture<'_, Result<Note>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             // content present → raw full set; otherwise title/tags metadata.
@@ -474,6 +628,17 @@ impl WorkspaceApi for Services {
             }
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            publish_event(
+                &bus,
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
             Ok(note)
         })
     }
@@ -485,6 +650,7 @@ impl WorkspaceApi for Services {
         input: NoteAddInput,
     ) -> BoxFuture<'_, Result<NoteAddResult>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let old_content = note.content.clone();
@@ -497,6 +663,17 @@ impl WorkspaceApi for Services {
             note.content = new_content.clone();
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            publish_event(
+                &bus,
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
             Ok(NoteAddResult {
                 ok: true,
                 note_id: note.id,
@@ -518,6 +695,7 @@ impl WorkspaceApi for Services {
         input: NoteEditInput,
     ) -> BoxFuture<'_, Result<NoteEditResult>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             if input.old.is_empty() {
                 return Err(Error::Internal(
@@ -531,6 +709,17 @@ impl WorkspaceApi for Services {
             note.content = new_content.clone();
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            publish_event(
+                &bus,
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
             Ok(NoteEditResult {
                 ok: true,
                 note_id: note.id,
@@ -556,6 +745,7 @@ impl WorkspaceApi for Services {
         input: NoteEditLinesInput,
     ) -> BoxFuture<'_, Result<NoteEditLinesResult>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let old_content = note.content.clone();
@@ -566,6 +756,17 @@ impl WorkspaceApi for Services {
             note.content = new_content.clone();
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            publish_event(
+                &bus,
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
             Ok(NoteEditLinesResult {
                 ok: true,
                 note_id: note.id,
@@ -589,6 +790,7 @@ impl WorkspaceApi for Services {
         confirm_replacement: bool,
     ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let old_content = note.content.clone();
@@ -611,6 +813,17 @@ impl WorkspaceApi for Services {
             let now = now_iso();
             note.updated_at = now.clone();
             store.update_note(&note).await?;
+            publish_event(
+                &bus,
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
             Ok(NoteSetContentResult {
                 ok: true,
                 title: note.title,
@@ -633,6 +846,7 @@ impl WorkspaceApi for Services {
         tags: Option<Vec<String>>,
     ) -> BoxFuture<'_, Result<NoteUpdateMetadataResult>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             if title.is_none() && tags.is_none() {
                 return Err(Error::Internal(
@@ -667,6 +881,17 @@ impl WorkspaceApi for Services {
             let now = now_iso();
             note.updated_at = now.clone();
             store.update_note(&note).await?;
+            publish_event(
+                &bus,
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
             Ok(NoteUpdateMetadataResult {
                 ok: true,
                 note_id: note.id,
@@ -685,10 +910,16 @@ impl WorkspaceApi for Services {
         note_id: NoteId,
     ) -> BoxFuture<'_, Result<NoteDeleteResult>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             // Scope-check first so a foreign/absent note yields the peer message.
-            fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             store.delete_note(&note_id).await?;
+            publish_event(
+                &bus,
+                note_change_event(&workspace_id, &note_id, &note.title, NOTE_DELETED, "delete"),
+            )
+            .await;
             Ok(NoteDeleteResult {
                 ok: true,
                 note_id,
@@ -742,6 +973,7 @@ impl WorkspaceApi for Services {
         status: String,
     ) -> BoxFuture<'_, Result<TaskUpdateStatusResult>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             if task_text.is_empty() {
                 return Err(Error::Internal(
@@ -757,6 +989,17 @@ impl WorkspaceApi for Services {
             note.content = updated;
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            publish_event(
+                &bus,
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
             Ok(TaskUpdateStatusResult {
                 ok: true,
                 note_id: note.id,
@@ -773,6 +1016,7 @@ impl WorkspaceApi for Services {
         status: String,
     ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             let new_status = parse_task_status_strict(&status)?;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
@@ -784,10 +1028,27 @@ impl WorkspaceApi for Services {
                     ))
                 }
             };
-            apply_status_transition(&mut task, new_status, &now_iso());
+            let previous_status = task.status;
+            let now = now_iso();
+            apply_status_transition(&mut task, new_status, &now);
             note.task = Some(task);
-            note.updated_at = now_iso();
+            note.updated_at = now.clone();
             store.update_note(&note).await?;
+            // Mirror `notes.service.ts`: emit only when the status actually changed.
+            if previous_status != new_status {
+                publish_event(
+                    &bus,
+                    task_status_changed_event(
+                        &note.workspace_id,
+                        &note.id,
+                        &note.title,
+                        previous_status,
+                        new_status,
+                        &now,
+                    ),
+                )
+                .await;
+            }
             Ok(TaskUpdateNoteStatusResult {
                 ok: true,
                 note_id: note.id.clone(),
@@ -807,6 +1068,7 @@ impl WorkspaceApi for Services {
         expected: Option<String>,
     ) -> BoxFuture<'_, Result<TaskUpdateResult>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             if text.is_none() && status.is_none() {
                 return Err(Error::Internal(
@@ -836,6 +1098,17 @@ impl WorkspaceApi for Services {
             note.content = update.content;
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            publish_event(
+                &bus,
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
             Ok(TaskUpdateResult {
                 ok: true,
                 note_id: note.id,
@@ -1133,6 +1406,7 @@ impl WorkspaceApi for Services {
         author: Option<String>,
     ) -> BoxFuture<'_, Result<CommentAddResult>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             if comment.trim().is_empty() {
                 return Err(Error::Internal(
@@ -1167,7 +1441,7 @@ impl WorkspaceApi for Services {
             let new_comment = Comment {
                 id: comment_id.clone(),
                 thread_id: comment_id.clone(),
-                note_id: Some(note_id),
+                note_id: Some(note_id.clone()),
                 kind: parse_comment_type(kind.as_deref()),
                 content: comment,
                 author: author.unwrap_or_else(|| "Agent".to_string()),
@@ -1190,6 +1464,11 @@ impl WorkspaceApi for Services {
                 updated_at: now,
             };
             store.insert_comment(&new_comment).await?;
+            publish_event(
+                &bus,
+                comment_added_event(&workspace_id, &note_id, &comment_id),
+            )
+            .await;
             Ok(CommentAddResult {
                 success: true,
                 message: format!("Comment successfully anchored to \"{anchored_text}\""),

@@ -93,6 +93,14 @@ pub const WORKSPACE_DELETED: &str = "workspace:deleted";
 pub const WORKSPACE_OPENED: &str = "workspace:opened";
 pub const WORKSPACE_CLOSED: &str = "workspace:closed";
 pub const WORKSPACE_ACTIVITY: &str = "workspace:activity";
+// Workspace status-change family (new in intentd; PROTOCOL §6.5). Self-sufficient
+// payloads carry the new derived value so the FE flips the green/blue dot with no
+// follow-up fetch: `workspace:activity-changed` → `{ workspaceId, activity }`,
+// `workspace:attention-changed` → `{ workspaceId, attention }`. `activity-changed`
+// is reserved-but-unused until the M6 status model lands an `activity` transition;
+// `attention-changed` is emitted by `workspace.dismissAttention`/`markSeen` (§9.9).
+pub const WORKSPACE_ACTIVITY_CHANGED: &str = "workspace:activity-changed";
+pub const WORKSPACE_ATTENTION_CHANGED: &str = "workspace:attention-changed";
 
 // Spec / goal events.
 pub const SPEC_UPDATED: &str = "spec:updated";
@@ -166,6 +174,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     WORKSPACE_OPENED,
     WORKSPACE_CLOSED,
     WORKSPACE_ACTIVITY,
+    WORKSPACE_ACTIVITY_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED,
     SPEC_UPDATED,
     GOAL_UPDATED,
     COMMENT_ADDED,

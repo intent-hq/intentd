@@ -92,8 +92,14 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     // The event bus shares the store with the services surface so subscribers
     // see the same durable event log that future mutations will publish to.
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_assets_root(config.data_dir.join("assets")));
+    // The services surface publishes CRUD change events onto the same bus that
+    // transport subscriptions read, so a mutation on one connection streams to
+    // subscribers on another (§10).
+    let services: Arc<dyn WorkspaceApi> = Arc::new(
+        Services::new(store)
+            .with_assets_root(config.data_dir.join("assets"))
+            .with_event_bus(bus.clone()),
+    );
     // Start a filesystem watcher per active workspace with a resolvable on-disk
     // path; each publishes debounced `file:changed` events to the shared bus.
     // The handles are held for the lifetime of `serve` and torn down on return.

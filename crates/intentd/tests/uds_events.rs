@@ -10,7 +10,7 @@ use intent_core::{ActorType, EventActor, WorkspaceApi, WorkspaceId};
 use intent_services::{EventBus, Services};
 use intent_store::{NewEvent, Store};
 use intent_transport::serve_uds;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
@@ -177,6 +177,212 @@ async fn subscribe_push_filter_unsubscribe_and_disconnect_cleanup() {
     drop(write2);
     drop(reader2);
     wait_for_subscriber_count(&bus, 0).await;
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// Issue one JSON-RPC request on a dedicated (non-subscribed) connection and
+/// return its `result` object. The connection carries only responses, so reads
+/// never interleave with pushed `events.event` notifications.
+async fn rpc(
+    write_half: &mut (impl AsyncWriteExt + Unpin),
+    reader: &mut BufReader<OwnedReadHalf>,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> Value {
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    send(write_half, &serde_json::to_string(&frame).unwrap()).await;
+    let resp = read_json(reader).await;
+    assert_eq!(resp["id"], id, "response id mismatch for {method}");
+    assert!(resp.get("error").is_none(), "rpc {method} errored: {resp}");
+    resp["result"].clone()
+}
+
+/// End-to-end change-event proof (M2.6): one connection subscribes; another runs
+/// CRUD across workspace/note/task/comment over JSON-RPC; the subscriber receives
+/// the matching `events.event` notifications with the camelCase envelope + payload
+/// shapes the iOS client expects (PROTOCOL §6.5).
+#[tokio::test]
+async fn crud_mutations_emit_change_events_over_uds() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    // The services surface must publish onto the SAME bus the transport reads.
+    let services: Arc<dyn WorkspaceApi> =
+        Arc::new(Services::new(store).with_event_bus(bus.clone()));
+    let socket = std::env::temp_dir().join(format!("intentd-uds-{}.sock", Uuid::new_v4()));
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let bus = bus.clone();
+        let socket = socket.clone();
+        async move {
+            let _ = serve_uds(services, bus, &socket, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        }
+    });
+
+    // RPC connection (mutations + their responses only).
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = BufReader::new(rpc_read);
+
+    // Create the workspace first (no change event is wired for create) so the
+    // subscription below can scope to its id without missing any event.
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+
+    // Subscriber connection, scoped to this workspace across the change families.
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "events.subscribe",
+            "params": { "eventTypes": ["note:*", "task:*", "comment:*", "workspace:*"], "workspaceId": ws_id },
+        }))
+        .unwrap(),
+    )
+    .await;
+    let sub_resp = read_json(&mut sub_reader).await;
+    let sub_id = sub_resp["result"]["subscriptionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    wait_for_subscriber_count(&bus, 1).await;
+
+    // note.create → note:created { noteId, title, action: "create" }.
+    let created = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Note" }),
+    )
+    .await;
+    let note_id = created["note"]["id"].as_str().unwrap().to_string();
+    let ev = read_json(&mut sub_reader).await;
+    assert_eq!(ev["method"], "events.event");
+    assert_eq!(ev["params"]["subscriptionId"], sub_id.as_str());
+    let e = &ev["params"]["event"];
+    // Envelope camelCase parity (PROTOCOL §6.3 / §6.5).
+    assert_eq!(e["type"], "note:created");
+    assert_eq!(e["workspaceId"], ws_id.as_str());
+    assert!(e["id"].is_string());
+    assert!(e["timestamp"].is_string());
+    assert_eq!(
+        e["actor"],
+        json!({ "type": "system", "id": "system", "name": "System" })
+    );
+    assert_eq!(
+        e["data"],
+        json!({ "noteId": note_id, "title": "Note", "action": "create" })
+    );
+
+    // note.update (content) → note:updated.
+    rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        12,
+        "note.update",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "content": "hello world" }),
+    )
+    .await;
+    let ev = read_json(&mut sub_reader).await;
+    assert_eq!(ev["params"]["event"]["type"], "note:updated");
+    assert_eq!(
+        ev["params"]["event"]["data"],
+        json!({ "noteId": note_id, "title": "Note", "action": "update" })
+    );
+
+    // task.markAsTask makes it a task (no event), then task.updateNoteStatus
+    // → task:status-changed with the previous/new status payload.
+    rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        13,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "not_started" }),
+    )
+    .await;
+    rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        14,
+        "task.updateNoteStatus",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    let ev = read_json(&mut sub_reader).await;
+    let e = &ev["params"]["event"];
+    assert_eq!(e["type"], "task:status-changed");
+    assert_eq!(e["data"]["noteId"], note_id.as_str());
+    assert_eq!(e["data"]["noteTitle"], "Note");
+    assert_eq!(e["data"]["previousStatus"], "not_started");
+    assert_eq!(e["data"]["newStatus"], "in_progress");
+    assert!(e["data"]["changedAt"].is_string());
+
+    // comment.add → comment:added { noteId, commentId }.
+    let added = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        15,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "hello world",
+            "commentTarget": "hello",
+            "comment": "nice",
+        }),
+    )
+    .await;
+    let comment_id = added["commentId"].as_str().unwrap().to_string();
+    let ev = read_json(&mut sub_reader).await;
+    let e = &ev["params"]["event"];
+    assert_eq!(e["type"], "comment:added");
+    assert_eq!(
+        e["data"],
+        json!({ "noteId": note_id, "commentId": comment_id })
+    );
+
+    // Raise then dismiss attention → workspace:attention-changed { workspaceId, attention }.
+    // workspace.update carries no change event, so only the dismissal is observed.
+    rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        16,
+        "workspace.update",
+        json!({ "workspaceId": ws_id, "attention": "unread" }),
+    )
+    .await;
+    rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        17,
+        "workspace.dismissAttention",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let ev = read_json(&mut sub_reader).await;
+    let e = &ev["params"]["event"];
+    assert_eq!(e["type"], "workspace:attention-changed");
+    assert_eq!(
+        e["data"],
+        json!({ "workspaceId": ws_id, "attention": "none" })
+    );
 
     let _ = shutdown_tx.send(());
     let _ = server.await;
