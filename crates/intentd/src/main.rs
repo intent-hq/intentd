@@ -89,7 +89,8 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+    let services: Arc<dyn WorkspaceApi> =
+        Arc::new(Services::new(store).with_assets_root(config.data_dir.join("assets")));
     tracing::info!(socket = %config.socket_path.display(), "starting intentd");
     serve_uds(services, &config.socket_path, shutdown_signal()).await?;
     Ok(())
@@ -160,10 +161,27 @@ async fn cmd_doctor() -> ExitCode {
     }
 
     match Store::open(&config.db_path).await {
-        Ok(_) => println!(
-            "[ok] sqlite openable + migrations current: {}",
-            config.db_path.display()
-        ),
+        Ok(store) => {
+            println!("[ok] sqlite openable: {}", config.db_path.display());
+            match store.migration_status().await {
+                Ok(status) if status.is_current() => println!(
+                    "[ok] migrations current: {} applied {:?}",
+                    status.applied.len(),
+                    status.applied
+                ),
+                Ok(status) => {
+                    ok = false;
+                    println!(
+                        "[FAIL] migrations not current: expected {:?}, applied {:?}",
+                        status.expected, status.applied
+                    );
+                }
+                Err(e) => {
+                    ok = false;
+                    println!("[FAIL] migration status: {e}");
+                }
+            }
+        }
         Err(e) => {
             ok = false;
             println!("[FAIL] sqlite/migrations: {e}");

@@ -4,8 +4,9 @@
 use std::path::PathBuf;
 
 use intent_core::{
-    now_iso, ContentType, Note, NoteId, NoteVisibility, Workspace, WorkspaceActivity,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, AgentId, AuthorType, Comment, CommentAnchor, CommentAnchorType, CommentStatus,
+    CommentType, ContentType, Note, NoteId, NoteVisibility, TaskMetadata, TaskStatus, Workspace,
+    WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 
 use crate::Store;
@@ -68,6 +69,16 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
 }
 
 #[tokio::test]
+async fn migration_status_reports_current_after_open() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let status = store.migration_status().await.expect("migration status");
+    assert!(status.is_current(), "fresh open must apply all migrations");
+    assert_eq!(status.expected, vec![1, 2]);
+    assert_eq!(status.applied, vec![1, 2]);
+}
+
+#[tokio::test]
 async fn workspace_round_trip_and_archive_filter() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -102,6 +113,57 @@ async fn workspace_round_trip_and_archive_filter() {
 }
 
 #[tokio::test]
+async fn workspace_get_update_delete() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&id, "Original", false))
+        .await
+        .expect("insert");
+
+    // get
+    let got = store.get_workspace(&id).await.expect("get");
+    assert_eq!(got.title, "Original");
+
+    // missing get → NotFound
+    let missing = store.get_workspace(&WorkspaceId::from("nope")).await;
+    assert!(matches!(missing, Err(intent_core::Error::NotFound(_))));
+
+    // update (full row replace)
+    let mut updated = got.clone();
+    updated.title = "Renamed".to_string();
+    updated.attention = WorkspaceAttention::None;
+    updated.tags = vec!["x".to_string()];
+    store.update_workspace(&updated).await.expect("update");
+    let reread = store.get_workspace(&id).await.expect("reget");
+    assert_eq!(reread.title, "Renamed");
+    assert_eq!(reread.attention, WorkspaceAttention::None);
+    assert_eq!(reread.tags, vec!["x".to_string()]);
+
+    // update missing → NotFound
+    let mut ghost = updated.clone();
+    ghost.id = WorkspaceId::from("nope");
+    assert!(matches!(
+        store.update_workspace(&ghost).await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+
+    // delete
+    store.delete_workspace(&id).await.expect("delete");
+    assert!(matches!(
+        store.get_workspace(&id).await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+    // delete missing → NotFound
+    assert!(matches!(
+        store.delete_workspace(&id).await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+}
+
+#[tokio::test]
 async fn note_round_trip() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -125,7 +187,10 @@ async fn note_round_trip() {
         is_default: true,
         parent_id: None,
         visibility: NoteVisibility::Workspace,
-        task: Some(serde_json::json!({ "status": "in_progress" })),
+        task: Some(TaskMetadata {
+            status: TaskStatus::InProgress,
+            ..Default::default()
+        }),
         created_at: ts.clone(),
         updated_at: ts,
     };
@@ -142,7 +207,153 @@ async fn note_round_trip() {
     assert!(got.is_pinned);
     assert!(got.is_default);
     assert_eq!(
-        got.task,
-        Some(serde_json::json!({ "status": "in_progress" }))
+        got.task.as_ref().map(|t| t.status),
+        Some(TaskStatus::InProgress)
+    );
+
+    let fetched = store.get_note(&note.id).await.expect("get note");
+    assert_eq!(fetched.id, note.id);
+}
+
+fn task_note(ws_id: &WorkspaceId, title: &str, task: Option<TaskMetadata>) -> Note {
+    let ts = now_iso();
+    Note {
+        id: NoteId::new(),
+        workspace_id: ws_id.clone(),
+        title: title.to_string(),
+        content: String::new(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        task,
+        created_at: ts.clone(),
+        updated_at: ts,
+    }
+}
+
+#[tokio::test]
+async fn task_metadata_round_trip_and_list_tasks() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let meta = TaskMetadata {
+        status: TaskStatus::ReviewRequired,
+        assigned_agent_ids: vec![AgentId::from("agent-1"), AgentId::from("agent-2")],
+        acceptance_criteria: vec!["builds".to_string(), "tests pass".to_string()],
+        estimated_effort: Some("M".to_string()),
+        actual_effort: None,
+        blocked_reason: None,
+        started_at: Some(now_iso()),
+        completed_at: None,
+        peer_order: Some(100),
+    };
+    store
+        .insert_note(&task_note(&ws_id, "Task A", Some(meta.clone())))
+        .await
+        .expect("insert task note");
+    store
+        .insert_note(&task_note(&ws_id, "Plain note", None))
+        .await
+        .expect("insert plain note");
+
+    let tasks = store.list_tasks(&ws_id).await.expect("list tasks");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].task, Some(meta));
+}
+
+fn sample_comment(note_id: &NoteId, thread_id: &str, id: &str) -> Comment {
+    let ts = now_iso();
+    Comment {
+        id: id.to_string(),
+        thread_id: thread_id.to_string(),
+        note_id: Some(note_id.clone()),
+        kind: CommentType::Suggestion,
+        content: "please rename".to_string(),
+        author: "alice".to_string(),
+        author_type: AuthorType::User,
+        status: CommentStatus::Open,
+        parent_id: None,
+        anchor: CommentAnchor {
+            kind: CommentAnchorType::Range,
+            start_id: Some("a1".to_string()),
+            end_id: Some("a2".to_string()),
+            point_id: None,
+        },
+        anchor_text: Some("foo".to_string()),
+        anchor_before: Some("the ".to_string()),
+        anchor_after: Some(" bar".to_string()),
+        suggestion_original: Some("foo".to_string()),
+        suggestion_proposed: Some("baz".to_string()),
+        agent_id: Some(AgentId::from("agent-9")),
+        created_at: ts.clone(),
+        updated_at: ts,
+    }
+}
+
+#[tokio::test]
+async fn comment_round_trip_update_delete_and_thread() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let note = task_note(&ws_id, "Note", None);
+    store.insert_note(&note).await.expect("insert note");
+
+    let c1 = sample_comment(&note.id, "thread-1", "c1");
+    let mut c2 = sample_comment(&note.id, "thread-1", "c2");
+    c2.parent_id = Some("c1".to_string());
+    c2.kind = CommentType::Comment;
+    c2.anchor = CommentAnchor {
+        kind: CommentAnchorType::Point,
+        point_id: Some("p1".to_string()),
+        ..Default::default()
+    };
+    c2.anchor_before = None;
+    c2.anchor_after = None;
+    c2.suggestion_original = None;
+    c2.suggestion_proposed = None;
+    c2.agent_id = None;
+    store.insert_comment(&c1).await.expect("insert c1");
+    store.insert_comment(&c2).await.expect("insert c2");
+
+    let got = store.get_comment("c1").await.expect("get c1");
+    assert_eq!(got, c1);
+
+    let by_note = store.list_comments(&note.id).await.expect("list comments");
+    assert_eq!(by_note.len(), 2);
+
+    let thread = store.get_thread("thread-1").await.expect("get thread");
+    assert_eq!(thread.thread_id, "thread-1");
+    assert_eq!(thread.comments.len(), 2);
+
+    let mut updated = c1.clone();
+    updated.status = CommentStatus::Resolved;
+    updated.content = "resolved now".to_string();
+    store.update_comment(&updated).await.expect("update c1");
+    let reread = store.get_comment("c1").await.expect("reget c1");
+    assert_eq!(reread.status, CommentStatus::Resolved);
+    assert_eq!(reread.content, "resolved now");
+
+    store.delete_comment("c1").await.expect("delete c1");
+    assert!(store.get_comment("c1").await.is_err());
+    assert_eq!(
+        store
+            .list_comments(&note.id)
+            .await
+            .expect("list after del")
+            .len(),
+        1
     );
 }

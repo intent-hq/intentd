@@ -1,13 +1,22 @@
 //! Thin UDS JSON-RPC client used by the `call` / `status` subcommands (§5.7).
+//!
+//! UDS is Unix-only; the client is gated behind `#[cfg(unix)]`. On other
+//! platforms `rpc_call` builds but returns an error at runtime.
 
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::Value;
+
+#[cfg(unix)]
+use serde_json::json;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 /// Connect to the daemon socket, send one request, and return the parsed
 /// response envelope. The request `id` is auto-generated.
+#[cfg(unix)]
 pub async fn rpc_call(socket: &Path, method: &str, params: Value) -> anyhow::Result<Value> {
     let mut stream = UnixStream::connect(socket)
         .await
@@ -30,4 +39,11 @@ pub async fn rpc_call(socket: &Path, method: &str, params: Value) -> anyhow::Res
     let response: Value = serde_json::from_str(line.trim())
         .map_err(|e| anyhow::anyhow!("invalid response from daemon: {e}"))?;
     Ok(response)
+}
+
+/// Non-Unix fallback: UDS is unavailable, so report a clear runtime error
+/// instead of failing to compile.
+#[cfg(not(unix))]
+pub async fn rpc_call(_socket: &Path, _method: &str, _params: Value) -> anyhow::Result<Value> {
+    anyhow::bail!("UDS transport is not supported on this platform")
 }

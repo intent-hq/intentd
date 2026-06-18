@@ -161,6 +161,232 @@ async fn uds_slice_end_to_end() {
     .await;
     assert_eq!(resp["error"]["code"], json!(-32601));
 
+    // (e) workspace.* CRUD lifecycle: create → get → update → archive →
+    //     unarchive → dismissAttention → delete (PROTOCOL §5.1).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":5,"method":"workspace.create","params":{"title":"Lifecycle WS"}}"#,
+    )
+    .await;
+    let new_id = resp["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+    assert_eq!(resp["result"]["workspace"]["title"], json!("Lifecycle WS"));
+
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"workspace.get","params":{{"workspaceId":"{new_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["workspace"]["id"], json!(new_id));
+
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"workspace.update","params":{{"workspaceId":"{new_id}","title":"Renamed"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["workspace"]["title"], json!("Renamed"));
+
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"workspace.archive","params":{{"workspaceId":"{new_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"workspace.unarchive","params":{{"workspaceId":"{new_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"workspace.dismissAttention","params":{{"workspaceId":"{new_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["workspace"]["attention"], json!("none"));
+
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":11,"method":"workspace.delete","params":{{"workspaceId":"{new_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+
+    // (f) get after delete → -32602 "Workspace not found".
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":12,"method":"workspace.get","params":{{"workspaceId":"{new_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(resp["error"]["message"], json!("Workspace not found"));
+
+    // (g) note.create on the seeded workspace, with a checkbox line so the
+    //     task.* lifecycle has something to edit. Asserts the camelCase Note
+    //     wire shape the iOS client expects (PROTOCOL §5.2).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":13,"method":"note.create","params":{"workspaceId":"ws-seed","title":"Task Note","content":"- [ ] Do the thing"}}"#,
+    )
+    .await;
+    let note = &resp["result"]["note"];
+    let task_note_id = note["id"].as_str().expect("note id").to_string();
+    assert_eq!(note["title"], json!("Task Note"));
+    assert_eq!(note["workspaceId"], json!("ws-seed"));
+    assert_eq!(note["contentType"], json!("markdown"));
+    for key in [
+        "workspaceId",
+        "contentType",
+        "isPinned",
+        "isArchived",
+        "isDefault",
+        "createdAt",
+        "updatedAt",
+    ] {
+        assert!(note.get(key).is_some(), "Note must carry camelCase `{key}`");
+    }
+    assert!(
+        note.get("workspace_id").is_none() && note.get("content_type").is_none(),
+        "Note must not leak snake_case keys"
+    );
+
+    // (h) task.update the checkbox line → camelCase TaskUpdateResult.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":14,"method":"task.update","params":{{"workspaceId":"ws-seed","noteId":"{task_note_id}","line":1,"status":"done"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["lineNumber"], json!(1));
+    assert_eq!(resp["result"]["status"], json!("done"));
+    assert!(
+        resp["result"].get("line_number").is_none(),
+        "task.update must not leak snake_case keys"
+    );
+
+    // (i) task.markAsTask then task.updateNoteStatus → snake_case status words.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":15,"method":"task.markAsTask","params":{{"workspaceId":"ws-seed","noteId":"{task_note_id}","status":"not_started"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["status"], json!("not_started"));
+
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":16,"method":"task.updateNoteStatus","params":{{"workspaceId":"ws-seed","noteId":"{task_note_id}","status":"in_progress"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["status"], json!("in_progress"));
+    assert_eq!(
+        resp["result"]["note"]["task"]["status"],
+        json!("in_progress")
+    );
+
+    // (j) comment.add anchored to the seeded note's "# Seed" content
+    //     (PROTOCOL §5.3). Asserts the camelCase CommentAddResult shape.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":17,"method":"comment.add","params":{"workspaceId":"ws-seed","noteId":"note-seed","searchContext":"Seed","commentTarget":"Seed","comment":"first comment"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+    assert_eq!(resp["result"]["anchored"], json!(true));
+    let comment_id = resp["result"]["commentId"]
+        .as_str()
+        .expect("commentId")
+        .to_string();
+    assert_eq!(resp["result"]["location"]["anchoredText"], json!("Seed"));
+    assert!(
+        resp["result"]["location"].get("anchored_text").is_none(),
+        "comment.add must not leak snake_case keys"
+    );
+
+    // (k) comment.list with includeComments → camelCase thread summary + nested
+    //     CommentWire (`type`, `authorType`, `createdAt`).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":18,"method":"comment.list","params":{"workspaceId":"ws-seed","noteId":"note-seed","includeComments":true}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["totalThreads"], json!(1));
+    assert_eq!(resp["result"]["totalComments"], json!(1));
+    let thread = &resp["result"]["threads"][0];
+    assert_eq!(thread["threadId"], json!(comment_id));
+    assert_eq!(thread["commentCount"], json!(1));
+    let listed = &thread["comments"][0];
+    assert_eq!(listed["type"], json!("comment"));
+    assert_eq!(listed["authorType"], json!("agent"));
+    assert!(
+        listed.get("author_type").is_none() && listed.get("kind").is_none(),
+        "CommentWire must use camelCase `authorType` and `type`"
+    );
+
+    // (l) comment.respond with a suggestion → nested `suggestionDiff`.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":19,"method":"comment.respond","params":{{"workspaceId":"ws-seed","noteId":"note-seed","threadId":"{comment_id}","comment":"try this","type":"suggestion","suggestionOriginal":"Seed","suggestionProposed":"Sprout"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+    let reply = &resp["result"]["comment"];
+    assert_eq!(reply["type"], json!("suggestion"));
+    assert_eq!(reply["suggestionDiff"]["original"], json!("Seed"));
+    assert_eq!(reply["suggestionDiff"]["proposed"], json!("Sprout"));
+    assert_eq!(resp["result"]["thread"]["threadId"], json!(comment_id));
+    assert_eq!(resp["result"]["thread"]["totalComments"], json!(2));
+
+    // (m) comment.getThread → root + replies with camelCase fields.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":20,"method":"comment.getThread","params":{{"workspaceId":"ws-seed","noteId":"note-seed","threadId":"{comment_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["threadId"], json!(comment_id));
+    assert_eq!(resp["result"]["rootComment"]["id"], json!(comment_id));
+    assert_eq!(resp["result"]["totalComments"], json!(2));
+    assert_eq!(resp["result"]["replies"][0]["type"], json!("suggestion"));
+
+    // (n) comment.delete → success envelope.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":21,"method":"comment.delete","params":{{"workspaceId":"ws-seed","noteId":"note-seed","commentId":"{comment_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+
     let _ = tx.send(());
     let _ = server.await;
     let _ = std::fs::remove_dir_all(&dir);
