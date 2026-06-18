@@ -13,3 +13,9 @@ pub fn now_iso() -> String {
         .format(&Rfc3339)
         .unwrap_or_default()
 }
+
+/// Parse an RFC-3339 / ISO-8601 timestamp, returning `None` when malformed.
+/// Used by `comment.list` `since` filtering (the TS `new Date(since)` guard).
+pub fn parse_iso(s: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(s, &Rfc3339).ok()
+}

@@ -1,11 +1,14 @@
 //! Router error-matrix + dispatch unit tests using a fake `WorkspaceApi`.
 
 use intent_core::{
-    BoxFuture, ContentType, Error, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
-    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility,
-    ReadAssetResult, Result, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    AuthorType, BoxFuture, Comment, CommentAddResult, CommentAnchor, CommentAnchorType,
+    CommentLocation, CommentRespondResult, CommentRespondThread, CommentStatus, CommentType,
+    CommentWire, ContentType, Error, Note, NoteAddInput, NoteAddResult, NoteCreate,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    NoteId, NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult,
+    NoteVisibility, ReadAssetResult, Result, TaskUpdateResult, Workspace, WorkspaceActivity,
+    WorkspaceApi, WorkspaceAttention, WorkspaceCreate, WorkspaceId, WorkspaceStatus,
+    WorkspaceUpdate,
 };
 use serde_json::Value;
 
@@ -357,6 +360,104 @@ impl WorkspaceApi for FakeApi {
             })
         })
     }
+
+    fn task_update(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        line: i64,
+        _text: Option<String>,
+        status: Option<String>,
+        _expected: Option<String>,
+    ) -> BoxFuture<'_, Result<TaskUpdateResult>> {
+        Box::pin(async move {
+            Ok(TaskUpdateResult {
+                ok: true,
+                note_id,
+                line_number: line,
+                previous_text: "old".to_string(),
+                new_text: "new".to_string(),
+                status: status.unwrap_or_else(|| "todo".to_string()),
+            })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn comment_add(
+        &self,
+        _workspace_id: WorkspaceId,
+        _note_id: NoteId,
+        _search_context: String,
+        comment_target: String,
+        _comment: String,
+        _kind: Option<String>,
+        _author: Option<String>,
+    ) -> BoxFuture<'_, Result<CommentAddResult>> {
+        Box::pin(async move {
+            Ok(CommentAddResult {
+                success: true,
+                message: format!("Comment successfully anchored to \"{comment_target}\""),
+                comment_id: "c1".to_string(),
+                anchored: true,
+                location: CommentLocation {
+                    line: 1,
+                    anchored_text: comment_target,
+                },
+            })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn comment_respond(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        _thread_id: Option<String>,
+        _comment_id: Option<String>,
+        _comment: String,
+        _kind: Option<String>,
+        _author: Option<String>,
+        suggestion_original: Option<String>,
+        suggestion_proposed: Option<String>,
+    ) -> BoxFuture<'_, Result<CommentRespondResult>> {
+        Box::pin(async move {
+            let now = "t0".to_string();
+            let reply = Comment {
+                id: "r1".to_string(),
+                thread_id: "c1".to_string(),
+                note_id: Some(note_id),
+                kind: CommentType::Suggestion,
+                content: "please change".to_string(),
+                author: "Agent".to_string(),
+                author_type: AuthorType::Agent,
+                status: CommentStatus::Open,
+                parent_id: Some("c1".to_string()),
+                anchor: CommentAnchor {
+                    kind: CommentAnchorType::Range,
+                    start_id: Some("c1".to_string()),
+                    end_id: Some("c1".to_string()),
+                    point_id: None,
+                },
+                anchor_text: Some("target".to_string()),
+                anchor_before: None,
+                anchor_after: None,
+                suggestion_original,
+                suggestion_proposed,
+                agent_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            Ok(CommentRespondResult {
+                success: true,
+                message: "Reply added successfully".to_string(),
+                comment: CommentWire::from_comment(&reply),
+                thread: CommentRespondThread {
+                    thread_id: "c1".to_string(),
+                    total_comments: 2,
+                },
+            })
+        })
+    }
 }
 
 async fn call(msg: &str) -> Option<Value> {
@@ -693,4 +794,113 @@ async fn note_edit_missing_new_param_is_minus_32602() {
         v["error"]["message"],
         serde_json::json!("Missing required parameter: new")
     );
+}
+
+#[tokio::test]
+async fn task_update_returns_camel_case_result() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"task.update","params":{"workspaceId":"ws-1","noteId":"n1","line":3,"status":"done"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["lineNumber"], serde_json::json!(3));
+    assert_eq!(v["result"]["previousText"], serde_json::json!("old"));
+    assert_eq!(v["result"]["status"], serde_json::json!("done"));
+}
+
+#[tokio::test]
+async fn task_update_missing_line_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"task.update","params":{"workspaceId":"ws-1","noteId":"n1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: line")
+    );
+}
+
+#[tokio::test]
+async fn comment_add_returns_location_shape() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"comment.add","params":{"workspaceId":"ws-1","noteId":"n1","searchContext":"a test sentence","commentTarget":"test","comment":"nice"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["anchored"], serde_json::json!(true));
+    assert_eq!(v["result"]["commentId"], serde_json::json!("c1"));
+    assert_eq!(
+        v["result"]["location"]["anchoredText"],
+        serde_json::json!("test")
+    );
+}
+
+#[tokio::test]
+async fn comment_add_missing_target_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"comment.add","params":{"workspaceId":"ws-1","noteId":"n1","searchContext":"x","comment":"nice"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: commentTarget")
+    );
+}
+
+#[tokio::test]
+async fn comment_respond_nests_suggestion_diff_on_wire() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"comment.respond","params":{"workspaceId":"ws-1","noteId":"n1","commentId":"c1","comment":"please change","type":"suggestion","suggestionOriginal":"old text","suggestionProposed":"new text"}}"#,
+    )
+    .await
+    .unwrap();
+    // type alias + nested suggestionDiff confirm the wire DTO mapping.
+    assert_eq!(
+        v["result"]["comment"]["type"],
+        serde_json::json!("suggestion")
+    );
+    assert_eq!(
+        v["result"]["comment"]["suggestionDiff"]["original"],
+        serde_json::json!("old text")
+    );
+    assert_eq!(
+        v["result"]["comment"]["suggestionDiff"]["proposed"],
+        serde_json::json!("new text")
+    );
+    // Flat storage fields must NOT leak onto the wire.
+    assert!(v["result"]["comment"]["suggestionOriginal"].is_null());
+    assert_eq!(v["result"]["thread"]["totalComments"], serde_json::json!(2));
+}
+
+#[tokio::test]
+async fn task_comment_methods_missing_note_id_is_minus_32602() {
+    for method in [
+        "task.updateStatus",
+        "task.updateNoteStatus",
+        "task.update",
+        "task.markAsTask",
+        "task.convertBlocks",
+        "task.assignAgent",
+        "comment.add",
+        "comment.list",
+        "comment.getThread",
+        "comment.respond",
+        "comment.delete",
+    ] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"workspaceId":"ws-1"}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "{method}");
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!("Missing required parameter: noteId"),
+            "{method}"
+        );
+    }
 }

@@ -822,6 +822,7 @@ dependencies = [
  "intent-search",
  "intent-sourcecontrol",
  "intent-store",
+ "serde_json",
  "tokio",
  "uuid",
 ]

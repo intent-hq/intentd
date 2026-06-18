@@ -469,6 +469,281 @@ pub struct ReadAssetResult {
     pub size_kb: i64,
 }
 
+// ---------------------------------------------------------------------------
+// task.* result DTOs (PROTOCOL §5.4). Field names/optionality match the TS
+// `ws.task.*` peer returns so the iOS client is unchanged.
+// ---------------------------------------------------------------------------
+
+/// Result of `task.updateStatus` (checkbox edit by task text).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUpdateStatusResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    pub task_text: String,
+    /// Checkbox status string: `todo` / `in-progress` / `done`.
+    pub status: String,
+}
+
+/// Result of `task.updateNoteStatus` (task-note metadata status).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUpdateNoteStatusResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    pub status: TaskStatus,
+    pub note: Note,
+}
+
+/// Result of `task.update` (atomic single-line edit).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUpdateResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    pub line_number: i64,
+    pub previous_text: String,
+    pub new_text: String,
+    /// Checkbox status string: `todo` / `in-progress` / `done`.
+    pub status: String,
+}
+
+/// One subtask row in [`TaskGetMyTaskResult`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSubtask {
+    pub id: NoteId,
+    pub title: String,
+    /// Child task status string, or `unknown` if the child lost its metadata.
+    pub status: String,
+}
+
+/// Result of `task.getMyTask`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskGetMyTaskResult {
+    pub note_id: NoteId,
+    pub title: String,
+    pub content: String,
+    pub status: TaskStatus,
+    pub task_metadata: TaskMetadata,
+    pub parent_id: Option<NoteId>,
+    pub subtasks: Vec<TaskSubtask>,
+    pub assigned_agents: Vec<AgentId>,
+}
+
+/// Result of `task.markAsTask`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskMarkAsTaskResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    pub status: TaskStatus,
+}
+
+/// Result of `task.convertBlocks`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskConvertBlocksResult {
+    pub ok: bool,
+    pub converted_count: i64,
+    pub created_note_ids: Vec<String>,
+}
+
+/// Result of `task.createPrerequisite`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCreatePrerequisiteResult {
+    pub ok: bool,
+    pub prerequisite_note_id: NoteId,
+    pub dependent_note_id: NoteId,
+    pub title: String,
+}
+
+/// Result of `task.assignAgent`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAssignAgentResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    pub agent_id: AgentId,
+}
+
+// ---------------------------------------------------------------------------
+// comment.* wire DTOs (PROTOCOL §5.3). The stored [`Comment`] keeps anchor and
+// suggestion fields flat; on the wire they nest into `anchorContext` /
+// `suggestionDiff` to match the TS `CommentV2` shape the iOS client expects.
+// ---------------------------------------------------------------------------
+
+/// Nested `anchorContext` on the wire (`{ before, after }`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnchorContext {
+    pub before: String,
+    pub after: String,
+}
+
+/// Nested `suggestionDiff` on the wire (`{ original, proposed }`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestionDiff {
+    pub original: String,
+    pub proposed: String,
+}
+
+/// Wire-facing comment (the TS `CommentV2`). Built from the flat [`Comment`]
+/// via [`CommentWire::from_comment`]; nests `anchorContext`/`suggestionDiff`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentWire {
+    pub id: String,
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_id: Option<NoteId>,
+    #[serde(rename = "type")]
+    pub kind: CommentType,
+    pub content: String,
+    pub author: String,
+    pub author_type: AuthorType,
+    pub status: CommentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    pub anchor: CommentAnchor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_context: Option<AnchorContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion_diff: Option<SuggestionDiff>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl CommentWire {
+    /// Map a stored [`Comment`] to its nested wire shape.
+    pub fn from_comment(c: &Comment) -> Self {
+        let anchor_context = match (&c.anchor_before, &c.anchor_after) {
+            (None, None) => None,
+            (before, after) => Some(AnchorContext {
+                before: before.clone().unwrap_or_default(),
+                after: after.clone().unwrap_or_default(),
+            }),
+        };
+        let suggestion_diff = match (&c.suggestion_original, &c.suggestion_proposed) {
+            (Some(original), Some(proposed)) => Some(SuggestionDiff {
+                original: original.clone(),
+                proposed: proposed.clone(),
+            }),
+            _ => None,
+        };
+        Self {
+            id: c.id.clone(),
+            thread_id: c.thread_id.clone(),
+            note_id: c.note_id.clone(),
+            kind: c.kind,
+            content: c.content.clone(),
+            author: c.author.clone(),
+            author_type: c.author_type,
+            status: c.status,
+            parent_id: c.parent_id.clone(),
+            anchor: c.anchor.clone(),
+            anchor_text: c.anchor_text.clone(),
+            anchor_context,
+            suggestion_diff,
+            agent_id: c.agent_id.clone(),
+            created_at: c.created_at.clone(),
+            updated_at: c.updated_at.clone(),
+        }
+    }
+}
+
+/// Anchor location echoed by `comment.add`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentLocation {
+    pub line: usize,
+    pub anchored_text: String,
+}
+
+/// Result of `comment.add`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentAddResult {
+    pub success: bool,
+    pub message: String,
+    pub comment_id: String,
+    pub anchored: bool,
+    pub location: CommentLocation,
+}
+
+/// One thread summary in `comment.list`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentThreadSummary {
+    pub thread_id: String,
+    pub note_id: NoteId,
+    pub targeted_text: Option<String>,
+    pub anchor_id: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub last_activity: String,
+    pub latest_comment_author: String,
+    pub latest_comment_author_type: AuthorType,
+    pub latest_comment_at: String,
+    pub comment_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments: Option<Vec<CommentWire>>,
+}
+
+/// Result of `comment.list`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentListResult {
+    pub threads: Vec<CommentThreadSummary>,
+    pub total_threads: usize,
+    pub total_comments: usize,
+}
+
+/// Result of `comment.getThread`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentGetThreadResult {
+    pub thread_id: String,
+    pub note_id: NoteId,
+    pub root_comment: CommentWire,
+    pub replies: Vec<CommentWire>,
+    pub total_comments: usize,
+    pub status: String,
+}
+
+/// The `thread` summary echoed by `comment.respond`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentRespondThread {
+    pub thread_id: String,
+    pub total_comments: usize,
+}
+
+/// Result of `comment.respond`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentRespondResult {
+    pub success: bool,
+    pub message: String,
+    pub comment: CommentWire,
+    pub thread: CommentRespondThread,
+}
+
+/// Result of `comment.delete`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentDeleteResult {
+    pub success: bool,
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

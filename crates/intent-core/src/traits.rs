@@ -6,10 +6,13 @@ use std::pin::Pin;
 use crate::error::{Error, Result};
 use crate::ids::{NoteId, WorkspaceId};
 use crate::model::{
-    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteSetContentResult, NoteTaskRow,
-    NoteUpdateInput, NoteUpdateMetadataResult, ReadAssetResult, Workspace, WorkspaceCreate,
-    WorkspaceUpdate,
+    CommentAddResult, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
+    CommentRespondResult, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
+    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteSetContentResult,
+    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, ReadAssetResult, TaskAssignAgentResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult,
+    TaskMarkAsTaskResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    Workspace, WorkspaceCreate, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -280,6 +283,248 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::read_asset not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `task.updateStatus`: flip a checkbox by exact task text (PROTOCOL §5.4).
+    fn task_update_status(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        task_text: String,
+        status: String,
+    ) -> BoxFuture<'_, Result<TaskUpdateStatusResult>> {
+        let _ = (workspace_id, note_id, task_text, status);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::task_update_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `task.updateNoteStatus`: set task-note metadata status (PROTOCOL §5.4).
+    fn task_update_note_status(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        status: String,
+    ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
+        let _ = (workspace_id, note_id, status);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::task_update_note_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `task.update`: atomic single-line edit with `expected` conflict check (§5.4).
+    fn task_update(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        line: i64,
+        text: Option<String>,
+        status: Option<String>,
+        expected: Option<String>,
+    ) -> BoxFuture<'_, Result<TaskUpdateResult>> {
+        let _ = (workspace_id, note_id, line, text, status, expected);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::task_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `task.getMyTask`: read a task note with subtasks + assignees (PROTOCOL §5.4).
+    fn get_my_task(
+        &self,
+        workspace_id: WorkspaceId,
+        task_note_id: NoteId,
+    ) -> BoxFuture<'_, Result<TaskGetMyTaskResult>> {
+        let _ = (workspace_id, task_note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::get_my_task not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `task.markAsTask`: attach/replace task metadata on a note (PROTOCOL §5.4).
+    fn mark_as_task(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        status: String,
+        acceptance_criteria: Vec<String>,
+        effort: Option<String>,
+    ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
+        let _ = (workspace_id, note_id, status, acceptance_criteria, effort);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mark_as_task not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `task.convertBlocks`: `@@@task` blocks → linked child task notes (§5.4).
+    fn convert_task_blocks(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<TaskConvertBlocksResult>> {
+        let _ = (workspace_id, note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::convert_task_blocks not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `task.createPrerequisite`: create a child task note (PROTOCOL §5.4).
+    fn create_prerequisite(
+        &self,
+        workspace_id: WorkspaceId,
+        dependent_note_id: NoteId,
+        title: String,
+        content: Option<String>,
+        status: Option<String>,
+    ) -> BoxFuture<'_, Result<TaskCreatePrerequisiteResult>> {
+        let _ = (workspace_id, dependent_note_id, title, content, status);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::create_prerequisite not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `task.assignAgent`: append an agent to a task's assignee list (§5.4).
+    fn assign_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        agent_id: String,
+    ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
+        let _ = (workspace_id, note_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::assign_agent not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `comment.add`: text-anchored comment via searchContext + commentTarget (§5.3).
+    #[allow(clippy::too_many_arguments)]
+    fn comment_add(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        search_context: String,
+        comment_target: String,
+        comment: String,
+        kind: Option<String>,
+        author: Option<String>,
+    ) -> BoxFuture<'_, Result<CommentAddResult>> {
+        let _ = (
+            workspace_id,
+            note_id,
+            search_context,
+            comment_target,
+            comment,
+            kind,
+            author,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::comment_add not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `comment.list`: thread summaries with optional filters (PROTOCOL §5.3).
+    fn comment_list(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        since: Option<String>,
+        author_type: Option<String>,
+        status: Option<String>,
+        include_comments: bool,
+    ) -> BoxFuture<'_, Result<CommentListResult>> {
+        let _ = (
+            workspace_id,
+            note_id,
+            since,
+            author_type,
+            status,
+            include_comments,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::comment_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `comment.getThread`: one thread by `threadId` or `commentId` (§5.3).
+    fn comment_get_thread(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        thread_id: Option<String>,
+        comment_id: Option<String>,
+    ) -> BoxFuture<'_, Result<CommentGetThreadResult>> {
+        let _ = (workspace_id, note_id, thread_id, comment_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::comment_get_thread not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `comment.respond`: add a reply to a thread (PROTOCOL §5.3).
+    #[allow(clippy::too_many_arguments)]
+    fn comment_respond(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        thread_id: Option<String>,
+        comment_id: Option<String>,
+        comment: String,
+        kind: Option<String>,
+        author: Option<String>,
+        suggestion_original: Option<String>,
+        suggestion_proposed: Option<String>,
+    ) -> BoxFuture<'_, Result<CommentRespondResult>> {
+        let _ = (
+            workspace_id,
+            note_id,
+            thread_id,
+            comment_id,
+            comment,
+            kind,
+            author,
+            suggestion_original,
+            suggestion_proposed,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::comment_respond not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `comment.delete`: remove a comment by id (PROTOCOL §5.3).
+    fn comment_delete(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        comment_id: String,
+    ) -> BoxFuture<'_, Result<CommentDeleteResult>> {
+        let _ = (workspace_id, note_id, comment_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::comment_delete not implemented".to_string(),
             ))
         })
     }

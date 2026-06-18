@@ -21,17 +21,22 @@ pub mod events {
     pub enum Event {}
 }
 
-pub use clock::now_iso;
+pub use clock::{now_iso, parse_iso};
 pub use config::Config;
 pub use error::{Error, Result};
 pub use events::Event;
 pub use ids::{AgentId, NoteId, WorkspaceId};
 pub use model::{
-    AuthorType, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentThread,
-    CommentType, ContentType, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
-    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteSetContentResult,
-    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult,
-    TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceCreate,
-    WorkspaceStatus, WorkspaceUpdate,
+    AnchorContext, AuthorType, Comment, CommentAddResult, CommentAnchor, CommentAnchorType,
+    CommentDeleteResult, CommentGetThreadResult, CommentListResult, CommentLocation,
+    CommentRespondResult, CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary,
+    CommentType, CommentWire, ContentType, Note, NoteAddInput, NoteAddResult, NoteCreate,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility,
+    ReadAssetResult, SuggestionDiff, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata,
+    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceCreate, WorkspaceStatus,
+    WorkspaceUpdate,
 };
 pub use traits::{BoxFuture, ContextEngine, WorkspaceApi};

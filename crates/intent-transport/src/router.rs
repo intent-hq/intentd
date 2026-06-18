@@ -332,6 +332,178 @@ async fn dispatch(
             let result = api.read_asset(ws, asset).await.map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        "task.updateStatus" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let task_text = require_str_param(params, "taskText")?;
+            let status = require_str_param(params, "status")?;
+            let result = api
+                .task_update_status(ws, note_id, task_text, status)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "task.updateNoteStatus" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let status = require_str_param(params, "status")?;
+            let result = api
+                .task_update_note_status(ws, note_id, status)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "task.update" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            require_present(params, "line")?;
+            // Non-numeric/absent coerce to 0 so the service emits the TS
+            // "Line number must be a positive integer" message.
+            let line = parse_int_loose(params.get("line")).unwrap_or(0);
+            let text = opt_str(params, "text");
+            let status = opt_str(params, "status");
+            let expected = opt_str(params, "expected");
+            let result = api
+                .task_update(ws, note_id, line, text, status, expected)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "task.getMyTask" => {
+            let ws = require_ws_note(params)?;
+            let task_note_id = require_str_param(params, "taskNoteId").map(NoteId::from)?;
+            let result = api
+                .get_my_task(ws, task_note_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "task.markAsTask" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let status = require_str_param(params, "status")?;
+            let acceptance_criteria = normalize_acceptance_criteria(params);
+            let effort = opt_str(params, "effort");
+            let result = api
+                .mark_as_task(ws, note_id, status, acceptance_criteria, effort)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "task.convertBlocks" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let result = api
+                .convert_task_blocks(ws, note_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "task.createPrerequisite" => {
+            let ws = require_ws_note(params)?;
+            let dependent_note_id =
+                require_str_param(params, "dependentNoteId").map(NoteId::from)?;
+            let title = require_str_param(params, "title")?;
+            let content = opt_str(params, "content");
+            let status = opt_str(params, "status");
+            let result = api
+                .create_prerequisite(ws, dependent_note_id, title, content, status)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "task.assignAgent" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let agent_id = require_str_param(params, "agentId")?;
+            let result = api
+                .assign_agent(ws, note_id, agent_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "comment.add" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let search_context = require_str_param(params, "searchContext")?;
+            let comment_target = require_str_param(params, "commentTarget")?;
+            let comment = require_str_param(params, "comment")?;
+            let kind = opt_str(params, "type");
+            let author = opt_str(params, "author");
+            let result = api
+                .comment_add(
+                    ws,
+                    note_id,
+                    search_context,
+                    comment_target,
+                    comment,
+                    kind,
+                    author,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "comment.list" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let since = opt_str(params, "since");
+            let author_type = opt_str(params, "authorType");
+            let status = opt_str(params, "status");
+            let include_comments = parse_bool(params, "includeComments");
+            let result = api
+                .comment_list(ws, note_id, since, author_type, status, include_comments)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "comment.getThread" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let thread_id = opt_str(params, "threadId");
+            let comment_id = opt_str(params, "commentId");
+            let result = api
+                .comment_get_thread(ws, note_id, thread_id, comment_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "comment.respond" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let comment = require_str_param(params, "comment")?;
+            let thread_id = opt_str(params, "threadId");
+            let comment_id = opt_str(params, "commentId");
+            let kind = opt_str(params, "type");
+            let author = opt_str(params, "author");
+            let suggestion_original = opt_str(params, "suggestionOriginal");
+            let suggestion_proposed = opt_str(params, "suggestionProposed");
+            let result = api
+                .comment_respond(
+                    ws,
+                    note_id,
+                    thread_id,
+                    comment_id,
+                    comment,
+                    kind,
+                    author,
+                    suggestion_original,
+                    suggestion_proposed,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "comment.delete" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let comment_id = require_str_param(params, "commentId")?;
+            let result = api
+                .comment_delete(ws, note_id, comment_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }
@@ -405,6 +577,33 @@ fn parse_confirm(params: &Map<String, Value>) -> bool {
         Some(Value::Bool(b)) => *b,
         Some(Value::String(s)) => s == "true",
         _ => false,
+    }
+}
+
+/// Parse a boolean flag param: a real bool, or the string `"true"`.
+fn parse_bool(params: &Map<String, Value>, name: &str) -> bool {
+    match params.get(name) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s == "true",
+        _ => false,
+    }
+}
+
+/// Normalize `task.markAsTask` `acceptanceCriteria`: a string array as-is, a
+/// JSON-array string parsed, or any other string wrapped as a single entry
+/// (mirrors the TS `Array.isArray ? … : JSON.parse(…) ?? [value]` branch).
+fn normalize_acceptance_criteria(params: &Map<String, Value>) -> Vec<String> {
+    match params.get("acceptanceCriteria") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        Some(Value::String(s)) => match serde_json::from_str::<Vec<String>>(s) {
+            Ok(v) => v,
+            Err(_) => vec![s.clone()],
+        },
+        _ => Vec::new(),
     }
 }
 

@@ -254,3 +254,288 @@ async fn read_asset_reads_base64_from_assets_root() {
     assert_eq!(r.data, "aGVsbG8="); // base64("hello")
     let _ = std::fs::remove_dir_all(root);
 }
+
+// ---------------------------------------------------------------------------
+// task.* tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn task_update_atomic_and_conflict() {
+    let (_tmp, svc, ws, id) = setup("intro\n- [ ] do the thing\ntail").await;
+    // Atomic status-only update on line 2.
+    let r = svc
+        .task_update(
+            ws.clone(),
+            id.clone(),
+            2,
+            None,
+            Some("done".into()),
+            Some("do the thing".into()),
+        )
+        .await
+        .expect("update");
+    assert_eq!(r.status, "done");
+    assert_eq!(r.previous_text, "do the thing");
+    assert_eq!(
+        svc.get_note(ws.clone(), id.clone()).await.unwrap().content,
+        "intro\n- [x] do the thing\ntail"
+    );
+    // Conflict: the expected text no longer matches.
+    let err = svc
+        .task_update(
+            ws,
+            id,
+            2,
+            None,
+            Some("todo".into()),
+            Some("stale text".into()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Internal(ref m) if m.contains("Conflict detected")));
+}
+
+#[tokio::test]
+async fn task_update_status_and_not_found() {
+    let (_tmp, svc, ws, id) = setup("- [ ] alpha\n- [ ] beta").await;
+    let r = svc
+        .task_update_status(ws.clone(), id.clone(), "beta".into(), "in-progress".into())
+        .await
+        .expect("updateStatus");
+    assert_eq!(r.status, "in-progress");
+    assert_eq!(
+        svc.get_note(ws.clone(), id.clone()).await.unwrap().content,
+        "- [ ] alpha\n- [/] beta"
+    );
+    assert!(svc
+        .task_update_status(ws, id, "ghost".into(), "done".into())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn mark_as_task_then_update_note_status_and_get_my_task() {
+    let (_tmp, svc, ws, id) = setup("# Parent task").await;
+    let marked = svc
+        .mark_as_task(
+            ws.clone(),
+            id.clone(),
+            "not_started".into(),
+            vec!["criterion one".into()],
+            Some("M".into()),
+        )
+        .await
+        .expect("markAsTask");
+    assert_eq!(marked.status, intent_core::TaskStatus::NotStarted);
+
+    // updateNoteStatus → in_progress sets startedAt.
+    let upd = svc
+        .task_update_note_status(ws.clone(), id.clone(), "in_progress".into())
+        .await
+        .expect("updateNoteStatus");
+    assert_eq!(upd.status, intent_core::TaskStatus::InProgress);
+    assert!(upd.note.task.as_ref().unwrap().started_at.is_some());
+
+    // Invalid status string rejected with the TS-style message.
+    assert!(svc
+        .task_update_note_status(ws.clone(), id.clone(), "bogus".into())
+        .await
+        .is_err());
+
+    // createPrerequisite makes a child; getMyTask reports it as a subtask.
+    let prereq = svc
+        .create_prerequisite(
+            ws.clone(),
+            id.clone(),
+            "Child Step".into(),
+            Some("details".into()),
+            None,
+        )
+        .await
+        .expect("createPrerequisite");
+    assert_eq!(prereq.title, "Child Step");
+
+    let mine = svc.get_my_task(ws, id).await.expect("getMyTask");
+    assert_eq!(
+        mine.task_metadata.acceptance_criteria,
+        vec!["criterion one"]
+    );
+    assert_eq!(mine.subtasks.len(), 1);
+    assert_eq!(mine.subtasks[0].title, "Child Step");
+    assert_eq!(mine.subtasks[0].status, "not_started");
+}
+
+#[tokio::test]
+async fn assign_agent_validates_and_starts_task() {
+    let (_tmp, svc, ws, id) = setup("# Task").await;
+    svc.mark_as_task(ws.clone(), id.clone(), "not_started".into(), vec![], None)
+        .await
+        .expect("markAsTask");
+    // Bad agent id → error.
+    assert!(svc
+        .assign_agent(ws.clone(), id.clone(), "not-an-agent".into())
+        .await
+        .is_err());
+    // Valid agent id → assigned and status flips to in_progress.
+    let agent = "agent-b0a8044a-5eac-4b52-8456-15d3b784decb";
+    let r = svc
+        .assign_agent(ws.clone(), id.clone(), agent.into())
+        .await
+        .expect("assignAgent");
+    assert_eq!(r.agent_id.0, agent);
+    let note = svc.get_note(ws, id).await.unwrap();
+    let task = note.task.unwrap();
+    assert_eq!(task.status, intent_core::TaskStatus::InProgress);
+    assert_eq!(task.assigned_agent_ids[0].0, agent);
+}
+
+#[tokio::test]
+async fn convert_blocks_creates_children_idempotently() {
+    let content = "intro\n@@@task\n# Build API\nBuild the thing.\n@@@\ntail";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone())
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 1);
+    assert_eq!(r.created_note_ids.len(), 1);
+    let updated = svc.get_note(ws.clone(), id.clone()).await.unwrap();
+    assert!(updated
+        .content
+        .contains("- [ ] [Build API](intent://local/task/"));
+    assert!(!updated.content.contains("@@@task"));
+
+    // Re-running is idempotent: the existing child is reused, none created.
+    let r2 = svc
+        .convert_task_blocks(ws, id)
+        .await
+        .expect("convertBlocks2");
+    assert_eq!(r2.converted_count, 0);
+    assert!(r2.created_note_ids.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// comment.* tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn comment_add_unique_match_anchors_and_persists() {
+    let (_tmp, svc, ws, id) = setup("Hello world, this is a test sentence.").await;
+    let r = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "this is a test sentence".into(),
+            "test".into(),
+            "nice".into(),
+            None,
+            None,
+        )
+        .await
+        .expect("comment.add");
+    assert!(r.anchored);
+    assert_eq!(r.location.anchored_text, "test");
+    let note = svc.get_note(ws.clone(), id.clone()).await.unwrap();
+    assert!(note.content.contains(&format!(
+        "<!--anchor:{}:start-->test<!--anchor:{}:end-->",
+        r.comment_id, r.comment_id
+    )));
+
+    // The thread is listed with the comment included.
+    let list = svc
+        .comment_list(ws, id, None, None, None, true)
+        .await
+        .expect("list");
+    assert_eq!(list.total_threads, 1);
+    assert_eq!(list.threads[0].targeted_text.as_deref(), Some("test"));
+    assert_eq!(list.threads[0].comments.as_ref().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn comment_add_ambiguous_context_errors() {
+    let (_tmp, svc, ws, id) = setup("repeat repeat").await;
+    let err = svc
+        .comment_add(
+            ws,
+            id,
+            "repeat".into(),
+            "repeat".into(),
+            "c".into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Internal(ref m) if m.contains("appears multiple times in the document"))
+    );
+}
+
+#[tokio::test]
+async fn comment_respond_suggestion_nests_diff_and_threads() {
+    let (_tmp, svc, ws, id) = setup("alpha unique-target omega").await;
+    let added = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "alpha unique-target omega".into(),
+            "unique-target".into(),
+            "root".into(),
+            None,
+            None,
+        )
+        .await
+        .expect("add");
+
+    // Suggestion requires both original + proposed.
+    assert!(svc
+        .comment_respond(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some(added.comment_id.clone()),
+            "please change".into(),
+            Some("suggestion".into()),
+            None,
+            Some("only-original".into()),
+            None,
+        )
+        .await
+        .is_err());
+
+    let resp = svc
+        .comment_respond(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some(added.comment_id.clone()),
+            "please change".into(),
+            Some("suggestion".into()),
+            Some("Bob".into()),
+            Some("old text".into()),
+            Some("new text".into()),
+        )
+        .await
+        .expect("respond");
+    // The wire DTO nests suggestionDiff.
+    let diff = resp.comment.suggestion_diff.expect("diff");
+    assert_eq!(diff.original, "old text");
+    assert_eq!(diff.proposed, "new text");
+    assert_eq!(resp.thread.total_comments, 2);
+
+    // getThread returns the root + one reply.
+    let thread = svc
+        .comment_get_thread(ws.clone(), id.clone(), Some(added.comment_id.clone()), None)
+        .await
+        .expect("getThread");
+    assert_eq!(thread.total_comments, 2);
+    assert_eq!(thread.replies.len(), 1);
+    assert_eq!(thread.root_comment.id, added.comment_id);
+
+    // delete removes the root comment.
+    let del = svc
+        .comment_delete(ws, id, added.comment_id)
+        .await
+        .expect("delete");
+    assert!(del.success);
+}
