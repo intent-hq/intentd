@@ -53,6 +53,35 @@ impl Store {
             .map_err(|e| Error::Internal(format!("list notes failed: {e}")))?;
         rows.iter().map(map_note_row).collect()
     }
+
+    /// Fetch a single note by id, or `NotFound`.
+    pub async fn get_note(&self, id: &NoteId) -> Result<Note> {
+        let sql = format!("SELECT {NOTE_COLUMNS} FROM note WHERE id = ?");
+        let row = sqlx::query(&sql)
+            .bind(&id.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get note failed: {e}")))?;
+        match row {
+            Some(r) => map_note_row(&r),
+            None => Err(Error::NotFound(format!("note {id}"))),
+        }
+    }
+
+    /// List a workspace's task notes (those carrying `task_json`), using the
+    /// `idx_note_task` partial index. Ordered by creation time.
+    pub async fn list_tasks(&self, workspace_id: &WorkspaceId) -> Result<Vec<Note>> {
+        let sql = format!(
+            "SELECT {NOTE_COLUMNS} FROM note WHERE workspace_id = ? AND task_json IS NOT NULL \
+             ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list tasks failed: {e}")))?;
+        rows.iter().map(map_note_row).collect()
+    }
 }
 
 fn col<'r, T>(row: &'r SqliteRow, name: &str) -> Result<T>

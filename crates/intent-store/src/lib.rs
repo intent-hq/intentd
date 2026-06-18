@@ -12,6 +12,7 @@ use sqlx::SqlitePool;
 
 pub use intent_core::{Error, Result};
 
+mod comment_repo;
 mod note_repo;
 mod workspace_repo;
 
