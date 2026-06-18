@@ -68,6 +68,58 @@ impl Store {
         }
     }
 
+    /// Update an existing note (full-row replace, except `id`), or `NotFound`.
+    /// `task` is stored opaquely as `task_json` TEXT.
+    pub async fn update_note(&self, note: &Note) -> Result<()> {
+        let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
+        let task_json = match &note.task {
+            Some(v) => Some(
+                serde_json::to_string(v)
+                    .map_err(|e| Error::Internal(format!("encode task_json failed: {e}")))?,
+            ),
+            None => None,
+        };
+        let res = sqlx::query(
+            "UPDATE note SET workspace_id=?, title=?, content=?, content_type=?, tags=?, \
+             is_pinned=?, is_archived=?, is_default=?, parent_id=?, visibility=?, task_json=?, \
+             created_at=?, updated_at=? WHERE id=?",
+        )
+        .bind(&note.workspace_id.0)
+        .bind(&note.title)
+        .bind(&note.content)
+        .bind(enum_to_db(&note.content_type)?)
+        .bind(tags_to_db(&note.tags)?)
+        .bind(note.is_pinned as i64)
+        .bind(note.is_archived as i64)
+        .bind(note.is_default as i64)
+        .bind(parent_id)
+        .bind(enum_to_db(&note.visibility)?)
+        .bind(task_json)
+        .bind(&note.created_at)
+        .bind(&note.updated_at)
+        .bind(&note.id.0)
+        .execute(self.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("update note failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("note {}", note.id)));
+        }
+        Ok(())
+    }
+
+    /// Delete a note by id, or `NotFound`.
+    pub async fn delete_note(&self, id: &NoteId) -> Result<()> {
+        let res = sqlx::query("DELETE FROM note WHERE id = ?")
+            .bind(&id.0)
+            .execute(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("delete note failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("note {id}")));
+        }
+        Ok(())
+    }
+
     /// List a workspace's task notes (those carrying `task_json`), using the
     /// `idx_note_task` partial index. Ordered by creation time.
     pub async fn list_tasks(&self, workspace_id: &WorkspaceId) -> Result<Vec<Note>> {
