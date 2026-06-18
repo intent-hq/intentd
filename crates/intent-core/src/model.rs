@@ -311,6 +311,164 @@ pub struct CommentThread {
     pub comments: Vec<Comment>,
 }
 
+/// Wire input for `note.create` (PROTOCOL §5.2). `title` is required; the
+/// service fills ids/timestamps/defaults. Built by the router from request
+/// params.
+#[derive(Debug, Clone, Default)]
+pub struct NoteCreate {
+    pub title: String,
+    pub content: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub parent_id: Option<String>,
+}
+
+/// Wire input for the CRUD `note.update` path (PROTOCOL §5.2). `content`
+/// present → raw full-content set; otherwise `title`/`tags` metadata update.
+#[derive(Debug, Clone, Default)]
+pub struct NoteUpdateInput {
+    pub content: Option<String>,
+    pub title: Option<String>,
+    pub tags: Option<Vec<String>>,
+}
+
+/// Wire input for `note.add` (PROTOCOL §5.2).
+#[derive(Debug, Clone, Default)]
+pub struct NoteAddInput {
+    pub content: String,
+    pub heading: Option<String>,
+    pub position: Option<String>,
+}
+
+/// Wire input for `note.edit` (PROTOCOL §5.2).
+#[derive(Debug, Clone, Default)]
+pub struct NoteEditInput {
+    pub old: String,
+    pub new: String,
+}
+
+/// Wire input for `note.editLines` (PROTOCOL §5.2); 1-based inclusive lines.
+#[derive(Debug, Clone, Default)]
+pub struct NoteEditLinesInput {
+    pub start: i64,
+    pub end: i64,
+    pub content: String,
+}
+
+/// Result of `note.add` — mirrors the TS `ws.note.add` peer return shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteAddResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    pub added_length: usize,
+    pub total_length: usize,
+    pub position: String,
+    pub old_content: String,
+    pub new_content: String,
+    pub converted_count: i64,
+    pub created_task_note_ids: Vec<String>,
+}
+
+/// Result of `note.edit` — first exact-match replacement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteEditResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    pub old_text_length: usize,
+    pub new_text_length: usize,
+    /// Scalar (char) offset of the match, or `-1` when the note was empty.
+    pub match_position: i64,
+    pub old_content: String,
+    pub new_content: String,
+    pub converted_count: i64,
+    pub created_task_note_ids: Vec<String>,
+}
+
+/// Result of `note.editLines` — 1-based inclusive replace/delete/insert.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteEditLinesResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub total_lines_before: usize,
+    pub total_lines_after: usize,
+    pub old_content: String,
+    pub new_content: String,
+    pub converted_count: i64,
+    pub created_task_note_ids: Vec<String>,
+}
+
+/// Result of `note.setContent` — full replace with the reduction guard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteSetContentResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_title: Option<String>,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_content: Option<String>,
+    pub new_content: String,
+    pub converted_count: i64,
+    pub created_task_note_ids: Vec<String>,
+}
+
+/// Result of `note.updateMetadata`. Either a normal title/tags update or a
+/// `skipped` response (spec title cannot be modified).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteUpdateMetadataResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Result of `note.delete`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteDeleteResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    pub deleted: bool,
+}
+
+/// One parsed checkbox row returned by `note.listTasks`. `taskNoteId` is
+/// serialized as `null` when the row has no `intent://local/task/<id>` link.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteTaskRow {
+    pub line_number: usize,
+    pub text: String,
+    pub status: String,
+    pub task_note_id: Option<String>,
+    pub linked_task_note_id: Option<String>,
+}
+
+/// Result of `note.readAsset` (PROTOCOL §5.2). `data` is base64; `sizeKb` is
+/// rounded from the base64 string length to match the TS peer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadAssetResult {
+    pub asset_id: String,
+    pub mime_type: String,
+    pub data: String,
+    pub size_kb: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

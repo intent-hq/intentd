@@ -4,8 +4,13 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::error::{Error, Result};
-use crate::ids::WorkspaceId;
-use crate::model::{Note, Workspace, WorkspaceCreate, WorkspaceUpdate};
+use crate::ids::{NoteId, WorkspaceId};
+use crate::model::{
+    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteSetContentResult, NoteTaskRow,
+    NoteUpdateInput, NoteUpdateMetadataResult, ReadAssetResult, Workspace, WorkspaceCreate,
+    WorkspaceUpdate,
+};
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
 /// as `Arc<dyn WorkspaceApi>` (the agent→BE callback handle, §6.8).
@@ -117,6 +122,164 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::list_notes not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Fetch one note by id, scoped to the workspace (PROTOCOL §5.2).
+    fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
+        let _ = (workspace_id, note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::get_note not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Create a note from wire input (PROTOCOL §5.2).
+    fn create_note(
+        &self,
+        workspace_id: WorkspaceId,
+        input: NoteCreate,
+    ) -> BoxFuture<'_, Result<Note>> {
+        let _ = (workspace_id, input);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::create_note not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// CRUD `note.update`: raw content set, or title/tags metadata (PROTOCOL §5.2).
+    fn update_note(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        input: NoteUpdateInput,
+    ) -> BoxFuture<'_, Result<Note>> {
+        let _ = (workspace_id, note_id, input);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::update_note not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.add`: append/prepend/insert content (PROTOCOL §5.2).
+    fn add_to_note(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        input: NoteAddInput,
+    ) -> BoxFuture<'_, Result<NoteAddResult>> {
+        let _ = (workspace_id, note_id, input);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::add_to_note not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.edit`: first exact-match replacement (PROTOCOL §5.2).
+    fn edit_note(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        input: NoteEditInput,
+    ) -> BoxFuture<'_, Result<NoteEditResult>> {
+        let _ = (workspace_id, note_id, input);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::edit_note not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.editLines`: 1-based inclusive line replace/delete/insert (PROTOCOL §5.2).
+    fn edit_note_lines(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        input: NoteEditLinesInput,
+    ) -> BoxFuture<'_, Result<NoteEditLinesResult>> {
+        let _ = (workspace_id, note_id, input);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::edit_note_lines not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.setContent`: full replace with the reduction guard (PROTOCOL §5.2).
+    fn set_note_content(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        content: String,
+        confirm_replacement: bool,
+    ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
+        let _ = (workspace_id, note_id, content, confirm_replacement);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::set_note_content not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.updateMetadata`: title/tags (spec title is skipped) (PROTOCOL §5.2).
+    fn update_note_metadata(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        title: Option<String>,
+        tags: Option<Vec<String>>,
+    ) -> BoxFuture<'_, Result<NoteUpdateMetadataResult>> {
+        let _ = (workspace_id, note_id, title, tags);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::update_note_metadata not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.delete`: remove a note (PROTOCOL §5.2).
+    fn delete_note(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<NoteDeleteResult>> {
+        let _ = (workspace_id, note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::delete_note not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.listTasks`: parse checkbox rows from a note's content (PROTOCOL §5.2).
+    fn list_note_tasks(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<Vec<NoteTaskRow>>> {
+        let _ = (workspace_id, note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::list_note_tasks not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.readAsset`: read an asset (id or `workspace-asset://` URL) (PROTOCOL §5.2).
+    fn read_asset(
+        &self,
+        workspace_id: WorkspaceId,
+        asset: String,
+    ) -> BoxFuture<'_, Result<ReadAssetResult>> {
+        let _ = (workspace_id, asset);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::read_asset not implemented".to_string(),
             ))
         })
     }
