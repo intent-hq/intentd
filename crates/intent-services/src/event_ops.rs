@@ -164,7 +164,7 @@ pub fn build_workspace_summary(all_events: &[Event], minutes_ago: i64) -> Worksp
             }
         })
         .collect();
-    top_changed_files.sort_by(|a, b| b.change_count.cmp(&a.change_count));
+    top_changed_files.sort_by_key(|b| std::cmp::Reverse(b.change_count));
     top_changed_files.truncate(5);
 
     WorkspaceEventSummary {
