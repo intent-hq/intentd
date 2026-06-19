@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use intent_core::{Error, Result, Workspace};
 use intent_sourcecontrol::{
-    CheckRun, CheckState, PrState, PullRequest, Review, ReviewComment, ReviewThread,
+    CheckRun, CheckState, MergeMethod, PrState, PullRequest, Review, ReviewComment, ReviewThread,
     ReviewThreadComment, ReviewVerdict, SourceControl, SourceControlRegistry,
     SourceControlSettings,
 };
@@ -297,6 +297,318 @@ pub(crate) fn fallback_threads(mut comments: Vec<ReviewComment>) -> Vec<ReviewTh
     order.into_iter().filter_map(|id| map.remove(&id)).collect()
 }
 
+// ===========================================================================
+// `pr.*` write/action glue (PROTOCOL §5.7, IMPLEMENTATION_SPEC §7.5).
+// ===========================================================================
+
+/// `pr.waitForChanges` safety padding (TS `SAFETY_PADDING_SECONDS`).
+pub(crate) const SAFETY_PADDING_SECONDS: u64 = 10;
+
+/// Validate/default the `pr.merge` `mergeMethod` (TS `validateMergeMethod`,
+/// default `merge`); an invalid value throws → `-32603`.
+pub(crate) fn validate_merge_method(method: Option<String>) -> Result<MergeMethod> {
+    match method.as_deref() {
+        None | Some("merge") => Ok(MergeMethod::Merge),
+        Some("squash") => Ok(MergeMethod::Squash),
+        Some("rebase") => Ok(MergeMethod::Rebase),
+        Some(_) => Err(Error::Internal(
+            "mergeMethod must be one of: merge, squash, rebase".to_string(),
+        )),
+    }
+}
+
+/// Wire word for a [`MergeMethod`] (echoed back in the `pr.merge` result).
+pub(crate) fn merge_method_word(method: MergeMethod) -> &'static str {
+    match method {
+        MergeMethod::Merge => "merge",
+        MergeMethod::Squash => "squash",
+        MergeMethod::Rebase => "rebase",
+    }
+}
+
+/// Validate/default the `pr.waitForChanges` `watch` mode (TS
+/// `validateWatchMode`, default `any`).
+pub(crate) fn validate_watch_mode(watch: Option<String>) -> Result<String> {
+    match watch.as_deref() {
+        None => Ok("any".to_string()),
+        Some(s @ ("any" | "checks" | "state" | "commits")) => Ok(s.to_string()),
+        Some(_) => Err(Error::Internal(
+            "watch must be one of: any, checks, state, commits".to_string(),
+        )),
+    }
+}
+
+/// Validate/default the `pr.resolveThread` `action` (TS
+/// `validateResolveThreadAction`, default `resolve`).
+pub(crate) fn validate_resolve_action(action: Option<String>) -> Result<String> {
+    match action.as_deref() {
+        None => Ok("resolve".to_string()),
+        Some(s @ ("resolve" | "unresolve")) => Ok(s.to_string()),
+        Some(_) => Err(Error::Internal(
+            "action must be one of: resolve, unresolve".to_string(),
+        )),
+    }
+}
+
+/// Validate the `pr.createReview` `verdict` onto a [`ReviewVerdict`] (§5.18
+/// kebab-case wire values).
+pub(crate) fn validate_review_verdict(verdict: &str) -> Result<ReviewVerdict> {
+    match verdict {
+        "approve" => Ok(ReviewVerdict::Approve),
+        "request-changes" => Ok(ReviewVerdict::RequestChanges),
+        "comment" => Ok(ReviewVerdict::Comment),
+        _ => Err(Error::Internal(
+            "verdict must be one of: approve, request-changes, comment".to_string(),
+        )),
+    }
+}
+
+/// Clamp the `pr.waitForChanges` timeout to `[10, 600]` seconds (default 300).
+pub(crate) fn clamp_timeout(secs: Option<i64>) -> u64 {
+    secs.unwrap_or(300).clamp(10, 600) as u64
+}
+
+/// Clamp the `pr.waitForChanges` poll interval to `[10, 60]` seconds (default 15).
+pub(crate) fn clamp_poll_interval(secs: Option<i64>) -> u64 {
+    secs.unwrap_or(15).clamp(10, 60) as u64
+}
+
+/// Source for a snapshot's check-runs: not attempted (no head SHA), fetched, or
+/// the fetch failed (TS distinguishes the empty-vs-failed cases).
+pub(crate) enum CheckFetch {
+    NotAttempted,
+    Ok(Vec<CheckRun>),
+    Failed,
+}
+
+/// A single check-run within a poll snapshot (name + normalized state word).
+#[derive(Clone)]
+pub(crate) struct CheckSnap {
+    pub name: String,
+    pub status: String,
+}
+
+/// A `pr.waitForChanges` poll snapshot (TS `PRSnapshot`).
+///
+/// PARITY NOTE: the host-agnostic [`CheckRun`] carries only the normalized
+/// [`CheckState`], so `status` here is that derived word rather than GitHub's
+/// raw `status`/`conclusion` pair; change detection compares the normalized
+/// state per check name.
+#[derive(Clone)]
+pub(crate) struct PrSnapshot {
+    pub head_sha: Option<String>,
+    pub state: String,
+    pub mergeable: Option<bool>,
+    pub mergeable_state: Option<String>,
+    pub updated_at: Option<String>,
+    pub check_runs: Vec<CheckSnap>,
+    pub check_runs_fetch_failed: bool,
+}
+
+/// Normalized lowercase word for a [`CheckState`].
+pub(crate) fn check_state_word(state: CheckState) -> &'static str {
+    match state {
+        CheckState::Pending => "pending",
+        CheckState::Success => "success",
+        CheckState::Failure => "failure",
+        CheckState::Neutral => "neutral",
+        CheckState::Cancelled => "cancelled",
+    }
+}
+
+/// Build a poll snapshot from a fetched PR and its check-runs (TS
+/// `captureSnapshot`).
+pub(crate) fn build_snapshot(pr: &PullRequest, checks: CheckFetch) -> PrSnapshot {
+    let (check_runs, failed) = match checks {
+        CheckFetch::NotAttempted => (Vec::new(), false),
+        CheckFetch::Failed => (Vec::new(), true),
+        CheckFetch::Ok(runs) => (
+            runs.into_iter()
+                .map(|r| CheckSnap {
+                    name: r.name,
+                    status: check_state_word(r.state).to_string(),
+                })
+                .collect(),
+            false,
+        ),
+    };
+    PrSnapshot {
+        head_sha: pr.head_sha.clone().filter(|s| !s.is_empty()),
+        state: derive_status_state(pr).to_string(),
+        mergeable: pr.mergeable,
+        mergeable_state: pr.mergeable_state.clone(),
+        updated_at: Some(pr.updated_at.clone()).filter(|s| !s.is_empty()),
+        check_runs,
+        check_runs_fetch_failed: failed,
+    }
+}
+
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(7)]
+}
+
+fn bool_word(b: Option<bool>) -> String {
+    match b {
+        Some(true) => "true".to_string(),
+        Some(false) => "false".to_string(),
+        None => "undefined".to_string(),
+    }
+}
+
+/// Diff two snapshots under a `watch` mode (TS `detectChanges`).
+pub(crate) fn detect_changes(
+    initial: &PrSnapshot,
+    current: &PrSnapshot,
+    watch: &str,
+) -> Vec<String> {
+    let mut changes: Vec<String> = Vec::new();
+
+    if watch == "any" || watch == "commits" {
+        if let (Some(i), Some(c)) = (&initial.head_sha, &current.head_sha) {
+            if i != c {
+                changes.push(format!("New commit: {} → {}", short_sha(i), short_sha(c)));
+            }
+        }
+    }
+
+    if watch == "any" || watch == "state" {
+        if initial.state != current.state {
+            changes.push(format!(
+                "State changed: {} → {}",
+                initial.state, current.state
+            ));
+        }
+        if initial.mergeable != current.mergeable {
+            changes.push(format!(
+                "Mergeable changed: {} → {}",
+                bool_word(initial.mergeable),
+                bool_word(current.mergeable)
+            ));
+        }
+        if initial.mergeable_state != current.mergeable_state {
+            let unknown = || "unknown".to_string();
+            changes.push(format!(
+                "Mergeable state changed: {} → {}",
+                initial.mergeable_state.clone().unwrap_or_else(unknown),
+                current.mergeable_state.clone().unwrap_or_else(unknown)
+            ));
+        }
+    }
+
+    if (watch == "any" || watch == "checks")
+        && !initial.check_runs_fetch_failed
+        && !current.check_runs_fetch_failed
+    {
+        let initial_map: HashMap<&str, &str> = initial
+            .check_runs
+            .iter()
+            .map(|c| (c.name.as_str(), c.status.as_str()))
+            .collect();
+        for c in &current.check_runs {
+            match initial_map.get(c.name.as_str()) {
+                None => changes.push(format!("New check: {} ({})", c.name, c.status)),
+                Some(prev) if *prev != c.status.as_str() => {
+                    changes.push(format!("Check \"{}\": {} → {}", c.name, prev, c.status))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if watch == "any" {
+        if let (Some(i), Some(c)) = (&initial.updated_at, &current.updated_at) {
+            if i != c && changes.is_empty() {
+                changes.push(format!("PR updated: {i} → {c}"));
+            }
+        }
+    }
+
+    changes
+}
+
+/// Emoji for a normalized check status (TS `getCheckIcon`, adapted to the
+/// normalized [`CheckState`] words).
+pub(crate) fn check_icon(status: &str) -> &'static str {
+    match status {
+        "success" => "✅",
+        "failure" => "❌",
+        "cancelled" => "🚫",
+        "neutral" => "⏭️",
+        "pending" => "🔄",
+        _ => "•",
+    }
+}
+
+/// Human-readable change summary (TS `formatChangeSummary`).
+pub(crate) fn format_change_summary(
+    changes: &[String],
+    snapshot: &PrSnapshot,
+    elapsed_seconds: u64,
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!(
+        "✅ PR changes detected after {elapsed_seconds} seconds:"
+    ));
+    lines.push(String::new());
+    for c in changes {
+        lines.push(format!("  • {c}"));
+    }
+    lines.push(String::new());
+    lines.push("--- Current State ---".to_string());
+    lines.push(format!("State: {}", snapshot.state));
+    lines.push(format!(
+        "Head SHA: {}",
+        snapshot
+            .head_sha
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
+    lines.push(format!(
+        "Mergeable: {}",
+        snapshot
+            .mergeable
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
+    lines.push(format!(
+        "Mergeable State: {}",
+        snapshot
+            .mergeable_state
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
+    if !snapshot.check_runs.is_empty() {
+        lines.push(String::new());
+        lines.push("Check Runs:".to_string());
+        for c in &snapshot.check_runs {
+            lines.push(format!(
+                "  {} {}: {}",
+                check_icon(&c.status),
+                c.name,
+                c.status
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Render a snapshot to the `pr.waitForChanges` wire shape (TS `PRSnapshot`).
+pub(crate) fn snapshot_json(s: &PrSnapshot) -> Value {
+    json!({
+        "headSha": s.head_sha,
+        "state": s.state,
+        "mergeable": s.mergeable,
+        "mergeableState": s.mergeable_state,
+        "updatedAt": s.updated_at,
+        "checkRuns": s.check_runs.iter().map(|c| json!({
+            "name": c.name,
+            "status": c.status,
+        })).collect::<Vec<_>>(),
+        "checkRunsFetchFailed": s.check_runs_fetch_failed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +774,89 @@ mod tests {
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].id, "rest-thread-10");
         assert_eq!(threads[0].comments.len(), 2);
+    }
+
+    #[test]
+    fn validates_merge_method_with_default() {
+        assert_eq!(validate_merge_method(None).unwrap(), MergeMethod::Merge);
+        assert_eq!(
+            validate_merge_method(Some("squash".into())).unwrap(),
+            MergeMethod::Squash
+        );
+        assert_eq!(
+            validate_merge_method(Some("rebase".into())).unwrap(),
+            MergeMethod::Rebase
+        );
+        assert!(validate_merge_method(Some("bad".into())).is_err());
+        assert_eq!(merge_method_word(MergeMethod::Squash), "squash");
+    }
+
+    #[test]
+    fn validates_watch_action_verdict() {
+        assert_eq!(validate_watch_mode(None).unwrap(), "any");
+        assert_eq!(
+            validate_watch_mode(Some("checks".into())).unwrap(),
+            "checks"
+        );
+        assert!(validate_watch_mode(Some("nope".into())).is_err());
+        assert_eq!(validate_resolve_action(None).unwrap(), "resolve");
+        assert_eq!(
+            validate_resolve_action(Some("unresolve".into())).unwrap(),
+            "unresolve"
+        );
+        assert!(validate_resolve_action(Some("x".into())).is_err());
+        assert_eq!(
+            validate_review_verdict("request-changes").unwrap(),
+            ReviewVerdict::RequestChanges
+        );
+        assert!(validate_review_verdict("nope").is_err());
+    }
+
+    #[test]
+    fn clamps_wait_knobs() {
+        assert_eq!(clamp_timeout(None), 300);
+        assert_eq!(clamp_timeout(Some(5)), 10);
+        assert_eq!(clamp_timeout(Some(9000)), 600);
+        assert_eq!(clamp_poll_interval(None), 15);
+        assert_eq!(clamp_poll_interval(Some(1)), 10);
+        assert_eq!(clamp_poll_interval(Some(120)), 60);
+    }
+
+    fn snap(head: &str, state: &str, checks: Vec<(&str, &str)>, failed: bool) -> PrSnapshot {
+        PrSnapshot {
+            head_sha: Some(head.to_string()),
+            state: state.to_string(),
+            mergeable: Some(true),
+            mergeable_state: Some("clean".into()),
+            updated_at: Some("2026-01-01".into()),
+            check_runs: checks
+                .into_iter()
+                .map(|(n, s)| CheckSnap {
+                    name: n.into(),
+                    status: s.into(),
+                })
+                .collect(),
+            check_runs_fetch_failed: failed,
+        }
+    }
+
+    #[test]
+    fn detects_commit_and_check_changes() {
+        let a = snap("aaaaaaaa", "open", vec![("build", "pending")], false);
+        let b = snap("bbbbbbbb", "open", vec![("build", "success")], false);
+        let changes = detect_changes(&a, &b, "any");
+        assert!(changes.iter().any(|c| c.starts_with("New commit:")));
+        assert!(changes.iter().any(|c| c.contains("Check \"build\"")));
+
+        // `commits` watch ignores check transitions.
+        let only_commits = detect_changes(&a, &b, "commits");
+        assert_eq!(only_commits.len(), 1);
+        assert!(only_commits[0].starts_with("New commit:"));
+    }
+
+    #[test]
+    fn detects_no_changes_when_identical() {
+        let a = snap("aaaaaaaa", "open", vec![("build", "success")], false);
+        assert!(detect_changes(&a, &a, "any").is_empty());
     }
 }

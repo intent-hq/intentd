@@ -1028,6 +1028,7 @@ mod mcp_callback {
 // ============================================================================
 
 mod pr {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -1043,8 +1044,13 @@ mod pr {
     use super::{workspace, TempDb};
     use crate::Services;
 
+    #[derive(Default)]
     struct StubForge {
         fail_threads: bool,
+        /// When set, each `get_pr` returns a fresh head SHA so the
+        /// `pr.waitForChanges` poll detects a commit change.
+        mutate_head: bool,
+        head_seq: AtomicU64,
     }
 
     fn sample_pr() -> PullRequest {
@@ -1092,7 +1098,12 @@ mod pr {
             unimplemented!()
         }
         async fn get_pr(&self, _: &RepoRef, _: u64) -> ScResult<PullRequest> {
-            Ok(sample_pr())
+            let mut pr = sample_pr();
+            if self.mutate_head {
+                let n = self.head_seq.fetch_add(1, Ordering::SeqCst);
+                pr.head_sha = Some(format!("sha{n}"));
+            }
+            Ok(pr)
         }
         async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Vec<PullRequest>> {
             unimplemented!()
@@ -1104,25 +1115,34 @@ mod pr {
             &self,
             _: &RepoRef,
             _: u64,
-            _: MergeMethod,
+            method: MergeMethod,
             _: MergeOptions,
         ) -> ScResult<MergeOutcome> {
-            unimplemented!()
+            Ok(MergeOutcome {
+                merged: true,
+                message: format!("Merged via {method:?}"),
+                sha: Some("mergedsha".into()),
+            })
         }
         async fn mergeability(&self, _: &RepoRef, _: u64) -> ScResult<Mergeability> {
             unimplemented!()
         }
         async fn update_branch(&self, _: &RepoRef, _: u64) -> ScResult<()> {
-            unimplemented!()
+            Ok(())
         }
         async fn submit_review(
             &self,
             _: &RepoRef,
             _: u64,
-            _: ReviewVerdict,
-            _: Option<String>,
+            verdict: ReviewVerdict,
+            body: Option<String>,
         ) -> ScResult<Review> {
-            unimplemented!()
+            Ok(Review {
+                author: "octocat".into(),
+                verdict,
+                body,
+                submitted_at: "2026-06-17T05:00:00.000Z".into(),
+            })
         }
         async fn list_reviews(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Review>> {
             Ok(vec![
@@ -1148,16 +1168,25 @@ mod pr {
                 path: None,
                 line: None,
                 created_at: "2026".into(),
+                url: None,
             }])
         }
         async fn add_comment(
             &self,
             _: &RepoRef,
             _: u64,
-            _: &str,
+            body: &str,
             _: Option<CommentAnchor>,
         ) -> ScResult<Comment> {
-            unimplemented!()
+            Ok(Comment {
+                id: "777".into(),
+                author: "octocat".into(),
+                body: body.to_string(),
+                path: None,
+                line: None,
+                created_at: "2026".into(),
+                url: Some("https://github.com/o/r/pull/42#issuecomment-777".into()),
+            })
         }
         async fn list_review_comments(&self, _: &RepoRef, _: u64) -> ScResult<Vec<ReviewComment>> {
             Ok(vec![ReviewComment {
@@ -1176,10 +1205,20 @@ mod pr {
             &self,
             _: &RepoRef,
             _: u64,
-            _: u64,
-            _: &str,
+            comment_id: u64,
+            body: &str,
         ) -> ScResult<ReviewComment> {
-            unimplemented!()
+            Ok(ReviewComment {
+                id: comment_id + 1,
+                body: body.to_string(),
+                path: "a.rs".into(),
+                line: Some(1),
+                author: "octocat".into(),
+                created_at: "2026".into(),
+                updated_at: "2026".into(),
+                in_reply_to_id: Some(comment_id),
+                url: "https://github.com/o/r/pull/42#discussion_r999".into(),
+            })
         }
         async fn get_review_threads(&self, _: &RepoRef, _: u64) -> ScResult<Vec<ReviewThread>> {
             if self.fail_threads {
@@ -1213,10 +1252,10 @@ mod pr {
             ])
         }
         async fn resolve_thread(&self, _: &str) -> ScResult<bool> {
-            unimplemented!()
+            Ok(true)
         }
         async fn unresolve_thread(&self, _: &str) -> ScResult<bool> {
-            unimplemented!()
+            Ok(false)
         }
         async fn check_runs(&self, _: &RepoRef, _: &str) -> ScResult<Vec<CheckRun>> {
             Ok(vec![
@@ -1249,6 +1288,17 @@ mod pr {
     }
 
     async fn setup(fail_threads: bool, with_pr: bool) -> (TempDb, Services, WorkspaceId) {
+        setup_with(
+            StubForge {
+                fail_threads,
+                ..Default::default()
+            },
+            with_pr,
+        )
+        .await
+    }
+
+    async fn setup_with(forge: StubForge, with_pr: bool) -> (TempDb, Services, WorkspaceId) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_id = WorkspaceId::new();
@@ -1260,8 +1310,7 @@ mod pr {
             ws.pr_number = Some(42);
         }
         store.insert_workspace(&ws).await.expect("ws");
-        let services =
-            Services::new(store).with_source_control(Arc::new(StubForge { fail_threads }));
+        let services = Services::new(store).with_source_control(Arc::new(forge));
         (tmp, services, ws_id)
     }
 
@@ -1343,5 +1392,140 @@ mod pr {
         let (_t, svc, ws) = setup(false, false).await;
         let err = svc.pr_status(ws).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
+    }
+
+    #[tokio::test]
+    async fn merge_returns_parity_shape() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let v = svc
+            .pr_merge(ws, Some("squash".into()), None, None)
+            .await
+            .expect("merge");
+        assert_eq!(v["merged"], true);
+        assert_eq!(v["sha"], "mergedsha");
+        assert_eq!(v["mergeMethod"], "squash");
+        assert_eq!(v["prNumber"], 42);
+    }
+
+    #[tokio::test]
+    async fn merge_rejects_invalid_method() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let err = svc
+            .pr_merge(ws, Some("ff".into()), None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Internal(m) if m.contains("mergeMethod must be one of")));
+    }
+
+    #[tokio::test]
+    async fn merge_requires_active_pr() {
+        let (_t, svc, ws) = setup(false, false).await;
+        let err = svc.pr_merge(ws, None, None, None).await.unwrap_err();
+        assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
+    }
+
+    #[tokio::test]
+    async fn post_comment_and_reply_surface_html_url() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let v = svc
+            .pr_post_comment(ws.clone(), "ship it".into())
+            .await
+            .expect("post");
+        assert_eq!(v["id"], "777");
+        assert!(v["htmlUrl"].as_str().unwrap().contains("issuecomment-777"));
+
+        let r = svc
+            .pr_reply_to_review_comment(ws, 5, "agreed".into())
+            .await
+            .expect("reply");
+        assert_eq!(r["id"], 6);
+        assert!(r["htmlUrl"].as_str().unwrap().contains("discussion_r999"));
+    }
+
+    #[tokio::test]
+    async fn resolve_thread_reports_action() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let v = svc
+            .pr_resolve_thread(ws, "RT1".into(), Some("resolve".into()))
+            .await
+            .expect("resolve");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["threadId"], "RT1");
+        assert_eq!(v["action"], "resolve");
+    }
+
+    #[tokio::test]
+    async fn unresolve_thread_failure_is_internal_error() {
+        // The stub `unresolve_thread` returns `false` (not resolved), which the
+        // service treats as a silent failure.
+        let (_t, svc, ws) = setup(false, true).await;
+        let err = svc
+            .pr_resolve_thread(ws, "RT1".into(), Some("unresolve".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Internal(m) if m.contains("Failed to unresolve thread")));
+    }
+
+    #[tokio::test]
+    async fn create_review_returns_review() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let v = svc
+            .pr_create_review(ws, "approve".into(), Some("LGTM".into()))
+            .await
+            .expect("review");
+        assert_eq!(v["review"]["verdict"], "approve");
+        assert_eq!(v["review"]["body"], "LGTM");
+    }
+
+    #[tokio::test]
+    async fn update_branch_reports_success() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let v = svc.pr_update_branch(ws).await.expect("update branch");
+        assert_eq!(v["method"], "merge");
+        assert_eq!(v["alreadyUpToDate"], false);
+    }
+
+    #[tokio::test]
+    async fn wait_for_changes_detects_new_commit() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                mutate_head: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        // Pause after the store is open so the SQLite pool keeps its real-time
+        // connection; virtual time then makes the poll sleeps return instantly.
+        tokio::time::pause();
+        let v = svc
+            .pr_wait_for_changes(ws, Some(30), Some(10), Some("commits".into()))
+            .await
+            .expect("wait");
+        assert_eq!(v["changed"], true);
+        assert!(v["changes"][0].as_str().unwrap().starts_with("New commit:"));
+        assert!(v["iterations"].as_u64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn wait_for_changes_times_out_without_changes() {
+        let (_t, svc, ws) = setup(false, true).await;
+        tokio::time::pause();
+        let v = svc
+            .pr_wait_for_changes(ws, Some(30), Some(10), Some("any".into()))
+            .await
+            .expect("wait");
+        assert_eq!(v["changed"], false);
+        assert!(v["summary"].as_str().unwrap().contains("Timeout reached"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_changes_rejects_invalid_watch() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let err = svc
+            .pr_wait_for_changes(ws, None, None, Some("bogus".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Internal(m) if m.contains("watch must be one of")));
     }
 }

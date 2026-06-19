@@ -164,6 +164,7 @@ pub(crate) fn map_issue_comment(value: Value) -> Result<Comment> {
         path: None,
         line: None,
         created_at: c.created_at.unwrap_or_default(),
+        url: c.html_url,
     })
 }
 
@@ -190,6 +191,7 @@ fn review_comment_as_comment(rc: ReviewComment) -> Comment {
         path: Some(rc.path),
         line: rc.line,
         created_at: rc.created_at,
+        url: Some(rc.url),
     }
 }
 
@@ -310,6 +312,7 @@ mod dto {
         pub user: Option<User>,
         pub body: Option<String>,
         pub created_at: Option<String>,
+        pub html_url: Option<String>,
     }
 
     #[derive(Deserialize)]

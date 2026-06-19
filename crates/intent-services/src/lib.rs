@@ -2716,6 +2716,330 @@ impl WorkspaceApi for Services {
             }))
         })
     }
+
+    // ------------------------------------------------------------------------
+    // pr.* write/action surface (PROTOCOL §5.7). Same active-PR enforcement as
+    // the read methods; validation/poll glue lives in `pr_ops`.
+    // ------------------------------------------------------------------------
+
+    fn pr_merge(
+        &self,
+        workspace_id: WorkspaceId,
+        merge_method: Option<String>,
+        commit_title: Option<String>,
+        commit_message: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let method = pr_ops::validate_merge_method(merge_method)?;
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let number = pr_ops::active_pr_number(&ws)?;
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let pr = sc
+                .get_pr(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let state = pr_ops::derive_status_state(&pr);
+            if state == "draft" {
+                return Err(Error::Internal(format!(
+                    "PR #{number} is a draft and cannot be merged. GitHub blocks merging draft \
+                     PRs. Mark the PR as \"Ready for review\" first using the GitHub UI or API."
+                )));
+            }
+            if state != "open" {
+                return Err(Error::Internal(format!(
+                    "PR #{number} is {state} and cannot be merged."
+                )));
+            }
+            if pr.mergeable == Some(false) {
+                return Err(Error::Internal(format!(
+                    "PR #{number} is not mergeable. This could be due to merge conflicts, failing \
+                     required checks, or missing required reviews. Please resolve the issues \
+                     before attempting to merge."
+                )));
+            }
+            let outcome = sc
+                .merge_pr(
+                    &repo_ref,
+                    number,
+                    method,
+                    intent_sourcecontrol::MergeOptions {
+                        commit_title,
+                        commit_message,
+                    },
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            if !outcome.merged {
+                return Err(Error::Internal(format!(
+                    "Failed to merge PR #{number}: {}",
+                    outcome.message
+                )));
+            }
+            Ok(serde_json::json!({
+                "merged": true,
+                "sha": outcome.sha,
+                "mergeMethod": pr_ops::merge_method_word(method),
+                "message": outcome.message,
+                "prNumber": number,
+            }))
+        })
+    }
+
+    fn pr_update_branch(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let number = pr_ops::active_pr_number(&ws)?;
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            match sc.update_branch(&repo_ref, number).await {
+                Ok(()) => Ok(serde_json::json!({
+                    "method": "merge",
+                    "alreadyUpToDate": false,
+                    "message": "PR branch updated from the base branch.",
+                    "url": serde_json::Value::Null,
+                })),
+                Err(e) => {
+                    let msg = e.to_string();
+                    let lower = msg.to_lowercase();
+                    if lower.contains("already up-to-date") || lower.contains("already up to date")
+                    {
+                        Ok(serde_json::json!({
+                            "method": "merge",
+                            "alreadyUpToDate": true,
+                            "message": "PR branch is already up-to-date with the base branch.",
+                            "url": serde_json::Value::Null,
+                        }))
+                    } else if lower.contains("merge conflict") {
+                        Err(Error::Internal(format!(
+                            "Cannot update PR branch: merge conflicts detected. The conflicts must \
+                             be resolved manually.\n{msg}"
+                        )))
+                    } else {
+                        Err(Error::Internal(format!(
+                            "Failed to update PR branch: {msg}"
+                        )))
+                    }
+                }
+            }
+        })
+    }
+
+    fn pr_post_comment(
+        &self,
+        workspace_id: WorkspaceId,
+        body: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let number = pr_ops::active_pr_number(&ws)?;
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let comment = sc
+                .add_comment(&repo_ref, number, &body, None)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({
+                "id": comment.id,
+                "htmlUrl": comment.url,
+            }))
+        })
+    }
+
+    fn pr_reply_to_review_comment(
+        &self,
+        workspace_id: WorkspaceId,
+        comment_id: u64,
+        body: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let number = pr_ops::active_pr_number(&ws)?;
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let reply = sc
+                .reply_to_review_comment(&repo_ref, number, comment_id, &body)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({
+                "id": reply.id,
+                "htmlUrl": reply.url,
+            }))
+        })
+    }
+
+    fn pr_resolve_thread(
+        &self,
+        workspace_id: WorkspaceId,
+        thread_id: String,
+        action: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let action = pr_ops::validate_resolve_action(action)?;
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            // Active-PR enforcement (TS `requirePrContext`) even though the
+            // forge call keys off the thread id alone.
+            let _ = pr_ops::repo_of(&ws)?;
+            let _ = pr_ops::active_pr_number(&ws)?;
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let success = if action == "unresolve" {
+                sc.unresolve_thread(&thread_id).await
+            } else {
+                sc.resolve_thread(&thread_id).await
+            }
+            .map_err(pr_ops::map_sc_err)?;
+            if !success {
+                return Err(Error::Internal(format!(
+                    "Failed to {action} thread. The operation may have failed silently."
+                )));
+            }
+            Ok(serde_json::json!({
+                "ok": true,
+                "threadId": thread_id,
+                "action": action,
+            }))
+        })
+    }
+
+    fn pr_create_review(
+        &self,
+        workspace_id: WorkspaceId,
+        verdict: String,
+        body: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let verdict = pr_ops::validate_review_verdict(&verdict)?;
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let number = pr_ops::active_pr_number(&ws)?;
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let review = sc
+                .submit_review(&repo_ref, number, verdict, body)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({ "review": review }))
+        })
+    }
+
+    fn pr_wait_for_changes(
+        &self,
+        workspace_id: WorkspaceId,
+        timeout_seconds: Option<i64>,
+        poll_interval_seconds: Option<i64>,
+        watch: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let watch = pr_ops::validate_watch_mode(watch)?;
+            let timeout = pr_ops::clamp_timeout(timeout_seconds);
+            let poll_interval = pr_ops::clamp_poll_interval(poll_interval_seconds);
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let number = pr_ops::active_pr_number(&ws)?;
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
+
+            let timeout_ms = timeout * 1000;
+            let poll_ms = poll_interval * 1000;
+            let safety_ms = pr_ops::SAFETY_PADDING_SECONDS * 1000;
+            let effective_ms = timeout_ms.min(poll_ms.max(timeout_ms.saturating_sub(safety_ms)));
+
+            let start = tokio::time::Instant::now();
+            let initial = capture_pr_snapshot(&*sc, &repo_ref, number)
+                .await
+                .ok_or_else(|| {
+                    Error::Internal(format!("Could not fetch PR #{number} for {owner}/{repo}."))
+                })?;
+            let mut baseline = initial.clone();
+            let mut last = initial;
+            let mut iterations: u64 = 0;
+
+            loop {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                if elapsed_ms >= effective_ms {
+                    break;
+                }
+                iterations += 1;
+                let remaining = effective_ms - elapsed_ms;
+                tokio::time::sleep(std::time::Duration::from_millis(poll_ms.min(remaining))).await;
+                let current = match capture_pr_snapshot(&*sc, &repo_ref, number).await {
+                    Some(s) => s,
+                    None => continue,
+                };
+                last = current.clone();
+                if baseline.check_runs_fetch_failed && !current.check_runs_fetch_failed {
+                    baseline.check_runs = current.check_runs.clone();
+                    baseline.check_runs_fetch_failed = false;
+                }
+                let changes = pr_ops::detect_changes(&baseline, &current, &watch);
+                if !changes.is_empty() {
+                    let elapsed_s = ((start.elapsed().as_millis() as f64) / 1000.0).round() as u64;
+                    let summary = pr_ops::format_change_summary(&changes, &current, elapsed_s);
+                    return Ok(serde_json::json!({
+                        "changed": true,
+                        "changes": changes,
+                        "elapsedSeconds": elapsed_s,
+                        "iterations": iterations,
+                        "snapshot": pr_ops::snapshot_json(&current),
+                        "summary": summary,
+                    }));
+                }
+            }
+
+            let elapsed_s = ((start.elapsed().as_millis() as f64) / 1000.0).round() as u64;
+            Ok(serde_json::json!({
+                "changed": false,
+                "elapsedSeconds": elapsed_s,
+                "iterations": iterations,
+                "snapshot": pr_ops::snapshot_json(&last),
+                "summary": format!(
+                    "⏱️ Timeout reached after {elapsed_s} seconds without detecting changes.\n\
+                     Watched mode: {watch}\nPolls performed: {iterations}"
+                ),
+            }))
+        })
+    }
+}
+
+/// Capture a `pr.waitForChanges` poll snapshot (TS `captureSnapshot`): the PR
+/// plus its head-commit check-runs. Returns `None` when the PR cannot be
+/// fetched (the caller treats the initial `None` as fatal, later ones as a
+/// transient skip).
+async fn capture_pr_snapshot(
+    sc: &dyn intent_sourcecontrol::SourceControl,
+    repo_ref: &intent_sourcecontrol::RepoRef,
+    number: u64,
+) -> Option<pr_ops::PrSnapshot> {
+    let pr = sc.get_pr(repo_ref, number).await.ok()?;
+    let checks = match pr.head_sha.as_deref().filter(|s| !s.is_empty()) {
+        None => pr_ops::CheckFetch::NotAttempted,
+        Some(sha) => match sc.check_runs(repo_ref, sha).await {
+            Ok(runs) => pr_ops::CheckFetch::Ok(runs),
+            Err(_) => pr_ops::CheckFetch::Failed,
+        },
+    };
+    Some(pr_ops::build_snapshot(&pr, checks))
 }
 
 /// Load a workspace for a `pr.*` call, mapping a missing workspace onto the

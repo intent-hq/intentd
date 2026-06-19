@@ -167,6 +167,9 @@ pub struct Comment {
     pub path: Option<String>,
     pub line: Option<u64>,
     pub created_at: String,
+    /// Forge web URL of the comment (GitHub `html_url`); `None` when the host
+    /// does not surface one. Powers the `pr.postComment` `htmlUrl` reply.
+    pub url: Option<String>,
 }
 
 /// Where a review comment is anchored in the diff.

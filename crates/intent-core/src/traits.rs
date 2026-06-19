@@ -1163,6 +1163,115 @@ pub trait WorkspaceApi: Send + Sync {
             ))
         })
     }
+
+    /// `pr.merge`: merge the active PR with `merge_method` (default `merge`) and
+    /// optional commit overrides. Requires an active PR (PROTOCOL §5.7).
+    fn pr_merge(
+        &self,
+        workspace_id: WorkspaceId,
+        merge_method: Option<String>,
+        commit_title: Option<String>,
+        commit_message: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, merge_method, commit_title, commit_message);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_merge not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `pr.updateBranch`: update the active PR branch from its base (PROTOCOL §5.7).
+    fn pr_update_branch(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_update_branch not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `pr.postComment`: post a conversation comment on the active PR (PROTOCOL §5.7).
+    fn pr_post_comment(
+        &self,
+        workspace_id: WorkspaceId,
+        body: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, body);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_post_comment not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `pr.replyToReviewComment`: reply to a review comment on the active PR
+    /// (PROTOCOL §5.7).
+    fn pr_reply_to_review_comment(
+        &self,
+        workspace_id: WorkspaceId,
+        comment_id: u64,
+        body: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, comment_id, body);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_reply_to_review_comment not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `pr.resolveThread`: resolve/unresolve a review thread (default `resolve`)
+    /// on the active PR (PROTOCOL §5.7).
+    fn pr_resolve_thread(
+        &self,
+        workspace_id: WorkspaceId,
+        thread_id: String,
+        action: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, thread_id, action);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_resolve_thread not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `pr.createReview`: submit a review (`approve` / `request-changes` /
+    /// `comment`) on the active PR (PROTOCOL §5.7 extension).
+    fn pr_create_review(
+        &self,
+        workspace_id: WorkspaceId,
+        verdict: String,
+        body: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, verdict, body);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_create_review not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `pr.waitForChanges`: poll the active PR's status + checks until a change
+    /// is detected or the timeout elapses (PROTOCOL §5.7).
+    fn pr_wait_for_changes(
+        &self,
+        workspace_id: WorkspaceId,
+        timeout_seconds: Option<i64>,
+        poll_interval_seconds: Option<i64>,
+        watch: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, timeout_seconds, poll_interval_seconds, watch);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_wait_for_changes not implemented".to_string(),
+            ))
+        })
+    }
 }
 
 /// Context-engine abstraction implemented by `intent-context` (§3.1).
