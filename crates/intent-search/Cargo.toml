@@ -9,3 +9,9 @@ description = "BE-owned search.*: ripgrep-equivalent content/path search + store
 [dependencies]
 intent-core = { path = "../intent-core" }
 intent-store = { path = "../intent-store" }
+grep = { workspace = true }
+ignore = { workspace = true }
+globset = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
