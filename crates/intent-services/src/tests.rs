@@ -2351,3 +2351,98 @@ mod metrics {
         assert_eq!(m, serde_json::Value::Null);
     }
 }
+
+/// `search.*` wire glue (§5.15): requestId mint/echo, the worktree-rooted
+/// matches/files shape, and the idempotent no-op cancel. The ripgrep walk
+/// itself is covered in `intent-search`.
+mod search {
+    use super::*;
+
+    struct TempTree(PathBuf);
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn worktree() -> TempTree {
+        let dir = std::env::temp_dir().join(format!("intentd-search-svc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {\n    // TODO: x\n}\n").unwrap();
+        std::fs::write(dir.join("README.md"), "# readme\nTODO later\n").unwrap();
+        TempTree(dir)
+    }
+
+    async fn services_with_worktree(dir: &std::path::Path) -> (TempDb, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        // `path` is transient (never persisted); `worktree_path` round-trips.
+        ws.worktree_path = Some(dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.expect("ws");
+        (tmp, Services::new(store), ws_id)
+    }
+
+    #[tokio::test]
+    async fn in_files_echoes_request_id_and_returns_matches() {
+        let tree = worktree();
+        let (_tmp, svc, ws) = services_with_worktree(&tree.0).await;
+        let r = svc
+            .search_in_files(ws, "TODO".into(), None, Some("srch-xyz".into()))
+            .await
+            .unwrap();
+        assert_eq!(r["requestId"], "srch-xyz");
+        assert_eq!(r["truncated"], false);
+        assert_eq!(r["matches"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn in_files_mints_request_id_when_absent() {
+        let tree = worktree();
+        let (_tmp, svc, ws) = services_with_worktree(&tree.0).await;
+        let r = svc
+            .search_in_files(ws, "TODO".into(), None, None)
+            .await
+            .unwrap();
+        assert!(r["requestId"].as_str().unwrap().starts_with("srch-"));
+    }
+
+    #[tokio::test]
+    async fn file_names_glob_returns_relative_paths() {
+        let tree = worktree();
+        let (_tmp, svc, ws) = services_with_worktree(&tree.0).await;
+        let r = svc
+            .search_file_names(ws, "*.rs".into(), None, Some("srch-f".into()))
+            .await
+            .unwrap();
+        assert_eq!(r["requestId"], "srch-f");
+        let files = r["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], "src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn no_worktree_path_returns_empty() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.unwrap();
+        let ws_id = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws_id)).await.unwrap();
+        let svc = Services::new(store);
+        let r = svc
+            .search_in_files(ws_id, "x".into(), None, Some("srch-1".into()))
+            .await
+            .unwrap();
+        assert_eq!(r["matches"].as_array().unwrap().len(), 0);
+        assert_eq!(r["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_is_noop_success() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.unwrap();
+        let svc = Services::new(store);
+        let r = svc.search_cancel("srch-unknown".into()).await.unwrap();
+        assert_eq!(r, serde_json::json!({ "ok": true }));
+    }
+}

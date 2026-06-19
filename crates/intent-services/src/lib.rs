@@ -43,6 +43,7 @@ pub mod events;
 mod git_ops;
 mod note_ops;
 mod pr_ops;
+mod search_ops;
 
 #[cfg(test)]
 mod tests;
@@ -90,6 +91,11 @@ pub struct Services {
     /// `accept-changes.execute` commit/push path never races concurrent agents
     /// or operations on the same worktree.
     worktree_locks: intent_git::worktree::WorktreeLocks,
+    /// Per-request cancellation registry for `search.*` (§14.3). Keyed by
+    /// `requestId`, it lets `search.cancel` abort an in-flight search. Shares
+    /// its inner map across clones so a cancel observed by any handle reaches
+    /// the running walk.
+    search_cancels: intent_search::CancelRegistry,
 }
 
 impl Services {
@@ -104,6 +110,7 @@ impl Services {
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
+            search_cancels: intent_search::CancelRegistry::new(),
         }
     }
 
@@ -653,6 +660,99 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn search_in_files(
+        &self,
+        workspace_id: WorkspaceId,
+        query: String,
+        opts: Option<serde_json::Value>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let registry = self.search_cancels.clone();
+        Box::pin(async move {
+            let opts = search_ops::parse_opts(opts)?;
+            let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
+            let root = match search_ops::search_root(&store, &workspace_id).await? {
+                Some(root) => root,
+                None => {
+                    return Ok(serde_json::json!({
+                        "requestId": request_id,
+                        "matches": [],
+                        "truncated": false,
+                    }))
+                }
+            };
+            // Validate opts (incl. regex) before registering, so a bad regex is
+            // surfaced as InvalidParams without leaving a stale cancel token.
+            let token = registry.register(&request_id);
+            let outcome = {
+                let token = token.clone();
+                tokio::task::spawn_blocking(move || {
+                    intent_search::search_in_files(&root, &query, &opts, &token)
+                })
+                .await
+            };
+            registry.unregister(&request_id);
+            let outcome =
+                outcome.map_err(|e| Error::Internal(format!("search task failed: {e}")))??;
+            Ok(serde_json::json!({
+                "requestId": request_id,
+                "matches": outcome.matches,
+                "truncated": outcome.truncated,
+            }))
+        })
+    }
+
+    fn search_file_names(
+        &self,
+        workspace_id: WorkspaceId,
+        pattern: String,
+        limit: Option<i64>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let registry = self.search_cancels.clone();
+        Box::pin(async move {
+            let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
+            let limit = limit.and_then(|n| usize::try_from(n).ok());
+            let root = match search_ops::search_root(&store, &workspace_id).await? {
+                Some(root) => root,
+                None => {
+                    return Ok(serde_json::json!({
+                        "requestId": request_id,
+                        "files": [],
+                        "truncated": false,
+                    }))
+                }
+            };
+            let token = registry.register(&request_id);
+            let outcome = {
+                let token = token.clone();
+                tokio::task::spawn_blocking(move || {
+                    intent_search::search_file_names(&root, &pattern, limit, &token)
+                })
+                .await
+            };
+            registry.unregister(&request_id);
+            let outcome =
+                outcome.map_err(|e| Error::Internal(format!("search task failed: {e}")))??;
+            Ok(serde_json::json!({
+                "requestId": request_id,
+                "files": outcome.files,
+                "truncated": outcome.truncated,
+            }))
+        })
+    }
+
+    fn search_cancel(&self, request_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let registry = self.search_cancels.clone();
+        Box::pin(async move {
+            // Idempotent: cancelling an unknown/finished id is a no-op success.
+            registry.cancel(&request_id);
+            Ok(serde_json::json!({ "ok": true }))
+        })
+    }
+
     fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let store = self.store.clone();
         Box::pin(async move { store.list_workspaces(include_archived).await })

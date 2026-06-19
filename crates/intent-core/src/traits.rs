@@ -1532,6 +1532,59 @@ pub trait WorkspaceApi: Send + Sync {
             ))
         })
     }
+
+    // ------------------------------------------------------------------------
+    // search.* — BE-owned file/path search (PROTOCOL §5.15, IMPLEMENTATION_SPEC §14).
+    // ------------------------------------------------------------------------
+
+    /// `search.inFiles`: gitignore-aware ripgrep content search over the
+    /// workspace worktree. `opts` is the raw `{ caseSensitive?, regex?, globs?,
+    /// maxResults? }` object; a malformed `opts.regex` surfaces as
+    /// `InvalidParams` ("Invalid regex"). Returns `{ requestId, matches,
+    /// truncated }`, minting `request_id` when absent (PROTOCOL §5.15).
+    fn search_in_files(
+        &self,
+        workspace_id: WorkspaceId,
+        query: String,
+        opts: Option<serde_json::Value>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, query, opts, request_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::search_in_files not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `search.fileNames`: gitignore-aware path/glob filename search over the
+    /// worktree. Returns `{ requestId, files, truncated }`, minting `request_id`
+    /// when absent (PROTOCOL §5.15).
+    fn search_file_names(
+        &self,
+        workspace_id: WorkspaceId,
+        pattern: String,
+        limit: Option<i64>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, pattern, limit, request_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::search_file_names not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `search.cancel`: abort an in-flight search by its `requestId`. A no-op
+    /// success for an unknown/already-finished id (`{ ok: true }`) (PROTOCOL §5.15).
+    fn search_cancel(&self, request_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = request_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::search_cancel not implemented".to_string(),
+            ))
+        })
+    }
 }
 
 /// Context-engine abstraction implemented by `intent-context` (§3.1).
