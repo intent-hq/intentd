@@ -978,6 +978,71 @@ pub struct AgentSession {
     pub updated_at: String,
 }
 
+/// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
+/// the TS `AgentLite`: the full [`AgentSession`] with `messages` and
+/// `systemPrompt` stripped (clients fetch the transcript via
+/// `agent.getConversation`), plus a derived `messageCount` and the
+/// `lastAgentResponse` / `digest` computed from the last assistant message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentLite {
+    pub id: AgentId,
+    pub workspace_id: WorkspaceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_session_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_session_id: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub name_explicitly_set: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    pub status: AgentStatus,
+    #[serde(default)]
+    pub is_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<SessionStats>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub message_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_agent_response: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+impl AgentLite {
+    /// Project an [`AgentSession`] into its `agent.list`/`agent.get` form,
+    /// stripping `messages`/`systemPrompt` and attaching the derived fields.
+    pub fn from_session(
+        session: AgentSession,
+        message_count: u64,
+        last_agent_response: Option<String>,
+        digest: Option<String>,
+    ) -> Self {
+        Self {
+            id: session.id,
+            workspace_id: session.workspace_id,
+            backend_session_id: session.backend_session_id,
+            acp_session_id: session.acp_session_id,
+            name: session.name,
+            name_explicitly_set: session.name_explicitly_set,
+            model: session.model,
+            provider: session.provider,
+            status: session.status,
+            is_active: session.is_active,
+            stats: session.stats,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            message_count,
+            last_agent_response,
+            digest,
+        }
+    }
+}
+
 /// Wire input for `agent.delegate` (PROTOCOL §5.5). `workspaceId` is passed
 /// separately; these are the delegation options. Built by the router/MCP
 /// surface; the runtime wiring lands in a later milestone.

@@ -7,8 +7,9 @@
 //! transport (UDS today, WS/TLS later) shares one code path.
 
 use intent_core::{
-    Error, EventQueryParams, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId,
-    NoteUpdateInput, WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
+    AgentDelegateInput, AgentId, Error, EventQueryParams, NoteAddInput, NoteCreate, NoteEditInput,
+    NoteEditLinesInput, NoteId, NoteUpdateInput, WorkspaceApi, WorkspaceCreate, WorkspaceId,
+    WorkspaceUpdate,
 };
 use serde_json::{json, Map, Value};
 
@@ -578,6 +579,237 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        "agent.list" => {
+            let ws = require_ws_note(params)?;
+            let agents = api.agent_list(ws).await.map_err(domain_to_rpc)?;
+            Ok(json!({ "agents": agents }))
+        }
+        "agent.get" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            match api.agent_get(agent_id, ws).await {
+                Ok(agent) => Ok(json!({ "agent": agent })),
+                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "agent.getConversation" => {
+            let agent_id = require_agent_id(params)?;
+            let limit = opt_int(params, "limit");
+            let ws = opt_workspace_id(params);
+            match api.agent_get_conversation(agent_id, limit, ws).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "agent.create" => {
+            let ws = require_ws_note(params)?;
+            let name = opt_str(params, "name");
+            let model = opt_str(params, "model");
+            let specialist_id = opt_str(params, "specialistId");
+            let result = api
+                .agent_create(ws, name, model, specialist_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.delegate" => {
+            let ws = require_ws_note(params)?;
+            let mut rest = params.clone();
+            rest.remove("workspaceId");
+            let input: AgentDelegateInput = serde_json::from_value(Value::Object(rest))
+                .map_err(|e| rpc(INVALID_PARAMS, format!("invalid params: {e}")))?;
+            let result = api.agent_delegate(ws, input).await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.sendToTask" => {
+            let ws = require_ws_note(params)?;
+            let task_note_id = require_str_param(params, "taskNoteId").map(NoteId::from)?;
+            let message = require_str_param(params, "message")?;
+            let priority = opt_str(params, "priority");
+            let result = api
+                .agent_send_to_task(ws, task_note_id, message, priority)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.sendMessage" => {
+            let agent_id = require_agent_id(params)?;
+            let content = require_str_param(params, "content")?;
+            let ws = require_ws_note(params)?;
+            let message_id = opt_str(params, "messageId");
+            let image_blocks = opt_value(params, "imageBlocks");
+            let result = api
+                .agent_send_message(ws, agent_id, content, message_id, image_blocks)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.forceMessage" => {
+            let agent_id = require_agent_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let content = require_str_param(params, "content")?;
+            let ws = require_ws_note(params)?;
+            let image_blocks = opt_value(params, "imageBlocks");
+            let note_ids = opt_value(params, "noteIds");
+            let result = api
+                .agent_force_message(ws, agent_id, message_id, content, image_blocks, note_ids)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.queueMessage" => {
+            let agent_id = require_agent_id(params)?;
+            let content = require_str_param(params, "content")?;
+            let image_blocks = opt_value(params, "imageBlocks");
+            let result = api
+                .agent_queue_message(agent_id, content, image_blocks)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.editQueuedMessage" => {
+            let agent_id = require_agent_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let content = require_str_param(params, "content")?;
+            let result = api
+                .agent_edit_queued_message(agent_id, message_id, content)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.removeQueuedMessage" => {
+            let agent_id = require_agent_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let result = api
+                .agent_remove_queued_message(agent_id, message_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.getQueue" => {
+            let agent_id = require_agent_id(params)?;
+            let result = api.agent_get_queue(agent_id).await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.stop" => {
+            let agent_id = require_agent_id(params)?;
+            let result = api.agent_stop(agent_id).await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.setModel" => {
+            let agent_id = require_agent_id(params)?;
+            let model_id = require_str_param(params, "modelId")?;
+            let ws = require_ws_note(params)?;
+            let result = api
+                .agent_set_model(ws, agent_id, model_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.getModels" => {
+            let result = api.agent_get_models().await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.rename" => {
+            let agent_id = require_agent_id(params)?;
+            let name = require_str_param(params, "name")?;
+            let trimmed = name.trim().to_string();
+            if trimmed.is_empty() {
+                return Err(rpc(INVALID_PARAMS, "Name cannot be empty"));
+            }
+            let result = api
+                .agent_rename(agent_id, trimmed)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.delete" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let result = api
+                .agent_delete(agent_id, ws)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.wakeOrCreate" => {
+            let ws = require_ws_note(params)?;
+            let task_note_id = require_str_param(params, "taskNoteId").map(NoteId::from)?;
+            let context_message = require_str_param(params, "contextMessage")?;
+            let model = opt_str(params, "model");
+            let result = api
+                .agent_wake_or_create(ws, task_note_id, context_message, model)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.summary" => {
+            let ws = require_ws_note(params)?;
+            let agent_id = require_agent_id(params)?;
+            let result = api
+                .agent_summary(ws, agent_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.reportToParent" => {
+            let ws = require_ws_note(params)?;
+            require_present(params, "report")?;
+            let report = params.get("report").cloned().unwrap_or(Value::Null);
+            let result = api
+                .agent_report_to_parent(ws, report)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.getSubscriptions" => {
+            let ws = require_ws_note(params)?;
+            let agent_id = require_agent_id(params)?;
+            let result = api
+                .agent_get_subscriptions(ws, agent_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.cancelSubscriptions" => {
+            let ws = require_ws_note(params)?;
+            let agent_id = require_agent_id(params)?;
+            let result = api
+                .agent_cancel_subscriptions(ws, agent_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.subscribe" => {
+            let ws = require_ws_note(params)?;
+            require_present(params, "eventTypes")?;
+            let event_types = match params.get("eventTypes") {
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+                _ => return Err(rpc(INVALID_PARAMS, "eventTypes must be an array")),
+            };
+            let exclude_self = params.get("excludeSelf").and_then(Value::as_bool);
+            let batch_window = opt_int(params, "batchWindow");
+            let result = api
+                .agent_subscribe(ws, event_types, exclude_self, batch_window)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.unsubscribe" => {
+            let ws = require_ws_note(params)?;
+            let subscription_id = require_str_param(params, "subscriptionId")?;
+            let result = api
+                .agent_unsubscribe(ws, subscription_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }
@@ -594,6 +826,30 @@ fn require_ws_note(params: &Map<String, Value>) -> Result<WorkspaceId, RpcErr> {
 /// Require a `noteId` string param (`requireParam` parity: present & non-null).
 fn require_note_id(params: &Map<String, Value>) -> Result<NoteId, RpcErr> {
     require_str_param(params, "noteId").map(NoteId::from)
+}
+
+/// Require an `agentId` string param (`requireParam` parity).
+fn require_agent_id(params: &Map<String, Value>) -> Result<AgentId, RpcErr> {
+    require_str_param(params, "agentId").map(|s| AgentId::from(s.as_str()))
+}
+
+/// Optional `workspaceId` for `agent.*` methods where it is a non-required
+/// fallback (`agent.get`/`agent.getConversation`/`agent.delete`).
+fn opt_workspace_id(params: &Map<String, Value>) -> Option<WorkspaceId> {
+    params
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(WorkspaceId::from)
+}
+
+/// Optional pass-through JSON param (absent/null → `None`); used for the opaque
+/// `imageBlocks` / `noteIds` payloads.
+fn opt_value(params: &Map<String, Value>, name: &str) -> Option<Value> {
+    match params.get(name) {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.clone()),
+    }
 }
 
 /// Require a string param, mirroring TS `requireParam` (undefined/null → error).

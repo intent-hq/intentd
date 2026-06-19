@@ -19,18 +19,19 @@ pub use error::{Error, Result};
 pub use events::is_known_event_type;
 pub use ids::{AgentId, NoteId, WorkspaceId};
 pub use model::{
-    ActorType, AgentActivity, AgentMessage, AgentSession, AgentStatus, AnchorContext, AuthorType,
-    Comment, CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
-    CommentGetThreadResult, CommentListResult, CommentLocation, CommentRespondResult,
-    CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary, CommentType,
-    CommentWire, ContentType, Event, EventActor, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, FileActivity, Note, NoteAddInput, NoteAddResult, NoteCreate,
-    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility,
-    ReadAssetResult, SessionStats, SuggestionDiff, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata,
-    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TopChangedFile, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceCreate,
-    WorkspaceEventSummary, WorkspaceStatus, WorkspaceUpdate,
+    ActorType, AgentActivity, AgentDelegateInput, AgentLite, AgentMessage, AgentSession,
+    AgentStatus, AnchorContext, AuthorType, Comment, CommentAddResult, CommentAnchor,
+    CommentAnchorType, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
+    CommentLocation, CommentRespondResult, CommentRespondThread, CommentStatus, CommentThread,
+    CommentThreadSummary, CommentType, CommentWire, ContentType, Event, EventActor,
+    EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, Note,
+    NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
+    NoteEditLinesResult, NoteEditResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, SessionStats, SuggestionDiff,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TopChangedFile,
+    Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary,
+    WorkspaceStatus, WorkspaceUpdate,
 };
 pub use traits::{BoxFuture, ContextEngine, WorkspaceApi};

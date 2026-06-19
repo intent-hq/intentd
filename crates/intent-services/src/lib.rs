@@ -6,7 +6,7 @@
 //! implements the read-only `WorkspaceApi` surface (`workspace.list` /
 //! `note.list`) over `intent-store`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -16,25 +16,26 @@ use intent_core::events::{
     WORKSPACE_ATTENTION_CHANGED,
 };
 use intent_core::{
-    iso_minutes_ago, now_iso, parse_iso, ActorType, AgentId, AuthorType, BoxFuture, Comment,
-    CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
-    CommentGetThreadResult, CommentListResult, CommentLocation, CommentRespondResult,
-    CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType, CommentWire,
-    ContentType, Event, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
-    FileActivity, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteSetContentResult,
-    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult,
-    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, Workspace,
-    WorkspaceActivity, WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary, WorkspaceId,
-    WorkspaceStatus, WorkspaceUpdate,
+    iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId, AgentLite,
+    AuthorType, BoxFuture, Comment, CommentAddResult, CommentAnchor, CommentAnchorType,
+    CommentDeleteResult, CommentGetThreadResult, CommentListResult, CommentLocation,
+    CommentRespondResult, CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType,
+    CommentWire, ContentType, Event, EventQueryParams, EventSubscribeResult,
+    EventUnsubscribeResult, FileActivity, Note, NoteAddInput, NoteAddResult, NoteCreate,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    NoteId, NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult,
+    NoteVisibility, ReadAssetResult, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata,
+    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary,
+    WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
 
 mod agent_manager;
+mod agent_ops;
 mod agent_session;
 mod event_ops;
 pub mod events;
@@ -66,6 +67,11 @@ pub struct Services {
     /// `None` until wired by the composition root; when unset, mutations persist
     /// as before but emit no events (keeps read-only/test wiring unchanged).
     event_bus: Option<EventBus>,
+    /// Per-agent in-memory send queues backing `agent.queueMessage` /
+    /// `agent.getQueue` (and the `agent.sendMessage` auto-queue fallback). The
+    /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
+    /// with the end-to-end orchestration flow; the queue surface itself is here.
+    agent_queues: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
 }
 
 impl Services {
@@ -76,6 +82,7 @@ impl Services {
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             event_bus: None,
+            agent_queues: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1970,6 +1977,269 @@ impl WorkspaceApi for Services {
                 ok: true,
                 subscription_id,
             })
+        })
+    }
+
+    // ========================================================================
+    // agent.* surface (PROTOCOL §5.5). Store/in-memory-backed; the live-runtime
+    // coupling (spawning a turn from sendMessage, flipping `queued` mid-stream)
+    // lands with the end-to-end orchestration flow. Helpers live in `agent_ops`.
+    // ========================================================================
+
+    fn agent_delegate(
+        &self,
+        workspace_id: WorkspaceId,
+        input: AgentDelegateInput,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_delegate_op(workspace_id, input).await })
+    }
+
+    fn agent_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        Box::pin(async move { self.agent_list_op(workspace_id).await })
+    }
+
+    fn agent_get(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<AgentLite>> {
+        Box::pin(async move { self.agent_get_op(agent_id).await })
+    }
+
+    fn agent_get_conversation(
+        &self,
+        agent_id: AgentId,
+        limit: Option<i64>,
+        _workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_get_conversation_op(agent_id, limit).await })
+    }
+
+    fn agent_create(
+        &self,
+        workspace_id: WorkspaceId,
+        name: Option<String>,
+        model: Option<String>,
+        _specialist_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_create_op(workspace_id, name, model).await })
+    }
+
+    fn agent_send_to_task(
+        &self,
+        workspace_id: WorkspaceId,
+        task_note_id: NoteId,
+        message: String,
+        _priority: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_send_to_task_op(workspace_id, task_note_id, message)
+                .await
+        })
+    }
+
+    fn agent_send_message(
+        &self,
+        _workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        content: String,
+        message_id: Option<String>,
+        _image_blocks: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_send_message_op(agent_id, content, message_id)
+                .await
+        })
+    }
+
+    fn agent_force_message(
+        &self,
+        _workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+        content: String,
+        _image_blocks: Option<serde_json::Value>,
+        _note_ids: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_force_message_op(agent_id, message_id, content)
+                .await
+        })
+    }
+
+    fn agent_queue_message(
+        &self,
+        agent_id: AgentId,
+        content: String,
+        image_blocks: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_queue_message_op(agent_id, content, image_blocks)
+                .await
+        })
+    }
+
+    fn agent_edit_queued_message(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        content: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_edit_queued_message_op(agent_id, message_id, content)
+                .await
+        })
+    }
+
+    fn agent_remove_queued_message(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_remove_queued_message_op(agent_id, message_id)
+                .await
+        })
+    }
+
+    fn agent_get_queue(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_get_queue_op(agent_id).await })
+    }
+
+    fn agent_stop(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let _ = agent_id;
+            Ok(serde_json::json!({ "success": true }))
+        })
+    }
+
+    fn agent_set_model(
+        &self,
+        _workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        model_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_set_model_op(agent_id, model_id).await })
+    }
+
+    fn agent_get_models(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_get_models_op().await })
+    }
+
+    fn agent_rename(
+        &self,
+        agent_id: AgentId,
+        name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_rename_op(agent_id, name).await })
+    }
+
+    fn agent_delete(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_delete_op(agent_id).await })
+    }
+
+    fn agent_wake_or_create(
+        &self,
+        workspace_id: WorkspaceId,
+        task_note_id: NoteId,
+        context_message: String,
+        model: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_wake_or_create_op(workspace_id, task_note_id, context_message, model)
+                .await
+        })
+    }
+
+    fn agent_summary(
+        &self,
+        _workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_summary_op(agent_id).await })
+    }
+
+    fn agent_report_to_parent(
+        &self,
+        workspace_id: WorkspaceId,
+        report: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let _ = (workspace_id, report);
+            // No agent-caller context over the RPC dispatch path → never a
+            // delegated agent (TS surfaces this as -32603).
+            Err(Error::Internal(
+                "report_to_parent is only available to delegated agents".to_string(),
+            ))
+        })
+    }
+
+    fn agent_get_subscriptions(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let _ = (workspace_id, agent_id);
+            Ok(serde_json::json!({
+                "subscriptions": [],
+                "delegationGroups": [],
+                "agentStatuses": {},
+            }))
+        })
+    }
+
+    fn agent_cancel_subscriptions(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let _ = (workspace_id, agent_id);
+            Ok(serde_json::json!({ "success": true }))
+        })
+    }
+
+    fn agent_subscribe(
+        &self,
+        _workspace_id: WorkspaceId,
+        event_types: Vec<String>,
+        _exclude_self: Option<bool>,
+        _batch_window: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let subs = self.event_subscriptions.clone();
+        Box::pin(async move {
+            let resolved = events::resolve_event_types(&event_types);
+            let subscription_id = uuid::Uuid::new_v4().to_string();
+            subs.lock()
+                .expect("event subscription registry poisoned")
+                .insert(subscription_id.clone());
+            Ok(serde_json::json!({
+                "subscriptionId": subscription_id,
+                "eventTypes": resolved,
+            }))
+        })
+    }
+
+    fn agent_unsubscribe(
+        &self,
+        _workspace_id: WorkspaceId,
+        subscription_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let subs = self.event_subscriptions.clone();
+        Box::pin(async move {
+            let removed = subs
+                .lock()
+                .expect("event subscription registry poisoned")
+                .remove(&subscription_id);
+            if !removed {
+                return Err(Error::Internal("Subscription not found".to_string()));
+            }
+            Ok(serde_json::json!({ "success": true, "subscriptionId": subscription_id }))
         })
     }
 }

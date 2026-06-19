@@ -4,9 +4,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::error::{Error, Result};
-use crate::ids::{NoteId, WorkspaceId};
+use crate::ids::{AgentId, NoteId, WorkspaceId};
 use crate::model::{
-    AgentDelegateInput, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
+    AgentDelegateInput, AgentLite, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
     CommentListResult, CommentRespondResult, Event, EventQueryParams, EventSubscribeResult,
     EventUnsubscribeResult, FileActivity, Note, NoteAddInput, NoteAddResult, NoteCreate,
     NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
@@ -430,6 +430,354 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_delegate not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.list`: workspace agents as the stripped [`AgentLite`] projection
+    /// (PROTOCOL §5.5).
+    fn agent_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.get`: one agent as [`AgentLite`]; `NotFound` falls back to disk
+    /// then surfaces `-32602` (PROTOCOL §5.5).
+    fn agent_get(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<AgentLite>> {
+        let _ = (agent_id, workspace_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.getConversation`: `{ agentId, messages, truncated, totalMessages }`
+    /// capped to the most-recent `limit` (PROTOCOL §5.5).
+    fn agent_get_conversation(
+        &self,
+        agent_id: AgentId,
+        limit: Option<i64>,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, limit, workspace_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_get_conversation not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.create`: persist a new agent session; returns `{ agent: { id, name } }`
+    /// (the process spawns lazily on first turn) (PROTOCOL §5.5).
+    fn agent_create(
+        &self,
+        workspace_id: WorkspaceId,
+        name: Option<String>,
+        model: Option<String>,
+        specialist_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, name, model, specialist_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.sendToTask`: follow up with the agent assigned to a task note
+    /// (PROTOCOL §5.5).
+    fn agent_send_to_task(
+        &self,
+        workspace_id: WorkspaceId,
+        task_note_id: NoteId,
+        message: String,
+        priority: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, task_note_id, message, priority);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_send_to_task not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.sendMessage`: deliver a user message, auto-queuing when the agent
+    /// is mid-stream; `{ success, queued, messageId? }` (PROTOCOL §5.5).
+    fn agent_send_message(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        content: String,
+        message_id: Option<String>,
+        image_blocks: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, content, message_id, image_blocks);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_send_message not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.forceMessage`: stop the current stream then deliver immediately
+    /// (PROTOCOL §5.5).
+    #[allow(clippy::too_many_arguments)]
+    fn agent_force_message(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+        content: String,
+        image_blocks: Option<serde_json::Value>,
+        note_ids: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            agent_id,
+            message_id,
+            content,
+            image_blocks,
+            note_ids,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_force_message not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.queueMessage`: explicitly enqueue a message; `{ success, queuedMessage }`
+    /// (PROTOCOL §5.5).
+    fn agent_queue_message(
+        &self,
+        agent_id: AgentId,
+        content: String,
+        image_blocks: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, content, image_blocks);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_queue_message not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.editQueuedMessage`: edit a queued message's content (PROTOCOL §5.5).
+    fn agent_edit_queued_message(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        content: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, message_id, content);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_edit_queued_message not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.removeQueuedMessage`: remove a queued message (PROTOCOL §5.5).
+    fn agent_remove_queued_message(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, message_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_remove_queued_message not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.getQueue`: the agent's pending message queue; `{ queue: [...] }`
+    /// (PROTOCOL §5.5).
+    fn agent_get_queue(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = agent_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_get_queue not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.stop`: cancel an in-flight stream; `{ success: true }` (PROTOCOL §5.5).
+    fn agent_stop(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = agent_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_stop not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.setModel`: change an agent's model (PROTOCOL §5.5).
+    fn agent_set_model(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        model_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, model_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_set_model not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.getModels`: `{ models: [{ id, name, provider, description? }] }`
+    /// from the auggie CLI with a static tier fallback; no `workspaceId`
+    /// (PROTOCOL §5.5).
+    fn agent_get_models(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_get_models not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.rename`: rename an agent; `{ success: true, name }` (PROTOCOL §5.5).
+    fn agent_rename(
+        &self,
+        agent_id: AgentId,
+        name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_rename not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.delete`: delete an agent session; `{ success: true }` (PROTOCOL §5.5).
+    fn agent_delete(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, workspace_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.wakeOrCreate`: resume/create the agent assigned to a task note
+    /// (PROTOCOL §5.5).
+    fn agent_wake_or_create(
+        &self,
+        workspace_id: WorkspaceId,
+        task_note_id: NoteId,
+        context_message: String,
+        model: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, task_note_id, context_message, model);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_wake_or_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.summary`: a quick summary of what the agent did (PROTOCOL §5.5).
+    fn agent_summary(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_summary not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.reportToParent`: child→parent report; `-32603` when the caller is
+    /// not a delegated agent (PROTOCOL §5.5).
+    fn agent_report_to_parent(
+        &self,
+        workspace_id: WorkspaceId,
+        report: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, report);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_report_to_parent not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.getSubscriptions`: `{ subscriptions, delegationGroups, agentStatuses }`
+    /// (PROTOCOL §5.5).
+    fn agent_get_subscriptions(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_get_subscriptions not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.cancelSubscriptions`: cancel all of an agent's subscriptions;
+    /// `{ success: true }` (PROTOCOL §5.5).
+    fn agent_cancel_subscriptions(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_cancel_subscriptions not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.subscribe` (deprecated alias): service-style subscription result;
+    /// not the WS streaming surface (use `events.subscribe`) (PROTOCOL §5.5/§6).
+    fn agent_subscribe(
+        &self,
+        workspace_id: WorkspaceId,
+        event_types: Vec<String>,
+        exclude_self: Option<bool>,
+        batch_window: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, event_types, exclude_self, batch_window);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_subscribe not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.unsubscribe` (deprecated alias): service-style result (PROTOCOL §5.5/§6).
+    fn agent_unsubscribe(
+        &self,
+        workspace_id: WorkspaceId,
+        subscription_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, subscription_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_unsubscribe not implemented".to_string(),
             ))
         })
     }

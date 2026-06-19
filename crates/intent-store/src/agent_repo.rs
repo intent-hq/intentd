@@ -137,6 +137,17 @@ impl Store {
             .map_err(|e| Error::Internal(format!("set acp session id failed: {e}")))?;
         Ok(())
     }
+
+    /// Delete an agent session and its message log (the `agent_message` rows
+    /// cascade). Returns whether a row was removed (`agent.delete`, §5.5).
+    pub async fn delete_agent_session(&self, id: &AgentId) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM agent_session WHERE id = ?")
+            .bind(&id.0)
+            .execute(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))?;
+        Ok(result.rows_affected() > 0)
+    }
 }
 
 fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
