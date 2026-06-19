@@ -1585,6 +1585,95 @@ pub trait WorkspaceApi: Send + Sync {
             ))
         })
     }
+
+    /// `search.messages`: substring search over a workspace's persisted agent
+    /// session messages. Returns `{ requestId, matches: MessageMatch[] }` inline,
+    /// or `{ requestId, matches: [] }` (a prompt ack) when the result set is
+    /// streamed via `search:result`/`search:done` (PROTOCOL §5.15 / §6.5).
+    fn search_messages(
+        &self,
+        workspace_id: WorkspaceId,
+        query: String,
+        agent_id: Option<String>,
+        role: Option<String>,
+        limit: Option<i64>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, query, agent_id, role, limit, request_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::search_messages not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `search.events`: substring search over the BE event log. `workspaceId` is
+    /// optional (absent → all workspaces). Returns `{ requestId, matches:
+    /// EventMatch[] }` inline or a streamed prompt ack (PROTOCOL §5.15 / §6.5).
+    fn search_events(
+        &self,
+        query: String,
+        workspace_id: Option<WorkspaceId>,
+        limit: Option<i64>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (query, workspace_id, limit, request_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::search_events not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `search.memories`: substring search over the BE memories store. The
+    /// `memories` table is not created until M9; until then this returns an
+    /// empty match set (parity-safe, no error) (PROTOCOL §5.15).
+    fn search_memories(
+        &self,
+        query: String,
+        workspace_id: Option<WorkspaceId>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (query, workspace_id, request_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::search_memories not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `search.notes`: GLOBAL substring search over the BE notes store (no
+    /// `workspaceId`). Returns `{ requestId, matches: NoteMatch[] }` (PROTOCOL §5.15).
+    fn search_notes(
+        &self,
+        query: String,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (query, request_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::search_notes not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `search.codebase`: v1 ripgrep/symbol-backed content search over a
+    /// workspace worktree (context-engine wiring deferred, §8). Returns
+    /// `{ requestId, matches: CodebaseMatch[] }` inline or a streamed prompt ack
+    /// (PROTOCOL §5.15 / §6.5).
+    fn search_codebase(
+        &self,
+        workspace_id: WorkspaceId,
+        query: String,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, query, request_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::search_codebase not implemented".to_string(),
+            ))
+        })
+    }
 }
 
 /// Context-engine abstraction implemented by `intent-context` (§3.1).

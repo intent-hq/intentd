@@ -2446,3 +2446,328 @@ mod search {
         assert_eq!(r, serde_json::json!({ "ok": true }));
     }
 }
+
+/// Store-backed `search.*` adapters (M4.12): per-namespace matching, the global
+/// notes path, the memories deferral (empty, not error), and the streaming
+/// `search:result`/`search:done` delivery + mid-stream cancellation (§5.15/§6.5).
+mod search_adapters {
+    use std::time::Duration;
+
+    use intent_core::{AgentId, AgentSession, AgentStatus, WorkspaceApi, WorkspaceId};
+    use intent_store::{NewEvent, Store};
+    use serde_json::{json, Value};
+
+    use super::{note, workspace, TempDb};
+    use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+
+    async fn store_with_ws() -> (TempDb, Store, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        (tmp, store, ws)
+    }
+
+    async fn insert_session(
+        store: &Store,
+        ws: &WorkspaceId,
+        agent: &str,
+        messages: &[(&str, Value)],
+    ) -> AgentId {
+        let id = AgentId::from(agent);
+        let ts = intent_core::now_iso();
+        let session = AgentSession {
+            id: id.clone(),
+            workspace_id: ws.clone(),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "A".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            status: AgentStatus::default(),
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+        };
+        store.insert_agent_session(&session).await.expect("session");
+        for (role, content) in messages {
+            store
+                .append_agent_message(&id, role, content, &ts)
+                .await
+                .expect("message");
+        }
+        id
+    }
+
+    #[tokio::test]
+    async fn messages_search_matches_and_previews() {
+        let (_tmp, store, ws) = store_with_ws().await;
+        insert_session(
+            &store,
+            &ws,
+            "agent-1",
+            &[
+                ("user", json!("totally unrelated")),
+                (
+                    "assistant",
+                    json!([{ "type": "text", "text": "here is the needle in text" }]),
+                ),
+            ],
+        )
+        .await;
+        let svc = Services::new(store);
+        let r = svc
+            .search_messages(ws, "needle".into(), None, None, None, Some("srch-1".into()))
+            .await
+            .unwrap();
+        assert_eq!(r["requestId"], "srch-1");
+        let matches = r["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["agentId"], "agent-1");
+        assert!(matches[0]["messageId"].is_string());
+        assert!(matches[0]["preview"].as_str().unwrap().contains("needle"));
+    }
+
+    #[tokio::test]
+    async fn messages_search_filters_by_role() {
+        let (_tmp, store, ws) = store_with_ws().await;
+        insert_session(
+            &store,
+            &ws,
+            "agent-1",
+            &[
+                ("user", json!("the needle here")),
+                ("assistant", json!("another needle there")),
+            ],
+        )
+        .await;
+        let svc = Services::new(store);
+        let r = svc
+            .search_messages(ws, "needle".into(), None, Some("user".into()), None, None)
+            .await
+            .unwrap();
+        let matches = r["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn events_search_matches_data() {
+        let (_tmp, store, ws) = store_with_ws().await;
+        let ev = store
+            .insert_event(&NewEvent {
+                workspace_id: ws.clone(),
+                timestamp: intent_core::now_iso(),
+                event_type: "file:changed".to_string(),
+                actor: intent_core::EventActor {
+                    actor_type: intent_core::ActorType::System,
+                    ..Default::default()
+                },
+                session_id: None,
+                correlation_id: None,
+                parent_event_id: None,
+                data: json!({ "path": "src/alpha.rs", "action": "modify" }),
+            })
+            .await
+            .expect("event");
+        let svc = Services::new(store);
+        let r = svc
+            .search_events("alpha".into(), Some(ws), None, Some("srch-e".into()))
+            .await
+            .unwrap();
+        let matches = r["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["eventId"], ev.id);
+    }
+
+    #[tokio::test]
+    async fn notes_search_is_global_across_workspaces() {
+        let (_tmp, store, ws1) = store_with_ws().await;
+        let ws2 = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws2)).await.expect("ws2");
+        store
+            .insert_note(&note(&ws1, "n-1", "alpha content"))
+            .await
+            .expect("n1");
+        store
+            .insert_note(&note(&ws2, "n-2", "more alpha here"))
+            .await
+            .expect("n2");
+        store
+            .insert_note(&note(&ws2, "n-3", "no match"))
+            .await
+            .expect("n3");
+        let svc = Services::new(store);
+        // No workspaceId param — global search.
+        let r = svc
+            .search_notes("alpha".into(), Some("srch-n".into()))
+            .await
+            .unwrap();
+        assert_eq!(r["requestId"], "srch-n");
+        assert_eq!(r["matches"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn memories_search_returns_empty_not_error() {
+        let (_tmp, store, ws) = store_with_ws().await;
+        let svc = Services::new(store);
+        let r = svc
+            .search_memories("anything".into(), Some(ws), Some("srch-m".into()))
+            .await
+            .unwrap();
+        assert_eq!(r["requestId"], "srch-m");
+        assert_eq!(r["matches"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn codebase_search_returns_symbol_matches() {
+        let dir = std::env::temp_dir().join(format!("intentd-search-cb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().to_string());
+        store.insert_workspace(&w).await.expect("ws");
+        let svc = Services::new(store);
+        let r = svc
+            .search_codebase(ws, "main".into(), Some("srch-c".into()))
+            .await
+            .unwrap();
+        let matches = r["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["file"], "src/main.rs");
+        assert_eq!(matches[0]["symbol"], "main");
+        assert!(matches[0]["score"].is_number());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct StreamHarness {
+        _tmp: TempDb,
+        store: Store,
+        services: Services,
+        bus: EventBus,
+        ws: WorkspaceId,
+    }
+
+    async fn stream_harness() -> StreamHarness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        StreamHarness {
+            _tmp: tmp,
+            store,
+            services,
+            bus,
+            ws,
+        }
+    }
+
+    fn subscribe(h: &StreamHarness) -> Subscription {
+        h.bus.subscribe(SubscriptionFilter {
+            event_types: vec!["search:*".to_string()],
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        })
+    }
+
+    async fn recv_event(sub: &mut Subscription) -> Value {
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        serde_json::to_value(&batch[0]).expect("serialize")
+    }
+
+    #[tokio::test]
+    async fn streaming_emits_result_batches_and_done() {
+        let h = stream_harness().await;
+        // 60 matching messages → above the inline threshold → streamed.
+        let msgs: Vec<(&str, Value)> = (0..60)
+            .map(|i| ("assistant", json!(format!("needle {i}"))))
+            .collect();
+        insert_session(&h.store, &h.ws, "agent-1", &msgs).await;
+        let mut sub = subscribe(&h);
+        let ack = h
+            .services
+            .search_messages(
+                h.ws.clone(),
+                "needle".into(),
+                None,
+                None,
+                None,
+                Some("srch-stream".into()),
+            )
+            .await
+            .unwrap();
+        // Prompt ack: requestId + empty inline matches (the real data streams).
+        assert_eq!(ack["requestId"], "srch-stream");
+        assert_eq!(ack["matches"].as_array().unwrap().len(), 0);
+
+        let mut streamed = 0usize;
+        loop {
+            let ev = recv_event(&mut sub).await;
+            assert_eq!(ev["data"]["requestId"], "srch-stream");
+            match ev["type"].as_str().unwrap() {
+                "search:result" => {
+                    streamed += ev["data"]["matches"].as_array().unwrap().len();
+                }
+                "search:done" => {
+                    assert_eq!(ev["data"]["total"], 60);
+                    assert_eq!(ev["data"]["truncated"], false);
+                    break;
+                }
+                other => panic!("unexpected event {other}"),
+            }
+        }
+        assert_eq!(streamed, 60);
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_stream_stops_further_batches() {
+        let h = stream_harness().await;
+        let msgs: Vec<(&str, Value)> = (0..60)
+            .map(|i| ("assistant", json!(format!("needle {i}"))))
+            .collect();
+        insert_session(&h.store, &h.ws, "agent-1", &msgs).await;
+        let mut sub = subscribe(&h);
+        h.services
+            .search_messages(
+                h.ws.clone(),
+                "needle".into(),
+                None,
+                None,
+                None,
+                Some("srch-cancel".into()),
+            )
+            .await
+            .unwrap();
+        // Receive the first batch, then cancel mid-stream by requestId.
+        let first = recv_event(&mut sub).await;
+        assert_eq!(first["type"], "search:result");
+        h.services
+            .search_cancel("srch-cancel".into())
+            .await
+            .unwrap();
+
+        // Drain until the terminal done event: cancellation truncates the stream.
+        let mut done = None;
+        for _ in 0..10 {
+            let ev = recv_event(&mut sub).await;
+            if ev["type"] == "search:done" {
+                done = Some(ev);
+                break;
+            }
+        }
+        let done = done.expect("search:done delivered");
+        assert_eq!(done["data"]["truncated"], true);
+        assert!(done["data"]["total"].as_u64().unwrap() < 60);
+    }
+}

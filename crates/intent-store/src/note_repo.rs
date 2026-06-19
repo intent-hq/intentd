@@ -54,6 +54,17 @@ impl Store {
         rows.iter().map(map_note_row).collect()
     }
 
+    /// List every note across all workspaces, oldest first. Backs the global
+    /// `search.notes` adapter (PROTOCOL §5.15), which has no `workspaceId`.
+    pub async fn list_all_notes(&self) -> Result<Vec<Note>> {
+        let sql = format!("SELECT {NOTE_COLUMNS} FROM note ORDER BY created_at");
+        let rows = sqlx::query(&sql)
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list all notes failed: {e}")))?;
+        rows.iter().map(map_note_row).collect()
+    }
+
     /// Fetch a single note by id, or `NotFound`.
     pub async fn get_note(&self, id: &NoteId) -> Result<Note> {
         let sql = format!("SELECT {NOTE_COLUMNS} FROM note WHERE id = ?");

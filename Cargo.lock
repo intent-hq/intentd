@@ -1569,6 +1569,7 @@ dependencies = [
  "intent-sourcecontrol",
  "intent-store",
  "notify",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
