@@ -7,21 +7,34 @@
 //!
 //! M3.3 lands the client core: spawning piped-stdio providers ([`spawn`]), the
 //! serialized NDJSON JSON-RPC transport ([`transport`]), and the ACP handshake
-//! ([`handshake`]). Session new/load/prompt/streaming (M3.4), client-served
-//! handlers (M3.5), and the agent→BE MCP server (M3.7) remain stubs below.
+//! ([`handshake`]). M3.4 adds session new/load/prompt/streaming ([`session`]);
+//! M3.5 adds the client-served handlers ([`handler`]) backed by a sandboxed file
+//! service ([`fs`]), mediated permission prompts ([`permission`]), and the
+//! terminal stub ([`terminal`]). The agent→BE MCP server (M3.7) remains a stub
+//! below.
 
 use std::sync::Arc;
 
 use intent_core::WorkspaceApi;
 
 pub mod error;
+pub mod fs;
+pub mod handler;
 pub mod handshake;
+pub mod permission;
 pub mod session;
 pub mod spawn;
+pub mod terminal;
 pub mod transport;
 
 pub use error::{AcpError, AcpResult, JsonRpcError};
+pub use fs::{FileAction, FileChange, FileService};
+pub use handler::{ClientRequestHandler, EventSink, SinkEvent};
 pub use handshake::{handshake, HandshakeResult};
+pub use permission::{
+    PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,
+    DEFAULT_PERMISSION_TIMEOUT,
+};
 pub use session::{MappedToolCall, MappedUpdate};
 pub use spawn::{spawn_provider, SpawnOptions, SpawnedAgent};
 pub use transport::{
@@ -49,16 +62,4 @@ impl AcpClient {
 
 pub mod mcp_server {
     //! agent→BE MCP server reusing the `WorkspaceApi` surface — stub.
-}
-
-pub mod fs {
-    //! Client-served filesystem capability — stub.
-}
-
-pub mod terminal {
-    //! Client-served terminal capability — stub.
-}
-
-pub mod permission {
-    //! Client-served permission prompts — stub.
 }

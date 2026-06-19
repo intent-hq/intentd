@@ -425,3 +425,362 @@ mod session_tests {
         assert_eq!(session::map_notification(&other), None);
     }
 }
+
+/// Client-served handler tests: fs sandbox + events, permission resolve/timeout,
+/// and the terminal stub (§6.7 / PROTOCOL §8 DoD).
+mod client_served_tests {
+    use super::*;
+
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{AgentId, BoxFuture, WorkspaceId};
+    use tokio::io::DuplexStream;
+
+    use crate::permission::{PermissionOutcome, PermissionPolicy, PermissionRegistry};
+    use crate::transport::IncomingRequest;
+    use crate::{ClientRequestHandler, EventSink, FileService, SinkEvent};
+
+    /// Records every event published through the sink for assertions.
+    #[derive(Default)]
+    struct MockSink {
+        events: Mutex<Vec<SinkEvent>>,
+    }
+
+    impl MockSink {
+        fn types(&self) -> Vec<String> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| e.event_type.clone())
+                .collect()
+        }
+
+        fn last_of(&self, event_type: &str) -> Option<Value> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .rfind(|e| e.event_type == event_type)
+                .map(|e| e.data.clone())
+        }
+    }
+
+    impl EventSink for MockSink {
+        fn publish(&self, event: SinkEvent) -> BoxFuture<'_, ()> {
+            Box::pin(async move {
+                self.events.lock().unwrap().push(event);
+            })
+        }
+    }
+
+    /// A unique, freshly created temp directory for sandbox tests.
+    fn temp_dir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("intent-acp-test-{nanos}-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Wire a `Connection` whose agent→client requests land on `req_rx`. Returns
+    /// the connection, the request receiver, the agent-side writer (to send
+    /// requests), and a buffered reader over the agent-side stdin (to read the
+    /// handler's responses).
+    fn connect_handler() -> (
+        Connection,
+        mpsc::UnboundedReceiver<IncomingRequest>,
+        DuplexStream,
+        BufReader<DuplexStream>,
+    ) {
+        let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+        let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let hooks = ConnectionHooks {
+            requests: Some(req_tx),
+            ..Default::default()
+        };
+        let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+        (conn, req_rx, a2c_agent, BufReader::new(c2a_agent))
+    }
+
+    fn build_handler(
+        root: &std::path::Path,
+        policy: PermissionPolicy,
+        sink: Arc<MockSink>,
+        registry: PermissionRegistry,
+    ) -> (ClientRequestHandler, Arc<PermissionRegistry>) {
+        let registry = Arc::new(registry);
+        let handler = ClientRequestHandler::new(
+            WorkspaceId::from_string("ws-1"),
+            AgentId::from_string("agent-1"),
+            "auggie",
+            FileService::new(root),
+            registry.clone(),
+            policy,
+            sink,
+        );
+        (handler, registry)
+    }
+
+    async fn send(
+        writer: &mut DuplexStream,
+        req_rx: &mut mpsc::UnboundedReceiver<IncomingRequest>,
+        id: i64,
+        method: &str,
+        params: Value,
+    ) -> IncomingRequest {
+        let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        writer
+            .write_all(format!("{frame}\n").as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), req_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn read_frame(reader: &mut BufReader<DuplexStream>) -> Value {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(line.trim()).unwrap()
+    }
+
+    #[test]
+    fn sandbox_rejects_traversal_but_allows_in_scope() {
+        let root = temp_dir();
+        let svc = FileService::new(&root);
+        assert!(
+            svc.resolve(std::path::Path::new("../escape.txt")).is_err(),
+            "relative traversal escapes the worktree"
+        );
+        assert!(
+            svc.resolve(std::path::Path::new("/etc/passwd")).is_err(),
+            "absolute path outside the worktree is rejected"
+        );
+        let ok = svc.resolve(std::path::Path::new("sub/ok.txt")).unwrap();
+        assert!(ok.starts_with(&root), "in-scope path resolves inside root");
+    }
+
+    #[tokio::test]
+    async fn write_then_read_round_trip_fires_file_changed() {
+        let root = temp_dir();
+        let sink = Arc::new(MockSink::default());
+        let (handler, _reg) = build_handler(
+            &root,
+            PermissionPolicy::Interactive,
+            sink.clone(),
+            PermissionRegistry::new(),
+        );
+        let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+        let path = root.join("notes/hello.txt");
+
+        let req = send(
+            &mut writer,
+            &mut req_rx,
+            1,
+            "fs/write_text_file",
+            json!({ "sessionId": "acp-1", "path": path, "content": "hi there" }),
+        )
+        .await;
+        handler.serve(&conn, req).await.unwrap();
+        let resp = read_frame(&mut reader).await;
+        assert_eq!(resp["id"], json!(1));
+        assert!(resp.get("result").is_some(), "write returns a result");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hi there");
+
+        let changed = sink
+            .last_of("file:changed")
+            .expect("write fires file:changed");
+        assert_eq!(changed["relativePath"], json!("notes/hello.txt"));
+        assert_eq!(changed["action"], json!("create"));
+
+        let req = send(
+            &mut writer,
+            &mut req_rx,
+            2,
+            "fs/read_text_file",
+            json!({ "sessionId": "acp-1", "path": path }),
+        )
+        .await;
+        handler.serve(&conn, req).await.unwrap();
+        let resp = read_frame(&mut reader).await;
+        assert_eq!(resp["result"]["content"], json!("hi there"));
+    }
+
+    fn permission_params(title: &str) -> Value {
+        json!({
+            "sessionId": "acp-1",
+            "toolCall": { "toolCallId": "t1", "title": title, "rawInput": { "command": "x" } },
+            "options": [
+                { "optionId": "allow_once", "name": "Allow", "kind": "allow_once" },
+                { "optionId": "reject_once", "name": "Deny", "kind": "reject_once" }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn permission_request_resolves_via_registry() {
+        let root = temp_dir();
+        let sink = Arc::new(MockSink::default());
+        let (handler, registry) = build_handler(
+            &root,
+            PermissionPolicy::Interactive,
+            sink.clone(),
+            PermissionRegistry::new(),
+        );
+        let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+
+        let req = send(
+            &mut writer,
+            &mut req_rx,
+            7,
+            "session/request_permission",
+            permission_params("Write file"),
+        )
+        .await;
+
+        let handler = Arc::new(handler);
+        let conn = Arc::new(conn);
+        let task = {
+            let handler = handler.clone();
+            let conn = conn.clone();
+            tokio::spawn(async move { handler.serve(&conn, req).await.unwrap() })
+        };
+
+        // The prompt is registered + recoverable; resolve it from "the client".
+        let request_id = loop {
+            if let Some(data) = registry.pending().first() {
+                break data.request_id.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(
+            registry.resolve(
+                &request_id,
+                PermissionOutcome::Selected {
+                    option_id: "allow_once".to_string()
+                }
+            ),
+            "registry delivers the outcome to the waiter"
+        );
+        task.await.unwrap();
+
+        let resp = read_frame(&mut reader).await;
+        assert_eq!(resp["result"]["outcome"]["outcome"], json!("selected"));
+        assert_eq!(resp["result"]["outcome"]["optionId"], json!("allow_once"));
+        assert!(registry.pending().is_empty(), "resolved prompt is removed");
+
+        let resolved = sink.last_of("agent:permission:resolved").unwrap();
+        assert_eq!(resolved["requestId"], json!(request_id));
+        assert!(sink
+            .types()
+            .contains(&"agent:permission:request".to_string()));
+    }
+
+    #[tokio::test]
+    async fn permission_times_out_to_cancelled() {
+        let root = temp_dir();
+        let sink = Arc::new(MockSink::default());
+        let (handler, _reg) = build_handler(
+            &root,
+            PermissionPolicy::Interactive,
+            sink.clone(),
+            PermissionRegistry::with_timeout(Duration::from_millis(50)),
+        );
+        let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+
+        let req = send(
+            &mut writer,
+            &mut req_rx,
+            8,
+            "session/request_permission",
+            permission_params("Run command"),
+        )
+        .await;
+        handler.serve(&conn, req).await.unwrap();
+        let resp = read_frame(&mut reader).await;
+        assert_eq!(resp["result"]["outcome"]["outcome"], json!("cancelled"));
+        assert_eq!(
+            sink.last_of("agent:permission:resolved").unwrap()["outcome"]["outcome"],
+            json!("cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_policy_allows_reads_and_denies_destructive() {
+        let root = temp_dir();
+        let sink = Arc::new(MockSink::default());
+        let (handler, _reg) = build_handler(
+            &root,
+            PermissionPolicy::AutoByRisk,
+            sink.clone(),
+            PermissionRegistry::new(),
+        );
+        let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+
+        let req = send(
+            &mut writer,
+            &mut req_rx,
+            9,
+            "session/request_permission",
+            permission_params("Read file"),
+        )
+        .await;
+        handler.serve(&conn, req).await.unwrap();
+        let allow = read_frame(&mut reader).await;
+        assert_eq!(allow["result"]["outcome"]["optionId"], json!("allow_once"));
+
+        let req = send(
+            &mut writer,
+            &mut req_rx,
+            10,
+            "session/request_permission",
+            permission_params("Delete file"),
+        )
+        .await;
+        handler.serve(&conn, req).await.unwrap();
+        let deny = read_frame(&mut reader).await;
+        assert_eq!(deny["result"]["outcome"]["optionId"], json!("reject_once"));
+    }
+
+    #[tokio::test]
+    async fn terminal_methods_return_unsupported_stub() {
+        let root = temp_dir();
+        let sink = Arc::new(MockSink::default());
+        let (handler, _reg) = build_handler(
+            &root,
+            PermissionPolicy::Interactive,
+            sink,
+            PermissionRegistry::new(),
+        );
+        let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+
+        let req = send(
+            &mut writer,
+            &mut req_rx,
+            11,
+            "terminal/create",
+            json!({ "sessionId": "acp-1" }),
+        )
+        .await;
+        handler.serve(&conn, req).await.unwrap();
+        let resp = read_frame(&mut reader).await;
+        assert_eq!(resp["error"]["code"], json!(-32601));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("until M6"));
+    }
+}

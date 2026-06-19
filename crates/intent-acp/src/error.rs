@@ -49,6 +49,11 @@ pub enum AcpError {
     /// A protocol-level violation (malformed/unexpected message).
     #[error("protocol error: {0}")]
     Protocol(String),
+
+    /// A client-served filesystem request failed: either a sandbox violation
+    /// (path outside the session worktree) or an underlying IO error (§6.7).
+    #[error("filesystem error: {0}")]
+    Fs(String),
 }
 
 impl From<serde_json::Error> for AcpError {
