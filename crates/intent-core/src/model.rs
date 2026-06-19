@@ -1060,6 +1060,98 @@ pub struct AgentDelegateInput {
     pub skip_auto_commit: Option<bool>,
 }
 
+/// A single file's status line, mirroring the TS `GitFileStatus` enum
+/// (`src/shared/types.ts`). Serializes to the porcelain status character so the
+/// wire shape matches `git.status` exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GitFileStatus {
+    #[serde(rename = "M")]
+    Modified,
+    #[serde(rename = "A")]
+    Added,
+    #[serde(rename = "D")]
+    Deleted,
+    #[serde(rename = "R")]
+    Renamed,
+    #[serde(rename = "C")]
+    Copied,
+    #[serde(rename = "?")]
+    Untracked,
+    #[serde(rename = "!")]
+    Ignored,
+}
+
+/// One entry in [`GitStatus::files`] (`{ path, status, staged }`), mirroring the
+/// TS `FileStatus`. A file with both staged and unstaged changes yields two
+/// entries (matching the TS `parseStatusOutput`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileStatus {
+    pub path: String,
+    pub status: GitFileStatus,
+    pub staged: bool,
+}
+
+/// `git.status` result (`GitStatus` in `src/shared/types.ts`). `diverged` is true
+/// only when the branch is both ahead and behind its upstream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitStatus {
+    pub branch: String,
+    pub ahead: i64,
+    pub behind: i64,
+    pub diverged: bool,
+    pub files: Vec<FileStatus>,
+    pub has_uncommitted_changes: bool,
+    pub has_untracked_files: bool,
+}
+
+/// `git.getBranches` result (`{ branches, remoteBranches, currentBranch,
+/// defaultBranch }`), matching the TS `git.getBranches` handler.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranches {
+    pub branches: Vec<String>,
+    pub remote_branches: Vec<String>,
+    pub current_branch: String,
+    pub default_branch: String,
+}
+
+/// `git.commit` service result (the `ok` flag is added by the transport). Mirrors
+/// the TS `ws.git.commit` payload `{ hash?, files? }`; on success both are
+/// present (`hash` is the new commit SHA, `files` the files it changed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommitResult {
+    pub hash: String,
+    pub files: Vec<String>,
+}
+
+/// `git.agentCommit` service result (the `ok` flag is added by the transport).
+/// Mirrors the TS `ws.git.agentCommit` payload `{ hash, files, fileCount }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitAgentCommitResult {
+    pub hash: String,
+    pub files: Vec<String>,
+    pub file_count: i64,
+}
+
+/// `git.checkMergeConflicts` result, mirroring the TS `ws.git.checkMergeConflicts`
+/// payload `{ hasConflicts, conflictedFiles, cannotDetermine?, targetBranch,
+/// currentBranch }`. `cannotDetermine` is omitted unless the merge base could not
+/// be resolved (the TS legacy fallback's only producer).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitMergeConflicts {
+    pub has_conflicts: bool,
+    pub conflicted_files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cannot_determine: Option<bool>,
+    pub target_branch: String,
+    pub current_branch: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

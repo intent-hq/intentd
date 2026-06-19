@@ -810,6 +810,60 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "git.status" => {
+            let ws = require_ws_note(params)?;
+            let status = api.git_status(ws).await.map_err(domain_to_rpc)?;
+            to_result_value(&status)
+        }
+        "git.stage" => {
+            let ws = require_ws_note(params)?;
+            require_present(params, "paths")?;
+            let paths = params.get("paths").cloned().unwrap_or(Value::Null);
+            let staged = api.git_stage(ws, paths).await.map_err(domain_to_rpc)?;
+            Ok(json!({ "ok": true, "paths": staged }))
+        }
+        "git.getBranches" => {
+            let repo_path = require_str_param(params, "repoPath")?;
+            let include_remote = parse_bool(params, "includeRemote");
+            match api.git_get_branches(repo_path, include_remote).await {
+                Ok(branches) => to_result_value(&branches),
+                // Unknown/unauthorized repo path → -32602 with the TS message
+                // verbatim (no `invalid params:` prefix from `domain_to_rpc`).
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "git.commit" => {
+            let ws = require_ws_note(params)?;
+            let message = require_str_param(params, "message")?;
+            let r = api.git_commit(ws, message).await.map_err(domain_to_rpc)?;
+            Ok(json!({ "ok": true, "hash": r.hash, "files": r.files }))
+        }
+        "git.agentCommit" => {
+            let ws = require_ws_note(params)?;
+            let message = require_str_param(params, "message")?;
+            let files = opt_str_array(params, "files");
+            let user_requested = parse_bool(params, "userRequested");
+            let r = api
+                .git_agent_commit(ws, message, files, user_requested)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({
+                "ok": true,
+                "hash": r.hash,
+                "files": r.files,
+                "fileCount": r.file_count,
+            }))
+        }
+        "git.checkMergeConflicts" => {
+            let ws = require_ws_note(params)?;
+            let target = opt_str(params, "targetBranch");
+            let r = api
+                .git_check_merge_conflicts(ws, target)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&r)
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }
@@ -877,6 +931,18 @@ fn require_present(params: &Map<String, Value>, name: &str) -> Result<(), RpcErr
 /// Optional string param (absent/null/non-string → `None`).
 fn opt_str(params: &Map<String, Value>, name: &str) -> Option<String> {
     params.get(name).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Optional string-array param (absent/null/non-array → `None`); non-string
+/// elements are skipped. Used for the `git.agentCommit` `files` list.
+fn opt_str_array(params: &Map<String, Value>, name: &str) -> Option<Vec<String>> {
+    params.get(name).and_then(Value::as_array).map(|items| {
+        items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    })
 }
 
 /// Optional integer param from a JSON number (absent/non-number → `None`).
