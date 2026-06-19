@@ -65,6 +65,8 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         default_model: Some("opus".to_string()),
         pr_number: Some(42),
         pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
         archived,
         archived_at: if archived { Some(now_iso()) } else { None },
     }
@@ -76,8 +78,8 @@ async fn migration_status_reports_current_after_open() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let status = store.migration_status().await.expect("migration status");
     assert!(status.is_current(), "fresh open must apply all migrations");
-    assert_eq!(status.expected, vec![1, 2, 3, 4]);
-    assert_eq!(status.applied, vec![1, 2, 3, 4]);
+    assert_eq!(status.expected, vec![1, 2, 3, 4, 5]);
+    assert_eq!(status.applied, vec![1, 2, 3, 4, 5]);
 }
 
 #[tokio::test]

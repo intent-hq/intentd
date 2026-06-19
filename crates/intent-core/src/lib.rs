@@ -28,11 +28,11 @@ pub use model::{
     GitAgentCommitResult, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts,
     GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteSetContentResult, NoteTaskRow,
-    NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, SessionStats,
-    SuggestionDiff, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TopChangedFile,
-    Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary,
-    WorkspaceStatus, WorkspaceUpdate,
+    NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, PullRequestInfo, PullRequestStatus,
+    ReadAssetResult, SessionStats, SuggestionDiff, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata,
+    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TopChangedFile, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceCreate,
+    WorkspaceEventSummary, WorkspaceStatus, WorkspaceUpdate,
 };
 pub use traits::{BoxFuture, ContextEngine, WorkspaceApi};

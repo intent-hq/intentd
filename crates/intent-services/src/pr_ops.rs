@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use intent_core::{Error, Result, Workspace};
+use intent_core::{Error, PullRequestInfo, PullRequestStatus, Result, Workspace};
 use intent_sourcecontrol::{
     CheckRun, CheckState, MergeMethod, PrState, PullRequest, Review, ReviewComment, ReviewThread,
     ReviewThreadComment, ReviewVerdict, SourceControl, SourceControlRegistry,
@@ -57,6 +57,82 @@ pub(crate) fn repo_of(ws: &Workspace) -> Result<(String, String)> {
 pub(crate) fn active_pr_number(ws: &Workspace) -> Result<u64> {
     ws.pr_number
         .ok_or_else(|| Error::Internal(NO_ACTIVE_PR.to_string()))
+}
+
+// ===========================================================================
+// Workspace ↔ PR linkage (§7.6). The matching rule ports from the TS
+// `Workspace` type: a PR belongs to a workspace when its head ref equals the
+// workspace's OWN branch (`pr.head.ref === workspace.branch`), NOT `baseRef`.
+//
+// PARITY NOTE: the TS `performBackgroundEnrichment` additionally accepts a
+// `baseRef` match (`matchesBaseRef`); IMPLEMENTATION_SPEC §626 mandates
+// branch-only matching ("the workspace's own branch, NOT baseRef"), so this
+// port follows the SPEC and ignores `baseRef`.
+// ===========================================================================
+
+/// Outcome of a single workspace PR refresh (§7.6). Drives which `pr:*` event
+/// (if any) the caller emitted; `Skipped`/`Unchanged` emit nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrRefreshOutcome {
+    /// Not eligible (remote/archived workspace, no repo, or no branch).
+    Skipped,
+    /// Eligible but nothing changed (linked PR snapshot identical; or no
+    /// matching PR found during discovery).
+    Unchanged,
+    /// A previously unlinked workspace gained a PR link (`pr:linked`).
+    Linked,
+    /// A linked PR's persisted snapshot changed (`pr:updated`).
+    Updated,
+    /// A stale link was cleared after a positive branch mismatch (`pr:unlinked`).
+    Unlinked,
+}
+
+/// True when `pr.head.ref` (the host-agnostic `source_branch`) equals the
+/// workspace's own `branch`, and both are non-empty — the link/discovery rule.
+pub(crate) fn pr_matches_branch(pr: &PullRequest, branch: &str) -> bool {
+    !pr.source_branch.is_empty() && !branch.is_empty() && pr.source_branch == branch
+}
+
+/// True only on a POSITIVE mismatch: both branches are known (non-empty) and
+/// differ. An empty `source_branch` (e.g. a forge that omits it) is treated as
+/// "cannot determine" and never clears a link, mirroring the TS guard that only
+/// clears a stale link when the source branch is present and differs.
+pub(crate) fn pr_branch_mismatch(pr: &PullRequest, branch: &str) -> bool {
+    !pr.source_branch.is_empty() && !branch.is_empty() && pr.source_branch != branch
+}
+
+/// Derive the persisted [`PullRequestStatus`] from a forge PR (draft wins over
+/// open; merged/closed map directly), mirroring [`derive_status_state`].
+pub(crate) fn derive_pr_status(pr: &PullRequest) -> PullRequestStatus {
+    match pr.state {
+        PrState::Merged => PullRequestStatus::Merged,
+        PrState::Closed => PullRequestStatus::Closed,
+        PrState::Open if pr.draft => PullRequestStatus::Draft,
+        PrState::Open => PullRequestStatus::Open,
+    }
+}
+
+/// Build the persisted [`PullRequestInfo`] snapshot from a forge PR (§7.6).
+/// Empty strings on optional fields collapse to `None` so absent values are
+/// omitted from the wire, matching the TS `PullRequestInfo` JSON shape.
+pub(crate) fn build_pr_info(pr: &PullRequest) -> PullRequestInfo {
+    let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    PullRequestInfo {
+        id: pr.number.to_string(),
+        number: pr.number,
+        url: pr.url.clone(),
+        title: pr.title.clone(),
+        status: derive_pr_status(pr),
+        created_at: pr.created_at.clone(),
+        updated_at: pr.updated_at.clone(),
+        base_ref: non_empty(&pr.target_branch),
+        head_ref: non_empty(&pr.source_branch),
+        head_sha: pr.head_sha.clone().filter(|s| !s.is_empty()),
+        author: non_empty(&pr.author),
+        mergeable: pr.mergeable,
+        mergeable_state: pr.mergeable_state.clone(),
+        is_draft: Some(pr.draft),
+    }
 }
 
 /// The 4-value wire state for `pr.status` (TS `getPullRequest` derivation:
@@ -639,6 +715,74 @@ mod tests {
             body: None,
             submitted_at: at.into(),
         }
+    }
+
+    #[test]
+    fn matches_on_head_ref_not_baseref() {
+        // The sample PR's `source_branch` (head.ref) is "feat".
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        assert!(pr_matches_branch(&p, "feat"));
+        assert!(!pr_matches_branch(&p, "main"));
+        // Empty branch / empty source branch never match.
+        assert!(!pr_matches_branch(&p, ""));
+        let mut empty = p.clone();
+        empty.source_branch = String::new();
+        assert!(!pr_matches_branch(&empty, "feat"));
+    }
+
+    #[test]
+    fn branch_mismatch_only_on_positive_difference() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        // Same branch: no mismatch.
+        assert!(!pr_branch_mismatch(&p, "feat"));
+        // Different, both non-empty: positive mismatch.
+        assert!(pr_branch_mismatch(&p, "other"));
+        // Empty source branch: cannot determine → never a mismatch.
+        let mut empty = p.clone();
+        empty.source_branch = String::new();
+        assert!(!pr_branch_mismatch(&empty, "feat"));
+        // Empty workspace branch: cannot determine → never a mismatch.
+        assert!(!pr_branch_mismatch(&p, ""));
+    }
+
+    #[test]
+    fn derives_pr_status_draft_merged_closed_open() {
+        assert_eq!(
+            derive_pr_status(&pr(PrState::Merged, true, None, None)),
+            PullRequestStatus::Merged
+        );
+        assert_eq!(
+            derive_pr_status(&pr(PrState::Closed, false, None, None)),
+            PullRequestStatus::Closed
+        );
+        assert_eq!(
+            derive_pr_status(&pr(PrState::Open, true, None, None)),
+            PullRequestStatus::Draft
+        );
+        assert_eq!(
+            derive_pr_status(&pr(PrState::Open, false, None, None)),
+            PullRequestStatus::Open
+        );
+    }
+
+    #[test]
+    fn builds_pr_info_snapshot_from_forge_pr() {
+        let mut p = pr(PrState::Open, false, Some(true), Some("clean"));
+        p.head_sha = Some("abc123".into());
+        p.created_at = "2026-01-01".into();
+        p.updated_at = "2026-01-02".into();
+        let info = build_pr_info(&p);
+        assert_eq!(info.id, "1");
+        assert_eq!(info.number, 1);
+        assert_eq!(info.status, PullRequestStatus::Open);
+        assert_eq!(info.head_ref.as_deref(), Some("feat"));
+        assert_eq!(info.base_ref.as_deref(), Some("main"));
+        assert_eq!(info.head_sha.as_deref(), Some("abc123"));
+        assert_eq!(info.is_draft, Some(false));
+        // PascalCase status wire word matches the TS `PullRequestStatus` enum.
+        let v = serde_json::to_value(&info).unwrap();
+        assert_eq!(v["status"], serde_json::json!("Open"));
+        assert_eq!(v["headRef"], serde_json::json!("feat"));
     }
 
     #[test]

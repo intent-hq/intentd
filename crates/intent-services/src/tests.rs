@@ -59,6 +59,8 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         default_model: None,
         pr_number: None,
         pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
         archived: false,
         archived_at: None,
     }
@@ -1050,6 +1052,9 @@ mod pr {
         /// When set, each `get_pr` returns a fresh head SHA so the
         /// `pr.waitForChanges` poll detects a commit change.
         mutate_head: bool,
+        /// When set, `list_prs` returns the sample PR so PR-refresh discovery can
+        /// link an unlinked workspace by head ref.
+        discover: bool,
         head_seq: AtomicU64,
     }
 
@@ -1106,7 +1111,11 @@ mod pr {
             Ok(pr)
         }
         async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Vec<PullRequest>> {
-            unimplemented!()
+            if self.discover {
+                Ok(vec![sample_pr()])
+            } else {
+                Ok(vec![])
+            }
         }
         async fn update_pr(&self, _: &RepoRef, _: u64, _: PrPatch) -> ScResult<PullRequest> {
             unimplemented!()
@@ -1527,5 +1536,126 @@ mod pr {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m.contains("watch must be one of")));
+    }
+
+    // ------------------------------------------------------------------------
+    // PR ↔ workspace refresh (§7.6): head.ref matching, persisted snapshot, and
+    // `pr:*` event emission against the stubbed forge (no network).
+    // ------------------------------------------------------------------------
+
+    /// Build a bus-wired service plus a seeded workspace for refresh tests. The
+    /// returned bus persists `pr:*` events to the durable log we assert on.
+    async fn refresh_setup(
+        forge: StubForge,
+        branch: &str,
+        pr_number: Option<u64>,
+        is_remote: bool,
+    ) -> (TempDb, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.branch = branch.to_string();
+        ws.repository_owner = Some("o".into());
+        ws.repository_name = Some("r".into());
+        ws.pr_number = pr_number;
+        ws.is_remote = is_remote;
+        ws.updated_at = now_iso();
+        store.insert_workspace(&ws).await.expect("ws");
+        let bus = crate::EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_event_bus(bus)
+            .with_source_control(Arc::new(forge));
+        (tmp, svc, ws_id)
+    }
+
+    #[tokio::test]
+    async fn refresh_emits_pr_updated_and_is_idempotent() {
+        // Linked PR #42; ws branch matches the PR head ("feature").
+        let (_t, svc, ws_id) =
+            refresh_setup(StubForge::default(), "feature", Some(42), false).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        let info = after.active_pull_request.as_ref().expect("snapshot");
+        assert_eq!(info.number, 42);
+        assert_eq!(info.head_ref.as_deref(), Some("feature"));
+
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data["prNumber"], 42);
+        assert_eq!(evs[0].data["prStatus"], "Open");
+
+        // Re-running with the same forge state is a no-op (no new event).
+        let again = svc.refresh_workspace_pr(&ws_id).await.expect("refresh2");
+        assert_eq!(again, crate::PrRefreshOutcome::Unchanged);
+        let evs2 = svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs2.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_unlinks_on_positive_branch_mismatch() {
+        // Linked PR #42 but ws branch "main" differs from PR head "feature".
+        let (_t, svc, ws_id) = refresh_setup(StubForge::default(), "main", Some(42), false).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Unlinked);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, None);
+        assert_eq!(after.pr_url, None);
+        assert_eq!(after.pr_status, None);
+        assert!(after.active_pull_request.is_none());
+
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:unlinked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_links_via_head_ref_discovery() {
+        // Unlinked ws; discovery returns a PR whose head ref equals the branch.
+        let forge = StubForge {
+            discover: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) = refresh_setup(forge, "feature", None, false).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Linked);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:linked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data["prNumber"], 42);
+        assert_eq!(evs[0].data["prUrl"], "https://github.com/o/r/pull/42");
+    }
+
+    #[tokio::test]
+    async fn refresh_skips_remote_workspace() {
+        // Remote workspaces are not refreshed (no forge call, no event).
+        let (_t, svc, ws_id) = refresh_setup(StubForge::default(), "feature", Some(42), true).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Skipped);
+        let evs = svc.store().events_by_workspace(&ws_id, 10).await.unwrap();
+        assert!(evs.is_empty());
     }
 }

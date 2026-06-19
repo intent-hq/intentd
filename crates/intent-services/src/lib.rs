@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use base64::Engine as _;
 use intent_core::events::{
-    COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, TASK_STATUS_CHANGED,
-    WORKSPACE_ATTENTION_CHANGED,
+    COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED,
+    TASK_STATUS_CHANGED, WORKSPACE_ATTENTION_CHANGED,
 };
 use intent_core::{
     iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId, AgentLite,
@@ -50,6 +50,7 @@ pub use agent_manager::{
     compute_process_cap, default_process_cap, AgentManager, BusEventSink, ProcessRegistry,
 };
 pub use events::{EventBus, FileWatcher, Subscription, SubscriptionFilter};
+pub use pr_ops::PrRefreshOutcome;
 
 /// Aggregate service handle wired by the binary composition root. It implements
 /// `WorkspaceApi` so it can be handed to `intent-acp` as `Arc<dyn WorkspaceApi>`
@@ -142,6 +143,146 @@ impl Services {
     /// Borrow the underlying store (composition-root / diagnostics use).
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Refresh one workspace's PR linkage against the forge (§7.6), persisting
+    /// any change and emitting the matching `pr:*` event. Used both on demand
+    /// and by the background loop. The matching rule is `pr.head.ref ==
+    /// workspace.branch` (NOT baseRef). When the workspace is already linked the
+    /// PR is re-fetched and its snapshot diffed (clearing a stale link on a
+    /// positive branch mismatch); when unlinked, an open PR whose head ref
+    /// equals the branch is discovered and linked. Remote/archived workspaces,
+    /// and those lacking repo/branch info, are skipped. A missing forge token
+    /// (no injected/registry provider) surfaces as `Internal`.
+    pub async fn refresh_workspace_pr(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<pr_ops::PrRefreshOutcome> {
+        use pr_ops::PrRefreshOutcome;
+
+        let mut ws = self.store.get_workspace(workspace_id).await?;
+        if ws.is_remote || ws.archived {
+            return Ok(PrRefreshOutcome::Skipped);
+        }
+        let (owner, repo) = match pr_ops::repo_of(&ws) {
+            Ok(pair) => pair,
+            Err(_) => return Ok(PrRefreshOutcome::Skipped),
+        };
+        let sc = pr_ops::resolve_source_control(self.source_control.clone())?;
+        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+
+        match ws.pr_number {
+            Some(number) => {
+                let pr = sc
+                    .get_pr(&repo_ref, number)
+                    .await
+                    .map_err(pr_ops::map_sc_err)?;
+                // Clear a stale link only on a positive branch mismatch.
+                if pr_ops::pr_branch_mismatch(&pr, &ws.branch) {
+                    ws.pr_number = None;
+                    ws.pr_url = None;
+                    ws.pr_status = None;
+                    ws.active_pull_request = None;
+                    ws.updated_at = now_iso();
+                    self.store.update_workspace(&ws).await?;
+                    publish_event(&self.event_bus, pr_unlinked_event(workspace_id)).await;
+                    return Ok(PrRefreshOutcome::Unlinked);
+                }
+                let info = pr_ops::build_pr_info(&pr);
+                let changed = ws.pr_status != Some(info.status)
+                    || ws.active_pull_request.as_ref() != Some(&info)
+                    || ws.pr_url.as_deref() != Some(pr.url.as_str());
+                if !changed {
+                    return Ok(PrRefreshOutcome::Unchanged);
+                }
+                ws.pr_status = Some(info.status);
+                ws.pr_url = Some(pr.url.clone());
+                ws.active_pull_request = Some(info);
+                ws.updated_at = now_iso();
+                self.store.update_workspace(&ws).await?;
+                publish_event(&self.event_bus, pr_updated_event(&ws)).await;
+                Ok(PrRefreshOutcome::Updated)
+            }
+            None => {
+                // Discovery: link an open PR whose head ref equals the branch.
+                if ws.branch.is_empty() {
+                    return Ok(PrRefreshOutcome::Skipped);
+                }
+                let query = intent_sourcecontrol::PrQuery {
+                    state: Some(intent_sourcecontrol::PrState::Open),
+                    head: Some(ws.branch.clone()),
+                    ..Default::default()
+                };
+                let prs = sc
+                    .list_prs(&repo_ref, query)
+                    .await
+                    .map_err(pr_ops::map_sc_err)?;
+                match prs
+                    .into_iter()
+                    .find(|p| pr_ops::pr_matches_branch(p, &ws.branch))
+                {
+                    Some(pr) => {
+                        let info = pr_ops::build_pr_info(&pr);
+                        ws.pr_number = Some(pr.number);
+                        ws.pr_url = Some(pr.url.clone());
+                        ws.pr_status = Some(info.status);
+                        ws.active_pull_request = Some(info);
+                        ws.updated_at = now_iso();
+                        self.store.update_workspace(&ws).await?;
+                        publish_event(&self.event_bus, pr_linked_event(&ws)).await;
+                        Ok(PrRefreshOutcome::Linked)
+                    }
+                    None => Ok(PrRefreshOutcome::Unchanged),
+                }
+            }
+        }
+    }
+
+    /// Refresh every workspace that already has a linked PR (discovery stays
+    /// on-demand). Errors are logged per workspace and never abort the sweep.
+    async fn refresh_all_linked_prs(&self) {
+        let workspaces = match self.store.list_workspaces(false).await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(error = %e, "pr refresh: listing workspaces failed");
+                return;
+            }
+        };
+        for ws in workspaces {
+            if ws.pr_number.is_none() {
+                continue;
+            }
+            if let Err(e) = self.refresh_workspace_pr(&ws.id).await {
+                tracing::warn!(
+                    workspace = %ws.id.as_str(),
+                    error = %e,
+                    "pr refresh: workspace refresh failed"
+                );
+            }
+        }
+    }
+
+    /// Spawn the background PR refresh loop (§7.6): every `interval` it refreshes
+    /// all linked PRs, persisting deltas and emitting `pr:*` events. The first
+    /// sweep runs after one `interval`. Missed ticks are skipped (no pile-up).
+    /// No-op-safe when source control is unconfigured (each refresh surfaces the
+    /// missing-provider error, which is logged and swallowed). Returns the task
+    /// handle so the composition root can hold/abort it.
+    pub fn spawn_pr_refresh_loop(
+        &self,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let services = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Consume the immediate first tick so the loop waits one interval.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                services.refresh_all_linked_prs().await;
+            }
+        })
     }
 }
 
@@ -363,6 +504,63 @@ fn comment_added_event(workspace_id: &WorkspaceId, note_id: &NoteId, comment_id:
     }
 }
 
+/// Build a `pr:linked` event for a workspace that just gained a PR link (§7.6).
+/// Self-sufficient payload `{ workspaceId, prNumber, prUrl, prStatus,
+/// activePullRequest }` so a client can render the link without a follow-up read.
+fn pr_linked_event(ws: &Workspace) -> NewEvent {
+    NewEvent {
+        workspace_id: ws.id.clone(),
+        timestamp: now_iso(),
+        event_type: PR_LINKED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        data: serde_json::json!({
+            "workspaceId": ws.id.as_str(),
+            "prNumber": ws.pr_number,
+            "prUrl": ws.pr_url,
+            "prStatus": ws.pr_status,
+            "activePullRequest": ws.active_pull_request,
+        }),
+    }
+}
+
+/// Build a `pr:updated` event for a linked PR whose persisted snapshot changed
+/// (§7.6). Payload `{ workspaceId, prNumber, prStatus, activePullRequest }`.
+fn pr_updated_event(ws: &Workspace) -> NewEvent {
+    NewEvent {
+        workspace_id: ws.id.clone(),
+        timestamp: now_iso(),
+        event_type: PR_UPDATED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        data: serde_json::json!({
+            "workspaceId": ws.id.as_str(),
+            "prNumber": ws.pr_number,
+            "prStatus": ws.pr_status,
+            "activePullRequest": ws.active_pull_request,
+        }),
+    }
+}
+
+/// Build a `pr:unlinked` event for a workspace whose stale PR link was cleared
+/// (§7.6). Self-sufficient payload `{ workspaceId }`.
+fn pr_unlinked_event(workspace_id: &WorkspaceId) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: PR_UNLINKED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        data: serde_json::json!({ "workspaceId": workspace_id.as_str() }),
+    }
+}
+
 /// Publish a change event onto the bus when one is wired, logging (not failing)
 /// on error — the durable mutation has already succeeded by this point.
 pub(crate) async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
@@ -453,6 +651,8 @@ impl WorkspaceApi for Services {
                 default_model: input.default_model,
                 pr_number: None,
                 pr_url: None,
+                pr_status: None,
+                active_pull_request: None,
                 archived: false,
                 archived_at: None,
             };
@@ -2802,11 +3002,14 @@ impl WorkspaceApi for Services {
             let sc = pr_ops::resolve_source_control(injected)?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             match sc.update_branch(&repo_ref, number).await {
+                // URL revisit (§7.6): the forge `update_branch` returns no URL,
+                // so mirror the TS `result.url ?? null` by surfacing the PR URL
+                // now persisted on the workspace (`null` when not yet linked).
                 Ok(()) => Ok(serde_json::json!({
                     "method": "merge",
                     "alreadyUpToDate": false,
                     "message": "PR branch updated from the base branch.",
-                    "url": serde_json::Value::Null,
+                    "url": ws.pr_url.clone(),
                 })),
                 Err(e) => {
                     let msg = e.to_string();
