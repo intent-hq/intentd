@@ -23,6 +23,7 @@ pub mod error;
 pub mod fs;
 pub mod handler;
 pub mod handshake;
+pub mod mcp_bridge;
 pub mod mcp_config;
 pub mod mcp_env;
 pub mod mcp_server;
@@ -37,6 +38,7 @@ pub use error::{AcpError, AcpResult, JsonRpcError};
 pub use fs::{FileAction, FileChange, FileService};
 pub use handler::{ClientRequestHandler, EventSink, SinkEvent};
 pub use handshake::{handshake, HandshakeResult};
+pub use mcp_bridge::{run_stdio_bridge, serve_workspace_mcp_tcp, McpBridge};
 pub use mcp_config::{
     apply_baseline_env_to_stdio_servers, normalize_mcp_servers, to_acp_mcp_servers,
     to_auggie_mcp_config, to_claude_mcp_json, to_codex_mcp_overrides, to_opencode_mcp_config,
