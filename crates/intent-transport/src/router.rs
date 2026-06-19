@@ -1119,6 +1119,35 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "search.inFiles" => {
+            let ws = require_ws_note(params)?;
+            let query = require_str_param(params, "query")?;
+            let opts = opt_value(params, "opts");
+            let request_id = opt_str(params, "requestId");
+            match api.search_in_files(ws, query, opts, request_id).await {
+                Ok(v) => Ok(v),
+                // Malformed regex / glob → -32602 with the raw message
+                // ("Invalid regex"), not the `invalid params:` prefix.
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "search.fileNames" => {
+            let ws = require_ws_note(params)?;
+            let pattern = require_str_param(params, "pattern")?;
+            let limit = opt_int(params, "limit");
+            let request_id = opt_str(params, "requestId");
+            match api.search_file_names(ws, pattern, limit, request_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "search.cancel" => {
+            let request_id = require_str_param(params, "requestId")?;
+            let r = api.search_cancel(request_id).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }

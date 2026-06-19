@@ -702,6 +702,47 @@ impl WorkspaceApi for FakeApi {
             })
         })
     }
+
+    fn search_in_files(
+        &self,
+        _workspace_id: WorkspaceId,
+        query: String,
+        _opts: Option<Value>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if query == "bad(" {
+                return Err(Error::InvalidParams("Invalid regex".to_string()));
+            }
+            let request_id = request_id.unwrap_or_else(|| "srch-minted".to_string());
+            Ok(serde_json::json!({
+                "requestId": request_id,
+                "matches": [],
+                "truncated": false,
+            }))
+        })
+    }
+
+    fn search_file_names(
+        &self,
+        _workspace_id: WorkspaceId,
+        _pattern: String,
+        _limit: Option<i64>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            let request_id = request_id.unwrap_or_else(|| "srch-minted".to_string());
+            Ok(serde_json::json!({
+                "requestId": request_id,
+                "files": [],
+                "truncated": false,
+            }))
+        })
+    }
+
+    fn search_cancel(&self, _request_id: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async { Ok(serde_json::json!({ "ok": true })) })
+    }
 }
 
 async fn call(msg: &str) -> Option<Value> {
@@ -1621,4 +1662,80 @@ async fn metrics_agent_methods_require_agent_id() {
             serde_json::json!("Missing required parameter: agentId")
         );
     }
+}
+
+#[tokio::test]
+async fn search_in_files_requires_workspace_and_query() {
+    // Missing workspaceId.
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"search.inFiles","params":{"query":"x"}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("workspaceId is required")
+    );
+    // Missing query.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"search.inFiles","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: query")
+    );
+}
+
+#[tokio::test]
+async fn search_in_files_echoes_request_id_and_maps_invalid_regex() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"search.inFiles","params":{"workspaceId":"ws-1","query":"x","requestId":"srch-7"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["requestId"], serde_json::json!("srch-7"));
+    // Malformed regex → -32602 with the raw "Invalid regex" message.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"search.inFiles","params":{"workspaceId":"ws-1","query":"bad(","opts":{"regex":true}}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(v["error"]["message"], serde_json::json!("Invalid regex"));
+}
+
+#[tokio::test]
+async fn search_file_names_requires_pattern() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"search.fileNames","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: pattern")
+    );
+}
+
+#[tokio::test]
+async fn search_cancel_requires_request_id_and_is_ok() {
+    // Missing requestId → -32602.
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"search.cancel","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: requestId")
+    );
+    // Known/unknown id alike → no-op success.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"search.cancel","params":{"requestId":"srch-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"], serde_json::json!({ "ok": true }));
 }
