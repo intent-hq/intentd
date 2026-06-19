@@ -7,9 +7,14 @@
 
 use intent_core::Error;
 
-pub use intent_core::{FileStatus, GitBranches, GitFileStatus, GitStatus, Result};
+pub use intent_core::{
+    FileStatus, GitAgentCommitResult, GitBranches, GitCommitResult, GitFileStatus,
+    GitMergeConflicts, GitStatus, Result,
+};
 
 pub mod branches;
+pub mod commit;
+pub mod conflicts;
 pub mod diff;
 pub mod stage;
 pub mod status;
