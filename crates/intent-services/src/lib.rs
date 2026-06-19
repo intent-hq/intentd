@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use base64::Engine as _;
 use intent_core::events::{
@@ -72,6 +72,12 @@ pub struct Services {
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
     /// with the end-to-end orchestration flow; the queue surface itself is here.
     agent_queues: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Back-reference to the runtime [`AgentManager`] so the `agent.*` RPC
+    /// handlers drive the real spawn/turn/MCP loop (§6.8). Held as a [`Weak`] to
+    /// break the `AgentManager → Services` ownership cycle; the composition root
+    /// keeps the strong `Arc<AgentManager>` for the daemon's lifetime. `None`
+    /// until attached, so read-only/test wiring keeps the store-only behavior.
+    agent_manager: Arc<OnceLock<Weak<AgentManager>>>,
 }
 
 impl Services {
@@ -83,7 +89,23 @@ impl Services {
             event_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
+            agent_manager: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Attach the runtime [`AgentManager`] so the `agent.*` RPC handlers drive
+    /// the live spawn/turn/MCP loop (§6.8). Stores a [`Weak`] (the composition
+    /// root owns the strong handle). The `OnceLock` is shared across clones, so
+    /// every clone of this handle — including the one the manager holds — sees
+    /// the manager once attached. Idempotent: a second call is a no-op.
+    pub fn attach_agent_manager(&self, manager: &Arc<AgentManager>) {
+        let _ = self.agent_manager.set(Arc::downgrade(manager));
+    }
+
+    /// Upgrade the attached [`AgentManager`], or `None` when unattached or the
+    /// manager has been dropped (read-only/test wiring).
+    pub(crate) fn agent_manager(&self) -> Option<Arc<AgentManager>> {
+        self.agent_manager.get().and_then(Weak::upgrade)
     }
 
     /// Configure the note-asset root directory (for `note.readAsset`).
@@ -2040,21 +2062,32 @@ impl WorkspaceApi for Services {
 
     fn agent_send_message(
         &self,
-        _workspace_id: WorkspaceId,
+        workspace_id: WorkspaceId,
         agent_id: AgentId,
         content: String,
         message_id: Option<String>,
         _image_blocks: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_send_message_op(agent_id, content, message_id)
-                .await
+            // When the runtime manager is attached, drive a real spawn/turn loop;
+            // otherwise fall back to the store-only persist (read-only wiring).
+            match self.agent_manager() {
+                Some(manager) => {
+                    manager
+                        .send_message(agent_id, workspace_id, content, message_id)
+                        .await
+                }
+                None => {
+                    self.agent_send_message_op(agent_id, content, message_id)
+                        .await
+                }
+            }
         })
     }
 
     fn agent_force_message(
         &self,
-        _workspace_id: WorkspaceId,
+        workspace_id: WorkspaceId,
         agent_id: AgentId,
         message_id: String,
         content: String,
@@ -2062,8 +2095,17 @@ impl WorkspaceApi for Services {
         _note_ids: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_force_message_op(agent_id, message_id, content)
-                .await
+            match self.agent_manager() {
+                Some(manager) => {
+                    manager
+                        .force_message(agent_id, workspace_id, message_id, content)
+                        .await
+                }
+                None => {
+                    self.agent_force_message_op(agent_id, message_id, content)
+                        .await
+                }
+            }
         })
     }
 
@@ -2108,7 +2150,11 @@ impl WorkspaceApi for Services {
 
     fn agent_stop(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            let _ = agent_id;
+            // Cancel the in-flight stream + kill the child via the manager when
+            // attached; the result is `{ success: true }` either way (§5.5).
+            if let Some(manager) = self.agent_manager() {
+                manager.stop(&agent_id).await;
+            }
             Ok(serde_json::json!({ "success": true }))
         })
     }

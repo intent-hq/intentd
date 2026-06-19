@@ -12,7 +12,7 @@
 //! a global concurrency cap with LRU idle eviction); full timer/memory-pressure
 //! reaping is M5, exposed here as the [`AgentManager::reap_idle`] hook.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,13 +25,18 @@ use intent_acp::{
     NormalizedMcpServers, PermissionPolicy, PermissionRegistry, SinkEvent, SpawnOptions,
     WorkspaceMcpServer,
 };
-use intent_core::{now_iso, AgentId, BoxFuture, Error, Result, WorkspaceApi, WorkspaceId};
+use intent_core::{
+    now_iso, AgentId, AgentSession, BoxFuture, Error, Result, WorkspaceApi, WorkspaceId,
+};
 use intent_providers::ProviderConfig;
 use intent_store::NewEvent;
+use serde_json::{json, Value};
 use tokio::process::Child;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+use crate::agent_ops::new_message_id;
 
 use crate::events::EventBus;
 use crate::Services;
@@ -369,6 +374,13 @@ pub struct AgentManager {
     permissions: Arc<PermissionRegistry>,
     policy: PermissionPolicy,
     mcp_bridge_exe: PathBuf,
+    /// Agents with an in-flight turn loop (a worker is draining their stream).
+    /// `agent.sendMessage` consults this to flip a message to the queue while a
+    /// turn is mid-stream (the TS "queue while streaming" semantics).
+    busy: Arc<Mutex<HashSet<AgentId>>>,
+    /// Abortable background turn workers, keyed by agent. `stop`/`forceMessage`
+    /// abort the in-flight worker (interrupting the current stream).
+    workers: Arc<Mutex<HashMap<AgentId, JoinHandle<()>>>>,
 }
 
 impl AgentManager {
@@ -383,6 +395,8 @@ impl AgentManager {
             permissions: Arc::new(PermissionRegistry::new()),
             policy: PermissionPolicy::default(),
             mcp_bridge_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("intentd")),
+            busy: Arc::new(Mutex::new(HashSet::new())),
+            workers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -604,12 +618,153 @@ impl AgentManager {
         result
     }
 
-    /// Stop one agent: drop its handle (killing the child via `kill_on_drop` and
-    /// aborting its request loop) and deregister it. Returns whether it existed.
+    /// Stop one agent: abort its in-flight turn worker (interrupting the current
+    /// stream), clear its busy flag, drop its handle (killing the child via
+    /// `kill_on_drop` and aborting its request loop), and deregister it. Returns
+    /// whether a handle existed. This is the `agent.stop` cancel semantics.
     pub async fn stop(&self, agent_id: &AgentId) -> bool {
+        if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
+            worker.abort();
+        }
+        self.end_turn(agent_id);
         let removed = self.handles.lock().unwrap().remove(agent_id).is_some();
         self.registry.deregister(agent_id);
         removed
+    }
+
+    /// Whether a turn loop is currently in flight for `agent_id` (consulted by
+    /// `agent.sendMessage` to decide queue-vs-stream).
+    pub fn is_busy(&self, agent_id: &AgentId) -> bool {
+        self.busy.lock().unwrap().contains(agent_id)
+    }
+
+    /// Atomically claim the in-flight slot: `true` when the agent was idle (now
+    /// marked busy), `false` when a turn is already running.
+    fn try_begin(&self, agent_id: &AgentId) -> bool {
+        self.busy.lock().unwrap().insert(agent_id.clone())
+    }
+
+    /// Release the in-flight slot.
+    fn end_turn(&self, agent_id: &AgentId) {
+        self.busy.lock().unwrap().remove(agent_id);
+    }
+
+    /// Forget a finished worker's join handle.
+    fn clear_worker(&self, agent_id: &AgentId) {
+        self.workers.lock().unwrap().remove(agent_id);
+    }
+
+    /// `agent.sendMessage` runtime path (§5.5/§6.8): when a turn is already in
+    /// flight, enqueue (the worker flips it to in-flight when the current turn
+    /// ends); otherwise persist the user message and spawn a background worker
+    /// that lazily spawns the child on first turn, drives the ACP turn through
+    /// [`AgentManager::run_turn`], and drains the queue. Returns the TS-shaped
+    /// `{ success, queued, messageId | queuedMessage }`.
+    pub async fn send_message(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        content: String,
+        message_id: Option<String>,
+    ) -> Result<Value> {
+        if !self.try_begin(&agent_id) {
+            let queued = self.services.enqueue_message(&agent_id, content, None);
+            return Ok(
+                json!({ "success": true, "queued": true, "queuedMessage": queued.to_value() }),
+            );
+        }
+        let message_id = message_id.unwrap_or_else(new_message_id);
+        let blocks = user_text_blocks(&content);
+        if self
+            .services
+            .store
+            .append_agent_message(&agent_id, "user", &blocks, &now_iso())
+            .await
+            .is_err()
+        {
+            // Store write failed (e.g. session not yet persisted) → auto-queue,
+            // matching the `agent.sendMessage` fallback (PROTOCOL §5.5).
+            self.end_turn(&agent_id);
+            let queued = self.services.enqueue_message(&agent_id, content, None);
+            return Ok(
+                json!({ "success": true, "queued": true, "queuedMessage": queued.to_value() }),
+            );
+        }
+        self.spawn_worker(agent_id, workspace_id, content);
+        Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+    }
+
+    /// `agent.forceMessage` runtime path (§5.5): stop the current stream (abort
+    /// the worker + kill the child), discard the pending queue, then deliver the
+    /// forced message immediately as a fresh turn.
+    pub async fn force_message(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        message_id: String,
+        content: String,
+    ) -> Result<Value> {
+        self.stop(&agent_id).await;
+        self.services.clear_queue(&agent_id);
+        let blocks = user_text_blocks(&content);
+        self.services
+            .store
+            .append_agent_message(&agent_id, "user", &blocks, &now_iso())
+            .await?;
+        self.try_begin(&agent_id);
+        self.spawn_worker(agent_id, workspace_id, content);
+        Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+    }
+
+    /// Spawn (and track) the background turn worker for an agent. The caller must
+    /// already hold the in-flight slot (`try_begin`).
+    fn spawn_worker(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        content: String,
+    ) {
+        let mgr = self.clone();
+        let id = agent_id.clone();
+        let handle = tokio::spawn(async move {
+            run_message_worker(mgr, id, workspace_id, content).await;
+        });
+        self.workers.lock().unwrap().insert(agent_id, handle);
+    }
+
+    /// Ensure the agent's child process + ACP session exist, spawning lazily on
+    /// first turn (the TS spawn-on-first-message semantics) and reusing the live
+    /// session otherwise. Returns the `acpSessionId` to drive the turn.
+    async fn ensure_started(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<String> {
+        let session = self.services.store.get_agent_session(agent_id).await?;
+        if self.contains(agent_id) {
+            if let Some(acp) = session.acp_session_id.clone() {
+                return Ok(acp);
+            }
+        }
+        let workspace = self.services.store.get_workspace(workspace_id).await.ok();
+        let resolved = resolve_spawn(&session, workspace.as_ref())?;
+        let mut opts = SpawnOptions::new(&resolved.provider);
+        opts.cwd = Some(&resolved.cwd);
+        opts.model = resolved.model.as_deref();
+        opts.extra_env = resolved.extra_env.clone();
+        if !self.contains(agent_id) {
+            self.create_agent(
+                agent_id.clone(),
+                workspace_id.clone(),
+                session.name.clone(),
+                "interactive",
+                resolved.cwd.clone(),
+                &opts,
+            )
+            .await?;
+        }
+        self.start_session(agent_id, resolved.cwd.clone(), &resolved.provider)
+            .await
     }
 
     /// Tear down every tracked agent (clean daemon shutdown kills all children).
@@ -639,5 +794,160 @@ impl AgentManager {
                 }
             })
         })
+    }
+}
+
+/// A single user text content block (the persisted/prompt message shape).
+fn user_text_blocks(content: &str) -> Value {
+    json!([{ "type": "text", "text": content }])
+}
+
+/// One `text` ACP prompt content block for a user message.
+fn text_prompt(content: &str) -> Vec<ContentBlock> {
+    serde_json::from_value(json!([{ "type": "text", "text": content }])).unwrap_or_default()
+}
+
+/// Resolved spawn inputs for an agent: the provider config plus the owned model,
+/// cwd, and extra env the borrowing [`SpawnOptions`] reference during a spawn.
+struct ResolvedSpawn {
+    provider: ProviderConfig,
+    model: Option<String>,
+    cwd: PathBuf,
+    extra_env: BTreeMap<String, String>,
+}
+
+/// Resolve the provider config, model, cwd, and extra env for spawning an
+/// agent's child from its persisted session + workspace. The provider id comes
+/// from the session's explicit `provider`, else the `provider:model` compound
+/// id, else the default provider. The `mock` provider (E2E) reads its script
+/// from `MOCK_AGENT_SCRIPT_PATH` and enables `--mcp-config` so a daemon-spawned
+/// child reaches the per-agent workspace MCP server, forwarding
+/// `MOCK_AGENT_BEHAVIOR` to the child.
+fn resolve_spawn(
+    session: &AgentSession,
+    workspace: Option<&intent_core::Workspace>,
+) -> Result<ResolvedSpawn> {
+    let provider_id = session
+        .provider
+        .clone()
+        .or_else(|| {
+            session
+                .model
+                .as_ref()
+                .map(|m| intent_providers::parse_compound_model_id(m).0)
+        })
+        .unwrap_or_else(|| intent_providers::default_provider_id().to_string());
+    let model = session
+        .model
+        .as_ref()
+        .map(|m| intent_providers::parse_compound_model_id(m).1)
+        .filter(|m| !m.is_empty());
+    let cwd = workspace
+        .and_then(|w| w.path.clone().or_else(|| w.worktree_path.clone()))
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+
+    let mut extra_env = BTreeMap::new();
+    if provider_id == "mock" {
+        let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").map_err(|_| {
+            Error::Internal("mock provider requires MOCK_AGENT_SCRIPT_PATH".to_string())
+        })?;
+        // `'static` leaks are bounded to the mock (E2E-only) path; real
+        // providers carry static `base_args` and never leak.
+        let script_static: &'static str = Box::leak(script.into_boxed_str());
+        let base_args: &'static [&'static str] = Box::leak(vec![script_static].into_boxed_slice());
+        if let Ok(behavior) = std::env::var("MOCK_AGENT_BEHAVIOR") {
+            extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
+        }
+        let base = intent_providers::find_provider("mock")
+            .ok_or_else(|| Error::Internal("mock provider missing from registry".to_string()))?;
+        let provider = ProviderConfig {
+            command: "node",
+            base_args,
+            supports_authenticate: true,
+            supports_mcp_config: true,
+            mcp_config_flag: Some("--mcp-config"),
+            ..*base
+        };
+        return Ok(ResolvedSpawn {
+            provider,
+            model: None,
+            cwd,
+            extra_env,
+        });
+    }
+
+    Ok(ResolvedSpawn {
+        provider: *intent_providers::provider_config(&provider_id),
+        model,
+        cwd,
+        extra_env,
+    })
+}
+
+/// Background turn worker: drive the current message to completion, then drain
+/// any queued messages (flipping each to in-flight), re-checking once after the
+/// busy flag clears to absorb a late enqueue. Spawn/turn failures are logged so
+/// the loop always releases the in-flight slot and worker handle.
+async fn run_message_worker(
+    mgr: Arc<AgentManager>,
+    agent_id: AgentId,
+    workspace_id: WorkspaceId,
+    initial_content: String,
+) {
+    let mut content = initial_content;
+    'outer: loop {
+        match mgr.ensure_started(&agent_id, &workspace_id).await {
+            Ok(acp_session_id) => {
+                if let Err(e) = mgr
+                    .run_turn(
+                        &agent_id,
+                        &workspace_id,
+                        &acp_session_id,
+                        text_prompt(&content),
+                    )
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, error = %e, "agent turn failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "agent spawn failed");
+            }
+        }
+        // Drain the next queued message while still holding the in-flight slot.
+        if let Some(next) = mgr.services.dequeue_message(&agent_id) {
+            persist_user(&mgr, &agent_id, &next.content).await;
+            content = next.content;
+            continue;
+        }
+        // Queue drained: release the slot, then re-check once for a message that
+        // raced in just before the release (otherwise it would sit unworked).
+        mgr.end_turn(&agent_id);
+        if let Some(next) = mgr.services.dequeue_message(&agent_id) {
+            if mgr.try_begin(&agent_id) {
+                persist_user(&mgr, &agent_id, &next.content).await;
+                content = next.content;
+                continue 'outer;
+            }
+            // A concurrent send won the slot; hand the message back to it.
+            mgr.services.requeue_front(&agent_id, next);
+        }
+        break;
+    }
+    mgr.clear_worker(&agent_id);
+}
+
+/// Persist a queued user message into the append-only transcript before its turn
+/// (best-effort; a store error is logged and the turn still proceeds).
+async fn persist_user(mgr: &AgentManager, agent_id: &AgentId, content: &str) {
+    if let Err(e) = mgr
+        .services
+        .store
+        .append_agent_message(agent_id, "user", &user_text_blocks(content), &now_iso())
+        .await
+    {
+        tracing::warn!(agent = %agent_id, error = %e, "failed to persist queued user message");
     }
 }

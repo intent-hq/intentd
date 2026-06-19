@@ -37,7 +37,7 @@ pub(crate) struct QueuedMessage {
 
 impl QueuedMessage {
     /// The camelCase wire shape for `agent.getQueue` / queue results.
-    fn to_value(&self) -> Value {
+    pub(crate) fn to_value(&self) -> Value {
         let mut v = json!({
             "id": self.id,
             "agentId": self.agent_id,
@@ -263,7 +263,7 @@ pub(crate) async fn fetch_auggie_models() -> Result<Option<Vec<Value>>> {
 
 /// Mint a stable user-message id (`user-msg-{uuid}`), mirroring the TS
 /// `agent.sendMessage` `messageId` default.
-fn new_message_id() -> String {
+pub(crate) fn new_message_id() -> String {
     format!("user-msg-{}", Uuid::new_v4())
 }
 
@@ -609,7 +609,7 @@ impl Services {
     }
 
     /// Push a message onto an agent's in-memory queue and return it.
-    fn enqueue_message(
+    pub(crate) fn enqueue_message(
         &self,
         agent_id: &AgentId,
         content: String,
@@ -629,6 +629,42 @@ impl Services {
             .or_default()
             .push(queued.clone());
         queued
+    }
+
+    /// Pop the oldest queued message for an agent (FIFO), if any. Used by the
+    /// runtime turn loop to flip a queued message to in-flight when the current
+    /// turn ends.
+    pub(crate) fn dequeue_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = guard.get_mut(agent_id)?;
+        if queue.is_empty() {
+            None
+        } else {
+            Some(queue.remove(0))
+        }
+    }
+
+    /// Re-insert a message at the front of an agent's queue (used when a
+    /// concurrent turn won the in-flight slot during a drain race).
+    pub(crate) fn requeue_front(&self, agent_id: &AgentId, message: QueuedMessage) {
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .entry(agent_id.clone())
+            .or_default()
+            .insert(0, message);
+    }
+
+    /// Drop all queued messages for an agent (used by `agent.forceMessage`,
+    /// which supersedes the queue with the forced message).
+    pub(crate) fn clear_queue(&self, agent_id: &AgentId) {
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .remove(agent_id);
     }
 }
 

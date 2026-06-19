@@ -118,11 +118,15 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming
     // router (M3.4); a global process cap + LRU registry bound concurrency.
-    let manager = AgentManager::new(
+    let manager = Arc::new(AgentManager::new(
         services.clone(),
         Arc::new(BusEventSink::new(bus.clone())),
         default_process_cap(),
-    );
+    ));
+    // Attach the manager to the services surface so the `agent.*` RPC handlers
+    // drive the live spawn/turn/MCP loop at runtime (the shared `OnceLock` is
+    // visible to every clone, including the api handed to the transport below).
+    services.attach_agent_manager(&manager);
     tracing::info!(
         process_cap = manager.registry().cap(),
         "agent manager ready"
