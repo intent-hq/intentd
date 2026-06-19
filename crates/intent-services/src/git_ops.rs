@@ -17,6 +17,30 @@ const STAGE_ALL_MSG: &str = "Staging all files is not allowed. Please specify in
 const NO_PATHS_MSG: &str =
     "No file paths provided. Please specify at least one file path to stage.";
 
+/// TS `assertAgentCommitAllowed` rejection message (auto-commit disabled).
+const AUTO_COMMIT_DISABLED_MSG: &str = "Auto-commit is disabled for this workspace. \
+Use agent_commit_changes with userRequested: true if the user asked you to commit.";
+
+/// Port of `assertAgentCommitAllowed`: block an agent-initiated commit when
+/// auto-commit is disabled, unless `user_requested` bypasses it.
+///
+/// PARITY NOTE: intentd has no persisted `autoCommit` setting yet, so
+/// [`auto_commit_enabled`] returns the TS default (`true`) and the gate
+/// currently always allows. The seam is preserved so a future settings store can
+/// gate the disabled path without touching the call sites.
+pub(crate) fn assert_agent_commit_allowed(user_requested: bool) -> Result<()> {
+    if user_requested || auto_commit_enabled() {
+        return Ok(());
+    }
+    Err(Error::Internal(AUTO_COMMIT_DISABLED_MSG.to_string()))
+}
+
+/// Whether auto-commit is enabled for the workspace. No settings store exists in
+/// intentd yet, so this is the TS default (`autoCommitEnabled: true`).
+fn auto_commit_enabled() -> bool {
+    true
+}
+
 /// Resolve a workspace's worktree path: the explicit `worktreePath`, else the
 /// repository `path`. `None` when neither is set.
 pub(crate) fn worktree_path(ws: &Workspace) -> Option<PathBuf> {

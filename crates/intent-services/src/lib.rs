@@ -2076,6 +2076,137 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn git_commit(
+        &self,
+        workspace_id: WorkspaceId,
+        message: String,
+    ) -> BoxFuture<'_, Result<intent_core::GitCommitResult>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // TS `ws.git.commit` gates on auto-commit (no userRequested bypass).
+            git_ops::assert_agent_commit_allowed(false)?;
+            // All commit failures surface as `-32603` (the TS handler wraps the
+            // whole path in INTERNAL_ERROR), so a missing workspace is `Internal`.
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to commit: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to commit: workspace has no worktree".to_string())
+            })?;
+            let outcome = intent_git::commit::commit(&worktree, &message)?;
+            Ok(intent_core::GitCommitResult {
+                hash: outcome.hash,
+                files: outcome.files,
+            })
+        })
+    }
+
+    fn git_agent_commit(
+        &self,
+        workspace_id: WorkspaceId,
+        message: String,
+        files: Option<Vec<String>>,
+        user_requested: bool,
+    ) -> BoxFuture<'_, Result<intent_core::GitAgentCommitResult>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // userRequested bypasses the auto-commit gate (TS parity).
+            git_ops::assert_agent_commit_allowed(user_requested)?;
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to commit: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to commit: workspace has no worktree".to_string())
+            })?;
+            // PARITY NOTE: TS filters to the agent's own unstaged changes via the
+            // file-tracking attribution pipeline (deferred — not yet ported). Until
+            // it lands, an explicit `files` list is committed as-is; otherwise we
+            // fall back to every changed path in the worktree.
+            let to_commit = match files {
+                Some(f) if !f.is_empty() => f,
+                _ => intent_git::commit::all_changed_paths(&worktree)?,
+            };
+            if to_commit.is_empty() {
+                return Err(Error::Internal(
+                    "No uncommitted changes found for this agent".to_string(),
+                ));
+            }
+            intent_git::stage::stage(&worktree, &to_commit)?;
+            let outcome = intent_git::commit::commit(&worktree, &message)?;
+            let file_count = to_commit.len() as i64;
+            Ok(intent_core::GitAgentCommitResult {
+                hash: outcome.hash,
+                files: to_commit,
+                file_count,
+            })
+        })
+    }
+
+    fn git_check_merge_conflicts(
+        &self,
+        workspace_id: WorkspaceId,
+        target_branch: Option<String>,
+    ) -> BoxFuture<'_, Result<intent_core::GitMergeConflicts>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // TS throws 'Could not find workspace git info' when the workspace or
+            // its worktree can't be resolved.
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|_| Error::Internal("Could not find workspace git info".to_string()))?;
+            let worktree = git_ops::worktree_path(&ws)
+                .ok_or_else(|| Error::Internal("Could not find workspace git info".to_string()))?;
+
+            let current_branch = intent_git::conflicts::current_branch(&worktree)?;
+            if current_branch.is_empty() {
+                return Err(Error::Internal(
+                    "Failed to get current branch: No branch checked out (detached HEAD?)"
+                        .to_string(),
+                ));
+            }
+
+            let target = match target_branch {
+                Some(t) => t,
+                None => intent_git::conflicts::detect_default_branch(&worktree)?.ok_or_else(
+                    || {
+                        Error::Internal(
+                            "Could not determine target branch. Please specify a targetBranch parameter."
+                                .to_string(),
+                        )
+                    },
+                )?,
+            };
+
+            // Same branch can't conflict with itself (TS short-circuit).
+            if current_branch == target {
+                return Ok(intent_core::GitMergeConflicts {
+                    has_conflicts: false,
+                    conflicted_files: Vec::new(),
+                    cannot_determine: None,
+                    target_branch: target,
+                    current_branch,
+                });
+            }
+
+            let mc =
+                intent_git::conflicts::detect_merge_conflicts(&worktree, &current_branch, &target)?;
+            Ok(intent_core::GitMergeConflicts {
+                has_conflicts: mc.has_conflicts,
+                conflicted_files: mc.conflicted_files,
+                cannot_determine: if mc.cannot_determine {
+                    Some(true)
+                } else {
+                    None
+                },
+                target_branch: target,
+                current_branch,
+            })
+        })
+    }
+
     // ========================================================================
     // agent.* surface (PROTOCOL §5.5). Store/in-memory-backed; the live-runtime
     // coupling (spawning a turn from sendMessage, flipping `queued` mid-stream)
