@@ -1117,6 +1117,41 @@ pub struct GitBranches {
     pub default_branch: String,
 }
 
+/// `git.commit` service result (the `ok` flag is added by the transport). Mirrors
+/// the TS `ws.git.commit` payload `{ hash?, files? }`; on success both are
+/// present (`hash` is the new commit SHA, `files` the files it changed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommitResult {
+    pub hash: String,
+    pub files: Vec<String>,
+}
+
+/// `git.agentCommit` service result (the `ok` flag is added by the transport).
+/// Mirrors the TS `ws.git.agentCommit` payload `{ hash, files, fileCount }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitAgentCommitResult {
+    pub hash: String,
+    pub files: Vec<String>,
+    pub file_count: i64,
+}
+
+/// `git.checkMergeConflicts` result, mirroring the TS `ws.git.checkMergeConflicts`
+/// payload `{ hasConflicts, conflictedFiles, cannotDetermine?, targetBranch,
+/// currentBranch }`. `cannotDetermine` is omitted unless the merge base could not
+/// be resolved (the TS legacy fallback's only producer).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitMergeConflicts {
+    pub has_conflicts: bool,
+    pub conflicted_files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cannot_determine: Option<bool>,
+    pub target_branch: String,
+    pub current_branch: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

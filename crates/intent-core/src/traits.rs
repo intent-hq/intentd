@@ -8,13 +8,13 @@ use crate::ids::{AgentId, NoteId, WorkspaceId};
 use crate::model::{
     AgentDelegateInput, AgentLite, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
     CommentListResult, CommentRespondResult, Event, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, FileActivity, GitBranches, GitStatus, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
-    NoteEditLinesResult, NoteEditResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, ReadAssetResult, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskMarkAsTaskResult,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, Workspace,
-    WorkspaceCreate, WorkspaceEventSummary, WorkspaceUpdate,
+    EventUnsubscribeResult, FileActivity, GitAgentCommitResult, GitBranches, GitCommitResult,
+    GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
+    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteSetContentResult,
+    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, ReadAssetResult, TaskAssignAgentResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult,
+    TaskMarkAsTaskResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    Workspace, WorkspaceCreate, WorkspaceEventSummary, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -1039,6 +1039,55 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_get_branches not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.commit` (deprecated; prefer `git_agent_commit`): commit the already
+    /// staged changes with `message`. Failures (incl. nothing to commit) are
+    /// `-32603` (PROTOCOL §5.6).
+    fn git_commit(
+        &self,
+        workspace_id: WorkspaceId,
+        message: String,
+    ) -> BoxFuture<'_, Result<GitCommitResult>> {
+        let _ = (workspace_id, message);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_commit not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.agentCommit`: stage the agent's changes (or `files` when given) and
+    /// commit them; `user_requested` bypasses the auto-commit gate (PROTOCOL
+    /// §5.6).
+    fn git_agent_commit(
+        &self,
+        workspace_id: WorkspaceId,
+        message: String,
+        files: Option<Vec<String>>,
+        user_requested: bool,
+    ) -> BoxFuture<'_, Result<GitAgentCommitResult>> {
+        let _ = (workspace_id, message, files, user_requested);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_agent_commit not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.checkMergeConflicts`: whether merging the current branch into
+    /// `target_branch` (or the detected default) would conflict (PROTOCOL §5.6).
+    fn git_check_merge_conflicts(
+        &self,
+        workspace_id: WorkspaceId,
+        target_branch: Option<String>,
+    ) -> BoxFuture<'_, Result<GitMergeConflicts>> {
+        let _ = (workspace_id, target_branch);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_check_merge_conflicts not implemented".to_string(),
             ))
         })
     }
