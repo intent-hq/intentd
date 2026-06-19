@@ -197,6 +197,29 @@ pub fn always_enabled_providers() -> Vec<&'static ProviderConfig> {
         .collect()
 }
 
+/// Build the user-facing authentication-required message for a provider,
+/// including the login command hint (`login_command_hint`, else
+/// `{command} login`). Port of `getProviderAuthErrorMessage`.
+pub fn auth_error_message(provider_id: &str, is_remote: bool) -> String {
+    let config = provider_config(provider_id);
+    let login_cmd = config
+        .login_command_hint
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| format!("{} login", config.command));
+
+    if is_remote {
+        format!(
+            "{} needs to be authenticated on the remote server. Run \"{}\" in a terminal connected to the remote environment.",
+            config.display_name, login_cmd
+        )
+    } else {
+        format!(
+            "{} needs to be authenticated. Run \"{}\" in a terminal.",
+            config.display_name, login_cmd
+        )
+    }
+}
+
 /// Whether an error message indicates the provider needs authentication,
 /// using the provider's configured `auth_error_patterns` (case-insensitive).
 /// Port of `isProviderAuthenticationError`.

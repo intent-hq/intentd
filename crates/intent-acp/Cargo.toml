@@ -9,3 +9,12 @@ description = "ACP client, session multiplexing, and agent→BE MCP server"
 [dependencies]
 intent-core = { path = "../intent-core" }
 intent-providers = { path = "../intent-providers" }
+agent-client-protocol = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

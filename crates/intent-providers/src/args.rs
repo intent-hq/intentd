@@ -70,6 +70,69 @@ pub fn build_provider_args(config: &ProviderConfig, inputs: &ArgInputs) -> Vec<S
     args
 }
 
+/// Upsert a Codex `-c key="value"` config override into an argument list.
+///
+/// Codex parses config overrides as TOML, so the value is TOML-quoted (with
+/// embedded quotes escaped). Any existing `-c`/`--config` entry for the same
+/// `key` is removed before the new value is appended. Port of
+/// `upsertCodexConfigArgs` (`provider-registry.ts`).
+pub fn upsert_codex_config_args(args: &[String], key: &str, value: &str) -> Vec<String> {
+    let escaped = value.replace('"', "\\\"");
+    let config_value = format!("{key}=\"{escaped}\"");
+    let key_prefix = format!("{key}=");
+
+    let mut next: Vec<String> = Vec::with_capacity(args.len() + 2);
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if (a == "-c" || a == "--config") && i + 1 < args.len() {
+            let v = &args[i + 1];
+            if v.trim_start().starts_with(&key_prefix) {
+                // Skip the old flag + its value.
+                i += 2;
+                continue;
+            }
+        }
+        next.push(a.clone());
+        i += 1;
+    }
+
+    next.push("-c".to_string());
+    next.push(config_value);
+    next
+}
+
+/// Apply Codex model config args (`-c model=…`, `-c model_reasoning_effort=…`).
+///
+/// Mirrors the codex branch of `getACPWithProvider` (`provider-registry.ts`):
+/// when `raw_model` is set and not the `default` sentinel, the model id is split
+/// into base + reasoning effort; the base is written as `model`, and the effort
+/// (from the model id, else the `env_effort` fallback) as `model_reasoning_effort`.
+/// `env_effort` is supplied by the spawn layer (e.g. `CODEX_REASONING_EFFORT`).
+pub fn apply_codex_config_args(
+    args: Vec<String>,
+    raw_model: Option<&str>,
+    env_effort: Option<&str>,
+) -> Vec<String> {
+    let Some(model) = raw_model else {
+        return args;
+    };
+    if model.is_empty() || model == MODEL_SENTINEL_DEFAULT {
+        return args;
+    }
+
+    let (base_model, effort) = crate::models::parse_codex_reasoning_effort(model);
+    let mut args = upsert_codex_config_args(&args, "model", &base_model);
+    if let Some(effort) = effort {
+        args = upsert_codex_config_args(&args, "model_reasoning_effort", &effort);
+    } else if let Some(env_effort) = env_effort {
+        if !env_effort.is_empty() {
+            args = upsert_codex_config_args(&args, "model_reasoning_effort", env_effort);
+        }
+    }
+    args
+}
+
 /// Build provider-specific environment variables. Port of `buildProviderEnv`.
 ///
 /// - `cortex`: `ELECTRON_RUN_AS_NODE=1` (run the Electron binary as Node).

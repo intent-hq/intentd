@@ -13,17 +13,20 @@ pub mod args;
 pub mod config;
 pub mod models;
 
-pub use args::{build_provider_args, build_provider_env, enhanced_path, ArgInputs};
+pub use args::{
+    apply_codex_config_args, build_provider_args, build_provider_env, enhanced_path,
+    upsert_codex_config_args, ArgInputs,
+};
 pub use config::{
-    all_provider_ids, always_enabled_providers, default_provider_config, default_provider_id,
-    disableable_providers, find_provider, is_provider_authentication_error, provider_config,
-    ProviderConfig, ACP_PROVIDERS,
+    all_provider_ids, always_enabled_providers, auth_error_message, default_provider_config,
+    default_provider_id, disableable_providers, find_provider, is_provider_authentication_error,
+    provider_config, ProviderConfig, ACP_PROVIDERS,
 };
 pub use models::{
     create_compound_model_id, default_model_for_provider, fuzzy_match_model_in_pool,
     is_model_valid_for_provider, model_tier_from_model, normalize_model_override,
-    parse_compound_model_id, resolve_preferred_model, tiers_for, ModelTier, ModelTiers,
-    PROVIDER_MODEL_TIERS,
+    parse_codex_reasoning_effort, parse_compound_model_id, resolve_preferred_model, tiers_for,
+    ModelTier, ModelTiers, PROVIDER_MODEL_TIERS,
 };
 
 #[cfg(test)]

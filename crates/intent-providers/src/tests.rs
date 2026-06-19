@@ -285,3 +285,101 @@ fn fuzzy_and_override_resolution() {
     );
     assert_eq!(resolve_preferred_model(&["x"], &["y"]), None);
 }
+
+#[test]
+fn codex_reasoning_effort_parsing() {
+    assert_eq!(
+        parse_codex_reasoning_effort("gpt-5.3-codex/high"),
+        ("gpt-5.3-codex".to_string(), Some("high".to_string()))
+    );
+    assert_eq!(
+        parse_codex_reasoning_effort("gpt-5.3-codex"),
+        ("gpt-5.3-codex".to_string(), None)
+    );
+}
+
+#[test]
+fn codex_upsert_config_args_quotes_and_replaces() {
+    // Fresh insert appends `-c key="value"`.
+    let args = upsert_codex_config_args(&[], "model", "gpt-5.3-codex");
+    assert_eq!(args, vec!["-c", "model=\"gpt-5.3-codex\""]);
+
+    // Existing value for the same key is replaced (old `-c model=…` dropped).
+    let prior = vec![
+        "exec".to_string(),
+        "-c".to_string(),
+        "model=\"old\"".to_string(),
+        "-c".to_string(),
+        "sandbox=\"danger\"".to_string(),
+    ];
+    let next = upsert_codex_config_args(&prior, "model", "new");
+    assert_eq!(
+        next,
+        vec!["exec", "-c", "sandbox=\"danger\"", "-c", "model=\"new\""]
+    );
+
+    // Embedded quotes are escaped.
+    let escaped = upsert_codex_config_args(&[], "model", "a\"b");
+    assert_eq!(escaped, vec!["-c", "model=\"a\\\"b\""]);
+}
+
+#[test]
+fn codex_apply_config_args_effort_resolution() {
+    // Effort embedded in the model id wins over the env fallback.
+    let from_model = apply_codex_config_args(
+        vec!["exec".to_string()],
+        Some("gpt-5.3-codex/high"),
+        Some("low"),
+    );
+    assert_eq!(
+        from_model,
+        vec![
+            "exec",
+            "-c",
+            "model=\"gpt-5.3-codex\"",
+            "-c",
+            "model_reasoning_effort=\"high\""
+        ]
+    );
+
+    // Bare model id falls back to env effort.
+    let from_env = apply_codex_config_args(vec![], Some("gpt-5.3-codex"), Some("medium"));
+    assert_eq!(
+        from_env,
+        vec![
+            "-c",
+            "model=\"gpt-5.3-codex\"",
+            "-c",
+            "model_reasoning_effort=\"medium\""
+        ]
+    );
+
+    // The `default` sentinel and `None` are no-ops.
+    assert_eq!(
+        apply_codex_config_args(vec!["exec".to_string()], Some("default"), None),
+        vec!["exec"]
+    );
+    assert_eq!(
+        apply_codex_config_args(vec!["exec".to_string()], None, Some("high")),
+        vec!["exec"]
+    );
+}
+
+#[test]
+fn auth_error_message_uses_login_hint() {
+    // auggie has an explicit login_command_hint.
+    let msg = auth_error_message("auggie", false);
+    assert_eq!(
+        msg,
+        "Augment Auggie needs to be authenticated. Run \"auggie login\" in a terminal."
+    );
+
+    // Remote variant.
+    let remote = auth_error_message("auggie", true);
+    assert!(remote.contains("on the remote server"));
+    assert!(remote.contains("auggie login"));
+
+    // Providers without a hint fall back to `{command} login`.
+    let codex = auth_error_message("codex", false);
+    assert!(codex.contains("codex-acp login"));
+}

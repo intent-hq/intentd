@@ -3,12 +3,31 @@
 //! Depends on `intent-core` and `intent-providers` (§3.2 rule 3). It must NOT
 //! depend on `intent-services`; instead it calls back into business logic
 //! through the `WorkspaceApi` trait (defined in core, implemented in services),
-//! breaking the `services → acp → services` cycle (§6.8). Stub only — the ACP
-//! SDK is pulled when sessions land in Wave 3.
+//! breaking the `services → acp → services` cycle (§6.8).
+//!
+//! M3.3 lands the client core: spawning piped-stdio providers ([`spawn`]), the
+//! serialized NDJSON JSON-RPC transport ([`transport`]), and the ACP handshake
+//! ([`handshake`]). Session new/load/prompt/streaming (M3.4), client-served
+//! handlers (M3.5), and the agent→BE MCP server (M3.7) remain stubs below.
 
 use std::sync::Arc;
 
 use intent_core::WorkspaceApi;
+
+pub mod error;
+pub mod handshake;
+pub mod spawn;
+pub mod transport;
+
+pub use error::{AcpError, AcpResult, JsonRpcError};
+pub use handshake::{handshake, HandshakeResult};
+pub use spawn::{spawn_provider, SpawnOptions, SpawnedAgent};
+pub use transport::{
+    Connection, ConnectionHooks, IncomingNotification, IncomingRequest, DEFAULT_REQUEST_TIMEOUT,
+};
+
+#[cfg(test)]
+mod tests;
 
 /// ACP client handle. Holds the `WorkspaceApi` callback supplied by the
 /// composition root (§6.8). Provider configuration is resolved on demand from
