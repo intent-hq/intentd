@@ -132,6 +132,16 @@ pub const GOAL_UPDATED: &str = "goal:updated";
 // Comment events.
 pub const COMMENT_ADDED: &str = "comment:added";
 
+// Code-changes-review events (new in intentd; PROTOCOL §5.18–§5.20, §6.5). The
+// BE records attribution internally (there is no `file-tracking.trackChange`
+// RPC), so these self-sufficient payloads let the FE re-render without polling:
+// `changes:tracked` → `{ workspaceId, changes: TrackedChange[] }`,
+// `changes:git-status` → `{ workspaceId, status: WorkspaceGitStatus }`,
+// `changes:metrics-changed` → `{ workspaceId, agentId?, metrics: Metrics }`.
+pub const CHANGES_TRACKED: &str = "changes:tracked";
+pub const CHANGES_GIT_STATUS: &str = "changes:git-status";
+pub const CHANGES_METRICS_CHANGED: &str = "changes:metrics-changed";
+
 // MCP events.
 pub const MCP_NOTIFICATION: &str = "mcp:notification";
 
@@ -207,6 +217,9 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SPEC_UPDATED,
     GOAL_UPDATED,
     COMMENT_ADDED,
+    CHANGES_TRACKED,
+    CHANGES_GIT_STATUS,
+    CHANGES_METRICS_CHANGED,
     MCP_NOTIFICATION,
 ];
 

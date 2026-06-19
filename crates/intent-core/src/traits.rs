@@ -1441,6 +1441,97 @@ pub trait WorkspaceApi: Send + Sync {
             ))
         })
     }
+
+    // ------------------------------------------------------------------------
+    // accept-changes.* — commit→push→PR→merge orchestration (PROTOCOL §5.18).
+    // ------------------------------------------------------------------------
+
+    /// `accept-changes.getStatus`: the `WorkspaceGitStatus` for the accept-changes
+    /// panel (branch, ahead/behind trunk, remote/push state, local commits with
+    /// attribution, linked PR) (PROTOCOL §5.18).
+    fn accept_changes_get_status(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::accept_changes_get_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `accept-changes.prepare`: validate an action and return a `PrepareResult`
+    /// (warnings/errors, suggested commit message/PR fields, per-file stats)
+    /// (PROTOCOL §5.18).
+    fn accept_changes_prepare(
+        &self,
+        workspace_id: WorkspaceId,
+        action: String,
+        files: Option<Vec<String>>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, action, files);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::accept_changes_prepare not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `accept-changes.execute`: run the requested action (commit, optionally
+    /// chaining push + create-PR via `options`) and return an `AcceptChangesResult`
+    /// with per-step status (PROTOCOL §5.18). `params` is the full request object.
+    fn accept_changes_execute(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::accept_changes_execute not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `accept-changes.mergePR`: merge the linked PR via the forge and return an
+    /// `AcceptChangesResult` (PROTOCOL §5.18).
+    fn accept_changes_merge_pr(
+        &self,
+        workspace_id: WorkspaceId,
+        pr_number: u64,
+        merge_method: Option<String>,
+        commit_title: Option<String>,
+        commit_message: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            pr_number,
+            merge_method,
+            commit_title,
+            commit_message,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::accept_changes_merge_pr not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `accept-changes.addRemote`: add (and, if needed, initialize) the `origin`
+    /// remote, returning the refreshed `WorkspaceGitStatus` (PROTOCOL §5.18).
+    fn accept_changes_add_remote(
+        &self,
+        workspace_id: WorkspaceId,
+        remote_url: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, remote_url);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::accept_changes_add_remote not implemented".to_string(),
+            ))
+        })
+    }
 }
 
 /// Context-engine abstraction implemented by `intent-context` (§3.1).
