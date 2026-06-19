@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use intent_core::{Config, WorkspaceApi};
-use intent_services::{EventBus, FileWatcher, Services};
+use intent_services::{
+    default_process_cap, AgentManager, BusEventSink, EventBus, FileWatcher, Services,
+};
 use intent_store::Store;
 use intent_transport::serve_uds;
 use serde_json::{json, Value};
@@ -44,6 +46,13 @@ enum Command {
     Status,
     /// Diagnostics: data-dir writable + SQLite openable/migrations current.
     Doctor,
+    /// stdio↔TCP MCP proxy referenced from a generated `--mcp-config`; forwards a
+    /// spawned provider's MCP frames to the daemon's in-process server (§6.8).
+    McpBridge {
+        /// The per-agent MCP listener address to connect to (`host:port`).
+        #[arg(long)]
+        connect: String,
+    },
 }
 
 #[tokio::main]
@@ -54,7 +63,14 @@ async fn main() -> ExitCode {
         Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
         Command::Status => cmd_status().await,
         Command::Doctor => cmd_doctor().await,
+        Command::McpBridge { connect } => to_exit(cmd_mcp_bridge(&connect).await),
     }
+}
+
+async fn cmd_mcp_bridge(connect: &str) -> anyhow::Result<()> {
+    intent_acp::run_stdio_bridge(connect)
+        .await
+        .map_err(|e| anyhow::anyhow!("mcp bridge: {e}"))
 }
 
 fn to_exit(result: anyhow::Result<()>) -> ExitCode {
@@ -95,17 +111,32 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     // The services surface publishes CRUD change events onto the same bus that
     // transport subscriptions read, so a mutation on one connection streams to
     // subscribers on another (§10).
-    let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
-            .with_assets_root(config.data_dir.join("assets"))
-            .with_event_bus(bus.clone()),
+    let services = Services::new(store)
+        .with_assets_root(config.data_dir.join("assets"))
+        .with_event_bus(bus.clone());
+    // The AgentManager multiplexes spawned agent processes over the ACP client
+    // (§6.8). Its concrete EventSink bridges the client-served fs/permission
+    // events (M3.5) onto the same bus, and `run_turn` drives the streaming
+    // router (M3.4); a global process cap + LRU registry bound concurrency.
+    let manager = AgentManager::new(
+        services.clone(),
+        Arc::new(BusEventSink::new(bus.clone())),
+        default_process_cap(),
     );
+    tracing::info!(
+        process_cap = manager.registry().cap(),
+        "agent manager ready"
+    );
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     // Start a filesystem watcher per active workspace with a resolvable on-disk
     // path; each publishes debounced `file:changed` events to the shared bus.
     // The handles are held for the lifetime of `serve` and torn down on return.
-    let _watchers = start_workspace_watchers(&bus, services.as_ref()).await;
+    let _watchers = start_workspace_watchers(&bus, api.as_ref()).await;
     tracing::info!(socket = %config.socket_path.display(), "starting intentd");
-    serve_uds(services, bus, &config.socket_path, shutdown_signal()).await?;
+    serve_uds(api, bus, &config.socket_path, shutdown_signal()).await?;
+    // Clean shutdown: kill every spawned agent child and clear the registry
+    // (§6.8 teardown). Idle reaping during the run is the M5 `reap_idle` hook.
+    manager.shutdown().await;
     Ok(())
 }
 
@@ -211,11 +242,21 @@ async fn cmd_doctor() -> ExitCode {
         Ok(store) => {
             println!("[ok] sqlite openable: {}", config.db_path.display());
             match store.migration_status().await {
-                Ok(status) if status.is_current() => println!(
-                    "[ok] migrations current: {} applied {:?}",
-                    status.applied.len(),
-                    status.applied
-                ),
+                Ok(status) if status.is_current() => {
+                    println!(
+                        "[ok] migrations current: {} applied {:?}",
+                        status.applied.len(),
+                        status.applied
+                    );
+                    // Explicit gate on the agent_session schema (migration 0004),
+                    // the persistence behind the M3 orchestration loop (§9.2).
+                    if status.applied.contains(&4) {
+                        println!("[ok] migration 0004 (agent_session) applied");
+                    } else {
+                        ok = false;
+                        println!("[FAIL] migration 0004 (agent_session) missing");
+                    }
+                }
                 Ok(status) => {
                     ok = false;
                     println!(
@@ -235,10 +276,61 @@ async fn cmd_doctor() -> ExitCode {
         }
     }
 
+    report_provider_availability().await;
+
     if ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Doctor provider-discovery section (§6.9): print which configured ACP
+/// providers are installed (resolvable on `PATH`) and, best-effort, which are
+/// authenticated. Provider availability never fails `doctor` — a host with no
+/// providers installed is a valid (if limited) state.
+async fn report_provider_availability() {
+    println!("providers:");
+    for provider in intent_providers::discover_providers() {
+        if let Some(reason) = &provider.gated_off {
+            println!("  [--] {} ({})", provider.id, reason);
+            continue;
+        }
+        if !provider.installed {
+            println!(
+                "  [--] {} not installed ({} not on PATH)",
+                provider.id, provider.command
+            );
+            continue;
+        }
+        let path = provider
+            .resolved_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let auth = check_provider_auth(provider.command, provider.auth_check_args).await;
+        println!("  [ok] {} installed: {path}{auth}", provider.id);
+    }
+}
+
+/// Best-effort authentication probe for an installed provider: run its
+/// `auth_check_args` (exit 0 ⇒ authenticated) with a short timeout. Returns a
+/// trailing status fragment for the doctor line, or empty when no probe applies.
+async fn check_provider_auth(command: &str, auth_check_args: Option<&[&str]>) -> String {
+    let Some(args) = auth_check_args else {
+        return String::new();
+    };
+    let run = tokio::process::Command::new(command)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match tokio::time::timeout(std::time::Duration::from_secs(8), run).await {
+        Ok(Ok(status)) if status.success() => " (authenticated)".to_string(),
+        Ok(Ok(_)) => " (not authenticated)".to_string(),
+        Ok(Err(_)) => " (auth check failed)".to_string(),
+        Err(_) => " (auth check timed out)".to_string(),
     }
 }
 

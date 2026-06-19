@@ -388,6 +388,96 @@ async fn uds_slice_end_to_end() {
     .await;
     assert_eq!(resp["result"]["success"], json!(true));
 
+    // (o) agent.getModels (no workspaceId) → non-empty model catalog.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":22,"method":"agent.getModels"}"#,
+    )
+    .await;
+    let models = resp["result"]["models"].as_array().expect("models array");
+    assert!(!models.is_empty());
+
+    // (p) agent.create → { agent: { id, name } } on the seeded workspace.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":23,"method":"agent.create","params":{"workspaceId":"ws-seed","name":"E2E Agent","model":"auggie:sonnet4.5"}}"#,
+    )
+    .await;
+    let agent_id = resp["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    assert_eq!(resp["result"]["agent"]["name"], json!("E2E Agent"));
+
+    // (q) agent.list → AgentLite projection with messageCount, no messages key.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":24,"method":"agent.list","params":{"workspaceId":"ws-seed"}}"#,
+    )
+    .await;
+    let agents = resp["result"]["agents"].as_array().expect("agents array");
+    let listed = agents
+        .iter()
+        .find(|a| a["id"] == json!(agent_id))
+        .expect("created agent listed");
+    assert_eq!(listed["messageCount"], json!(0));
+    assert!(
+        listed.get("messages").is_none() && listed.get("systemPrompt").is_none(),
+        "AgentLite must strip messages/systemPrompt"
+    );
+
+    // (r) agent.sendMessage (agent idle) → delivered, queued:false.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":25,"method":"agent.sendMessage","params":{{"workspaceId":"ws-seed","agentId":"{agent_id}","content":"Run the tests","messageId":"m1"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+    assert_eq!(resp["result"]["queued"], json!(false));
+    assert_eq!(resp["result"]["messageId"], json!("m1"));
+
+    // (s) agent.getConversation → the persisted user message.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":26,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["agentId"], json!(agent_id));
+    assert_eq!(resp["result"]["totalMessages"], json!(1));
+    assert_eq!(resp["result"]["messages"][0]["role"], json!("user"));
+
+    // (t) agent.get unknown → -32602 "Agent not found".
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":27,"method":"agent.get","params":{"agentId":"agent-00000000-0000-0000-0000-000000000000"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(resp["error"]["message"], json!("Agent not found"));
+
+    // (u) agent.stop → { success: true }, then agent.delete.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":28,"method":"agent.stop","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":29,"method":"agent.delete","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+
     let _ = tx.send(());
     let _ = server.await;
     let _ = std::fs::remove_dir_all(&dir);

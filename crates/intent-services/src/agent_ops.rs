@@ -1,0 +1,673 @@
+//! `agent.*` RPC helpers (PROTOCOL §5.5).
+//!
+//! Pure projections + the model-catalog helpers that back the `agent.*`
+//! `WorkspaceApi` methods (the trait bodies live in `lib.rs`). The
+//! [`AgentLite`] derivation (`lastAgentResponse`/`digest`) ports the TS
+//! `agent.list`/`agent.get` post-processing; [`static_models`] /
+//! [`parse_model_list_output`] port the `agent.getModels` static-tier fallback
+//! and auggie CLI parser respectively.
+
+use std::collections::HashSet;
+
+use intent_core::{
+    now_iso, AgentId, AgentLite, AgentMessage, AgentSession, AgentStatus, Error, NoteId, Result,
+    WorkspaceApi, WorkspaceId,
+};
+use intent_providers::models::PROVIDER_MODEL_TIERS;
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+use crate::Services;
+
+#[cfg(test)]
+mod tests;
+
+/// Default `agent.getConversation` cap (TS `MAX_WEBSOCKET_CONVERSATION_MESSAGES`).
+const MAX_CONVERSATION_MESSAGES: i64 = 200;
+
+/// One pending message in an agent's in-memory send queue (`agent.getQueue`).
+#[derive(Debug, Clone)]
+pub(crate) struct QueuedMessage {
+    pub id: String,
+    pub agent_id: String,
+    pub content: String,
+    pub image_blocks: Option<Value>,
+    pub created_at: String,
+}
+
+impl QueuedMessage {
+    /// The camelCase wire shape for `agent.getQueue` / queue results.
+    fn to_value(&self) -> Value {
+        let mut v = json!({
+            "id": self.id,
+            "agentId": self.agent_id,
+            "content": self.content,
+            "createdAt": self.created_at,
+        });
+        if let Some(blocks) = &self.image_blocks {
+            v["imageBlocks"] = blocks.clone();
+        }
+        v
+    }
+}
+
+/// Collect the `text` of every `type: "text"` content block in a message's
+/// `content` (a JSON array of blocks; non-arrays yield nothing).
+fn text_blocks(content: &Value) -> Vec<String> {
+    let Some(blocks) = content.as_array() else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Remove all `start..=end` delimited spans from `s` (inclusive of the markers).
+fn strip_spans(s: &str, start: &str, end: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find(start) {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + start.len()..];
+        match after.find(end) {
+            Some(j) => rest = &after[j + end.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Drop `<group:…>` / `</group…>` tags (the streamed response group markers).
+fn strip_group_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('<') {
+        let tail = &rest[i..];
+        let is_group = tail.starts_with("<group:") || tail.starts_with("</group");
+        if is_group {
+            if let Some(j) = tail.find('>') {
+                out.push_str(&rest[..i]);
+                rest = &tail[j + 1..];
+                continue;
+            }
+        }
+        out.push_str(&rest[..i + 1]);
+        rest = &rest[i + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Clean an assistant text block of digest/suggested-prompts/group markers,
+/// mirroring the TS `agent.list` cleaning before the last-line extraction.
+fn clean_response_text(text: &str) -> String {
+    let mut cleaned = strip_spans(text, "<agent_digest>", "</agent_digest>");
+    cleaned = strip_spans(&cleaned, "<!-- suggested-prompts", "-->");
+    cleaned = strip_group_tags(&cleaned);
+    cleaned.trim().to_string()
+}
+
+/// Derive `(lastAgentResponse, digest)` from the most-recent assistant message,
+/// porting the TS `agent.list`/`agent.get` post-processing (PROTOCOL §5.5).
+pub(crate) fn last_response_and_digest(
+    messages: &[AgentMessage],
+) -> (Option<String>, Option<String>) {
+    for msg in messages.iter().rev() {
+        if msg.role != "assistant" {
+            continue;
+        }
+        let blocks = text_blocks(&msg.content);
+        let mut digest: Option<String> = None;
+        let mut last_response: Option<String> = None;
+        for block in &blocks {
+            let text = block.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if digest.is_none() {
+                if let Some(d) = strip_spans_capture(text, "<agent_digest>", "</agent_digest>") {
+                    digest = Some(d.trim().to_string());
+                }
+            }
+            let cleaned = clean_response_text(text);
+            if !cleaned.is_empty() {
+                let line = cleaned
+                    .lines()
+                    .rfind(|l| !l.trim().is_empty())
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_else(|| cleaned.chars().take(200).collect());
+                last_response = Some(line);
+            }
+        }
+        return (last_response, digest);
+    }
+    (None, None)
+}
+
+/// Capture the first `start..end` span's inner text (for digest extraction).
+fn strip_spans_capture(s: &str, start: &str, end: &str) -> Option<String> {
+    let i = s.find(start)?;
+    let after = &s[i + start.len()..];
+    let j = after.find(end)?;
+    Some(after[..j].to_string())
+}
+
+/// The static model catalog used as the `agent.getModels` fallback when the
+/// auggie CLI is unavailable: every `(provider, tier)` model from
+/// `PROVIDER_MODEL_TIERS`, deduped by `provider:model` (PROTOCOL §5.5).
+pub(crate) fn static_models() -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (provider_id, tiers) in PROVIDER_MODEL_TIERS {
+        for (tier, model_id) in [
+            ("fast", tiers.fast),
+            ("balanced", tiers.balanced),
+            ("smart", tiers.smart),
+        ] {
+            let key = format!("{provider_id}:{model_id}");
+            if seen.insert(key) {
+                out.push(json!({
+                    "id": model_id,
+                    "name": format!("{model_id} ({tier})"),
+                    "provider": provider_id,
+                }));
+            }
+        }
+    }
+    out
+}
+
+/// Parse `auggie model list` output into `(value, label, description?)` rows,
+/// porting the TS `parseModelListOutput` (`- Label [model-id]` + an optional
+/// indented description on the next line).
+pub(crate) fn parse_model_list_output(stdout: &str) -> Vec<(String, String, Option<String>)> {
+    let lines: Vec<&str> = stdout.split('\n').collect();
+    let mut models = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        if trimmed.is_empty() || trimmed.starts_with("Available models") {
+            i += 1;
+            continue;
+        }
+        if let Some((label, value)) = parse_model_line(trimmed) {
+            let mut description = None;
+            if i + 1 < lines.len() {
+                let next = lines[i + 1].trim();
+                if !next.is_empty() && !next.starts_with('-') && !next.starts_with("Available") {
+                    description = Some(next.to_string());
+                    i += 1;
+                }
+            }
+            models.push((value, label, description));
+        }
+        i += 1;
+    }
+    models
+}
+
+/// Parse a single `- Label [model-id]` line into `(label, value)`.
+fn parse_model_line(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix('-')?.trim_start();
+    let open = rest.find('[')?;
+    let close = rest[open + 1..].find(']')? + open + 1;
+    let label = rest[..open].trim().to_string();
+    let value = rest[open + 1..close].trim().to_string();
+    if label.is_empty() || value.is_empty() {
+        return None;
+    }
+    Some((label, value))
+}
+
+/// Best-effort `agent.getModels` dynamic fetch: run `auggie model list`, parse
+/// stdout (then stderr), and map to wire models. Returns `Ok(None)` when the
+/// CLI is unavailable or yields nothing, so the caller can fall back to
+/// [`static_models`].
+pub(crate) async fn fetch_auggie_models() -> Result<Option<Vec<Value>>> {
+    let output = match tokio::process::Command::new("auggie")
+        .args(["model", "list"])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(_) => return Ok(None),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut parsed = parse_model_list_output(&stdout);
+    if parsed.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        parsed = parse_model_list_output(&stderr);
+    }
+    if parsed.is_empty() {
+        return Ok(None);
+    }
+    let models = parsed
+        .into_iter()
+        .map(|(value, label, description)| {
+            let mut m = json!({ "id": value, "name": label, "provider": "auggie" });
+            if let Some(d) = description {
+                m["description"] = Value::String(d);
+            }
+            m
+        })
+        .collect();
+    Ok(Some(models))
+}
+
+/// Mint a stable user-message id (`user-msg-{uuid}`), mirroring the TS
+/// `agent.sendMessage` `messageId` default.
+fn new_message_id() -> String {
+    format!("user-msg-{}", Uuid::new_v4())
+}
+
+/// A single user text content block (the persisted/queued message shape).
+fn user_content_blocks(content: &str) -> Value {
+    json!([{ "type": "text", "text": content }])
+}
+
+/// Project an [`AgentSession`] (with its loaded messages) into [`AgentLite`].
+fn project_lite(session: AgentSession) -> AgentLite {
+    let (last_response, digest) = last_response_and_digest(&session.messages);
+    let count = session.messages.len() as u64;
+    AgentLite::from_session(session, count, last_response, digest)
+}
+
+impl Services {
+    /// `agent.list` (PROTOCOL §5.5).
+    pub(crate) async fn agent_list_op(&self, workspace_id: WorkspaceId) -> Result<Vec<AgentLite>> {
+        let sessions = self.store.list_agent_sessions(&workspace_id).await?;
+        Ok(sessions.into_iter().map(project_lite).collect())
+    }
+
+    /// `agent.get` (PROTOCOL §5.5). `NotFound` is surfaced to the router which
+    /// maps it to `-32602 "Agent not found"`.
+    pub(crate) async fn agent_get_op(&self, agent_id: AgentId) -> Result<AgentLite> {
+        let session = self.store.get_agent_session(&agent_id).await?;
+        Ok(project_lite(session))
+    }
+
+    /// `agent.getConversation` (PROTOCOL §5.5).
+    pub(crate) async fn agent_get_conversation_op(
+        &self,
+        agent_id: AgentId,
+        limit: Option<i64>,
+    ) -> Result<Value> {
+        let session = self.store.get_agent_session(&agent_id).await?;
+        let mut messages = session.messages;
+        let total = messages.len() as i64;
+        let limit = limit.unwrap_or(MAX_CONVERSATION_MESSAGES);
+        let truncated = limit >= 0 && total > limit;
+        if truncated {
+            let start = (total - limit) as usize;
+            messages = messages.split_off(start);
+        }
+        Ok(json!({
+            "agentId": agent_id,
+            "messages": messages,
+            "truncated": truncated,
+            "totalMessages": total,
+        }))
+    }
+
+    /// `agent.create`: persist a new session; the process spawns lazily on first
+    /// turn (PROTOCOL §5.5).
+    pub(crate) async fn agent_create_op(
+        &self,
+        workspace_id: WorkspaceId,
+        name: Option<String>,
+        model: Option<String>,
+    ) -> Result<Value> {
+        let now = now_iso();
+        let name_explicitly_set = name.is_some();
+        let name =
+            name.unwrap_or_else(|| format!("Agent {}", &Uuid::new_v4().simple().to_string()[..6]));
+        let session = AgentSession {
+            id: AgentId(format!("agent-{}", Uuid::new_v4())),
+            workspace_id,
+            backend_session_id: None,
+            acp_session_id: None,
+            name,
+            name_explicitly_set,
+            model,
+            provider: None,
+            system_prompt: None,
+            status: AgentStatus::Pending,
+            is_active: false,
+            messages: Vec::new(),
+            stats: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        self.store.insert_agent_session(&session).await?;
+        Ok(json!({ "agent": { "id": session.id, "name": session.name } }))
+    }
+
+    /// `agent.rename` (PROTOCOL §5.5). A missing agent surfaces as `-32603`
+    /// (matching the TS `renameAgentOnDisk` failure path).
+    pub(crate) async fn agent_rename_op(&self, agent_id: AgentId, name: String) -> Result<Value> {
+        let mut session = self.load_session_internal(&agent_id).await?;
+        session.name = name.clone();
+        session.name_explicitly_set = true;
+        session.updated_at = now_iso();
+        self.store.update_agent_session(&session).await?;
+        Ok(json!({ "success": true, "name": name }))
+    }
+
+    /// `agent.setModel` (PROTOCOL §5.5).
+    pub(crate) async fn agent_set_model_op(
+        &self,
+        agent_id: AgentId,
+        model_id: String,
+    ) -> Result<Value> {
+        let mut session = self.load_session_internal(&agent_id).await?;
+        session.model = Some(model_id.clone());
+        session.updated_at = now_iso();
+        self.store.update_agent_session(&session).await?;
+        Ok(json!({ "success": true, "modelId": model_id }))
+    }
+
+    /// `agent.delete`: idempotent session delete (PROTOCOL §5.5).
+    pub(crate) async fn agent_delete_op(&self, agent_id: AgentId) -> Result<Value> {
+        self.store.delete_agent_session(&agent_id).await?;
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .remove(&agent_id);
+        Ok(json!({ "success": true }))
+    }
+
+    /// `agent.getModels`: auggie CLI with the static-tier fallback (PROTOCOL §5.5).
+    pub(crate) async fn agent_get_models_op(&self) -> Result<Value> {
+        let models = match fetch_auggie_models().await? {
+            Some(m) => m,
+            None => static_models(),
+        };
+        Ok(json!({ "models": models }))
+    }
+
+    /// `agent.queueMessage` (PROTOCOL §5.5).
+    pub(crate) async fn agent_queue_message_op(
+        &self,
+        agent_id: AgentId,
+        content: String,
+        image_blocks: Option<Value>,
+    ) -> Result<Value> {
+        let queued = self.enqueue_message(&agent_id, content, image_blocks);
+        Ok(json!({ "success": true, "queuedMessage": queued.to_value() }))
+    }
+
+    /// `agent.getQueue` (PROTOCOL §5.5).
+    pub(crate) async fn agent_get_queue_op(&self, agent_id: AgentId) -> Result<Value> {
+        let queue: Vec<Value> = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(&agent_id)
+            .map(|q| q.iter().map(QueuedMessage::to_value).collect())
+            .unwrap_or_default();
+        Ok(json!({ "queue": queue }))
+    }
+
+    /// `agent.editQueuedMessage` (PROTOCOL §5.5).
+    pub(crate) async fn agent_edit_queued_message_op(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        content: String,
+    ) -> Result<Value> {
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = guard
+            .get_mut(&agent_id)
+            .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
+        let msg = queue
+            .iter_mut()
+            .find(|m| m.id == message_id)
+            .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
+        msg.content = content;
+        Ok(json!({ "success": true, "queuedMessage": msg.to_value() }))
+    }
+
+    /// `agent.removeQueuedMessage` (PROTOCOL §5.5).
+    pub(crate) async fn agent_remove_queued_message_op(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> Result<Value> {
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = guard
+            .get_mut(&agent_id)
+            .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
+        let before = queue.len();
+        queue.retain(|m| m.id != message_id);
+        if queue.len() == before {
+            return Err(Error::Internal("Queued message not found".to_string()));
+        }
+        Ok(json!({ "success": true }))
+    }
+
+    /// `agent.sendMessage`: persist the user message; on failure auto-queue
+    /// (PROTOCOL §5.5).
+    pub(crate) async fn agent_send_message_op(
+        &self,
+        agent_id: AgentId,
+        content: String,
+        message_id: Option<String>,
+    ) -> Result<Value> {
+        let message_id = message_id.unwrap_or_else(new_message_id);
+        let blocks = user_content_blocks(&content);
+        match self
+            .store
+            .append_agent_message(&agent_id, "user", &blocks, &now_iso())
+            .await
+        {
+            Ok(_) => Ok(json!({ "success": true, "queued": false, "messageId": message_id })),
+            Err(_) => {
+                let queued = self.enqueue_message(&agent_id, content, None);
+                Ok(json!({ "success": true, "queued": true, "queuedMessage": queued.to_value() }))
+            }
+        }
+    }
+
+    /// `agent.forceMessage`: stop the current stream (best-effort) then deliver
+    /// immediately with the caller-supplied `messageId` (PROTOCOL §5.5).
+    pub(crate) async fn agent_force_message_op(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        content: String,
+    ) -> Result<Value> {
+        let blocks = user_content_blocks(&content);
+        self.store
+            .append_agent_message(&agent_id, "user", &blocks, &now_iso())
+            .await?;
+        Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+    }
+
+    /// `agent.summary`: a quick summary derived from the transcript (PROTOCOL §5.5).
+    pub(crate) async fn agent_summary_op(&self, agent_id: AgentId) -> Result<Value> {
+        let session = self.load_session_internal(&agent_id).await?;
+        let last_response = last_assistant_text(&session.messages);
+        let tool_counts = tool_call_counts(&session.messages);
+        let mut out = json!({
+            "agentId": agent_id,
+            "agentName": session.name,
+            "status": session.status,
+            "messageCount": session.messages.len(),
+            "toolCallCounts": tool_counts,
+            "createdAt": session.created_at,
+            "updatedAt": session.updated_at,
+        });
+        if let Some(text) = last_response {
+            out["lastResponse"] = Value::String(text);
+        }
+        Ok(out)
+    }
+
+    /// `agent.delegate`: create a session and (best-effort) assign it to the
+    /// target task note (PROTOCOL §5.5).
+    pub(crate) async fn agent_delegate_op(
+        &self,
+        workspace_id: WorkspaceId,
+        input: intent_core::AgentDelegateInput,
+    ) -> Result<Value> {
+        let created = self
+            .agent_create_op(workspace_id.clone(), None, input.model)
+            .await?;
+        let agent_id = created["agent"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let name = created["agent"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if let Some(task_note_id) = input.task_note_id.clone().or(input.note_id.clone()) {
+            let _ = self
+                .assign_agent(workspace_id, task_note_id, agent_id.clone())
+                .await;
+        }
+        Ok(json!({ "ok": true, "agentId": agent_id, "name": name }))
+    }
+
+    /// `agent.sendToTask`: deliver to the agent assigned to a task note (PROTOCOL §5.5).
+    pub(crate) async fn agent_send_to_task_op(
+        &self,
+        workspace_id: WorkspaceId,
+        task_note_id: NoteId,
+        message: String,
+    ) -> Result<Value> {
+        let task = self.get_my_task(workspace_id, task_note_id).await?;
+        let Some(agent) = task.assigned_agents.first().cloned() else {
+            return Ok(
+                json!({ "ok": false, "delivered": false, "error": "No agent assigned to task" }),
+            );
+        };
+        let result = self
+            .agent_send_message_op(agent.clone(), message, None)
+            .await?;
+        Ok(json!({ "ok": true, "agentId": agent, "result": result }))
+    }
+
+    /// `agent.wakeOrCreate`: resume the assigned agent or create + assign a new
+    /// one, then deliver the context message (PROTOCOL §5.5).
+    pub(crate) async fn agent_wake_or_create_op(
+        &self,
+        workspace_id: WorkspaceId,
+        task_note_id: NoteId,
+        context_message: String,
+        model: Option<String>,
+    ) -> Result<Value> {
+        let task = self
+            .get_my_task(workspace_id.clone(), task_note_id.clone())
+            .await?;
+        if let Some(agent) = task.assigned_agents.first().cloned() {
+            let result = self
+                .agent_send_message_op(agent.clone(), context_message, None)
+                .await?;
+            return Ok(json!({ "ok": true, "agentId": agent, "created": false, "result": result }));
+        }
+        let created = self
+            .agent_create_op(workspace_id.clone(), None, model)
+            .await?;
+        let agent_id = created["agent"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let _ = self
+            .assign_agent(workspace_id, task_note_id, agent_id.clone())
+            .await;
+        let agent = AgentId::from(agent_id.as_str());
+        let result = self
+            .agent_send_message_op(agent.clone(), context_message, None)
+            .await?;
+        Ok(json!({ "ok": true, "agentId": agent, "created": true, "result": result }))
+    }
+
+    /// Load a session, mapping `NotFound` to `-32603` for the methods whose TS
+    /// peers surface a generic failure (rename/setModel/summary).
+    async fn load_session_internal(&self, agent_id: &AgentId) -> Result<AgentSession> {
+        match self.store.get_agent_session(agent_id).await {
+            Ok(s) => Ok(s),
+            Err(Error::NotFound(_)) => {
+                Err(Error::Internal(format!("Agent \"{agent_id}\" not found")))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Push a message onto an agent's in-memory queue and return it.
+    fn enqueue_message(
+        &self,
+        agent_id: &AgentId,
+        content: String,
+        image_blocks: Option<Value>,
+    ) -> QueuedMessage {
+        let queued = QueuedMessage {
+            id: new_message_id(),
+            agent_id: agent_id.0.clone(),
+            content,
+            image_blocks,
+            created_at: now_iso(),
+        };
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .entry(agent_id.clone())
+            .or_default()
+            .push(queued.clone());
+        queued
+    }
+}
+
+/// Join all text blocks of the most-recent assistant message (the summary's
+/// `lastResponse`).
+fn last_assistant_text(messages: &[AgentMessage]) -> Option<String> {
+    for msg in messages.iter().rev() {
+        if msg.role != "assistant" {
+            continue;
+        }
+        let joined = text_blocks(&msg.content).join(" ");
+        let trimmed = joined.trim();
+        return if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+    None
+}
+
+/// Count `tool_use` content blocks by tool name across all messages.
+fn tool_call_counts(messages: &[AgentMessage]) -> Value {
+    let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for msg in messages {
+        let Some(blocks) = msg.content.as_array() else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let name = block
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            *counts.entry(name).or_insert(0) += 1;
+        }
+    }
+    json!(counts)
+}

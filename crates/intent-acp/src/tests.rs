@@ -426,6 +426,299 @@ mod session_tests {
     }
 }
 
+/// Agent→BE MCP server, config conversions, env baseline/redaction, and the
+/// per-agent-type tool denylist (§6.8 / §18.4 DoD).
+mod mcp_tests {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{
+        BoxFuture, Note, NoteAddInput, NoteAddResult, NoteId, Result, WorkspaceApi, WorkspaceId,
+    };
+    use serde_json::{json, Value};
+
+    use crate::mcp_config::{
+        apply_baseline_env_to_stdio_servers, normalize_mcp_servers, to_acp_mcp_servers,
+        to_auggie_mcp_config, to_claude_mcp_json, to_codex_mcp_overrides, to_opencode_mcp_config,
+        NormalizedMcpServer,
+    };
+    use crate::mcp_env::{
+        build_baseline_mcp_env, is_likely_secret_env_key, merge_mcp_env,
+        redact_mcp_env_for_logging, EnvMap, REDACTED_VALUE,
+    };
+    use crate::tool_restrictions::{get_tool_denylist_for_agent_type, SUBAGENT_TOOLS};
+    use crate::WorkspaceMcpServer;
+
+    /// A `WorkspaceApi` that records the `add_to_note` calls it receives so a tool
+    /// call through the MCP server can be observed as a state change.
+    #[derive(Default)]
+    struct MockApi {
+        added: Mutex<Vec<(String, String)>>,
+    }
+
+    impl WorkspaceApi for MockApi {
+        fn list_notes<'a>(
+            &'a self,
+            _workspace_id: &'a WorkspaceId,
+        ) -> BoxFuture<'a, Result<Vec<Note>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn add_to_note(
+            &self,
+            _workspace_id: WorkspaceId,
+            note_id: NoteId,
+            input: NoteAddInput,
+        ) -> BoxFuture<'_, Result<NoteAddResult>> {
+            self.added
+                .lock()
+                .unwrap()
+                .push((note_id.to_string(), input.content.clone()));
+            Box::pin(async move {
+                let len = input.content.len();
+                Ok(NoteAddResult {
+                    ok: true,
+                    note_id,
+                    added_length: len,
+                    total_length: len,
+                    position: "at end".to_string(),
+                    old_content: String::new(),
+                    new_content: input.content,
+                    converted_count: 0,
+                    created_task_note_ids: Vec::new(),
+                })
+            })
+        }
+    }
+
+    fn server(api: Arc<MockApi>) -> WorkspaceMcpServer {
+        WorkspaceMcpServer::new(api, WorkspaceId::from_string("ws-1"))
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_protocol_and_tools() {
+        let srv = server(Arc::new(MockApi::default()));
+        let resp = srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["protocolVersion"], json!("2024-11-05"));
+        assert_eq!(
+            resp["result"]["capabilities"]["tools"]["listChanged"],
+            json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_dispatches_to_workspace_api() {
+        let api = Arc::new(MockApi::default());
+        let srv = server(api.clone());
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_to_note_workspace-mcp",
+                    "arguments": { "noteId": "n1", "content": "hello" }
+                }
+            }))
+            .await
+            .unwrap();
+        // The BE state changed: the mock recorded the add.
+        assert_eq!(
+            *api.added.lock().unwrap(),
+            vec![("n1".to_string(), "hello".to_string())]
+        );
+        // The MCP result wraps the service result as text content.
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["ok"], json!(true));
+        assert_eq!(parsed["newContent"], json!("hello"));
+    }
+
+    #[tokio::test]
+    async fn notification_yields_no_response() {
+        let srv = server(Arc::new(MockApi::default()));
+        let resp = srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+            .await;
+        assert!(resp.is_none());
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_is_rejected() {
+        let srv = server(Arc::new(MockApi::default()));
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": { "name": "does_not_exist", "arguments": {} }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+    }
+
+    #[tokio::test]
+    async fn denylist_filters_tools_list_and_blocks_calls() {
+        // commit-message denies every write category, including note writes.
+        let srv = WorkspaceMcpServer::for_agent_type(
+            Arc::new(MockApi::default()),
+            WorkspaceId::from_string("ws-1"),
+            "commit-message",
+        );
+        let names: Vec<String> = srv
+            .available_tools()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(!names.contains(&"add_to_note_workspace-mcp".to_string()));
+        assert!(!names.contains(&"delegate_task_workspace-mcp".to_string()));
+        // Read tools remain available.
+        assert!(names.contains(&"get_note_workspace-mcp".to_string()));
+
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": { "name": "add_to_note_workspace-mcp", "arguments": { "noteId": "n1", "content": "x" } }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+    }
+
+    #[test]
+    fn task_loop_denies_only_subagent_tools() {
+        let deny = get_tool_denylist_for_agent_type("task-loop");
+        assert_eq!(deny, SUBAGENT_TOOLS.to_vec());
+        // Interactive/foreground agents are unrestricted.
+        assert!(get_tool_denylist_for_agent_type("interactive").is_empty());
+        // Pure text agents deny note writes and file writes.
+        let cm = get_tool_denylist_for_agent_type("commit-message");
+        assert!(cm.contains(&"add_to_note_workspace-mcp"));
+        assert!(cm.contains(&"str-replace-editor"));
+    }
+
+    #[test]
+    fn secret_env_detection_matches_ts() {
+        for key in [
+            "GITHUB_TOKEN",
+            "OPENAI_API_KEY",
+            "MY_SECRET",
+            "AUTH_TOKEN",
+            "DB_PASSWORD",
+        ] {
+            assert!(is_likely_secret_env_key(key), "{key} should be secret");
+        }
+        for key in ["PATH", "HOME", "LANG", "TOKENIZER"] {
+            assert!(!is_likely_secret_env_key(key), "{key} should not be secret");
+        }
+    }
+
+    #[test]
+    fn baseline_env_drops_secrets_and_controlled_keys() {
+        let mut parent = EnvMap::new();
+        parent.insert("PATH".into(), "/usr/bin".into());
+        parent.insert("HOME".into(), "/home/u".into());
+        parent.insert("GITHUB_TOKEN".into(), "ghp_x".into());
+        parent.insert("ELECTRON_RUN_AS_NODE".into(), "1".into());
+        let baseline = build_baseline_mcp_env(&parent);
+        assert_eq!(baseline.get("PATH").map(String::as_str), Some("/usr/bin"));
+        assert!(baseline.contains_key("HOME"));
+        assert!(!baseline.contains_key("GITHUB_TOKEN"));
+        assert!(!baseline.contains_key("ELECTRON_RUN_AS_NODE"));
+    }
+
+    #[test]
+    fn merge_env_later_layers_win() {
+        let mut a = EnvMap::new();
+        a.insert("K".into(), "1".into());
+        a.insert("ONLY_A".into(), "a".into());
+        let mut b = EnvMap::new();
+        b.insert("K".into(), "2".into());
+        let merged = merge_mcp_env(&[&a, &b]);
+        assert_eq!(merged.get("K").map(String::as_str), Some("2"));
+        assert_eq!(merged.get("ONLY_A").map(String::as_str), Some("a"));
+    }
+
+    #[test]
+    fn redaction_masks_env_and_header_values() {
+        let config = json!({
+            "mcpServers": {
+                "ws": { "command": "node", "args": ["x"], "env": { "TOKEN": "secret" } },
+                "remote": { "type": "http", "url": "https://h", "headers": { "Authorization": "Bearer z" } }
+            }
+        });
+        let redacted = redact_mcp_env_for_logging(&config);
+        assert_eq!(
+            redacted["mcpServers"]["ws"]["env"]["TOKEN"],
+            json!(REDACTED_VALUE)
+        );
+        assert_eq!(redacted["mcpServers"]["ws"]["command"], json!("node"));
+        assert_eq!(
+            redacted["mcpServers"]["remote"]["headers"]["Authorization"],
+            json!(REDACTED_VALUE)
+        );
+    }
+
+    fn stdio_servers() -> Value {
+        json!({
+            "ws": { "command": "node", "args": ["server.js"], "env": { "A": "1" } },
+            "remote": { "type": "sse", "url": "https://h", "headers": { "X": "y" } }
+        })
+    }
+
+    #[test]
+    fn normalize_and_convert_to_provider_formats() {
+        let normalized = normalize_mcp_servers(&stdio_servers());
+        assert!(matches!(
+            normalized.get("ws"),
+            Some(NormalizedMcpServer::Stdio { .. })
+        ));
+
+        let acp = to_acp_mcp_servers(&normalized);
+        let ws = acp.iter().find(|s| s["name"] == json!("ws")).unwrap();
+        assert_eq!(ws["command"], json!("node"));
+        assert_eq!(ws["env"], json!([{ "name": "A", "value": "1" }]));
+
+        let opencode = to_opencode_mcp_config(&normalized);
+        assert_eq!(opencode["ws"]["type"], json!("local"));
+        assert_eq!(opencode["ws"]["command"], json!(["node", "server.js"]));
+
+        let claude = to_claude_mcp_json(&normalized);
+        assert_eq!(claude["mcpServers"]["ws"]["type"], json!("stdio"));
+
+        let auggie = to_auggie_mcp_config(&normalized);
+        assert_eq!(auggie["mcpServers"]["ws"]["command"], json!("node"));
+
+        let codex = to_codex_mcp_overrides(&normalized);
+        assert!(codex
+            .iter()
+            .any(|o| o.key == "mcp_servers.ws.command" && o.toml_value == "\"node\""));
+        assert!(codex.iter().any(|o| o.key == "mcp_servers.ws.enabled"));
+    }
+
+    #[test]
+    fn baseline_env_injected_into_stdio_servers_existing_wins() {
+        let normalized = normalize_mcp_servers(&stdio_servers());
+        let mut baseline = EnvMap::new();
+        baseline.insert("PATH".into(), "/usr/bin".into());
+        baseline.insert("A".into(), "baseline".into());
+        let injected = apply_baseline_env_to_stdio_servers(&normalized, &baseline);
+        let NormalizedMcpServer::Stdio { env, .. } = injected.get("ws").unwrap() else {
+            panic!("ws is stdio");
+        };
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
+        // Server's own env wins over the baseline.
+        assert_eq!(env.get("A").map(String::as_str), Some("1"));
+        // Remote servers are untouched.
+        assert!(matches!(
+            injected.get("remote"),
+            Some(NormalizedMcpServer::Sse { .. })
+        ));
+    }
+}
+
 /// Client-served handler tests: fs sandbox + events, permission resolve/timeout,
 /// and the terminal stub (§6.7 / PROTOCOL §8 DoD).
 mod client_served_tests {

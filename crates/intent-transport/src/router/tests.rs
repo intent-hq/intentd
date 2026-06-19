@@ -1132,3 +1132,79 @@ async fn event_unsubscribe_requires_subscription_id() {
     assert_eq!(v["result"]["ok"], serde_json::json!(true));
     assert_eq!(v["result"]["subscriptionId"], serde_json::json!("s1"));
 }
+
+#[tokio::test]
+async fn agent_methods_validate_required_params() {
+    // agent.list without workspaceId.
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("workspaceId is required")
+    );
+
+    // agent.get without agentId.
+    let v = call(r#"{"jsonrpc":"2.0","id":2,"method":"agent.get","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: agentId")
+    );
+
+    // agent.sendMessage missing workspaceId (agentId + content present).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":3,"method":"agent.sendMessage","params":{"agentId":"agent-1","content":"hi"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("workspaceId is required")
+    );
+
+    // agent.rename with a blank name.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":4,"method":"agent.rename","params":{"agentId":"agent-1","name":"   "}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Name cannot be empty")
+    );
+
+    // agent.subscribe with a non-array eventTypes.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":5,"method":"agent.subscribe","params":{"workspaceId":"ws-1","eventTypes":"agent:*"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("eventTypes must be an array")
+    );
+}
+
+#[tokio::test]
+async fn agent_methods_are_routed_not_method_not_found() {
+    // A fully-valid agent.list dispatches to the (default) impl → -32603, never
+    // -32601, proving the method is registered in the dispatch table.
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32603);
+
+    // agent.getModels takes no params and must route too.
+    let v = call(r#"{"jsonrpc":"2.0","id":2,"method":"agent.getModels"}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32603);
+}
