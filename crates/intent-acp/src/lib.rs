@@ -16,11 +16,13 @@ use intent_core::WorkspaceApi;
 
 pub mod error;
 pub mod handshake;
+pub mod session;
 pub mod spawn;
 pub mod transport;
 
 pub use error::{AcpError, AcpResult, JsonRpcError};
 pub use handshake::{handshake, HandshakeResult};
+pub use session::{MappedToolCall, MappedUpdate};
 pub use spawn::{spawn_provider, SpawnOptions, SpawnedAgent};
 pub use transport::{
     Connection, ConnectionHooks, IncomingNotification, IncomingRequest, DEFAULT_REQUEST_TIMEOUT,
@@ -43,10 +45,6 @@ impl AcpClient {
             _workspace: workspace,
         }
     }
-}
-
-pub mod session {
-    //! Session new/load/prompt/cancel + streaming multiplexing — stub.
 }
 
 pub mod mcp_server {

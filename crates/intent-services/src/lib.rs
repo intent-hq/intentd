@@ -34,6 +34,7 @@ use intent_store::{EventQuery, NewEvent, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
 
+mod agent_session;
 mod event_ops;
 pub mod events;
 mod note_ops;
@@ -314,7 +315,7 @@ fn comment_added_event(workspace_id: &WorkspaceId, note_id: &NoteId, comment_id:
 
 /// Publish a change event onto the bus when one is wired, logging (not failing)
 /// on error — the durable mutation has already succeeded by this point.
-async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
+pub(crate) async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
     let Some(bus) = bus else {
         return;
     };

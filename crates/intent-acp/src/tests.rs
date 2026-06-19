@@ -214,3 +214,214 @@ async fn spawn_real_child_handshake() {
 
     agent.kill().await.ok();
 }
+
+/// Session-lifecycle + streaming-mapping tests (§6.5/§6.6 DoD).
+mod session_tests {
+    use super::*;
+
+    use agent_client_protocol::schema::{
+        ContentBlock, SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallStatus,
+        ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    };
+
+    use crate::session::{self, MappedUpdate};
+    use crate::IncomingNotification;
+
+    /// Mock agent that answers the session lifecycle methods and records every
+    /// frame it received. `session/cancel` is a notification (no id) → no reply.
+    fn spawn_session_responder<R, W>(read: R, write: W) -> JoinHandle<Vec<Value>>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(read).lines();
+            let mut write = write;
+            let mut seen = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let value: Value = serde_json::from_str(&line).expect("agent received valid JSON");
+                seen.push(value.clone());
+                let (Some(id), Some(method)) =
+                    (value.get("id"), value.get("method").and_then(Value::as_str))
+                else {
+                    continue;
+                };
+                let result = match method {
+                    "initialize" => {
+                        json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                    }
+                    "session/new" => json!({ "sessionId": "acp-session-1" }),
+                    "session/load" => json!({}),
+                    "session/prompt" => json!({ "stopReason": "end_turn" }),
+                    _ => json!({}),
+                };
+                let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                write
+                    .write_all(format!("{resp}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+            }
+            seen
+        })
+    }
+
+    fn connect_session() -> (Connection, JoinHandle<Vec<Value>>) {
+        let (c2a_client, c2a_agent) = tokio::io::duplex(8 * 1024);
+        let (a2c_agent, a2c_client) = tokio::io::duplex(8 * 1024);
+        let responder = spawn_session_responder(c2a_agent, a2c_agent);
+        let conn = Connection::new(c2a_client, a2c_client, None, ConnectionHooks::default());
+        (conn, responder)
+    }
+
+    #[tokio::test]
+    async fn new_session_returns_acp_session_id() {
+        let (conn, _responder) = connect_session();
+        let resp = session::new_session(&conn, "/tmp/ws", Vec::new())
+            .await
+            .expect("session/new succeeds");
+        assert_eq!(resp.session_id.0.as_ref(), "acp-session-1");
+    }
+
+    #[tokio::test]
+    async fn prompt_returns_stop_reason_and_load_caps_detected() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let (conn, _responder) = connect_session();
+        let handshake = crate::handshake::handshake(&conn, provider).await.unwrap();
+        assert!(session::supports_load_session(&handshake.initialize));
+
+        session::load_session(&conn, "acp-session-1", "/tmp/ws", Vec::new())
+            .await
+            .expect("session/load succeeds when capability present");
+
+        let block = ContentBlock::Text(TextContent::new("hello"));
+        let stop = session::prompt(&conn, "acp-session-1", vec![block])
+            .await
+            .expect("session/prompt resolves");
+        assert_eq!(
+            serde_json::to_value(stop).unwrap(),
+            json!("end_turn"),
+            "stop reason round-trips as end_turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_sends_session_cancel_notification() {
+        let (conn, responder) = connect_session();
+        session::cancel(&conn, "acp-session-1")
+            .await
+            .expect("cancel notification sent");
+        // Await a follow-up request: the single FIFO writer guarantees the
+        // cancel line was flushed before this response arrives (avoids racing
+        // the writer task against the drop below).
+        session::new_session(&conn, "/tmp/ws", Vec::new())
+            .await
+            .expect("follow-up request flushes the cancel line");
+        // Drop the connection to close the agent read side, then inspect frames.
+        drop(conn);
+        let seen = responder.await.unwrap();
+        let cancel = seen
+            .iter()
+            .find(|f| f.get("method").and_then(Value::as_str) == Some("session/cancel"))
+            .expect("agent received session/cancel");
+        assert!(cancel.get("id").is_none(), "cancel is a notification");
+        assert_eq!(cancel["params"]["sessionId"], json!("acp-session-1"));
+    }
+
+    #[test]
+    fn maps_message_chunk_to_stream_chunk() {
+        let update =
+            SessionUpdate::AgentMessageChunk(agent_client_protocol::schema::ContentChunk::new(
+                ContentBlock::Text(TextContent::new("tok")),
+            ));
+        assert_eq!(
+            session::map_session_update(&update),
+            Some(MappedUpdate::Chunk {
+                content: json!("tok"),
+                text: Some("tok".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn maps_tool_call_started_with_tool_kind() {
+        let call = ToolCall::new("t1", "Edit src/lib.rs")
+            .kind(ToolKind::Edit)
+            .raw_input(json!({ "path": "src/lib.rs" }));
+        let mapped = session::map_session_update(&SessionUpdate::ToolCall(call)).unwrap();
+        let MappedUpdate::ToolCall(tc) = mapped else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.tool_kind, "file");
+        assert_eq!(tc.status, "started");
+        assert_eq!(tc.tool_name, "Edit src/lib.rs");
+        assert_eq!(tc.input, json!({ "path": "src/lib.rs" }));
+    }
+
+    #[test]
+    fn maps_tool_call_update_completed_and_error() {
+        let done = ToolCallUpdate::new(
+            "t1",
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Completed)
+                .kind(ToolKind::Search),
+        );
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCallUpdate(done)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.status, "completed");
+        assert_eq!(tc.tool_kind, "search");
+
+        let failed = ToolCallUpdate::new(
+            "t1",
+            ToolCallUpdateFields::new().status(ToolCallStatus::Failed),
+        );
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCallUpdate(failed)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.status, "error");
+    }
+
+    #[test]
+    fn unmapped_variants_return_none() {
+        let thought =
+            SessionUpdate::AgentThoughtChunk(agent_client_protocol::schema::ContentChunk::new(
+                ContentBlock::Text(TextContent::new("thinking")),
+            ));
+        assert_eq!(session::map_session_update(&thought), None);
+    }
+
+    #[test]
+    fn map_notification_parses_session_update() {
+        let note = SessionNotification::new(
+            "acp-session-1",
+            SessionUpdate::AgentMessageChunk(agent_client_protocol::schema::ContentChunk::new(
+                ContentBlock::Text(TextContent::new("hi")),
+            )),
+        );
+        let incoming = IncomingNotification {
+            method: "session/update".to_string(),
+            params: serde_json::to_value(&note).unwrap(),
+        };
+        assert_eq!(
+            session::map_notification(&incoming),
+            Some(MappedUpdate::Chunk {
+                content: json!("hi"),
+                text: Some("hi".to_string()),
+            })
+        );
+
+        let other = IncomingNotification {
+            method: "session/other".to_string(),
+            params: json!({}),
+        };
+        assert_eq!(session::map_notification(&other), None);
+    }
+}
