@@ -100,6 +100,8 @@ fn verdict_event(verdict: ReviewVerdict) -> &'static str {
 
 pub(crate) fn map_pull(value: Value) -> Result<PullRequest> {
     let p: dto::Pull = serde_json::from_value(value)?;
+    let head_sha = p.head.as_ref().and_then(|r| r.sha.clone());
+    let source_branch = p.head.and_then(|r| r.r#ref).unwrap_or_default();
     Ok(PullRequest {
         number: p.number,
         url: p.html_url.unwrap_or_default(),
@@ -111,10 +113,12 @@ pub(crate) fn map_pull(value: Value) -> Result<PullRequest> {
             p.state.as_deref().unwrap_or("open"),
         ),
         draft: p.draft,
-        source_branch: p.head.and_then(|r| r.r#ref).unwrap_or_default(),
+        source_branch,
         target_branch: p.base.and_then(|r| r.r#ref).unwrap_or_default(),
         author: login_of(&p.user),
         mergeable: p.mergeable,
+        mergeable_state: p.mergeable_state,
+        head_sha,
         created_at: p.created_at.unwrap_or_default(),
         updated_at: p.updated_at.unwrap_or_default(),
     })
@@ -259,6 +263,7 @@ mod dto {
     pub(super) struct GitRef {
         #[serde(rename = "ref")]
         pub r#ref: Option<String>,
+        pub sha: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -732,6 +737,22 @@ mod tests {
         assert_eq!(pr.source_branch, "feature");
         assert_eq!(pr.target_branch, "main");
         assert_eq!(pr.author, "octocat");
+    }
+
+    #[test]
+    fn maps_head_sha_and_mergeable_state() {
+        let v = json!({
+            "number": 7,
+            "state": "open",
+            "mergeable": true,
+            "mergeable_state": "clean",
+            "head": { "ref": "feature", "sha": "abc123" },
+            "base": { "ref": "main" }
+        });
+        let pr = map_pull(v).unwrap();
+        assert_eq!(pr.head_sha.as_deref(), Some("abc123"));
+        assert_eq!(pr.mergeable_state.as_deref(), Some("clean"));
+        assert_eq!(pr.source_branch, "feature");
     }
 
     #[test]

@@ -42,9 +42,10 @@ pub enum MergeMethod {
     Rebase,
 }
 
-/// Verdict carried by a submitted review.
+/// Verdict carried by a submitted review. Wire values are kebab-case
+/// (`approve` / `request-changes` / `comment`, §5.18 `Review`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "kebab-case")]
 pub enum ReviewVerdict {
     Approve,
     RequestChanges,
@@ -76,6 +77,12 @@ pub struct PullRequest {
     pub target_branch: String,
     pub author: String,
     pub mergeable: Option<bool>,
+    /// Raw forge mergeability state (e.g. GitHub `mergeable_state`:
+    /// `clean`/`dirty`/`blocked`/`unstable`/`behind`/`unknown`). Powers the
+    /// `pr.status` summary parity; `None` when the forge does not expose it.
+    pub mergeable_state: Option<String>,
+    /// SHA of the head commit (race protection; default `pr.listCheckRuns` ref).
+    pub head_sha: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

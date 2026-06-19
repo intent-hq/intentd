@@ -41,6 +41,7 @@ mod event_ops;
 pub mod events;
 mod git_ops;
 mod note_ops;
+mod pr_ops;
 
 #[cfg(test)]
 mod tests;
@@ -79,6 +80,10 @@ pub struct Services {
     /// keeps the strong `Arc<AgentManager>` for the daemon's lifetime. `None`
     /// until attached, so read-only/test wiring keeps the store-only behavior.
     agent_manager: Arc<OnceLock<Weak<AgentManager>>>,
+    /// Active forge for the `pr.*` methods (§7). `None` until wired by the
+    /// composition root or a test; when unset, the `pr.*` handlers build the
+    /// provider from default settings (token from env / `gh` / keychain).
+    source_control: Option<Arc<dyn intent_sourcecontrol::SourceControl>>,
 }
 
 impl Services {
@@ -91,7 +96,18 @@ impl Services {
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
+            source_control: None,
         }
+    }
+
+    /// Wire the active source-control provider used by the `pr.*` methods (§7).
+    /// The composition root builds it from settings; tests inject a stub.
+    pub fn with_source_control(
+        mut self,
+        source_control: Arc<dyn intent_sourcecontrol::SourceControl>,
+    ) -> Self {
+        self.source_control = Some(source_control);
+        self
     }
 
     /// Attach the runtime [`AgentManager`] so the `agent.*` RPC handlers drive
@@ -2493,6 +2509,226 @@ impl WorkspaceApi for Services {
             Ok(serde_json::json!({ "success": true, "subscriptionId": subscription_id }))
         })
     }
+
+    // ========================================================================
+    // pr.* read surface (PROTOCOL §5.7). Maps onto the host-agnostic
+    // `SourceControl` trait (§7.5); every method requires an active PR on the
+    // workspace (else `-32603`). Pure mapping/aggregation lives in `pr_ops`.
+    // ========================================================================
+
+    fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let number = pr_ops::active_pr_number(&ws)?;
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let pr = sc
+                .get_pr(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let state = pr_ops::derive_status_state(&pr);
+            let mergeable_state = pr
+                .mergeable_state
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let summary = pr_ops::build_status_summary(state, pr.mergeable, &mergeable_state);
+            Ok(serde_json::json!({
+                "prNumber": number,
+                "title": pr.title,
+                "url": pr.url,
+                "state": state,
+                "mergeable": pr.mergeable,
+                "mergeableState": mergeable_state,
+                "hasConflicts": mergeable_state == "dirty",
+                "isDraft": state == "draft",
+                "isMerged": state == "merged",
+                "isClosed": state == "closed",
+                "summary": summary,
+            }))
+        })
+    }
+
+    fn pr_list_comments(
+        &self,
+        workspace_id: WorkspaceId,
+        count: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let number = pr_ops::active_pr_number(&ws)?;
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let comments = sc
+                .list_comments(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let limit = pr_ops::clamp_count(count);
+            let comments: Vec<_> = comments.into_iter().take(limit).collect();
+            Ok(serde_json::json!({ "count": comments.len(), "comments": comments }))
+        })
+    }
+
+    fn pr_list_review_comments(
+        &self,
+        workspace_id: WorkspaceId,
+        path: Option<String>,
+        status: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let status = pr_ops::validate_review_comment_status(status)?;
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let number = pr_ops::active_pr_number(&ws)?;
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            match sc.get_review_threads(&repo_ref, number).await {
+                Ok(mut threads) => {
+                    let total = threads.len() as i64;
+                    if status == "resolved" {
+                        threads.retain(|t| t.is_resolved);
+                    } else if status == "unresolved" {
+                        threads.retain(|t| !t.is_resolved);
+                    }
+                    if let Some(p) = &path {
+                        pr_ops::retain_path(&mut threads, p);
+                    }
+                    let json_threads = pr_ops::thread_list_json(&threads);
+                    Ok(serde_json::json!({
+                        "threads": json_threads,
+                        "threadCount": threads.len(),
+                        "usingFallback": false,
+                        "pagination": { "totalCount": total, "pagesFetched": 1, "hasMore": false },
+                        "filter": { "path": path, "status": status },
+                        "note": serde_json::Value::Null,
+                    }))
+                }
+                Err(_) => {
+                    let comments = sc
+                        .list_review_comments(&repo_ref, number)
+                        .await
+                        .map_err(pr_ops::map_sc_err)?;
+                    let total_fetched = comments.len() as i64;
+                    let mut threads = pr_ops::fallback_threads(comments);
+                    if let Some(p) = &path {
+                        pr_ops::retain_path(&mut threads, p);
+                    }
+                    let json_threads = pr_ops::thread_list_json(&threads);
+                    let note = if status != "all" {
+                        serde_json::Value::String(
+                            "Resolved status is unavailable with REST fallback; returning all \
+                             threads regardless of the status filter."
+                                .to_string(),
+                        )
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    Ok(serde_json::json!({
+                        "threads": json_threads,
+                        "threadCount": threads.len(),
+                        "usingFallback": true,
+                        "pagination": { "totalFetched": total_fetched, "pagesFetched": 1, "hasMore": false },
+                        "filter": { "path": path, "status": status },
+                        "note": note,
+                    }))
+                }
+            }
+        })
+    }
+
+    fn pr_get_reviews(
+        &self,
+        workspace_id: WorkspaceId,
+        pr_number: Option<u64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let number = match pr_number {
+                Some(n) => n,
+                None => pr_ops::active_pr_number(&ws)?,
+            };
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let reviews = sc
+                .list_reviews(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let agg = pr_ops::aggregate_reviews(&reviews);
+            Ok(serde_json::json!({
+                "reviewDecision": agg.review_decision,
+                "approvalCount": agg.approval_count,
+                "changesRequestedCount": agg.changes_requested_count,
+                "approvedBy": agg.approved_by,
+                "reviews": reviews,
+            }))
+        })
+    }
+
+    fn pr_list_check_runs(
+        &self,
+        workspace_id: WorkspaceId,
+        git_ref: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let number = pr_ops::active_pr_number(&ws)?;
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let git_ref = match git_ref {
+                Some(r) => r,
+                None => {
+                    let pr = sc
+                        .get_pr(&repo_ref, number)
+                        .await
+                        .map_err(pr_ops::map_sc_err)?;
+                    pr.head_sha
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| Some(pr.source_branch).filter(|s| !s.is_empty()))
+                        .ok_or_else(|| {
+                            Error::Internal("Could not determine PR head commit".to_string())
+                        })?
+                }
+            };
+            let runs = sc
+                .check_runs(&repo_ref, &git_ref)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let s = pr_ops::summarize_check_runs(&runs);
+            Ok(serde_json::json!({
+                "total": s.total,
+                "passed": s.passed,
+                "failed": s.failed,
+                "pending": s.pending,
+                "runs": runs,
+            }))
+        })
+    }
+}
+
+/// Load a workspace for a `pr.*` call, mapping a missing workspace onto the
+/// "No active PR" error (→ `-32603`) so an unknown/unlinked workspace surfaces
+/// like the TS `requirePrContext` guard (PROTOCOL §5.7).
+async fn load_ws_for_pr(store: &Store, workspace_id: &WorkspaceId) -> Result<Workspace> {
+    store
+        .get_workspace(workspace_id)
+        .await
+        .map_err(|e| match e {
+            Error::NotFound(_) => Error::Internal(pr_ops::NO_ACTIVE_PR.to_string()),
+            other => other,
+        })
 }
 
 /// Snake_case status word for a `TaskStatus` (matches the wire serialization).

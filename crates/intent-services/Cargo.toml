@@ -26,3 +26,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 uuid = { workspace = true }
+async-trait = "0.1"

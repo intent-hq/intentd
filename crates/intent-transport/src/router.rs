@@ -864,6 +864,48 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&r)
         }
+        "pr.status" => {
+            let ws = require_ws_note(params)?;
+            let r = api.pr_status(ws).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "pr.listComments" => {
+            let ws = require_ws_note(params)?;
+            let count = opt_int(params, "count");
+            let r = api
+                .pr_list_comments(ws, count)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "pr.listReviewComments" => {
+            let ws = require_ws_note(params)?;
+            let path = opt_str(params, "path");
+            let status = opt_str(params, "status");
+            let r = api
+                .pr_list_review_comments(ws, path, status)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "pr.getReviews" => {
+            let ws = require_ws_note(params)?;
+            let pr_number = opt_int(params, "prNumber").and_then(|n| u64::try_from(n).ok());
+            let r = api
+                .pr_get_reviews(ws, pr_number)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "pr.listCheckRuns" => {
+            let ws = require_ws_note(params)?;
+            let git_ref = opt_str(params, "ref");
+            let r = api
+                .pr_list_check_runs(ws, git_ref)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }

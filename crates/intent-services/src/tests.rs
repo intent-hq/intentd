@@ -1021,3 +1021,327 @@ mod mcp_callback {
         assert!(batch.iter().any(|e| e.event_type == NOTE_UPDATED));
     }
 }
+
+// ============================================================================
+// pr.* read methods over a stubbed forge (no network). Asserts the parity-exact
+// status/reviews/check-run shapes and the review-thread filtering/fallback.
+// ============================================================================
+
+mod pr {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use intent_core::{now_iso, Error, WorkspaceApi, WorkspaceId};
+    use intent_sourcecontrol::{
+        AuthStatus, CheckRun, CheckState, Comment, CommentAnchor, Error as ScError, Issue,
+        IssueQuery, MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, PrPatch,
+        PrQuery, PrState, PullRequest, RepoRef, Result as ScResult, Review, ReviewComment,
+        ReviewThread, ReviewThreadComment, ReviewVerdict, ScCapabilities, SourceControl,
+    };
+    use intent_store::Store;
+
+    use super::{workspace, TempDb};
+    use crate::Services;
+
+    struct StubForge {
+        fail_threads: bool,
+    }
+
+    fn sample_pr() -> PullRequest {
+        PullRequest {
+            number: 42,
+            url: "https://github.com/o/r/pull/42".into(),
+            title: "Add thing".into(),
+            body: None,
+            state: PrState::Open,
+            draft: false,
+            source_branch: "feature".into(),
+            target_branch: "main".into(),
+            author: "octocat".into(),
+            mergeable: Some(true),
+            mergeable_state: Some("clean".into()),
+            head_sha: Some("deadbeef".into()),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[async_trait]
+    impl SourceControl for StubForge {
+        fn provider_id(&self) -> &'static str {
+            "stub"
+        }
+        fn capabilities(&self) -> ScCapabilities {
+            ScCapabilities {
+                draft_prs: true,
+                squash_merge: true,
+                rebase_merge: true,
+                review_required_changes: true,
+                check_runs: true,
+                issues: true,
+            }
+        }
+        async fn check_auth(&self) -> ScResult<AuthStatus> {
+            Ok(AuthStatus {
+                authenticated: true,
+                login: Some("octocat".into()),
+                scopes: vec![],
+            })
+        }
+        async fn create_pr(&self, _: &RepoRef, _: NewPullRequest) -> ScResult<PullRequest> {
+            unimplemented!()
+        }
+        async fn get_pr(&self, _: &RepoRef, _: u64) -> ScResult<PullRequest> {
+            Ok(sample_pr())
+        }
+        async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Vec<PullRequest>> {
+            unimplemented!()
+        }
+        async fn update_pr(&self, _: &RepoRef, _: u64, _: PrPatch) -> ScResult<PullRequest> {
+            unimplemented!()
+        }
+        async fn merge_pr(
+            &self,
+            _: &RepoRef,
+            _: u64,
+            _: MergeMethod,
+            _: MergeOptions,
+        ) -> ScResult<MergeOutcome> {
+            unimplemented!()
+        }
+        async fn mergeability(&self, _: &RepoRef, _: u64) -> ScResult<Mergeability> {
+            unimplemented!()
+        }
+        async fn update_branch(&self, _: &RepoRef, _: u64) -> ScResult<()> {
+            unimplemented!()
+        }
+        async fn submit_review(
+            &self,
+            _: &RepoRef,
+            _: u64,
+            _: ReviewVerdict,
+            _: Option<String>,
+        ) -> ScResult<Review> {
+            unimplemented!()
+        }
+        async fn list_reviews(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Review>> {
+            Ok(vec![
+                Review {
+                    author: "alice".into(),
+                    verdict: ReviewVerdict::Approve,
+                    body: None,
+                    submitted_at: "2026-01-01".into(),
+                },
+                Review {
+                    author: "bob".into(),
+                    verdict: ReviewVerdict::Comment,
+                    body: None,
+                    submitted_at: "2026-01-02".into(),
+                },
+            ])
+        }
+        async fn list_comments(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Comment>> {
+            Ok(vec![Comment {
+                id: "1".into(),
+                author: "u".into(),
+                body: "hi".into(),
+                path: None,
+                line: None,
+                created_at: "2026".into(),
+            }])
+        }
+        async fn add_comment(
+            &self,
+            _: &RepoRef,
+            _: u64,
+            _: &str,
+            _: Option<CommentAnchor>,
+        ) -> ScResult<Comment> {
+            unimplemented!()
+        }
+        async fn list_review_comments(&self, _: &RepoRef, _: u64) -> ScResult<Vec<ReviewComment>> {
+            Ok(vec![ReviewComment {
+                id: 5,
+                body: "nit".into(),
+                path: "a.rs".into(),
+                line: Some(1),
+                author: "rev".into(),
+                created_at: "2026".into(),
+                updated_at: "2026".into(),
+                in_reply_to_id: None,
+                url: "url".into(),
+            }])
+        }
+        async fn reply_to_review_comment(
+            &self,
+            _: &RepoRef,
+            _: u64,
+            _: u64,
+            _: &str,
+        ) -> ScResult<ReviewComment> {
+            unimplemented!()
+        }
+        async fn get_review_threads(&self, _: &RepoRef, _: u64) -> ScResult<Vec<ReviewThread>> {
+            if self.fail_threads {
+                return Err(ScError::Api("graphql down".into()));
+            }
+            Ok(vec![
+                ReviewThread {
+                    id: "RT1".into(),
+                    is_resolved: false,
+                    comments: vec![ReviewThreadComment {
+                        id: "c1".into(),
+                        body: "x".into(),
+                        author: "rev".into(),
+                        path: "a.rs".into(),
+                        line: Some(1),
+                        created_at: "2026".into(),
+                    }],
+                },
+                ReviewThread {
+                    id: "RT2".into(),
+                    is_resolved: true,
+                    comments: vec![ReviewThreadComment {
+                        id: "c2".into(),
+                        body: "y".into(),
+                        author: "rev".into(),
+                        path: "b.rs".into(),
+                        line: Some(2),
+                        created_at: "2026".into(),
+                    }],
+                },
+            ])
+        }
+        async fn resolve_thread(&self, _: &str) -> ScResult<bool> {
+            unimplemented!()
+        }
+        async fn unresolve_thread(&self, _: &str) -> ScResult<bool> {
+            unimplemented!()
+        }
+        async fn check_runs(&self, _: &RepoRef, _: &str) -> ScResult<Vec<CheckRun>> {
+            Ok(vec![
+                CheckRun {
+                    name: "build".into(),
+                    state: CheckState::Success,
+                    url: None,
+                },
+                CheckRun {
+                    name: "test".into(),
+                    state: CheckState::Failure,
+                    url: None,
+                },
+                CheckRun {
+                    name: "lint".into(),
+                    state: CheckState::Pending,
+                    url: None,
+                },
+            ])
+        }
+        async fn create_issue(&self, _: &RepoRef, _: &str, _: Option<&str>) -> ScResult<Issue> {
+            unimplemented!()
+        }
+        async fn get_issue(&self, _: &RepoRef, _: u64) -> ScResult<Issue> {
+            unimplemented!()
+        }
+        async fn list_issues(&self, _: &RepoRef, _: IssueQuery) -> ScResult<Vec<Issue>> {
+            unimplemented!()
+        }
+    }
+
+    async fn setup(fail_threads: bool, with_pr: bool) -> (TempDb, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.updated_at = now_iso();
+        if with_pr {
+            ws.repository_owner = Some("o".into());
+            ws.repository_name = Some("r".into());
+            ws.pr_number = Some(42);
+        }
+        store.insert_workspace(&ws).await.expect("ws");
+        let services =
+            Services::new(store).with_source_control(Arc::new(StubForge { fail_threads }));
+        (tmp, services, ws_id)
+    }
+
+    #[tokio::test]
+    async fn status_shape_is_parity_exact() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let v = svc.pr_status(ws).await.expect("status");
+        assert_eq!(v["prNumber"], 42);
+        assert_eq!(v["title"], "Add thing");
+        assert_eq!(v["state"], "open");
+        assert_eq!(v["mergeable"], true);
+        assert_eq!(v["mergeableState"], "clean");
+        assert_eq!(v["hasConflicts"], false);
+        assert_eq!(v["isDraft"], false);
+        assert_eq!(v["summary"], "✅ PR is mergeable with no conflicts.");
+    }
+
+    #[tokio::test]
+    async fn get_reviews_aggregates_and_serializes_verdicts() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let v = svc.pr_get_reviews(ws, None).await.expect("reviews");
+        assert_eq!(v["reviewDecision"], "APPROVED");
+        assert_eq!(v["approvalCount"], 1);
+        assert_eq!(v["changesRequestedCount"], 0);
+        assert_eq!(v["approvedBy"][0], "alice");
+        assert_eq!(v["reviews"].as_array().unwrap().len(), 2);
+        assert_eq!(v["reviews"][0]["verdict"], "approve");
+        assert_eq!(v["reviews"][1]["verdict"], "comment");
+    }
+
+    #[tokio::test]
+    async fn list_check_runs_tallies() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let v = svc.pr_list_check_runs(ws, None).await.expect("checks");
+        assert_eq!(v["total"], 3);
+        assert_eq!(v["passed"], 1);
+        assert_eq!(v["failed"], 1);
+        assert_eq!(v["pending"], 1);
+        assert_eq!(v["runs"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_review_comments_filters_unresolved() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let v = svc
+            .pr_list_review_comments(ws, None, None)
+            .await
+            .expect("review comments");
+        assert_eq!(v["usingFallback"], false);
+        assert_eq!(v["threadCount"], 1);
+        assert_eq!(v["threads"][0]["id"], "RT1");
+        assert_eq!(v["threads"][0]["comments"][0]["author"]["login"], "rev");
+        assert_eq!(v["filter"]["status"], "unresolved");
+    }
+
+    #[tokio::test]
+    async fn list_review_comments_falls_back_to_rest() {
+        let (_t, svc, ws) = setup(true, true).await;
+        let v = svc
+            .pr_list_review_comments(ws, None, None)
+            .await
+            .expect("review comments");
+        assert_eq!(v["usingFallback"], true);
+        assert_eq!(v["threadCount"], 1);
+        assert_eq!(v["threads"][0]["id"], "rest-thread-5");
+        assert!(v["note"].is_string());
+    }
+
+    #[tokio::test]
+    async fn list_comments_returns_count() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let v = svc.pr_list_comments(ws, Some(5)).await.expect("comments");
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["comments"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_active_pr_is_internal_error() {
+        let (_t, svc, ws) = setup(false, false).await;
+        let err = svc.pr_status(ws).await.unwrap_err();
+        assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
+    }
+}
