@@ -1030,6 +1030,7 @@ mod mcp_callback {
 // ============================================================================
 
 mod pr {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
@@ -1042,6 +1043,7 @@ mod pr {
         ReviewThread, ReviewThreadComment, ReviewVerdict, ScCapabilities, SourceControl,
     };
     use intent_store::Store;
+    use serde_json::json;
 
     use super::{workspace, TempDb};
     use crate::Services;
@@ -1099,8 +1101,23 @@ mod pr {
                 scopes: vec![],
             })
         }
-        async fn create_pr(&self, _: &RepoRef, _: NewPullRequest) -> ScResult<PullRequest> {
-            unimplemented!()
+        async fn create_pr(&self, _: &RepoRef, input: NewPullRequest) -> ScResult<PullRequest> {
+            Ok(PullRequest {
+                number: 7,
+                url: "https://github.com/o/r/pull/7".into(),
+                title: input.title,
+                body: input.body,
+                state: PrState::Open,
+                draft: input.draft,
+                source_branch: input.source_branch,
+                target_branch: input.target_branch,
+                author: "octocat".into(),
+                mergeable: Some(true),
+                mergeable_state: Some("clean".into()),
+                head_sha: Some("deadbeef".into()),
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
         }
         async fn get_pr(&self, _: &RepoRef, _: u64) -> ScResult<PullRequest> {
             let mut pr = sample_pr();
@@ -1657,6 +1674,223 @@ mod pr {
         assert_eq!(outcome, crate::PrRefreshOutcome::Skipped);
         let evs = svc.store().events_by_workspace(&ws_id, 10).await.unwrap();
         assert!(evs.is_empty());
+    }
+
+    // ------------------------------------------------------------------------
+    // accept-changes.* orchestration (§5.18): the commit→push→create-PR
+    // pipeline against a real worktree + local bare remote, then mergePR via the
+    // stubbed forge.
+    // ------------------------------------------------------------------------
+
+    /// Drop guard removing a temp directory tree.
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_dir(prefix: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Commit everything in the worktree on the current branch, returning the oid.
+    fn commit_all(repo: &git2::Repository, msg: &str) -> git2::Oid {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .and_then(|o| repo.find_commit(o).ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
+            .unwrap()
+    }
+
+    /// Build a store + a workspace whose worktree is a real git repo on branch
+    /// `feature` with an `origin` bare remote and a linked `o/r` repository.
+    async fn ac_setup(
+        forge: StubForge,
+    ) -> (TempDb, TempDir, TempDir, Services, WorkspaceId, PathBuf) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+
+        let work = unique_dir("intentd-ac-work");
+        let bare = unique_dir("intentd-ac-bare");
+        let mut opts = git2::RepositoryInitOptions::new();
+        opts.initial_head("feature");
+        let repo = git2::Repository::init_opts(&work, &opts).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Tester").unwrap();
+            cfg.set_str("user.email", "t@e.dev").unwrap();
+        }
+        std::fs::write(work.join("README.md"), "init\n").unwrap();
+        commit_all(&repo, "chore: init");
+        git2::Repository::init_bare(&bare).unwrap();
+        repo.remote("origin", bare.to_str().unwrap()).unwrap();
+
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.branch = "feature".into();
+        ws.base_ref = Some("main".into());
+        ws.repository_owner = Some("o".into());
+        ws.repository_name = Some("r".into());
+        ws.worktree_path = Some(work.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.expect("ws");
+
+        let svc = Services::new(store).with_source_control(Arc::new(forge));
+        (tmp, TempDir(work.clone()), TempDir(bare), svc, ws_id, work)
+    }
+
+    #[tokio::test]
+    async fn execute_runs_commit_push_create_pr_pipeline() {
+        let (_t, _w, _b, svc, ws, work) = ac_setup(StubForge::default()).await;
+        // An unstaged change for the commit step to capture.
+        std::fs::write(work.join("feature.txt"), "hello\n").unwrap();
+
+        let params = json!({
+            "action": "commit",
+            "commitMessage": "feat: add feature",
+            "options": {
+                "stageUnstaged": true,
+                "pushAfterCommit": true,
+                "createPRAfterPush": true,
+            },
+        });
+        let res = svc
+            .accept_changes_execute(ws.clone(), params)
+            .await
+            .expect("execute");
+
+        assert_eq!(res["success"], true, "result: {res}");
+        let steps = res["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0]["id"], "commit");
+        assert_eq!(steps[0]["status"], "completed");
+        assert_eq!(steps[1]["id"], "push");
+        assert_eq!(steps[1]["status"], "completed");
+        assert_eq!(steps[2]["id"], "create-pr");
+        assert_eq!(steps[2]["status"], "completed");
+        assert_eq!(res["result"]["commitHash"].as_str().unwrap().len(), 40);
+        assert_eq!(res["result"]["prNumber"], 7);
+        assert!(res["result"]["prUrl"].as_str().unwrap().contains("pull/7"));
+
+        // Linkage persisted.
+        let linked = svc.store().get_workspace(&ws).await.unwrap();
+        assert_eq!(linked.pr_number, Some(7));
+
+        // getStatus reflects the pushed branch + linked PR.
+        let st = svc
+            .accept_changes_get_status(ws.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["branch"], "feature");
+        assert_eq!(st["hasRemote"], true);
+        assert_eq!(st["isPushed"], true);
+        assert_eq!(st["existingPR"]["number"], 7);
+
+        // The bare remote now carries the feature branch.
+        let bare_repo = git2::Repository::open_bare(_b.0.clone()).unwrap();
+        assert!(bare_repo.find_reference("refs/heads/feature").is_ok());
+
+        // mergePR via the stubbed forge.
+        let mg = svc
+            .accept_changes_merge_pr(ws.clone(), 7, Some("squash".into()), None, None)
+            .await
+            .expect("merge");
+        assert_eq!(mg["success"], true);
+        assert_eq!(mg["steps"][0]["id"], "merge");
+        assert_eq!(mg["steps"][0]["status"], "completed");
+        assert_eq!(mg["result"]["mergeCommitHash"], "mergedsha");
+        let merged = svc.store().get_workspace(&ws).await.unwrap();
+        assert_eq!(
+            merged.pr_status,
+            Some(intent_core::PullRequestStatus::Merged)
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_create_pr_without_remote_fails_step() {
+        // A workspace with no git repo at all → push/create-pr cannot proceed.
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(unique_dir("intentd-ac-empty").to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store).with_source_control(Arc::new(StubForge::default()));
+
+        let res = svc
+            .accept_changes_execute(ws_id, json!({ "action": "create-pr" }))
+            .await
+            .expect("execute");
+        assert_eq!(res["success"], false);
+        assert_eq!(res["steps"][0]["id"], "create-pr");
+        assert_eq!(res["steps"][0]["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_unknown_action() {
+        let (_t, _w, _b, svc, ws, _work) = ac_setup(StubForge::default()).await;
+        let err = svc
+            .accept_changes_execute(ws, json!({ "action": "teleport" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    #[tokio::test]
+    async fn prepare_lists_files_and_suggests_message() {
+        let (_t, _w, _b, svc, ws, work) = ac_setup(StubForge::default()).await;
+        std::fs::write(work.join("feature.txt"), "a\nb\n").unwrap();
+
+        let p = svc
+            .accept_changes_prepare(ws, "commit".into(), None)
+            .await
+            .expect("prepare");
+        assert_eq!(p["valid"], true);
+        assert!(p["filesCount"].as_u64().unwrap() >= 1);
+        assert!(p["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "feature.txt"));
+        assert!(p["additions"].as_i64().unwrap() >= 2);
+    }
+
+    #[tokio::test]
+    async fn add_remote_initializes_and_returns_status() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("store");
+        let dir = TempDir(unique_dir("intentd-ac-addremote"));
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.branch = "feature".into();
+        ws.worktree_path = Some(dir.0.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store).with_source_control(Arc::new(StubForge::default()));
+
+        let st = svc
+            .accept_changes_add_remote(ws_id, "https://github.com/o/r.git".into())
+            .await
+            .expect("add remote");
+        assert_eq!(st["hasRemote"], true);
+        assert_eq!(st["owner"], "o");
+        assert_eq!(st["repo"], "r");
+
+        let bad = svc
+            .accept_changes_add_remote(WorkspaceId::new(), "not-a-url".into())
+            .await;
+        assert!(bad.is_err());
     }
 }
 

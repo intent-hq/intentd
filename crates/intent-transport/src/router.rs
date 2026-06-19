@@ -1068,6 +1068,57 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "accept-changes.getStatus" => {
+            let ws = require_ws_note(params)?;
+            let r = api
+                .accept_changes_get_status(ws)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "accept-changes.prepare" => {
+            let ws = require_ws_note(params)?;
+            let action = require_str_param(params, "action")?;
+            let files = opt_str_array(params, "files");
+            let r = api
+                .accept_changes_prepare(ws, action, files)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "accept-changes.execute" => {
+            let ws = require_ws_note(params)?;
+            require_str_param(params, "action")?;
+            let r = api
+                .accept_changes_execute(ws, Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "accept-changes.mergePR" => {
+            let ws = require_ws_note(params)?;
+            let pr_number = params
+                .get("prNumber")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: prNumber"))?;
+            let merge_method = opt_str(params, "mergeMethod");
+            let commit_title = opt_str(params, "commitTitle");
+            let commit_message = opt_str(params, "commitMessage");
+            let r = api
+                .accept_changes_merge_pr(ws, pr_number, merge_method, commit_title, commit_message)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "accept-changes.addRemote" => {
+            let ws = require_ws_note(params)?;
+            let remote_url = require_str_param(params, "remoteUrl")?;
+            let r = api
+                .accept_changes_add_remote(ws, remote_url)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }
