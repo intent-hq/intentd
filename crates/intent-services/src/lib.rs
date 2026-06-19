@@ -3299,8 +3299,8 @@ pub mod mcp_servers {}
 pub mod memories {}
 
 // Code Changes Review modules (§17).
-pub mod file_tracking {}
-pub mod diffs {}
+pub mod diffs;
+pub mod file_tracking;
 pub mod accept_changes {}
 pub mod metrics {}
 
