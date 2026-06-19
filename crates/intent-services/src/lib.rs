@@ -39,6 +39,7 @@ mod agent_ops;
 mod agent_session;
 mod event_ops;
 pub mod events;
+mod git_ops;
 mod note_ops;
 
 #[cfg(test)]
@@ -1999,6 +2000,79 @@ impl WorkspaceApi for Services {
                 ok: true,
                 subscription_id,
             })
+        })
+    }
+
+    // ========================================================================
+    // git.* surface (PROTOCOL §5.6). Worktree resolution + wire policy live in
+    // `git_ops`; the git operations themselves are in `intent-git` (core-only).
+    // ========================================================================
+
+    fn git_status(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<intent_core::GitStatus>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Unknown workspace / remote / non-repo all return the empty status
+            // (the TS `getStatus` fallbacks), never an error.
+            let ws = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(Error::NotFound(_)) => return Ok(intent_git::status::empty_status()),
+                Err(e) => return Err(e),
+            };
+            if ws.is_remote {
+                return Ok(intent_git::status::empty_status());
+            }
+            let Some(path) = git_ops::worktree_path(&ws) else {
+                return Ok(intent_git::status::empty_status());
+            };
+            if !path.join(".git").exists() {
+                return Ok(intent_git::status::empty_status());
+            }
+            intent_git::status::status(&path)
+        })
+    }
+
+    fn git_stage(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: serde_json::Value,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Reject `.`/`*`/`--all` and parse first (TS `ws.git.stage` order).
+            let path_list = git_ops::parse_stage_paths(&paths)?;
+            // All stage failures surface as `-32603` (TS wraps the whole path in
+            // INTERNAL_ERROR), so a missing workspace/worktree is `Internal` too.
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to stage files: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to stage files: workspace has no worktree".to_string())
+            })?;
+            intent_git::stage::stage(&worktree, &path_list)?;
+            Ok(path_list)
+        })
+    }
+
+    fn git_get_branches(
+        &self,
+        repo_path: String,
+        include_remote: bool,
+    ) -> BoxFuture<'_, Result<intent_core::GitBranches>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Validate against known repos (archived included) to prevent
+            // arbitrary filesystem access, matching the TS registry check.
+            let workspaces = store.list_workspaces(true).await?;
+            if !git_ops::is_known_repo(&workspaces, &repo_path) {
+                return Err(Error::InvalidParams(
+                    "Unknown or unauthorized repository path".to_string(),
+                ));
+            }
+            intent_git::branches::get_branches(std::path::Path::new(&repo_path), include_remote)
         })
     }
 
