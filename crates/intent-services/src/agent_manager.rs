@@ -246,7 +246,7 @@ impl BusEventSink {
         };
 
         let change = NewTrackedChange {
-            workspace_id,
+            workspace_id: workspace_id.clone(),
             path: rel_path,
             stage: "unstaged".to_string(),
             status: status.to_string(),
@@ -261,6 +261,12 @@ impl BusEventSink {
         };
         if let Err(e) = crate::file_tracking::track_change(store, change).await {
             tracing::warn!(error = %e, "file-tracking: track_change failed");
+            return;
+        }
+        // Recompute the durable line-change aggregates so the metrics.* reads
+        // (§17.5) reflect this edit. Best-effort: attribution is already recorded.
+        if let Err(e) = crate::metrics::recompute(store, &workspace_id).await {
+            tracing::warn!(error = %e, "metrics: recompute failed");
         }
     }
 }

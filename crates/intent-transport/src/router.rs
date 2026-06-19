@@ -1037,6 +1037,37 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "metrics.getWorkspaceStats" => {
+            let ws = require_ws_note(params)?;
+            let r = api
+                .metrics_get_workspace_stats(ws)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "metrics.getAgentStats" => {
+            let agent_id = require_str_param(params, "agentId")?;
+            let r = api
+                .metrics_get_agent_stats(agent_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "metrics.getAllWorkspaceStats" => {
+            let r = api
+                .metrics_get_all_workspace_stats()
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "metrics.clearAgentStats" => {
+            let agent_id = require_str_param(params, "agentId")?;
+            let r = api
+                .metrics_clear_agent_stats(agent_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }

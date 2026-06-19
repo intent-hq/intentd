@@ -1963,3 +1963,157 @@ mod file_tracking {
         assert!(row["stats"]["additions"].as_i64().unwrap() >= 1);
     }
 }
+
+/// `metrics.*` aggregation (§17.5) over the M4.7 `tracked_changes` table: the
+/// internal recompute fills `workspace_metrics`/`agent_metrics`, and the four
+/// read/clear wire methods project the §5.20 `Metrics` shape.
+mod metrics {
+    use super::*;
+    use intent_store::NewTrackedChange;
+
+    async fn setup() -> (TempDb, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        (tmp, Services::new(store), ws)
+    }
+
+    fn change(
+        ws: &WorkspaceId,
+        path: &str,
+        agent: Option<&str>,
+        additions: i64,
+        deletions: i64,
+    ) -> NewTrackedChange {
+        NewTrackedChange {
+            workspace_id: ws.clone(),
+            path: path.to_string(),
+            stage: "unstaged".to_string(),
+            status: "modified".to_string(),
+            agent_id: agent.map(str::to_string),
+            session_id: None,
+            turn: None,
+            commit_hash: None,
+            old_blob_sha: None,
+            new_blob_sha: None,
+            additions,
+            deletions,
+        }
+    }
+
+    #[tokio::test]
+    async fn recompute_aggregates_by_workspace_and_agent() {
+        let (_t, svc, ws) = setup().await;
+        let store = svc.store();
+        store
+            .upsert_tracked_change(&change(&ws, "a.ts", Some("agent-1"), 100, 10))
+            .await
+            .unwrap();
+        store
+            .upsert_tracked_change(&change(&ws, "b.ts", Some("agent-1"), 40, 2))
+            .await
+            .unwrap();
+        store
+            .upsert_tracked_change(&change(&ws, "c.ts", Some("agent-2"), 7, 1))
+            .await
+            .unwrap();
+        store
+            .upsert_tracked_change(&change(&ws, "d.ts", None, 3, 0))
+            .await
+            .unwrap();
+
+        crate::metrics::recompute(store, &ws).await.unwrap();
+
+        let m = svc.metrics_get_workspace_stats(ws.clone()).await.unwrap();
+        assert_eq!(m["additions"], serde_json::json!(150));
+        assert_eq!(m["deletions"], serde_json::json!(13));
+        assert_eq!(m["filesChanged"], serde_json::json!(4));
+        assert_eq!(m["byAgent"]["agent-1"]["additions"], serde_json::json!(140));
+        assert_eq!(m["byAgent"]["agent-1"]["deletions"], serde_json::json!(12));
+        assert_eq!(
+            m["byAgent"]["agent-1"]["filesChanged"],
+            serde_json::json!(2)
+        );
+        assert_eq!(m["byAgent"]["agent-2"]["additions"], serde_json::json!(7));
+        // Unattributed changes count toward the workspace total but not byAgent.
+        assert!(m["byAgent"].get("").is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_stats_null_when_unknown() {
+        let (_t, svc, _ws) = setup().await;
+        let missing = WorkspaceId::new();
+        let m = svc.metrics_get_workspace_stats(missing).await.unwrap();
+        assert_eq!(m, serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn agent_stats_sum_across_workspaces_and_clear() {
+        let (_t, svc, ws1) = setup().await;
+        let store = svc.store();
+        let ws2 = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws2)).await.unwrap();
+
+        store
+            .upsert_tracked_change(&change(&ws1, "a.ts", Some("agent-1"), 10, 1))
+            .await
+            .unwrap();
+        store
+            .upsert_tracked_change(&change(&ws2, "b.ts", Some("agent-1"), 5, 4))
+            .await
+            .unwrap();
+        crate::metrics::recompute(store, &ws1).await.unwrap();
+        crate::metrics::recompute(store, &ws2).await.unwrap();
+
+        let a = svc
+            .metrics_get_agent_stats("agent-1".to_string())
+            .await
+            .unwrap();
+        assert_eq!(a["additions"], serde_json::json!(15));
+        assert_eq!(a["deletions"], serde_json::json!(5));
+        assert_eq!(a["filesChanged"], serde_json::json!(2));
+        assert!(a.get("byAgent").is_none());
+
+        // getAllWorkspaceStats returns one entry per workspace.
+        let all = svc.metrics_get_all_workspace_stats().await.unwrap();
+        assert_eq!(all[&ws1.0]["additions"], serde_json::json!(10));
+        assert_eq!(all[&ws2.0]["additions"], serde_json::json!(5));
+
+        // clearAgentStats resets the agent's counters across workspaces.
+        let cleared = svc
+            .metrics_clear_agent_stats("agent-1".to_string())
+            .await
+            .unwrap();
+        assert_eq!(cleared, serde_json::json!({ "success": true }));
+        let after = svc
+            .metrics_get_agent_stats("agent-1".to_string())
+            .await
+            .unwrap();
+        assert_eq!(after, serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn recompute_drops_metrics_when_no_changes() {
+        let (_t, svc, ws) = setup().await;
+        let store = svc.store();
+        // Seed a stale aggregate, then recompute with no tracked changes: the
+        // durable rows are cleared so the read returns `null`.
+        store.upsert_workspace_metrics(&ws, 99, 9, 3).await.unwrap();
+        store
+            .upsert_agent_metrics(&ws, "agent-1", 99, 9, 3)
+            .await
+            .unwrap();
+        assert!(store.get_workspace_metrics(&ws).await.unwrap().is_some());
+
+        crate::metrics::recompute(store, &ws).await.unwrap();
+        assert!(store.get_workspace_metrics(&ws).await.unwrap().is_none());
+        assert!(store
+            .list_agent_metrics_for_workspace(&ws)
+            .await
+            .unwrap()
+            .is_empty());
+        let m = svc.metrics_get_workspace_stats(ws).await.unwrap();
+        assert_eq!(m, serde_json::Value::Null);
+    }
+}

@@ -3460,6 +3460,62 @@ impl WorkspaceApi for Services {
             Ok(serde_json::json!({ "ok": true }))
         })
     }
+
+    fn metrics_get_workspace_stats(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let Some(ws) = store.get_workspace_metrics(&workspace_id).await? else {
+                return Ok(serde_json::Value::Null);
+            };
+            let agents = store
+                .list_agent_metrics_for_workspace(&workspace_id)
+                .await?;
+            Ok(crate::metrics::workspace_metrics_value(&ws, &agents))
+        })
+    }
+
+    fn metrics_get_agent_stats(
+        &self,
+        agent_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let rows = store.list_agent_metrics(&agent_id).await?;
+            Ok(crate::metrics::agent_metrics_value(&rows))
+        })
+    }
+
+    fn metrics_get_all_workspace_stats(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let workspaces = store.list_workspace_metrics().await?;
+            let mut out = serde_json::Map::new();
+            for ws in &workspaces {
+                let agents = store
+                    .list_agent_metrics_for_workspace(&ws.workspace_id)
+                    .await?;
+                out.insert(
+                    ws.workspace_id.0.clone(),
+                    crate::metrics::workspace_metrics_value(ws, &agents),
+                );
+            }
+            Ok(serde_json::Value::Object(out))
+        })
+    }
+
+    fn metrics_clear_agent_stats(
+        &self,
+        agent_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            store.delete_agent_metrics(&agent_id).await?;
+            Ok(serde_json::json!({ "success": true }))
+        })
+    }
 }
 
 /// Per-path attribution `(agent_id, session_id, turn)` carried across a
@@ -3560,7 +3616,7 @@ pub mod diffs;
 pub mod file_tracking;
 mod file_tracking_ops;
 pub mod accept_changes {}
-pub mod metrics {}
+pub mod metrics;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage {}

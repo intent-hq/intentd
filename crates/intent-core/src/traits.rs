@@ -1389,6 +1389,58 @@ pub trait WorkspaceApi: Send + Sync {
             ))
         })
     }
+
+    /// `metrics.getWorkspaceStats`: the workspace's line-change `Metrics`
+    /// (`{ additions, deletions, filesChanged, byAgent }`) or `null` (PROTOCOL §5.20).
+    fn metrics_get_workspace_stats(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::metrics_get_workspace_stats not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `metrics.getAgentStats`: one agent's `Metrics` summed across workspaces
+    /// (`{ additions, deletions, filesChanged }`, `byAgent` omitted) or `null` (§5.20).
+    fn metrics_get_agent_stats(
+        &self,
+        agent_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = agent_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::metrics_get_agent_stats not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `metrics.getAllWorkspaceStats`: a `{ [workspaceId]: Metrics }` map across
+    /// every workspace (PROTOCOL §5.20).
+    fn metrics_get_all_workspace_stats(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::metrics_get_all_workspace_stats not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `metrics.clearAgentStats`: reset one agent's counters across workspaces,
+    /// returning `{ success: boolean }` (PROTOCOL §5.20).
+    fn metrics_clear_agent_stats(
+        &self,
+        agent_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = agent_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::metrics_clear_agent_stats not implemented".to_string(),
+            ))
+        })
+    }
 }
 
 /// Context-engine abstraction implemented by `intent-context` (§3.1).
