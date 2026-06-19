@@ -810,6 +810,29 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "git.status" => {
+            let ws = require_ws_note(params)?;
+            let status = api.git_status(ws).await.map_err(domain_to_rpc)?;
+            to_result_value(&status)
+        }
+        "git.stage" => {
+            let ws = require_ws_note(params)?;
+            require_present(params, "paths")?;
+            let paths = params.get("paths").cloned().unwrap_or(Value::Null);
+            let staged = api.git_stage(ws, paths).await.map_err(domain_to_rpc)?;
+            Ok(json!({ "ok": true, "paths": staged }))
+        }
+        "git.getBranches" => {
+            let repo_path = require_str_param(params, "repoPath")?;
+            let include_remote = parse_bool(params, "includeRemote");
+            match api.git_get_branches(repo_path, include_remote).await {
+                Ok(branches) => to_result_value(&branches),
+                // Unknown/unauthorized repo path → -32602 with the TS message
+                // verbatim (no `invalid params:` prefix from `domain_to_rpc`).
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }

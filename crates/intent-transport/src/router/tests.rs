@@ -4,12 +4,12 @@ use intent_core::{
     AuthorType, BoxFuture, Comment, CommentAddResult, CommentAnchor, CommentAnchorType,
     CommentLocation, CommentRespondResult, CommentRespondThread, CommentStatus, CommentType,
     CommentWire, ContentType, Error, Event, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, FileActivity, Note, NoteAddInput, NoteAddResult, NoteCreate,
-    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteId, NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult,
-    NoteVisibility, ReadAssetResult, Result, TaskUpdateResult, Workspace, WorkspaceActivity,
-    WorkspaceApi, WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary, WorkspaceId,
-    WorkspaceStatus, WorkspaceUpdate,
+    EventUnsubscribeResult, FileActivity, FileStatus, GitBranches, GitFileStatus, GitStatus, Note,
+    NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
+    NoteEditLinesResult, NoteEditResult, NoteId, NoteSetContentResult, NoteTaskRow,
+    NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, Result,
+    TaskUpdateResult, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
+    WorkspaceCreate, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use serde_json::Value;
 
@@ -567,6 +567,85 @@ impl WorkspaceApi for FakeApi {
             Ok(EventUnsubscribeResult {
                 ok: true,
                 subscription_id,
+            })
+        })
+    }
+
+    fn git_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<GitStatus>> {
+        Box::pin(async move {
+            if workspace_id.as_str() == "empty" {
+                return Ok(GitStatus {
+                    branch: String::new(),
+                    ahead: 0,
+                    behind: 0,
+                    diverged: false,
+                    files: vec![],
+                    has_uncommitted_changes: false,
+                    has_untracked_files: false,
+                });
+            }
+            Ok(GitStatus {
+                branch: "main".to_string(),
+                ahead: 1,
+                behind: 0,
+                diverged: false,
+                files: vec![FileStatus {
+                    path: "src/a.ts".to_string(),
+                    status: GitFileStatus::Modified,
+                    staged: true,
+                }],
+                has_uncommitted_changes: true,
+                has_untracked_files: false,
+            })
+        })
+    }
+
+    fn git_stage(
+        &self,
+        _workspace_id: WorkspaceId,
+        paths: Value,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        Box::pin(async move {
+            if let Value::String(s) = &paths {
+                if s == "." || s == "*" || s.contains("--all") {
+                    return Err(Error::Internal(
+                        "Staging all files is not allowed.".to_string(),
+                    ));
+                }
+            }
+            let list = match paths {
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+                Value::String(s) => s.split(',').map(|p| p.trim().to_string()).collect(),
+                _ => vec![],
+            };
+            Ok(list)
+        })
+    }
+
+    fn git_get_branches(
+        &self,
+        repo_path: String,
+        include_remote: bool,
+    ) -> BoxFuture<'_, Result<GitBranches>> {
+        Box::pin(async move {
+            if repo_path == "/unknown" {
+                return Err(Error::InvalidParams(
+                    "Unknown or unauthorized repository path".to_string(),
+                ));
+            }
+            Ok(GitBranches {
+                branches: vec!["main".to_string(), "feature".to_string()],
+                remote_branches: if include_remote {
+                    vec!["origin/main".to_string()]
+                } else {
+                    vec![]
+                },
+                current_branch: "feature".to_string(),
+                default_branch: "main".to_string(),
             })
         })
     }
@@ -1207,4 +1286,117 @@ async fn agent_methods_are_routed_not_method_not_found() {
         .await
         .unwrap();
     assert_eq!(err_code(&v), -32603);
+}
+
+#[tokio::test]
+async fn git_status_returns_status_object() {
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"git.status","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(v["result"]["branch"], serde_json::json!("main"));
+    assert_eq!(
+        v["result"]["hasUncommittedChanges"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        v["result"]["files"][0]["path"],
+        serde_json::json!("src/a.ts")
+    );
+    assert_eq!(v["result"]["files"][0]["status"], serde_json::json!("M"));
+    assert_eq!(v["result"]["files"][0]["staged"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn git_status_missing_workspace_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"git.status","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("workspaceId is required")
+    );
+}
+
+#[tokio::test]
+async fn git_stage_returns_ok_and_paths() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.stage","params":{"workspaceId":"ws-1","paths":["src/a.ts","src/b.ts"]}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(
+        v["result"]["paths"],
+        serde_json::json!(["src/a.ts", "src/b.ts"])
+    );
+}
+
+#[tokio::test]
+async fn git_stage_missing_paths_is_minus_32602() {
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"git.stage","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: paths")
+    );
+}
+
+#[tokio::test]
+async fn git_stage_all_is_rejected_with_minus_32603() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.stage","params":{"workspaceId":"ws-1","paths":"."}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+}
+
+#[tokio::test]
+async fn git_get_branches_returns_branch_shape() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.getBranches","params":{"repoPath":"/repo","includeRemote":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["currentBranch"], serde_json::json!("feature"));
+    assert_eq!(v["result"]["defaultBranch"], serde_json::json!("main"));
+    assert_eq!(
+        v["result"]["branches"],
+        serde_json::json!(["main", "feature"])
+    );
+    assert_eq!(
+        v["result"]["remoteBranches"],
+        serde_json::json!(["origin/main"])
+    );
+}
+
+#[tokio::test]
+async fn git_get_branches_missing_repo_path_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"git.getBranches","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: repoPath")
+    );
+}
+
+#[tokio::test]
+async fn git_get_branches_unknown_repo_is_minus_32602_with_message() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.getBranches","params":{"repoPath":"/unknown"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Unknown or unauthorized repository path")
+    );
 }
