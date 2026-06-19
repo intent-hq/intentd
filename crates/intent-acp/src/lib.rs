@@ -9,13 +9,12 @@
 use std::sync::Arc;
 
 use intent_core::WorkspaceApi;
-use intent_providers::ProviderRegistry;
 
-/// ACP client handle. Holds the `WorkspaceApi` callback and the provider
-/// registry, both supplied by the composition root (§6.8).
+/// ACP client handle. Holds the `WorkspaceApi` callback supplied by the
+/// composition root (§6.8). Provider configuration is resolved on demand from
+/// the static `intent_providers` registry (§6.9).
 pub struct AcpClient {
     _workspace: Arc<dyn WorkspaceApi>,
-    _providers: ProviderRegistry,
 }
 
 impl AcpClient {
@@ -23,7 +22,6 @@ impl AcpClient {
     pub fn new(workspace: Arc<dyn WorkspaceApi>) -> Self {
         Self {
             _workspace: workspace,
-            _providers: ProviderRegistry,
         }
     }
 }
