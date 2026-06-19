@@ -885,6 +885,116 @@ pub struct EventQueryParams {
     pub limit: Option<i64>,
 }
 
+/// Agent runtime status (§9.1; `AgentStatus` in `agent.types.ts`). The modern
+/// values are lowercase (`pending`/`active`/`idle`/`error`/`deleted`); the
+/// capitalized variants are legacy values kept so persisted sessions round-trip
+/// without rewriting. Mixed casing means each variant carries an explicit
+/// `rename` rather than a blanket `rename_all`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AgentStatus {
+    #[default]
+    #[serde(rename = "pending")]
+    Pending,
+    #[serde(rename = "active")]
+    Active,
+    /// Lowercase `idle` persisted by app-level runtime events (including Chief).
+    #[serde(rename = "idle")]
+    RuntimeIdle,
+    #[serde(rename = "error")]
+    Error,
+    #[serde(rename = "deleted")]
+    Deleted,
+    /// Legacy capitalized values kept for backward-compatible round-trips.
+    #[serde(rename = "Idle")]
+    Idle,
+    #[serde(rename = "Waiting")]
+    Waiting,
+    #[serde(rename = "Completed")]
+    Completed,
+    #[serde(rename = "Processing")]
+    Processing,
+}
+
+/// Per-session credit/message/tool stats (§9.1 / §19.2). A derived snapshot
+/// populated from `auggie session stats --json`; it is **not** persisted in the
+/// `agent_session` table (the `stats` field is recomputed on demand). Field
+/// names match the TS `SessionStats`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStats {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits_used: Option<f64>,
+    pub message_count: u64,
+    pub tool_count: u64,
+}
+
+/// One row of the append-only agent conversation log (§9.2 `agent_message`).
+/// `seq` is monotonic per agent (enforced by `UNIQUE(agent_id, seq)`); `content`
+/// holds the message's JSON content blocks. Names use camelCase to match the
+/// wire shape returned by `agent.getConversation` (PROTOCOL §5.5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMessage {
+    pub id: String,
+    pub agent_id: AgentId,
+    pub seq: i64,
+    /// `user` | `assistant` | `tool` | `system`.
+    pub role: String,
+    pub content: serde_json::Value,
+    pub created_at: String,
+}
+
+/// Agent runtime session (§9.1). Field names/casing match the TS `AgentSession`
+/// (`agent-session.ts`): `backendSessionId`, `acpSessionId` (write-once after
+/// the provider's `session:created`), `nameExplicitlySet`, `systemPrompt`, etc.
+/// `messages` is the append-only conversation log; `stats` is a derived snapshot
+/// (not persisted, §19.2). `provider` is immutable once set on first real use.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSession {
+    pub id: AgentId,
+    pub workspace_id: WorkspaceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_session_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_session_id: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub name_explicitly_set: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    pub status: AgentStatus,
+    #[serde(default)]
+    pub is_active: bool,
+    #[serde(default)]
+    pub messages: Vec<AgentMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<SessionStats>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Wire input for `agent.delegate` (PROTOCOL §5.5). `workspaceId` is passed
+/// separately; these are the delegation options. Built by the router/MCP
+/// surface; the runtime wiring lands in a later milestone.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AgentDelegateInput {
+    pub task_note_id: Option<NoteId>,
+    pub note_id: Option<NoteId>,
+    pub task_text: Option<String>,
+    pub agent_instructions: Option<String>,
+    pub specialist: Option<String>,
+    pub model: Option<String>,
+    pub behavior_prompt: Option<String>,
+    pub wait_mode: Option<String>,
+    pub skip_auto_commit: Option<bool>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1077,5 +1187,85 @@ mod tests {
                 "status": "done"
             })
         );
+    }
+
+    /// `AgentStatus` keeps the modern lowercase values and the legacy
+    /// capitalized ones distinct, so persisted sessions round-trip unchanged
+    /// (`agent.types.ts`).
+    #[test]
+    fn agent_status_wire_forms_match_ts() {
+        for (variant, wire) in [
+            (AgentStatus::Pending, "\"pending\""),
+            (AgentStatus::Active, "\"active\""),
+            (AgentStatus::RuntimeIdle, "\"idle\""),
+            (AgentStatus::Error, "\"error\""),
+            (AgentStatus::Deleted, "\"deleted\""),
+            (AgentStatus::Idle, "\"Idle\""),
+            (AgentStatus::Waiting, "\"Waiting\""),
+            (AgentStatus::Completed, "\"Completed\""),
+            (AgentStatus::Processing, "\"Processing\""),
+        ] {
+            assert_eq!(serde_json::to_string(&variant).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<AgentStatus>(wire).unwrap(), variant);
+        }
+    }
+
+    /// `AgentSession` serializes to the camelCase `agent-session.ts` wire shape:
+    /// `backendSessionId`/`acpSessionId`/`nameExplicitlySet`/`isActive`/
+    /// `systemPrompt`, with absent optionals omitted and a nested message log.
+    #[test]
+    fn agent_session_camel_case_parity() {
+        let session = AgentSession {
+            id: AgentId::from("agent-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            backend_session_id: Some(AgentId::from("backend-9")),
+            acp_session_id: Some("acp-uuid".to_string()),
+            name: "Builder".to_string(),
+            name_explicitly_set: true,
+            model: Some("opus".to_string()),
+            provider: Some("auggie".to_string()),
+            system_prompt: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![AgentMessage {
+                id: "msg-1".to_string(),
+                agent_id: AgentId::from("agent-1"),
+                seq: 0,
+                role: "user".to_string(),
+                content: json!([{ "type": "text", "text": "hi" }]),
+                created_at: "t0".to_string(),
+            }],
+            stats: None,
+            created_at: "t0".to_string(),
+            updated_at: "t1".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&session).unwrap(),
+            json!({
+                "id": "agent-1",
+                "workspaceId": "ws-1",
+                "backendSessionId": "backend-9",
+                "acpSessionId": "acp-uuid",
+                "name": "Builder",
+                "nameExplicitlySet": true,
+                "model": "opus",
+                "provider": "auggie",
+                "status": "active",
+                "isActive": true,
+                "messages": [{
+                    "id": "msg-1",
+                    "agentId": "agent-1",
+                    "seq": 0,
+                    "role": "user",
+                    "content": [{ "type": "text", "text": "hi" }],
+                    "createdAt": "t0"
+                }],
+                "createdAt": "t0",
+                "updatedAt": "t1"
+            })
+        );
+        let back: AgentSession =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        assert_eq!(back, session);
     }
 }
