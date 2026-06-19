@@ -34,6 +34,18 @@ pub struct CommitRecord {
 /// Read up to `limit` commits of first-parent, non-merge history from `HEAD`,
 /// newest first. An empty repository (unborn `HEAD`) yields an empty list.
 pub fn history(worktree_path: &Path, limit: usize) -> Result<Vec<CommitRecord>> {
+    history_since(worktree_path, None, limit)
+}
+
+/// Like [`history`] but, when `base_ref` resolves, hides it from the walk so the
+/// result is the `base_ref..HEAD` range (the accept-changes `localCommits`:
+/// commits on the branch not yet on trunk). An unresolvable `base_ref` falls back
+/// to the full `HEAD` history.
+pub fn history_since(
+    worktree_path: &Path,
+    base_ref: Option<&str>,
+    limit: usize,
+) -> Result<Vec<CommitRecord>> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     if repo.head().ok().and_then(|h| h.target()).is_none() {
         return Ok(Vec::new());
@@ -44,6 +56,11 @@ pub fn history(worktree_path: &Path, limit: usize) -> Result<Vec<CommitRecord>> 
 
     let mut walk = repo.revwalk().map_err(map_git_err)?;
     walk.push_head().map_err(map_git_err)?;
+    if let Some(base) = base_ref {
+        if let Ok(obj) = repo.revparse_single(base) {
+            let _ = walk.hide(obj.id());
+        }
+    }
     walk.simplify_first_parent().map_err(map_git_err)?;
     walk.set_sorting(Sort::TIME).map_err(map_git_err)?;
 

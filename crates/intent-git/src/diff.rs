@@ -92,6 +92,82 @@ pub fn diff_index_to_workdir(repo_path: &Path) -> Result<Vec<FileDiff>> {
     Ok(out)
 }
 
+/// Per-file summaries for the staged changes (HEAD→index diff), mirroring
+/// `git diff --cached --numstat`. An unborn `HEAD` diffs the index against the
+/// empty tree (every staged file is an addition).
+pub fn diff_head_to_index(repo_path: &Path) -> Result<Vec<FileDiff>> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let head_tree = repo
+        .head()
+        .ok()
+        .and_then(|h| h.target())
+        .and_then(|oid| repo.find_commit(oid).ok())
+        .and_then(|c| c.tree().ok());
+    let index = repo.index().map_err(map_git_err)?;
+    let diff = repo
+        .diff_tree_to_index(head_tree.as_ref(), Some(&index), None)
+        .map_err(map_git_err)?;
+    diff_to_file_summaries(&diff)
+}
+
+/// Per-file summaries for the committed `base_ref...HEAD` range (three-dot:
+/// merge-base of `base_ref` and `HEAD` → `HEAD`), mirroring
+/// `git diff --numstat <base>...<branch>`. Returns an empty vec when `base_ref`
+/// or `HEAD` cannot be resolved.
+pub fn diff_range(repo_path: &Path, base_ref: &str) -> Result<Vec<FileDiff>> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let Some(head_oid) = repo.head().ok().and_then(|h| h.target()) else {
+        return Ok(Vec::new());
+    };
+    let Ok(base_obj) = repo.revparse_single(base_ref) else {
+        return Ok(Vec::new());
+    };
+    let base_tree = match repo.merge_base(base_obj.id(), head_oid) {
+        Ok(mb) => repo.find_commit(mb).ok().and_then(|c| c.tree().ok()),
+        Err(_) => None,
+    };
+    let head_tree = match repo.find_commit(head_oid).ok().and_then(|c| c.tree().ok()) {
+        Some(t) => t,
+        None => return Ok(Vec::new()),
+    };
+    let diff = repo
+        .diff_tree_to_tree(base_tree.as_ref(), Some(&head_tree), None)
+        .map_err(map_git_err)?;
+    diff_to_file_summaries(&diff)
+}
+
+/// Build per-file [`FileDiff`] summaries (path + line stats + blob SHAs) from a
+/// computed [`git2::Diff`].
+fn diff_to_file_summaries(diff: &git2::Diff) -> Result<Vec<FileDiff>> {
+    let mut out = Vec::new();
+    for i in 0..diff.deltas().len() {
+        let delta = diff.get_delta(i).expect("delta index in range");
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let is_binary = delta.flags().is_binary();
+        let (additions, deletions) = match Patch::from_diff(diff, i).map_err(map_git_err)? {
+            Some(patch) => {
+                let (_ctx, adds, dels) = patch.line_stats().map_err(map_git_err)?;
+                (adds, dels)
+            }
+            None => (0, 0),
+        };
+        out.push(FileDiff {
+            path,
+            additions,
+            deletions,
+            is_binary,
+            old_blob: oid_to_opt(delta.old_file().id()),
+            new_blob: oid_to_opt(delta.new_file().id()),
+        });
+    }
+    Ok(out)
+}
+
 /// Lazily compute hunks for a single file from its old/new blob SHAs. A `None`
 /// blob is treated as empty (added/deleted file). Both blobs must exist in the
 /// object DB (committed/staged content); for an unstaged workdir change whose
