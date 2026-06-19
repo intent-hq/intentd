@@ -27,3 +27,4 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 uuid = { workspace = true }
 async-trait = "0.1"
+git2.workspace = true

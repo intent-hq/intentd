@@ -14,11 +14,17 @@ pub use intent_core::{Error, Result};
 
 mod agent_repo;
 mod comment_repo;
+mod diffs_repo;
 mod event_repo;
+mod metrics_repo;
 mod note_repo;
+mod tracked_changes_repo;
 mod workspace_repo;
 
+pub use diffs_repo::{DiffRow, NewDiff};
 pub use event_repo::{EventQuery, NewEvent};
+pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
+pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
 
 #[cfg(test)]
 mod tests;

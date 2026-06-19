@@ -7,13 +7,14 @@
 //! `note.list`) over `intent-store`.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use base64::Engine as _;
 use intent_core::events::{
-    COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED,
-    TASK_STATUS_CHANGED, WORKSPACE_ATTENTION_CHANGED,
+    CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED,
+    NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED,
 };
 use intent_core::{
     iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId, AgentLite,
@@ -85,6 +86,10 @@ pub struct Services {
     /// composition root or a test; when unset, the `pr.*` handlers build the
     /// provider from default settings (token from env / `gh` / keychain).
     source_control: Option<Arc<dyn intent_sourcecontrol::SourceControl>>,
+    /// Per-worktree async locks (`withGitWorktreeLock` parity, §9.5) so the
+    /// `accept-changes.execute` commit/push path never races concurrent agents
+    /// or operations on the same worktree.
+    worktree_locks: intent_git::worktree::WorktreeLocks,
 }
 
 impl Services {
@@ -98,6 +103,7 @@ impl Services {
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
+            worktree_locks: intent_git::worktree::WorktreeLocks::new(),
         }
     }
 
@@ -558,6 +564,45 @@ fn pr_unlinked_event(workspace_id: &WorkspaceId) -> NewEvent {
         correlation_id: None,
         parent_event_id: None,
         data: serde_json::json!({ "workspaceId": workspace_id.as_str() }),
+    }
+}
+
+/// Build a `changes:git-status` event carrying the refreshed `WorkspaceGitStatus`
+/// (§5.18, §6.5). Self-sufficient payload `{ workspaceId, status }`.
+fn changes_git_status_event(workspace_id: &WorkspaceId, status: serde_json::Value) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: CHANGES_GIT_STATUS.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "status": status,
+        }),
+    }
+}
+
+/// Build a `changes:metrics-changed` event carrying the recomputed workspace
+/// `Metrics` (§5.20, §6.5). Self-sufficient payload `{ workspaceId, metrics }`.
+fn changes_metrics_changed_event(
+    workspace_id: &WorkspaceId,
+    metrics: serde_json::Value,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: CHANGES_METRICS_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "metrics": metrics,
+        }),
     }
 }
 
@@ -3223,6 +3268,948 @@ impl WorkspaceApi for Services {
             }))
         })
     }
+
+    fn file_tracking_init(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // Tracking is attached at workspace-open / agent-edit time (§17.1); the
+        // wire init is a no-op acknowledgement, matching the TS handler.
+        let _ = workspace_id;
+        Box::pin(async { Ok(serde_json::json!({ "ok": true })) })
+    }
+
+    fn file_tracking_sync(
+        &self,
+        workspace_id: WorkspaceId,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // `force` is accepted for wire parity; reconciliation is idempotent.
+            let _ = force;
+            let synced = serde_json::json!({ "success": true, "synced": true });
+            let ws = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(_) => return Ok(synced),
+            };
+            if ws.is_remote {
+                return Ok(synced);
+            }
+            let Some(worktree) = git_ops::worktree_path(&ws) else {
+                return Ok(synced);
+            };
+            if !worktree.join(".git").exists() {
+                return Ok(synced);
+            }
+            // Preserve existing attribution per path while reconciling the
+            // unstaged worktree changes against live git (§17.4).
+            let existing = store
+                .list_tracked_changes(&workspace_id)
+                .await
+                .unwrap_or_default();
+            let mut attribution: AttributionByPath = HashMap::new();
+            for row in &existing {
+                attribution.insert(
+                    row.path.clone(),
+                    (row.agent_id.clone(), row.session_id.clone(), row.turn),
+                );
+            }
+            let files = intent_git::diff::diff_index_to_workdir(&worktree)?;
+            for fd in files {
+                let summary = crate::diffs::compute_and_store(
+                    &store,
+                    &worktree,
+                    &workspace_id,
+                    &fd.path,
+                    false,
+                )
+                .await
+                .ok()
+                .flatten();
+                let status = if fd.old_blob.is_none() {
+                    "added"
+                } else if fd.new_blob.is_none() {
+                    "deleted"
+                } else {
+                    "modified"
+                };
+                let (agent_id, session_id, turn) = attribution
+                    .get(&fd.path)
+                    .cloned()
+                    .unwrap_or((None, None, None));
+                let change = intent_store::NewTrackedChange {
+                    workspace_id: workspace_id.clone(),
+                    path: fd.path.clone(),
+                    stage: "unstaged".to_string(),
+                    status: status.to_string(),
+                    agent_id,
+                    session_id,
+                    turn,
+                    commit_hash: None,
+                    old_blob_sha: summary.as_ref().and_then(|s| s.old_blob_sha.clone()),
+                    new_blob_sha: summary.as_ref().and_then(|s| s.new_blob_sha.clone()),
+                    additions: summary.as_ref().map(|s| s.additions).unwrap_or(0),
+                    deletions: summary.as_ref().map(|s| s.deletions).unwrap_or(0),
+                };
+                crate::file_tracking::track_change(&store, change).await?;
+            }
+            Ok(synced)
+        })
+    }
+
+    fn file_tracking_load(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let worktree = ft_worktree(&store, &workspace_id).await;
+            let rows = match store.list_tracked_changes(&workspace_id).await {
+                Ok(r) => r,
+                Err(_) => return Ok(empty_changes_result()),
+            };
+            Ok(file_tracking_ops::build_changes_result(
+                rows,
+                worktree.as_deref(),
+                &file_tracking_ops::ChangeFilterParsed::default(),
+            ))
+        })
+    }
+
+    fn file_tracking_get_changes(
+        &self,
+        workspace_id: WorkspaceId,
+        filter: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let parsed = file_tracking_ops::parse_filter(filter.as_ref());
+            let worktree = ft_worktree(&store, &workspace_id).await;
+            let rows = match store.list_tracked_changes(&workspace_id).await {
+                Ok(r) => r,
+                Err(_) => return Ok(empty_changes_result()),
+            };
+            Ok(file_tracking_ops::build_changes_result(
+                rows,
+                worktree.as_deref(),
+                &parsed,
+            ))
+        })
+    }
+
+    fn file_tracking_load_commits(
+        &self,
+        workspace_id: WorkspaceId,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Default 50 (TS), clamp to the PROTOCOL §5.19 cap of 200.
+            let limit = limit.unwrap_or(50).clamp(0, 200) as usize;
+            let empty = serde_json::json!({ "commits": [] });
+            let ws = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(_) => return Ok(empty),
+            };
+            if ws.is_remote {
+                return Ok(empty);
+            }
+            let Some(worktree) = git_ops::worktree_path(&ws) else {
+                return Ok(empty);
+            };
+            if !worktree.join(".git").exists() {
+                return Ok(empty);
+            }
+            let commits = intent_git::history::history(&worktree, limit)?;
+            let values: Vec<serde_json::Value> = commits
+                .iter()
+                .map(file_tracking_ops::commit_to_value)
+                .collect();
+            Ok(serde_json::json!({ "commits": values }))
+        })
+    }
+
+    fn file_tracking_get_line_stats(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let rows = store
+                .list_tracked_changes(&workspace_id)
+                .await
+                .unwrap_or_default();
+            let mut additions = 0i64;
+            let mut deletions = 0i64;
+            for row in &rows {
+                additions += row.additions;
+                deletions += row.deletions;
+            }
+            Ok(serde_json::json!({ "additions": additions, "deletions": deletions }))
+        })
+    }
+
+    fn file_tracking_stage(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let path_list = file_tracking_ops::parse_paths(&paths)?;
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to stage files: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to stage files: workspace has no worktree".to_string())
+            })?;
+            intent_git::stage::stage(&worktree, &path_list)?;
+            // Preserve attribution: move each file's audit row unstaged → staged.
+            for raw in &path_list {
+                let rel = file_tracking_ops::worktree_relative(&worktree, raw);
+                let key = crate::file_tracking::normalize_path(&rel);
+                store
+                    .set_tracked_change_stage(&workspace_id, &key, "unstaged", "staged")
+                    .await?;
+            }
+            Ok(serde_json::json!({ "ok": true }))
+        })
+    }
+
+    fn file_tracking_unstage(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let path_list = file_tracking_ops::parse_paths(&paths)?;
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to unstage files: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to unstage files: workspace has no worktree".to_string())
+            })?;
+            intent_git::stage::unstage(&worktree, &path_list)?;
+            // Preserve attribution: move each file's audit row staged → unstaged.
+            for raw in &path_list {
+                let rel = file_tracking_ops::worktree_relative(&worktree, raw);
+                let key = crate::file_tracking::normalize_path(&rel);
+                store
+                    .set_tracked_change_stage(&workspace_id, &key, "staged", "unstaged")
+                    .await?;
+            }
+            Ok(serde_json::json!({ "ok": true }))
+        })
+    }
+
+    fn metrics_get_workspace_stats(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let Some(ws) = store.get_workspace_metrics(&workspace_id).await? else {
+                return Ok(serde_json::Value::Null);
+            };
+            let agents = store
+                .list_agent_metrics_for_workspace(&workspace_id)
+                .await?;
+            Ok(crate::metrics::workspace_metrics_value(&ws, &agents))
+        })
+    }
+
+    fn metrics_get_agent_stats(
+        &self,
+        agent_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let rows = store.list_agent_metrics(&agent_id).await?;
+            Ok(crate::metrics::agent_metrics_value(&rows))
+        })
+    }
+
+    fn metrics_get_all_workspace_stats(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let workspaces = store.list_workspace_metrics().await?;
+            let mut out = serde_json::Map::new();
+            for ws in &workspaces {
+                let agents = store
+                    .list_agent_metrics_for_workspace(&ws.workspace_id)
+                    .await?;
+                out.insert(
+                    ws.workspace_id.0.clone(),
+                    crate::metrics::workspace_metrics_value(ws, &agents),
+                );
+            }
+            Ok(serde_json::Value::Object(out))
+        })
+    }
+
+    fn metrics_clear_agent_stats(
+        &self,
+        agent_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            store.delete_agent_metrics(&agent_id).await?;
+            Ok(serde_json::json!({ "success": true }))
+        })
+    }
+
+    // ========================================================================
+    // accept-changes.* — commit→push→PR→merge orchestration (PROTOCOL §5.18).
+    // ========================================================================
+
+    fn accept_changes_get_status(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.ac_get_status(workspace_id).await })
+    }
+
+    fn accept_changes_prepare(
+        &self,
+        workspace_id: WorkspaceId,
+        action: String,
+        files: Option<Vec<String>>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.ac_prepare(workspace_id, action, files).await })
+    }
+
+    fn accept_changes_execute(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.ac_execute(workspace_id, params).await })
+    }
+
+    fn accept_changes_merge_pr(
+        &self,
+        workspace_id: WorkspaceId,
+        pr_number: u64,
+        merge_method: Option<String>,
+        commit_title: Option<String>,
+        commit_message: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
+        Box::pin(async move {
+            svc.ac_merge_pr(
+                workspace_id,
+                pr_number,
+                merge_method,
+                commit_title,
+                commit_message,
+            )
+            .await
+        })
+    }
+
+    fn accept_changes_add_remote(
+        &self,
+        workspace_id: WorkspaceId,
+        remote_url: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.ac_add_remote(workspace_id, remote_url).await })
+    }
+}
+
+/// Orchestration backing the `accept-changes.*` methods (§5.18). Kept on
+/// `Services` (not the trait) so the steps can share `self.store` /
+/// `self.source_control` / `self.event_bus` / `self.worktree_locks` and reuse the
+/// `pr_ops` / `accept_changes` glue.
+impl Services {
+    /// `accept-changes.getStatus`: the `WorkspaceGitStatus` for the panel.
+    async fn ac_get_status(&self, workspace_id: WorkspaceId) -> Result<serde_json::Value> {
+        let ws = self.store.get_workspace(&workspace_id).await.map_err(|_| {
+            Error::Internal(format!("Workspace not found: {}", workspace_id.as_str()))
+        })?;
+        let trunk = accept_changes::trunk_branch(&ws);
+        if ws.is_remote {
+            return Ok(accept_changes::minimal_status_value(&ws, &trunk));
+        }
+        match git_ops::worktree_path(&ws) {
+            Some(worktree) => accept_changes::build_git_status_value(&worktree, &ws),
+            None => Ok(accept_changes::minimal_status_value(&ws, &trunk)),
+        }
+    }
+
+    /// `accept-changes.prepare`: validate + suggest (PrepareResult).
+    async fn ac_prepare(
+        &self,
+        workspace_id: WorkspaceId,
+        action: String,
+        files: Option<Vec<String>>,
+    ) -> Result<serde_json::Value> {
+        accept_changes::validate_action(&action)?;
+        let ws = match self.store.get_workspace(&workspace_id).await {
+            Ok(w) => w,
+            Err(_) => return Ok(accept_changes::prepare_invalid("Workspace not found")),
+        };
+        let Some(worktree) = git_ops::worktree_path(&ws) else {
+            return Ok(accept_changes::prepare_invalid("Workspace has no path"));
+        };
+        accept_changes::build_prepare_value(&worktree, &ws, &action, files.as_deref())
+    }
+
+    /// `accept-changes.execute`: dispatch the action under the worktree lock.
+    async fn ac_execute(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let action_raw = params
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                Error::InvalidParams("Missing required parameter: action".to_string())
+            })?;
+        let action = accept_changes::validate_action(action_raw)?;
+
+        let files = json_str_array(params.get("files"));
+        let commit_message = json_opt_str(params.get("commitMessage"));
+        let pr_title = json_opt_str(params.get("prTitle"));
+        let pr_body = json_opt_str(params.get("prBody"));
+        let target_branch = json_opt_str(params.get("targetBranch"));
+        let options = params.get("options");
+        let stage_unstaged = json_opt_bool(options, "stageUnstaged");
+        let push_after = json_opt_bool(options, "pushAfterCommit");
+        let create_pr_after = json_opt_bool(options, "createPRAfterPush");
+
+        let ws = self.store.get_workspace(&workspace_id).await.map_err(|_| {
+            Error::Internal(format!("Workspace not found: {}", workspace_id.as_str()))
+        })?;
+        if ws.is_remote {
+            let msg = "remote workspaces are not supported by intentd yet";
+            let step = accept_changes::step(action, "Execute", "failed", None, Some(msg));
+            return Ok(accept_changes::accept_result(
+                false,
+                vec![step],
+                None,
+                Some(msg.to_string()),
+            ));
+        }
+        let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+            Error::Internal(format!("Workspace has no path: {}", workspace_id.as_str()))
+        })?;
+        let branch = ws.branch.clone();
+
+        let locks = self.worktree_locks.clone();
+        locks
+            .with_lock(&worktree, || async {
+                self.ac_run_pipeline(
+                    &workspace_id,
+                    &worktree,
+                    &branch,
+                    action,
+                    files,
+                    commit_message,
+                    pr_title,
+                    pr_body,
+                    target_branch,
+                    stage_unstaged,
+                    push_after,
+                    create_pr_after,
+                )
+                .await
+            })
+            .await
+    }
+
+    /// Run the requested action's step sequence, accumulating per-step status.
+    /// A failing step short-circuits with `success:false`; on success the
+    /// recomputed metrics + refreshed git-status are emitted.
+    #[allow(clippy::too_many_arguments)]
+    async fn ac_run_pipeline(
+        &self,
+        workspace_id: &WorkspaceId,
+        worktree: &Path,
+        branch: &str,
+        action: &str,
+        files: Option<Vec<String>>,
+        commit_message: Option<String>,
+        pr_title: Option<String>,
+        pr_body: Option<String>,
+        target_branch: Option<String>,
+        stage_unstaged: bool,
+        push_after: bool,
+        create_pr_after: bool,
+    ) -> Result<serde_json::Value> {
+        let mut steps: Vec<serde_json::Value> = Vec::new();
+        let mut result = serde_json::Map::new();
+
+        match action {
+            "commit" => {
+                match self
+                    .ac_commit(
+                        workspace_id,
+                        worktree,
+                        commit_message,
+                        files,
+                        stage_unstaged,
+                    )
+                    .await
+                {
+                    Ok(hash) => {
+                        let short = &hash[..hash.len().min(7)];
+                        steps.push(accept_changes::step(
+                            "commit",
+                            "Commit changes",
+                            "completed",
+                            Some(&format!("Committed {short}")),
+                            None,
+                        ));
+                        result.insert("commitHash".to_string(), serde_json::json!(hash));
+                    }
+                    Err(e) => return Ok(fail_step("commit", "Commit changes", steps, result, e)),
+                }
+                if push_after {
+                    match self.ac_push(workspace_id, worktree, branch).await {
+                        Ok(sha) => {
+                            steps.push(accept_changes::step(
+                                "push",
+                                "Push to remote",
+                                "completed",
+                                None,
+                                None,
+                            ));
+                            result.insert("pushedSha".to_string(), serde_json::json!(sha));
+                        }
+                        Err(e) => return Ok(fail_step("push", "Push to remote", steps, result, e)),
+                    }
+                }
+                if create_pr_after {
+                    match self
+                        .ac_create_pr(workspace_id, worktree, pr_title, pr_body, target_branch)
+                        .await
+                    {
+                        Ok((num, url)) => {
+                            steps.push(accept_changes::step(
+                                "create-pr",
+                                "Create pull request",
+                                "completed",
+                                None,
+                                None,
+                            ));
+                            result.insert("prNumber".to_string(), serde_json::json!(num));
+                            result.insert("prUrl".to_string(), serde_json::json!(url));
+                        }
+                        Err(e) => {
+                            return Ok(fail_step(
+                                "create-pr",
+                                "Create pull request",
+                                steps,
+                                result,
+                                e,
+                            ))
+                        }
+                    }
+                }
+            }
+            "push" => match self.ac_push(workspace_id, worktree, branch).await {
+                Ok(sha) => {
+                    steps.push(accept_changes::step(
+                        "push",
+                        "Push to remote",
+                        "completed",
+                        None,
+                        None,
+                    ));
+                    result.insert("pushedSha".to_string(), serde_json::json!(sha));
+                }
+                Err(e) => return Ok(fail_step("push", "Push to remote", steps, result, e)),
+            },
+            "create-pr" => {
+                match self
+                    .ac_create_pr(workspace_id, worktree, pr_title, pr_body, target_branch)
+                    .await
+                {
+                    Ok((num, url)) => {
+                        steps.push(accept_changes::step(
+                            "create-pr",
+                            "Create pull request",
+                            "completed",
+                            None,
+                            None,
+                        ));
+                        result.insert("prNumber".to_string(), serde_json::json!(num));
+                        result.insert("prUrl".to_string(), serde_json::json!(url));
+                    }
+                    Err(e) => {
+                        return Ok(fail_step(
+                            "create-pr",
+                            "Create pull request",
+                            steps,
+                            result,
+                            e,
+                        ))
+                    }
+                }
+            }
+            other => {
+                // The TS local-trunk-merge / export / undo / reset / rebase paths
+                // depend on libgit2 merge/rebase/fetch + remote RPC not yet ported
+                // (the PR-merge step is `accept-changes.mergePR`).
+                let msg = format!("the '{other}' action is not supported by intentd yet");
+                steps.push(accept_changes::step(
+                    other,
+                    "Execute",
+                    "failed",
+                    None,
+                    Some(&msg),
+                ));
+                return Ok(accept_changes::accept_result(false, steps, None, Some(msg)));
+            }
+        }
+
+        self.ac_emit_after_mutation(workspace_id, worktree).await;
+        let result = if result.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(result))
+        };
+        Ok(accept_changes::accept_result(true, steps, result, None))
+    }
+
+    /// Stage (optionally) then commit, restoring attribution (staged/unstaged →
+    /// committed) for the committed files. Returns the new commit SHA.
+    async fn ac_commit(
+        &self,
+        workspace_id: &WorkspaceId,
+        worktree: &Path,
+        message: Option<String>,
+        files: Option<Vec<String>>,
+        stage_unstaged: bool,
+    ) -> Result<String> {
+        // accept-changes is a user-initiated action → bypass the auto-commit gate.
+        git_ops::assert_agent_commit_allowed(true)?;
+        let message = message
+            .filter(|m| !m.trim().is_empty())
+            .ok_or_else(|| Error::Internal("Commit message is required".to_string()))?;
+
+        let to_stage = match files {
+            Some(f) if !f.is_empty() => f,
+            _ if stage_unstaged => intent_git::commit::all_changed_paths(worktree)?,
+            _ => Vec::new(),
+        };
+        if !to_stage.is_empty() {
+            intent_git::stage::stage(worktree, &to_stage)?;
+        }
+        let outcome = intent_git::commit::commit(worktree, &message)?;
+
+        for path in &outcome.files {
+            let key = crate::file_tracking::normalize_path(path);
+            let _ = self
+                .store
+                .set_tracked_change_stage(workspace_id, &key, "staged", "committed")
+                .await;
+            let _ = self
+                .store
+                .set_tracked_change_stage(workspace_id, &key, "unstaged", "committed")
+                .await;
+        }
+        Ok(outcome.hash)
+    }
+
+    /// Push the branch to `origin`, restoring attribution (committed → pushed).
+    async fn ac_push(
+        &self,
+        workspace_id: &WorkspaceId,
+        worktree: &Path,
+        branch: &str,
+    ) -> Result<String> {
+        if intent_git::remote::origin_url(worktree)?.is_none() {
+            return Err(Error::Internal(
+                "No remote configured for this repository".to_string(),
+            ));
+        }
+        let outcome = intent_git::push::push(worktree, "origin", branch, false)?;
+        self.ac_move_stage(workspace_id, "committed", "pushed")
+            .await;
+        Ok(outcome.pushed_sha)
+    }
+
+    /// Create a PR via the forge (reusing an existing link), persist the linkage,
+    /// emit `pr:linked`, and restore attribution (pushed → pull_request).
+    async fn ac_create_pr(
+        &self,
+        workspace_id: &WorkspaceId,
+        worktree: &Path,
+        title: Option<String>,
+        body: Option<String>,
+        target: Option<String>,
+    ) -> Result<(u64, String)> {
+        let mut ws = self.store.get_workspace(workspace_id).await?;
+        // An already-linked PR is reused (idempotent create).
+        if let Some(number) = ws.pr_number {
+            return Ok((number, ws.pr_url.clone().unwrap_or_default()));
+        }
+        let (owner, repo) = pr_ops::repo_of(&ws)
+            .map_err(|_| Error::Internal("No remote configured for this repository".to_string()))?;
+        let sc = pr_ops::resolve_source_control(self.source_control.clone())?;
+        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+
+        let branch = ws.branch.clone();
+        let target_branch = target
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| accept_changes::trunk_branch(&ws));
+        let title = title
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| branch.clone());
+        let input = intent_sourcecontrol::NewPullRequest {
+            title,
+            body,
+            source_branch: branch,
+            target_branch,
+            draft: false,
+        };
+        let pr = sc
+            .create_pr(&repo_ref, input)
+            .await
+            .map_err(pr_ops::map_sc_err)?;
+
+        let info = pr_ops::build_pr_info(&pr);
+        ws.pr_number = Some(pr.number);
+        ws.pr_url = Some(pr.url.clone());
+        ws.pr_status = Some(info.status);
+        ws.active_pull_request = Some(info);
+        ws.updated_at = now_iso();
+        self.store.update_workspace(&ws).await?;
+        publish_event(&self.event_bus, pr_linked_event(&ws)).await;
+
+        let _ = worktree; // attribution move below is workspace-scoped.
+        self.ac_move_stage(workspace_id, "pushed", "pull_request")
+            .await;
+        Ok((pr.number, pr.url))
+    }
+
+    /// `accept-changes.mergePR`: merge the linked PR via the forge.
+    async fn ac_merge_pr(
+        &self,
+        workspace_id: WorkspaceId,
+        pr_number: u64,
+        merge_method: Option<String>,
+        commit_title: Option<String>,
+        commit_message: Option<String>,
+    ) -> Result<serde_json::Value> {
+        let method = pr_ops::validate_merge_method(merge_method)?;
+        let mut ws = self.store.get_workspace(&workspace_id).await.map_err(|_| {
+            Error::Internal(format!("Workspace not found: {}", workspace_id.as_str()))
+        })?;
+        let (owner, repo) = pr_ops::repo_of(&ws)?;
+        let sc = pr_ops::resolve_source_control(self.source_control.clone())?;
+        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+        let options = intent_sourcecontrol::MergeOptions {
+            commit_title,
+            commit_message,
+        };
+        match sc.merge_pr(&repo_ref, pr_number, method, options).await {
+            Ok(outcome) => {
+                ws.pr_status = Some(intent_core::PullRequestStatus::Merged);
+                if let Some(info) = ws.active_pull_request.as_mut() {
+                    info.status = intent_core::PullRequestStatus::Merged;
+                }
+                ws.updated_at = now_iso();
+                let _ = self.store.update_workspace(&ws).await;
+                publish_event(&self.event_bus, pr_updated_event(&ws)).await;
+                self.ac_move_stage(&workspace_id, "pull_request", "merged")
+                    .await;
+                let step = accept_changes::step(
+                    "merge",
+                    "Merge PR",
+                    "completed",
+                    Some(&outcome.message),
+                    None,
+                );
+                let result = serde_json::json!({
+                    "prNumber": pr_number,
+                    "mergeCommitHash": outcome.sha,
+                });
+                Ok(accept_changes::accept_result(
+                    true,
+                    vec![step],
+                    Some(result),
+                    None,
+                ))
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let step = accept_changes::step("merge", "Merge PR", "failed", None, Some(&msg));
+                Ok(accept_changes::accept_result(
+                    false,
+                    vec![step],
+                    None,
+                    Some(msg),
+                ))
+            }
+        }
+    }
+
+    /// `accept-changes.addRemote`: add (and, if needed, init) `origin`, then
+    /// return + broadcast the refreshed `WorkspaceGitStatus`.
+    async fn ac_add_remote(
+        &self,
+        workspace_id: WorkspaceId,
+        remote_url: String,
+    ) -> Result<serde_json::Value> {
+        let ws = self.store.get_workspace(&workspace_id).await.map_err(|_| {
+            Error::Internal(format!("Workspace not found: {}", workspace_id.as_str()))
+        })?;
+        let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+            Error::Internal(format!("Workspace has no path: {}", workspace_id.as_str()))
+        })?;
+        let trimmed = remote_url.trim();
+        if trimmed.is_empty() {
+            return Err(Error::Internal("Remote URL cannot be empty".to_string()));
+        }
+        if !accept_changes::is_valid_git_remote_url(trimmed) {
+            return Err(Error::Internal(
+                "Invalid remote URL. Accepted formats: https://, http://, git@host:path, ssh://, or git://"
+                    .to_string(),
+            ));
+        }
+        let desired = if ws.branch.is_empty() {
+            "main".to_string()
+        } else {
+            ws.branch.clone()
+        };
+        intent_git::remote::add_origin(&worktree, trimmed, &desired)?;
+
+        let status = accept_changes::build_git_status_value(&worktree, &ws)?;
+        publish_event(
+            &self.event_bus,
+            changes_git_status_event(&workspace_id, status.clone()),
+        )
+        .await;
+        Ok(status)
+    }
+
+    /// Move every distinct tracked-change path for the workspace from `from`
+    /// stage to `to` stage (attribution restore across a git stage transition).
+    async fn ac_move_stage(&self, workspace_id: &WorkspaceId, from: &str, to: &str) {
+        let rows = self
+            .store
+            .list_tracked_changes(workspace_id)
+            .await
+            .unwrap_or_default();
+        let mut seen = HashSet::new();
+        for row in rows {
+            if row.stage == from && seen.insert(row.path.clone()) {
+                let _ = self
+                    .store
+                    .set_tracked_change_stage(workspace_id, &row.path, from, to)
+                    .await;
+            }
+        }
+    }
+
+    /// Recompute the workspace metrics and broadcast `changes:metrics-changed` +
+    /// `changes:git-status` after a mutating accept-changes step.
+    async fn ac_emit_after_mutation(&self, workspace_id: &WorkspaceId, worktree: &Path) {
+        if let Err(e) = crate::metrics::recompute(&self.store, workspace_id).await {
+            tracing::warn!(error = %e, "accept-changes: metrics recompute failed");
+        }
+        let metrics = match self.store.get_workspace_metrics(workspace_id).await {
+            Ok(Some(ws)) => {
+                let agents = self
+                    .store
+                    .list_agent_metrics_for_workspace(workspace_id)
+                    .await
+                    .unwrap_or_default();
+                crate::metrics::workspace_metrics_value(&ws, &agents)
+            }
+            _ => serde_json::Value::Null,
+        };
+        publish_event(
+            &self.event_bus,
+            changes_metrics_changed_event(workspace_id, metrics),
+        )
+        .await;
+
+        if let Ok(ws) = self.store.get_workspace(workspace_id).await {
+            if let Ok(status) = accept_changes::build_git_status_value(worktree, &ws) {
+                publish_event(
+                    &self.event_bus,
+                    changes_git_status_event(workspace_id, status),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// Build an `AcceptChangesResult` for a failed step: appends the failed step,
+/// returns `success:false` with the error both on the step and at top level.
+fn fail_step(
+    id: &str,
+    name: &str,
+    mut steps: Vec<serde_json::Value>,
+    result: serde_json::Map<String, serde_json::Value>,
+    error: Error,
+) -> serde_json::Value {
+    let msg = error.to_string();
+    steps.push(accept_changes::step(id, name, "failed", None, Some(&msg)));
+    let result = if result.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(result))
+    };
+    accept_changes::accept_result(false, steps, result, Some(msg))
+}
+
+/// Parse an optional JSON string-array param into `Vec<String>` (non-strings
+/// skipped); absent/null/non-array → `None`.
+fn json_str_array(value: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    value.and_then(|v| v.as_array()).map(|items| {
+        items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+/// Parse an optional JSON string param (absent/null/non-string → `None`).
+fn json_opt_str(value: Option<&serde_json::Value>) -> Option<String> {
+    value.and_then(|v| v.as_str()).map(str::to_string)
+}
+
+/// Read a boolean flag from an `options` object (absent/non-bool → `false`).
+fn json_opt_bool(options: Option<&serde_json::Value>, key: &str) -> bool {
+    options
+        .and_then(|o| o.get(key))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Per-path attribution `(agent_id, session_id, turn)` carried across a
+/// `file-tracking.sync` reconcile so reconciled rows keep their provenance.
+type AttributionByPath = HashMap<String, (Option<String>, Option<String>, Option<i64>)>;
+
+/// Resolve a workspace's worktree path for the `file-tracking.*` reads (used to
+/// render the absolute `TrackedChange.file`). `None` for a missing/remote/
+/// pathless workspace — the reads still return their persisted rows.
+async fn ft_worktree(store: &Store, workspace_id: &WorkspaceId) -> Option<PathBuf> {
+    let ws = store.get_workspace(workspace_id).await.ok()?;
+    if ws.is_remote {
+        return None;
+    }
+    git_ops::worktree_path(&ws)
+}
+
+/// The empty `file-tracking.load`/`getChanges` result (TS `emptyChangesResult`).
+fn empty_changes_result() -> serde_json::Value {
+    serde_json::json!({ "changes": [], "truncated": false, "totalCount": 0 })
 }
 
 /// Capture a `pr.waitForChanges` poll snapshot (TS `captureSnapshot`): the PR
@@ -3299,10 +4286,11 @@ pub mod mcp_servers {}
 pub mod memories {}
 
 // Code Changes Review modules (§17).
-pub mod file_tracking {}
-pub mod diffs {}
-pub mod accept_changes {}
-pub mod metrics {}
+mod accept_changes;
+pub mod diffs;
+pub mod file_tracking;
+mod file_tracking_ops;
+pub mod metrics;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage {}

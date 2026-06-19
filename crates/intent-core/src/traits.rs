@@ -1272,6 +1272,266 @@ pub trait WorkspaceApi: Send + Sync {
             ))
         })
     }
+
+    /// `file-tracking.init`: initialize/attach the tracker for a workspace
+    /// (`{ ok: true }`) (PROTOCOL §5.19).
+    fn file_tracking_init(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_init not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file-tracking.sync`: reconcile tracked changes against the live git
+    /// worktree, preserving attribution (PROTOCOL §5.19).
+    fn file_tracking_sync(
+        &self,
+        workspace_id: WorkspaceId,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, force);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_sync not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file-tracking.load`: the tracked-change review list
+    /// (`{ changes, truncated, totalCount }`) (PROTOCOL §5.19).
+    fn file_tracking_load(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_load not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file-tracking.getChanges`: the filtered tracked-change list
+    /// (`{ changes, truncated, totalCount }`) (PROTOCOL §5.19).
+    fn file_tracking_get_changes(
+        &self,
+        workspace_id: WorkspaceId,
+        filter: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, filter);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_get_changes not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file-tracking.loadCommits`: commit history with attribution
+    /// (`{ commits: CommitWithAttribution[] }`) (PROTOCOL §5.19).
+    fn file_tracking_load_commits(
+        &self,
+        workspace_id: WorkspaceId,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_load_commits not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file-tracking.getLineStats`: real-time additions/deletions totals
+    /// (`{ additions, deletions }`) (PROTOCOL §5.19).
+    fn file_tracking_get_line_stats(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_get_line_stats not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file-tracking.stage`: stage `paths` and move their audit rows to the
+    /// `staged` stage (`{ ok: true }`) (PROTOCOL §5.19).
+    fn file_tracking_stage(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, paths);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_stage not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file-tracking.unstage`: unstage `paths` and move their audit rows back to
+    /// the `unstaged` stage (`{ ok: true }`) (PROTOCOL §5.19).
+    fn file_tracking_unstage(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, paths);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_unstage not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `metrics.getWorkspaceStats`: the workspace's line-change `Metrics`
+    /// (`{ additions, deletions, filesChanged, byAgent }`) or `null` (PROTOCOL §5.20).
+    fn metrics_get_workspace_stats(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::metrics_get_workspace_stats not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `metrics.getAgentStats`: one agent's `Metrics` summed across workspaces
+    /// (`{ additions, deletions, filesChanged }`, `byAgent` omitted) or `null` (§5.20).
+    fn metrics_get_agent_stats(
+        &self,
+        agent_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = agent_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::metrics_get_agent_stats not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `metrics.getAllWorkspaceStats`: a `{ [workspaceId]: Metrics }` map across
+    /// every workspace (PROTOCOL §5.20).
+    fn metrics_get_all_workspace_stats(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::metrics_get_all_workspace_stats not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `metrics.clearAgentStats`: reset one agent's counters across workspaces,
+    /// returning `{ success: boolean }` (PROTOCOL §5.20).
+    fn metrics_clear_agent_stats(
+        &self,
+        agent_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = agent_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::metrics_clear_agent_stats not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ------------------------------------------------------------------------
+    // accept-changes.* — commit→push→PR→merge orchestration (PROTOCOL §5.18).
+    // ------------------------------------------------------------------------
+
+    /// `accept-changes.getStatus`: the `WorkspaceGitStatus` for the accept-changes
+    /// panel (branch, ahead/behind trunk, remote/push state, local commits with
+    /// attribution, linked PR) (PROTOCOL §5.18).
+    fn accept_changes_get_status(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::accept_changes_get_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `accept-changes.prepare`: validate an action and return a `PrepareResult`
+    /// (warnings/errors, suggested commit message/PR fields, per-file stats)
+    /// (PROTOCOL §5.18).
+    fn accept_changes_prepare(
+        &self,
+        workspace_id: WorkspaceId,
+        action: String,
+        files: Option<Vec<String>>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, action, files);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::accept_changes_prepare not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `accept-changes.execute`: run the requested action (commit, optionally
+    /// chaining push + create-PR via `options`) and return an `AcceptChangesResult`
+    /// with per-step status (PROTOCOL §5.18). `params` is the full request object.
+    fn accept_changes_execute(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::accept_changes_execute not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `accept-changes.mergePR`: merge the linked PR via the forge and return an
+    /// `AcceptChangesResult` (PROTOCOL §5.18).
+    fn accept_changes_merge_pr(
+        &self,
+        workspace_id: WorkspaceId,
+        pr_number: u64,
+        merge_method: Option<String>,
+        commit_title: Option<String>,
+        commit_message: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            pr_number,
+            merge_method,
+            commit_title,
+            commit_message,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::accept_changes_merge_pr not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `accept-changes.addRemote`: add (and, if needed, initialize) the `origin`
+    /// remote, returning the refreshed `WorkspaceGitStatus` (PROTOCOL §5.18).
+    fn accept_changes_add_remote(
+        &self,
+        workspace_id: WorkspaceId,
+        remote_url: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, remote_url);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::accept_changes_add_remote not implemented".to_string(),
+            ))
+        })
+    }
 }
 
 /// Context-engine abstraction implemented by `intent-context` (§3.1).

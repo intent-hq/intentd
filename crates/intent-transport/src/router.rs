@@ -972,6 +972,153 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "file-tracking.init" => {
+            let ws = require_ws_note(params)?;
+            let r = api.file_tracking_init(ws).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "file-tracking.sync" => {
+            let ws = require_ws_note(params)?;
+            let force = parse_bool(params, "force");
+            let r = api
+                .file_tracking_sync(ws, force)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "file-tracking.load" => {
+            let ws = require_ws_note(params)?;
+            let r = api.file_tracking_load(ws).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "file-tracking.getChanges" => {
+            let ws = require_ws_note(params)?;
+            let filter = opt_value(params, "filter");
+            let r = api
+                .file_tracking_get_changes(ws, filter)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "file-tracking.loadCommits" => {
+            let ws = require_ws_note(params)?;
+            let limit = opt_int(params, "limit");
+            let r = api
+                .file_tracking_load_commits(ws, limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "file-tracking.getLineStats" => {
+            let ws = require_ws_note(params)?;
+            let r = api
+                .file_tracking_get_line_stats(ws)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "file-tracking.stage" => {
+            let ws = require_ws_note(params)?;
+            require_present(params, "paths")?;
+            let paths = params.get("paths").cloned().unwrap_or(Value::Null);
+            let r = api
+                .file_tracking_stage(ws, paths)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "file-tracking.unstage" => {
+            let ws = require_ws_note(params)?;
+            require_present(params, "paths")?;
+            let paths = params.get("paths").cloned().unwrap_or(Value::Null);
+            let r = api
+                .file_tracking_unstage(ws, paths)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "metrics.getWorkspaceStats" => {
+            let ws = require_ws_note(params)?;
+            let r = api
+                .metrics_get_workspace_stats(ws)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "metrics.getAgentStats" => {
+            let agent_id = require_str_param(params, "agentId")?;
+            let r = api
+                .metrics_get_agent_stats(agent_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "metrics.getAllWorkspaceStats" => {
+            let r = api
+                .metrics_get_all_workspace_stats()
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "metrics.clearAgentStats" => {
+            let agent_id = require_str_param(params, "agentId")?;
+            let r = api
+                .metrics_clear_agent_stats(agent_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "accept-changes.getStatus" => {
+            let ws = require_ws_note(params)?;
+            let r = api
+                .accept_changes_get_status(ws)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "accept-changes.prepare" => {
+            let ws = require_ws_note(params)?;
+            let action = require_str_param(params, "action")?;
+            let files = opt_str_array(params, "files");
+            let r = api
+                .accept_changes_prepare(ws, action, files)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "accept-changes.execute" => {
+            let ws = require_ws_note(params)?;
+            require_str_param(params, "action")?;
+            let r = api
+                .accept_changes_execute(ws, Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "accept-changes.mergePR" => {
+            let ws = require_ws_note(params)?;
+            let pr_number = params
+                .get("prNumber")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: prNumber"))?;
+            let merge_method = opt_str(params, "mergeMethod");
+            let commit_title = opt_str(params, "commitTitle");
+            let commit_message = opt_str(params, "commitMessage");
+            let r = api
+                .accept_changes_merge_pr(ws, pr_number, merge_method, commit_title, commit_message)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "accept-changes.addRemote" => {
+            let ws = require_ws_note(params)?;
+            let remote_url = require_str_param(params, "remoteUrl")?;
+            let r = api
+                .accept_changes_add_remote(ws, remote_url)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }

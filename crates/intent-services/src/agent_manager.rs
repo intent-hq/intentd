@@ -26,10 +26,10 @@ use intent_acp::{
     WorkspaceMcpServer,
 };
 use intent_core::{
-    now_iso, AgentId, AgentSession, BoxFuture, Error, Result, WorkspaceApi, WorkspaceId,
+    now_iso, ActorType, AgentId, AgentSession, BoxFuture, Error, Result, WorkspaceApi, WorkspaceId,
 };
 use intent_providers::ProviderConfig;
-use intent_store::NewEvent;
+use intent_store::{NewEvent, NewTrackedChange};
 use serde_json::{json, Value};
 use tokio::process::Child;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
@@ -152,6 +152,21 @@ impl BusEventSink {
 impl EventSink for BusEventSink {
     fn publish(&self, event: SinkEvent) -> BoxFuture<'_, ()> {
         Box::pin(async move {
+            // An agent `file:changed` also feeds the BE-internal code-review
+            // pipeline (§17.1): record diff + attribution after the event lands.
+            // The wiring composes `diffs` + `file_tracking` here so neither
+            // service module depends on the other (§3.2).
+            let track_ctx = (event.event_type == intent_core::events::FILE_CHANGED
+                && event.actor.actor_type == ActorType::Agent)
+                .then(|| {
+                    (
+                        event.workspace_id.clone(),
+                        event.actor.id.clone(),
+                        event.session_id.clone(),
+                        event.data.clone(),
+                    )
+                });
+
             let new_event = NewEvent {
                 workspace_id: event.workspace_id,
                 timestamp: now_iso(),
@@ -165,7 +180,94 @@ impl EventSink for BusEventSink {
             if let Err(e) = self.bus.publish(&new_event).await {
                 tracing::warn!(error = %e, "failed to publish agent client event");
             }
+
+            if let Some((workspace_id, agent_id, session_id, data)) = track_ctx {
+                self.record_agent_file_change(workspace_id, agent_id, session_id, data)
+                    .await;
+            }
         })
+    }
+}
+
+impl BusEventSink {
+    /// Record the code-review state for one agent `file:changed` (§17.3/§17.4):
+    /// compute + persist the file's diff, then upsert its attribution row on
+    /// `tracked_changes` (stage `unstaged`). Best-effort — every failure is
+    /// logged and swallowed so a tracking miss never breaks the agent's edit.
+    async fn record_agent_file_change(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<String>,
+        session_id: Option<String>,
+        data: Value,
+    ) {
+        let rel_path = match data
+            .get("relativePath")
+            .or_else(|| data.get("path"))
+            .and_then(Value::as_str)
+        {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => return,
+        };
+        let status = match data.get("action").and_then(Value::as_str) {
+            Some("create") => "added",
+            Some("delete") => "deleted",
+            _ => "modified",
+        };
+
+        let store = self.bus.store();
+        let ws = match store.get_workspace(&workspace_id).await {
+            Ok(ws) => ws,
+            Err(e) => {
+                tracing::warn!(error = %e, "file-tracking: workspace lookup failed");
+                return;
+            }
+        };
+        let Some(worktree) = crate::git_ops::worktree_path(&ws) else {
+            return;
+        };
+
+        // Diff compute is best-effort: a missing repo / clean worktree still
+        // records the attribution row (with zero stats) so provenance is kept.
+        let summary = match crate::diffs::compute_and_store(
+            store,
+            &worktree,
+            &workspace_id,
+            &rel_path,
+            false,
+        )
+        .await
+        {
+            Ok(summary) => summary,
+            Err(e) => {
+                tracing::warn!(error = %e, "file-tracking: diff compute failed");
+                None
+            }
+        };
+
+        let change = NewTrackedChange {
+            workspace_id: workspace_id.clone(),
+            path: rel_path,
+            stage: "unstaged".to_string(),
+            status: status.to_string(),
+            agent_id,
+            session_id,
+            turn: None,
+            commit_hash: None,
+            old_blob_sha: summary.as_ref().and_then(|s| s.old_blob_sha.clone()),
+            new_blob_sha: summary.as_ref().and_then(|s| s.new_blob_sha.clone()),
+            additions: summary.as_ref().map(|s| s.additions).unwrap_or(0),
+            deletions: summary.as_ref().map(|s| s.deletions).unwrap_or(0),
+        };
+        if let Err(e) = crate::file_tracking::track_change(store, change).await {
+            tracing::warn!(error = %e, "file-tracking: track_change failed");
+            return;
+        }
+        // Recompute the durable line-change aggregates so the metrics.* reads
+        // (§17.5) reflect this edit. Best-effort: attribution is already recorded.
+        if let Err(e) = crate::metrics::recompute(store, &workspace_id).await {
+            tracing::warn!(error = %e, "metrics: recompute failed");
+        }
     }
 }
 

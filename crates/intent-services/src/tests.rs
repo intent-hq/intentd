@@ -1030,6 +1030,7 @@ mod mcp_callback {
 // ============================================================================
 
 mod pr {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
@@ -1042,6 +1043,7 @@ mod pr {
         ReviewThread, ReviewThreadComment, ReviewVerdict, ScCapabilities, SourceControl,
     };
     use intent_store::Store;
+    use serde_json::json;
 
     use super::{workspace, TempDb};
     use crate::Services;
@@ -1099,8 +1101,23 @@ mod pr {
                 scopes: vec![],
             })
         }
-        async fn create_pr(&self, _: &RepoRef, _: NewPullRequest) -> ScResult<PullRequest> {
-            unimplemented!()
+        async fn create_pr(&self, _: &RepoRef, input: NewPullRequest) -> ScResult<PullRequest> {
+            Ok(PullRequest {
+                number: 7,
+                url: "https://github.com/o/r/pull/7".into(),
+                title: input.title,
+                body: input.body,
+                state: PrState::Open,
+                draft: input.draft,
+                source_branch: input.source_branch,
+                target_branch: input.target_branch,
+                author: "octocat".into(),
+                mergeable: Some(true),
+                mergeable_state: Some("clean".into()),
+                head_sha: Some("deadbeef".into()),
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
         }
         async fn get_pr(&self, _: &RepoRef, _: u64) -> ScResult<PullRequest> {
             let mut pr = sample_pr();
@@ -1657,5 +1674,680 @@ mod pr {
         assert_eq!(outcome, crate::PrRefreshOutcome::Skipped);
         let evs = svc.store().events_by_workspace(&ws_id, 10).await.unwrap();
         assert!(evs.is_empty());
+    }
+
+    // ------------------------------------------------------------------------
+    // accept-changes.* orchestration (§5.18): the commit→push→create-PR
+    // pipeline against a real worktree + local bare remote, then mergePR via the
+    // stubbed forge.
+    // ------------------------------------------------------------------------
+
+    /// Drop guard removing a temp directory tree.
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_dir(prefix: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Commit everything in the worktree on the current branch, returning the oid.
+    fn commit_all(repo: &git2::Repository, msg: &str) -> git2::Oid {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .and_then(|o| repo.find_commit(o).ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
+            .unwrap()
+    }
+
+    /// Build a store + a workspace whose worktree is a real git repo on branch
+    /// `feature` with an `origin` bare remote and a linked `o/r` repository.
+    async fn ac_setup(
+        forge: StubForge,
+    ) -> (TempDb, TempDir, TempDir, Services, WorkspaceId, PathBuf) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+
+        let work = unique_dir("intentd-ac-work");
+        let bare = unique_dir("intentd-ac-bare");
+        let mut opts = git2::RepositoryInitOptions::new();
+        opts.initial_head("feature");
+        let repo = git2::Repository::init_opts(&work, &opts).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Tester").unwrap();
+            cfg.set_str("user.email", "t@e.dev").unwrap();
+        }
+        std::fs::write(work.join("README.md"), "init\n").unwrap();
+        commit_all(&repo, "chore: init");
+        git2::Repository::init_bare(&bare).unwrap();
+        repo.remote("origin", bare.to_str().unwrap()).unwrap();
+
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.branch = "feature".into();
+        ws.base_ref = Some("main".into());
+        ws.repository_owner = Some("o".into());
+        ws.repository_name = Some("r".into());
+        ws.worktree_path = Some(work.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.expect("ws");
+
+        let svc = Services::new(store).with_source_control(Arc::new(forge));
+        (tmp, TempDir(work.clone()), TempDir(bare), svc, ws_id, work)
+    }
+
+    #[tokio::test]
+    async fn execute_runs_commit_push_create_pr_pipeline() {
+        let (_t, _w, _b, svc, ws, work) = ac_setup(StubForge::default()).await;
+        // An unstaged change for the commit step to capture.
+        std::fs::write(work.join("feature.txt"), "hello\n").unwrap();
+
+        let params = json!({
+            "action": "commit",
+            "commitMessage": "feat: add feature",
+            "options": {
+                "stageUnstaged": true,
+                "pushAfterCommit": true,
+                "createPRAfterPush": true,
+            },
+        });
+        let res = svc
+            .accept_changes_execute(ws.clone(), params)
+            .await
+            .expect("execute");
+
+        assert_eq!(res["success"], true, "result: {res}");
+        let steps = res["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0]["id"], "commit");
+        assert_eq!(steps[0]["status"], "completed");
+        assert_eq!(steps[1]["id"], "push");
+        assert_eq!(steps[1]["status"], "completed");
+        assert_eq!(steps[2]["id"], "create-pr");
+        assert_eq!(steps[2]["status"], "completed");
+        assert_eq!(res["result"]["commitHash"].as_str().unwrap().len(), 40);
+        assert_eq!(res["result"]["prNumber"], 7);
+        assert!(res["result"]["prUrl"].as_str().unwrap().contains("pull/7"));
+
+        // Linkage persisted.
+        let linked = svc.store().get_workspace(&ws).await.unwrap();
+        assert_eq!(linked.pr_number, Some(7));
+
+        // getStatus reflects the pushed branch + linked PR.
+        let st = svc
+            .accept_changes_get_status(ws.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["branch"], "feature");
+        assert_eq!(st["hasRemote"], true);
+        assert_eq!(st["isPushed"], true);
+        assert_eq!(st["existingPR"]["number"], 7);
+
+        // The bare remote now carries the feature branch.
+        let bare_repo = git2::Repository::open_bare(_b.0.clone()).unwrap();
+        assert!(bare_repo.find_reference("refs/heads/feature").is_ok());
+
+        // mergePR via the stubbed forge.
+        let mg = svc
+            .accept_changes_merge_pr(ws.clone(), 7, Some("squash".into()), None, None)
+            .await
+            .expect("merge");
+        assert_eq!(mg["success"], true);
+        assert_eq!(mg["steps"][0]["id"], "merge");
+        assert_eq!(mg["steps"][0]["status"], "completed");
+        assert_eq!(mg["result"]["mergeCommitHash"], "mergedsha");
+        let merged = svc.store().get_workspace(&ws).await.unwrap();
+        assert_eq!(
+            merged.pr_status,
+            Some(intent_core::PullRequestStatus::Merged)
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_create_pr_without_remote_fails_step() {
+        // A workspace with no git repo at all → push/create-pr cannot proceed.
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(unique_dir("intentd-ac-empty").to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store).with_source_control(Arc::new(StubForge::default()));
+
+        let res = svc
+            .accept_changes_execute(ws_id, json!({ "action": "create-pr" }))
+            .await
+            .expect("execute");
+        assert_eq!(res["success"], false);
+        assert_eq!(res["steps"][0]["id"], "create-pr");
+        assert_eq!(res["steps"][0]["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_unknown_action() {
+        let (_t, _w, _b, svc, ws, _work) = ac_setup(StubForge::default()).await;
+        let err = svc
+            .accept_changes_execute(ws, json!({ "action": "teleport" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    #[tokio::test]
+    async fn prepare_lists_files_and_suggests_message() {
+        let (_t, _w, _b, svc, ws, work) = ac_setup(StubForge::default()).await;
+        std::fs::write(work.join("feature.txt"), "a\nb\n").unwrap();
+
+        let p = svc
+            .accept_changes_prepare(ws, "commit".into(), None)
+            .await
+            .expect("prepare");
+        assert_eq!(p["valid"], true);
+        assert!(p["filesCount"].as_u64().unwrap() >= 1);
+        assert!(p["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "feature.txt"));
+        assert!(p["additions"].as_i64().unwrap() >= 2);
+    }
+
+    #[tokio::test]
+    async fn add_remote_initializes_and_returns_status() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("store");
+        let dir = TempDir(unique_dir("intentd-ac-addremote"));
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.branch = "feature".into();
+        ws.worktree_path = Some(dir.0.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store).with_source_control(Arc::new(StubForge::default()));
+
+        let st = svc
+            .accept_changes_add_remote(ws_id, "https://github.com/o/r.git".into())
+            .await
+            .expect("add remote");
+        assert_eq!(st["hasRemote"], true);
+        assert_eq!(st["owner"], "o");
+        assert_eq!(st["repo"], "r");
+
+        let bad = svc
+            .accept_changes_add_remote(WorkspaceId::new(), "not-a-url".into())
+            .await;
+        assert!(bad.is_err());
+    }
+}
+
+/// `file-tracking.*` reads + stage/unstage over the M4.7 `tracked_changes` table
+/// and a real git worktree (M4.8).
+mod file_tracking {
+    use super::*;
+    use git2::{Repository, Signature};
+    use intent_store::NewTrackedChange;
+
+    /// A self-cleaning git repository seeded with one commit.
+    struct GitRepo {
+        dir: PathBuf,
+    }
+
+    impl Drop for GitRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn init_git_repo() -> GitRepo {
+        let dir = std::env::temp_dir().join(format!("intentd-ft-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = Repository::init(&dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Test").unwrap();
+        cfg.set_str("user.email", "test@example.com").unwrap();
+        commit_file(&dir, "seed.txt", "seed\n", "seed commit");
+        GitRepo { dir }
+    }
+
+    fn commit_file(dir: &std::path::Path, rel: &str, contents: &str, message: &str) {
+        std::fs::write(dir.join(rel), contents).unwrap();
+        let repo = Repository::open(dir).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(rel)).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let parents: Vec<git2::Commit> = repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .and_then(|oid| repo.find_commit(oid).ok())
+            .into_iter()
+            .collect();
+        let refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &refs)
+            .unwrap();
+    }
+
+    fn tracked(ws: &WorkspaceId, path: &str, stage: &str, agent: Option<&str>) -> NewTrackedChange {
+        NewTrackedChange {
+            workspace_id: ws.clone(),
+            path: path.to_string(),
+            stage: stage.to_string(),
+            status: "modified".to_string(),
+            agent_id: agent.map(str::to_string),
+            session_id: Some("sess-1".to_string()),
+            turn: Some(3),
+            commit_hash: None,
+            old_blob_sha: None,
+            new_blob_sha: None,
+            additions: 5,
+            deletions: 2,
+        }
+    }
+
+    async fn ft_setup() -> (TempDb, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        (tmp, Services::new(store), ws)
+    }
+
+    #[tokio::test]
+    async fn load_returns_tracked_changes_with_attribution() {
+        let (_t, svc, ws) = ft_setup().await;
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "src/a.ts", "unstaged", Some("agent-1")))
+            .await
+            .unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "src/b.ts", "staged", None))
+            .await
+            .unwrap();
+
+        let result = svc.file_tracking_load(ws.clone()).await.unwrap();
+        assert_eq!(result["totalCount"], serde_json::json!(2));
+        assert_eq!(result["truncated"], serde_json::json!(false));
+        let changes = result["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 2);
+        let a = changes
+            .iter()
+            .find(|c| c["relativePath"] == "src/a.ts")
+            .unwrap();
+        assert_eq!(a["stage"], serde_json::json!("unstaged"));
+        assert_eq!(
+            a["attribution"]["agent"]["agentId"],
+            serde_json::json!("agent-1")
+        );
+        assert_eq!(
+            a["attribution"]["agent"]["turnNumber"],
+            serde_json::json!(3)
+        );
+        let b = changes
+            .iter()
+            .find(|c| c["relativePath"] == "src/b.ts")
+            .unwrap();
+        assert!(b["attribution"].get("agent").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_changes_filters_by_stage_and_agent() {
+        let (_t, svc, ws) = ft_setup().await;
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "a.ts", "unstaged", Some("agent-1")))
+            .await
+            .unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "b.ts", "staged", Some("agent-2")))
+            .await
+            .unwrap();
+
+        let staged = svc
+            .file_tracking_get_changes(ws.clone(), Some(serde_json::json!({ "stage": "staged" })))
+            .await
+            .unwrap();
+        assert_eq!(staged["totalCount"], serde_json::json!(2));
+        let arr = staged["changes"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["relativePath"], serde_json::json!("b.ts"));
+
+        let by_agent = svc
+            .file_tracking_get_changes(
+                ws.clone(),
+                Some(serde_json::json!({ "agentId": "agent-1" })),
+            )
+            .await
+            .unwrap();
+        let arr = by_agent["changes"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["relativePath"], serde_json::json!("a.ts"));
+    }
+
+    #[tokio::test]
+    async fn get_line_stats_sums_additions_and_deletions() {
+        let (_t, svc, ws) = ft_setup().await;
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "a.ts", "unstaged", None))
+            .await
+            .unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "b.ts", "staged", None))
+            .await
+            .unwrap();
+        let stats = svc.file_tracking_get_line_stats(ws.clone()).await.unwrap();
+        assert_eq!(stats["additions"], serde_json::json!(10));
+        assert_eq!(stats["deletions"], serde_json::json!(4));
+    }
+
+    #[tokio::test]
+    async fn init_is_ok_and_load_empty_for_unknown_workspace() {
+        let (_t, svc, ws) = ft_setup().await;
+        assert_eq!(
+            svc.file_tracking_init(ws.clone()).await.unwrap(),
+            serde_json::json!({ "ok": true })
+        );
+        let missing = WorkspaceId::new();
+        let result = svc.file_tracking_load(missing).await.unwrap();
+        assert_eq!(result["totalCount"], serde_json::json!(0));
+        assert_eq!(result["changes"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn stage_then_unstage_preserves_attribution() {
+        let repo = init_git_repo();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store);
+
+        // A new agent-authored file with an unstaged audit row.
+        std::fs::write(repo.dir.join("x.txt"), "hi\n").unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws_id, "x.txt", "unstaged", Some("agent-9")))
+            .await
+            .unwrap();
+
+        // Stage → git index + audit row both move to staged, attribution kept.
+        svc.file_tracking_stage(ws_id.clone(), serde_json::json!(["x.txt"]))
+            .await
+            .unwrap();
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        assert!(st.files.iter().any(|f| f.path == "x.txt" && f.staged));
+        let changes = svc.file_tracking_load(ws_id.clone()).await.unwrap();
+        let row = changes["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["relativePath"] == "x.txt")
+            .unwrap();
+        assert_eq!(row["stage"], serde_json::json!("staged"));
+        assert_eq!(
+            row["attribution"]["agent"]["agentId"],
+            serde_json::json!("agent-9")
+        );
+
+        // Unstage → both move back to unstaged, attribution still kept.
+        svc.file_tracking_unstage(ws_id.clone(), serde_json::json!(["x.txt"]))
+            .await
+            .unwrap();
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        assert!(st.files.iter().any(|f| f.path == "x.txt" && !f.staged));
+        let changes = svc.file_tracking_load(ws_id.clone()).await.unwrap();
+        let row = changes["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["relativePath"] == "x.txt")
+            .unwrap();
+        assert_eq!(row["stage"], serde_json::json!("unstaged"));
+        assert_eq!(
+            row["attribution"]["agent"]["agentId"],
+            serde_json::json!("agent-9")
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_rejects_empty_paths() {
+        let (_t, svc, ws) = ft_setup().await;
+        let err = svc
+            .file_tracking_stage(ws, serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("No file paths provided"));
+    }
+
+    #[tokio::test]
+    async fn load_commits_returns_history_with_attribution() {
+        let repo = init_git_repo();
+        commit_file(
+            &repo.dir,
+            "feature.txt",
+            "feature\n",
+            "add feature\n\nAgent-Id: agent-7\nLinked-Note-Id: note-2\n",
+        );
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store);
+
+        let result = svc
+            .file_tracking_load_commits(ws_id, Some(10))
+            .await
+            .unwrap();
+        let commits = result["commits"].as_array().unwrap();
+        assert_eq!(commits.len(), 2);
+        let head = &commits[0];
+        assert_eq!(head["agentId"], serde_json::json!("agent-7"));
+        assert_eq!(head["linkedNoteId"], serde_json::json!("note-2"));
+        assert_eq!(head["filesChanged"], serde_json::json!(1));
+        assert_eq!(head["isPushed"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn sync_reconciles_unstaged_changes_preserving_attribution() {
+        let repo = init_git_repo();
+        // A pre-existing agent attribution row for a file we now modify.
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nmore\n").unwrap();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        store
+            .upsert_tracked_change(&tracked(&ws_id, "seed.txt", "unstaged", Some("agent-3")))
+            .await
+            .unwrap();
+        let svc = Services::new(store);
+
+        let result = svc.file_tracking_sync(ws_id.clone(), false).await.unwrap();
+        assert_eq!(result["success"], serde_json::json!(true));
+        let changes = svc.file_tracking_load(ws_id).await.unwrap();
+        let row = changes["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["relativePath"] == "seed.txt")
+            .unwrap();
+        assert_eq!(
+            row["attribution"]["agent"]["agentId"],
+            serde_json::json!("agent-3")
+        );
+        assert!(row["stats"]["additions"].as_i64().unwrap() >= 1);
+    }
+}
+
+/// `metrics.*` aggregation (§17.5) over the M4.7 `tracked_changes` table: the
+/// internal recompute fills `workspace_metrics`/`agent_metrics`, and the four
+/// read/clear wire methods project the §5.20 `Metrics` shape.
+mod metrics {
+    use super::*;
+    use intent_store::NewTrackedChange;
+
+    async fn setup() -> (TempDb, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        (tmp, Services::new(store), ws)
+    }
+
+    fn change(
+        ws: &WorkspaceId,
+        path: &str,
+        agent: Option<&str>,
+        additions: i64,
+        deletions: i64,
+    ) -> NewTrackedChange {
+        NewTrackedChange {
+            workspace_id: ws.clone(),
+            path: path.to_string(),
+            stage: "unstaged".to_string(),
+            status: "modified".to_string(),
+            agent_id: agent.map(str::to_string),
+            session_id: None,
+            turn: None,
+            commit_hash: None,
+            old_blob_sha: None,
+            new_blob_sha: None,
+            additions,
+            deletions,
+        }
+    }
+
+    #[tokio::test]
+    async fn recompute_aggregates_by_workspace_and_agent() {
+        let (_t, svc, ws) = setup().await;
+        let store = svc.store();
+        store
+            .upsert_tracked_change(&change(&ws, "a.ts", Some("agent-1"), 100, 10))
+            .await
+            .unwrap();
+        store
+            .upsert_tracked_change(&change(&ws, "b.ts", Some("agent-1"), 40, 2))
+            .await
+            .unwrap();
+        store
+            .upsert_tracked_change(&change(&ws, "c.ts", Some("agent-2"), 7, 1))
+            .await
+            .unwrap();
+        store
+            .upsert_tracked_change(&change(&ws, "d.ts", None, 3, 0))
+            .await
+            .unwrap();
+
+        crate::metrics::recompute(store, &ws).await.unwrap();
+
+        let m = svc.metrics_get_workspace_stats(ws.clone()).await.unwrap();
+        assert_eq!(m["additions"], serde_json::json!(150));
+        assert_eq!(m["deletions"], serde_json::json!(13));
+        assert_eq!(m["filesChanged"], serde_json::json!(4));
+        assert_eq!(m["byAgent"]["agent-1"]["additions"], serde_json::json!(140));
+        assert_eq!(m["byAgent"]["agent-1"]["deletions"], serde_json::json!(12));
+        assert_eq!(
+            m["byAgent"]["agent-1"]["filesChanged"],
+            serde_json::json!(2)
+        );
+        assert_eq!(m["byAgent"]["agent-2"]["additions"], serde_json::json!(7));
+        // Unattributed changes count toward the workspace total but not byAgent.
+        assert!(m["byAgent"].get("").is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_stats_null_when_unknown() {
+        let (_t, svc, _ws) = setup().await;
+        let missing = WorkspaceId::new();
+        let m = svc.metrics_get_workspace_stats(missing).await.unwrap();
+        assert_eq!(m, serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn agent_stats_sum_across_workspaces_and_clear() {
+        let (_t, svc, ws1) = setup().await;
+        let store = svc.store();
+        let ws2 = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws2)).await.unwrap();
+
+        store
+            .upsert_tracked_change(&change(&ws1, "a.ts", Some("agent-1"), 10, 1))
+            .await
+            .unwrap();
+        store
+            .upsert_tracked_change(&change(&ws2, "b.ts", Some("agent-1"), 5, 4))
+            .await
+            .unwrap();
+        crate::metrics::recompute(store, &ws1).await.unwrap();
+        crate::metrics::recompute(store, &ws2).await.unwrap();
+
+        let a = svc
+            .metrics_get_agent_stats("agent-1".to_string())
+            .await
+            .unwrap();
+        assert_eq!(a["additions"], serde_json::json!(15));
+        assert_eq!(a["deletions"], serde_json::json!(5));
+        assert_eq!(a["filesChanged"], serde_json::json!(2));
+        assert!(a.get("byAgent").is_none());
+
+        // getAllWorkspaceStats returns one entry per workspace.
+        let all = svc.metrics_get_all_workspace_stats().await.unwrap();
+        assert_eq!(all[&ws1.0]["additions"], serde_json::json!(10));
+        assert_eq!(all[&ws2.0]["additions"], serde_json::json!(5));
+
+        // clearAgentStats resets the agent's counters across workspaces.
+        let cleared = svc
+            .metrics_clear_agent_stats("agent-1".to_string())
+            .await
+            .unwrap();
+        assert_eq!(cleared, serde_json::json!({ "success": true }));
+        let after = svc
+            .metrics_get_agent_stats("agent-1".to_string())
+            .await
+            .unwrap();
+        assert_eq!(after, serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn recompute_drops_metrics_when_no_changes() {
+        let (_t, svc, ws) = setup().await;
+        let store = svc.store();
+        // Seed a stale aggregate, then recompute with no tracked changes: the
+        // durable rows are cleared so the read returns `null`.
+        store.upsert_workspace_metrics(&ws, 99, 9, 3).await.unwrap();
+        store
+            .upsert_agent_metrics(&ws, "agent-1", 99, 9, 3)
+            .await
+            .unwrap();
+        assert!(store.get_workspace_metrics(&ws).await.unwrap().is_some());
+
+        crate::metrics::recompute(store, &ws).await.unwrap();
+        assert!(store.get_workspace_metrics(&ws).await.unwrap().is_none());
+        assert!(store
+            .list_agent_metrics_for_workspace(&ws)
+            .await
+            .unwrap()
+            .is_empty());
+        let m = svc.metrics_get_workspace_stats(ws).await.unwrap();
+        assert_eq!(m, serde_json::Value::Null);
     }
 }
