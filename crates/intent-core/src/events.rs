@@ -142,6 +142,14 @@ pub const CHANGES_TRACKED: &str = "changes:tracked";
 pub const CHANGES_GIT_STATUS: &str = "changes:git-status";
 pub const CHANGES_METRICS_CHANGED: &str = "changes:metrics-changed";
 
+// Search streaming events (new in intentd; §5.15 / §6.5). Large or long-running
+// `search.*` requests return `{ requestId }` promptly, then the daemon pushes
+// incremental `search:result` batches (`data: { requestId, matches }`) followed
+// by a terminal `search:done` (`data: { requestId, total, truncated }`), all
+// correlated by `requestId`.
+pub const SEARCH_RESULT: &str = "search:result";
+pub const SEARCH_DONE: &str = "search:done";
+
 // MCP events.
 pub const MCP_NOTIFICATION: &str = "mcp:notification";
 
@@ -220,6 +228,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     CHANGES_TRACKED,
     CHANGES_GIT_STATUS,
     CHANGES_METRICS_CHANGED,
+    SEARCH_RESULT,
+    SEARCH_DONE,
     MCP_NOTIFICATION,
 ];
 

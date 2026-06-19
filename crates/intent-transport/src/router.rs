@@ -1119,6 +1119,81 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "search.inFiles" => {
+            let ws = require_ws_note(params)?;
+            let query = require_str_param(params, "query")?;
+            let opts = opt_value(params, "opts");
+            let request_id = opt_str(params, "requestId");
+            match api.search_in_files(ws, query, opts, request_id).await {
+                Ok(v) => Ok(v),
+                // Malformed regex / glob → -32602 with the raw message
+                // ("Invalid regex"), not the `invalid params:` prefix.
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "search.fileNames" => {
+            let ws = require_ws_note(params)?;
+            let pattern = require_str_param(params, "pattern")?;
+            let limit = opt_int(params, "limit");
+            let request_id = opt_str(params, "requestId");
+            match api.search_file_names(ws, pattern, limit, request_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "search.cancel" => {
+            let request_id = require_str_param(params, "requestId")?;
+            let r = api.search_cancel(request_id).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "search.messages" => {
+            let ws = require_ws_note(params)?;
+            let query = require_str_param(params, "query")?;
+            let agent_id = opt_str(params, "agentId");
+            let role = opt_str(params, "role");
+            let limit = opt_int(params, "limit");
+            let request_id = opt_str(params, "requestId");
+            api.search_messages(ws, query, agent_id, role, limit, request_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "search.events" => {
+            let query = require_str_param(params, "query")?;
+            let workspace_id = opt_workspace_id(params);
+            let limit = opt_int(params, "limit");
+            let request_id = opt_str(params, "requestId");
+            api.search_events(query, workspace_id, limit, request_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "search.memories" => {
+            let query = require_str_param(params, "query")?;
+            let workspace_id = opt_workspace_id(params);
+            let request_id = opt_str(params, "requestId");
+            api.search_memories(query, workspace_id, request_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "search.notes" => {
+            let query = require_str_param(params, "query")?;
+            let request_id = opt_str(params, "requestId");
+            api.search_notes(query, request_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "search.codebase" => {
+            let ws = require_ws_note(params)?;
+            let query = require_str_param(params, "query")?;
+            let request_id = opt_str(params, "requestId");
+            match api.search_codebase(ws, query, request_id).await {
+                Ok(v) => Ok(v),
+                // A malformed regex from the content-search reuse surfaces raw.
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }
