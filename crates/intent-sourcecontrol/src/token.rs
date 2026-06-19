@@ -1,0 +1,119 @@
+//! GitHub token resolution (§7.3).
+//!
+//! Tokens are resolved per `sourceControl.github.tokenSource`:
+//!
+//! 1. `explicit` — stored in the OS keychain via the `keyring` crate (never in
+//!    plaintext config or logs).
+//! 2. `env` — `GITHUB_TOKEN` / `GH_TOKEN`.
+//! 3. `gh-cli` — `gh auth token` (shell out to the GitHub CLI).
+//!
+//! `auto` (the default) tries the three in order and uses the first hit. A
+//! missing token is *not* an error here — [`resolve`] returns `None`, and the
+//! registry turns that into a graceful `NotConfigured` (§7.4).
+
+use serde::{Deserialize, Serialize};
+
+/// Keychain service name used for `intentd` secrets.
+const KEYRING_SERVICE: &str = "intentd";
+/// Keychain account/key for the GitHub token (`sourceControl.github.token`).
+const KEYRING_ACCOUNT: &str = "sourceControl.github.token";
+
+/// Strategy used to resolve the GitHub token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TokenSource {
+    /// Try keychain, then env, then `gh` CLI (the default).
+    #[default]
+    Auto,
+    /// Read from the OS keychain only.
+    Explicit,
+    /// Read from `GITHUB_TOKEN` / `GH_TOKEN` only.
+    Env,
+    /// Shell out to `gh auth token` only.
+    GhCli,
+}
+
+/// Resolve a token for the given strategy, or `None` if none is available.
+pub fn resolve(source: &TokenSource) -> Option<String> {
+    match source {
+        TokenSource::Explicit => keyring_token(),
+        TokenSource::Env => env_token(),
+        TokenSource::GhCli => gh_cli_token(),
+        TokenSource::Auto => keyring_token().or_else(env_token).or_else(gh_cli_token),
+    }
+}
+
+/// Read the token from the OS keychain. Any keychain error (missing entry,
+/// unavailable backend) resolves to `None` so resolution can fall through.
+fn keyring_token() -> Option<String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).ok()?;
+    entry.get_password().ok().and_then(non_empty)
+}
+
+/// Read `GITHUB_TOKEN`, falling back to `GH_TOKEN`.
+fn env_token() -> Option<String> {
+    pick_env_token(
+        std::env::var("GITHUB_TOKEN").ok(),
+        std::env::var("GH_TOKEN").ok(),
+    )
+}
+
+/// Pure selection of the env token (testable): prefer `GITHUB_TOKEN`, then
+/// `GH_TOKEN`, ignoring empty values.
+pub(crate) fn pick_env_token(github: Option<String>, gh: Option<String>) -> Option<String> {
+    github
+        .and_then(non_empty)
+        .or_else(|| gh.and_then(non_empty))
+}
+
+/// Shell out to `gh auth token`. A non-zero exit or missing CLI yields `None`.
+fn gh_cli_token() -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    non_empty(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// `Some(s)` only when `s` is non-empty after trimming.
+fn non_empty(s: String) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefers_github_token_over_gh_token() {
+        let picked = pick_env_token(Some("gho_primary".into()), Some("gho_fallback".into()));
+        assert_eq!(picked.as_deref(), Some("gho_primary"));
+    }
+
+    #[test]
+    fn falls_back_to_gh_token() {
+        let picked = pick_env_token(None, Some("gho_fallback".into()));
+        assert_eq!(picked.as_deref(), Some("gho_fallback"));
+    }
+
+    #[test]
+    fn ignores_empty_values() {
+        assert_eq!(pick_env_token(Some("   ".into()), Some("".into())), None);
+        assert_eq!(pick_env_token(None, None), None);
+    }
+
+    #[test]
+    fn token_source_deserializes_kebab_case() {
+        let s: TokenSource = serde_json::from_str("\"gh-cli\"").unwrap();
+        assert_eq!(s, TokenSource::GhCli);
+        assert_eq!(TokenSource::default(), TokenSource::Auto);
+    }
+}
