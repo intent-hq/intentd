@@ -833,6 +833,37 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "git.commit" => {
+            let ws = require_ws_note(params)?;
+            let message = require_str_param(params, "message")?;
+            let r = api.git_commit(ws, message).await.map_err(domain_to_rpc)?;
+            Ok(json!({ "ok": true, "hash": r.hash, "files": r.files }))
+        }
+        "git.agentCommit" => {
+            let ws = require_ws_note(params)?;
+            let message = require_str_param(params, "message")?;
+            let files = opt_str_array(params, "files");
+            let user_requested = parse_bool(params, "userRequested");
+            let r = api
+                .git_agent_commit(ws, message, files, user_requested)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({
+                "ok": true,
+                "hash": r.hash,
+                "files": r.files,
+                "fileCount": r.file_count,
+            }))
+        }
+        "git.checkMergeConflicts" => {
+            let ws = require_ws_note(params)?;
+            let target = opt_str(params, "targetBranch");
+            let r = api
+                .git_check_merge_conflicts(ws, target)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&r)
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }
@@ -900,6 +931,18 @@ fn require_present(params: &Map<String, Value>, name: &str) -> Result<(), RpcErr
 /// Optional string param (absent/null/non-string → `None`).
 fn opt_str(params: &Map<String, Value>, name: &str) -> Option<String> {
     params.get(name).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Optional string-array param (absent/null/non-array → `None`); non-string
+/// elements are skipped. Used for the `git.agentCommit` `files` list.
+fn opt_str_array(params: &Map<String, Value>, name: &str) -> Option<Vec<String>> {
+    params.get(name).and_then(Value::as_array).map(|items| {
+        items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    })
 }
 
 /// Optional integer param from a JSON number (absent/non-number → `None`).

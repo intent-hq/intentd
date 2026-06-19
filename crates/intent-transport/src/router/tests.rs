@@ -4,8 +4,9 @@ use intent_core::{
     AuthorType, BoxFuture, Comment, CommentAddResult, CommentAnchor, CommentAnchorType,
     CommentLocation, CommentRespondResult, CommentRespondThread, CommentStatus, CommentType,
     CommentWire, ContentType, Error, Event, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, FileActivity, FileStatus, GitBranches, GitFileStatus, GitStatus, Note,
-    NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
+    EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult, GitBranches,
+    GitCommitResult, GitFileStatus, GitMergeConflicts, GitStatus, Note, NoteAddInput,
+    NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
     NoteEditLinesResult, NoteEditResult, NoteId, NoteSetContentResult, NoteTaskRow,
     NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, Result,
     TaskUpdateResult, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
@@ -646,6 +647,56 @@ impl WorkspaceApi for FakeApi {
                 },
                 current_branch: "feature".to_string(),
                 default_branch: "main".to_string(),
+            })
+        })
+    }
+
+    fn git_commit(
+        &self,
+        _workspace_id: WorkspaceId,
+        message: String,
+    ) -> BoxFuture<'_, Result<GitCommitResult>> {
+        Box::pin(async move {
+            if message == "boom" {
+                return Err(Error::Internal("nothing to commit".to_string()));
+            }
+            Ok(GitCommitResult {
+                hash: "abc123".to_string(),
+                files: vec!["src/a.ts".to_string()],
+            })
+        })
+    }
+
+    fn git_agent_commit(
+        &self,
+        _workspace_id: WorkspaceId,
+        _message: String,
+        files: Option<Vec<String>>,
+        _user_requested: bool,
+    ) -> BoxFuture<'_, Result<GitAgentCommitResult>> {
+        Box::pin(async move {
+            let files = files.unwrap_or_else(|| vec!["src/a.ts".to_string()]);
+            let file_count = files.len() as i64;
+            Ok(GitAgentCommitResult {
+                hash: "def456".to_string(),
+                files,
+                file_count,
+            })
+        })
+    }
+
+    fn git_check_merge_conflicts(
+        &self,
+        _workspace_id: WorkspaceId,
+        target_branch: Option<String>,
+    ) -> BoxFuture<'_, Result<GitMergeConflicts>> {
+        Box::pin(async move {
+            Ok(GitMergeConflicts {
+                has_conflicts: true,
+                conflicted_files: vec!["src/a.ts".to_string()],
+                cannot_determine: None,
+                target_branch: target_branch.unwrap_or_else(|| "main".to_string()),
+                current_branch: "feature".to_string(),
             })
         })
     }
@@ -1398,5 +1449,87 @@ async fn git_get_branches_unknown_repo_is_minus_32602_with_message() {
     assert_eq!(
         v["error"]["message"],
         serde_json::json!("Unknown or unauthorized repository path")
+    );
+}
+
+#[tokio::test]
+async fn git_commit_returns_ok_hash_and_files() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.commit","params":{"workspaceId":"ws-1","message":"msg"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["hash"], serde_json::json!("abc123"));
+    assert_eq!(v["result"]["files"], serde_json::json!(["src/a.ts"]));
+}
+
+#[tokio::test]
+async fn git_commit_missing_message_is_minus_32602() {
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"git.commit","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: message")
+    );
+}
+
+#[tokio::test]
+async fn git_agent_commit_returns_ok_hash_files_and_count() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.agentCommit","params":{"workspaceId":"ws-1","message":"msg","files":["a.ts","b.ts"]}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["hash"], serde_json::json!("def456"));
+    assert_eq!(v["result"]["files"], serde_json::json!(["a.ts", "b.ts"]));
+    assert_eq!(v["result"]["fileCount"], serde_json::json!(2));
+}
+
+#[tokio::test]
+async fn git_agent_commit_missing_message_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.agentCommit","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: message")
+    );
+}
+
+#[tokio::test]
+async fn git_check_merge_conflicts_returns_conflict_shape() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.checkMergeConflicts","params":{"workspaceId":"ws-1","targetBranch":"develop"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["hasConflicts"], serde_json::json!(true));
+    assert_eq!(
+        v["result"]["conflictedFiles"],
+        serde_json::json!(["src/a.ts"])
+    );
+    assert_eq!(v["result"]["targetBranch"], serde_json::json!("develop"));
+    assert_eq!(v["result"]["currentBranch"], serde_json::json!("feature"));
+    // `cannotDetermine` is omitted when not set (serde skip).
+    assert!(v["result"].get("cannotDetermine").is_none());
+}
+
+#[tokio::test]
+async fn git_check_merge_conflicts_missing_workspace_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"git.checkMergeConflicts","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("workspaceId is required")
     );
 }
