@@ -1060,6 +1060,63 @@ pub struct AgentDelegateInput {
     pub skip_auto_commit: Option<bool>,
 }
 
+/// A single file's status line, mirroring the TS `GitFileStatus` enum
+/// (`src/shared/types.ts`). Serializes to the porcelain status character so the
+/// wire shape matches `git.status` exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GitFileStatus {
+    #[serde(rename = "M")]
+    Modified,
+    #[serde(rename = "A")]
+    Added,
+    #[serde(rename = "D")]
+    Deleted,
+    #[serde(rename = "R")]
+    Renamed,
+    #[serde(rename = "C")]
+    Copied,
+    #[serde(rename = "?")]
+    Untracked,
+    #[serde(rename = "!")]
+    Ignored,
+}
+
+/// One entry in [`GitStatus::files`] (`{ path, status, staged }`), mirroring the
+/// TS `FileStatus`. A file with both staged and unstaged changes yields two
+/// entries (matching the TS `parseStatusOutput`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileStatus {
+    pub path: String,
+    pub status: GitFileStatus,
+    pub staged: bool,
+}
+
+/// `git.status` result (`GitStatus` in `src/shared/types.ts`). `diverged` is true
+/// only when the branch is both ahead and behind its upstream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitStatus {
+    pub branch: String,
+    pub ahead: i64,
+    pub behind: i64,
+    pub diverged: bool,
+    pub files: Vec<FileStatus>,
+    pub has_uncommitted_changes: bool,
+    pub has_untracked_files: bool,
+}
+
+/// `git.getBranches` result (`{ branches, remoteBranches, currentBranch,
+/// defaultBranch }`), matching the TS `git.getBranches` handler.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranches {
+    pub branches: Vec<String>,
+    pub remote_branches: Vec<String>,
+    pub current_branch: String,
+    pub default_branch: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,12 +8,13 @@ use crate::ids::{AgentId, NoteId, WorkspaceId};
 use crate::model::{
     AgentDelegateInput, AgentLite, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
     CommentListResult, CommentRespondResult, Event, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, FileActivity, Note, NoteAddInput, NoteAddResult, NoteCreate,
-    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, ReadAssetResult,
-    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskUpdateNoteStatusResult, TaskUpdateResult,
-    TaskUpdateStatusResult, Workspace, WorkspaceCreate, WorkspaceEventSummary, WorkspaceUpdate,
+    EventUnsubscribeResult, FileActivity, GitBranches, GitStatus, Note, NoteAddInput,
+    NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
+    NoteEditLinesResult, NoteEditResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, ReadAssetResult, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskMarkAsTaskResult,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, Workspace,
+    WorkspaceCreate, WorkspaceEventSummary, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -997,6 +998,47 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::event_unsubscribe not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.status`: working-tree status for a workspace. Remote workspaces and
+    /// non-repositories return the empty status (PROTOCOL §5.6).
+    fn git_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<GitStatus>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.stage`: stage `paths` (CSV string or array). `.`/`*`/`--all` are
+    /// rejected (`-32603`); returns the validated path list (PROTOCOL §5.6).
+    fn git_stage(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: serde_json::Value,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        let _ = (workspace_id, paths);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_stage not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.getBranches`: branches for a known `repo_path`; an unknown repo path
+    /// is `-32602` (PROTOCOL §5.6).
+    fn git_get_branches(
+        &self,
+        repo_path: String,
+        include_remote: bool,
+    ) -> BoxFuture<'_, Result<GitBranches>> {
+        let _ = (repo_path, include_remote);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_get_branches not implemented".to_string(),
             ))
         })
     }
