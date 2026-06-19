@@ -19,15 +19,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use intent_acp::session::{ContentBlock, StopReason};
 use intent_acp::{
-    spawn_provider, ClientRequestHandler, Connection, ConnectionHooks, EventSink, FileService,
-    IncomingNotification, IncomingRequest, PermissionPolicy, PermissionRegistry, SinkEvent,
-    SpawnOptions,
+    build_baseline_mcp_env_from_process, handshake, serve_workspace_mcp_tcp, spawn_provider,
+    to_auggie_mcp_config, ClientRequestHandler, Connection, ConnectionHooks, EventSink,
+    FileService, IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer,
+    NormalizedMcpServers, PermissionPolicy, PermissionRegistry, SinkEvent, SpawnOptions,
+    WorkspaceMcpServer,
 };
-use intent_core::{now_iso, AgentId, BoxFuture, Error, Result, WorkspaceId};
+use intent_core::{now_iso, AgentId, BoxFuture, Error, Result, WorkspaceApi, WorkspaceId};
+use intent_providers::ProviderConfig;
 use intent_store::NewEvent;
 use tokio::process::Child;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 use crate::events::EventBus;
 use crate::Services;
@@ -321,14 +325,29 @@ impl ProcessRegistry {
     }
 }
 
+/// A generated `--mcp-config` file on disk, removed when the owning agent's
+/// handle is dropped (the file only needs to outlive the child that reads it).
+struct TempConfigFile {
+    path: PathBuf,
+}
+
+impl Drop for TempConfigFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// One live agent: its ACP [`Connection`] (own id space + pending map), the
 /// streaming-notification receiver consumed during a turn, the client-served
-/// request loop, and the owned child (killed on drop via `kill_on_drop`).
+/// request loop, the owned child (killed on drop via `kill_on_drop`), and the
+/// per-agent MCP bridge + generated config that back the agent→BE tool loop.
 struct AgentHandle {
     connection: Arc<Connection>,
     notifications: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
     serve_task: JoinHandle<()>,
     _child: Option<Child>,
+    _mcp_bridge: Option<McpBridge>,
+    _mcp_config: Option<TempConfigFile>,
 }
 
 impl Drop for AgentHandle {
@@ -349,6 +368,7 @@ pub struct AgentManager {
     sink: Arc<dyn EventSink>,
     permissions: Arc<PermissionRegistry>,
     policy: PermissionPolicy,
+    mcp_bridge_exe: PathBuf,
 }
 
 impl AgentManager {
@@ -362,12 +382,21 @@ impl AgentManager {
             sink,
             permissions: Arc::new(PermissionRegistry::new()),
             policy: PermissionPolicy::default(),
+            mcp_bridge_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("intentd")),
         }
     }
 
     /// Override the permission policy used by spawned agents' client handlers.
     pub fn with_policy(mut self, policy: PermissionPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Override the executable used as the generated `--mcp-config` bridge
+    /// command (defaults to the current `intentd` binary). Tests point this at
+    /// `CARGO_BIN_EXE_intentd` so a spawned child reaches the in-process server.
+    pub fn with_mcp_bridge_exe(mut self, exe: impl Into<PathBuf>) -> Self {
+        self.mcp_bridge_exe = exe.into();
         self
     }
 
@@ -391,7 +420,9 @@ impl AgentManager {
         self.handles.lock().unwrap().contains_key(agent_id)
     }
 
-    /// Spawn a provider child, acquire a concurrency slot, wire its
+    /// Spawn a provider child, acquire a concurrency slot, stand up the per-agent
+    /// agent→BE MCP server + bridge (denylisted for `agent_type`, §6.8/§18.4),
+    /// write the generated `--mcp-config` for providers that consume it, wire the
     /// client-served request loop, and track it. Each connection's pending-id
     /// correlation lives in `intent-acp`; the manager keys the handle by
     /// `AgentId` and registers it for lifecycle/eviction.
@@ -400,10 +431,52 @@ impl AgentManager {
         agent_id: AgentId,
         workspace_id: WorkspaceId,
         agent_name: impl Into<String>,
+        agent_type: &str,
         cwd: PathBuf,
         opts: &SpawnOptions<'_>,
     ) -> Result<()> {
         self.registry.acquire().await;
+
+        // Per-agent in-process MCP server over the SAME services surface the FE
+        // uses, with the §18.4 denylist for this agent type applied, served over
+        // a loopback bridge a real spawned child reaches via `--mcp-config`.
+        let api: Arc<dyn WorkspaceApi> = Arc::new(self.services.clone());
+        let server = Arc::new(WorkspaceMcpServer::for_agent_type(
+            api,
+            workspace_id.clone(),
+            agent_type,
+        ));
+        let bridge = serve_workspace_mcp_tcp(server)
+            .await
+            .map_err(|e| Error::Internal(format!("mcp bridge bind failed: {e}")))?;
+
+        // Generated MCP config (auggie format) pointing at the bridge
+        // subcommand, written only for providers that consume an MCP-config flag.
+        let mut mcp_config: Option<TempConfigFile> = None;
+        let mut mcp_config_path: Option<String> = None;
+        if opts.provider.supports_mcp_config {
+            let config = self.generate_mcp_config(&bridge);
+            let path = std::env::temp_dir().join(format!("intentd-mcp-{}.json", Uuid::new_v4()));
+            let bytes = serde_json::to_vec_pretty(&config)
+                .map_err(|e| Error::Internal(format!("serialize mcp config failed: {e}")))?;
+            std::fs::write(&path, bytes)
+                .map_err(|e| Error::Internal(format!("write mcp config failed: {e}")))?;
+            mcp_config_path = Some(path.to_string_lossy().into_owned());
+            mcp_config = Some(TempConfigFile { path });
+        }
+
+        // Reconstruct the spawn options with the generated config path injected.
+        let mut spawn_opts = SpawnOptions::new(opts.provider);
+        spawn_opts.model = opts.model;
+        spawn_opts.cwd = opts.cwd;
+        spawn_opts.rules_file = opts.rules_file;
+        spawn_opts.quiet = opts.quiet;
+        spawn_opts.provider_binary = opts.provider_binary;
+        spawn_opts.extra_env = opts.extra_env.clone();
+        if let Some(ref p) = mcp_config_path {
+            spawn_opts.mcp_config_file = Some(p.as_str());
+        }
+
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<IncomingRequest>();
         let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
         let hooks = ConnectionHooks {
@@ -415,7 +488,7 @@ impl AgentManager {
                 .map(|p| p.iter().map(|s| s.to_string()).collect())
                 .unwrap_or_default(),
         };
-        let spawned = spawn_provider(opts, hooks)
+        let spawned = spawn_provider(&spawn_opts, hooks)
             .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
         let (child, connection) = spawned.into_parts();
         let connection = Arc::new(connection);
@@ -445,9 +518,56 @@ impl AgentManager {
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task,
             _child: Some(child),
+            _mcp_bridge: Some(bridge),
+            _mcp_config: mcp_config,
         };
         self.handles.lock().unwrap().insert(agent_id, handle);
         Ok(())
+    }
+
+    /// Build the generated `--mcp-config` (auggie `{ mcpServers }` shape): the
+    /// `workspace-mcp` server is the `intentd mcp-bridge --connect <addr>`
+    /// subcommand, with the safe baseline env injected (§6.8).
+    fn generate_mcp_config(&self, bridge: &McpBridge) -> serde_json::Value {
+        let mut servers = NormalizedMcpServers::new();
+        servers.insert(
+            "workspace-mcp".to_string(),
+            NormalizedMcpServer::Stdio {
+                command: self.mcp_bridge_exe.to_string_lossy().into_owned(),
+                args: vec![
+                    "mcp-bridge".to_string(),
+                    "--connect".to_string(),
+                    bridge.connect_addr(),
+                ],
+                env: build_baseline_mcp_env_from_process(),
+            },
+        );
+        to_auggie_mcp_config(&servers)
+    }
+
+    /// Complete the connection handshake and open an ACP session for a spawned
+    /// agent (the agent→BE MCP server is delivered out-of-band via the generated
+    /// `--mcp-config`, so `session/new` carries no `mcpServers`). Returns the
+    /// persisted `acpSessionId` to drive [`AgentManager::run_turn`].
+    pub async fn start_session(
+        &self,
+        agent_id: &AgentId,
+        cwd: PathBuf,
+        provider: &ProviderConfig,
+    ) -> Result<String> {
+        let conn = {
+            let map = self.handles.lock().unwrap();
+            map.get(agent_id)
+                .ok_or_else(|| Error::NotFound(format!("agent {agent_id}")))?
+                .connection
+                .clone()
+        };
+        handshake(conn.as_ref(), provider)
+            .await
+            .map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
+        self.services
+            .open_acp_session(conn.as_ref(), agent_id, cwd, Vec::new())
+            .await
     }
 
     /// Drive one `session/prompt` turn for `agent_id`, marking it active for the

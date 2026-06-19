@@ -165,6 +165,8 @@ fn mock_handle() -> AgentHandle {
         notifications: Arc::new(TokioMutex::new(note_rx)),
         serve_task: tokio::spawn(async {}),
         _child: None,
+        _mcp_bridge: None,
+        _mcp_config: None,
     }
 }
 
