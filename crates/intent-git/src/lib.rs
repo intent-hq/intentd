@@ -1,22 +1,24 @@
-//! intent-git — libgit2/gix wrappers + worktree locking (§3.1).
+//! intent-git — git2 (libgit2) wrappers + worktree locking (§3.1, §9.5).
 //!
-//! Depends on `intent-core` only (§3.2). Stub only — git2/gix is pulled when
-//! git operations land in Wave 3.
+//! Depends on `intent-core` only (§3.2). Provides the read/stage git operations
+//! exposed over the wire (`git.status`, `git.stage`, `git.getBranches`) plus the
+//! internal diff and worktree-lock helpers Cycle C consumes. Local git
+//! operations live here, never in `intent-sourcecontrol` (the forge trait, §7).
 
-pub use intent_core::Result;
+use intent_core::Error;
 
-pub mod status {
-    //! Working-tree status — stub.
-}
+pub use intent_core::{FileStatus, GitBranches, GitFileStatus, GitStatus, Result};
 
-pub mod commit {
-    //! Stage + commit operations — stub.
-}
+pub mod branches;
+pub mod diff;
+pub mod stage;
+pub mod status;
+pub mod worktree;
 
-pub mod branches {
-    //! Branch listing / management — stub.
-}
+#[cfg(test)]
+mod testutil;
 
-pub mod worktree {
-    //! Worktree create + lock — stub.
+/// Map a libgit2 error into the domain [`Error::Internal`] (`-32603`).
+pub(crate) fn map_git_err(e: git2::Error) -> Error {
+    Error::Internal(e.message().to_string())
 }

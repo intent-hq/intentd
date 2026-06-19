@@ -1,0 +1,94 @@
+//! Test-only git fixtures: a self-cleaning temp directory plus helpers to seed a
+//! repository, commit/stage/branch, and write loose blobs.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use git2::{Repository, Signature};
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A temp directory removed on drop.
+pub struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Create a fresh git repository in a unique temp directory.
+pub fn init_repo(tag: &str) -> TempDir {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("intent-git-{tag}-{nanos}-{n}"));
+    std::fs::create_dir_all(&path).unwrap();
+    let repo = Repository::init(&path).unwrap();
+    let mut cfg = repo.config().unwrap();
+    cfg.set_str("user.name", "Test").unwrap();
+    cfg.set_str("user.email", "test@example.com").unwrap();
+    TempDir { path }
+}
+
+/// Write a file under the worktree (creating parent dirs).
+pub fn write_file(worktree: &Path, rel: &str, contents: &str) {
+    let full = worktree.join(rel);
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(full, contents).unwrap();
+}
+
+/// Write `rel` and commit it, returning nothing (HEAD advances).
+pub fn commit_file(worktree: &Path, rel: &str, contents: &str) {
+    write_file(worktree, rel, contents);
+    let repo = Repository::open(worktree).unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new(rel)).unwrap();
+    index.write().unwrap();
+    let tree_oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let sig = Signature::now("Test", "test@example.com").unwrap();
+    let parents = match repo.head().ok().and_then(|h| h.target()) {
+        Some(oid) => vec![repo.find_commit(oid).unwrap()],
+        None => Vec::new(),
+    };
+    let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+    repo.commit(Some("HEAD"), &sig, &sig, "commit", &tree, &parent_refs)
+        .unwrap();
+}
+
+/// Create a branch named `name` at the current HEAD commit.
+pub fn create_branch(worktree: &Path, name: &str) {
+    let repo = Repository::open(worktree).unwrap();
+    let head = repo.head().unwrap().target().unwrap();
+    let commit = repo.find_commit(head).unwrap();
+    repo.branch(name, &commit, false).unwrap();
+}
+
+/// Check out an existing branch so it becomes the current branch.
+pub fn checkout_branch(worktree: &Path, name: &str) {
+    let repo = Repository::open(worktree).unwrap();
+    let refname = format!("refs/heads/{name}");
+    repo.set_head(&refname).unwrap();
+    let mut opts = git2::build::CheckoutBuilder::new();
+    opts.force();
+    repo.checkout_head(Some(&mut opts)).unwrap();
+}
+
+/// Write a loose blob into the object DB and return its SHA.
+pub fn write_blob(worktree: &Path, bytes: &[u8]) -> String {
+    let repo = Repository::open(worktree).unwrap();
+    repo.blob(bytes).unwrap().to_string()
+}
