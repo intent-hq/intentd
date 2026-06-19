@@ -6,25 +6,28 @@ use std::pin::Pin;
 use crate::error::{Error, Result};
 use crate::ids::{NoteId, WorkspaceId};
 use crate::model::{
-    CommentAddResult, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
-    CommentRespondResult, Event, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
-    FileActivity, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteSetContentResult, NoteTaskRow,
-    NoteUpdateInput, NoteUpdateMetadataResult, ReadAssetResult, TaskAssignAgentResult,
-    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult,
-    TaskMarkAsTaskResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    Workspace, WorkspaceCreate, WorkspaceEventSummary, WorkspaceUpdate,
+    AgentDelegateInput, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
+    CommentListResult, CommentRespondResult, Event, EventQueryParams, EventSubscribeResult,
+    EventUnsubscribeResult, FileActivity, Note, NoteAddInput, NoteAddResult, NoteCreate,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, ReadAssetResult,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskUpdateNoteStatusResult, TaskUpdateResult,
+    TaskUpdateStatusResult, Workspace, WorkspaceCreate, WorkspaceEventSummary, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
 /// as `Arc<dyn WorkspaceApi>` (the agent→BE callback handle, §6.8).
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Business-logic read surface that `intent-acp` calls back into and the
-/// transport router dispatches to. Defined here in the leaf crate; the real,
-/// store-backed implementation lives in `intent-services` (§3.2 rule 3). The
-/// default bodies return an internal error so downstream stubs compile until
-/// they override these methods.
+/// The single shared service surface (§6.8, "one impl, two front doors"): the
+/// transport JSON-RPC router and the agent→BE MCP callback both dispatch to the
+/// same `WorkspaceApi`, so an agent calling `note.*`/`task.*`/`comment.*`/
+/// `agent.delegate`/event queries reuses the FE's service logic without a
+/// dependency cycle. Defined here in the leaf crate so `intent-acp` can hold an
+/// `Arc<dyn WorkspaceApi>`; the real, store-backed implementation lives in
+/// `intent-services` (§3.2 rule 3). The default bodies return an internal error
+/// so downstream stubs compile until they override these methods.
 pub trait WorkspaceApi: Send + Sync {
     /// List workspaces, optionally including archived ones (PROTOCOL §5.1).
     fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
@@ -410,6 +413,23 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::assign_agent not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.delegate`: delegate a task to a new agent (PROTOCOL §5.5). Part of
+    /// the shared MCP surface agents call back into; the runtime wiring
+    /// (spawn/ACP) lands in a later milestone, so the default returns an
+    /// internal error and the result is the opaque service value.
+    fn agent_delegate(
+        &self,
+        workspace_id: WorkspaceId,
+        input: AgentDelegateInput,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, input);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_delegate not implemented".to_string(),
             ))
         })
     }

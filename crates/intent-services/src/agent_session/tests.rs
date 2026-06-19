@@ -1,0 +1,339 @@
+//! Driver tests over a temp SQLite store + a mock ACP agent: a prompt turn
+//! accumulates chunks, publishes events in order with a single terminal
+//! `stream:end`, persists `acpSessionId`, and gates resume on the capability.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use intent_acp::session::{ContentBlock, InitializeResponse};
+use intent_acp::{Connection, ConnectionHooks, IncomingNotification};
+use intent_core::{
+    now_iso, AgentId, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
+    WorkspaceId, WorkspaceStatus,
+};
+use intent_store::Store;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+
+use crate::events::{EventBus, SubscriptionFilter};
+use crate::Services;
+
+struct TempDb {
+    path: PathBuf,
+}
+
+impl TempDb {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("intentd-agent-{}.db", uuid::Uuid::new_v4()));
+        Self { path }
+    }
+}
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
+        }
+    }
+}
+
+const ACP_SID: &str = "acp-session-1";
+
+/// Mock agent: answers the lifecycle methods; `session/prompt` streams two text
+/// chunks and one tool call, then resolves with `end_turn`.
+fn spawn_mock_agent<R, W>(read: R, write: W) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                for note in prompt_updates() {
+                    write
+                        .write_all(format!("{note}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/load" => json!({}),
+                "session/prompt" => json!({ "stopReason": "end_turn" }),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// The `session/update` notifications a prompt turn streams before completing.
+fn prompt_updates() -> Vec<String> {
+    let chunk = |text: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": ACP_SID,
+                "update": { "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": text } }
+            }
+        })
+        .to_string()
+    };
+    let tool = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": "Edit src/lib.rs", "kind": "edit", "status": "in_progress",
+                "rawInput": { "path": "src/lib.rs" } }
+        }
+    })
+    .to_string();
+    vec![chunk("Hello "), chunk("world"), tool]
+}
+
+/// Wire a `Connection` to a fresh mock agent, returning the connection, its
+/// notification receiver, and the agent task handle.
+fn connect() -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+) {
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent = spawn_mock_agent(c2a_agent, a2c_agent);
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent)
+}
+
+async fn setup() -> (TempDb, Services, EventBus, AgentId, WorkspaceId) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store.clone()).with_event_bus(bus.clone());
+    let workspace_id = WorkspaceId::from("ws-1");
+    let agent_id = AgentId::from("agent-1");
+    store
+        .insert_workspace(&workspace(&workspace_id))
+        .await
+        .expect("insert workspace");
+    store
+        .insert_agent_session(&new_session(&agent_id, &workspace_id))
+        .await
+        .expect("insert agent session");
+    (tmp, services, bus, agent_id, workspace_id)
+}
+
+fn workspace(id: &WorkspaceId) -> Workspace {
+    let ts = now_iso();
+    Workspace {
+        id: id.clone(),
+        title: "WS".to_string(),
+        branch: "main".to_string(),
+        base_ref: None,
+        base_commit_sha: None,
+        status: WorkspaceStatus::Active,
+        status_message: None,
+        activity: WorkspaceActivity::Idle,
+        attention: WorkspaceAttention::None,
+        created_at: ts.clone(),
+        updated_at: ts,
+        last_activity: None,
+        tags: vec![],
+        path: None,
+        repository_owner: None,
+        repository_name: None,
+        worktree_path: None,
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        archived: false,
+        archived_at: None,
+    }
+}
+
+fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
+    let ts = now_iso();
+    AgentSession {
+        id: agent_id.clone(),
+        workspace_id: workspace_id.clone(),
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Builder".to_string(),
+        name_explicitly_set: false,
+        model: None,
+        provider: None,
+        system_prompt: None,
+        status: AgentStatus::Pending,
+        is_active: true,
+        messages: Vec::new(),
+        stats: None,
+        created_at: ts.clone(),
+        updated_at: ts,
+    }
+}
+
+fn text_block(text: &str) -> ContentBlock {
+    serde_json::from_value(json!({ "type": "text", "text": text })).unwrap()
+}
+
+fn init_caps(load_session: bool) -> InitializeResponse {
+    serde_json::from_value(
+        json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": load_session } }),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn prompt_turn_streams_events_and_accumulates() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect();
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let stop = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+        )
+        .await
+        .expect("turn completes");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+
+    // Collect the published events (default filter → one event per batch).
+    let mut events = Vec::new();
+    while events.len() < 4 {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(
+        types,
+        vec![
+            "agent:stream:chunk",
+            "agent:stream:chunk",
+            "agent:tool:call",
+            "agent:stream:end",
+        ],
+        "events publish in order with a single terminal stream:end"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.event_type == "agent:stream:end")
+            .count(),
+        1
+    );
+
+    let tool = events
+        .iter()
+        .find(|e| e.event_type == "agent:tool:call")
+        .unwrap();
+    assert_eq!(tool.data["toolKind"], json!("file"));
+    assert_eq!(tool.data["status"], json!("started"));
+    assert_eq!(tool.data["input"], json!({ "path": "src/lib.rs" }));
+
+    // Chunks accumulate into one assistant message (coalesced text).
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, "assistant");
+    assert_eq!(
+        messages[0].content,
+        json!([{ "type": "text", "text": "Hello world" }])
+    );
+}
+
+#[tokio::test]
+async fn open_acp_session_persists_id() {
+    let (_tmp, services, bus, agent_id, _ws) = setup().await;
+    let (conn, _rx, _agent) = connect();
+    let sid = services
+        .open_acp_session(&conn, &agent_id, "/tmp/ws", Vec::new())
+        .await
+        .expect("open session");
+    assert_eq!(sid, ACP_SID);
+    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
+}
+
+#[tokio::test]
+async fn resume_requires_capability_and_stored_id() {
+    let (_tmp, services, bus, agent_id, _ws) = setup().await;
+    let (conn, _rx, _agent) = connect();
+
+    // No stored acpSessionId yet → None even with the capability.
+    assert_eq!(
+        services
+            .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
+            .await
+            .unwrap(),
+        None
+    );
+
+    bus.store()
+        .set_acp_session_id(&agent_id, ACP_SID)
+        .await
+        .unwrap();
+
+    // Stored id but the agent lacks loadSession → None.
+    assert_eq!(
+        services
+            .resume_acp_session(&conn, &init_caps(false), &agent_id, "/tmp/ws", Vec::new())
+            .await
+            .unwrap(),
+        None
+    );
+
+    // Stored id + capability → resumes.
+    assert_eq!(
+        services
+            .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
+            .await
+            .unwrap(),
+        Some(ACP_SID.to_string())
+    );
+}

@@ -4,10 +4,10 @@
 use std::path::PathBuf;
 
 use intent_core::{
-    events, now_iso, ActorType, AgentId, AuthorType, Comment, CommentAnchor, CommentAnchorType,
-    CommentStatus, CommentType, ContentType, EventActor, Note, NoteId, NoteVisibility,
-    TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, Comment,
+    CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, EventActor, Note,
+    NoteId, NoteVisibility, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use serde_json::json;
 
@@ -76,8 +76,8 @@ async fn migration_status_reports_current_after_open() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let status = store.migration_status().await.expect("migration status");
     assert!(status.is_current(), "fresh open must apply all migrations");
-    assert_eq!(status.expected, vec![1, 2, 3]);
-    assert_eq!(status.applied, vec![1, 2, 3]);
+    assert_eq!(status.expected, vec![1, 2, 3, 4]);
+    assert_eq!(status.applied, vec![1, 2, 3, 4]);
 }
 
 #[tokio::test]
@@ -521,4 +521,155 @@ async fn event_round_trip_and_queries() {
         .expect("page");
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].timestamp, "2026-01-01T00:00:02Z");
+}
+
+fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
+    let ts = now_iso();
+    AgentSession {
+        id: id.clone(),
+        workspace_id: ws.clone(),
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Builder".to_string(),
+        name_explicitly_set: false,
+        model: Some("opus".to_string()),
+        provider: None,
+        system_prompt: Some("be helpful".to_string()),
+        status: AgentStatus::Pending,
+        is_active: false,
+        messages: Vec::new(),
+        stats: None,
+        created_at: ts.clone(),
+        updated_at: ts,
+    }
+}
+
+#[tokio::test]
+async fn agent_session_round_trip_and_append_only_log() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let agent_id = AgentId::from("agent-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+
+    // Append-only log: seq is monotonic per agent, starting at 0.
+    let m0 = store
+        .append_agent_message(
+            &agent_id,
+            "user",
+            &json!([{ "type": "text", "text": "hi" }]),
+            "t0",
+        )
+        .await
+        .expect("append m0");
+    let m1 = store
+        .append_agent_message(
+            &agent_id,
+            "assistant",
+            &json!([{ "type": "text", "text": "yo" }]),
+            "t1",
+        )
+        .await
+        .expect("append m1");
+    assert_eq!(m0.seq, 0);
+    assert_eq!(m1.seq, 1);
+
+    // Round-trip the session with its full message log (chronological order).
+    let loaded = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(loaded.name, "Builder");
+    assert_eq!(loaded.model.as_deref(), Some("opus"));
+    assert_eq!(loaded.status, AgentStatus::Pending);
+    assert_eq!(loaded.messages.len(), 2);
+    assert_eq!(loaded.messages[0].seq, 0);
+    assert_eq!(loaded.messages[0].role, "user");
+    assert_eq!(
+        loaded.messages[0].content,
+        json!([{ "type": "text", "text": "hi" }])
+    );
+    assert_eq!(loaded.messages[1].seq, 1);
+
+    // getConversation cap: most-recent N, still oldest→newest.
+    assert_eq!(
+        store.count_agent_messages(&agent_id).await.expect("count"),
+        2
+    );
+    let recent = store
+        .get_agent_messages(&agent_id, Some(1))
+        .await
+        .expect("recent");
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].seq, 1);
+
+    let listed = store.list_agent_sessions(&ws).await.expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, agent_id);
+    assert_eq!(listed[0].messages.len(), 2);
+}
+
+#[tokio::test]
+async fn agent_acp_session_id_is_write_once() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+
+    // First write succeeds; re-setting the same value is idempotent.
+    store
+        .set_acp_session_id(&agent_id, "acp-1")
+        .await
+        .expect("first set");
+    store
+        .set_acp_session_id(&agent_id, "acp-1")
+        .await
+        .expect("idempotent set");
+    // Changing it to a different value is rejected.
+    assert!(store.set_acp_session_id(&agent_id, "acp-2").await.is_err());
+
+    // update_agent_session also refuses to overwrite a set acpSessionId.
+    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    s.acp_session_id = Some("acp-3".to_string());
+    assert!(store.update_agent_session(&s).await.is_err());
+}
+
+#[tokio::test]
+async fn agent_provider_is_immutable_once_set() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+
+    // Provider starts unset, so first set (via update) is allowed.
+    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    s.provider = Some("auggie".to_string());
+    s.status = AgentStatus::Active;
+    store.update_agent_session(&s).await.expect("set provider");
+
+    // Changing the provider afterwards is rejected.
+    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    s.provider = Some("claude-code".to_string());
+    assert!(store.update_agent_session(&s).await.is_err());
 }

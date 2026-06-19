@@ -59,6 +59,16 @@ pub const AGENT_QUEUE_STALE_MESSAGE: &str = "agent:queue:stale-message";
 // Agent user message events (cross-client sync).
 pub const AGENT_USER_MESSAGE_SENT: &str = "agent:user-message:sent";
 
+// Agent permission events (new in intentd; PROTOCOL §8). The TS reference
+// surfaced `session/request_permission` over Electron IPC rather than a
+// `WorkspaceEvent`; a wire backend instead pushes these to subscribed clients
+// and awaits a response RPC. `agent:permission:request` carries the normalized
+// `PermissionRequestData`; `agent:permission:resolved` carries the chosen
+// outcome (`selected`/`cancelled`). Both are scoped to the agent (`sessionId ==
+// agentId`) so a client can route the prompt to the right agent view.
+pub const AGENT_PERMISSION_REQUEST: &str = "agent:permission:request";
+pub const AGENT_PERMISSION_RESOLVED: &str = "agent:permission:resolved";
+
 // Git events.
 pub const GIT_COMMIT: &str = "git:commit";
 pub const GIT_PUSH: &str = "git:push";
@@ -153,6 +163,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_QUEUE_PROCESSING_CANCELLED,
     AGENT_QUEUE_STALE_MESSAGE,
     AGENT_USER_MESSAGE_SENT,
+    AGENT_PERMISSION_REQUEST,
+    AGENT_PERMISSION_RESOLVED,
     GIT_COMMIT,
     GIT_PUSH,
     GIT_PULL,
