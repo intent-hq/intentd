@@ -93,7 +93,9 @@ pub fn diff_index_to_workdir(repo_path: &Path) -> Result<Vec<FileDiff>> {
 }
 
 /// Lazily compute hunks for a single file from its old/new blob SHAs. A `None`
-/// blob is treated as empty (added/deleted file).
+/// blob is treated as empty (added/deleted file). Both blobs must exist in the
+/// object DB (committed/staged content); for an unstaged workdir change whose
+/// post-image is not yet a blob, use [`hunks_index_to_workdir`] instead.
 pub fn hunks_between(
     repo_path: &Path,
     old_blob: Option<&str>,
@@ -105,6 +107,44 @@ pub fn hunks_between(
     let mut opts = DiffOptions::new();
     let patch = Patch::from_buffers(&old_bytes, None, &new_bytes, None, Some(&mut opts))
         .map_err(map_git_err)?;
+    patch_to_hunks(&patch)
+}
+
+/// Compute hunks for a single file directly from the index→workdir diff, reading
+/// the workdir content rather than looking up a post-image blob in the object DB.
+/// This is the variant the agent-edit pipeline uses: an unstaged change's new
+/// content is not yet a blob, so [`hunks_between`] cannot hydrate it. Returns an
+/// empty vec when `rel_path` has no pending change (or is binary).
+pub fn hunks_index_to_workdir(repo_path: &Path, rel_path: &str) -> Result<Vec<DiffHunk>> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let mut opts = DiffOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true);
+    let diff = repo
+        .diff_index_to_workdir(None, Some(&mut opts))
+        .map_err(map_git_err)?;
+    for i in 0..diff.deltas().len() {
+        let delta = diff.get_delta(i).expect("delta index in range");
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if path != rel_path {
+            continue;
+        }
+        return match Patch::from_diff(&diff, i).map_err(map_git_err)? {
+            Some(patch) => patch_to_hunks(&patch),
+            None => Ok(Vec::new()),
+        };
+    }
+    Ok(Vec::new())
+}
+
+/// Extract the [`DiffHunk`] list (with per-line origin/numbers) from a [`Patch`].
+fn patch_to_hunks(patch: &Patch) -> Result<Vec<DiffHunk>> {
     let mut hunks = Vec::new();
     for h in 0..patch.num_hunks() {
         let (hunk, _lines) = patch.hunk(h).map_err(map_git_err)?;
@@ -205,6 +245,35 @@ mod tests {
             .lines
             .iter()
             .any(|l| l.kind == DiffLineKind::Deletion && l.content.contains("two")));
+    }
+
+    #[test]
+    fn hunks_index_to_workdir_reads_unstaged_workdir_content() {
+        // An unstaged workdir change's post-image is not yet a blob, so hunks
+        // must be read from the diff itself (not hydrated from a blob SHA).
+        let dir = init_repo("diff-workdir-hunks");
+        commit_file(dir.path(), "a.txt", "line1\nline2\nline3\n");
+        write_file(dir.path(), "a.txt", "line1\nCHANGED\nline3\nline4\n");
+        let hunks = hunks_index_to_workdir(dir.path(), "a.txt").unwrap();
+        assert_eq!(hunks.len(), 1);
+        let hunk = &hunks[0];
+        assert!(hunk
+            .lines
+            .iter()
+            .any(|l| l.kind == DiffLineKind::Addition && l.content.contains("CHANGED")));
+        assert!(hunk
+            .lines
+            .iter()
+            .any(|l| l.kind == DiffLineKind::Deletion && l.content.contains("line2")));
+    }
+
+    #[test]
+    fn hunks_index_to_workdir_missing_path_is_empty() {
+        let dir = init_repo("diff-workdir-none");
+        commit_file(dir.path(), "a.txt", "seed\n");
+        assert!(hunks_index_to_workdir(dir.path(), "a.txt")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
