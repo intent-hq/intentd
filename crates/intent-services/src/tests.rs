@@ -957,3 +957,67 @@ mod change_event_parity {
         );
     }
 }
+
+/// End-to-end §6.8 "one impl, two front doors": an agent (via the in-process MCP
+/// callback server) calls a workspace tool against the SAME store-backed
+/// `WorkspaceApi` the FE uses; the BE state changes and a change event fires.
+mod mcp_callback {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use intent_acp::WorkspaceMcpServer;
+    use intent_core::events::NOTE_UPDATED;
+    use intent_core::{NoteId, WorkspaceApi, WorkspaceId};
+    use intent_store::Store;
+    use serde_json::json;
+
+    use super::{note, workspace, TempDb};
+    use crate::{EventBus, Services, SubscriptionFilter};
+
+    #[tokio::test]
+    async fn agent_note_add_through_mcp_changes_state_and_fires_event() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let note_id = NoteId::from("n1");
+        store
+            .insert_note(&note(&ws, "n1", "# A\nbody"))
+            .await
+            .expect("note");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store).with_event_bus(bus.clone());
+
+        // Subscribe before the call; un-batched → immediate single-event batch.
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(ws.0.clone()),
+            ..Default::default()
+        });
+
+        let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+        let server = WorkspaceMcpServer::new(api.clone(), ws.clone());
+
+        let resp = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "add_to_note_workspace-mcp",
+                    "arguments": { "noteId": "n1", "content": "more" }
+                }
+            }))
+            .await
+            .expect("tools/call returns a response");
+        assert_eq!(resp["result"]["isError"], json!(false));
+
+        // BE state changed: the note content was persisted through the shared API.
+        let persisted = api.get_note(ws.clone(), note_id).await.expect("get");
+        assert_eq!(persisted.content, "# A\nbody\n\nmore");
+
+        // Event fired on the same bus the FE transport pushes from.
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        assert!(batch.iter().any(|e| e.event_type == NOTE_UPDATED));
+    }
+}
