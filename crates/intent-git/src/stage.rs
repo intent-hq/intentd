@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use git2::Repository;
+use git2::{ObjectType, Repository};
 use intent_core::{Error, Result};
 
 use crate::map_git_err;
@@ -36,6 +36,33 @@ pub fn stage(worktree_path: &Path, paths: &[String]) -> Result<()> {
         }
     }
     index.write().map_err(map_git_err)?;
+    Ok(())
+}
+
+/// Unstage `paths` (already split and validated), mirroring `git reset -- <paths>`:
+/// each path's index entry is reset to its `HEAD` version, or removed from the
+/// index when the path is absent from `HEAD` (a newly added file). With no
+/// commit yet (unborn `HEAD`) every path is reset against the empty tree, so a
+/// staged add is dropped from the index.
+pub fn unstage(worktree_path: &Path, paths: &[String]) -> Result<()> {
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| Error::Internal("Repository has no working directory".to_string()))?
+        .to_path_buf();
+    // The HEAD commit object backs `reset_default`; `None` (unborn HEAD) resets
+    // the listed paths against the empty tree, dropping staged adds.
+    let head = repo
+        .head()
+        .ok()
+        .and_then(|h| h.target())
+        .and_then(|oid| repo.find_object(oid, Some(ObjectType::Commit)).ok());
+    let specs: Vec<String> = paths
+        .iter()
+        .map(|raw| normalize_rel(&workdir, raw))
+        .collect();
+    repo.reset_default(head.as_ref(), specs.iter())
+        .map_err(map_git_err)?;
     Ok(())
 }
 
@@ -81,6 +108,32 @@ mod tests {
         let f = st.files.iter().find(|f| f.path == "gone.txt").unwrap();
         assert!(f.staged);
         assert_eq!(f.status, GitFileStatus::Deleted);
+    }
+
+    #[test]
+    fn unstage_reverts_a_staged_modification() {
+        let dir = init_repo("unstage-mod");
+        commit_file(dir.path(), "a.txt", "one\n");
+        write_file(dir.path(), "a.txt", "two\n");
+        stage(dir.path(), &["a.txt".to_string()]).unwrap();
+        unstage(dir.path(), &["a.txt".to_string()]).unwrap();
+        let st = status(dir.path()).unwrap();
+        let f = st.files.iter().find(|f| f.path == "a.txt").unwrap();
+        assert!(!f.staged);
+        assert_eq!(f.status, GitFileStatus::Modified);
+    }
+
+    #[test]
+    fn unstage_drops_a_staged_add_from_the_index() {
+        let dir = init_repo("unstage-add");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        write_file(dir.path(), "new.txt", "hi\n");
+        stage(dir.path(), &["new.txt".to_string()]).unwrap();
+        unstage(dir.path(), &["new.txt".to_string()]).unwrap();
+        let st = status(dir.path()).unwrap();
+        let f = st.files.iter().find(|f| f.path == "new.txt").unwrap();
+        assert!(!f.staged);
+        assert_eq!(f.status, GitFileStatus::Untracked);
     }
 
     #[test]

@@ -3223,6 +3223,263 @@ impl WorkspaceApi for Services {
             }))
         })
     }
+
+    fn file_tracking_init(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // Tracking is attached at workspace-open / agent-edit time (§17.1); the
+        // wire init is a no-op acknowledgement, matching the TS handler.
+        let _ = workspace_id;
+        Box::pin(async { Ok(serde_json::json!({ "ok": true })) })
+    }
+
+    fn file_tracking_sync(
+        &self,
+        workspace_id: WorkspaceId,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // `force` is accepted for wire parity; reconciliation is idempotent.
+            let _ = force;
+            let synced = serde_json::json!({ "success": true, "synced": true });
+            let ws = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(_) => return Ok(synced),
+            };
+            if ws.is_remote {
+                return Ok(synced);
+            }
+            let Some(worktree) = git_ops::worktree_path(&ws) else {
+                return Ok(synced);
+            };
+            if !worktree.join(".git").exists() {
+                return Ok(synced);
+            }
+            // Preserve existing attribution per path while reconciling the
+            // unstaged worktree changes against live git (§17.4).
+            let existing = store
+                .list_tracked_changes(&workspace_id)
+                .await
+                .unwrap_or_default();
+            let mut attribution: AttributionByPath = HashMap::new();
+            for row in &existing {
+                attribution.insert(
+                    row.path.clone(),
+                    (row.agent_id.clone(), row.session_id.clone(), row.turn),
+                );
+            }
+            let files = intent_git::diff::diff_index_to_workdir(&worktree)?;
+            for fd in files {
+                let summary = crate::diffs::compute_and_store(
+                    &store,
+                    &worktree,
+                    &workspace_id,
+                    &fd.path,
+                    false,
+                )
+                .await
+                .ok()
+                .flatten();
+                let status = if fd.old_blob.is_none() {
+                    "added"
+                } else if fd.new_blob.is_none() {
+                    "deleted"
+                } else {
+                    "modified"
+                };
+                let (agent_id, session_id, turn) = attribution
+                    .get(&fd.path)
+                    .cloned()
+                    .unwrap_or((None, None, None));
+                let change = intent_store::NewTrackedChange {
+                    workspace_id: workspace_id.clone(),
+                    path: fd.path.clone(),
+                    stage: "unstaged".to_string(),
+                    status: status.to_string(),
+                    agent_id,
+                    session_id,
+                    turn,
+                    commit_hash: None,
+                    old_blob_sha: summary.as_ref().and_then(|s| s.old_blob_sha.clone()),
+                    new_blob_sha: summary.as_ref().and_then(|s| s.new_blob_sha.clone()),
+                    additions: summary.as_ref().map(|s| s.additions).unwrap_or(0),
+                    deletions: summary.as_ref().map(|s| s.deletions).unwrap_or(0),
+                };
+                crate::file_tracking::track_change(&store, change).await?;
+            }
+            Ok(synced)
+        })
+    }
+
+    fn file_tracking_load(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let worktree = ft_worktree(&store, &workspace_id).await;
+            let rows = match store.list_tracked_changes(&workspace_id).await {
+                Ok(r) => r,
+                Err(_) => return Ok(empty_changes_result()),
+            };
+            Ok(file_tracking_ops::build_changes_result(
+                rows,
+                worktree.as_deref(),
+                &file_tracking_ops::ChangeFilterParsed::default(),
+            ))
+        })
+    }
+
+    fn file_tracking_get_changes(
+        &self,
+        workspace_id: WorkspaceId,
+        filter: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let parsed = file_tracking_ops::parse_filter(filter.as_ref());
+            let worktree = ft_worktree(&store, &workspace_id).await;
+            let rows = match store.list_tracked_changes(&workspace_id).await {
+                Ok(r) => r,
+                Err(_) => return Ok(empty_changes_result()),
+            };
+            Ok(file_tracking_ops::build_changes_result(
+                rows,
+                worktree.as_deref(),
+                &parsed,
+            ))
+        })
+    }
+
+    fn file_tracking_load_commits(
+        &self,
+        workspace_id: WorkspaceId,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Default 50 (TS), clamp to the PROTOCOL §5.19 cap of 200.
+            let limit = limit.unwrap_or(50).clamp(0, 200) as usize;
+            let empty = serde_json::json!({ "commits": [] });
+            let ws = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(_) => return Ok(empty),
+            };
+            if ws.is_remote {
+                return Ok(empty);
+            }
+            let Some(worktree) = git_ops::worktree_path(&ws) else {
+                return Ok(empty);
+            };
+            if !worktree.join(".git").exists() {
+                return Ok(empty);
+            }
+            let commits = intent_git::history::history(&worktree, limit)?;
+            let values: Vec<serde_json::Value> = commits
+                .iter()
+                .map(file_tracking_ops::commit_to_value)
+                .collect();
+            Ok(serde_json::json!({ "commits": values }))
+        })
+    }
+
+    fn file_tracking_get_line_stats(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let rows = store
+                .list_tracked_changes(&workspace_id)
+                .await
+                .unwrap_or_default();
+            let mut additions = 0i64;
+            let mut deletions = 0i64;
+            for row in &rows {
+                additions += row.additions;
+                deletions += row.deletions;
+            }
+            Ok(serde_json::json!({ "additions": additions, "deletions": deletions }))
+        })
+    }
+
+    fn file_tracking_stage(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let path_list = file_tracking_ops::parse_paths(&paths)?;
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to stage files: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to stage files: workspace has no worktree".to_string())
+            })?;
+            intent_git::stage::stage(&worktree, &path_list)?;
+            // Preserve attribution: move each file's audit row unstaged → staged.
+            for raw in &path_list {
+                let rel = file_tracking_ops::worktree_relative(&worktree, raw);
+                let key = crate::file_tracking::normalize_path(&rel);
+                store
+                    .set_tracked_change_stage(&workspace_id, &key, "unstaged", "staged")
+                    .await?;
+            }
+            Ok(serde_json::json!({ "ok": true }))
+        })
+    }
+
+    fn file_tracking_unstage(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let path_list = file_tracking_ops::parse_paths(&paths)?;
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to unstage files: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to unstage files: workspace has no worktree".to_string())
+            })?;
+            intent_git::stage::unstage(&worktree, &path_list)?;
+            // Preserve attribution: move each file's audit row staged → unstaged.
+            for raw in &path_list {
+                let rel = file_tracking_ops::worktree_relative(&worktree, raw);
+                let key = crate::file_tracking::normalize_path(&rel);
+                store
+                    .set_tracked_change_stage(&workspace_id, &key, "staged", "unstaged")
+                    .await?;
+            }
+            Ok(serde_json::json!({ "ok": true }))
+        })
+    }
+}
+
+/// Per-path attribution `(agent_id, session_id, turn)` carried across a
+/// `file-tracking.sync` reconcile so reconciled rows keep their provenance.
+type AttributionByPath = HashMap<String, (Option<String>, Option<String>, Option<i64>)>;
+
+/// Resolve a workspace's worktree path for the `file-tracking.*` reads (used to
+/// render the absolute `TrackedChange.file`). `None` for a missing/remote/
+/// pathless workspace — the reads still return their persisted rows.
+async fn ft_worktree(store: &Store, workspace_id: &WorkspaceId) -> Option<PathBuf> {
+    let ws = store.get_workspace(workspace_id).await.ok()?;
+    if ws.is_remote {
+        return None;
+    }
+    git_ops::worktree_path(&ws)
+}
+
+/// The empty `file-tracking.load`/`getChanges` result (TS `emptyChangesResult`).
+fn empty_changes_result() -> serde_json::Value {
+    serde_json::json!({ "changes": [], "truncated": false, "totalCount": 0 })
 }
 
 /// Capture a `pr.waitForChanges` poll snapshot (TS `captureSnapshot`): the PR
@@ -3301,6 +3558,7 @@ pub mod memories {}
 // Code Changes Review modules (§17).
 pub mod diffs;
 pub mod file_tracking;
+mod file_tracking_ops;
 pub mod accept_changes {}
 pub mod metrics {}
 

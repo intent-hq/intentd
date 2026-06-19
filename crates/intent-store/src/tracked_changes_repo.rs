@@ -123,6 +123,35 @@ impl Store {
         Ok(())
     }
 
+    /// Transition the `stage` of a workspace's tracked-change rows for `path`
+    /// from `from_stage` to `to_stage` in place, stamping `updated_at` and
+    /// preserving every attribution column (`agent_id`/`session_id`/`turn`) and
+    /// the recorded stats/blobs. Backs `file-tracking.stage`/`unstage` (M4.8):
+    /// staging/unstaging a file moves its audit row across the git stage without
+    /// dropping who produced it. Returns the number of rows transitioned.
+    pub async fn set_tracked_change_stage(
+        &self,
+        workspace_id: &WorkspaceId,
+        path: &str,
+        from_stage: &str,
+        to_stage: &str,
+    ) -> Result<u64> {
+        let now = now_iso();
+        let result = sqlx::query(
+            "UPDATE tracked_changes SET stage = ?, updated_at = ? \
+             WHERE workspace_id = ? AND path = ? AND stage = ?",
+        )
+        .bind(to_stage)
+        .bind(&now)
+        .bind(&workspace_id.0)
+        .bind(path)
+        .bind(from_stage)
+        .execute(self.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("transition tracked change failed: {e}")))?;
+        Ok(result.rows_affected())
+    }
+
     /// List a workspace's tracked changes, oldest first. Internal read used by the
     /// pipeline + tests (the UI-facing reads land in M4.8).
     pub async fn list_tracked_changes(

@@ -1659,3 +1659,307 @@ mod pr {
         assert!(evs.is_empty());
     }
 }
+
+/// `file-tracking.*` reads + stage/unstage over the M4.7 `tracked_changes` table
+/// and a real git worktree (M4.8).
+mod file_tracking {
+    use super::*;
+    use git2::{Repository, Signature};
+    use intent_store::NewTrackedChange;
+
+    /// A self-cleaning git repository seeded with one commit.
+    struct GitRepo {
+        dir: PathBuf,
+    }
+
+    impl Drop for GitRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn init_git_repo() -> GitRepo {
+        let dir = std::env::temp_dir().join(format!("intentd-ft-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = Repository::init(&dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Test").unwrap();
+        cfg.set_str("user.email", "test@example.com").unwrap();
+        commit_file(&dir, "seed.txt", "seed\n", "seed commit");
+        GitRepo { dir }
+    }
+
+    fn commit_file(dir: &std::path::Path, rel: &str, contents: &str, message: &str) {
+        std::fs::write(dir.join(rel), contents).unwrap();
+        let repo = Repository::open(dir).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(rel)).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let parents: Vec<git2::Commit> = repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .and_then(|oid| repo.find_commit(oid).ok())
+            .into_iter()
+            .collect();
+        let refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &refs)
+            .unwrap();
+    }
+
+    fn tracked(ws: &WorkspaceId, path: &str, stage: &str, agent: Option<&str>) -> NewTrackedChange {
+        NewTrackedChange {
+            workspace_id: ws.clone(),
+            path: path.to_string(),
+            stage: stage.to_string(),
+            status: "modified".to_string(),
+            agent_id: agent.map(str::to_string),
+            session_id: Some("sess-1".to_string()),
+            turn: Some(3),
+            commit_hash: None,
+            old_blob_sha: None,
+            new_blob_sha: None,
+            additions: 5,
+            deletions: 2,
+        }
+    }
+
+    async fn ft_setup() -> (TempDb, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        (tmp, Services::new(store), ws)
+    }
+
+    #[tokio::test]
+    async fn load_returns_tracked_changes_with_attribution() {
+        let (_t, svc, ws) = ft_setup().await;
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "src/a.ts", "unstaged", Some("agent-1")))
+            .await
+            .unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "src/b.ts", "staged", None))
+            .await
+            .unwrap();
+
+        let result = svc.file_tracking_load(ws.clone()).await.unwrap();
+        assert_eq!(result["totalCount"], serde_json::json!(2));
+        assert_eq!(result["truncated"], serde_json::json!(false));
+        let changes = result["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 2);
+        let a = changes
+            .iter()
+            .find(|c| c["relativePath"] == "src/a.ts")
+            .unwrap();
+        assert_eq!(a["stage"], serde_json::json!("unstaged"));
+        assert_eq!(
+            a["attribution"]["agent"]["agentId"],
+            serde_json::json!("agent-1")
+        );
+        assert_eq!(
+            a["attribution"]["agent"]["turnNumber"],
+            serde_json::json!(3)
+        );
+        let b = changes
+            .iter()
+            .find(|c| c["relativePath"] == "src/b.ts")
+            .unwrap();
+        assert!(b["attribution"].get("agent").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_changes_filters_by_stage_and_agent() {
+        let (_t, svc, ws) = ft_setup().await;
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "a.ts", "unstaged", Some("agent-1")))
+            .await
+            .unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "b.ts", "staged", Some("agent-2")))
+            .await
+            .unwrap();
+
+        let staged = svc
+            .file_tracking_get_changes(ws.clone(), Some(serde_json::json!({ "stage": "staged" })))
+            .await
+            .unwrap();
+        assert_eq!(staged["totalCount"], serde_json::json!(2));
+        let arr = staged["changes"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["relativePath"], serde_json::json!("b.ts"));
+
+        let by_agent = svc
+            .file_tracking_get_changes(
+                ws.clone(),
+                Some(serde_json::json!({ "agentId": "agent-1" })),
+            )
+            .await
+            .unwrap();
+        let arr = by_agent["changes"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["relativePath"], serde_json::json!("a.ts"));
+    }
+
+    #[tokio::test]
+    async fn get_line_stats_sums_additions_and_deletions() {
+        let (_t, svc, ws) = ft_setup().await;
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "a.ts", "unstaged", None))
+            .await
+            .unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "b.ts", "staged", None))
+            .await
+            .unwrap();
+        let stats = svc.file_tracking_get_line_stats(ws.clone()).await.unwrap();
+        assert_eq!(stats["additions"], serde_json::json!(10));
+        assert_eq!(stats["deletions"], serde_json::json!(4));
+    }
+
+    #[tokio::test]
+    async fn init_is_ok_and_load_empty_for_unknown_workspace() {
+        let (_t, svc, ws) = ft_setup().await;
+        assert_eq!(
+            svc.file_tracking_init(ws.clone()).await.unwrap(),
+            serde_json::json!({ "ok": true })
+        );
+        let missing = WorkspaceId::new();
+        let result = svc.file_tracking_load(missing).await.unwrap();
+        assert_eq!(result["totalCount"], serde_json::json!(0));
+        assert_eq!(result["changes"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn stage_then_unstage_preserves_attribution() {
+        let repo = init_git_repo();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store);
+
+        // A new agent-authored file with an unstaged audit row.
+        std::fs::write(repo.dir.join("x.txt"), "hi\n").unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws_id, "x.txt", "unstaged", Some("agent-9")))
+            .await
+            .unwrap();
+
+        // Stage → git index + audit row both move to staged, attribution kept.
+        svc.file_tracking_stage(ws_id.clone(), serde_json::json!(["x.txt"]))
+            .await
+            .unwrap();
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        assert!(st.files.iter().any(|f| f.path == "x.txt" && f.staged));
+        let changes = svc.file_tracking_load(ws_id.clone()).await.unwrap();
+        let row = changes["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["relativePath"] == "x.txt")
+            .unwrap();
+        assert_eq!(row["stage"], serde_json::json!("staged"));
+        assert_eq!(
+            row["attribution"]["agent"]["agentId"],
+            serde_json::json!("agent-9")
+        );
+
+        // Unstage → both move back to unstaged, attribution still kept.
+        svc.file_tracking_unstage(ws_id.clone(), serde_json::json!(["x.txt"]))
+            .await
+            .unwrap();
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        assert!(st.files.iter().any(|f| f.path == "x.txt" && !f.staged));
+        let changes = svc.file_tracking_load(ws_id.clone()).await.unwrap();
+        let row = changes["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["relativePath"] == "x.txt")
+            .unwrap();
+        assert_eq!(row["stage"], serde_json::json!("unstaged"));
+        assert_eq!(
+            row["attribution"]["agent"]["agentId"],
+            serde_json::json!("agent-9")
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_rejects_empty_paths() {
+        let (_t, svc, ws) = ft_setup().await;
+        let err = svc
+            .file_tracking_stage(ws, serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("No file paths provided"));
+    }
+
+    #[tokio::test]
+    async fn load_commits_returns_history_with_attribution() {
+        let repo = init_git_repo();
+        commit_file(
+            &repo.dir,
+            "feature.txt",
+            "feature\n",
+            "add feature\n\nAgent-Id: agent-7\nLinked-Note-Id: note-2\n",
+        );
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store);
+
+        let result = svc
+            .file_tracking_load_commits(ws_id, Some(10))
+            .await
+            .unwrap();
+        let commits = result["commits"].as_array().unwrap();
+        assert_eq!(commits.len(), 2);
+        let head = &commits[0];
+        assert_eq!(head["agentId"], serde_json::json!("agent-7"));
+        assert_eq!(head["linkedNoteId"], serde_json::json!("note-2"));
+        assert_eq!(head["filesChanged"], serde_json::json!(1));
+        assert_eq!(head["isPushed"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn sync_reconciles_unstaged_changes_preserving_attribution() {
+        let repo = init_git_repo();
+        // A pre-existing agent attribution row for a file we now modify.
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nmore\n").unwrap();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        store
+            .upsert_tracked_change(&tracked(&ws_id, "seed.txt", "unstaged", Some("agent-3")))
+            .await
+            .unwrap();
+        let svc = Services::new(store);
+
+        let result = svc.file_tracking_sync(ws_id.clone(), false).await.unwrap();
+        assert_eq!(result["success"], serde_json::json!(true));
+        let changes = svc.file_tracking_load(ws_id).await.unwrap();
+        let row = changes["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["relativePath"] == "seed.txt")
+            .unwrap();
+        assert_eq!(
+            row["attribution"]["agent"]["agentId"],
+            serde_json::json!("agent-3")
+        );
+        assert!(row["stats"]["additions"].as_i64().unwrap() >= 1);
+    }
+}

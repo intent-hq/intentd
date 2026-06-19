@@ -1272,6 +1272,123 @@ pub trait WorkspaceApi: Send + Sync {
             ))
         })
     }
+
+    /// `file-tracking.init`: initialize/attach the tracker for a workspace
+    /// (`{ ok: true }`) (PROTOCOL §5.19).
+    fn file_tracking_init(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_init not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file-tracking.sync`: reconcile tracked changes against the live git
+    /// worktree, preserving attribution (PROTOCOL §5.19).
+    fn file_tracking_sync(
+        &self,
+        workspace_id: WorkspaceId,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, force);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_sync not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file-tracking.load`: the tracked-change review list
+    /// (`{ changes, truncated, totalCount }`) (PROTOCOL §5.19).
+    fn file_tracking_load(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_load not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file-tracking.getChanges`: the filtered tracked-change list
+    /// (`{ changes, truncated, totalCount }`) (PROTOCOL §5.19).
+    fn file_tracking_get_changes(
+        &self,
+        workspace_id: WorkspaceId,
+        filter: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, filter);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_get_changes not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file-tracking.loadCommits`: commit history with attribution
+    /// (`{ commits: CommitWithAttribution[] }`) (PROTOCOL §5.19).
+    fn file_tracking_load_commits(
+        &self,
+        workspace_id: WorkspaceId,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_load_commits not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file-tracking.getLineStats`: real-time additions/deletions totals
+    /// (`{ additions, deletions }`) (PROTOCOL §5.19).
+    fn file_tracking_get_line_stats(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_get_line_stats not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file-tracking.stage`: stage `paths` and move their audit rows to the
+    /// `staged` stage (`{ ok: true }`) (PROTOCOL §5.19).
+    fn file_tracking_stage(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, paths);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_stage not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file-tracking.unstage`: unstage `paths` and move their audit rows back to
+    /// the `unstaged` stage (`{ ok: true }`) (PROTOCOL §5.19).
+    fn file_tracking_unstage(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, paths);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_unstage not implemented".to_string(),
+            ))
+        })
+    }
 }
 
 /// Context-engine abstraction implemented by `intent-context` (§3.1).

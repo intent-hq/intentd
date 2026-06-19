@@ -1535,3 +1535,50 @@ async fn git_check_merge_conflicts_missing_workspace_id_is_minus_32602() {
         serde_json::json!("workspaceId is required")
     );
 }
+
+#[tokio::test]
+async fn file_tracking_methods_are_routed_not_method_not_found() {
+    // The default `WorkspaceApi` impl surfaces `-32603`; the point is that the
+    // methods dispatch (never `-32601 Method not found`).
+    for method in [
+        "file-tracking.init",
+        "file-tracking.sync",
+        "file-tracking.load",
+        "file-tracking.getChanges",
+        "file-tracking.loadCommits",
+        "file-tracking.getLineStats",
+    ] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"workspaceId":"ws-1"}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_ne!(err_code(&v), -32601, "{method} should be routed");
+    }
+}
+
+#[tokio::test]
+async fn file_tracking_reads_require_workspace_id() {
+    for method in ["file-tracking.load", "file-tracking.getLineStats"] {
+        let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{}}}}"#);
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602);
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!("workspaceId is required")
+        );
+    }
+}
+
+#[tokio::test]
+async fn file_tracking_stage_requires_paths() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file-tracking.stage","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: paths")
+    );
+}

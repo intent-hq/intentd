@@ -13,7 +13,7 @@ pub mod ids;
 pub mod model;
 pub mod traits;
 
-pub use clock::{iso_minutes_ago, now_iso, parse_iso};
+pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_iso, parse_iso};
 pub use config::Config;
 pub use error::{Error, Result};
 pub use events::is_known_event_type;

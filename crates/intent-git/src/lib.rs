@@ -16,6 +16,7 @@ pub mod branches;
 pub mod commit;
 pub mod conflicts;
 pub mod diff;
+pub mod history;
 pub mod stage;
 pub mod status;
 pub mod worktree;

@@ -972,6 +972,71 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "file-tracking.init" => {
+            let ws = require_ws_note(params)?;
+            let r = api.file_tracking_init(ws).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "file-tracking.sync" => {
+            let ws = require_ws_note(params)?;
+            let force = parse_bool(params, "force");
+            let r = api
+                .file_tracking_sync(ws, force)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "file-tracking.load" => {
+            let ws = require_ws_note(params)?;
+            let r = api.file_tracking_load(ws).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "file-tracking.getChanges" => {
+            let ws = require_ws_note(params)?;
+            let filter = opt_value(params, "filter");
+            let r = api
+                .file_tracking_get_changes(ws, filter)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "file-tracking.loadCommits" => {
+            let ws = require_ws_note(params)?;
+            let limit = opt_int(params, "limit");
+            let r = api
+                .file_tracking_load_commits(ws, limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "file-tracking.getLineStats" => {
+            let ws = require_ws_note(params)?;
+            let r = api
+                .file_tracking_get_line_stats(ws)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "file-tracking.stage" => {
+            let ws = require_ws_note(params)?;
+            require_present(params, "paths")?;
+            let paths = params.get("paths").cloned().unwrap_or(Value::Null);
+            let r = api
+                .file_tracking_stage(ws, paths)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "file-tracking.unstage" => {
+            let ws = require_ws_note(params)?;
+            require_present(params, "paths")?;
+            let paths = params.get("paths").cloned().unwrap_or(Value::Null);
+            let r = api
+                .file_tracking_unstage(ws, paths)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }
