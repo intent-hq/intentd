@@ -34,6 +34,7 @@ use intent_store::{EventQuery, NewEvent, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
 
+mod agent_manager;
 mod agent_session;
 mod event_ops;
 pub mod events;
@@ -42,6 +43,9 @@ mod note_ops;
 #[cfg(test)]
 mod tests;
 
+pub use agent_manager::{
+    compute_process_cap, default_process_cap, AgentManager, BusEventSink, ProcessRegistry,
+};
 pub use events::{EventBus, FileWatcher, Subscription, SubscriptionFilter};
 
 /// Aggregate service handle wired by the binary composition root. It implements

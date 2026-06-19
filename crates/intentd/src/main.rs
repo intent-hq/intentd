@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use intent_core::{Config, WorkspaceApi};
-use intent_services::{EventBus, FileWatcher, Services};
+use intent_services::{
+    default_process_cap, AgentManager, BusEventSink, EventBus, FileWatcher, Services,
+};
 use intent_store::Store;
 use intent_transport::serve_uds;
 use serde_json::{json, Value};
@@ -95,17 +97,32 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     // The services surface publishes CRUD change events onto the same bus that
     // transport subscriptions read, so a mutation on one connection streams to
     // subscribers on another (§10).
-    let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
-            .with_assets_root(config.data_dir.join("assets"))
-            .with_event_bus(bus.clone()),
+    let services = Services::new(store)
+        .with_assets_root(config.data_dir.join("assets"))
+        .with_event_bus(bus.clone());
+    // The AgentManager multiplexes spawned agent processes over the ACP client
+    // (§6.8). Its concrete EventSink bridges the client-served fs/permission
+    // events (M3.5) onto the same bus, and `run_turn` drives the streaming
+    // router (M3.4); a global process cap + LRU registry bound concurrency.
+    let manager = AgentManager::new(
+        services.clone(),
+        Arc::new(BusEventSink::new(bus.clone())),
+        default_process_cap(),
     );
+    tracing::info!(
+        process_cap = manager.registry().cap(),
+        "agent manager ready"
+    );
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     // Start a filesystem watcher per active workspace with a resolvable on-disk
     // path; each publishes debounced `file:changed` events to the shared bus.
     // The handles are held for the lifetime of `serve` and torn down on return.
-    let _watchers = start_workspace_watchers(&bus, services.as_ref()).await;
+    let _watchers = start_workspace_watchers(&bus, api.as_ref()).await;
     tracing::info!(socket = %config.socket_path.display(), "starting intentd");
-    serve_uds(services, bus, &config.socket_path, shutdown_signal()).await?;
+    serve_uds(api, bus, &config.socket_path, shutdown_signal()).await?;
+    // Clean shutdown: kill every spawned agent child and clear the registry
+    // (§6.8 teardown). Idle reaping during the run is the M5 `reap_idle` hook.
+    manager.shutdown().await;
     Ok(())
 }
 
