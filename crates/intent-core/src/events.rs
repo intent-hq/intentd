@@ -69,6 +69,19 @@ pub const AGENT_USER_MESSAGE_SENT: &str = "agent:user-message:sent";
 pub const AGENT_PERMISSION_REQUEST: &str = "agent:permission:request";
 pub const AGENT_PERMISSION_RESOLVED: &str = "agent:permission:resolved";
 
+// Pull-request events (new in intentd; §7.6). The TS reference broadcasts PR
+// refresh deltas over Electron IPC (`workspace:background-enrichment-complete`,
+// renderer-only); a wire backend instead emits `pr:*` WorkspaceEvents so the
+// iOS WS client updates linked-PR state without polling. Self-sufficient
+// payloads carry the new derived values: `pr:linked` →
+// `{ workspaceId, prNumber, prUrl, prStatus, activePullRequest }`, `pr:updated`
+// → `{ workspaceId, prNumber, prStatus, activePullRequest }`, `pr:unlinked` →
+// `{ workspaceId }`. All three are emitted **only on change** by the background
+// / on-demand PR refresh.
+pub const PR_LINKED: &str = "pr:linked";
+pub const PR_UPDATED: &str = "pr:updated";
+pub const PR_UNLINKED: &str = "pr:unlinked";
+
 // Git events.
 pub const GIT_COMMIT: &str = "git:commit";
 pub const GIT_PUSH: &str = "git:push";
@@ -165,6 +178,9 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_USER_MESSAGE_SENT,
     AGENT_PERMISSION_REQUEST,
     AGENT_PERMISSION_RESOLVED,
+    PR_LINKED,
+    PR_UPDATED,
+    PR_UNLINKED,
     GIT_COMMIT,
     GIT_PUSH,
     GIT_PULL,

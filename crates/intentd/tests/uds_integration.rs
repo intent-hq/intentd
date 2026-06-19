@@ -43,6 +43,8 @@ fn seed_workspace(id: &WorkspaceId) -> Workspace {
         default_model: None,
         pr_number: None,
         pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
         archived: false,
         archived_at: None,
     }

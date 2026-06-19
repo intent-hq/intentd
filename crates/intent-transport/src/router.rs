@@ -864,6 +864,114 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&r)
         }
+        "pr.status" => {
+            let ws = require_ws_note(params)?;
+            let r = api.pr_status(ws).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "pr.listComments" => {
+            let ws = require_ws_note(params)?;
+            let count = opt_int(params, "count");
+            let r = api
+                .pr_list_comments(ws, count)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "pr.listReviewComments" => {
+            let ws = require_ws_note(params)?;
+            let path = opt_str(params, "path");
+            let status = opt_str(params, "status");
+            let r = api
+                .pr_list_review_comments(ws, path, status)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "pr.getReviews" => {
+            let ws = require_ws_note(params)?;
+            let pr_number = opt_int(params, "prNumber").and_then(|n| u64::try_from(n).ok());
+            let r = api
+                .pr_get_reviews(ws, pr_number)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "pr.listCheckRuns" => {
+            let ws = require_ws_note(params)?;
+            let git_ref = opt_str(params, "ref");
+            let r = api
+                .pr_list_check_runs(ws, git_ref)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "pr.merge" => {
+            let ws = require_ws_note(params)?;
+            let merge_method = opt_str(params, "mergeMethod");
+            let commit_title = opt_str(params, "commitTitle");
+            let commit_message = opt_str(params, "commitMessage");
+            let r = api
+                .pr_merge(ws, merge_method, commit_title, commit_message)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "pr.updateBranch" => {
+            let ws = require_ws_note(params)?;
+            let r = api.pr_update_branch(ws).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "pr.postComment" => {
+            let ws = require_ws_note(params)?;
+            let body = require_str_param(params, "body")?;
+            let r = api.pr_post_comment(ws, body).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "pr.replyToReviewComment" => {
+            let ws = require_ws_note(params)?;
+            let comment_id = params
+                .get("commentId")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: commentId"))?;
+            let body = require_str_param(params, "body")?;
+            let r = api
+                .pr_reply_to_review_comment(ws, comment_id, body)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "pr.resolveThread" => {
+            let ws = require_ws_note(params)?;
+            let thread_id = require_str_param(params, "threadId")?;
+            let action = opt_str(params, "action");
+            let r = api
+                .pr_resolve_thread(ws, thread_id, action)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "pr.createReview" => {
+            let ws = require_ws_note(params)?;
+            let verdict = require_str_param(params, "verdict")?;
+            let body = opt_str(params, "body");
+            let r = api
+                .pr_create_review(ws, verdict, body)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "pr.waitForChanges" => {
+            let ws = require_ws_note(params)?;
+            let timeout_seconds = opt_int(params, "timeoutSeconds");
+            let poll_interval_seconds = opt_int(params, "pollIntervalSeconds");
+            let watch = opt_str(params, "watch");
+            let r = api
+                .pr_wait_for_changes(ws, timeout_seconds, poll_interval_seconds, watch)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }

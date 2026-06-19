@@ -131,6 +131,11 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
         process_cap = manager.registry().cap(),
         "agent manager ready"
     );
+    // Background PR refresh (§7.6): periodically re-fetch every linked PR,
+    // persist any change, and emit `pr:*` events so clients update without
+    // polling. Safe when source control is unconfigured (each refresh logs and
+    // swallows the missing-provider error). Aborted on clean shutdown.
+    let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(60));
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     // Start a filesystem watcher per active workspace with a resolvable on-disk
     // path; each publishes debounced `file:changed` events to the shared bus.
@@ -138,8 +143,10 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     let _watchers = start_workspace_watchers(&bus, api.as_ref()).await;
     tracing::info!(socket = %config.socket_path.display(), "starting intentd");
     serve_uds(api, bus, &config.socket_path, shutdown_signal()).await?;
-    // Clean shutdown: kill every spawned agent child and clear the registry
-    // (§6.8 teardown). Idle reaping during the run is the M5 `reap_idle` hook.
+    // Clean shutdown: stop the PR refresh loop, then kill every spawned agent
+    // child and clear the registry (§6.8 teardown). Idle reaping during the run
+    // is the M5 `reap_idle` hook.
+    pr_refresh.abort();
     manager.shutdown().await;
     Ok(())
 }

@@ -1,7 +1,8 @@
 //! Workspace repository: insert + list, mapping rows ↔ [`Workspace`] (§9.2).
 
 use intent_core::{
-    Error, Result, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    Error, PullRequestInfo, Result, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
+    WorkspaceStatus,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -10,15 +11,15 @@ use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, Store};
 
 const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, status, \
     status_message, attention, repository_owner, repository_name, worktree_path, scope, \
-    skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, \
-    created_at, updated_at, last_activity";
+    skip_worktree, is_remote, default_model, pr_number, pr_url, pr_status, active_pull_request, \
+    archived, archived_at, tags, created_at, updated_at, last_activity";
 
 impl Store {
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
     pub async fn insert_workspace(&self, ws: &Workspace) -> Result<()> {
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -38,6 +39,8 @@ impl Store {
             .bind(&ws.default_model)
             .bind(ws.pr_number.map(|n| n as i64))
             .bind(&ws.pr_url)
+            .bind(pr_status_to_db(ws)?)
+            .bind(active_pr_to_db(ws)?)
             .bind(ws.archived as i64)
             .bind(&ws.archived_at)
             .bind(tags_to_db(&ws.tags)?)
@@ -71,8 +74,8 @@ impl Store {
             "UPDATE workspace SET title=?, branch=?, base_ref=?, base_commit_sha=?, status=?, \
              status_message=?, attention=?, repository_owner=?, repository_name=?, \
              worktree_path=?, scope=?, skip_worktree=?, is_remote=?, default_model=?, \
-             pr_number=?, pr_url=?, archived=?, archived_at=?, tags=?, created_at=?, \
-             updated_at=?, last_activity=? WHERE id=?",
+             pr_number=?, pr_url=?, pr_status=?, active_pull_request=?, archived=?, \
+             archived_at=?, tags=?, created_at=?, updated_at=?, last_activity=? WHERE id=?",
         )
         .bind(&ws.title)
         .bind(&ws.branch)
@@ -90,6 +93,8 @@ impl Store {
         .bind(&ws.default_model)
         .bind(ws.pr_number.map(|n| n as i64))
         .bind(&ws.pr_url)
+        .bind(pr_status_to_db(ws)?)
+        .bind(active_pr_to_db(ws)?)
         .bind(ws.archived as i64)
         .bind(&ws.archived_at)
         .bind(tags_to_db(&ws.tags)?)
@@ -144,8 +149,38 @@ where
         .map_err(|e| Error::Internal(format!("column {name}: {e}")))
 }
 
+/// Encode the optional `pr_status` enum to its PascalCase DB word, or `None`.
+fn pr_status_to_db(ws: &Workspace) -> Result<Option<String>> {
+    ws.pr_status.map(|s| enum_to_db(&s)).transpose()
+}
+
+/// Encode the optional `active_pull_request` snapshot to a JSON TEXT column.
+fn active_pr_to_db(ws: &Workspace) -> Result<Option<String>> {
+    ws.active_pull_request
+        .as_ref()
+        .map(|pr| {
+            serde_json::to_string(pr)
+                .map_err(|e| Error::Internal(format!("encode active_pull_request failed: {e}")))
+        })
+        .transpose()
+}
+
+/// Decode the optional `active_pull_request` JSON TEXT column.
+fn active_pr_from_db(s: Option<String>) -> Result<Option<PullRequestInfo>> {
+    s.map(|json| {
+        serde_json::from_str::<PullRequestInfo>(&json)
+            .map_err(|e| Error::Internal(format!("decode active_pull_request failed: {e}")))
+    })
+    .transpose()
+}
+
 fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
     let pr_number: Option<i64> = col(row, "pr_number")?;
+    let pr_status = col::<Option<String>>(row, "pr_status")?
+        .map(|s| enum_from_db::<intent_core::PullRequestStatus>(&s))
+        .transpose()?;
+    let active_pull_request =
+        active_pr_from_db(col::<Option<String>>(row, "active_pull_request")?)?;
     Ok(Workspace {
         id: WorkspaceId(col(row, "id")?),
         title: col(row, "title")?,
@@ -174,6 +209,8 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         default_model: col(row, "default_model")?,
         pr_number: pr_number.map(|n| n as u64),
         pr_url: col(row, "pr_url")?,
+        pr_status,
+        active_pull_request,
         archived: col::<i64>(row, "archived")? != 0,
         archived_at: col(row, "archived_at")?,
     })

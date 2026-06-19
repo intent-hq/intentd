@@ -36,6 +36,48 @@ pub enum WorkspaceAttention {
     ReviewRequired,
 }
 
+/// Pull-request lifecycle status (§9.1; TS `PullRequestStatus` in
+/// `src/shared/types.ts`). Wire values are the PascalCase variant names
+/// (`Open`/`Closed`/`Merged`/`Draft`), matching the TS string enum exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PullRequestStatus {
+    Open,
+    Closed,
+    Merged,
+    Draft,
+}
+
+/// Pull-request metadata persisted on a [`Workspace`] as `activePullRequest`
+/// (§7.6; TS `PullRequestInfo` in `src/shared/types.ts`). A focused subset of
+/// the TS shape populated from the host-agnostic forge `PullRequest`; required
+/// fields match the TS required set, and absent optionals are omitted from the
+/// wire to mirror `JSON.stringify`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestInfo {
+    pub id: String,
+    pub number: u64,
+    pub url: String,
+    pub title: String,
+    pub status: PullRequestStatus,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mergeable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mergeable_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_draft: Option<bool>,
+}
+
 /// Note body content type (§9.1). `PlainText` serializes as `plain_text` to
 /// match the TS `ContentType` enum (`src/shared/types.ts`); the others are their
 /// lowercase names.
@@ -90,6 +132,10 @@ pub struct Workspace {
     pub default_model: Option<String>,
     pub pr_number: Option<u64>,
     pub pr_url: Option<String>,
+    /// Persisted PR lifecycle status for the linked PR (§7.6).
+    pub pr_status: Option<PullRequestStatus>,
+    /// Persisted snapshot of the linked PR (§7.6); refreshed in the background.
+    pub active_pull_request: Option<PullRequestInfo>,
     pub archived: bool,
     pub archived_at: Option<String>,
 }
