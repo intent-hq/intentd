@@ -743,6 +743,72 @@ impl WorkspaceApi for FakeApi {
     fn search_cancel(&self, _request_id: String) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async { Ok(serde_json::json!({ "ok": true })) })
     }
+
+    fn search_messages(
+        &self,
+        _workspace_id: WorkspaceId,
+        _query: String,
+        _agent_id: Option<String>,
+        _role: Option<String>,
+        _limit: Option<i64>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            let request_id = request_id.unwrap_or_else(|| "srch-minted".to_string());
+            Ok(serde_json::json!({ "requestId": request_id, "matches": [] }))
+        })
+    }
+
+    fn search_events(
+        &self,
+        _query: String,
+        _workspace_id: Option<WorkspaceId>,
+        _limit: Option<i64>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            let request_id = request_id.unwrap_or_else(|| "srch-minted".to_string());
+            Ok(serde_json::json!({ "requestId": request_id, "matches": [] }))
+        })
+    }
+
+    fn search_memories(
+        &self,
+        _query: String,
+        _workspace_id: Option<WorkspaceId>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            let request_id = request_id.unwrap_or_else(|| "srch-minted".to_string());
+            Ok(serde_json::json!({ "requestId": request_id, "matches": [] }))
+        })
+    }
+
+    fn search_notes(
+        &self,
+        _query: String,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            let request_id = request_id.unwrap_or_else(|| "srch-minted".to_string());
+            Ok(serde_json::json!({ "requestId": request_id, "matches": [] }))
+        })
+    }
+
+    fn search_codebase(
+        &self,
+        _workspace_id: WorkspaceId,
+        query: String,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if query == "bad(" {
+                return Err(Error::InvalidParams("Invalid regex".to_string()));
+            }
+            let request_id = request_id.unwrap_or_else(|| "srch-minted".to_string());
+            Ok(serde_json::json!({ "requestId": request_id, "matches": [] }))
+        })
+    }
 }
 
 async fn call(msg: &str) -> Option<Value> {
@@ -1738,4 +1804,101 @@ async fn search_cancel_requires_request_id_and_is_ok() {
     .await
     .unwrap();
     assert_eq!(v["result"], serde_json::json!({ "ok": true }));
+}
+
+#[tokio::test]
+async fn search_messages_requires_workspace_and_query() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"search.messages","params":{"query":"x"}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("workspaceId is required")
+    );
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"search.messages","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: query")
+    );
+    // Routed + echoes the caller's requestId.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"search.messages","params":{"workspaceId":"ws-1","query":"x","requestId":"srch-9"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["requestId"], serde_json::json!("srch-9"));
+}
+
+#[tokio::test]
+async fn search_events_requires_query_only() {
+    // No workspaceId required; missing query → -32602.
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"search.events","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: query")
+    );
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"search.events","params":{"query":"x","requestId":"srch-e"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["requestId"], serde_json::json!("srch-e"));
+}
+
+#[tokio::test]
+async fn search_memories_requires_query_only() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"search.memories","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"search.memories","params":{"query":"x","requestId":"srch-m"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["requestId"], serde_json::json!("srch-m"));
+}
+
+#[tokio::test]
+async fn search_notes_requires_query_and_is_global() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"search.notes","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    // No workspaceId → routed (global search).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"search.notes","params":{"query":"x","requestId":"srch-n"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["requestId"], serde_json::json!("srch-n"));
+}
+
+#[tokio::test]
+async fn search_codebase_requires_workspace_and_query_and_maps_regex() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"search.codebase","params":{"query":"x"}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("workspaceId is required")
+    );
+    // Malformed regex reuse surfaces the raw "Invalid regex" message.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"search.codebase","params":{"workspaceId":"ws-1","query":"bad("}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(v["error"]["message"], serde_json::json!("Invalid regex"));
 }
