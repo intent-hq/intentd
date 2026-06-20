@@ -8,28 +8,23 @@
 pub use intent_core::Result;
 pub use intent_services::Services;
 
+pub use auth::{
+    extract_bearer_token, extract_token, generate_token, get_or_create_token, is_allowed_origin,
+    is_auth_enabled, is_discovery_enabled, validate_token, KeyringTokenStore, TokenStore,
+};
 pub use listener::serve_uds;
 pub use router::handle_message;
+pub use tls::{cert_fingerprint, ensure_tls_certificate, TlsCertificate};
+pub use ws::{WsApiServer, WsOptions};
 
+pub mod auth;
+mod conn;
 mod events;
+pub mod lifecycle;
 pub mod listener;
 pub mod router;
-
-pub mod tls {
-    //! TLS termination + SHA-256 fingerprint pinning — stub.
-}
-
-pub mod auth {
-    //! Bearer auth + origin allow-list — stub.
-}
-
-pub mod heartbeat {
-    //! Connection heartbeat — stub.
-}
-
-pub mod lifecycle {
-    //! Single-flight start/stop, race guards, port backoff (§5.6) — stub.
-}
+pub mod tls;
+pub mod ws;
 
 pub mod mdns {
     //! mDNS advertisement of `_intent-ws._tcp` (§5.4) — stub.

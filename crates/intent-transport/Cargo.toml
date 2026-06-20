@@ -13,6 +13,24 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+httparse = "1"
+rcgen.workspace = true
+sha2 = "0.10.9"
+rustls-pemfile = "2.2.0"
+x509-parser = "0.18.1"
+if-addrs = "0.15.0"
+time.workspace = true
+getrandom = "0.2"
+subtle = "2"
+hex = "0.4"
+whoami = "1"
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
