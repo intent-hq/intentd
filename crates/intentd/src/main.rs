@@ -170,6 +170,9 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     // The event bus shares the store with the services surface so subscribers
     // see the same durable event log that future mutations will publish to.
     let bus = EventBus::new(store.clone());
+    // Hold a store handle for the §10.2 retention sweep before the store is
+    // moved into the services surface below.
+    let retention_store = store.clone();
     // The services surface publishes CRUD change events onto the same bus that
     // transport subscriptions read, so a mutation on one connection streams to
     // subscribers on another (§10).
@@ -202,6 +205,11 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     // configured TTL, killing each one's whole process group. Disabled entirely
     // when `agents.idleReapMinutes == 0`.
     let reap_task = spawn_idle_reap_loop(manager.clone(), config.idle_reap_minutes);
+    // Event retention/compaction (§10.2): periodically delete `agent:stream:*`
+    // chunk events older than the configured TTL, preserving every other event
+    // family. Disabled entirely when `events.streamRetentionHours == 0`.
+    let retention_task =
+        spawn_stream_retention_loop(retention_store, config.stream_retention_hours);
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     // Start a filesystem watcher per active workspace with a resolvable on-disk
     // path; each publishes debounced `file:changed` events to the shared bus.
@@ -277,6 +285,9 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     pr_refresh.abort();
     if let Some(reap_task) = reap_task {
         reap_task.abort();
+    }
+    if let Some(retention_task) = retention_task {
+        retention_task.abort();
     }
     manager.shutdown().await;
     Ok(())
@@ -437,6 +448,48 @@ fn spawn_idle_reap_loop(
             let reaped = manager.reap_idle_older_than(ttl).await;
             if reaped > 0 {
                 tracing::info!(reaped, "idle agent sweep evicted idle agents");
+            }
+        }
+    }))
+}
+
+/// Spawn the periodic event-retention/compaction sweep (§10.2), or `None` when
+/// disabled (`stream_retention_hours == 0`). Each tick deletes `agent:stream:*`
+/// chunk events older than the TTL while preserving every other event family.
+/// The sweep interval is derived from the TTL (≈4×/TTL), clamped so long TTLs
+/// still sweep periodically and short ones do not busy-loop. A failed sweep is
+/// logged and retried on the next tick (never aborts the loop).
+fn spawn_stream_retention_loop(
+    store: Store,
+    stream_retention_hours: u32,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if stream_retention_hours == 0 {
+        tracing::info!("event retention sweep disabled (events.streamRetentionHours = 0)");
+        return None;
+    }
+    let ttl = Duration::from_secs(stream_retention_hours as u64 * 3600);
+    let interval = (ttl / 4).clamp(Duration::from_secs(300), Duration::from_secs(3600));
+    tracing::info!(
+        ttl_hours = stream_retention_hours,
+        interval_secs = interval.as_secs(),
+        "event retention sweep enabled (agent:stream:* only)"
+    );
+    Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let cutoff = intent_core::iso_minutes_ago(stream_retention_hours as i64 * 60);
+            match store.delete_stream_events_before(&cutoff).await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(
+                        removed,
+                        cutoff,
+                        "event retention sweep trimmed stream events"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "event retention sweep failed"),
             }
         }
     }))
@@ -993,6 +1046,7 @@ mod tests {
             socket_path: short_socket_path(&id),
             pid_path: dir.join("intentd.pid"),
             idle_reap_minutes: 30,
+            stream_retention_hours: 0,
             data_dir: dir,
         }
     }
