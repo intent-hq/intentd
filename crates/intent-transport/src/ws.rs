@@ -47,6 +47,8 @@ pub struct WsOptions {
     pub base_port: u16,
     pub enabled: bool,
     pub auth_enabled: bool,
+    /// Advertise the bound port + fingerprint over mDNS (§5.4). Default off.
+    pub discovery_enabled: bool,
     pub heartbeat_interval: Duration,
     pub heartbeat_timeout: Duration,
 }
@@ -58,6 +60,7 @@ impl Default for WsOptions {
             base_port: DEFAULT_PORT,
             enabled: true,
             auth_enabled: true,
+            discovery_enabled: false,
             heartbeat_interval: HEARTBEAT_INTERVAL,
             heartbeat_timeout: HEARTBEAT_TIMEOUT,
         }
@@ -88,6 +91,7 @@ pub(crate) struct WsInner {
     pub token_store: Arc<dyn TokenStore>,
     pub enabled: bool,
     pub auth_enabled: bool,
+    pub discovery_enabled: bool,
     pub bind_address: IpAddr,
     pub base_port: u16,
     pub fingerprint: String,
@@ -125,6 +129,7 @@ impl WsApiServer {
             token_store,
             enabled: options.enabled,
             auth_enabled: options.auth_enabled,
+            discovery_enabled: options.discovery_enabled,
             bind_address: options.bind_address,
             base_port: options.base_port,
             fingerprint: tls.fingerprint256.clone(),
