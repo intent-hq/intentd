@@ -23,7 +23,7 @@ const TOKEN_BYTES: usize = 32;
 /// [`KeyringTokenStore`]; tests use an in-memory store so they never touch the
 /// real user keychain. This is a test seam over the *same* `keyring` crate, not
 /// a second keychain abstraction.
-pub trait TokenStore {
+pub trait TokenStore: Send + Sync {
     /// Return the stored token, or `None` if unset/unavailable.
     fn load_token(&self) -> Option<String>;
     /// Persist the token, replacing any existing value.

@@ -12,7 +12,10 @@ use intent_services::{
     default_process_cap, AgentManager, BusEventSink, EventBus, FileWatcher, Services,
 };
 use intent_store::Store;
-use intent_transport::serve_uds;
+use intent_transport::{
+    ensure_tls_certificate, get_or_create_token, serve_uds, KeyringTokenStore, WsApiServer,
+    WsOptions,
+};
 use serde_json::{json, Value};
 
 mod client;
@@ -28,9 +31,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Start the daemon and serve JSON-RPC over a Unix-domain socket.
+    /// Start the daemon and serve JSON-RPC. `--listen` selects the transport(s):
+    /// `uds` (default), `tcp` (HTTPS+WSS on 0.0.0.0:5180), or `both`.
     Serve {
-        /// Transport to listen on (only `uds` is supported in this slice).
+        /// Transport to listen on: `uds`, `tcp`, or `both`.
         #[arg(long, default_value = "uds")]
         listen: String,
     },
@@ -97,9 +101,12 @@ fn resolve_config() -> anyhow::Result<Config> {
 }
 
 async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
-    if listen != "uds" {
-        anyhow::bail!("unsupported --listen '{listen}'; only 'uds' is supported");
-    }
+    let (serve_uds_enabled, serve_tcp_enabled) = match listen {
+        "uds" => (true, false),
+        "tcp" => (false, true),
+        "both" => (true, true),
+        other => anyhow::bail!("unsupported --listen '{other}'; expected uds|tcp|both"),
+    };
     let config = resolve_config()?;
     std::fs::create_dir_all(&config.data_dir)?;
     let store = Store::open(&config.db_path)
@@ -141,11 +148,45 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     // path; each publishes debounced `file:changed` events to the shared bus.
     // The handles are held for the lifetime of `serve` and torn down on return.
     let _watchers = start_workspace_watchers(&bus, api.as_ref()).await;
-    tracing::info!(socket = %config.socket_path.display(), "starting intentd");
-    serve_uds(api, bus, &config.socket_path, shutdown_signal()).await?;
-    // Clean shutdown: stop the PR refresh loop, then kill every spawned agent
-    // child and clear the registry (§6.8 teardown). Idle reaping during the run
-    // is the M5 `reap_idle` hook.
+
+    // Start the HTTPS+WSS listener when requested. TLS and bearer auth are
+    // auto-on for TCP (§5.2/§5.3): the self-signed cert (M5.1) is reused across
+    // restarts and the persisted token (M5.2) gates upgrades. The listener runs
+    // in the background and is gracefully stopped after the shutdown signal.
+    let ws_server = if serve_tcp_enabled {
+        let tls =
+            ensure_tls_certificate(&config.data_dir).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        get_or_create_token(&KeyringTokenStore).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let server = WsApiServer::new(
+            api.clone(),
+            bus.clone(),
+            &tls,
+            Arc::new(KeyringTokenStore),
+            WsOptions::default(),
+        )
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let port = server.start().await?;
+        tracing::info!(port, fingerprint = %server.fingerprint(), "intentd WSS listening");
+        Some(server)
+    } else {
+        None
+    };
+
+    if serve_uds_enabled {
+        tracing::info!(socket = %config.socket_path.display(), "starting intentd");
+        serve_uds(api, bus, &config.socket_path, shutdown_signal()).await?;
+    } else {
+        // TCP-only: keep serving in the background until a signal arrives.
+        shutdown_signal().await;
+    }
+
+    // Clean shutdown: stop the WSS listener (graceful close + port release),
+    // stop the PR refresh loop, then kill every spawned agent child and clear
+    // the registry (§6.8 teardown). Idle reaping during the run is the M5
+    // `reap_idle` hook.
+    if let Some(server) = ws_server {
+        server.stop().await;
+    }
     pr_refresh.abort();
     manager.shutdown().await;
     Ok(())

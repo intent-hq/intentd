@@ -15,20 +15,16 @@ pub use auth::{
 pub use listener::serve_uds;
 pub use router::handle_message;
 pub use tls::{cert_fingerprint, ensure_tls_certificate, TlsCertificate};
+pub use ws::{WsApiServer, WsOptions};
 
 pub mod auth;
+mod conn;
 mod events;
+pub mod lifecycle;
 pub mod listener;
 pub mod router;
 pub mod tls;
-
-pub mod heartbeat {
-    //! Connection heartbeat — stub.
-}
-
-pub mod lifecycle {
-    //! Single-flight start/stop, race guards, port backoff (§5.6) — stub.
-}
+pub mod ws;
 
 pub mod mdns {
     //! mDNS advertisement of `_intent-ws._tcp` (§5.4) — stub.

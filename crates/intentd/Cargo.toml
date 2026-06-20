@@ -35,3 +35,9 @@ intent-core = { path = "../intent-core" }
 intent-store = { path = "../intent-store" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+sha2 = "0.10"
