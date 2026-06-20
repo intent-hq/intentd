@@ -1739,6 +1739,7 @@ dependencies = [
  "intent-sourcecontrol",
  "intent-store",
  "intent-transport",
+ "mdns-sd",
  "nix",
  "rustls 0.23.40",
  "rustls-pki-types",

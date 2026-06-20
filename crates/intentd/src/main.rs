@@ -16,7 +16,7 @@ use intent_services::{
 use intent_store::Store;
 use intent_transport::{
     detect_has_display, ensure_tls_certificate, get_or_create_token, serve_uds, CertStatus,
-    KeyringTokenStore, SystemControl, SystemStatus, WsApiServer, WsOptions,
+    KeyringTokenStore, SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
 
@@ -223,13 +223,14 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     let (ws_server, ws_port) = if serve_tcp_enabled {
         let tls =
             ensure_tls_certificate(&config.data_dir).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        get_or_create_token(&KeyringTokenStore).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let token_store = resolve_token_store();
+        get_or_create_token(&*token_store).map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let server = WsApiServer::new(
             api.clone(),
             bus.clone(),
             &tls,
-            Arc::new(KeyringTokenStore),
-            WsOptions::default(),
+            token_store,
+            ws_options_from_env(),
         )
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let port = server.start().await?;
@@ -334,6 +335,60 @@ impl SystemControl for DaemonControl {
     }
 }
 
+/// Fixed-token [`TokenStore`] selected only when `INTENTD_AUTH_TOKEN` is set.
+/// TEST-ONLY SEAM (§13.1 E2E): lets the E2E suite authenticate a real `intentd
+/// serve --listen tcp/both` daemon hermetically, without touching the OS
+/// keychain. Production always uses [`KeyringTokenStore`].
+struct EnvTokenStore(String);
+
+impl TokenStore for EnvTokenStore {
+    fn load_token(&self) -> Option<String> {
+        Some(self.0.clone())
+    }
+    fn store_token(&self, _token: &str) -> intent_core::Result<()> {
+        Ok(())
+    }
+}
+
+/// Select the WSS token store: a fixed env token when `INTENTD_AUTH_TOKEN` is
+/// set (test-only hermetic seam, §13.1), otherwise the OS keychain.
+fn resolve_token_store() -> Arc<dyn TokenStore> {
+    match std::env::var("INTENTD_AUTH_TOKEN") {
+        Ok(t) if !t.is_empty() => Arc::new(EnvTokenStore(t)),
+        _ => Arc::new(KeyringTokenStore),
+    }
+}
+
+/// Build [`WsOptions`] from the production defaults plus optional env seams:
+/// mDNS discovery (`INTENTD_DISCOVERY=1`, default off) and an explicit base port
+/// (`INTENTD_TCP_PORT`, `0` = OS-assigned ephemeral). Both are §13.1 E2E seams:
+/// the port seam keeps the suite hermetic (no fixed-5180 contention) and the
+/// discovery seam lets it assert the advertise→resolve + fingerprint round-trip.
+fn ws_options_from_env() -> WsOptions {
+    let mut opts = WsOptions::default();
+    if env_flag("INTENTD_DISCOVERY") {
+        opts.discovery_enabled = true;
+    }
+    if let Some(port) = std::env::var("INTENTD_TCP_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+    {
+        opts.base_port = port;
+    }
+    opts
+}
+
+/// Parse a boolean-ish env flag (`1`/`true`/`yes`, case-insensitive).
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
 /// RAII single-instance pidfile: removes the file on drop, but only if it still
 /// holds our pid (so a racing replacement is never clobbered).
 struct PidFile {
@@ -429,15 +484,13 @@ fn spawn_idle_reap_loop(
     manager: Arc<AgentManager>,
     idle_reap_minutes: u32,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if idle_reap_minutes == 0 {
+    let Some((ttl, interval)) = reap_timings(idle_reap_minutes) else {
         tracing::info!("idle agent reaping disabled (agents.idleReapMinutes = 0)");
         return None;
-    }
-    let ttl = Duration::from_secs(idle_reap_minutes as u64 * 60);
-    let interval = (ttl / 4).clamp(Duration::from_secs(30), Duration::from_secs(300));
+    };
     tracing::info!(
-        ttl_minutes = idle_reap_minutes,
-        interval_secs = interval.as_secs(),
+        ttl_ms = ttl.as_millis() as u64,
+        interval_ms = interval.as_millis() as u64,
         "idle agent reaping enabled"
     );
     Some(tokio::spawn(async move {
@@ -451,6 +504,28 @@ fn spawn_idle_reap_loop(
             }
         }
     }))
+}
+
+/// Compute the idle-reap `(ttl, sweep interval)`, or `None` when disabled
+/// (`idle_reap_minutes == 0`). Production rule: interval ≈ ttl/4, clamped to
+/// `[30s, 300s]`. The `INTENTD_IDLE_REAP_MS` env seam (§13.1 E2E, test-only)
+/// forces a sub-second TTL+interval so the E2E suite can assert reaping without
+/// a ≥30s wait; it is ignored in production deployments.
+fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
+    if let Some(ms) = std::env::var("INTENTD_IDLE_REAP_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&m| m > 0)
+    {
+        let d = Duration::from_millis(ms);
+        return Some((d, d));
+    }
+    if idle_reap_minutes == 0 {
+        return None;
+    }
+    let ttl = Duration::from_secs(idle_reap_minutes as u64 * 60);
+    let interval = (ttl / 4).clamp(Duration::from_secs(30), Duration::from_secs(300));
+    Some((ttl, interval))
 }
 
 /// Spawn the periodic event-retention/compaction sweep (§10.2), or `None` when
