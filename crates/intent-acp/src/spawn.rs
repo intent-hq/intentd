@@ -96,6 +96,11 @@ pub fn build_command(opts: &SpawnOptions) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Put the provider in its own process group (leader pgid == child pid) so
+    // reaping/stop can signal the WHOLE tree via `killpg(-pgid)` — `kill_on_drop`
+    // only reaches the direct child, leaving grandchildren orphaned (§5.6).
+    #[cfg(unix)]
+    cmd.process_group(0);
     cmd
 }
 

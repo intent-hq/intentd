@@ -41,3 +41,6 @@ rustls = { workspace = true }
 rustls-pki-types = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 sha2 = "0.10"
+
+[target."cfg(unix)".dependencies]
+nix = { workspace = true, features = ["signal", "process"] }

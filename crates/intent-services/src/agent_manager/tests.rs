@@ -213,6 +213,111 @@ async fn reap_idle_evicts_handles_and_deregisters() {
     assert_eq!(mgr.registry().size(), 0);
 }
 
+#[tokio::test]
+async fn evict_idle_older_than_evicts_only_stale_idle() {
+    let reg = ProcessRegistry::new(8);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (old, fresh, active) = (
+        AgentId::from("old"),
+        AgentId::from("fresh"),
+        AgentId::from("active"),
+    );
+    for id in [&old, &fresh, &active] {
+        reg.register(id.clone(), recording_kill(id.clone(), log.clone()));
+    }
+    // `old` last streamed at the epoch (well past any TTL); `fresh` just now;
+    // `active` is streaming (protected regardless of its timestamp).
+    reg.set_last_active(&old, 1);
+    reg.set_last_active(&fresh, super::now_ms());
+    reg.set_last_active(&active, 1);
+    reg.mark_active(&active);
+
+    let evicted = reg
+        .evict_idle_older_than(Duration::from_secs(60), |_| true)
+        .await;
+
+    assert_eq!(evicted, 1, "only the stale idle process is reaped");
+    assert_eq!(*log.lock().unwrap(), vec![old.clone()]);
+    assert!(!reg.is_registered(&old));
+    assert!(reg.is_registered(&fresh), "within-TTL idle kept");
+    assert!(reg.is_registered(&active), "active process kept");
+}
+
+#[tokio::test]
+async fn reap_idle_older_than_skips_in_flight_agents() {
+    let (_tmp, mgr) = manager().await;
+    let (busy, idle) = (AgentId::from("busy"), AgentId::from("idle"));
+    track(&mgr, &busy);
+    track(&mgr, &idle);
+    // Both stale past the TTL, but `busy` has an in-flight prompt.
+    mgr.registry().set_last_active(&busy, 1);
+    mgr.registry().set_last_active(&idle, 1);
+    assert!(mgr.try_begin(&busy));
+
+    let reaped = mgr.reap_idle_older_than(Duration::from_secs(60)).await;
+
+    assert_eq!(reaped, 1, "only the idle agent is reaped");
+    assert!(
+        mgr.contains(&busy),
+        "agent with an in-flight prompt is kept"
+    );
+    assert!(!mgr.contains(&idle));
+    assert_eq!(mgr.registry().size(), 1);
+}
+
+/// Process-tree teardown (§5.6): a provider's whole process group is signalled,
+/// so a grandchild spawned by the direct child is terminated too — `kill_on_drop`
+/// alone would leave it orphaned.
+#[cfg(unix)]
+#[tokio::test]
+async fn kill_child_tree_terminates_grandchild() {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    // The shell becomes the group leader (`process_group(0)`), backgrounds a
+    // grandchild `sleep`, prints its pid, then sleeps so the group stays alive.
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg("sleep 300 & echo $!; sleep 300");
+    cmd.stdout(Stdio::piped());
+    cmd.kill_on_drop(true);
+    cmd.process_group(0);
+    let mut child = cmd.spawn().expect("spawn sleep tree");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let line = timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .expect("grandchild pid line in time")
+        .expect("read ok")
+        .expect("a pid line");
+    let grandchild: u32 = line.trim().parse().expect("grandchild pid");
+    assert!(pid_alive(grandchild), "grandchild alive before teardown");
+
+    super::kill_child_tree(child).await;
+
+    let mut dead = false;
+    for _ in 0..100 {
+        if !pid_alive(grandchild) {
+            dead = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(dead, "grandchild terminated with the process group");
+}
+
+/// Signal-0 liveness probe used by the process-group teardown test.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    matches!(
+        kill(Pid::from_raw(pid as i32), None),
+        Ok(()) | Err(nix::errno::Errno::EPERM)
+    )
+}
+
 /// A self-cleaning temp git repo with one committed file modified in the workdir.
 struct TempRepo {
     dir: PathBuf,

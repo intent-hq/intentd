@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use intent_acp::session::{ContentBlock, StopReason};
 use intent_acp::{
@@ -132,6 +132,22 @@ fn lru_idle(inner: &RegistryInner) -> Option<(AgentId, KillFn)> {
         .filter(|(_, e)| !e.is_active)
         .min_by_key(|(_, e)| e.last_active_ms)
         .map(|(id, e)| (id.clone(), e.kill.clone()))
+}
+
+/// Idle entries whose `last_active_ms` is at/older than `cutoff_ms`, ordered
+/// least-recently-used first (the TTL idle-reap candidate list).
+fn idle_older_than(inner: &RegistryInner, cutoff_ms: u64) -> Vec<(AgentId, KillFn)> {
+    let mut candidates: Vec<(AgentId, u64, KillFn)> = inner
+        .entries
+        .iter()
+        .filter(|(_, e)| !e.is_active && e.last_active_ms <= cutoff_ms)
+        .map(|(id, e)| (id.clone(), e.last_active_ms, e.kill.clone()))
+        .collect();
+    candidates.sort_by_key(|(_, ms, _)| *ms);
+    candidates
+        .into_iter()
+        .map(|(id, _, kill)| (id, kill))
+        .collect()
 }
 
 /// The concrete service-layer [`EventSink`]: the bridge `intent-acp`'s
@@ -430,6 +446,31 @@ impl ProcessRegistry {
         }
         evicted
     }
+
+    /// TTL-based idle reaping (§5.6/§6.7): evict every idle process whose last
+    /// activity is older than `ttl`, skipping any the `eligible` predicate
+    /// rejects (e.g. an agent with an in-flight prompt). Active processes and
+    /// those within the TTL are always kept. Returns the number evicted.
+    pub async fn evict_idle_older_than<F>(&self, ttl: Duration, eligible: F) -> usize
+    where
+        F: Fn(&AgentId) -> bool,
+    {
+        let cutoff = now_ms().saturating_sub(ttl.as_millis() as u64);
+        let candidates = {
+            let inner = self.inner.lock().unwrap();
+            idle_older_than(&inner, cutoff)
+        };
+        let mut evicted = 0;
+        for (id, kill) in candidates {
+            if !eligible(&id) {
+                continue;
+            }
+            kill().await;
+            self.deregister(&id);
+            evicted += 1;
+        }
+        evicted
+    }
 }
 
 /// A generated `--mcp-config` file on disk, removed when the owning agent's
@@ -446,8 +487,9 @@ impl Drop for TempConfigFile {
 
 /// One live agent: its ACP [`Connection`] (own id space + pending map), the
 /// streaming-notification receiver consumed during a turn, the client-served
-/// request loop, the owned child (killed on drop via `kill_on_drop`), and the
-/// per-agent MCP bridge + generated config that back the agent→BE tool loop.
+/// request loop, the owned child (its process group is killed on teardown via
+/// [`kill_child_tree`], with `kill_on_drop` as a direct-child safety net), and
+/// the per-agent MCP bridge + generated config that back the agent→BE tool loop.
 struct AgentHandle {
     connection: Arc<Connection>,
     notifications: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
@@ -721,15 +763,22 @@ impl AgentManager {
     }
 
     /// Stop one agent: abort its in-flight turn worker (interrupting the current
-    /// stream), clear its busy flag, drop its handle (killing the child via
-    /// `kill_on_drop` and aborting its request loop), and deregister it. Returns
-    /// whether a handle existed. This is the `agent.stop` cancel semantics.
+    /// stream), clear its busy flag, drop its handle, and deregister it. The
+    /// child's whole process group is signalled (SIGTERM→SIGKILL) so no orphaned
+    /// grandchildren linger. Returns whether a handle existed. This is the
+    /// `agent.stop` / hard-cancel cancel semantics.
     pub async fn stop(&self, agent_id: &AgentId) -> bool {
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
         }
         self.end_turn(agent_id);
-        let removed = self.handles.lock().unwrap().remove(agent_id).is_some();
+        let handle = self.handles.lock().unwrap().remove(agent_id);
+        let removed = handle.is_some();
+        if let Some(mut handle) = handle {
+            if let Some(child) = handle._child.take() {
+                kill_child_tree(child).await;
+            }
+        }
         self.registry.deregister(agent_id);
         removed
     }
@@ -877,26 +926,76 @@ impl AgentManager {
         }
     }
 
-    /// Idle-reap hook: evict up to `max` idle agents in LRU order (full
-    /// timer/memory-pressure reaping is M5).
+    /// Idle-reap hook: evict up to `max` idle agents in LRU order (count-based;
+    /// the LRU `acquire`-eviction companion).
     pub async fn reap_idle(&self, max: Option<usize>) -> usize {
         self.registry.evict_idle(max).await
     }
 
-    /// Build the kill callback for `agent_id`: dropping the handle kills the
-    /// child (`kill_on_drop`) and aborts its request loop.
+    /// TTL idle-reap sweep (§5.6/§6.7): evict every idle agent whose last
+    /// activity is older than `ttl`, skipping any with an in-flight prompt (a
+    /// live turn loop in `busy`). Active streaming agents are protected by the
+    /// registry's `is_active` flag. Returns the number reaped.
+    pub async fn reap_idle_older_than(&self, ttl: Duration) -> usize {
+        let busy = self.busy.clone();
+        self.registry
+            .evict_idle_older_than(ttl, move |id| !busy.lock().unwrap().contains(id))
+            .await
+    }
+
+    /// Build the kill callback for `agent_id`: removing the handle signals the
+    /// child's whole process group (SIGTERM→SIGKILL) and aborts its request
+    /// loop, so no orphaned grandchildren linger.
     fn make_kill(&self, agent_id: AgentId) -> KillFn {
         let handles: Weak<Mutex<HashMap<AgentId, AgentHandle>>> = Arc::downgrade(&self.handles);
         Arc::new(move || {
             let handles = handles.clone();
             let id = agent_id.clone();
             Box::pin(async move {
-                if let Some(handles) = handles.upgrade() {
-                    handles.lock().unwrap().remove(&id);
+                let removed = handles
+                    .upgrade()
+                    .and_then(|h| h.lock().unwrap().remove(&id));
+                if let Some(mut handle) = removed {
+                    if let Some(child) = handle._child.take() {
+                        kill_child_tree(child).await;
+                    }
                 }
             })
         })
     }
+}
+
+/// Grace period between SIGTERM and SIGKILL when tearing down a provider's
+/// process group, giving the tree a chance to exit cleanly first.
+const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
+
+/// Terminate a spawned provider's WHOLE process tree (§5.6). The child is its
+/// own process-group leader (`process_group(0)` at spawn), so `killpg(pgid,…)`
+/// reaches every descendant — `kill_on_drop` alone only reaps the direct child,
+/// orphaning grandchildren. SIGTERM first for a clean exit, then SIGKILL after a
+/// grace period to sweep anything that ignored it.
+#[cfg(unix)]
+async fn kill_child_tree(mut child: Child) {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let Some(pid) = child.id() else {
+        let _ = child.start_kill();
+        return;
+    };
+    let pgid = Pid::from_raw(pid as i32);
+    let _ = killpg(pgid, Signal::SIGTERM);
+    // Wait briefly for the group to drain, then SIGKILL the whole group so any
+    // grandchild that ignored SIGTERM is still removed.
+    let _ = tokio::time::timeout(PROCESS_GROUP_TERM_GRACE, child.wait()).await;
+    let _ = killpg(pgid, Signal::SIGKILL);
+}
+
+/// Non-unix fallback: no process groups, so fall back to killing the direct
+/// child (`kill_on_drop` remains the safety net on drop).
+#[cfg(not(unix))]
+async fn kill_child_tree(mut child: Child) {
+    let _ = child.start_kill();
 }
 
 /// A single user text content block (the persisted/prompt message shape).
