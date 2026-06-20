@@ -1843,8 +1843,9 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `script.output`: the script's current PTY scrollback as text (optionally
-    /// trailing `maxLines`); returns `{ scriptId, output }` (PROTOCOL §5.8).
+    /// `script.output`: the script's current PTY scrollback as plaintext
+    /// output-buffer text (optionally trailing `maxLines`, default 100); returns
+    /// a bare string (`"No output yet."` when empty), not an object (§5.8).
     fn script_output(
         &self,
         script_id: String,

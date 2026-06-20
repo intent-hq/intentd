@@ -3292,6 +3292,60 @@ mod script {
         );
     }
 
+    /// `script.output` returns the buffer as a plaintext string (a `[... lines]`
+    /// header + text), not an object — the ancestor/§5.8 parity contract.
+    #[tokio::test]
+    async fn output_returns_plaintext_buffer_with_header() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create(
+            &h,
+            "svc",
+            "echo OUTPUT-PARITY-MARK ; sleep 5",
+            ScriptMode::Service,
+        )
+        .await;
+        h.services.script_start(id.clone()).await.expect("start");
+        drain_until(&mut sub, Duration::from_secs(5), |v| {
+            if v["type"] == "script:output" {
+                let bytes = v["data"]["chunk"].as_str().map(decode).unwrap_or_default();
+                contains(&bytes, b"OUTPUT-PARITY-MARK").then_some(())
+            } else {
+                None
+            }
+        })
+        .await;
+
+        let out = h
+            .services
+            .script_output(id.clone(), Some(10))
+            .await
+            .expect("output");
+        let text = out
+            .as_str()
+            .unwrap_or_else(|| panic!("script.output must be a string, got: {out:?}"));
+        assert!(text.starts_with('['), "header line present: {text:?}");
+        assert!(
+            text.contains("lines]"),
+            "header is a [... lines] line: {text:?}"
+        );
+        assert!(
+            text.contains("OUTPUT-PARITY-MARK"),
+            "buffer text included: {text:?}"
+        );
+        h.services.script_stop(id).await.expect("stop");
+    }
+
+    /// `script.output` on a script that never produced output returns the bare
+    /// `"No output yet."` string (ancestor empty-buffer case).
+    #[tokio::test]
+    async fn output_empty_buffer_returns_placeholder() {
+        let h = harness().await;
+        let id = create(&h, "idle", "echo never-started", ScriptMode::Command).await;
+        let out = h.services.script_output(id, None).await.expect("output");
+        assert_eq!(out, Value::String("No output yet.".to_string()));
+    }
+
     /// A service that exits faster than the 2s floor is treated as a config error
     /// and is NOT auto-restarted (the ported backoff guard).
     #[tokio::test]

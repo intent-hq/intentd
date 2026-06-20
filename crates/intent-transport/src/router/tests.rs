@@ -934,7 +934,14 @@ impl WorkspaceApi for FakeApi {
         max_lines: Option<i64>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
-            Ok(serde_json::json!({ "scriptId": script_id, "maxLines": max_lines, "output": "" }))
+            // `script.output` returns plaintext buffer text (a bare string), not
+            // an object (§5.8). Echo `scriptId`/`maxLines` into the string so the
+            // dispatch test can still assert they were threaded through.
+            let _ = script_id;
+            Ok(Value::String(format!(
+                "[1 lines]\nmaxLines={}",
+                max_lines.unwrap_or(-1)
+            )))
         })
     }
 
@@ -2214,13 +2221,18 @@ async fn script_lifecycle_and_run_dispatch() {
     assert_eq!(v["result"]["maxLines"], serde_json::json!(50));
     assert_eq!(v["result"]["timeoutSeconds"], serde_json::json!(30));
 
-    // script.output passes maxLines; script.status dispatches.
+    // script.output passes maxLines and its result is a bare plaintext string
+    // (a header line + text), not an object (§5.8).
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"script.output","params":{"scriptId":"s-1","maxLines":10}}"#,
     )
     .await
     .unwrap();
-    assert_eq!(v["result"]["maxLines"], serde_json::json!(10));
+    let out = v["result"]
+        .as_str()
+        .expect("script.output result is a string");
+    assert!(out.starts_with("["), "header line present: {out:?}");
+    assert!(out.contains("maxLines=10"), "maxLines threaded: {out:?}");
 
     // Missing scriptId → -32602.
     let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"script.start","params":{}}"#)

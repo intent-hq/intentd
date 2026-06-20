@@ -153,8 +153,11 @@ impl ScriptManager {
         Ok(serde_json::to_value(&m.state).unwrap_or_else(|_| json!({})))
     }
 
-    /// `script.output`: the script's current PTY scrollback as text (optionally
-    /// only the trailing `max_lines`).
+    /// `script.output`: the script's current PTY scrollback rendered as
+    /// plaintext output-buffer text — a bare JSON string, not an object
+    /// (mirrors `ws.script.output`, PROTOCOL §5.8). The trailing `max_lines`
+    /// (default 100) are returned under a `[... lines]` header; an empty buffer
+    /// yields `"No output yet."`.
     pub(crate) fn output(&self, script_id: &str, max_lines: Option<i64>) -> Result<Value> {
         let pty_id = {
             let guard = self.scripts.lock().unwrap();
@@ -163,18 +166,25 @@ impl ScriptManager {
                 .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
             m.pty_id
         };
-        let text = match pty_id {
+        let buffer = match pty_id {
             Some(id) => {
                 let bytes = self.pty.scrollback(id).unwrap_or_default();
                 String::from_utf8_lossy(&bytes).into_owned()
             }
             None => String::new(),
         };
-        let text = match max_lines {
-            Some(n) if n > 0 => last_n_lines(&text, n as usize),
-            _ => text,
+        let line_count = clamp_line_count(max_lines, 100);
+        let text = last_n_lines(&buffer, line_count);
+        if text.trim().is_empty() {
+            return Ok(Value::String("No output yet.".to_string()));
+        }
+        let total = buffer.split('\n').count();
+        let header = if total > line_count {
+            format!("[showing last {line_count} of {total} lines]")
+        } else {
+            format!("[{total} lines]")
         };
-        Ok(json!({ "scriptId": script_id, "output": text }))
+        Ok(Value::String(format!("{header}\n{text}")))
     }
 
     /// `script.start`: spawn the script and run its supervisor loop. A script
@@ -630,6 +640,12 @@ fn shell_args(shell: &str, command: &str) -> Vec<String> {
         return vec!["-c".to_string(), command.to_string()];
     }
     vec!["-l".to_string(), "-c".to_string(), command.to_string()]
+}
+
+/// Clamp a caller-supplied `maxLines` to a sane positive count (mirrors
+/// `clampLineCount`): use `fallback` when absent, then bound to `1..=10_000`.
+fn clamp_line_count(max_lines: Option<i64>, fallback: usize) -> usize {
+    max_lines.unwrap_or(fallback as i64).clamp(1, 10_000) as usize
 }
 
 /// The trailing `n` newline-delimited lines of `text` (mirrors `getLastText`).
