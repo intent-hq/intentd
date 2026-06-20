@@ -1,0 +1,4 @@
+{"reply":"initialize","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}
+{"reply":"authenticate","result":{}}
+{"reply":"session/new","result":{"sessionId":"acp-session-1"}}
+{"prompt":[{"update":{"sessionId":"acp-session-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working, please wait"}}}},{"await_cancel":{}},{"stop":"cancelled"}]}

@@ -1,0 +1,4 @@
+{"reply":"initialize","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}
+{"reply":"authenticate","result":{}}
+{"reply":"session/new","result":{"sessionId":"acp-session-1"}}
+{"prompt":[{"call":{"method":"session/request_permission","params":{"sessionId":"acp-session-1","toolCall":{"toolCallId":"t1","title":"Write file","rawInput":{"command":"x"}},"options":[{"optionId":"allow_once","name":"Allow","kind":"allow_once"},{"optionId":"reject_once","name":"Deny","kind":"reject_once"}]}}},{"stop":"end_turn"}]}
