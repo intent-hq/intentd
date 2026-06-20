@@ -21,6 +21,7 @@ use intent_transport::{
 use serde_json::{json, Value};
 
 mod client;
+mod import;
 mod service;
 use client::rpc_call;
 
@@ -71,6 +72,14 @@ enum Command {
         #[arg(long)]
         connect: String,
     },
+    /// Migrate an existing Intent (Electron) install into intentd's SQLite store
+    /// (§9.7): read `<dir>/workspaces.json` and each workspace's `.workspace/`
+    /// entities and idempotently upsert them. Read-only toward the source.
+    Import {
+        /// Path to the Intent `userData` directory to import from.
+        #[arg(long)]
+        from: PathBuf,
+    },
 }
 
 /// Sub-actions for `intentd service` (daemonization, §5.8).
@@ -95,7 +104,22 @@ async fn main() -> ExitCode {
         Command::Doctor => cmd_doctor().await,
         Command::Service { action } => to_exit(cmd_service(&action)),
         Command::McpBridge { connect } => to_exit(cmd_mcp_bridge(&connect).await),
+        Command::Import { from } => to_exit(cmd_import(&from).await),
     }
+}
+
+/// Migrate a legacy Intent `userData` dir into intentd's SQLite store (§9.7).
+/// Opens (creating + migrating) the configured DB, runs the idempotent import,
+/// and prints the per-domain summary. Exits non-zero on a hard source failure.
+async fn cmd_import(from: &Path) -> anyhow::Result<()> {
+    let config = resolve_config()?;
+    std::fs::create_dir_all(&config.data_dir)?;
+    let store = Store::open(&config.db_path)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let summary = import::run(&store, from).await?;
+    println!("{summary}");
+    Ok(())
 }
 
 async fn cmd_mcp_bridge(connect: &str) -> anyhow::Result<()> {
