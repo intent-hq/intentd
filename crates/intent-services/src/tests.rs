@@ -958,6 +958,150 @@ mod change_event_parity {
             json!({ "workspaceId": h.ws.0, "attention": "none" })
         );
     }
+
+    /// Derived `activity` flips `Idle → AgentRunning → Idle` across in-flight
+    /// session begin/end, reflected by `get_workspace`, and emits
+    /// `workspace:activity-changed` ONLY on the zero/non-zero edges (§9.9/§10.1).
+    #[tokio::test]
+    async fn activity_changed_only_on_change_and_derived() {
+        use intent_core::{WorkspaceActivity, WorkspaceApi};
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        // First in-flight session: Idle → AgentRunning (emits agent_running).
+        h.services.agent_activity_begin(&h.ws).await;
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "activity": "agent_running" })
+        );
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning
+        );
+        // get_workspace derives the live value (never persisted).
+        let got = h.services.get_workspace(h.ws.clone()).await.expect("get");
+        assert_eq!(got.activity, WorkspaceActivity::AgentRunning);
+
+        // A nested begin/end pair stays non-zero → NO event is emitted.
+        h.services.agent_activity_begin(&h.ws).await;
+        h.services.agent_activity_end(&h.ws).await;
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning
+        );
+
+        // Last session leaves flight: AgentRunning → Idle (emits idle). If the
+        // nested pair had emitted, this would observe agent_running instead.
+        h.services.agent_activity_end(&h.ws).await;
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "activity": "idle" })
+        );
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::Idle
+        );
+        let got = h.services.get_workspace(h.ws.clone()).await.expect("get");
+        assert_eq!(got.activity, WorkspaceActivity::Idle);
+
+        // Decrementing past zero is a saturating no-op (no panic, stays Idle).
+        h.services.agent_activity_end(&h.ws).await;
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::Idle
+        );
+    }
+
+    /// The BE raises `attention`, it persists across a store reload, the raise is
+    /// idempotent (no duplicate event), and dismissal clears it + emits
+    /// `attention-changed` and is itself idempotent (§9.9).
+    #[tokio::test]
+    async fn attention_raise_dismiss_persists_and_idempotent() {
+        use intent_core::{WorkspaceApi, WorkspaceAttention};
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        // BE raises the blue dot → persisted + attention-changed { unread }.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:attention-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "unread" })
+        );
+        // Survives a reload (persisted column, not derived state).
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::Unread);
+
+        // Raising the same level again is idempotent (no second event).
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise again");
+
+        // Dismiss clears it for everyone → attention-changed { none }. If the
+        // idempotent raise had emitted, this would observe unread instead.
+        h.services
+            .dismiss_attention(h.ws.clone())
+            .await
+            .expect("dismiss");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:attention-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+
+        // Dismiss is idempotent: a no-op on an already-clear workspace.
+        let again = h
+            .services
+            .dismiss_attention(h.ws.clone())
+            .await
+            .expect("dismiss");
+        assert_eq!(again.attention, WorkspaceAttention::None);
+    }
+
+    /// `markSeen` clears an `unread` flag (emitting attention-changed) and is a
+    /// no-op when there is nothing unread (§9.9).
+    #[tokio::test]
+    async fn mark_seen_clears_unread_and_is_idempotent() {
+        use intent_core::{WorkspaceApi, WorkspaceAttention};
+        let h = harness().await;
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+        let mut sub = subscribe(&h);
+
+        // markSeen clears the unread flag and emits attention-changed { none }.
+        let seen = h.services.mark_seen(h.ws.clone()).await.expect("seen");
+        assert_eq!(seen.attention, WorkspaceAttention::None);
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:attention-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+
+        // markSeen again is a no-op (already clear).
+        let again = h
+            .services
+            .mark_seen(h.ws.clone())
+            .await
+            .expect("seen again");
+        assert_eq!(again.attention, WorkspaceAttention::None);
+    }
 }
 
 /// End-to-end §6.8 "one impl, two front doors": an agent (via the in-process MCP

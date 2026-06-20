@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use intent_acp::{Connection, ConnectionHooks, EventSink};
-use intent_core::AgentId;
+use intent_core::{AgentId, WorkspaceId};
 use intent_store::Store;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::time::timeout;
@@ -252,7 +252,7 @@ async fn reap_idle_older_than_skips_in_flight_agents() {
     // Both stale past the TTL, but `busy` has an in-flight prompt.
     mgr.registry().set_last_active(&busy, 1);
     mgr.registry().set_last_active(&idle, 1);
-    assert!(mgr.try_begin(&busy));
+    assert!(mgr.try_begin(&busy, &WorkspaceId::new()).await);
 
     let reaped = mgr.reap_idle_older_than(Duration::from_secs(60)).await;
 

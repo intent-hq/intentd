@@ -26,7 +26,8 @@ use intent_acp::{
     WorkspaceMcpServer,
 };
 use intent_core::{
-    now_iso, ActorType, AgentId, AgentSession, BoxFuture, Error, Result, WorkspaceApi, WorkspaceId,
+    now_iso, ActorType, AgentId, AgentSession, BoxFuture, Error, Result, WorkspaceApi,
+    WorkspaceAttention, WorkspaceId,
 };
 use intent_providers::ProviderConfig;
 use intent_store::{NewEvent, NewTrackedChange};
@@ -522,6 +523,11 @@ pub struct AgentManager {
     /// `agent.sendMessage` consults this to flip a message to the queue while a
     /// turn is mid-stream (the TS "queue while streaming" semantics).
     busy: Arc<Mutex<HashSet<AgentId>>>,
+    /// Workspace each in-flight agent belongs to, recorded when the agent claims
+    /// its in-flight slot so the slot release can recompute the workspace's
+    /// derived `WorkspaceActivity` (§9.9) even on the `stop` path, which only
+    /// knows the agent id.
+    agent_ws: Arc<Mutex<HashMap<AgentId, WorkspaceId>>>,
     /// Abortable background turn workers, keyed by agent. `stop`/`forceMessage`
     /// abort the in-flight worker (interrupting the current stream).
     workers: Arc<Mutex<HashMap<AgentId, JoinHandle<()>>>>,
@@ -540,6 +546,7 @@ impl AgentManager {
             policy: PermissionPolicy::default(),
             mcp_bridge_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("intentd")),
             busy: Arc::new(Mutex::new(HashSet::new())),
+            agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -771,7 +778,7 @@ impl AgentManager {
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
         }
-        self.end_turn(agent_id);
+        self.end_turn(agent_id).await;
         let handle = self.handles.lock().unwrap().remove(agent_id);
         let removed = handle.is_some();
         if let Some(mut handle) = handle {
@@ -789,15 +796,35 @@ impl AgentManager {
         self.busy.lock().unwrap().contains(agent_id)
     }
 
-    /// Atomically claim the in-flight slot: `true` when the agent was idle (now
-    /// marked busy), `false` when a turn is already running.
-    fn try_begin(&self, agent_id: &AgentId) -> bool {
-        self.busy.lock().unwrap().insert(agent_id.clone())
+    /// Atomically claim the in-flight slot for `agent_id` in `workspace_id`:
+    /// `true` when the agent was idle (now marked busy), `false` when a turn is
+    /// already running. On a successful claim the agent's workspace is recorded
+    /// and the workspace's derived `WorkspaceActivity` is recomputed (§9.9),
+    /// emitting `workspace:activity-changed` on the `Idle → AgentRunning` edge.
+    async fn try_begin(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) -> bool {
+        let claimed = self.busy.lock().unwrap().insert(agent_id.clone());
+        if claimed {
+            self.agent_ws
+                .lock()
+                .unwrap()
+                .insert(agent_id.clone(), workspace_id.clone());
+            self.services.agent_activity_begin(workspace_id).await;
+        }
+        claimed
     }
 
-    /// Release the in-flight slot.
-    fn end_turn(&self, agent_id: &AgentId) {
-        self.busy.lock().unwrap().remove(agent_id);
+    /// Release the in-flight slot, recomputing the owning workspace's derived
+    /// `WorkspaceActivity` (§9.9) and emitting `workspace:activity-changed` on
+    /// the `AgentRunning → Idle` edge.
+    async fn end_turn(&self, agent_id: &AgentId) {
+        let was_busy = self.busy.lock().unwrap().remove(agent_id);
+        if !was_busy {
+            return;
+        }
+        let workspace_id = self.agent_ws.lock().unwrap().remove(agent_id);
+        if let Some(workspace_id) = workspace_id {
+            self.services.agent_activity_end(&workspace_id).await;
+        }
     }
 
     /// Forget a finished worker's join handle.
@@ -818,7 +845,7 @@ impl AgentManager {
         content: String,
         message_id: Option<String>,
     ) -> Result<Value> {
-        if !self.try_begin(&agent_id) {
+        if !self.try_begin(&agent_id, &workspace_id).await {
             let queued = self.services.enqueue_message(&agent_id, content, None);
             return Ok(
                 json!({ "success": true, "queued": true, "queuedMessage": queued.to_value() }),
@@ -835,7 +862,7 @@ impl AgentManager {
         {
             // Store write failed (e.g. session not yet persisted) → auto-queue,
             // matching the `agent.sendMessage` fallback (PROTOCOL §5.5).
-            self.end_turn(&agent_id);
+            self.end_turn(&agent_id).await;
             let queued = self.services.enqueue_message(&agent_id, content, None);
             return Ok(
                 json!({ "success": true, "queued": true, "queuedMessage": queued.to_value() }),
@@ -862,7 +889,7 @@ impl AgentManager {
             .store
             .append_agent_message(&agent_id, "user", &blocks, &now_iso())
             .await?;
-        self.try_begin(&agent_id);
+        self.try_begin(&agent_id, &workspace_id).await;
         self.spawn_worker(agent_id, workspace_id, content);
         Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
     }
@@ -1126,9 +1153,9 @@ async fn run_message_worker(
         }
         // Queue drained: release the slot, then re-check once for a message that
         // raced in just before the release (otherwise it would sit unworked).
-        mgr.end_turn(&agent_id);
+        mgr.end_turn(&agent_id).await;
         if let Some(next) = mgr.services.dequeue_message(&agent_id) {
-            if mgr.try_begin(&agent_id) {
+            if mgr.try_begin(&agent_id, &workspace_id).await {
                 persist_user(&mgr, &agent_id, &next.content).await;
                 content = next.content;
                 continue 'outer;
@@ -1139,6 +1166,15 @@ async fn run_message_worker(
         break;
     }
     mgr.clear_worker(&agent_id);
+    // The agent finished its work (queue drained, slot released): raise the
+    // server-owned `attention` blue dot so every client surfaces it (§9.9).
+    if let Err(e) = mgr
+        .services
+        .raise_attention(&workspace_id, WorkspaceAttention::Unread)
+        .await
+    {
+        tracing::warn!(agent = %agent_id, error = %e, "failed to raise attention");
+    }
 }
 
 /// Persist a queued user message into the append-only transcript before its turn
