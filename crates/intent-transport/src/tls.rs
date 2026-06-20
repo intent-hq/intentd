@@ -73,6 +73,41 @@ fn cert_paths(data_dir: &Path) -> (PathBuf, PathBuf) {
     (data_dir.join(CERT_FILENAME), data_dir.join(KEY_FILENAME))
 }
 
+/// Result of inspecting the persisted certificate on disk, used by `intentd
+/// doctor` (§5.7) to report cert validity without generating a new one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CertStatus {
+    /// No cert/key pair persisted yet (generated on first TCP serve).
+    Missing,
+    /// A valid, in-window certificate; carries its pinned fingerprint.
+    Valid { fingerprint: String },
+    /// A persisted certificate that is expired or not yet valid.
+    Expired,
+    /// A persisted certificate (or key) that could not be parsed.
+    Unparseable,
+}
+
+/// Inspect the persisted certificate under `data_dir` without mutating it
+/// (read-only; never generates). Drives the `doctor` cert-validity check.
+pub fn inspect_cert(data_dir: &Path) -> CertStatus {
+    let (cert_path, key_path) = cert_paths(data_dir);
+    if !cert_path.exists() || !key_path.exists() {
+        return CertStatus::Missing;
+    }
+    let Ok(cert) = std::fs::read_to_string(&cert_path) else {
+        return CertStatus::Unparseable;
+    };
+    let Some(der) = der_from_pem(&cert) else {
+        return CertStatus::Unparseable;
+    };
+    if !is_cert_valid(&der) {
+        return CertStatus::Expired;
+    }
+    CertStatus::Valid {
+        fingerprint: compute_fingerprint(&der),
+    }
+}
+
 /// Compute the colon-separated UPPERCASE hex SHA-256 fingerprint over a DER body.
 fn compute_fingerprint(der: &[u8]) -> String {
     Sha256::digest(der)

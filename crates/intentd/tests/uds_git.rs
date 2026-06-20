@@ -111,7 +111,7 @@ async fn uds_git_write_ops_round_trip() {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
-        serve_uds(services, bus, &socket, async move {
+        serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
         .await

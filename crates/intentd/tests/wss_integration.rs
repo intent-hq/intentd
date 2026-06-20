@@ -351,7 +351,7 @@ async fn wss_jsonrpc_roundtrip_matches_uds() {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let (api, bus, sock) = (srv.api.clone(), srv.bus.clone(), socket.clone());
     let uds = tokio::spawn(async move {
-        serve_uds(api, bus, &sock, async move {
+        serve_uds(api, bus, &sock, None, async move {
             let _ = rx.await;
         })
         .await

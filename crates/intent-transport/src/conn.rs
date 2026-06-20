@@ -12,9 +12,11 @@ use intent_core::WorkspaceApi;
 use intent_services::{EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::control::{self, SystemControl};
 use crate::events::{self, FastPath};
 use crate::router::handle_message;
 
@@ -73,16 +75,29 @@ impl ConnSubs {
     }
 }
 
-/// Route one frame: intercept the `events.` fast-path, else hand to the
-/// JSON-RPC dispatcher. Returns `false` when the outbound channel is closed.
+/// Route one frame: intercept the `system.*` control methods, then the
+/// `events.` fast-path, else hand to the JSON-RPC dispatcher. `control` is
+/// `Some` only on a transport that exposes the control surface (the UDS
+/// listener); `is_local` reflects that transport's locality (§12.3). Returns
+/// `false` when the outbound channel is closed.
 pub(crate) async fn process_frame(
     raw: &str,
     api: &dyn WorkspaceApi,
     bus: &EventBus,
     out_tx: &mpsc::Sender<String>,
     subs: &mut ConnSubs,
+    control: Option<&Arc<dyn SystemControl>>,
+    is_local: bool,
 ) -> bool {
     if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        if let Some(control) = control {
+            if let Some(req) = control::classify(&value) {
+                return match control::handle(req, control.as_ref(), is_local) {
+                    Some(frame) => out_tx.send(frame).await.is_ok(),
+                    None => true,
+                };
+            }
+        }
         if let Some(fast_path) = events::classify(&value) {
             return handle_fast_path(fast_path, bus, out_tx, subs).await;
         }
