@@ -14,7 +14,7 @@ use base64::Engine as _;
 use intent_core::events::{
     CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED,
     NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT,
-    TASK_STATUS_CHANGED, WORKSPACE_ATTENTION_CHANGED,
+    TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
 };
 use intent_core::{
     iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId, AgentLite,
@@ -96,6 +96,13 @@ pub struct Services {
     /// its inner map across clones so a cancel observed by any handle reaches
     /// the running walk.
     search_cancels: intent_search::CancelRegistry,
+    /// Per-workspace count of in-flight agent sessions backing the **derived**
+    /// `WorkspaceActivity` green dot (§9.9). Shared across clones so the
+    /// [`AgentManager`] (which holds a [`Services`]) and the `WorkspaceApi`
+    /// read door observe the same state. Never persisted: `AgentRunning` iff a
+    /// workspace's count is non-zero. Transitions to/from zero emit
+    /// `workspace:activity-changed`.
+    agent_activity: Arc<Mutex<HashMap<WorkspaceId, usize>>>,
 }
 
 impl Services {
@@ -111,7 +118,90 @@ impl Services {
             source_control: None,
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
             search_cancels: intent_search::CancelRegistry::new(),
+            agent_activity: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Derive the read-only [`WorkspaceActivity`] for a workspace from the live
+    /// in-flight agent count (§9.9): `AgentRunning` iff any session is in flight.
+    pub(crate) fn workspace_activity(&self, workspace_id: &WorkspaceId) -> WorkspaceActivity {
+        let map = self.agent_activity.lock().unwrap();
+        match map.get(workspace_id) {
+            Some(count) if *count > 0 => WorkspaceActivity::AgentRunning,
+            _ => WorkspaceActivity::Idle,
+        }
+    }
+
+    /// Record an agent session entering flight for `workspace_id`. On the
+    /// `Idle → AgentRunning` transition (count `0 → 1`) emits a self-sufficient
+    /// `workspace:activity-changed { workspaceId, activity }` (§10.1, only-on-change).
+    pub(crate) async fn agent_activity_begin(&self, workspace_id: &WorkspaceId) {
+        let transitioned = {
+            let mut map = self.agent_activity.lock().unwrap();
+            let count = map.entry(workspace_id.clone()).or_insert(0);
+            *count += 1;
+            *count == 1
+        };
+        if transitioned {
+            publish_event(
+                &self.event_bus,
+                activity_changed_event(workspace_id, WorkspaceActivity::AgentRunning),
+            )
+            .await;
+        }
+    }
+
+    /// Record an agent session leaving flight for `workspace_id`. On the
+    /// `AgentRunning → Idle` transition (count `1 → 0`) emits a self-sufficient
+    /// `workspace:activity-changed` (§10.1, only-on-change). A decrement with no
+    /// tracked session is a no-op.
+    pub(crate) async fn agent_activity_end(&self, workspace_id: &WorkspaceId) {
+        let transitioned = {
+            let mut map = self.agent_activity.lock().unwrap();
+            match map.get_mut(workspace_id) {
+                Some(count) if *count > 0 => {
+                    *count -= 1;
+                    if *count == 0 {
+                        map.remove(workspace_id);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            }
+        };
+        if transitioned {
+            publish_event(
+                &self.event_bus,
+                activity_changed_event(workspace_id, WorkspaceActivity::Idle),
+            )
+            .await;
+        }
+    }
+
+    /// Raise the server-owned `attention` flag (§9.9) — the BE side of the
+    /// blue dot. Persists `attention = level` and emits a self-sufficient
+    /// `workspace:attention-changed` only when the value actually changes
+    /// (§10.1). Best-effort: a missing workspace surfaces as an error.
+    pub(crate) async fn raise_attention(
+        &self,
+        workspace_id: &WorkspaceId,
+        level: WorkspaceAttention,
+    ) -> Result<()> {
+        let mut ws = self.store.get_workspace(workspace_id).await?;
+        if ws.attention == level {
+            return Ok(());
+        }
+        ws.attention = level;
+        ws.updated_at = now_iso();
+        self.store.update_workspace(&ws).await?;
+        publish_event(
+            &self.event_bus,
+            attention_changed_event(&ws.id, ws.attention),
+        )
+        .await;
+        Ok(())
     }
 
     /// Wire the active source-control provider used by the `pr.*` methods (§7).
@@ -476,6 +566,24 @@ fn task_status_changed_event(
             "previousStatus": status_word(previous_status),
             "newStatus": status_word(new_status),
             "changedAt": changed_at,
+        }),
+    }
+}
+
+/// Build a `workspace:activity-changed` change event with the self-sufficient
+/// payload `{ workspaceId, activity }` (PROTOCOL §6.5 / IMPLEMENTATION_SPEC §10.1).
+fn activity_changed_event(workspace_id: &WorkspaceId, activity: WorkspaceActivity) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_ACTIVITY_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "activity": activity,
         }),
     }
 }
@@ -1009,12 +1117,26 @@ impl WorkspaceApi for Services {
 
     fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let store = self.store.clone();
-        Box::pin(async move { store.list_workspaces(include_archived).await })
+        let this = self.clone();
+        Box::pin(async move {
+            let mut list = store.list_workspaces(include_archived).await?;
+            // `activity` is derived from live agent state, never persisted (§9.9).
+            for ws in &mut list {
+                ws.activity = this.workspace_activity(&ws.id);
+            }
+            Ok(list)
+        })
     }
 
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
-        Box::pin(async move { store.get_workspace(&id).await })
+        let this = self.clone();
+        Box::pin(async move {
+            let mut ws = store.get_workspace(&id).await?;
+            // `activity` is derived from live agent state, never persisted (§9.9).
+            ws.activity = this.workspace_activity(&id);
+            Ok(ws)
+        })
     }
 
     fn create_workspace(&self, input: WorkspaceCreate) -> BoxFuture<'_, Result<Workspace>> {
