@@ -3,6 +3,8 @@
 //! and PROTOCOL.md §5.1/§5.2. Enums serialize to their lowercase / snake_case
 //! string forms, which are also their stored DB representations.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentId, NoteId, WorkspaceId};
@@ -1196,6 +1198,102 @@ pub struct GitMergeConflicts {
     pub cannot_determine: Option<bool>,
     pub target_branch: String,
     pub current_branch: String,
+}
+
+/// Script execution mode (`script.*`, PROTOCOL §5.8; ported from the TS
+/// `ScriptMode`). `service` is a long-running, auto-restartable process (dev
+/// server / watcher); `command` runs once to completion (build / test / lint).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptMode {
+    #[default]
+    Service,
+    Command,
+}
+
+/// Runtime status of a script process (ported from the TS `ScriptStatus`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptStatus {
+    #[default]
+    Idle,
+    Running,
+    Exited,
+}
+
+/// In-memory runtime state of a script process — the `script.status` result and
+/// the `runtime` field of a `script.list` entry (ported from the TS
+/// `ScriptRuntimeState`). Not persisted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptRuntimeState {
+    pub status: ScriptStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped_at: Option<String>,
+    pub restart_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_url: Option<String>,
+}
+
+impl Default for ScriptRuntimeState {
+    fn default() -> Self {
+        Self {
+            status: ScriptStatus::Idle,
+            pid: None,
+            exit_code: None,
+            started_at: None,
+            stopped_at: None,
+            restart_count: 0,
+            error: None,
+            detected_url: None,
+        }
+    }
+}
+
+/// A workspace script definition — the `script.create` result and the base of a
+/// `script.list` entry (ported from the TS `WorkspaceScript`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Script {
+    pub id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, String>>,
+    pub mode: ScriptMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_start: Option<bool>,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// Wire input for `script.create` (PROTOCOL §5.8); built by the router from
+/// request params. `workspaceId` is passed separately.
+#[derive(Debug, Clone, Default)]
+pub struct ScriptCreateParams {
+    pub name: String,
+    pub command: String,
+    pub mode: ScriptMode,
+    pub cwd: Option<String>,
+    pub env: Option<BTreeMap<String, String>>,
+    pub category: Option<String>,
+    pub auto_start: Option<bool>,
+    pub script_id: Option<String>,
 }
 
 #[cfg(test)]

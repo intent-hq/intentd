@@ -25,11 +25,11 @@ use intent_core::{
     EventUnsubscribeResult, FileActivity, Note, NoteAddInput, NoteAddResult, NoteCreate,
     NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
     NoteId, NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult,
-    NoteVisibility, ReadAssetResult, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata,
-    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary,
-    WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    NoteVisibility, ReadAssetResult, ScriptCreateParams, TaskAssignAgentResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult,
+    TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, Workspace, WorkspaceActivity, WorkspaceAttention,
+    WorkspaceCreate, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -43,6 +43,7 @@ pub mod events;
 mod git_ops;
 mod note_ops;
 mod pr_ops;
+mod script_ops;
 mod search_ops;
 mod terminal_ops;
 
@@ -111,6 +112,10 @@ pub struct Services {
     /// [`AgentManager`] that builds the ACP terminal adapter — drives the same
     /// terminals.
     pty: Arc<intent_pty::PtyHost>,
+    /// The shared `script.*` registry (definitions + runtime + supervisor tasks),
+    /// keyed by script id. Scripts run on the same [`pty`](Self::pty) host as
+    /// `terminal.*`, so a terminal can attach to a running script (§12.2).
+    scripts: script_ops::ScriptRegistry,
 }
 
 impl Services {
@@ -128,12 +133,24 @@ impl Services {
             search_cancels: intent_search::CancelRegistry::new(),
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
             pty: Arc::new(intent_pty::PtyHost::new()),
+            scripts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Borrow the shared PTY host (composition root / ACP terminal-adapter use).
     pub fn pty(&self) -> Arc<intent_pty::PtyHost> {
         self.pty.clone()
+    }
+
+    /// Build a [`ScriptManager`](script_ops::ScriptManager) view over the shared
+    /// PTY host, event bus, store, and script registry for one `script.*` call.
+    fn script_manager(&self) -> script_ops::ScriptManager {
+        script_ops::ScriptManager::new(
+            self.pty.clone(),
+            self.event_bus.clone(),
+            self.store.clone(),
+            self.scripts.clone(),
+        )
     }
 
     /// Derive the read-only [`WorkspaceActivity`] for a workspace from the live
@@ -1180,6 +1197,64 @@ impl WorkspaceApi for Services {
     fn terminal_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         Box::pin(async move { terminal_ops::list(&pty, &workspace_id) })
+    }
+
+    fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let mgr = self.script_manager();
+        Box::pin(async move { mgr.list(&workspace_id) })
+    }
+
+    fn script_create(
+        &self,
+        workspace_id: WorkspaceId,
+        params: ScriptCreateParams,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let mgr = self.script_manager();
+        Box::pin(async move { mgr.create(workspace_id, params).await })
+    }
+
+    fn script_remove(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let mgr = self.script_manager();
+        Box::pin(async move { mgr.remove(&script_id).await })
+    }
+
+    fn script_start(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let mgr = self.script_manager();
+        Box::pin(async move { mgr.start(&script_id).await })
+    }
+
+    fn script_stop(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let mgr = self.script_manager();
+        Box::pin(async move { mgr.stop(&script_id).await })
+    }
+
+    fn script_restart(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let mgr = self.script_manager();
+        Box::pin(async move { mgr.restart(&script_id).await })
+    }
+
+    fn script_output(
+        &self,
+        script_id: String,
+        max_lines: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let mgr = self.script_manager();
+        Box::pin(async move { mgr.output(&script_id, max_lines) })
+    }
+
+    fn script_status(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let mgr = self.script_manager();
+        Box::pin(async move { mgr.status(&script_id) })
+    }
+
+    fn script_run(
+        &self,
+        script_id: String,
+        max_lines: Option<i64>,
+        timeout_seconds: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let mgr = self.script_manager();
+        Box::pin(async move { mgr.run(&script_id, max_lines, timeout_seconds).await })
     }
 
     fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {

@@ -113,6 +113,14 @@ pub const TERMINAL_EXIT: &str = "terminal:exit";
 pub const TERMINAL_TITLE: &str = "terminal:title";
 pub const TERMINAL_CWD: &str = "terminal:cwd";
 
+// Script streaming family (new in intentd; PROTOCOL §5.8/§6.5). Scripts run on
+// the unified PTY host (§12); the daemon fans live script output to subscribers
+// as `script:output` (base64 `chunk`) and publishes runtime/state transitions
+// (start, exit, auto-restart, URL detection) as `script:state`. Both payloads
+// are self-sufficient and carry the `scriptId`.
+pub const SCRIPT_OUTPUT: &str = "script:output";
+pub const SCRIPT_STATE: &str = "script:state";
+
 // Test events.
 pub const TEST_STARTED: &str = "test:started";
 pub const TEST_COMPLETED: &str = "test:completed";
@@ -222,6 +230,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     TASK_STATUS_CHANGED,
     TASK_READY_TASKS_CHANGED,
     TERMINAL_COMMAND,
+    SCRIPT_OUTPUT,
+    SCRIPT_STATE,
     TEST_STARTED,
     TEST_COMPLETED,
     BUILD_STARTED,

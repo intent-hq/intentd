@@ -269,6 +269,11 @@ impl PtyHost {
         Ok(guard.scrollback.snapshot())
     }
 
+    /// The PTY child's process id, if the platform reported one at spawn.
+    pub fn pid(&self, id: PtyId) -> Option<u32> {
+        self.sessions.lock().unwrap().get(&id).and_then(|s| s.pid)
+    }
+
     /// The child's exit status if it has already exited, else `None`. Latches
     /// the status so it stays observable after the stream closes.
     pub fn try_exit(&self, id: PtyId) -> Result<Option<PtyExit>> {
