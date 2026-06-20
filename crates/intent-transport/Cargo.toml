@@ -31,6 +31,7 @@ subtle = "2"
 hex = "0.4"
 whoami = "1"
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
+mdns-sd = "0.11"
 
 [dev-dependencies]
 tokio = { workspace = true }

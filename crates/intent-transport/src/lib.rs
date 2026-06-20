@@ -12,6 +12,7 @@ pub use auth::{
     extract_bearer_token, extract_token, generate_token, get_or_create_token, is_allowed_origin,
     is_auth_enabled, is_discovery_enabled, validate_token, KeyringTokenStore, TokenStore,
 };
+pub use discovery::{Discovery, SERVICE_TYPE};
 pub use listener::serve_uds;
 pub use router::handle_message;
 pub use tls::{cert_fingerprint, ensure_tls_certificate, TlsCertificate};
@@ -19,16 +20,13 @@ pub use ws::{WsApiServer, WsOptions};
 
 pub mod auth;
 mod conn;
+pub mod discovery;
 mod events;
 pub mod lifecycle;
 pub mod listener;
 pub mod router;
 pub mod tls;
 pub mod ws;
-
-pub mod mdns {
-    //! mDNS advertisement of `_intent-ws._tcp` (§5.4) — stub.
-}
 
 pub mod client_map {
     //! live-connection → logical `clientId` map + `client.hello` (§16) — stub.
