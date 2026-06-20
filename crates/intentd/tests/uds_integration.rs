@@ -111,7 +111,7 @@ async fn uds_slice_end_to_end() {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
-        serve_uds(services, bus, &socket, async move {
+        serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
         .await

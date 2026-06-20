@@ -15,12 +15,13 @@ use intent_services::{
 };
 use intent_store::Store;
 use intent_transport::{
-    ensure_tls_certificate, get_or_create_token, serve_uds, KeyringTokenStore, WsApiServer,
-    WsOptions,
+    detect_has_display, ensure_tls_certificate, get_or_create_token, serve_uds, CertStatus,
+    KeyringTokenStore, SystemControl, SystemStatus, WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
 
 mod client;
+mod service;
 use client::rpc_call;
 
 /// intentd — local-first JSON-RPC daemon for the Intent domain model.
@@ -48,10 +49,21 @@ enum Command {
         #[arg(long)]
         params: Option<String>,
     },
-    /// Probe daemon liveness and print basic info.
+    /// Probe daemon liveness and print live status (transports, port, clients,
+    /// agents, cert fingerprint, host OS/arch + hasDisplay + locality, §5.7).
     Status,
-    /// Diagnostics: data-dir writable + SQLite openable/migrations current.
+    /// Ask a running daemon to shut down gracefully (control RPC → SIGTERM →
+    /// SIGKILL escalation, signalled via the pidfile, §5.7).
+    Stop,
+    /// Diagnostics: data-dir writable, SQLite/migrations current, providers,
+    /// ports free, cert validity, GitHub token, context engine, host caps (§5.7).
     Doctor,
+    /// Install/uninstall/validate the platform service unit (launchd/systemd,
+    /// §5.8) so the daemon runs unattended under the OS service manager.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// stdio↔TCP MCP proxy referenced from a generated `--mcp-config`; forwards a
     /// spawned provider's MCP frames to the daemon's in-process server (§6.8).
     McpBridge {
@@ -61,6 +73,17 @@ enum Command {
     },
 }
 
+/// Sub-actions for `intentd service` (daemonization, §5.8).
+#[derive(Debug, Subcommand)]
+enum ServiceAction {
+    /// Install (or refresh) the launchd/systemd user unit.
+    Install,
+    /// Remove the installed unit.
+    Uninstall,
+    /// Report whether the unit is installed and current (non-zero if not).
+    Status,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
@@ -68,7 +91,9 @@ async fn main() -> ExitCode {
         Command::Serve { listen } => to_exit(cmd_serve(&listen).await),
         Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
         Command::Status => cmd_status().await,
+        Command::Stop => cmd_stop().await,
         Command::Doctor => cmd_doctor().await,
+        Command::Service { action } => to_exit(cmd_service(&action)),
         Command::McpBridge { connect } => to_exit(cmd_mcp_bridge(&connect).await),
     }
 }
@@ -163,7 +188,7 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     // auto-on for TCP (§5.2/§5.3): the self-signed cert (M5.1) is reused across
     // restarts and the persisted token (M5.2) gates upgrades. The listener runs
     // in the background and is gracefully stopped after the shutdown signal.
-    let ws_server = if serve_tcp_enabled {
+    let (ws_server, ws_port) = if serve_tcp_enabled {
         let tls =
             ensure_tls_certificate(&config.data_dir).map_err(|e| anyhow::anyhow!(e.to_string()))?;
         get_or_create_token(&KeyringTokenStore).map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -177,17 +202,45 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let port = server.start().await?;
         tracing::info!(port, fingerprint = %server.fingerprint(), "intentd WSS listening");
-        Some(server)
+        (Some(server), Some(port))
     } else {
-        None
+        (None, None)
+    };
+
+    // System control surface (§5.7): exposes `system.status` / `system.shutdown`
+    // to local UDS clients (`intentd status` / `intentd stop`). The `Notify`
+    // lets the `system.shutdown` RPC trigger the same graceful teardown as an OS
+    // signal, so `stop` can ask politely before escalating to SIGTERM/SIGKILL.
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let control: Arc<dyn SystemControl> = Arc::new(DaemonControl {
+        listen_mode: listen.to_string(),
+        uds: serve_uds_enabled,
+        tcp: serve_tcp_enabled,
+        port: ws_port,
+        fingerprint: ws_server.as_ref().map(|s| s.fingerprint().to_string()),
+        ws_server: ws_server.clone(),
+        manager: manager.clone(),
+        shutdown: shutdown_notify.clone(),
+    });
+
+    let shutdown = {
+        let notify = shutdown_notify.clone();
+        async move {
+            tokio::select! {
+                _ = shutdown_signal() => {}
+                _ = notify.notified() => tracing::info!("shutdown requested via system.shutdown"),
+            }
+        }
     };
 
     if serve_uds_enabled {
         tracing::info!(socket = %config.socket_path.display(), "starting intentd");
-        serve_uds(api, bus, &config.socket_path, shutdown_signal()).await?;
+        serve_uds(api, bus, &config.socket_path, Some(control), shutdown).await?;
     } else {
-        // TCP-only: keep serving in the background until a signal arrives.
-        shutdown_signal().await;
+        // TCP-only: no local control transport, but the shutdown notify is still
+        // wired so a future control path could trigger it. Wait for a signal.
+        let _ = control;
+        shutdown.await;
     }
 
     // Clean shutdown: stop the WSS listener (graceful close + port release),
@@ -203,6 +256,47 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     }
     manager.shutdown().await;
     Ok(())
+}
+
+/// Live daemon control surface backing `system.status` / `system.shutdown`
+/// (§5.7). Built post-bind so the resolved WSS `port`/`fingerprint` are real
+/// (not guessed); `client_count`/agent count are read live on each status call.
+struct DaemonControl {
+    listen_mode: String,
+    uds: bool,
+    tcp: bool,
+    port: Option<u16>,
+    fingerprint: Option<String>,
+    ws_server: Option<WsApiServer>,
+    manager: Arc<AgentManager>,
+    shutdown: Arc<tokio::sync::Notify>,
+}
+
+impl SystemControl for DaemonControl {
+    fn status(&self) -> SystemStatus {
+        SystemStatus {
+            listen_mode: self.listen_mode.clone(),
+            uds: self.uds,
+            tcp: self.tcp,
+            port: self.port,
+            clients: self
+                .ws_server
+                .as_ref()
+                .map(|s| s.client_count())
+                .unwrap_or(0),
+            agents: self.manager.registry().size(),
+            fingerprint: self.fingerprint.clone(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            has_display: detect_has_display(),
+        }
+    }
+
+    fn request_shutdown(&self) {
+        // `notify_one` stores a permit if the serve loop is not yet awaiting, so
+        // the shutdown is never lost to a race with a freshly-arrived RPC.
+        self.shutdown.notify_one();
+    }
 }
 
 /// RAII single-instance pidfile: removes the file on drop, but only if it still
@@ -381,19 +475,18 @@ async fn cmd_status() -> ExitCode {
         Ok(c) => c,
         Err(e) => return to_exit(Err(e)),
     };
-    match rpc_call(&config.socket_path, "workspace.list", json!({})).await {
+    // Source the status from the live `system.status` control RPC (§5.7) rather
+    // than guessing — a successful response is itself the liveness proof.
+    match rpc_call(&config.socket_path, "system.status", json!({})).await {
         Ok(resp) if resp.get("result").is_some() => {
-            let count = resp["result"]["workspaces"]
-                .as_array()
-                .map(|a| a.len())
-                .unwrap_or(0);
-            println!("intentd: up");
-            println!("  socket: {}", config.socket_path.display());
-            println!("  workspaces: {count}");
+            print_status(&config, &resp["result"]);
             ExitCode::SUCCESS
         }
         Ok(resp) => {
-            println!("intentd: up (rpc error)");
+            // Reachable but the control method is unavailable (older daemon): the
+            // socket answered, so it is up, but we cannot render full status.
+            println!("intentd: up (status rpc unavailable)");
+            println!("  socket: {}", config.socket_path.display());
             if let Some(e) = resp.get("error") {
                 println!("  error: {e}");
             }
@@ -404,6 +497,217 @@ async fn cmd_status() -> ExitCode {
             println!("  socket: {} (not reachable)", config.socket_path.display());
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Render the `system.status` result (§5.7): liveness, transports + listen mode,
+/// bound port, connected clients, active agents, cert fingerprint, host caps.
+fn print_status(config: &Config, r: &Value) {
+    let transports = r["transports"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(none)".to_string());
+    println!("intentd: up");
+    println!("  socket: {}", config.socket_path.display());
+    println!("  listenMode: {}", r["listenMode"].as_str().unwrap_or("?"));
+    println!("  transports: {transports}");
+    match r["port"].as_u64() {
+        Some(p) => println!("  port: {p}"),
+        None => println!("  port: (uds-only)"),
+    }
+    println!("  clients: {}", r["clients"].as_u64().unwrap_or(0));
+    println!("  agents: {}", r["agents"].as_u64().unwrap_or(0));
+    match r["fingerprint"].as_str() {
+        Some(fp) => println!("  fingerprint: {fp}"),
+        None => println!("  fingerprint: (none)"),
+    }
+    let host = &r["host"];
+    println!(
+        "  host: {} / {} (hasDisplay={}, locality={})",
+        host["os"].as_str().unwrap_or("?"),
+        host["arch"].as_str().unwrap_or("?"),
+        host["hasDisplay"].as_bool().unwrap_or(false),
+        host["locality"].as_str().unwrap_or("?"),
+    );
+}
+
+/// Ask a running daemon to stop (§5.7): issue the graceful `system.shutdown`
+/// control RPC, then escalate via the pidfile (SIGTERM → SIGKILL) with timeouts.
+/// Exits non-zero only if shutdown cannot be confirmed.
+async fn cmd_stop() -> ExitCode {
+    let config = match resolve_config() {
+        Ok(c) => c,
+        Err(e) => return to_exit(Err(e)),
+    };
+    let Some(pid) = read_pid(&config.pid_path) else {
+        println!(
+            "intentd: not running (no pidfile at {})",
+            config.pid_path.display()
+        );
+        return ExitCode::SUCCESS;
+    };
+    if !pid_is_alive(pid) {
+        println!("intentd: not running (stale pidfile for pid {pid}); cleaning up");
+        let _ = std::fs::remove_file(&config.pid_path);
+        return ExitCode::SUCCESS;
+    }
+
+    // (1) Politely request a graceful shutdown over the control RPC.
+    let graceful = match rpc_call(&config.socket_path, "system.shutdown", json!({})).await {
+        Ok(resp) if resp.get("result").is_some() => {
+            println!("intentd: graceful shutdown requested (pid {pid})");
+            true
+        }
+        _ => {
+            println!("intentd: control RPC unavailable; signalling pid {pid}");
+            false
+        }
+    };
+
+    // (2)-(4) Wait, then escalate SIGTERM → SIGKILL with timeouts.
+    let outcome = run_stop_escalation(pid, graceful).await;
+    match outcome {
+        StopOutcome::AlreadyDown => println!("intentd: stopped"),
+        StopOutcome::Graceful => println!("intentd: stopped gracefully"),
+        StopOutcome::Terminated => println!("intentd: stopped (SIGTERM)"),
+        StopOutcome::Killed => println!("intentd: stopped (SIGKILL)"),
+        StopOutcome::Failed => {
+            eprintln!("error: could not confirm intentd shutdown (pid {pid})");
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Run the escalation with production timeouts, using the real OS signaller on
+/// unix. On non-unix there is no UDS daemon to signal, so report failure.
+async fn run_stop_escalation(pid: u32, graceful: bool) -> StopOutcome {
+    #[cfg(unix)]
+    {
+        escalate_stop(
+            &NixSignaller,
+            pid,
+            graceful,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(3),
+            Duration::from_millis(100),
+        )
+        .await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, graceful);
+        StopOutcome::Failed
+    }
+}
+
+/// Install/uninstall/validate the platform service unit (§5.8).
+fn cmd_service(action: &ServiceAction) -> anyhow::Result<()> {
+    let config = resolve_config()?;
+    match action {
+        ServiceAction::Install => service::install(&config),
+        ServiceAction::Uninstall => service::uninstall(&config),
+        ServiceAction::Status => {
+            if service::status(&config)? {
+                Ok(())
+            } else {
+                anyhow::bail!("service unit not installed or stale")
+            }
+        }
+    }
+}
+
+/// The terminal result of a stop escalation (§5.7).
+#[derive(Debug, PartialEq, Eq)]
+enum StopOutcome {
+    /// The process was already gone before any escalation.
+    AlreadyDown,
+    /// Exited after the graceful control RPC, before any signal.
+    Graceful,
+    /// Exited after SIGTERM.
+    Terminated,
+    /// Exited after SIGKILL.
+    Killed,
+    /// Still alive after SIGKILL + timeout — shutdown unconfirmed.
+    Failed,
+}
+
+/// Process-signalling seam so the escalation logic is unit-testable with a fake
+/// (§5.7 verification). The real impl uses `nix` signal-0/SIGTERM/SIGKILL.
+trait Signaller {
+    fn is_alive(&self, pid: u32) -> bool;
+    fn term(&self, pid: u32);
+    fn kill(&self, pid: u32);
+}
+
+/// SIGTERM → SIGKILL escalation. The caller has already issued the graceful
+/// control RPC; `graceful_requested` says whether to first wait for a polite
+/// exit. Each phase polls liveness up to its timeout before escalating.
+async fn escalate_stop<S: Signaller>(
+    sig: &S,
+    pid: u32,
+    graceful_requested: bool,
+    grace: Duration,
+    term_timeout: Duration,
+    kill_timeout: Duration,
+    poll: Duration,
+) -> StopOutcome {
+    if !sig.is_alive(pid) {
+        return StopOutcome::AlreadyDown;
+    }
+    if graceful_requested && wait_for_exit(sig, pid, grace, poll).await {
+        return StopOutcome::Graceful;
+    }
+    sig.term(pid);
+    if wait_for_exit(sig, pid, term_timeout, poll).await {
+        return StopOutcome::Terminated;
+    }
+    sig.kill(pid);
+    if wait_for_exit(sig, pid, kill_timeout, poll).await {
+        return StopOutcome::Killed;
+    }
+    StopOutcome::Failed
+}
+
+/// Poll `is_alive` until the process exits or `timeout` elapses; `true` on exit.
+async fn wait_for_exit<S: Signaller>(sig: &S, pid: u32, timeout: Duration, poll: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !sig.is_alive(pid) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// The real OS signaller (unix): signal-0 liveness probe + SIGTERM/SIGKILL.
+#[cfg(unix)]
+struct NixSignaller;
+
+#[cfg(unix)]
+impl Signaller for NixSignaller {
+    fn is_alive(&self, pid: u32) -> bool {
+        pid_is_alive(pid)
+    }
+    fn term(&self, pid: u32) {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+    }
+    fn kill(&self, pid: u32) {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
     }
 }
 
@@ -462,11 +766,112 @@ async fn cmd_doctor() -> ExitCode {
 
     report_provider_availability().await;
 
+    // §5.7 additions: ports-free window, cert validity, GitHub token presence,
+    // context-engine availability, and host display/locality. The first two are
+    // gating; the rest are graceful-degradation reports (never fatal, G6).
+    if !check_ports_free() {
+        ok = false;
+    }
+    if !check_cert_validity(&config) {
+        ok = false;
+    }
+    report_github_token();
+    report_context_engine();
+    report_host_capabilities();
+
     if ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// §5.7 ports-free check: count bindable ports in the WSS bind window
+/// (`DEFAULT_PORT ..= +MAX_PORT_ATTEMPTS`). Fails only when the entire window is
+/// occupied (no TCP listener could start); a busy base port alone is reported.
+fn check_ports_free() -> bool {
+    use intent_transport::lifecycle::{DEFAULT_PORT, MAX_PORT_ATTEMPTS};
+    let mut free = 0u16;
+    for offset in 0..MAX_PORT_ATTEMPTS {
+        let Some(port) = DEFAULT_PORT.checked_add(offset) else {
+            break;
+        };
+        if std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_ok() {
+            free += 1;
+        }
+    }
+    let last = DEFAULT_PORT + MAX_PORT_ATTEMPTS - 1;
+    if free == 0 {
+        println!("[FAIL] no free port in WSS window {DEFAULT_PORT}..={last}");
+        false
+    } else {
+        println!(
+            "[ok] {free}/{MAX_PORT_ATTEMPTS} ports free in WSS window {DEFAULT_PORT}..={last}"
+        );
+        true
+    }
+}
+
+/// §5.7 cert-validity check: inspect (never generate) the persisted WSS cert. A
+/// missing cert is fine (generated on first TCP serve); an expired/unparseable
+/// one is a real failure to surface (the pinned fingerprint will change).
+fn check_cert_validity(config: &Config) -> bool {
+    match intent_transport::inspect_cert(&config.data_dir) {
+        CertStatus::Missing => {
+            println!("[ok] TLS cert: none yet (generated on first `serve --listen tcp`)");
+            true
+        }
+        CertStatus::Valid { fingerprint } => {
+            println!("[ok] TLS cert valid (fingerprint {fingerprint})");
+            true
+        }
+        CertStatus::Expired => {
+            println!("[FAIL] TLS cert expired/not-yet-valid (regenerated on next TCP serve)");
+            false
+        }
+        CertStatus::Unparseable => {
+            println!("[FAIL] TLS cert unparseable on disk");
+            false
+        }
+    }
+}
+
+/// §5.7 / §11.3 GitHub-token presence: report presence only, never the value.
+/// Non-fatal — GitHub features degrade gracefully when no token is configured.
+fn report_github_token() {
+    let env_present =
+        std::env::var_os("GITHUB_TOKEN").is_some() || std::env::var_os("GH_TOKEN").is_some();
+    let gh_cli = intent_providers::resolve_on_path("gh").is_some();
+    if env_present {
+        println!("[ok] GitHub token present (GITHUB_TOKEN/GH_TOKEN set)");
+    } else if gh_cli {
+        println!("[--] GitHub token: none in env; `gh` CLI on PATH (may provide one)");
+    } else {
+        println!("[--] GitHub token: not present (GitHub features degrade gracefully)");
+    }
+}
+
+/// §5.7 context-engine availability: best-effort `auggie` PATH probe. Non-fatal
+/// — codebase retrieval degrades gracefully when the engine is absent (§8.3).
+fn report_context_engine() {
+    match intent_providers::resolve_on_path("auggie") {
+        Some(p) => println!("[ok] context engine: auggie available ({})", p.display()),
+        None => {
+            println!("[--] context engine: auggie not on PATH (retrieval degrades gracefully)")
+        }
+    }
+}
+
+/// §5.7 / §12.3 host capabilities: display availability + derived locality. The
+/// local UDS control path is `local`; remote WSS clients are `remote` (the live
+/// value is reported per-connection by `intentd status`).
+fn report_host_capabilities() {
+    println!(
+        "[ok] host: {} / {} (hasDisplay={}, locality=local over UDS)",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        detect_has_display(),
+    );
 }
 
 /// Doctor provider-discovery section (§6.9): print which configured ACP
@@ -631,5 +1036,114 @@ mod tests {
         drop(listener);
         std::fs::remove_file(&config.socket_path).ok();
         std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    use std::sync::Mutex;
+
+    /// A scriptable [`Signaller`] for the stop-escalation unit tests: it models
+    /// process death either after N liveness polls (a "graceful" exit) or in
+    /// response to SIGTERM / SIGKILL, and records which signals were sent.
+    #[derive(Default)]
+    struct FakeState {
+        term_called: bool,
+        kill_called: bool,
+        polls: u32,
+    }
+
+    struct FakeSignaller {
+        inner: Mutex<FakeState>,
+        die_after_polls: Option<u32>,
+        die_on_term: bool,
+        die_on_kill: bool,
+    }
+
+    impl FakeSignaller {
+        fn new(die_after_polls: Option<u32>, die_on_term: bool, die_on_kill: bool) -> Self {
+            Self {
+                inner: Mutex::new(FakeState::default()),
+                die_after_polls,
+                die_on_term,
+                die_on_kill,
+            }
+        }
+    }
+
+    impl Signaller for FakeSignaller {
+        fn is_alive(&self, _pid: u32) -> bool {
+            let mut s = self.inner.lock().unwrap();
+            s.polls += 1;
+            if s.kill_called && self.die_on_kill {
+                return false;
+            }
+            if s.term_called && self.die_on_term {
+                return false;
+            }
+            if let Some(n) = self.die_after_polls {
+                if s.polls > n {
+                    return false;
+                }
+            }
+            true
+        }
+        fn term(&self, _pid: u32) {
+            self.inner.lock().unwrap().term_called = true;
+        }
+        fn kill(&self, _pid: u32) {
+            self.inner.lock().unwrap().kill_called = true;
+        }
+    }
+
+    // Tiny timeouts keep the escalation tests fast while exercising real waits.
+    const GRACE: Duration = Duration::from_millis(200);
+    const TERM_T: Duration = Duration::from_millis(60);
+    const KILL_T: Duration = Duration::from_millis(60);
+    const POLL: Duration = Duration::from_millis(2);
+
+    #[tokio::test]
+    async fn stop_already_down_when_not_alive() {
+        // Dead on the very first liveness probe.
+        let sig = FakeSignaller::new(Some(0), false, false);
+        let outcome = escalate_stop(&sig, 123, true, GRACE, TERM_T, KILL_T, POLL).await;
+        assert_eq!(outcome, StopOutcome::AlreadyDown);
+        assert!(!sig.inner.lock().unwrap().term_called);
+        assert!(!sig.inner.lock().unwrap().kill_called);
+    }
+
+    #[tokio::test]
+    async fn stop_graceful_when_exits_before_signal() {
+        // Alive for the first couple of polls, then exits during the grace wait.
+        let sig = FakeSignaller::new(Some(2), false, false);
+        let outcome = escalate_stop(&sig, 123, true, GRACE, TERM_T, KILL_T, POLL).await;
+        assert_eq!(outcome, StopOutcome::Graceful);
+        assert!(!sig.inner.lock().unwrap().term_called, "no signal needed");
+    }
+
+    #[tokio::test]
+    async fn stop_escalates_to_sigterm() {
+        // Never exits on its own; dies on SIGTERM. No graceful wait requested.
+        let sig = FakeSignaller::new(None, true, false);
+        let outcome = escalate_stop(&sig, 123, false, GRACE, TERM_T, KILL_T, POLL).await;
+        assert_eq!(outcome, StopOutcome::Terminated);
+        assert!(sig.inner.lock().unwrap().term_called);
+        assert!(!sig.inner.lock().unwrap().kill_called);
+    }
+
+    #[tokio::test]
+    async fn stop_escalates_to_sigkill() {
+        // Survives SIGTERM, dies on SIGKILL.
+        let sig = FakeSignaller::new(None, false, true);
+        let outcome = escalate_stop(&sig, 123, false, GRACE, TERM_T, KILL_T, POLL).await;
+        assert_eq!(outcome, StopOutcome::Killed);
+        assert!(sig.inner.lock().unwrap().term_called);
+        assert!(sig.inner.lock().unwrap().kill_called);
+    }
+
+    #[tokio::test]
+    async fn stop_fails_when_process_never_dies() {
+        let sig = FakeSignaller::new(None, false, false);
+        let outcome = escalate_stop(&sig, 123, true, GRACE, TERM_T, KILL_T, POLL).await;
+        assert_eq!(outcome, StopOutcome::Failed);
+        assert!(sig.inner.lock().unwrap().term_called);
+        assert!(sig.inner.lock().unwrap().kill_called);
     }
 }

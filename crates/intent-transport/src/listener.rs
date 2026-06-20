@@ -23,6 +23,8 @@ use std::sync::Arc;
 use intent_core::WorkspaceApi;
 use intent_services::EventBus;
 
+use crate::control::SystemControl;
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -36,12 +38,15 @@ use tokio::sync::mpsc;
 use crate::conn::{process_frame, ConnSubs, OUTBOUND_CAPACITY};
 
 /// Serve JSON-RPC over a UDS until `shutdown` resolves. `bus` is the shared
-/// in-process event bus that connection subscriptions are wired to.
+/// in-process event bus that connection subscriptions are wired to. `control`,
+/// when present, exposes the `system.status`/`system.shutdown` control surface
+/// (§5.7) to local UDS clients (`intentd status`/`stop`).
 #[cfg(unix)]
 pub async fn serve_uds<F>(
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
     socket_path: &Path,
+    control: Option<Arc<dyn SystemControl>>,
     shutdown: F,
 ) -> std::io::Result<()>
 where
@@ -67,8 +72,9 @@ where
                     Ok((stream, _addr)) => {
                         let api = api.clone();
                         let bus = bus.clone();
+                        let control = control.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, api, bus).await {
+                            if let Err(e) = handle_connection(stream, api, bus, control).await {
                                 tracing::debug!(error = %e, "uds connection ended");
                             }
                         });
@@ -92,6 +98,7 @@ async fn handle_connection(
     stream: UnixStream,
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
+    control: Option<Arc<dyn SystemControl>>,
 ) -> std::io::Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -125,7 +132,18 @@ async fn handle_connection(
             continue;
         }
         // A send failure means the writer/client is gone → end the connection.
-        if !process_frame(trimmed, &*api, &bus, &out_tx, &mut subs).await {
+        // UDS is the local control transport, so `is_local = true` (§12.3).
+        if !process_frame(
+            trimmed,
+            &*api,
+            &bus,
+            &out_tx,
+            &mut subs,
+            control.as_ref(),
+            true,
+        )
+        .await
+        {
             break Ok(());
         }
     };
@@ -144,6 +162,7 @@ pub async fn serve_uds<F>(
     _api: Arc<dyn WorkspaceApi>,
     _bus: EventBus,
     _socket_path: &Path,
+    _control: Option<Arc<dyn SystemControl>>,
     _shutdown: F,
 ) -> std::io::Result<()>
 where

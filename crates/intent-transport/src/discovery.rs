@@ -53,8 +53,10 @@ impl HostCapabilities {
 }
 
 /// Best-effort `hasDisplay` (§12.3): X11/Wayland env on Unix, otherwise assume
-/// a display unless the process was reached over SSH (no local console).
-fn detect_has_display() -> bool {
+/// a display unless the process was reached over SSH (no local console). Public
+/// so the CLI `status`/`doctor` surfaces (§5.7) report the same value the mDNS
+/// TXT record advertises.
+pub fn detect_has_display() -> bool {
     if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
         return true;
     }

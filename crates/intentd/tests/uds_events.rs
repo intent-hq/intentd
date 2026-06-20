@@ -113,7 +113,7 @@ async fn subscribe_push_filter_unsubscribe_and_disconnect_cleanup() {
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
-            let _ = serve_uds(services, bus, &socket, async {
+            let _ = serve_uds(services, bus, &socket, None, async {
                 let _ = shutdown_rx.await;
             })
             .await;
@@ -219,7 +219,7 @@ async fn crud_mutations_emit_change_events_over_uds() {
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
-            let _ = serve_uds(services, bus, &socket, async {
+            let _ = serve_uds(services, bus, &socket, None, async {
                 let _ = shutdown_rx.await;
             })
             .await;

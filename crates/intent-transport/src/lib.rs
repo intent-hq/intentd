@@ -12,14 +12,16 @@ pub use auth::{
     extract_bearer_token, extract_token, generate_token, get_or_create_token, is_allowed_origin,
     is_auth_enabled, is_discovery_enabled, validate_token, KeyringTokenStore, TokenStore,
 };
-pub use discovery::{Discovery, SERVICE_TYPE};
+pub use control::{SystemControl, SystemStatus};
+pub use discovery::{detect_has_display, Discovery, SERVICE_TYPE};
 pub use listener::serve_uds;
 pub use router::handle_message;
-pub use tls::{cert_fingerprint, ensure_tls_certificate, TlsCertificate};
+pub use tls::{cert_fingerprint, ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
 pub use ws::{WsApiServer, WsOptions};
 
 pub mod auth;
 mod conn;
+pub mod control;
 pub mod discovery;
 mod events;
 pub mod lifecycle;

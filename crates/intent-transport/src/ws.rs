@@ -358,7 +358,9 @@ impl WsInner {
                 incoming = stream.next() => match incoming {
                     None | Some(Err(_)) => break,
                     Some(Ok(Message::Text(text))) => {
-                        if !conn::process_frame(&text, &*self.api, &self.bus, &app_tx, &mut subs).await {
+                        // The WSS transport does not expose the `system.*` control
+                        // surface (those are served over the local UDS); pass `None`.
+                        if !conn::process_frame(&text, &*self.api, &self.bus, &app_tx, &mut subs, None, false).await {
                             break;
                         }
                     }
