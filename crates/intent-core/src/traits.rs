@@ -1674,6 +1674,100 @@ pub trait WorkspaceApi: Send + Sync {
             ))
         })
     }
+
+    // ------------------------------------------------------------------------
+    // terminal.* — interactive PTYs on the unified host (PROTOCOL §5.13, §12).
+    // ------------------------------------------------------------------------
+
+    /// `terminal.create`: spawn a PTY (default shell when `command` is absent)
+    /// scoped to the workspace and start fanning its output to subscribers as
+    /// `terminal:data` events. Returns `{ terminalId }` (PROTOCOL §5.13).
+    fn terminal_create(
+        &self,
+        workspace_id: WorkspaceId,
+        cols: u16,
+        rows: u16,
+        cwd: Option<String>,
+        command: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, cols, rows, cwd, command);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::terminal_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `terminal.write`: write base64-encoded input bytes to a PTY's stdin
+    /// (writes are serialized into the single master). Returns `{ ok: true }`
+    /// (PROTOCOL §5.13).
+    fn terminal_write(
+        &self,
+        terminal_id: String,
+        data: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (terminal_id, data);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::terminal_write not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `terminal.resize`: resize a PTY's visible area. Returns `{ ok: true }`
+    /// (PROTOCOL §5.13).
+    fn terminal_resize(
+        &self,
+        terminal_id: String,
+        cols: u16,
+        rows: u16,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (terminal_id, cols, rows);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::terminal_resize not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `terminal.kill`: signal/terminate a PTY's process group; the streamer
+    /// emits `terminal:exit` when the process ends. Returns `{ ok: true }`
+    /// (PROTOCOL §5.13).
+    fn terminal_kill(&self, terminal_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = terminal_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::terminal_kill not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `terminal.getBuffer`: snapshot a PTY's server-side scrollback for replay,
+    /// base64-encoded (optionally trailing `maxBytes`). Returns
+    /// `{ terminalId, data }` (PROTOCOL §5.13).
+    fn terminal_get_buffer(
+        &self,
+        terminal_id: String,
+        max_bytes: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (terminal_id, max_bytes);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::terminal_get_buffer not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `terminal.list`: the workspace's live terminals as `{ terminals: [...] }`
+    /// (PROTOCOL §5.9).
+    fn terminal_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::terminal_list not implemented".to_string(),
+            ))
+        })
+    }
 }
 
 /// Context-engine abstraction implemented by `intent-context` (§3.1).

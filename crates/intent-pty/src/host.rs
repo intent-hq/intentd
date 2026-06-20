@@ -37,6 +37,17 @@ impl std::fmt::Display for PtyId {
     }
 }
 
+impl PtyId {
+    /// Parse the `pty-{n}` [`Display`](std::fmt::Display) form back into a
+    /// `PtyId` (the wire id used by `terminal.*` / ACP `terminal/*`). Returns
+    /// `None` for any other shape.
+    pub fn parse(s: &str) -> Option<PtyId> {
+        s.strip_prefix("pty-")
+            .and_then(|n| n.parse::<u64>().ok())
+            .map(PtyId)
+    }
+}
+
 /// Visible terminal dimensions in character cells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PtySize {
@@ -59,6 +70,17 @@ impl PtySize {
             pixel_height: 0,
         }
     }
+}
+
+/// A terminated PTY child's exit status. `signal` is unavailable through the
+/// `portable-pty` child abstraction, so only `exit_code` is populated; callers
+/// that need richer parity treat a non-success code as the failure indicator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PtyExit {
+    /// The raw process exit code as reported by the platform.
+    pub exit_code: u32,
+    /// Whether the process exited successfully (code 0).
+    pub success: bool,
 }
 
 /// A signal to deliver to a PTY's process group.
@@ -133,6 +155,30 @@ struct PtySession {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     fanout: Arc<Mutex<Fanout>>,
     reader: Mutex<Option<JoinHandle<()>>>,
+    /// Cached exit status, latched the first time the child is observed exited so
+    /// it survives later teardown/removal (the `portable-pty` child only yields
+    /// its status once).
+    exit: Mutex<Option<PtyExit>>,
+}
+
+/// Latch and return a session's exit status: returns the cached value, or polls
+/// the child once (non-blocking) and caches the result when it has exited.
+fn observe_exit(session: &PtySession) -> Option<PtyExit> {
+    let mut cached = session.exit.lock().unwrap();
+    if let Some(exit) = cached.as_ref() {
+        return Some(exit.clone());
+    }
+    match session.child.lock().unwrap().try_wait() {
+        Ok(Some(status)) => {
+            let exit = PtyExit {
+                exit_code: status.exit_code(),
+                success: status.success(),
+            };
+            *cached = Some(exit.clone());
+            Some(exit)
+        }
+        _ => None,
+    }
 }
 
 fn internal(e: impl std::fmt::Display) -> Error {
@@ -195,6 +241,7 @@ impl PtyHost {
             killer: Mutex::new(killer),
             fanout,
             reader: Mutex::new(Some(handle)),
+            exit: Mutex::new(None),
         });
 
         let id = PtyId(self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -212,6 +259,33 @@ impl PtyHost {
         let live = guard.tx.subscribe();
         drop(guard);
         Ok(Attachment { backlog, live })
+    }
+
+    /// Snapshot the PTY's current scrollback for replay (`terminal.getBuffer` /
+    /// ACP `terminal/output`), without subscribing to live output.
+    pub fn scrollback(&self, id: PtyId) -> Result<Vec<u8>> {
+        let session = self.get(id)?;
+        let guard = session.fanout.lock().unwrap();
+        Ok(guard.scrollback.snapshot())
+    }
+
+    /// The child's exit status if it has already exited, else `None`. Latches
+    /// the status so it stays observable after the stream closes.
+    pub fn try_exit(&self, id: PtyId) -> Result<Option<PtyExit>> {
+        let session = self.get(id)?;
+        Ok(observe_exit(&session))
+    }
+
+    /// Wait until the PTY's child exits and return its status (ACP
+    /// `terminal/wait_for_exit`). Polls the child rather than blocking a thread.
+    pub async fn wait(&self, id: PtyId) -> Result<PtyExit> {
+        let session = self.get(id)?;
+        loop {
+            if let Some(exit) = observe_exit(&session) {
+                return Ok(exit);
+            }
+            tokio::time::sleep(REAP_POLL).await;
+        }
     }
 
     /// Write input to the PTY master. The per-PTY writer mutex serializes
@@ -419,6 +493,31 @@ mod tests {
         acc
     }
 
+    /// Drain a live receiver until every needle in `needles` is present or the
+    /// deadline passes. Used when output arrives in an arbitrary order and no
+    /// single chunk can serve as a completion sentinel.
+    async fn collect_until_all(
+        rx: &mut broadcast::Receiver<Arc<Vec<u8>>>,
+        needles: &[Vec<u8>],
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let mut acc = Vec::new();
+        let deadline = Instant::now() + timeout;
+        while !needles.iter().all(|n| contains(&acc, n)) {
+            let remaining = match deadline.checked_duration_since(Instant::now()) {
+                Some(d) => d,
+                None => break,
+            };
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(chunk)) => acc.extend_from_slice(&chunk),
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                Err(_) => break,
+            }
+        }
+        acc
+    }
+
     fn pid_alive(pid: u32) -> bool {
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
@@ -512,11 +611,11 @@ mod tests {
             t.await.unwrap();
         }
 
-        let acc = collect_until(&mut rx, &[b'a' + (n - 1); 64], Duration::from_secs(5)).await;
-        for i in 0..n {
-            let payload = vec![b'a' + i; 64];
+        let payloads: Vec<Vec<u8>> = (0..n).map(|i| vec![b'a' + i; 64]).collect();
+        let acc = collect_until_all(&mut rx, &payloads, Duration::from_secs(10)).await;
+        for (i, payload) in payloads.iter().enumerate() {
             assert!(
-                contains(&acc, &payload),
+                contains(&acc, payload),
                 "payload {i} was split — writes interleaved"
             );
         }

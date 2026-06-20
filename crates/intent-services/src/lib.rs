@@ -44,9 +44,12 @@ mod git_ops;
 mod note_ops;
 mod pr_ops;
 mod search_ops;
+mod terminal_ops;
 
 #[cfg(test)]
 mod tests;
+
+pub use terminal_ops::PtyTerminalHost;
 
 pub use agent_manager::{
     compute_process_cap, default_process_cap, AgentManager, BusEventSink, ProcessRegistry,
@@ -103,6 +106,11 @@ pub struct Services {
     /// workspace's count is non-zero. Transitions to/from zero emit
     /// `workspace:activity-changed`.
     agent_activity: Arc<Mutex<HashMap<WorkspaceId, usize>>>,
+    /// The unified PTY host backing `terminal.*` and the ACP `terminal/*`
+    /// adapter (§12). Shared across clones so every service handle — and the
+    /// [`AgentManager`] that builds the ACP terminal adapter — drives the same
+    /// terminals.
+    pty: Arc<intent_pty::PtyHost>,
 }
 
 impl Services {
@@ -119,7 +127,13 @@ impl Services {
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
             search_cancels: intent_search::CancelRegistry::new(),
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
+            pty: Arc::new(intent_pty::PtyHost::new()),
         }
+    }
+
+    /// Borrow the shared PTY host (composition root / ACP terminal-adapter use).
+    pub fn pty(&self) -> Arc<intent_pty::PtyHost> {
+        self.pty.clone()
     }
 
     /// Derive the read-only [`WorkspaceActivity`] for a workspace from the live
@@ -507,7 +521,7 @@ fn fresh_task_metadata(status: TaskStatus, now: &str, peer_order: Option<i64>) -
 /// Mirrors the TS fallback `{ type: 'system', id: 'system', name: 'System' }`
 /// used by `createWorkspaceEvent` when no provenance actor is present; agent
 /// provenance attribution is wired in a later milestone.
-fn system_actor() -> intent_core::EventActor {
+pub(crate) fn system_actor() -> intent_core::EventActor {
     intent_core::EventActor {
         actor_type: ActorType::System,
         id: Some("system".to_string()),
@@ -1113,6 +1127,59 @@ impl WorkspaceApi for Services {
             let matches = to_value_vec(matches)?;
             Ok(services.deliver_search(request_id, Some(workspace_id), matches, token))
         })
+    }
+
+    fn terminal_create(
+        &self,
+        workspace_id: WorkspaceId,
+        cols: u16,
+        rows: u16,
+        cwd: Option<String>,
+        command: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let pty = self.pty.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            terminal_ops::create(pty, bus, workspace_id, cols, rows, cwd, command).await
+        })
+    }
+
+    fn terminal_write(
+        &self,
+        terminal_id: String,
+        data: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let pty = self.pty.clone();
+        Box::pin(async move { terminal_ops::write(&pty, &terminal_id, &data) })
+    }
+
+    fn terminal_resize(
+        &self,
+        terminal_id: String,
+        cols: u16,
+        rows: u16,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let pty = self.pty.clone();
+        Box::pin(async move { terminal_ops::resize(&pty, &terminal_id, cols, rows) })
+    }
+
+    fn terminal_kill(&self, terminal_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let pty = self.pty.clone();
+        Box::pin(async move { terminal_ops::kill(&pty, &terminal_id).await })
+    }
+
+    fn terminal_get_buffer(
+        &self,
+        terminal_id: String,
+        max_bytes: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let pty = self.pty.clone();
+        Box::pin(async move { terminal_ops::get_buffer(&pty, &terminal_id, max_bytes) })
+    }
+
+    fn terminal_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let pty = self.pty.clone();
+        Box::pin(async move { terminal_ops::list(&pty, &workspace_id) })
     }
 
     fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {

@@ -14,14 +14,18 @@ use intent_core::{ActorType, AgentId, BoxFuture, EventActor, WorkspaceId};
 use serde_json::{json, Value};
 
 use agent_client_protocol::schema::{
-    ReadTextFileRequest, ReadTextFileResponse, RequestPermissionRequest, WriteTextFileRequest,
+    CreateTerminalRequest, CreateTerminalResponse, KillTerminalRequest, KillTerminalResponse,
+    ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    RequestPermissionRequest, TerminalExitStatus, TerminalOutputRequest, TerminalOutputResponse,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
     WriteTextFileResponse,
 };
 
 use crate::error::{AcpError, AcpResult, JsonRpcError};
+use crate::fs;
 use crate::permission::{self, PermissionOutcome, PermissionPolicy, PermissionRegistry};
+use crate::terminal::{self, TerminalCreateParams, TerminalExitInfo, TerminalHost};
 use crate::transport::{Connection, IncomingRequest};
-use crate::{fs, terminal};
 use std::sync::Arc;
 
 /// JSON-RPC error codes used when answering client-served requests.
@@ -61,6 +65,10 @@ pub struct ClientRequestHandler {
     permissions: Arc<PermissionRegistry>,
     policy: PermissionPolicy,
     sink: Arc<dyn EventSink>,
+    /// Client-served terminal host (the unified PTY host, wired by the service
+    /// layer). `None` for read-only/test wiring, in which case `terminal/*`
+    /// requests answer with [`terminal::unsupported_error`].
+    terminal_host: Option<Arc<dyn TerminalHost>>,
 }
 
 impl ClientRequestHandler {
@@ -82,7 +90,16 @@ impl ClientRequestHandler {
             permissions,
             policy,
             sink,
+            terminal_host: None,
         }
+    }
+
+    /// Attach the client-served terminal host so `terminal/*` requests run on
+    /// the real PTY host (§6.7). The PTY lifetime scope is the agent session id.
+    #[must_use]
+    pub fn with_terminal_host(mut self, host: Arc<dyn TerminalHost>) -> Self {
+        self.terminal_host = Some(host);
+        self
     }
 
     /// Dispatch one incoming request and answer it over `conn`.
@@ -92,9 +109,10 @@ impl ClientRequestHandler {
             "fs/read_text_file" => self.handle_read(conn, id, params).await,
             "fs/write_text_file" => self.handle_write(conn, id, params).await,
             "session/request_permission" => self.handle_permission(conn, id, params).await,
-            m if terminal::is_terminal_method(m) => {
-                conn.respond_error(id, terminal::unsupported_error(m)).await
-            }
+            m if terminal::is_terminal_method(m) => match self.terminal_host.clone() {
+                Some(host) => self.handle_terminal(conn, id, m, params, host).await,
+                None => conn.respond_error(id, terminal::unsupported_error(m)).await,
+            },
             other => {
                 conn.respond_error(
                     id,
@@ -198,6 +216,104 @@ impl ClientRequestHandler {
         conn.respond_result(id, outcome.to_response_value()).await
     }
 
+    /// Dispatch one client-served `terminal/*` request onto the wired host
+    /// (§6.7). Parse failures answer `invalid params`; host failures answer
+    /// `internal error` carrying the reason.
+    async fn handle_terminal(
+        &self,
+        conn: &Connection,
+        id: Value,
+        method: &str,
+        params: Value,
+        host: Arc<dyn TerminalHost>,
+    ) -> AcpResult<()> {
+        match method {
+            "terminal/create" => {
+                let req: CreateTerminalRequest = match serde_json::from_value(params) {
+                    Ok(p) => p,
+                    Err(e) => return conn.respond_error(id, invalid_params(e)).await,
+                };
+                let create = TerminalCreateParams {
+                    session_id: req.session_id.0.to_string(),
+                    command: req.command,
+                    args: req.args,
+                    env: req.env.into_iter().map(|v| (v.name, v.value)).collect(),
+                    cwd: req.cwd,
+                    output_byte_limit: req.output_byte_limit,
+                };
+                match host.create(create).await {
+                    Ok(terminal_id) => {
+                        let result =
+                            serde_json::to_value(CreateTerminalResponse::new(terminal_id))?;
+                        conn.respond_result(id, result).await
+                    }
+                    Err(e) => conn.respond_error(id, terminal_error(&e)).await,
+                }
+            }
+            "terminal/output" => {
+                let req: TerminalOutputRequest = match serde_json::from_value(params) {
+                    Ok(p) => p,
+                    Err(e) => return conn.respond_error(id, invalid_params(e)).await,
+                };
+                match host.output(req.terminal_id.0.to_string()).await {
+                    Ok(out) => {
+                        let mut resp = TerminalOutputResponse::new(out.output, out.truncated);
+                        if let Some(exit) = out.exit_status {
+                            resp = resp.exit_status(exit_status_value(exit));
+                        }
+                        let result = serde_json::to_value(resp)?;
+                        conn.respond_result(id, result).await
+                    }
+                    Err(e) => conn.respond_error(id, terminal_error(&e)).await,
+                }
+            }
+            "terminal/wait_for_exit" => {
+                let req: WaitForTerminalExitRequest = match serde_json::from_value(params) {
+                    Ok(p) => p,
+                    Err(e) => return conn.respond_error(id, invalid_params(e)).await,
+                };
+                match host.wait_for_exit(req.terminal_id.0.to_string()).await {
+                    Ok(exit) => {
+                        let resp = WaitForTerminalExitResponse::new(exit_status_value(exit));
+                        let result = serde_json::to_value(resp)?;
+                        conn.respond_result(id, result).await
+                    }
+                    Err(e) => conn.respond_error(id, terminal_error(&e)).await,
+                }
+            }
+            "terminal/release" => {
+                let req: ReleaseTerminalRequest = match serde_json::from_value(params) {
+                    Ok(p) => p,
+                    Err(e) => return conn.respond_error(id, invalid_params(e)).await,
+                };
+                match host.release(req.terminal_id.0.to_string()).await {
+                    Ok(()) => {
+                        let result = serde_json::to_value(ReleaseTerminalResponse::new())?;
+                        conn.respond_result(id, result).await
+                    }
+                    Err(e) => conn.respond_error(id, terminal_error(&e)).await,
+                }
+            }
+            "terminal/kill" => {
+                let req: KillTerminalRequest = match serde_json::from_value(params) {
+                    Ok(p) => p,
+                    Err(e) => return conn.respond_error(id, invalid_params(e)).await,
+                };
+                match host.kill(req.terminal_id.0.to_string()).await {
+                    Ok(()) => {
+                        let result = serde_json::to_value(KillTerminalResponse::new())?;
+                        conn.respond_result(id, result).await
+                    }
+                    Err(e) => conn.respond_error(id, terminal_error(&e)).await,
+                }
+            }
+            other => {
+                conn.respond_error(id, terminal::unsupported_error(other))
+                    .await
+            }
+        }
+    }
+
     /// Publish one event attributed to this agent onto the sink.
     async fn emit(&self, event_type: &str, data: Value) {
         self.sink
@@ -240,4 +356,20 @@ fn fs_error(e: &AcpError) -> JsonRpcError {
         message: e.to_string(),
         data: None,
     }
+}
+
+/// Map a terminal host failure to an `internal` JSON-RPC error.
+fn terminal_error(e: &AcpError) -> JsonRpcError {
+    JsonRpcError {
+        code: INTERNAL_ERROR,
+        message: e.to_string(),
+        data: None,
+    }
+}
+
+/// Build the ACP `TerminalExitStatus` from the host's exit info.
+fn exit_status_value(exit: TerminalExitInfo) -> TerminalExitStatus {
+    TerminalExitStatus::new()
+        .exit_code(exit.exit_code)
+        .signal(exit.signal)
 }

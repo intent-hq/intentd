@@ -103,6 +103,15 @@ pub const TASK_READY_TASKS_CHANGED: &str = "task:ready-tasks-changed";
 
 // Terminal events.
 pub const TERMINAL_COMMAND: &str = "terminal:command";
+// Interactive PTY streaming family (new in intentd; PROTOCOL §5.13/§6.5). The
+// daemon fans live PTY output to subscribers as `terminal:data` (base64 `chunk`)
+// and signals process exit with `terminal:exit`; `terminal:title`/`terminal:cwd`
+// carry detected title / working-directory changes. All payloads are
+// self-sufficient and carry the `terminalId`.
+pub const TERMINAL_DATA: &str = "terminal:data";
+pub const TERMINAL_EXIT: &str = "terminal:exit";
+pub const TERMINAL_TITLE: &str = "terminal:title";
+pub const TERMINAL_CWD: &str = "terminal:cwd";
 
 // Test events.
 pub const TEST_STARTED: &str = "test:started";

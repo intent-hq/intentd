@@ -18,3 +18,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# Integration tests drive the client-served `terminal/*` handlers against the
+# real unified PTY host. `intent-pty` depends only on `intent-core`, so this
+# dev-only edge introduces no dependency cycle.
+intent-pty = { path = "../intent-pty" }

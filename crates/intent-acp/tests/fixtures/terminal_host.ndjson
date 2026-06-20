@@ -1,0 +1,4 @@
+{"reply":"initialize","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}
+{"reply":"authenticate","result":{}}
+{"reply":"session/new","result":{"sessionId":"acp-session-1"}}
+{"prompt":[{"call":{"method":"terminal/create","params":{"sessionId":"acp-session-1","command":"echo","args":["acp-term-ok"]}}},{"call":{"method":"terminal/wait_for_exit","params":{"sessionId":"acp-session-1","terminalId":"pty-0"}}},{"call":{"method":"terminal/output","params":{"sessionId":"acp-session-1","terminalId":"pty-0"}}},{"call":{"method":"terminal/release","params":{"sessionId":"acp-session-1","terminalId":"pty-0"}}},{"stop":"end_turn"}]}

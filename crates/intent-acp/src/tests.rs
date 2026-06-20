@@ -1108,6 +1108,9 @@ mod client_served_tests {
         assert_eq!(deny["result"]["outcome"]["optionId"], json!("reject_once"));
     }
 
+    /// With no terminal host wired, `terminal/*` falls back to a clean
+    /// "method not found" stub (the host is wired in production by the service
+    /// layer; see the `acp_integration` host-backed scenario).
     #[tokio::test]
     async fn terminal_methods_return_unsupported_stub() {
         let root = temp_dir();
@@ -1134,6 +1137,6 @@ mod client_served_tests {
         assert!(resp["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("until M6"));
+            .contains("no terminal host wired"));
     }
 }
