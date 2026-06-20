@@ -493,6 +493,31 @@ mod tests {
         acc
     }
 
+    /// Drain a live receiver until every needle in `needles` is present or the
+    /// deadline passes. Used when output arrives in an arbitrary order and no
+    /// single chunk can serve as a completion sentinel.
+    async fn collect_until_all(
+        rx: &mut broadcast::Receiver<Arc<Vec<u8>>>,
+        needles: &[Vec<u8>],
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let mut acc = Vec::new();
+        let deadline = Instant::now() + timeout;
+        while !needles.iter().all(|n| contains(&acc, n)) {
+            let remaining = match deadline.checked_duration_since(Instant::now()) {
+                Some(d) => d,
+                None => break,
+            };
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(chunk)) => acc.extend_from_slice(&chunk),
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                Err(_) => break,
+            }
+        }
+        acc
+    }
+
     fn pid_alive(pid: u32) -> bool {
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
@@ -586,11 +611,11 @@ mod tests {
             t.await.unwrap();
         }
 
-        let acc = collect_until(&mut rx, &[b'a' + (n - 1); 64], Duration::from_secs(5)).await;
-        for i in 0..n {
-            let payload = vec![b'a' + i; 64];
+        let payloads: Vec<Vec<u8>> = (0..n).map(|i| vec![b'a' + i; 64]).collect();
+        let acc = collect_until_all(&mut rx, &payloads, Duration::from_secs(10)).await;
+        for (i, payload) in payloads.iter().enumerate() {
             assert!(
-                contains(&acc, &payload),
+                contains(&acc, payload),
                 "payload {i} was split — writes interleaved"
             );
         }
