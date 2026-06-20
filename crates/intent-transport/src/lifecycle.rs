@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::discovery::{advertise_if_enabled, Discovery};
 use crate::ws::{ConnCmd, WsInner};
 
 /// Default base listen port (PROTOCOL §1). If busy, the listener walks forward.
@@ -41,6 +42,9 @@ pub(crate) struct RunningHandles {
     pub accept_task: JoinHandle<()>,
     pub heartbeat_task: JoinHandle<()>,
     pub shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Live mDNS advertisement (§5.4), present only when discovery is enabled;
+    /// unpublished first during graceful shutdown so no stale record lingers.
+    pub discovery: Option<Discovery>,
 }
 
 /// Lifecycle state guarded by a single async mutex (the TS instance fields).
@@ -89,6 +93,9 @@ impl WsInner {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let accept_task = tokio::spawn(self.clone().accept_loop(listener, shutdown_rx));
         let heartbeat_task = tokio::spawn(self.clone().heartbeat_loop());
+        // Advertise the real, post-backoff port over mDNS (§5.4); a no-op (and
+        // `None`) when discovery is disabled or registration fails.
+        let discovery = advertise_if_enabled(self.discovery_enabled, port, &self.fingerprint);
         let mut st = self.state.lock().await;
         st.started = true;
         st.port = Some(port);
@@ -97,6 +104,7 @@ impl WsInner {
             accept_task,
             heartbeat_task,
             shutdown_tx: Some(shutdown_tx),
+            discovery,
         });
         Ok(port)
     }
@@ -154,6 +162,11 @@ impl WsInner {
             let _ = task.await;
         }
         if let Some(mut running) = running {
+            // (0) unpublish the mDNS advert first so no client resolves a
+            // listener that is mid-teardown (§5.4 graceful-shutdown ordering).
+            if let Some(discovery) = running.discovery.take() {
+                discovery.stop();
+            }
             // (1) stop the heartbeat.
             running.heartbeat_task.abort();
             // (2)+(3) close every client with 1001; the connection loop drops
