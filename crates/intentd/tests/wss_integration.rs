@@ -401,7 +401,18 @@ async fn port_backoff_picks_next_port() {
         ..WsOptions::default()
     })
     .await;
-    assert_eq!(srv.port, base + 1, "should walk forward past the busy port");
+    // `free_port()` discovers a number by binding port 0 then releasing it, so
+    // any concurrently-running test may grab `base + 1` before this listener's
+    // backoff reaches it — a TOCTOU that is fundamental to OS port assignment.
+    // The guarantee under test is "a busy base port makes the listener walk
+    // forward within the attempt window", so assert that range rather than one
+    // exact port (which is inherently racy under default parallelism).
+    let max = base + intent_transport::lifecycle::MAX_PORT_ATTEMPTS;
+    assert!(
+        srv.port > base && srv.port < max,
+        "should walk forward past the busy base {base} within the attempt window, got {}",
+        srv.port
+    );
     srv.ws.stop().await;
 }
 
