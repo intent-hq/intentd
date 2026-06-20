@@ -8,18 +8,19 @@
 pub use intent_core::Result;
 pub use intent_services::Services;
 
+pub use auth::{
+    extract_bearer_token, extract_token, generate_token, get_or_create_token, is_allowed_origin,
+    is_auth_enabled, is_discovery_enabled, validate_token, KeyringTokenStore, TokenStore,
+};
 pub use listener::serve_uds;
 pub use router::handle_message;
 pub use tls::{cert_fingerprint, ensure_tls_certificate, TlsCertificate};
 
+pub mod auth;
 mod events;
 pub mod listener;
 pub mod router;
 pub mod tls;
-
-pub mod auth {
-    //! Bearer auth + origin allow-list — stub.
-}
 
 pub mod heartbeat {
     //! Connection heartbeat — stub.
