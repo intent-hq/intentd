@@ -8,3 +8,6 @@ description = "Unified PTY host for terminals and scripts: scrollback, multi-cli
 
 [dependencies]
 intent-core = { path = "../intent-core" }
+nix.workspace = true
+portable-pty.workspace = true
+tokio.workspace = true
