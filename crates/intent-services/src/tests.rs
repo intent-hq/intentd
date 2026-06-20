@@ -1058,6 +1058,11 @@ mod pr {
         /// link an unlinked workspace by head ref.
         discover: bool,
         head_seq: AtomicU64,
+        /// Notified on the first `get_pr` call — the point at which
+        /// `pr.waitForChanges` has finished its one SQLite read and is past it.
+        /// The paused-clock poll tests use this as a barrier (see
+        /// `run_wait_for_changes`).
+        first_get_pr: Arc<tokio::sync::Notify>,
     }
 
     fn sample_pr() -> PullRequest {
@@ -1120,6 +1125,9 @@ mod pr {
             })
         }
         async fn get_pr(&self, _: &RepoRef, _: u64) -> ScResult<PullRequest> {
+            // Signal that the one pre-loop SQLite read is done (see
+            // `run_wait_for_changes`); harmless for non-poll callers.
+            self.first_get_pr.notify_one();
             let mut pr = sample_pr();
             if self.mutate_head {
                 let n = self.head_seq.fetch_add(1, Ordering::SeqCst);
@@ -1340,6 +1348,43 @@ mod pr {
         (tmp, services, ws_id)
     }
 
+    /// Drive `pr_wait_for_changes` deterministically under a paused clock.
+    ///
+    /// `pr_wait_for_changes` performs exactly one SQLite read (`load_ws_for_pr`)
+    /// before it captures the `initial` PR snapshot (the stub's first `get_pr`)
+    /// and enters its poll loop. That read crosses to sqlx's SQLite worker
+    /// thread; if the tokio clock is already paused the runtime's idle
+    /// auto-advance can fire the pool's `acquire_timeout` timer before the real
+    /// worker-thread reply lands, intermittently surfacing a spurious
+    /// `PoolTimedOut` (the pre-existing CI flake).
+    ///
+    /// So we run the call in a task while the clock still flows, wait on the
+    /// stub's first-`get_pr` signal (which fires immediately after that DB read),
+    /// and only then pause: by that point the read is provably done and the only
+    /// remaining timers are the poll-loop sleeps, which auto-advance instantly as
+    /// the tests intend. TEST-ONLY — no production change.
+    async fn run_wait_for_changes(
+        forge: StubForge,
+        timeout: Option<i64>,
+        poll: Option<i64>,
+        watch: &str,
+    ) -> serde_json::Value {
+        let ready = forge.first_get_pr.clone();
+        let (_t, svc, ws) = setup_with(forge, true).await;
+        let watch = watch.to_string();
+        let task = tokio::spawn(async move {
+            svc.pr_wait_for_changes(ws, timeout, poll, Some(watch))
+                .await
+        });
+        // The DB read finishes in real time; the stub signals once it is past it.
+        ready.notified().await;
+        tokio::time::pause();
+        // `_t` (the temp DB) must outlive the task.
+        let result = task.await.expect("join wait_for_changes task");
+        drop(_t);
+        result.expect("wait")
+    }
+
     #[tokio::test]
     async fn status_shape_is_parity_exact() {
         let (_t, svc, ws) = setup(false, true).await;
@@ -1513,21 +1558,16 @@ mod pr {
 
     #[tokio::test]
     async fn wait_for_changes_detects_new_commit() {
-        let (_t, svc, ws) = setup_with(
+        let v = run_wait_for_changes(
             StubForge {
                 mutate_head: true,
                 ..Default::default()
             },
-            true,
+            Some(30),
+            Some(10),
+            "commits",
         )
         .await;
-        // Pause after the store is open so the SQLite pool keeps its real-time
-        // connection; virtual time then makes the poll sleeps return instantly.
-        tokio::time::pause();
-        let v = svc
-            .pr_wait_for_changes(ws, Some(30), Some(10), Some("commits".into()))
-            .await
-            .expect("wait");
         assert_eq!(v["changed"], true);
         assert!(v["changes"][0].as_str().unwrap().starts_with("New commit:"));
         assert!(v["iterations"].as_u64().unwrap() >= 1);
@@ -1535,12 +1575,7 @@ mod pr {
 
     #[tokio::test]
     async fn wait_for_changes_times_out_without_changes() {
-        let (_t, svc, ws) = setup(false, true).await;
-        tokio::time::pause();
-        let v = svc
-            .pr_wait_for_changes(ws, Some(30), Some(10), Some("any".into()))
-            .await
-            .expect("wait");
+        let v = run_wait_for_changes(StubForge::default(), Some(30), Some(10), "any").await;
         assert_eq!(v["changed"], false);
         assert!(v["summary"].as_str().unwrap().contains("Timeout reached"));
     }

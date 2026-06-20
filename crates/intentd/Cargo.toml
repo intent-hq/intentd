@@ -41,6 +41,9 @@ rustls = { workspace = true }
 rustls-pki-types = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 sha2 = "0.10"
+# E2E transport suite (§13.1): browse the daemon's mDNS advertisement to assert
+# the advertise→resolve round-trip and that the advertised fingerprint matches.
+mdns-sd = "0.11"
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process"] }
