@@ -10,14 +10,12 @@ pub use intent_services::Services;
 
 pub use listener::serve_uds;
 pub use router::handle_message;
+pub use tls::{cert_fingerprint, ensure_tls_certificate, TlsCertificate};
 
 mod events;
 pub mod listener;
 pub mod router;
-
-pub mod tls {
-    //! TLS termination + SHA-256 fingerprint pinning — stub.
-}
+pub mod tls;
 
 pub mod auth {
     //! Bearer auth + origin allow-list — stub.

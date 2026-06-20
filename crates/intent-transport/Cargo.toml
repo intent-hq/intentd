@@ -13,6 +13,12 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+rcgen.workspace = true
+sha2 = "0.10.9"
+rustls-pemfile = "2.2.0"
+x509-parser = "0.18.1"
+if-addrs = "0.15.0"
+time.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
