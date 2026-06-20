@@ -41,7 +41,10 @@ pub const AGENT_SUBSCRIPTIONS_RESTORED: &str = "agent:subscriptions-restored";
 pub const AGENT_SUBSCRIPTIONS_CHANGED: &str = "agent:subscriptions-changed";
 pub const AGENT_MESSAGE_DELIVERY_FAILED: &str = "agent:message:delivery-failed";
 
-// Agent streaming events (for the WebSocket API).
+// Agent streaming events (for the WebSocket API). All share the
+// `agent:stream:` prefix — the high-volume chunk family the §10.2
+// retention/compaction sweep is allowed to trim.
+pub const AGENT_STREAM_PREFIX: &str = "agent:stream:";
 pub const AGENT_STREAM_START: &str = "agent:stream:start";
 pub const AGENT_STREAM_CHUNK: &str = "agent:stream:chunk";
 pub const AGENT_STREAM_CONTENT_BLOCKS: &str = "agent:stream:content-blocks";

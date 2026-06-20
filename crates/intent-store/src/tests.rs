@@ -525,6 +525,123 @@ async fn event_round_trip_and_queries() {
     assert_eq!(page[0].timestamp, "2026-01-01T00:00:02Z");
 }
 
+fn typed_event(ws: &WorkspaceId, ts: &str, event_type: &str, actor: EventActor) -> NewEvent {
+    NewEvent {
+        workspace_id: ws.clone(),
+        timestamp: ts.to_string(),
+        event_type: event_type.to_string(),
+        actor,
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        data: json!({}),
+    }
+}
+
+#[tokio::test]
+async fn stream_retention_sweep_trims_only_old_stream_events() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let agent = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+
+    // Mixed families across ages. Old = 2026-01-01, new = 2026-06-01.
+    let old = "2026-01-01T00:00:00Z";
+    let new = "2026-06-01T00:00:00Z";
+    let seed = vec![
+        // Old stream chunks (should be deleted by the sweep).
+        typed_event(&ws, old, events::AGENT_STREAM_START, agent.clone()),
+        typed_event(&ws, old, events::AGENT_STREAM_CHUNK, agent.clone()),
+        typed_event(&ws, old, events::AGENT_STREAM_END, agent.clone()),
+        // New stream chunk (within TTL — must survive).
+        typed_event(&ws, new, events::AGENT_STREAM_CHUNK, agent.clone()),
+        // Old non-stream families (must NEVER be deleted regardless of age).
+        typed_event(&ws, old, events::AGENT_STARTED, agent.clone()),
+        typed_event(&ws, old, events::AGENT_TOOL_CALL, agent.clone()),
+        typed_event(&ws, old, events::FILE_CHANGED, agent.clone()),
+        typed_event(&ws, old, events::NOTE_UPDATED, agent.clone()),
+        typed_event(&ws, old, events::TASK_STATUS_CHANGED, agent.clone()),
+    ];
+    for ev in &seed {
+        store.insert_event(ev).await.expect("insert seed event");
+    }
+
+    // Cutoff between old and new: only old stream chunks are eligible.
+    let cutoff = "2026-03-01T00:00:00Z";
+    let removed = store
+        .delete_stream_events_before(cutoff)
+        .await
+        .expect("sweep");
+    assert_eq!(removed, 3, "exactly the three old stream events removed");
+
+    let remaining = store
+        .events_by_workspace(&ws, 100)
+        .await
+        .expect("remaining");
+    assert_eq!(remaining.len(), 6);
+    // The surviving stream event is the new one; no old stream events remain.
+    let stream_types: Vec<&str> = remaining
+        .iter()
+        .filter(|e| e.event_type.starts_with(events::AGENT_STREAM_PREFIX))
+        .map(|e| e.timestamp.as_str())
+        .collect();
+    assert_eq!(stream_types, vec![new]);
+    // Every non-stream family survives, including the old ones.
+    for t in [
+        events::AGENT_STARTED,
+        events::AGENT_TOOL_CALL,
+        events::FILE_CHANGED,
+        events::NOTE_UPDATED,
+        events::TASK_STATUS_CHANGED,
+    ] {
+        assert!(
+            remaining.iter().any(|e| e.event_type == t),
+            "preserved family {t} missing"
+        );
+    }
+
+    // Idempotent: a re-run with the same cutoff removes nothing more.
+    let removed_again = store
+        .delete_stream_events_before(cutoff)
+        .await
+        .expect("sweep re-run");
+    assert_eq!(removed_again, 0);
+}
+
+#[tokio::test]
+async fn stream_retention_sweep_disabled_is_noop_in_practice() {
+    // The daemon disables the sweep at TTL=0 by never calling it; at the store
+    // layer a cutoff older than every row is a safe no-op (nothing eligible).
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let agent = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+    store
+        .insert_event(&typed_event(
+            &ws,
+            "2026-06-01T00:00:00Z",
+            events::AGENT_STREAM_CHUNK,
+            agent,
+        ))
+        .await
+        .expect("insert");
+
+    let removed = store
+        .delete_stream_events_before("2020-01-01T00:00:00Z")
+        .await
+        .expect("sweep");
+    assert_eq!(removed, 0);
+    assert_eq!(store.events_by_workspace(&ws, 10).await.unwrap().len(), 1);
+}
+
 fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
     let ts = now_iso();
     AgentSession {
