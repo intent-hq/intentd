@@ -809,6 +809,77 @@ impl WorkspaceApi for FakeApi {
             Ok(serde_json::json!({ "requestId": request_id, "matches": [] }))
         })
     }
+
+    fn terminal_create(
+        &self,
+        workspace_id: WorkspaceId,
+        cols: u16,
+        rows: u16,
+        cwd: Option<String>,
+        command: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "terminalId": "pty-1",
+                "workspaceId": workspace_id.as_str(),
+                "cols": cols,
+                "rows": rows,
+                "cwd": cwd,
+                "command": command,
+            }))
+        })
+    }
+
+    fn terminal_write(&self, terminal_id: String, data: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({ "ok": true, "terminalId": terminal_id, "data": data }))
+        })
+    }
+
+    fn terminal_resize(
+        &self,
+        terminal_id: String,
+        cols: u16,
+        rows: u16,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(
+                serde_json::json!({ "ok": true, "terminalId": terminal_id, "cols": cols, "rows": rows }),
+            )
+        })
+    }
+
+    fn terminal_kill(&self, terminal_id: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if terminal_id == "pty-missing" {
+                return Err(Error::NotFound(format!("terminal {terminal_id}")));
+            }
+            Ok(serde_json::json!({ "ok": true, "terminalId": terminal_id }))
+        })
+    }
+
+    fn terminal_get_buffer(
+        &self,
+        terminal_id: String,
+        max_bytes: Option<i64>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "terminalId": terminal_id,
+                "data": "aGk=",
+                "maxBytes": max_bytes,
+            }))
+        })
+    }
+
+    fn terminal_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "terminals": [{ "id": "pty-1", "alive": true }],
+                "workspaceId": workspace_id.as_str(),
+            }))
+        })
+    }
 }
 
 async fn call(msg: &str) -> Option<Value> {
@@ -1901,4 +1972,105 @@ async fn search_codebase_requires_workspace_and_query_and_maps_regex() {
     .unwrap();
     assert_eq!(err_code(&v), -32602);
     assert_eq!(v["error"]["message"], serde_json::json!("Invalid regex"));
+}
+
+#[tokio::test]
+async fn terminal_create_parses_dims_and_defaults() {
+    // Explicit cols/rows/cwd/command flow through to the service call.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"terminal.create","params":{"workspaceId":"ws-1","cols":120,"rows":40,"cwd":"/tmp","command":"bash"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["terminalId"], serde_json::json!("pty-1"));
+    assert_eq!(v["result"]["cols"], serde_json::json!(120));
+    assert_eq!(v["result"]["rows"], serde_json::json!(40));
+    assert_eq!(v["result"]["cwd"], serde_json::json!("/tmp"));
+    assert_eq!(v["result"]["command"], serde_json::json!("bash"));
+
+    // Defaults applied (80x24) when dims are absent.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"terminal.create","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["cols"], serde_json::json!(80));
+    assert_eq!(v["result"]["rows"], serde_json::json!(24));
+    assert_eq!(v["result"]["command"], serde_json::json!(null));
+
+    // workspaceId is required.
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"terminal.create","params":{"cols":80}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("workspaceId is required")
+    );
+}
+
+#[tokio::test]
+async fn terminal_write_resize_getbuffer_pass_params() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"terminal.write","params":{"terminalId":"pty-1","data":"aGk="}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["data"], serde_json::json!("aGk="));
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"terminal.resize","params":{"terminalId":"pty-1","cols":100,"rows":30}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["cols"], serde_json::json!(100));
+    assert_eq!(v["result"]["rows"], serde_json::json!(30));
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"terminal.getBuffer","params":{"terminalId":"pty-1","maxBytes":4096}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["terminalId"], serde_json::json!("pty-1"));
+    assert_eq!(v["result"]["data"], serde_json::json!("aGk="));
+    assert_eq!(v["result"]["maxBytes"], serde_json::json!(4096));
+
+    // Missing terminalId → -32602.
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"terminal.write","params":{"data":"aGk="}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn terminal_kill_and_list_dispatch() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"terminal.kill","params":{"terminalId":"pty-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+
+    // Unknown terminal → NotFound maps to -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"terminal.kill","params":{"terminalId":"pty-missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"terminal.list","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"]["terminals"][0]["id"],
+        serde_json::json!("pty-1")
+    );
+    assert_eq!(
+        v["result"]["terminals"][0]["alive"],
+        serde_json::json!(true)
+    );
 }

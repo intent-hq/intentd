@@ -658,15 +658,20 @@ impl AgentManager {
         let (child, connection) = spawned.into_parts();
         let connection = Arc::new(connection);
 
-        let handler = Arc::new(ClientRequestHandler::new(
-            workspace_id,
-            agent_id.clone(),
-            agent_name.into(),
-            FileService::new(cwd),
-            self.permissions.clone(),
-            self.policy,
-            self.sink.clone(),
-        ));
+        let terminal_host: Arc<dyn intent_acp::TerminalHost> =
+            Arc::new(crate::PtyTerminalHost::new(self.services.pty()));
+        let handler = Arc::new(
+            ClientRequestHandler::new(
+                workspace_id,
+                agent_id.clone(),
+                agent_name.into(),
+                FileService::new(cwd),
+                self.permissions.clone(),
+                self.policy,
+                self.sink.clone(),
+            )
+            .with_terminal_host(terminal_host),
+        );
         let serve_conn = connection.clone();
         let serve_task = tokio::spawn(async move {
             while let Some(req) = req_rx.recv().await {

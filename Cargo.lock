@@ -1590,6 +1590,7 @@ dependencies = [
  "agent-client-protocol",
  "intent-core",
  "intent-providers",
+ "intent-pty",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

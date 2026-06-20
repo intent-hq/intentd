@@ -2950,3 +2950,221 @@ mod search_adapters {
         assert!(done["data"]["total"].as_u64().unwrap() < 60);
     }
 }
+
+/// `terminal.*` lifecycle over a real PTY host wired into [`Services`]: stream
+/// `terminal:data`/`terminal:exit` onto the bus, multi-subscriber fan-out,
+/// late-attach back-fill via `getBuffer`, write/resize/kill/list (§5.13, §12).
+#[cfg(unix)]
+mod terminal {
+    use std::time::Duration;
+
+    use base64::Engine as _;
+    use intent_core::{WorkspaceApi, WorkspaceId};
+    use intent_store::Store;
+    use serde_json::Value;
+
+    use super::{workspace, TempDb};
+    use crate::events::{EventBus, Subscription, SubscriptionFilter};
+    use crate::Services;
+
+    struct Harness {
+        _tmp: TempDb,
+        services: Services,
+        bus: EventBus,
+        ws: WorkspaceId,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store).with_event_bus(bus.clone());
+        Harness {
+            _tmp: tmp,
+            services,
+            bus,
+            ws,
+        }
+    }
+
+    fn subscribe(h: &Harness) -> Subscription {
+        h.bus.subscribe(SubscriptionFilter {
+            event_types: vec!["terminal:*".to_string()],
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        })
+    }
+
+    fn b64(s: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
+    }
+
+    fn decode(s: &str) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+    }
+
+    /// Drain terminal events until one of `event_type` arrives, accumulating the
+    /// decoded `terminal:data` chunks seen along the way. Returns the matching
+    /// event and the accumulated data bytes.
+    async fn drain_until(
+        sub: &mut Subscription,
+        event_type: &str,
+        timeout: Duration,
+    ) -> (Value, Vec<u8>) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut data = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let batch = tokio::time::timeout(remaining, sub.recv())
+                .await
+                .expect("terminal event delivered")
+                .expect("subscription open");
+            for ev in &batch {
+                let v = serde_json::to_value(ev).expect("serialize");
+                if v["type"] == "terminal:data" {
+                    if let Some(chunk) = v["data"]["chunk"].as_str() {
+                        data.extend_from_slice(&decode(chunk));
+                    }
+                }
+                if v["type"] == event_type {
+                    return (v, data);
+                }
+            }
+        }
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// create → write echoes back as `terminal:data`; two subscribers see the
+    /// same output; kill emits `terminal:exit`.
+    #[tokio::test]
+    async fn create_streams_data_to_all_subscribers_then_exit() {
+        let h = harness().await;
+        let mut a = subscribe(&h);
+        let mut b = subscribe(&h);
+        let created = h
+            .services
+            .terminal_create(h.ws.clone(), 80, 24, None, Some("cat".into()))
+            .await
+            .expect("create");
+        let terminal_id = created["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+
+        h.services
+            .terminal_write(terminal_id.clone(), b64("ping-stream\n"))
+            .await
+            .expect("write");
+
+        let (_, from_a) = drain_until(&mut a, "terminal:data", Duration::from_secs(5)).await;
+        let (_, from_b) = drain_until(&mut b, "terminal:data", Duration::from_secs(5)).await;
+        assert!(contains(&from_a, b"ping-stream"), "subscriber a sees echo");
+        assert!(contains(&from_b, b"ping-stream"), "subscriber b sees echo");
+
+        h.services
+            .terminal_kill(terminal_id.clone())
+            .await
+            .expect("kill");
+        let (exit, _) = drain_until(&mut a, "terminal:exit", Duration::from_secs(5)).await;
+        assert_eq!(exit["data"]["terminalId"], terminal_id);
+    }
+
+    /// `terminal.getBuffer` back-fills scrollback for a late attach (the echoed
+    /// input survives in the server-side buffer), then `terminal.list` reports it.
+    #[tokio::test]
+    async fn get_buffer_backfills_and_list_reports() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let created = h
+            .services
+            .terminal_create(h.ws.clone(), 80, 24, None, Some("cat".into()))
+            .await
+            .expect("create");
+        let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+
+        h.services
+            .terminal_write(terminal_id.clone(), b64("BUFFERED\n"))
+            .await
+            .expect("write");
+        // Wait until the echo has streamed (so it is in scrollback too).
+        drain_until(&mut sub, "terminal:data", Duration::from_secs(5)).await;
+
+        let buf = h
+            .services
+            .terminal_get_buffer(terminal_id.clone(), None)
+            .await
+            .expect("getBuffer");
+        assert_eq!(buf["terminalId"], terminal_id);
+        let bytes = decode(buf["data"].as_str().expect("data"));
+        assert!(contains(&bytes, b"BUFFERED"), "scrollback back-fill");
+
+        h.services
+            .terminal_resize(terminal_id.clone(), 120, 40)
+            .await
+            .expect("resize");
+
+        let list = h.services.terminal_list(h.ws.clone()).await.expect("list");
+        let ids: Vec<&str> = list["terminals"]
+            .as_array()
+            .expect("terminals")
+            .iter()
+            .filter_map(|t| t["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&terminal_id.as_str()),
+            "list contains terminal"
+        );
+
+        h.services.terminal_kill(terminal_id).await.expect("kill");
+    }
+
+    /// A process that exits on its own surfaces its exit code on `terminal:exit`.
+    #[tokio::test]
+    async fn natural_exit_reports_exit_code() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        // `false` exits with code 1 immediately.
+        let created = h
+            .services
+            .terminal_create(h.ws.clone(), 80, 24, None, Some("false".into()))
+            .await
+            .expect("create");
+        let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+
+        let (exit, _) = drain_until(&mut sub, "terminal:exit", Duration::from_secs(5)).await;
+        assert_eq!(exit["data"]["terminalId"], terminal_id);
+        assert_eq!(exit["data"]["exitCode"], 1);
+    }
+
+    /// Unknown terminal ids map to `NotFound`; bad base64 input maps to
+    /// `InvalidParams`.
+    #[tokio::test]
+    async fn unknown_id_and_bad_base64_error() {
+        let h = harness().await;
+        let err = h
+            .services
+            .terminal_get_buffer("pty-99999".into(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, intent_core::Error::NotFound(_)));
+
+        let created = h
+            .services
+            .terminal_create(h.ws.clone(), 80, 24, None, Some("cat".into()))
+            .await
+            .expect("create");
+        let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+        let err = h
+            .services
+            .terminal_write(terminal_id.clone(), "!!not base64!!".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, intent_core::Error::InvalidParams(_)));
+        h.services.terminal_kill(terminal_id).await.expect("kill");
+    }
+}

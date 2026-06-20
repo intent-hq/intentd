@@ -54,6 +54,11 @@ pub enum AcpError {
     /// (path outside the session worktree) or an underlying IO error (§6.7).
     #[error("filesystem error: {0}")]
     Fs(String),
+
+    /// A client-served terminal request failed on the PTY host (spawn failure,
+    /// unknown terminal id, or IO error) (§6.7).
+    #[error("terminal error: {0}")]
+    Terminal(String),
 }
 
 impl From<serde_json::Error> for AcpError {

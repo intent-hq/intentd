@@ -1194,6 +1194,46 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "terminal.create" => {
+            let ws = require_ws_note(params)?;
+            let cols = opt_dim(params, "cols", 80);
+            let rows = opt_dim(params, "rows", 24);
+            let cwd = opt_str(params, "cwd");
+            let command = opt_str(params, "command");
+            api.terminal_create(ws, cols, rows, cwd, command)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "terminal.write" => {
+            let terminal_id = require_str_param(params, "terminalId")?;
+            let data = require_str_param(params, "data")?;
+            api.terminal_write(terminal_id, data)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "terminal.resize" => {
+            let terminal_id = require_str_param(params, "terminalId")?;
+            let cols = opt_dim(params, "cols", 80);
+            let rows = opt_dim(params, "rows", 24);
+            api.terminal_resize(terminal_id, cols, rows)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "terminal.kill" => {
+            let terminal_id = require_str_param(params, "terminalId")?;
+            api.terminal_kill(terminal_id).await.map_err(domain_to_rpc)
+        }
+        "terminal.getBuffer" => {
+            let terminal_id = require_str_param(params, "terminalId")?;
+            let max_bytes = opt_int(params, "maxBytes");
+            api.terminal_get_buffer(terminal_id, max_bytes)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "terminal.list" => {
+            let ws = require_ws_note(params)?;
+            api.terminal_list(ws).await.map_err(domain_to_rpc)
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }
@@ -1282,6 +1322,15 @@ fn opt_int(params: &Map<String, Value>, name: &str) -> Option<i64> {
     match params.get(name) {
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
         _ => None,
+    }
+}
+
+/// Optional terminal dimension (`cols`/`rows`) clamped into `u16`, defaulting
+/// when absent/non-numeric (mirrors the ancestor's `value || default`).
+fn opt_dim(params: &Map<String, Value>, name: &str, default: u16) -> u16 {
+    match opt_int(params, name) {
+        Some(n) if n > 0 => u16::try_from(n).unwrap_or(default),
+        _ => default,
     }
 }
 

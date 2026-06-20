@@ -27,8 +27,9 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use intent_acp::session::{self, ContentBlock};
 use intent_acp::transport::{Connection, ConnectionHooks, IncomingRequest};
 use intent_acp::{
-    AcpError, ClientRequestHandler, EventSink, FileService, IncomingNotification, MappedUpdate,
-    PermissionOutcome, PermissionPolicy, PermissionRegistry, SinkEvent,
+    AcpError, AcpResult, ClientRequestHandler, EventSink, FileService, IncomingNotification,
+    MappedUpdate, PermissionOutcome, PermissionPolicy, PermissionRegistry, SinkEvent,
+    TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo,
 };
 use intent_core::{AgentId, BoxFuture, WorkspaceId};
 
@@ -413,6 +414,27 @@ fn build(
     registry: PermissionRegistry,
     auth_patterns: Vec<String>,
 ) -> Scenario {
+    build_inner(fixture, policy, registry, auth_patterns, None)
+}
+
+/// Like [`build`] but also wires a client-served terminal host so `terminal/*`
+/// requests run on the real PTY host (§6.7).
+fn build_with_terminal(
+    fixture: &str,
+    policy: PermissionPolicy,
+    registry: PermissionRegistry,
+    terminal_host: Arc<dyn TerminalHost>,
+) -> Scenario {
+    build_inner(fixture, policy, registry, Vec::new(), Some(terminal_host))
+}
+
+fn build_inner(
+    fixture: &str,
+    policy: PermissionPolicy,
+    registry: PermissionRegistry,
+    auth_patterns: Vec<String>,
+    terminal_host: Option<Arc<dyn TerminalHost>>,
+) -> Scenario {
     let root = temp_dir();
     let script = load_script(fixture, &root.to_string_lossy());
 
@@ -437,7 +459,7 @@ fn build(
 
     let sink = Arc::new(MockSink::default());
     let registry = Arc::new(registry);
-    let handler = Arc::new(ClientRequestHandler::new(
+    let mut handler = ClientRequestHandler::new(
         WorkspaceId::from_string("ws-1"),
         AgentId::from_string("agent-1"),
         "auggie",
@@ -445,7 +467,11 @@ fn build(
         registry.clone(),
         policy,
         sink.clone(),
-    ));
+    );
+    if let Some(host) = terminal_host {
+        handler = handler.with_terminal_host(host);
+    }
+    let handler = Arc::new(handler);
 
     let serve_conn = conn.clone();
     tokio::spawn(async move {
@@ -741,4 +767,138 @@ async fn concurrent_sends_do_not_interleave() {
         "every request arrived as one intact frame"
     );
     assert!(!s.mock.interleave_detected(), "no frame interleaving");
+}
+
+/// A client-served terminal host backed by the real unified PTY host, exercising
+/// the `TerminalHost` adapter contract end-to-end (§6.7).
+struct PtyTermHost {
+    pty: Arc<intent_pty::PtyHost>,
+}
+
+fn term_resolve(terminal_id: &str) -> AcpResult<intent_pty::PtyId> {
+    intent_pty::PtyId::parse(terminal_id)
+        .ok_or_else(|| AcpError::Terminal(format!("unknown terminal {terminal_id}")))
+}
+
+impl TerminalHost for PtyTermHost {
+    fn create(&self, params: TerminalCreateParams) -> BoxFuture<'_, AcpResult<String>> {
+        let pty = self.pty.clone();
+        Box::pin(async move {
+            let mut spec = intent_pty::SpawnSpec::new(params.session_id, params.command);
+            spec.args = params.args;
+            spec.env = params.env;
+            spec.cwd = params.cwd;
+            let id = pty
+                .spawn(spec)
+                .map_err(|e| AcpError::Terminal(e.to_string()))?;
+            Ok(id.to_string())
+        })
+    }
+
+    fn output(&self, terminal_id: String) -> BoxFuture<'_, AcpResult<TerminalOutputInfo>> {
+        let pty = self.pty.clone();
+        Box::pin(async move {
+            let id = term_resolve(&terminal_id)?;
+            let bytes = pty
+                .scrollback(id)
+                .map_err(|e| AcpError::Terminal(e.to_string()))?;
+            let exit = pty.try_exit(id).ok().flatten().map(|e| TerminalExitInfo {
+                exit_code: Some(e.exit_code),
+                signal: None,
+            });
+            Ok(TerminalOutputInfo {
+                output: String::from_utf8_lossy(&bytes).into_owned(),
+                truncated: false,
+                exit_status: exit,
+            })
+        })
+    }
+
+    fn wait_for_exit(&self, terminal_id: String) -> BoxFuture<'_, AcpResult<TerminalExitInfo>> {
+        let pty = self.pty.clone();
+        Box::pin(async move {
+            let id = term_resolve(&terminal_id)?;
+            let exit = pty
+                .wait(id)
+                .await
+                .map_err(|e| AcpError::Terminal(e.to_string()))?;
+            Ok(TerminalExitInfo {
+                exit_code: Some(exit.exit_code),
+                signal: None,
+            })
+        })
+    }
+
+    fn release(&self, terminal_id: String) -> BoxFuture<'_, AcpResult<()>> {
+        let pty = self.pty.clone();
+        Box::pin(async move {
+            let id = term_resolve(&terminal_id)?;
+            pty.kill(id).await;
+            Ok(())
+        })
+    }
+
+    fn kill(&self, terminal_id: String) -> BoxFuture<'_, AcpResult<()>> {
+        let pty = self.pty.clone();
+        Box::pin(async move {
+            let id = term_resolve(&terminal_id)?;
+            pty.kill(id).await;
+            Ok(())
+        })
+    }
+}
+
+/// An agent's `terminal/*` calls (create → wait_for_exit → output → release)
+/// run on the real PTY host and return host-backed responses (§6.7).
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_requests_run_on_real_pty_host() {
+    let pty = Arc::new(intent_pty::PtyHost::new());
+    let host: Arc<dyn TerminalHost> = Arc::new(PtyTermHost { pty });
+    let s = build_with_terminal(
+        "terminal_host.ndjson",
+        PermissionPolicy::Interactive,
+        PermissionRegistry::new(),
+        host,
+    );
+    let sid = open_session(&s).await;
+    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("term")])
+        .await
+        .expect("prompt resolves");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+
+    // create → the fresh host mints `pty-0`.
+    let created = s
+        .mock
+        .call_response("terminal/create")
+        .expect("agent received the create response");
+    assert_eq!(created["result"]["terminalId"], json!("pty-0"));
+
+    // wait_for_exit → the real `echo` exits cleanly (code 0, flattened status).
+    let exit = s
+        .mock
+        .call_response("terminal/wait_for_exit")
+        .expect("agent received the exit status");
+    assert_eq!(exit["result"]["exitCode"], json!(0));
+
+    // output → host scrollback flows through (echoed text, not truncated).
+    let out = s
+        .mock
+        .call_response("terminal/output")
+        .expect("agent received the output");
+    assert_eq!(out["result"]["truncated"], json!(false));
+    assert!(
+        out["result"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("acp-term-ok"),
+        "terminal output carries the echoed text: {out}"
+    );
+
+    // release → a clean empty result.
+    let released = s
+        .mock
+        .call_response("terminal/release")
+        .expect("agent received the release ack");
+    assert!(released["result"].is_object());
 }
