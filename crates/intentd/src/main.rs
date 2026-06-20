@@ -3,8 +3,10 @@
 //! This binary is the composition root (§3.2 rule 5): it is the only place that
 //! wires concrete implementations together (store → services → transport).
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use intent_core::{Config, WorkspaceApi};
@@ -109,6 +111,10 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     };
     let config = resolve_config()?;
     std::fs::create_dir_all(&config.data_dir)?;
+    // Single-instance guard (§5.6): refuse to start if a live daemon owns the
+    // UDS or a live pid holds the pidfile; clean a stale socket/pidfile whose
+    // owner is gone. The returned guard removes our pidfile on shutdown.
+    let _pidfile = acquire_single_instance(&config, serve_uds_enabled).await?;
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -143,6 +149,10 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
     // polling. Safe when source control is unconfigured (each refresh logs and
     // swallows the missing-provider error). Aborted on clean shutdown.
     let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(60));
+    // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
+    // configured TTL, killing each one's whole process group. Disabled entirely
+    // when `agents.idleReapMinutes == 0`.
+    let reap_task = spawn_idle_reap_loop(manager.clone(), config.idle_reap_minutes);
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     // Start a filesystem watcher per active workspace with a resolvable on-disk
     // path; each publishes debounced `file:changed` events to the shared bus.
@@ -188,8 +198,130 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
         server.stop().await;
     }
     pr_refresh.abort();
+    if let Some(reap_task) = reap_task {
+        reap_task.abort();
+    }
     manager.shutdown().await;
     Ok(())
+}
+
+/// RAII single-instance pidfile: removes the file on drop, but only if it still
+/// holds our pid (so a racing replacement is never clobbered).
+struct PidFile {
+    path: PathBuf,
+}
+
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        if read_pid(&self.path) == Some(std::process::id()) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Read a pid from a pidfile, returning `None` when absent/unparseable.
+fn read_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+/// Whether a process with `pid` is currently alive (signal-0 probe).
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    // `EPERM` means the process exists but we may not signal it — still alive.
+    matches!(
+        kill(Pid::from_raw(pid as i32), None),
+        Ok(()) | Err(nix::errno::Errno::EPERM)
+    )
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    true
+}
+
+/// UDS liveness probe: a successful connect means a daemon is listening.
+/// UDS is Unix-only; on other platforms there is no socket to probe.
+#[cfg(unix)]
+async fn uds_is_live(socket_path: &Path) -> bool {
+    tokio::net::UnixStream::connect(socket_path).await.is_ok()
+}
+
+#[cfg(not(unix))]
+async fn uds_is_live(_socket_path: &Path) -> bool {
+    false
+}
+
+/// Enforce single-instance startup (§5.6). Refuses to start when a live daemon
+/// owns the UDS or a live pid holds the pidfile; otherwise removes a stale
+/// socket/pidfile whose owner is gone and claims the pidfile with our pid.
+async fn acquire_single_instance(
+    config: &Config,
+    serve_uds_enabled: bool,
+) -> anyhow::Result<PidFile> {
+    if serve_uds_enabled && config.socket_path.exists() {
+        if uds_is_live(&config.socket_path).await {
+            anyhow::bail!(
+                "intentd is already running on {} — refusing to start a second instance",
+                config.socket_path.display()
+            );
+        }
+        tracing::warn!(socket = %config.socket_path.display(), "removing stale socket (owner gone)");
+        let _ = std::fs::remove_file(&config.socket_path);
+    }
+
+    if let Some(pid) = read_pid(&config.pid_path) {
+        if pid != std::process::id() && pid_is_alive(pid) {
+            anyhow::bail!(
+                "intentd is already running (pid {pid}, pidfile {}) — refusing to start a second instance",
+                config.pid_path.display()
+            );
+        }
+        tracing::warn!(pid, pidfile = %config.pid_path.display(), "removing stale pidfile (owner gone)");
+        let _ = std::fs::remove_file(&config.pid_path);
+    }
+
+    std::fs::write(&config.pid_path, std::process::id().to_string())
+        .map_err(|e| anyhow::anyhow!("write pidfile {}: {e}", config.pid_path.display()))?;
+    Ok(PidFile {
+        path: config.pid_path.clone(),
+    })
+}
+
+/// Spawn the periodic idle-reap sweep (§5.6/§6.7), or `None` when disabled
+/// (`idle_reap_minutes == 0`). The sweep interval is derived from the TTL
+/// (≈4×/TTL), clamped so long TTLs still sweep and short ones do not busy-loop.
+fn spawn_idle_reap_loop(
+    manager: Arc<AgentManager>,
+    idle_reap_minutes: u32,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if idle_reap_minutes == 0 {
+        tracing::info!("idle agent reaping disabled (agents.idleReapMinutes = 0)");
+        return None;
+    }
+    let ttl = Duration::from_secs(idle_reap_minutes as u64 * 60);
+    let interval = (ttl / 4).clamp(Duration::from_secs(30), Duration::from_secs(300));
+    tracing::info!(
+        ttl_minutes = idle_reap_minutes,
+        interval_secs = interval.as_secs(),
+        "idle agent reaping enabled"
+    );
+    Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let reaped = manager.reap_idle_older_than(ttl).await;
+            if reaped > 0 {
+                tracing::info!(reaped, "idle agent sweep evicted idle agents");
+            }
+        }
+    }))
 }
 
 /// Start a [`FileWatcher`] for every non-archived workspace that exposes an
@@ -414,4 +546,90 @@ async fn shutdown_signal() {
 #[cfg(not(unix))]
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_config() -> Config {
+        let id = uuid::Uuid::new_v4().to_string();
+        let dir = std::env::temp_dir().join(format!("intentd-si-{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        Config {
+            config_path: dir.join("config.toml"),
+            db_path: dir.join("intentd.db"),
+            // UDS paths are capped at ~104 bytes (`SUN_LEN`); keep the socket on
+            // a short path so a deep temp data dir does not overflow the bind.
+            socket_path: short_socket_path(&id),
+            pid_path: dir.join("intentd.pid"),
+            idle_reap_minutes: 30,
+            data_dir: dir,
+        }
+    }
+
+    #[cfg(unix)]
+    fn short_socket_path(id: &str) -> PathBuf {
+        PathBuf::from(format!("/tmp/itd-{}.sock", &id[..8]))
+    }
+
+    #[cfg(not(unix))]
+    fn short_socket_path(id: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("itd-{}.sock", &id[..8]))
+    }
+
+    #[tokio::test]
+    async fn refuses_when_live_pid_holds_pidfile() {
+        let config = temp_config();
+        // pid 1 (init/launchd) is always alive; a signal-0 probe yields EPERM.
+        std::fs::write(&config.pid_path, "1").unwrap();
+        let result = acquire_single_instance(&config, false).await;
+        assert!(result.is_err(), "a live pidfile owner must refuse startup");
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn cleans_stale_pidfile_and_proceeds() {
+        let config = temp_config();
+        // A pid essentially guaranteed not to be running.
+        std::fs::write(&config.pid_path, "2147483640").unwrap();
+        let guard = acquire_single_instance(&config, false)
+            .await
+            .expect("startup proceeds past a stale pidfile");
+        assert_eq!(
+            read_pid(&config.pid_path),
+            Some(std::process::id()),
+            "claims the pidfile with our pid"
+        );
+        drop(guard);
+        assert!(
+            read_pid(&config.pid_path).is_none(),
+            "the guard removes our pidfile on shutdown"
+        );
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn cleans_stale_socket_and_proceeds() {
+        let config = temp_config();
+        // A leftover socket path with nothing listening → connect refused → stale.
+        std::fs::write(&config.socket_path, b"").unwrap();
+        let _guard = acquire_single_instance(&config, true)
+            .await
+            .expect("startup proceeds past a stale socket");
+        assert!(!config.socket_path.exists(), "stale socket removed");
+        std::fs::remove_file(&config.socket_path).ok();
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn refuses_when_uds_is_live() {
+        let config = temp_config();
+        let listener = tokio::net::UnixListener::bind(&config.socket_path).expect("bind live uds");
+        let result = acquire_single_instance(&config, true).await;
+        assert!(result.is_err(), "a live UDS owner must refuse startup");
+        drop(listener);
+        std::fs::remove_file(&config.socket_path).ok();
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
 }
