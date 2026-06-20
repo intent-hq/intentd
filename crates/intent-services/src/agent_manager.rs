@@ -967,6 +967,7 @@ impl AgentManager {
 
 /// Grace period between SIGTERM and SIGKILL when tearing down a provider's
 /// process group, giving the tree a chance to exit cleanly first.
+#[cfg(unix)]
 const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
 
 /// Terminate a spawned provider's WHOLE process tree (§5.6). The child is its

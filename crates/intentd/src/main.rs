@@ -246,8 +246,15 @@ fn pid_is_alive(_pid: u32) -> bool {
 }
 
 /// UDS liveness probe: a successful connect means a daemon is listening.
+/// UDS is Unix-only; on other platforms there is no socket to probe.
+#[cfg(unix)]
 async fn uds_is_live(socket_path: &Path) -> bool {
     tokio::net::UnixStream::connect(socket_path).await.is_ok()
+}
+
+#[cfg(not(unix))]
+async fn uds_is_live(_socket_path: &Path) -> bool {
+    false
 }
 
 /// Enforce single-instance startup (§5.6). Refuses to start when a live daemon
