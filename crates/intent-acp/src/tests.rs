@@ -659,6 +659,17 @@ mod mcp_tests {
             redacted["mcpServers"]["remote"]["headers"]["Authorization"],
             json!(REDACTED_VALUE)
         );
+        // §11.3 secret hygiene: the raw secret values must never survive into the
+        // serialized, log-bound form (keys + structure are preserved, values are not).
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !serialized.contains("secret"),
+            "redacted MCP config leaked an env secret value: {serialized}"
+        );
+        assert!(
+            !serialized.contains("Bearer z"),
+            "redacted MCP config leaked a header secret value: {serialized}"
+        );
     }
 
     fn stdio_servers() -> Value {
@@ -854,16 +865,65 @@ mod client_served_tests {
     fn sandbox_rejects_traversal_but_allows_in_scope() {
         let root = temp_dir();
         let svc = FileService::new(&root);
-        assert!(
-            svc.resolve(std::path::Path::new("../escape.txt")).is_err(),
-            "relative traversal escapes the worktree"
-        );
+        // §11.3 path sandboxing: every shape of `..` escape outside the worktree
+        // must be rejected, including nested and trailing traversal that lexically
+        // climbs above the root.
+        for escape in [
+            "../escape.txt",
+            "../../escape.txt",
+            "sub/../../escape.txt",
+            "a/b/../../../escape.txt",
+            "./../escape.txt",
+        ] {
+            assert!(
+                svc.resolve(std::path::Path::new(escape)).is_err(),
+                "traversal `{escape}` must escape the worktree and be rejected"
+            );
+        }
         assert!(
             svc.resolve(std::path::Path::new("/etc/passwd")).is_err(),
             "absolute path outside the worktree is rejected"
         );
+        // In-scope `..` that stays within the root resolves and stays inside it.
         let ok = svc.resolve(std::path::Path::new("sub/ok.txt")).unwrap();
         assert!(ok.starts_with(&root), "in-scope path resolves inside root");
+        let in_scope = svc
+            .resolve(std::path::Path::new("a/b/../c.txt"))
+            .expect("in-bounds traversal resolves");
+        assert!(
+            in_scope.starts_with(&root),
+            "traversal that stays within the root remains sandboxed"
+        );
+    }
+
+    #[test]
+    fn headless_policy_default_denies_destructive_and_medium() {
+        use crate::permission::{assess_risk_level, RiskLevel};
+
+        // §11.3 permission gating: the headless default (`AutoByRisk`) auto-allows
+        // only low-risk reads and DENIES anything destructive or unclassified.
+        assert_eq!(
+            PermissionPolicy::AutoByRisk.auto_allow(RiskLevel::Low),
+            Some(true)
+        );
+        assert_eq!(
+            PermissionPolicy::AutoByRisk.auto_allow(RiskLevel::Medium),
+            Some(false),
+            "medium/unclassified prompts default-deny in headless"
+        );
+        assert_eq!(
+            PermissionPolicy::AutoByRisk.auto_allow(RiskLevel::High),
+            Some(false),
+            "destructive prompts default-deny in headless"
+        );
+        // `DenyAll` denies every risk; `Interactive` surfaces every prompt.
+        for risk in [RiskLevel::Low, RiskLevel::Medium, RiskLevel::High] {
+            assert_eq!(PermissionPolicy::DenyAll.auto_allow(risk), Some(false));
+            assert_eq!(PermissionPolicy::Interactive.auto_allow(risk), None);
+        }
+        // A representative destructive title classifies High (→ denied above).
+        assert_eq!(assess_risk_level("Delete file"), RiskLevel::High);
+        assert_eq!(assess_risk_level("Run command"), RiskLevel::Medium);
     }
 
     #[tokio::test]
