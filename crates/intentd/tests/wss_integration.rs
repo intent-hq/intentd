@@ -256,6 +256,85 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     }
 }
 
+/// Drive several JSON-RPC frames over ONE WSS connection so the per-connection
+/// `client_id` binding from `client.hello` persists across them (§16).
+async fn wss_session(port: u16, cfg: Arc<ClientConfig>, frames: Vec<String>) -> Vec<Value> {
+    let mut ws = connect_ws(port, cfg).await;
+    let mut out = Vec::new();
+    for frame in frames {
+        ws.send(Message::Text(frame)).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    out.push(serde_json::from_str(&text).expect("json"));
+                    break;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn wss_client_hello_and_drafts_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    // Create a workspace first (drafts FK to `workspace`); a fresh connection is
+    // fine — only `drafts.*` needs the per-connection client binding.
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Draft WS"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            r#"{"jsonrpc":"2.0","id":2,"method":"client.hello","params":{"clientId":"cli-wss","name":"WSS"}}"#.to_string(),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"drafts.set","params":{{"workspaceId":"{ws_id}","agentId":"agent-wss","text":"wss draft"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"drafts.get","params":{{"workspaceId":"{ws_id}","agentId":"agent-wss"}}}}"#
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
+    assert_eq!(
+        sess[0]["result"]["server"]["locality"], "remote",
+        "WSS ⇒ remote in the client.hello server block (§5.14/§5.17)"
+    );
+    assert_eq!(sess[1]["result"]["ok"], true);
+    assert!(sess[1]["result"]["updatedAt"].is_string());
+    assert_eq!(sess[2]["result"]["text"], "wss draft");
+
+    // Reconnect with the same clientId restores the persisted draft.
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            r#"{"jsonrpc":"2.0","id":5,"method":"client.hello","params":{"clientId":"cli-wss"}}"#.to_string(),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":6,"method":"drafts.get","params":{{"workspaceId":"{ws_id}","agentId":"agent-wss"}}}}"#
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        sess[1]["result"]["text"], "wss draft",
+        "reconnect restores the draft"
+    );
+    srv.ws.stop().await;
+}
+
 #[tokio::test]
 async fn health_reports_ok_and_client_count() {
     let srv = start(WsOptions::default()).await;

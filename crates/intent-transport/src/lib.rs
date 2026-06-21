@@ -22,9 +22,11 @@ pub use tls::{cert_fingerprint, ensure_tls_certificate, inspect_cert, CertStatus
 pub use ws::{WsApiServer, WsOptions};
 
 pub mod auth;
+mod client;
 mod conn;
 pub mod control;
 pub mod discovery;
+mod drafts;
 mod events;
 mod forward;
 pub mod host;
@@ -34,7 +36,3 @@ pub mod reverse;
 pub mod router;
 pub mod tls;
 pub mod ws;
-
-pub mod client_map {
-    //! live-connection → logical `clientId` map + `client.hello` (§16) — stub.
-}

@@ -4,10 +4,10 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::error::{Error, Result};
-use crate::ids::{AgentId, NoteId, WorkspaceId};
+use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId};
 use crate::model::{
     AgentDelegateInput, AgentLite, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
-    CommentListResult, CommentRespondResult, Event, EventQueryParams, EventSubscribeResult,
+    CommentListResult, CommentRespondResult, Draft, Event, EventQueryParams, EventSubscribeResult,
     EventUnsubscribeResult, FileActivity, GitAgentCommitResult, GitBranches, GitCommitResult,
     GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
     NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteSetContentResult,
@@ -1883,6 +1883,83 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_run not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ------------------------------------------------------------------------
+    // client.hello + drafts.* — stable client identity & per-client drafts
+    // (PROTOCOL §5.16/§5.17, IMPLEMENTATION_SPEC §15/§16). These back the
+    // transport-level interceptors (§16); they are not routed through the
+    // JSON-RPC dispatcher, but live on `WorkspaceApi` so the transport reaches
+    // persistence through services without depending on `intent-store` (§3.2).
+    // ------------------------------------------------------------------------
+
+    /// `client.hello` persistence: upsert the logical `client` row, setting
+    /// `first_seen` once and touching `last_seen`, and persisting `name` /
+    /// `capabilities` (a JSON bag). The connection→client binding and the
+    /// `server` capability block are transport concerns (§16) (PROTOCOL §5.17).
+    fn upsert_client(
+        &self,
+        client_id: ClientId,
+        name: Option<String>,
+        capabilities: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let _ = (client_id, name, capabilities);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::upsert_client not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `drafts.get`: the draft for the calling client (`client_id` resolved from
+    /// the connection, never a param), or `None` when absent (PROTOCOL §5.16).
+    fn draft_get(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        client_id: ClientId,
+    ) -> BoxFuture<'_, Result<Option<Draft>>> {
+        let _ = (workspace_id, agent_id, client_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::draft_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `drafts.set`: upsert the calling client's draft. An empty `text` is a
+    /// clear (the row is deleted). Returns `Some(updatedAt)` when a draft was
+    /// stored or `None` when it was cleared, and emits `draft:changed` (carrying
+    /// `hasDraft`, never the text) (PROTOCOL §5.16/§6.5).
+    fn draft_set(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        client_id: ClientId,
+        text: String,
+    ) -> BoxFuture<'_, Result<Option<String>>> {
+        let _ = (workspace_id, agent_id, client_id, text);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::draft_set not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `drafts.clear`: delete the calling client's draft (idempotent if none),
+    /// emitting `draft:changed` with `hasDraft: false` (PROTOCOL §5.16/§6.5).
+    fn draft_clear(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        client_id: ClientId,
+    ) -> BoxFuture<'_, Result<()>> {
+        let _ = (workspace_id, agent_id, client_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::draft_clear not implemented".to_string(),
             ))
         })
     }

@@ -17,13 +17,13 @@ pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_iso, parse_iso};
 pub use config::Config;
 pub use error::{Error, Result};
 pub use events::is_known_event_type;
-pub use ids::{AgentId, NoteId, WorkspaceId};
+pub use ids::{AgentId, ClientId, NoteId, WorkspaceId};
 pub use model::{
     ActorType, AgentActivity, AgentDelegateInput, AgentLite, AgentMessage, AgentSession,
-    AgentStatus, AnchorContext, AuthorType, Comment, CommentAddResult, CommentAnchor,
+    AgentStatus, AnchorContext, AuthorType, Client, Comment, CommentAddResult, CommentAnchor,
     CommentAnchorType, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
     CommentLocation, CommentRespondResult, CommentRespondThread, CommentStatus, CommentThread,
-    CommentThreadSummary, CommentType, CommentWire, ContentType, Event, EventActor,
+    CommentThreadSummary, CommentType, CommentWire, ContentType, Draft, Event, EventActor,
     EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus,
     GitAgentCommitResult, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts,
     GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
