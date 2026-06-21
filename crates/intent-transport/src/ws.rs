@@ -33,7 +33,9 @@ use tokio_tungstenite::WebSocketStream;
 
 use crate::auth::{extract_token, is_allowed_origin, validate_token, TokenStore};
 use crate::conn::{self, ConnSubs, OUTBOUND_CAPACITY};
+use crate::forward::ForwardRegistry;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
+use crate::reverse::ReverseChannel;
 use crate::tls::TlsCertificate;
 
 /// Maximum bytes accepted for an HTTP request head before `\r\n\r\n`.
@@ -365,6 +367,8 @@ impl WsInner {
         let (mut sink, mut stream) = ws.split();
         let (app_tx, mut app_rx) = mpsc::channel::<String>(OUTBOUND_CAPACITY);
         let mut subs = ConnSubs::default();
+        let mut forwards = ForwardRegistry::default();
+        let reverse = ReverseChannel::new(app_tx.clone());
         loop {
             tokio::select! {
                 incoming = stream.next() => match incoming {
@@ -374,7 +378,7 @@ impl WsInner {
                         // surface (those are served over the local UDS); pass `None`.
                         // `host.status` IS answered here, with the resolved WSS
                         // locality (remote unless overridden, §5.14).
-                        if !conn::process_frame(&text, &*self.api, &self.bus, &app_tx, &mut subs, None, self.locality_is_local).await {
+                        if !conn::process_frame(&text, &*self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, None, self.locality_is_local).await {
                             break;
                         }
                     }
@@ -412,6 +416,7 @@ impl WsInner {
             }
         }
         drop(subs);
+        drop(forwards);
         let _ = sink.close().await;
         self.deregister(id);
     }
