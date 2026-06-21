@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 
 use crate::control::{self, SystemControl};
 use crate::events::{self, FastPath};
+use crate::host;
 use crate::router::handle_message;
 
 /// Capacity of the per-connection outbound frame queue (responses + pushed
@@ -75,11 +76,12 @@ impl ConnSubs {
     }
 }
 
-/// Route one frame: intercept the `system.*` control methods, then the
-/// `events.` fast-path, else hand to the JSON-RPC dispatcher. `control` is
-/// `Some` only on a transport that exposes the control surface (the UDS
-/// listener); `is_local` reflects that transport's locality (§12.3). Returns
-/// `false` when the outbound channel is closed.
+/// Route one frame: intercept the `system.*` control methods (UDS only), then
+/// the `host.status` capability probe (both transports), then the `events.`
+/// fast-path, else hand to the JSON-RPC dispatcher. `control` is `Some` only on
+/// a transport that exposes the control surface (the UDS listener); `is_local`
+/// reflects that connection's resolved locality (§5.14). Returns `false` when
+/// the outbound channel is closed.
 pub(crate) async fn process_frame(
     raw: &str,
     api: &dyn WorkspaceApi,
@@ -97,6 +99,12 @@ pub(crate) async fn process_frame(
                     None => true,
                 };
             }
+        }
+        if let Some(req) = host::classify(&value) {
+            return match host::handle(req, is_local) {
+                Some(frame) => out_tx.send(frame).await.is_ok(),
+                None => true,
+            };
         }
         if let Some(fast_path) = events::classify(&value) {
             return handle_fast_path(fast_path, bus, out_tx, subs).await;

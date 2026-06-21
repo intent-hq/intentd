@@ -392,6 +392,40 @@ async fn wss_jsonrpc_roundtrip_matches_uds() {
 }
 
 #[tokio::test]
+async fn wss_host_status_reports_remote_locality() {
+    // host.status is answered on the WSS transport (§5.14) and reports `remote`
+    // by default, with the host capability fields a client gates UI on.
+    let srv = start(WsOptions::default()).await;
+    let frame = r#"{"jsonrpc":"2.0","id":5,"method":"host.status"}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    let h = &resp["result"];
+    assert_eq!(resp["id"], 5);
+    assert_eq!(h["locality"], "remote", "WSS ⇒ remote (§5.14)");
+    assert!(h["os"].is_string());
+    assert!(h["arch"].is_string());
+    assert!(h["hostname"].is_string());
+    assert!(h["hasDisplay"].is_boolean());
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn wss_host_status_override_forces_local() {
+    // `--mode local` / `server.locality=local` forces local even over WSS.
+    let srv = start(WsOptions {
+        locality_override: Some(true),
+        ..WsOptions::default()
+    })
+    .await;
+    let frame = r#"{"jsonrpc":"2.0","id":6,"method":"host.status"}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(
+        resp["result"]["locality"], "local",
+        "override forces local over WSS (§5.14)"
+    );
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
 async fn port_backoff_picks_next_port() {
     let base = free_port();
     // Occupy the base port for the whole test so the listener must advance.

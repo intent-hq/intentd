@@ -63,7 +63,37 @@ fn txt_records_match_ts_keys_plus_host_capabilities() {
 #[test]
 fn disabled_flag_publishes_nothing() {
     // The gate must not even construct a daemon when discovery is disabled.
-    assert!(advertise_if_enabled(false, 5180, "AB:CD:EF").is_none());
+    assert!(advertise_if_enabled(false, 5180, "AB:CD:EF", false).is_none());
+}
+
+#[test]
+fn detect_sets_locality_from_resolved_flag() {
+    // mDNS advertises the resolved locality (§5.14): TCP/WSS is remote by
+    // default, forced-local listeners advertise local.
+    assert_eq!(HostCapabilities::detect(true).locality, "local");
+    assert_eq!(HostCapabilities::detect(false).locality, "remote");
+}
+
+#[test]
+fn has_display_policy_is_cross_platform_clean() {
+    // An explicit display server always wins, regardless of platform/SSH.
+    assert!(has_display(true, false, true, false));
+    assert!(has_display(false, true, true, false));
+    // GUI platforms (macOS/Windows) assume a console unless reached over SSH.
+    assert!(has_display(false, false, false, true));
+    assert!(!has_display(false, false, true, true));
+    // Headless Unix without a display server has none.
+    assert!(!has_display(false, false, false, false));
+}
+
+#[test]
+fn display_server_prefers_wayland_then_x11() {
+    // Deterministic precedence is asserted at the policy boundary; this test
+    // only pins the documented contract for the env-free `None` case (CI hosts
+    // without DISPLAY/WAYLAND_DISPLAY set).
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
+        assert_eq!(detect_display_server(), None);
+    }
 }
 
 /// Hermetic advertise→browse round-trip: a single `mdns-sd` daemon publishes

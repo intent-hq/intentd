@@ -49,6 +49,10 @@ pub struct WsOptions {
     pub auth_enabled: bool,
     /// Advertise the bound port + fingerprint over mDNS (§5.4). Default off.
     pub discovery_enabled: bool,
+    /// Force the connection locality (§5.14) regardless of transport:
+    /// `Some(true)` = local (`--mode local`/`server.locality=local`),
+    /// `Some(false)` = remote, `None` = infer from transport (TCP/WSS ⇒ remote).
+    pub locality_override: Option<bool>,
     pub heartbeat_interval: Duration,
     pub heartbeat_timeout: Duration,
 }
@@ -61,6 +65,7 @@ impl Default for WsOptions {
             enabled: true,
             auth_enabled: true,
             discovery_enabled: false,
+            locality_override: None,
             heartbeat_interval: HEARTBEAT_INTERVAL,
             heartbeat_timeout: HEARTBEAT_TIMEOUT,
         }
@@ -92,6 +97,10 @@ pub(crate) struct WsInner {
     pub enabled: bool,
     pub auth_enabled: bool,
     pub discovery_enabled: bool,
+    /// Resolved connection locality for this listener (§5.14): `true` = local,
+    /// `false` = remote. TCP/WSS defaults to remote unless forced via
+    /// `WsOptions::locality_override`.
+    pub locality_is_local: bool,
     pub bind_address: IpAddr,
     pub base_port: u16,
     pub fingerprint: String,
@@ -130,6 +139,9 @@ impl WsApiServer {
             enabled: options.enabled,
             auth_enabled: options.auth_enabled,
             discovery_enabled: options.discovery_enabled,
+            // The WSS transport is remote by default; an override forces it
+            // local/remote (§5.14).
+            locality_is_local: crate::host::resolve_is_local(false, options.locality_override),
             bind_address: options.bind_address,
             base_port: options.base_port,
             fingerprint: tls.fingerprint256.clone(),
@@ -360,7 +372,9 @@ impl WsInner {
                     Some(Ok(Message::Text(text))) => {
                         // The WSS transport does not expose the `system.*` control
                         // surface (those are served over the local UDS); pass `None`.
-                        if !conn::process_frame(&text, &*self.api, &self.bus, &app_tx, &mut subs, None, false).await {
+                        // `host.status` IS answered here, with the resolved WSS
+                        // locality (remote unless overridden, §5.14).
+                        if !conn::process_frame(&text, &*self.api, &self.bus, &app_tx, &mut subs, None, self.locality_is_local).await {
                             break;
                         }
                     }

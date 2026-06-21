@@ -38,16 +38,16 @@ pub(crate) struct HostCapabilities {
 }
 
 impl HostCapabilities {
-    /// Best-effort detection (§12.3). `locality` defaults to `local` (a
-    /// documented approximation — true remote/local derivation is done at the
-    /// transport/`client.hello` layer); `has_display` is inferred from
-    /// platform env (`DISPLAY`/`WAYLAND_DISPLAY`, or absence of `SSH_*`).
-    pub fn detect() -> Self {
+    /// Best-effort detection (§12.3). `locality` is the resolved value for the
+    /// listener being advertised (`local` when forced/UDS, `remote` for TCP/WSS,
+    /// §5.14); `has_display` is inferred from platform env
+    /// (`DISPLAY`/`WAYLAND_DISPLAY`, or absence of `SSH_*`).
+    pub fn detect(is_local: bool) -> Self {
         Self {
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             has_display: detect_has_display(),
-            locality: "local",
+            locality: if is_local { "local" } else { "remote" },
         }
     }
 }
@@ -57,18 +57,44 @@ impl HostCapabilities {
 /// so the CLI `status`/`doctor` surfaces (§5.7) report the same value the mDNS
 /// TXT record advertises.
 pub fn detect_has_display() -> bool {
-    if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+    has_display(
+        std::env::var_os("DISPLAY").is_some(),
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some(),
+        cfg!(target_os = "macos") || cfg!(target_os = "windows"),
+    )
+}
+
+/// Pure `hasDisplay` policy (testable without touching the process env): an
+/// explicit X11/Wayland display always wins; otherwise GUI platforms
+/// (macOS/Windows) assume a console unless reached over SSH; headless Unix
+/// without a display server has none.
+fn has_display(display: bool, wayland: bool, over_ssh: bool, gui_platform: bool) -> bool {
+    if display || wayland {
         return true;
     }
-    if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
-        return std::env::var_os("SSH_CONNECTION").is_none()
-            && std::env::var_os("SSH_TTY").is_none();
+    if gui_platform {
+        return !over_ssh;
     }
     false
 }
 
+/// Best-effort display-server identifier for `host.status` `displayServer`
+/// (§5.14). Reports `wayland`/`x11` when their env is present; `None`
+/// otherwise. Cross-platform clean — returns `None` on hosts without those
+/// Unix display-server env vars.
+pub fn detect_display_server() -> Option<String> {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return Some("wayland".to_string());
+    }
+    if std::env::var_os("DISPLAY").is_some() {
+        return Some("x11".to_string());
+    }
+    None
+}
+
 /// Local OS hostname (`os.hostname()` equivalent), or `intent` on failure.
-fn local_hostname() -> String {
+pub(crate) fn local_hostname() -> String {
     whoami::fallible::hostname()
         .ok()
         .filter(|h| !h.is_empty())
@@ -135,13 +161,15 @@ pub struct Discovery {
 }
 
 impl Discovery {
-    /// Publish the service on the host's real interfaces.
-    pub fn start(port: u16, fingerprint: &str) -> Result<Self> {
+    /// Publish the service on the host's real interfaces. `is_local` is the
+    /// resolved locality advertised in the TXT record (§5.14): TCP/WSS listeners
+    /// are `remote` by default, unless forced local via `--mode`/`server.locality`.
+    pub fn start(port: u16, fingerprint: &str, is_local: bool) -> Result<Self> {
         let info = build_service_info(
             port,
             fingerprint,
             &local_hostname(),
-            &HostCapabilities::detect(),
+            &HostCapabilities::detect(is_local),
             None,
         )?;
         Self::register(info)
@@ -170,15 +198,17 @@ impl Discovery {
 /// Advertise only when `enabled`; returns `None` (publishing nothing) when the
 /// discovery flag is off. A registration failure is logged and yields `None`
 /// rather than failing the listener (best-effort, matching the TS try/catch).
+/// `is_local` is the resolved locality advertised in the TXT record (§5.14).
 pub(crate) fn advertise_if_enabled(
     enabled: bool,
     port: u16,
     fingerprint: &str,
+    is_local: bool,
 ) -> Option<Discovery> {
     if !enabled {
         return None;
     }
-    match Discovery::start(port, fingerprint) {
+    match Discovery::start(port, fingerprint, is_local) {
         Ok(discovery) => Some(discovery),
         Err(e) => {
             tracing::warn!(error = %e, "failed to publish mDNS service");
