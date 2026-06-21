@@ -8,10 +8,13 @@
 //! control), `host.status` is answered on BOTH transports so a remote WSS client
 //! can probe the daemon host's nature and gate GUI/forwarding UI accordingly.
 
+use std::fmt;
+
 use serde_json::{json, Value};
 
 use crate::discovery::{detect_display_server, detect_has_display, local_hostname};
 use crate::events::success_frame;
+use crate::reverse::{ReverseChannel, DEFAULT_REVERSE_TIMEOUT};
 
 /// Resolve the effective locality for a connection (§5.14): the transport
 /// default (`true`/local for UDS, `false`/remote for TCP/WSS) unless forced by
@@ -91,6 +94,124 @@ pub(crate) fn handle(req: HostRequest, is_local: bool) -> Option<String> {
         return None;
     }
     Some(success_frame(req.id_echo, result))
+}
+
+/// Opens a URL/file on the daemon host's GUI. Injected so the local path is
+/// unit-testable without launching a real browser.
+pub trait ExternalOpener: Send + Sync {
+    /// Open `url` with the host's default handler. Returns a descriptive error
+    /// when the platform opener cannot be spawned.
+    fn open(&self, url: &str) -> Result<(), String>;
+}
+
+/// Default opener: the platform handler (`open` on macOS, `cmd /C start` on
+/// Windows, `xdg-open` elsewhere), detached from this process's stdio.
+pub struct OsOpener;
+
+impl ExternalOpener for OsOpener {
+    fn open(&self, url: &str) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        let mut cmd = {
+            let mut c = std::process::Command::new("open");
+            c.arg(url);
+            c
+        };
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "start", "", url]);
+            c
+        };
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+        let mut cmd = {
+            let mut c = std::process::Command::new("xdg-open");
+            c.arg(url);
+            c
+        };
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        cmd.spawn()
+            .map(|_| ())
+            .map_err(|e| format!("open external failed: {e}"))
+    }
+}
+
+/// Why a [`open_external`] call could not be satisfied. `code()` maps each to a
+/// standard JSON-RPC error code (PROTOCOL §9: no custom codes — server-side
+/// conditions are `-32602`/`-32603` with a descriptive message).
+#[derive(Debug)]
+pub enum OpenExternalError {
+    /// `hasDisplay=false` on the daemon host and the op needs a display (§12.4).
+    Headless(String),
+    /// The host OS opener failed (the local path).
+    Opener(String),
+    /// The FE-served reverse RPC failed/timed out (the remote path).
+    Proxy(String),
+    /// The `url` parameter was missing or empty.
+    InvalidUrl(String),
+}
+
+impl OpenExternalError {
+    /// JSON-RPC 2.0 numeric error code for this condition (PROTOCOL §9).
+    pub fn code(&self) -> i32 {
+        match self {
+            OpenExternalError::InvalidUrl(_) => -32602,
+            OpenExternalError::Headless(_)
+            | OpenExternalError::Opener(_)
+            | OpenExternalError::Proxy(_) => -32603,
+        }
+    }
+}
+
+impl fmt::Display for OpenExternalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpenExternalError::Headless(m)
+            | OpenExternalError::Opener(m)
+            | OpenExternalError::Proxy(m)
+            | OpenExternalError::InvalidUrl(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for OpenExternalError {}
+
+/// Open `url` on the *user's* machine (§12.4). When the connection is local the
+/// daemon resolves it directly via `opener`; if the local host is headless
+/// (`has_display=false`) this is a clear headless warning instead of a silent
+/// failure. When the connection is remote the intent is dispatched to the
+/// connected frontend as an FE-served reverse RPC (`host.openExternal`) so it
+/// opens on the user's machine (mirroring the ACP client-served pattern, §6.7).
+pub async fn open_external(
+    url: &str,
+    is_local: bool,
+    has_display: bool,
+    opener: &dyn ExternalOpener,
+    reverse: &ReverseChannel,
+) -> Result<(), OpenExternalError> {
+    if url.is_empty() {
+        return Err(OpenExternalError::InvalidUrl(
+            "Missing required parameter: url".to_string(),
+        ));
+    }
+    if is_local {
+        if !has_display {
+            return Err(OpenExternalError::Headless(format!(
+                "host is headless (hasDisplay=false); cannot open {url} on the daemon host — connect a client with a display"
+            )));
+        }
+        return opener.open(url).map_err(OpenExternalError::Opener);
+    }
+    reverse
+        .request(
+            "host.openExternal",
+            json!({ "url": url }),
+            DEFAULT_REVERSE_TIMEOUT,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| OpenExternalError::Proxy(e.message))
 }
 
 #[cfg(test)]

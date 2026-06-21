@@ -18,7 +18,9 @@ use tokio::task::JoinHandle;
 
 use crate::control::{self, SystemControl};
 use crate::events::{self, FastPath};
+use crate::forward::{self, ForwardRegistry};
 use crate::host;
+use crate::reverse::ReverseChannel;
 use crate::router::handle_message;
 
 /// Capacity of the per-connection outbound frame queue (responses + pushed
@@ -76,22 +78,33 @@ impl ConnSubs {
     }
 }
 
-/// Route one frame: intercept the `system.*` control methods (UDS only), then
-/// the `host.status` capability probe (both transports), then the `events.`
-/// fast-path, else hand to the JSON-RPC dispatcher. `control` is `Some` only on
-/// a transport that exposes the control surface (the UDS listener); `is_local`
-/// reflects that connection's resolved locality (§5.14). Returns `false` when
-/// the outbound channel is closed.
+/// Route one frame: deliver replies to daemon-initiated reverse RPCs (§12.4),
+/// then intercept the `system.*` control methods (UDS only), the `host.status`
+/// capability probe (both transports), the `forward.*` port-forwarding methods,
+/// and the `events.` fast-path, else hand to the JSON-RPC dispatcher. `control`
+/// is `Some` only on a transport that exposes the control surface (the UDS
+/// listener); `forwards`/`reverse` are the connection's port-forward registry
+/// and reverse-RPC channel; `is_local` reflects that connection's resolved
+/// locality (§5.14). Returns `false` when the outbound channel is closed.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_frame(
     raw: &str,
     api: &dyn WorkspaceApi,
     bus: &EventBus,
     out_tx: &mpsc::Sender<String>,
     subs: &mut ConnSubs,
+    forwards: &mut ForwardRegistry,
+    reverse: &ReverseChannel,
     control: Option<&Arc<dyn SystemControl>>,
     is_local: bool,
 ) -> bool {
     if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        // A reply to a daemon-initiated reverse request (FE-served intents such
+        // as `host.openExternal`, §12.4) — route it to the awaiting caller and
+        // never treat it as a client request.
+        if reverse.route_response(&value) {
+            return true;
+        }
         if let Some(control) = control {
             if let Some(req) = control::classify(&value) {
                 return match control::handle(req, control.as_ref(), is_local) {
@@ -102,6 +115,12 @@ pub(crate) async fn process_frame(
         }
         if let Some(req) = host::classify(&value) {
             return match host::handle(req, is_local) {
+                Some(frame) => out_tx.send(frame).await.is_ok(),
+                None => true,
+            };
+        }
+        if let Some(req) = forward::classify(&value) {
+            return match forward::handle(req, forwards, is_local).await {
                 Some(frame) => out_tx.send(frame).await.is_ok(),
                 None => true,
             };

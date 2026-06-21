@@ -36,6 +36,10 @@ use tokio::sync::mpsc;
 
 #[cfg(unix)]
 use crate::conn::{process_frame, ConnSubs, OUTBOUND_CAPACITY};
+#[cfg(unix)]
+use crate::forward::ForwardRegistry;
+#[cfg(unix)]
+use crate::reverse::ReverseChannel;
 
 /// Serve JSON-RPC over a UDS until `shutdown` resolves. `bus` is the shared
 /// in-process event bus that connection subscriptions are wired to. `control`,
@@ -119,6 +123,8 @@ async fn handle_connection(
     });
 
     let mut subs = ConnSubs::default();
+    let mut forwards = ForwardRegistry::default();
+    let reverse = ReverseChannel::new(out_tx.clone());
     let mut line = String::new();
     let io_result = loop {
         line.clear();
@@ -139,6 +145,8 @@ async fn handle_connection(
             &bus,
             &out_tx,
             &mut subs,
+            &mut forwards,
+            &reverse,
             control.as_ref(),
             true,
         )
@@ -148,8 +156,9 @@ async fn handle_connection(
         }
     };
 
-    // Cleanup: abort all forwarders, then let the writer drain and finish.
+    // Cleanup: abort all subscriptions + forwards, then let the writer finish.
     drop(subs);
+    drop(forwards);
     drop(out_tx);
     let _ = writer.await;
     io_result
