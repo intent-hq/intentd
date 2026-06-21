@@ -81,3 +81,9 @@ id_newtype!(
     /// Identifier for an agent.
     AgentId
 );
+id_newtype!(
+    /// Identifier for a logical client (stable, client-supplied identity; §16).
+    /// Distinct from the ephemeral per-connection id used for transport
+    /// bookkeeping — this is the key that disambiguates `drafts.*` (§5.16).
+    ClientId
+);

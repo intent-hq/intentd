@@ -369,6 +369,8 @@ impl WsInner {
         let mut subs = ConnSubs::default();
         let mut forwards = ForwardRegistry::default();
         let reverse = ReverseChannel::new(app_tx.clone());
+        // Per-connection logical-client binding (§16): `None` until `client.hello`.
+        let mut client_id: Option<intent_core::ClientId> = None;
         loop {
             tokio::select! {
                 incoming = stream.next() => match incoming {
@@ -378,7 +380,7 @@ impl WsInner {
                         // surface (those are served over the local UDS); pass `None`.
                         // `host.status` IS answered here, with the resolved WSS
                         // locality (remote unless overridden, §5.14).
-                        if !conn::process_frame(&text, &*self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, None, self.locality_is_local).await {
+                        if !conn::process_frame(&text, &*self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, None, &mut client_id, self.locality_is_local).await {
                             break;
                         }
                     }

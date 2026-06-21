@@ -82,6 +82,25 @@ async fn send(socket: &Path, frame: &str) -> Value {
     serde_json::from_str(line.trim()).expect("valid json")
 }
 
+/// Drive several frames over ONE connection (so the per-connection `client_id`
+/// binding from `client.hello` persists across them, §16), collecting the
+/// ordered responses.
+async fn send_session(socket: &Path, frames: &[&str]) -> Vec<Value> {
+    let stream = UnixStream::connect(socket).await.expect("connect");
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let mut out = Vec::new();
+    for frame in frames {
+        write_half.write_all(frame.as_bytes()).await.expect("write");
+        write_half.write_all(b"\n").await.expect("write nl");
+        write_half.flush().await.expect("flush");
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read");
+        out.push(serde_json::from_str(line.trim()).expect("valid json"));
+    }
+    out
+}
+
 #[tokio::test]
 async fn uds_slice_end_to_end() {
     // Use a short base path: macOS caps UDS paths at ~104 bytes (SUN_LEN) and
@@ -479,6 +498,71 @@ async fn uds_slice_end_to_end() {
     )
     .await;
     assert_eq!(resp["result"]["success"], json!(true));
+
+    // (v) client.hello establishes a logical clientId + `server` block (§5.17);
+    //     drafts.* then round-trip on the SAME connection (the `client_id`
+    //     binding is per-connection, §16).
+    let sess = send_session(
+        &config.socket_path,
+        &[
+            r#"{"jsonrpc":"2.0","id":30,"method":"client.hello","params":{"clientId":"cli-e2e","name":"E2E","capabilities":{"forward":true}}}"#,
+            r#"{"jsonrpc":"2.0","id":31,"method":"drafts.set","params":{"workspaceId":"ws-seed","agentId":"agent-e2e","text":"draft body"}}"#,
+            r#"{"jsonrpc":"2.0","id":32,"method":"drafts.get","params":{"workspaceId":"ws-seed","agentId":"agent-e2e"}}"#,
+        ],
+    )
+    .await;
+    assert_eq!(sess[0]["result"]["clientId"], json!("cli-e2e"));
+    assert_eq!(sess[0]["result"]["server"]["locality"], json!("local"));
+    assert!(sess[0]["result"]["server"]["osArch"]
+        .as_str()
+        .unwrap()
+        .contains('/'));
+    assert_eq!(sess[1]["result"]["ok"], json!(true));
+    assert!(sess[1]["result"]["updatedAt"].is_string());
+    assert_eq!(sess[2]["result"]["text"], json!("draft body"));
+
+    // (w) a fresh connection re-presenting the same clientId restores the draft.
+    let sess = send_session(
+        &config.socket_path,
+        &[
+            r#"{"jsonrpc":"2.0","id":33,"method":"client.hello","params":{"clientId":"cli-e2e"}}"#,
+            r#"{"jsonrpc":"2.0","id":34,"method":"drafts.get","params":{"workspaceId":"ws-seed","agentId":"agent-e2e"}}"#,
+        ],
+    )
+    .await;
+    assert_eq!(sess[0]["result"]["clientId"], json!("cli-e2e"));
+    assert_eq!(
+        sess[1]["result"]["text"],
+        json!("draft body"),
+        "reconnect restores the draft"
+    );
+
+    // (x) an anonymous connection (no hello) never sees another client's draft,
+    //     round-trips its own, and an empty set clears it.
+    let sess = send_session(
+        &config.socket_path,
+        &[
+            r#"{"jsonrpc":"2.0","id":35,"method":"drafts.get","params":{"workspaceId":"ws-seed","agentId":"agent-e2e"}}"#,
+            r#"{"jsonrpc":"2.0","id":36,"method":"drafts.set","params":{"workspaceId":"ws-seed","agentId":"agent-e2e","text":"anon"}}"#,
+            r#"{"jsonrpc":"2.0","id":37,"method":"drafts.get","params":{"workspaceId":"ws-seed","agentId":"agent-e2e"}}"#,
+            r#"{"jsonrpc":"2.0","id":38,"method":"drafts.set","params":{"workspaceId":"ws-seed","agentId":"agent-e2e","text":""}}"#,
+            r#"{"jsonrpc":"2.0","id":39,"method":"drafts.get","params":{"workspaceId":"ws-seed","agentId":"agent-e2e"}}"#,
+        ],
+    )
+    .await;
+    assert_eq!(
+        sess[0]["result"],
+        Value::Null,
+        "anonymous sees no other client's draft"
+    );
+    assert_eq!(sess[1]["result"]["ok"], json!(true));
+    assert_eq!(sess[2]["result"]["text"], json!("anon"));
+    assert_eq!(sess[3]["result"]["ok"], json!(true));
+    assert!(
+        sess[3]["result"].get("updatedAt").is_none(),
+        "empty set is a clear"
+    );
+    assert_eq!(sess[4]["result"], Value::Null, "the draft was cleared");
 
     let _ = tx.send(());
     let _ = server.await;

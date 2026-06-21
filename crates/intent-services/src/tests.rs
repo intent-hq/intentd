@@ -1169,6 +1169,92 @@ mod mcp_callback {
 }
 
 // ============================================================================
+// drafts.* — BE-persisted per-client drafts emit `draft:changed` WITHOUT the
+// draft text (no leakage, PROTOCOL §5.16/§6.5).
+// ============================================================================
+mod drafts_events {
+    use std::time::Duration;
+
+    use intent_core::events::DRAFT_CHANGED;
+    use intent_core::{AgentId, ClientId, WorkspaceId};
+    use intent_store::Store;
+    use serde_json::json;
+
+    use super::{workspace, TempDb};
+    use crate::{EventBus, Services, SubscriptionFilter};
+
+    #[tokio::test]
+    async fn draft_set_then_clear_emit_change_events_without_text() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let client = ClientId::from_string("cli-secret");
+        store
+            .upsert_client(&client, None, None)
+            .await
+            .expect("client");
+        let agent = AgentId::from_string("agent-1");
+
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store).with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(ws.0.clone()),
+            ..Default::default()
+        });
+
+        let secret = "TOP SECRET DRAFT TEXT";
+        let updated = services
+            .drafts_set(
+                ws.clone(),
+                agent.clone(),
+                client.clone(),
+                secret.to_string(),
+            )
+            .await
+            .expect("set draft");
+        assert!(updated.is_some(), "a non-empty set stores a draft");
+
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        let ev = batch
+            .iter()
+            .find(|e| e.event_type == DRAFT_CHANGED)
+            .expect("draft:changed fired");
+        assert_eq!(ev.data["hasDraft"], json!(true));
+        assert_eq!(ev.data["workspaceId"], json!(ws.0));
+        assert_eq!(ev.data["agentId"], json!(agent.0));
+        assert_eq!(ev.data["clientId"], json!(client.0));
+        assert!(
+            ev.data.get("text").is_none(),
+            "draft:changed must NOT carry text"
+        );
+        assert!(
+            !serde_json::to_string(&ev.data).unwrap().contains(secret),
+            "the draft text never appears in the event payload"
+        );
+
+        // Clearing emits hasDraft=false (still no text).
+        services
+            .drafts_clear(ws.clone(), agent.clone(), client.clone())
+            .await
+            .expect("clear draft");
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        let ev = batch
+            .iter()
+            .find(|e| e.event_type == DRAFT_CHANGED)
+            .expect("draft:changed fired on clear");
+        assert_eq!(ev.data["hasDraft"], json!(false));
+        assert!(ev.data.get("text").is_none());
+    }
+}
+
+// ============================================================================
 // pr.* read methods over a stubbed forge (no network). Asserts the parity-exact
 // status/reviews/check-run shapes and the review-thread filtering/fallback.
 // ============================================================================

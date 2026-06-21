@@ -18,10 +18,10 @@ use intent_core::events::{
 };
 use intent_core::{
     iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId, AgentLite,
-    AuthorType, BoxFuture, Comment, CommentAddResult, CommentAnchor, CommentAnchorType,
+    AuthorType, BoxFuture, ClientId, Comment, CommentAddResult, CommentAnchor, CommentAnchorType,
     CommentDeleteResult, CommentGetThreadResult, CommentListResult, CommentLocation,
     CommentRespondResult, CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType,
-    CommentWire, ContentType, Event, EventQueryParams, EventSubscribeResult,
+    CommentWire, ContentType, Draft, Event, EventQueryParams, EventSubscribeResult,
     EventUnsubscribeResult, FileActivity, Note, NoteAddInput, NoteAddResult, NoteCreate,
     NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
     NoteId, NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult,
@@ -38,6 +38,7 @@ pub use intent_core::{Error, Result, WorkspaceApi};
 mod agent_manager;
 mod agent_ops;
 mod agent_session;
+mod drafts;
 mod event_ops;
 pub mod events;
 mod git_ops;
@@ -4240,6 +4241,50 @@ impl WorkspaceApi for Services {
         let svc = self.clone();
         Box::pin(async move { svc.ac_add_remote(workspace_id, remote_url).await })
     }
+
+    fn upsert_client(
+        &self,
+        client_id: ClientId,
+        name: Option<String>,
+        capabilities: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.client_hello_upsert(client_id, name, capabilities).await })
+    }
+
+    fn draft_get(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        client_id: ClientId,
+    ) -> BoxFuture<'_, Result<Option<Draft>>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.drafts_get(workspace_id, agent_id, client_id).await })
+    }
+
+    fn draft_set(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        client_id: ClientId,
+        text: String,
+    ) -> BoxFuture<'_, Result<Option<String>>> {
+        let svc = self.clone();
+        Box::pin(async move {
+            svc.drafts_set(workspace_id, agent_id, client_id, text)
+                .await
+        })
+    }
+
+    fn draft_clear(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        client_id: ClientId,
+    ) -> BoxFuture<'_, Result<()>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.drafts_clear(workspace_id, agent_id, client_id).await })
+    }
 }
 
 /// Orchestration backing the `accept-changes.*` methods (§5.18). Kept on
@@ -4895,7 +4940,6 @@ pub mod pr {}
 pub mod script {}
 pub mod file {}
 pub mod event {}
-pub mod drafts {} // §9.10
 
 // Agent-Ecosystem modules (§18).
 pub mod rules {}

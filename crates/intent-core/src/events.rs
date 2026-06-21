@@ -170,6 +170,13 @@ pub const CHANGES_METRICS_CHANGED: &str = "changes:metrics-changed";
 pub const SEARCH_RESULT: &str = "search:result";
 pub const SEARCH_DONE: &str = "search:done";
 
+// Drafts events (new in intentd; PROTOCOL §5.16/§6.5). Emitted after
+// `drafts.set` / `drafts.clear`; the self-sufficient payload
+// `{ workspaceId, agentId, clientId, hasDraft }` deliberately OMITS the draft
+// text (no leakage) — it only signals that a client's draft exists or was
+// cleared so other connections can sync/refetch.
+pub const DRAFT_CHANGED: &str = "draft:changed";
+
 // MCP events.
 pub const MCP_NOTIFICATION: &str = "mcp:notification";
 
@@ -252,6 +259,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     CHANGES_METRICS_CHANGED,
     SEARCH_RESULT,
     SEARCH_DONE,
+    DRAFT_CHANGED,
     MCP_NOTIFICATION,
 ];
 

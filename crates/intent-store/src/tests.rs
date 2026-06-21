@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use intent_core::{
-    events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, Comment,
+    events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientId, Comment,
     CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, EventActor, Note,
     NoteId, NoteVisibility, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus,
@@ -78,8 +78,8 @@ async fn migration_status_reports_current_after_open() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let status = store.migration_status().await.expect("migration status");
     assert!(status.is_current(), "fresh open must apply all migrations");
-    assert_eq!(status.expected, vec![1, 2, 3, 4, 5, 6]);
-    assert_eq!(status.applied, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(status.expected, vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(status.applied, vec![1, 2, 3, 4, 5, 6, 7]);
 }
 
 #[tokio::test]
@@ -791,4 +791,142 @@ async fn agent_provider_is_immutable_once_set() {
     let mut s = store.get_agent_session(&agent_id).await.expect("get");
     s.provider = Some("claude-code".to_string());
     assert!(store.update_agent_session(&s).await.is_err());
+}
+
+#[tokio::test]
+async fn client_upsert_sets_first_seen_once_and_touches_last_seen() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let id = ClientId::from_string("cli-abc");
+
+    store
+        .upsert_client(&id, Some("Laptop"), Some(&json!({ "forward": true })))
+        .await
+        .expect("insert client");
+    let first = store.get_client(&id).await.expect("get").expect("present");
+    assert_eq!(first.name, Some("Laptop".to_string()));
+    assert_eq!(first.capabilities, json!({ "forward": true }));
+
+    // Re-hello updates name/capabilities and touches last_seen; first_seen stays.
+    store
+        .upsert_client(&id, Some("Desktop"), Some(&json!({ "forward": false })))
+        .await
+        .expect("re-upsert");
+    let again = store.get_client(&id).await.expect("get").expect("present");
+    assert_eq!(again.name, Some("Desktop".to_string()));
+    assert_eq!(again.capabilities, json!({ "forward": false }));
+    assert_eq!(
+        again.first_seen, first.first_seen,
+        "first_seen is preserved"
+    );
+    assert!(store
+        .get_client(&ClientId::from_string("missing"))
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn draft_round_trip_upsert_get_delete() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let client = ClientId::from_string("cli-1");
+    store
+        .upsert_client(&client, None, None)
+        .await
+        .expect("client");
+    let agent = AgentId::from_string("agent-1");
+
+    assert!(store
+        .get_draft(&ws, &agent, &client)
+        .await
+        .unwrap()
+        .is_none());
+    store
+        .upsert_draft(&ws, &agent, &client, "hello")
+        .await
+        .expect("set");
+    let got = store
+        .get_draft(&ws, &agent, &client)
+        .await
+        .unwrap()
+        .expect("present");
+    assert_eq!(got.text, "hello");
+
+    // Upsert overwrites text in place.
+    store
+        .upsert_draft(&ws, &agent, &client, "world")
+        .await
+        .expect("set2");
+    assert_eq!(
+        store
+            .get_draft(&ws, &agent, &client)
+            .await
+            .unwrap()
+            .unwrap()
+            .text,
+        "world"
+    );
+
+    assert!(
+        store.delete_draft(&ws, &agent, &client).await.unwrap(),
+        "row removed"
+    );
+    assert!(
+        !store.delete_draft(&ws, &agent, &client).await.unwrap(),
+        "idempotent no-op"
+    );
+    assert!(store
+        .get_draft(&ws, &agent, &client)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn drafts_are_isolated_by_client_and_cascade_on_workspace_delete() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent = AgentId::from_string("agent-1");
+    let a = ClientId::from_string("cli-a");
+    let b = ClientId::from_string("cli-b");
+    store.upsert_client(&a, None, None).await.unwrap();
+    store.upsert_client(&b, None, None).await.unwrap();
+
+    store.upsert_draft(&ws, &agent, &a, "from-a").await.unwrap();
+    store.upsert_draft(&ws, &agent, &b, "from-b").await.unwrap();
+    assert_eq!(
+        store
+            .get_draft(&ws, &agent, &a)
+            .await
+            .unwrap()
+            .unwrap()
+            .text,
+        "from-a"
+    );
+    assert_eq!(
+        store
+            .get_draft(&ws, &agent, &b)
+            .await
+            .unwrap()
+            .unwrap()
+            .text,
+        "from-b"
+    );
+
+    store.delete_workspace(&ws).await.expect("delete ws");
+    assert!(
+        store.get_draft(&ws, &agent, &a).await.unwrap().is_none(),
+        "ON DELETE CASCADE removes drafts with their workspace"
+    );
 }

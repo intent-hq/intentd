@@ -125,6 +125,8 @@ async fn handle_connection(
     let mut subs = ConnSubs::default();
     let mut forwards = ForwardRegistry::default();
     let reverse = ReverseChannel::new(out_tx.clone());
+    // Per-connection logical-client binding (§16): `None` until `client.hello`.
+    let mut client_id: Option<intent_core::ClientId> = None;
     let mut line = String::new();
     let io_result = loop {
         line.clear();
@@ -148,6 +150,7 @@ async fn handle_connection(
             &mut forwards,
             &reverse,
             control.as_ref(),
+            &mut client_id,
             true,
         )
         .await

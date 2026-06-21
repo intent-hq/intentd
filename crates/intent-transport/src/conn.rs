@@ -8,7 +8,7 @@
 //! identical regardless of transport. The only difference is framing, which the
 //! transports handle by draining an outbound `mpsc::Sender<String>`.
 
-use intent_core::WorkspaceApi;
+use intent_core::{ClientId, WorkspaceApi};
 use intent_services::{EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -16,7 +16,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::client;
 use crate::control::{self, SystemControl};
+use crate::drafts;
 use crate::events::{self, FastPath};
 use crate::forward::{self, ForwardRegistry};
 use crate::host;
@@ -84,8 +86,10 @@ impl ConnSubs {
 /// and the `events.` fast-path, else hand to the JSON-RPC dispatcher. `control`
 /// is `Some` only on a transport that exposes the control surface (the UDS
 /// listener); `forwards`/`reverse` are the connection's port-forward registry
-/// and reverse-RPC channel; `is_local` reflects that connection's resolved
-/// locality (§5.14). Returns `false` when the outbound channel is closed.
+/// and reverse-RPC channel; `client_id` is the connection's logical-client
+/// binding, set by `client.hello` and consumed by `drafts.*` (§16); `is_local`
+/// reflects that connection's resolved locality (§5.14). Returns `false` when
+/// the outbound channel is closed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_frame(
     raw: &str,
@@ -96,6 +100,7 @@ pub(crate) async fn process_frame(
     forwards: &mut ForwardRegistry,
     reverse: &ReverseChannel,
     control: Option<&Arc<dyn SystemControl>>,
+    client_id: &mut Option<ClientId>,
     is_local: bool,
 ) -> bool {
     if let Ok(value) = serde_json::from_str::<Value>(raw) {
@@ -121,6 +126,18 @@ pub(crate) async fn process_frame(
         }
         if let Some(req) = forward::classify(&value) {
             return match forward::handle(req, forwards, is_local).await {
+                Some(frame) => out_tx.send(frame).await.is_ok(),
+                None => true,
+            };
+        }
+        if let Some(req) = client::classify(&value) {
+            return match client::handle(req, api, client_id, is_local).await {
+                Some(frame) => out_tx.send(frame).await.is_ok(),
+                None => true,
+            };
+        }
+        if let Some(req) = drafts::classify(&value) {
+            return match drafts::handle(req, api, client_id).await {
                 Some(frame) => out_tx.send(frame).await.is_ok(),
                 None => true,
             };

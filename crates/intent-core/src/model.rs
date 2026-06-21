@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, NoteId, WorkspaceId};
+use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId};
 
 /// Workspace lifecycle (§9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1294,6 +1294,35 @@ pub struct ScriptCreateParams {
     pub category: Option<String>,
     pub auto_start: Option<bool>,
     pub script_id: Option<String>,
+}
+
+/// Logical client record (§9.2, §16). The stable, client-supplied identity that
+/// survives reconnects; persisted to the `client` table with `name`,
+/// `capabilities`, `first_seen`, and `last_seen`. The ephemeral per-connection
+/// id is transport-only and never stored here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Client {
+    pub id: ClientId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub capabilities: serde_json::Value,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+/// Per-client chat draft (§9.10, §15), keyed by `(workspaceId, agentId,
+/// clientId)` so concurrent clients never clobber one another. Persisted to the
+/// `draft` table; an empty draft is represented by the row's absence (an empty
+/// `drafts.set` clears it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Draft {
+    pub workspace_id: WorkspaceId,
+    pub agent_id: AgentId,
+    pub client_id: ClientId,
+    pub text: String,
+    pub updated_at: String,
 }
 
 #[cfg(test)]
