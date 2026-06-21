@@ -94,8 +94,15 @@ impl WsInner {
         let accept_task = tokio::spawn(self.clone().accept_loop(listener, shutdown_rx));
         let heartbeat_task = tokio::spawn(self.clone().heartbeat_loop());
         // Advertise the real, post-backoff port over mDNS (§5.4); a no-op (and
-        // `None`) when discovery is disabled or registration fails.
-        let discovery = advertise_if_enabled(self.discovery_enabled, port, &self.fingerprint);
+        // `None`) when discovery is disabled or registration fails. The TXT
+        // record carries the resolved locality (§5.14): remote for a plain
+        // TCP/WSS listener, local when forced via `--mode`/`server.locality`.
+        let discovery = advertise_if_enabled(
+            self.discovery_enabled,
+            port,
+            &self.fingerprint,
+            self.locality_is_local,
+        );
         let mut st = self.state.lock().await;
         st.started = true;
         st.port = Some(port);

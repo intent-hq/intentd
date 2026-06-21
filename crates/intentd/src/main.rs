@@ -41,6 +41,11 @@ enum Command {
         /// Transport to listen on: `uds`, `tcp`, or `both`.
         #[arg(long, default_value = "uds")]
         listen: String,
+        /// Force connection locality (§5.14): `local` or `remote`. Overrides the
+        /// transport default (UDS ⇒ local, TCP/WSS ⇒ remote) for `host.status`
+        /// and the mDNS TXT record. Omit to infer from the transport.
+        #[arg(long)]
+        mode: Option<String>,
     },
     /// One-shot JSON-RPC call to a running daemon; prints the JSON result.
     Call {
@@ -97,7 +102,7 @@ enum ServiceAction {
 async fn main() -> ExitCode {
     init_tracing();
     match Cli::parse().command {
-        Command::Serve { listen } => to_exit(cmd_serve(&listen).await),
+        Command::Serve { listen, mode } => to_exit(cmd_serve(&listen, mode.as_deref()).await),
         Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
         Command::Status => cmd_status().await,
         Command::Stop => cmd_stop().await,
@@ -151,13 +156,17 @@ fn resolve_config() -> anyhow::Result<Config> {
     Config::resolve().map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
-async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
+async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
     let (serve_uds_enabled, serve_tcp_enabled) = match listen {
         "uds" => (true, false),
         "tcp" => (false, true),
         "both" => (true, true),
         other => anyhow::bail!("unsupported --listen '{other}'; expected uds|tcp|both"),
     };
+    // Resolve the optional locality override (§5.14): `--mode local|remote`
+    // forces the value reported over `host.status` + mDNS regardless of
+    // transport; absent ⇒ infer from the transport (UDS local, TCP/WSS remote).
+    let locality_override = parse_locality_mode(mode)?;
     let config = resolve_config()?;
     std::fs::create_dir_all(&config.data_dir)?;
     // Single-instance guard (§5.6): refuse to start if a live daemon owns the
@@ -225,14 +234,10 @@ async fn cmd_serve(listen: &str) -> anyhow::Result<()> {
             ensure_tls_certificate(&config.data_dir).map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let token_store = resolve_token_store();
         get_or_create_token(&*token_store).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        let server = WsApiServer::new(
-            api.clone(),
-            bus.clone(),
-            &tls,
-            token_store,
-            ws_options_from_env(),
-        )
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let mut ws_options = ws_options_from_env();
+        ws_options.locality_override = locality_override;
+        let server = WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, ws_options)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let port = server.start().await?;
         tracing::info!(port, fingerprint = %server.fingerprint(), "intentd WSS listening");
         (Some(server), Some(port))
@@ -376,6 +381,20 @@ fn ws_options_from_env() -> WsOptions {
         opts.base_port = port;
     }
     opts
+}
+
+/// Parse the optional `--mode` locality override (§5.14) into the transport
+/// override flag: `local` ⇒ `Some(true)`, `remote` ⇒ `Some(false)`, absent ⇒
+/// `None` (infer from the transport). Any other value is a hard CLI error. The
+/// override is applied to the TCP/WSS listener (`host.status` + mDNS); the local
+/// UDS control path is always `local`.
+fn parse_locality_mode(mode: Option<&str>) -> anyhow::Result<Option<bool>> {
+    match mode {
+        None => Ok(None),
+        Some("local") => Ok(Some(true)),
+        Some("remote") => Ok(Some(false)),
+        Some(other) => anyhow::bail!("unsupported --mode '{other}'; expected local|remote"),
+    }
 }
 
 /// Parse a boolean-ish env flag (`1`/`true`/`yes`, case-insensitive).

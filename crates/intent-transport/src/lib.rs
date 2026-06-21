@@ -13,7 +13,8 @@ pub use auth::{
     is_auth_enabled, is_discovery_enabled, validate_token, KeyringTokenStore, TokenStore,
 };
 pub use control::{SystemControl, SystemStatus};
-pub use discovery::{detect_has_display, Discovery, SERVICE_TYPE};
+pub use discovery::{detect_display_server, detect_has_display, Discovery, SERVICE_TYPE};
+pub use host::resolve_is_local;
 pub use listener::serve_uds;
 pub use router::handle_message;
 pub use tls::{cert_fingerprint, ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
@@ -24,6 +25,7 @@ mod conn;
 pub mod control;
 pub mod discovery;
 mod events;
+pub mod host;
 pub mod lifecycle;
 pub mod listener;
 pub mod router;

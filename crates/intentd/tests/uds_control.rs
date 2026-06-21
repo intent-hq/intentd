@@ -96,6 +96,16 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     assert!(r["host"]["hasDisplay"].is_boolean());
     assert_eq!(r["agents"], 0);
 
+    // host.status is the §5.14 capability probe, answered on the same UDS
+    // connection with the resolved locality (UDS ⇒ local) and host fields.
+    let host = rpc(&socket, "host.status").await;
+    let h = &host["result"];
+    assert_eq!(h["locality"], "local", "UDS host.status ⇒ local (§5.14)");
+    assert!(h["os"].is_string());
+    assert!(h["arch"].is_string());
+    assert!(h["hostname"].is_string());
+    assert!(h["hasDisplay"].is_boolean());
+
     // `intentd stop` issues the graceful control RPC then escalates if needed.
     // Run it in a blocking thread while we concurrently reap the daemon: the
     // daemon is THIS test's child, so its post-exit zombie would otherwise keep
