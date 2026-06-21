@@ -9,8 +9,9 @@ use intent_core::{
     NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
     NoteEditLinesResult, NoteEditResult, NoteId, NoteSetContentResult, NoteTaskRow,
     NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, Result,
-    TaskUpdateResult, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    ScriptCreateParams, ScriptMode, TaskUpdateResult, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
+    WorkspaceUpdate,
 };
 use serde_json::Value;
 
@@ -877,6 +878,88 @@ impl WorkspaceApi for FakeApi {
             Ok(serde_json::json!({
                 "terminals": [{ "id": "pty-1", "alive": true }],
                 "workspaceId": workspace_id.as_str(),
+            }))
+        })
+    }
+
+    fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({ "scripts": [], "workspaceId": workspace_id.as_str() }))
+        })
+    }
+
+    fn script_create(
+        &self,
+        workspace_id: WorkspaceId,
+        params: ScriptCreateParams,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            let mode = match params.mode {
+                ScriptMode::Service => "service",
+                ScriptMode::Command => "command",
+            };
+            Ok(serde_json::json!({
+                "workspaceId": workspace_id.as_str(),
+                "name": params.name,
+                "command": params.command,
+                "mode": mode,
+                "cwd": params.cwd,
+                "env": params.env,
+                "category": params.category,
+                "autoStart": params.auto_start,
+                "scriptId": params.script_id,
+            }))
+        })
+    }
+
+    fn script_remove(&self, script_id: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "scriptId": script_id })) })
+    }
+
+    fn script_start(&self, script_id: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "scriptId": script_id })) })
+    }
+
+    fn script_stop(&self, script_id: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "scriptId": script_id })) })
+    }
+
+    fn script_restart(&self, script_id: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "scriptId": script_id })) })
+    }
+
+    fn script_output(
+        &self,
+        script_id: String,
+        max_lines: Option<i64>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            // `script.output` returns plaintext buffer text (a bare string), not
+            // an object (§5.8). Echo `scriptId`/`maxLines` into the string so the
+            // dispatch test can still assert they were threaded through.
+            let _ = script_id;
+            Ok(Value::String(format!(
+                "[1 lines]\nmaxLines={}",
+                max_lines.unwrap_or(-1)
+            )))
+        })
+    }
+
+    fn script_status(&self, script_id: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!({ "scriptId": script_id, "status": "idle" })) })
+    }
+
+    fn script_run(
+        &self,
+        script_id: String,
+        max_lines: Option<i64>,
+        timeout_seconds: Option<i64>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "scriptId": script_id,
+                "maxLines": max_lines,
+                "timeoutSeconds": timeout_seconds,
             }))
         })
     }
@@ -2073,4 +2156,87 @@ async fn terminal_kill_and_list_dispatch() {
         v["result"]["terminals"][0]["alive"],
         serde_json::json!(true)
     );
+}
+
+#[tokio::test]
+async fn script_create_parses_fields_and_mode() {
+    // All optional fields flow through; mode parses to the enum.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"script.create","params":{"workspaceId":"ws-1","name":"dev","command":"pnpm dev","mode":"service","cwd":"app","env":{"PORT":"3000"},"category":"dev","autoStart":true,"scriptId":"s-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["name"], serde_json::json!("dev"));
+    assert_eq!(v["result"]["command"], serde_json::json!("pnpm dev"));
+    assert_eq!(v["result"]["mode"], serde_json::json!("service"));
+    assert_eq!(v["result"]["cwd"], serde_json::json!("app"));
+    assert_eq!(v["result"]["env"]["PORT"], serde_json::json!("3000"));
+    assert_eq!(v["result"]["category"], serde_json::json!("dev"));
+    assert_eq!(v["result"]["autoStart"], serde_json::json!(true));
+    assert_eq!(v["result"]["scriptId"], serde_json::json!("s-1"));
+
+    // Invalid mode → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"script.create","params":{"workspaceId":"ws-1","name":"x","command":"y","mode":"daemon"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // Missing command → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"script.create","params":{"workspaceId":"ws-1","name":"x","mode":"command"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn script_lifecycle_and_run_dispatch() {
+    for method in [
+        "script.start",
+        "script.stop",
+        "script.restart",
+        "script.remove",
+    ] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"scriptId":"s-1"}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(v["result"]["ok"], serde_json::json!(true), "{method}");
+        assert_eq!(
+            v["result"]["scriptId"],
+            serde_json::json!("s-1"),
+            "{method}"
+        );
+    }
+
+    // script.run accepts the `timeout` alias for `timeoutSeconds`.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"script.run","params":{"scriptId":"s-1","maxLines":50,"timeout":30}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["maxLines"], serde_json::json!(50));
+    assert_eq!(v["result"]["timeoutSeconds"], serde_json::json!(30));
+
+    // script.output passes maxLines and its result is a bare plaintext string
+    // (a header line + text), not an object (§5.8).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"script.output","params":{"scriptId":"s-1","maxLines":10}}"#,
+    )
+    .await
+    .unwrap();
+    let out = v["result"]
+        .as_str()
+        .expect("script.output result is a string");
+    assert!(out.starts_with("["), "header line present: {out:?}");
+    assert!(out.contains("maxLines=10"), "maxLines threaded: {out:?}");
+
+    // Missing scriptId → -32602.
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"script.start","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
 }

@@ -3168,3 +3168,297 @@ mod terminal {
         h.services.terminal_kill(terminal_id).await.expect("kill");
     }
 }
+
+/// `script.*` reconciled onto the same PTY host (§5.8, §12.2): command one-shot
+/// `script.run`, service auto-restart/backoff, dev-server URL detection on
+/// `script:state`, and a terminal attaching to a running script's PTY.
+#[cfg(unix)]
+mod script {
+    use std::time::Duration;
+
+    use base64::Engine as _;
+    use intent_core::{ScriptCreateParams, ScriptMode, WorkspaceApi, WorkspaceId};
+    use intent_store::Store;
+    use serde_json::Value;
+
+    use super::{workspace, TempDb};
+    use crate::events::{EventBus, Subscription, SubscriptionFilter};
+    use crate::Services;
+
+    struct Harness {
+        _tmp: TempDb,
+        services: Services,
+        bus: EventBus,
+        ws: WorkspaceId,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store).with_event_bus(bus.clone());
+        Harness {
+            _tmp: tmp,
+            services,
+            bus,
+            ws,
+        }
+    }
+
+    fn subscribe(h: &Harness) -> Subscription {
+        h.bus.subscribe(SubscriptionFilter {
+            event_types: vec!["script:*".to_string()],
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        })
+    }
+
+    fn decode(s: &str) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    async fn create(h: &Harness, name: &str, command: &str, mode: ScriptMode) -> String {
+        let params = ScriptCreateParams {
+            name: name.to_string(),
+            command: command.to_string(),
+            mode,
+            ..Default::default()
+        };
+        let v = h
+            .services
+            .script_create(h.ws.clone(), params)
+            .await
+            .expect("create");
+        v["id"].as_str().expect("script id").to_string()
+    }
+
+    /// Drain script events until `pred` returns `Some`, accumulating decoded
+    /// `script:output` chunks along the way.
+    async fn drain_until<F, T>(
+        sub: &mut Subscription,
+        timeout: Duration,
+        mut pred: F,
+    ) -> (T, Vec<u8>)
+    where
+        F: FnMut(&Value) -> Option<T>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut data = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let batch = tokio::time::timeout(remaining, sub.recv())
+                .await
+                .expect("script event delivered")
+                .expect("subscription open");
+            for ev in &batch {
+                let v = serde_json::to_value(ev).expect("serialize");
+                if v["type"] == "script:output" {
+                    if let Some(chunk) = v["data"]["chunk"].as_str() {
+                        data.extend_from_slice(&decode(chunk));
+                    }
+                }
+                if let Some(t) = pred(&v) {
+                    return (t, data);
+                }
+            }
+        }
+    }
+
+    /// `script.run` runs a command-mode script once and captures its output.
+    #[tokio::test]
+    async fn command_runs_once_and_captures_output() {
+        let h = harness().await;
+        let id = create(&h, "echo", "echo run-once-output", ScriptMode::Command).await;
+        let out = h
+            .services
+            .script_run(id, None, Some(10))
+            .await
+            .expect("run");
+        assert_eq!(out["timedOut"], false);
+        assert_eq!(out["exitCode"], 0);
+        assert!(
+            out["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("run-once-output"),
+            "captured output: {:?}",
+            out["output"]
+        );
+    }
+
+    /// `script.output` returns the buffer as a plaintext string (a `[... lines]`
+    /// header + text), not an object — the ancestor/§5.8 parity contract.
+    #[tokio::test]
+    async fn output_returns_plaintext_buffer_with_header() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create(
+            &h,
+            "svc",
+            "echo OUTPUT-PARITY-MARK ; sleep 5",
+            ScriptMode::Service,
+        )
+        .await;
+        h.services.script_start(id.clone()).await.expect("start");
+        drain_until(&mut sub, Duration::from_secs(5), |v| {
+            if v["type"] == "script:output" {
+                let bytes = v["data"]["chunk"].as_str().map(decode).unwrap_or_default();
+                contains(&bytes, b"OUTPUT-PARITY-MARK").then_some(())
+            } else {
+                None
+            }
+        })
+        .await;
+
+        let out = h
+            .services
+            .script_output(id.clone(), Some(10))
+            .await
+            .expect("output");
+        let text = out
+            .as_str()
+            .unwrap_or_else(|| panic!("script.output must be a string, got: {out:?}"));
+        assert!(text.starts_with('['), "header line present: {text:?}");
+        assert!(
+            text.contains("lines]"),
+            "header is a [... lines] line: {text:?}"
+        );
+        assert!(
+            text.contains("OUTPUT-PARITY-MARK"),
+            "buffer text included: {text:?}"
+        );
+        h.services.script_stop(id).await.expect("stop");
+    }
+
+    /// `script.output` on a script that never produced output returns the bare
+    /// `"No output yet."` string (ancestor empty-buffer case).
+    #[tokio::test]
+    async fn output_empty_buffer_returns_placeholder() {
+        let h = harness().await;
+        let id = create(&h, "idle", "echo never-started", ScriptMode::Command).await;
+        let out = h.services.script_output(id, None).await.expect("output");
+        assert_eq!(out, Value::String("No output yet.".to_string()));
+    }
+
+    /// A service that exits faster than the 2s floor is treated as a config error
+    /// and is NOT auto-restarted (the ported backoff guard).
+    #[tokio::test]
+    async fn service_too_fast_exit_does_not_restart() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create(&h, "boom", "echo boom", ScriptMode::Service).await;
+        h.services.script_start(id.clone()).await.expect("start");
+        drain_until(&mut sub, Duration::from_secs(5), |v| {
+            (v["type"] == "script:state" && v["data"]["status"] == "exited").then_some(())
+        })
+        .await;
+        // Past the restart delay it must stay exited, with no restart attempts.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let st = h.services.script_status(id).await.expect("status");
+        assert_eq!(st["status"], "exited");
+        assert_eq!(st["restartCount"], 0);
+    }
+
+    /// A service that runs past the 2s floor before exiting auto-restarts once,
+    /// surfacing `restartCount: 1` on the next `running` `script:state`.
+    #[tokio::test]
+    async fn service_auto_restarts_after_long_enough_run() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create(&h, "svc", "sleep 2.1", ScriptMode::Service).await;
+        h.services.script_start(id.clone()).await.expect("start");
+        drain_until(&mut sub, Duration::from_secs(12), |v| {
+            (v["type"] == "script:state"
+                && v["data"]["status"] == "running"
+                && v["data"]["restartCount"] == 1)
+                .then_some(())
+        })
+        .await;
+        let st = h.services.script_status(id.clone()).await.expect("status");
+        assert_eq!(st["restartCount"], 1);
+        h.services.script_stop(id).await.expect("stop");
+    }
+
+    /// A service whose output prints a local dev-server URL surfaces it on
+    /// `script:state` as `detectedUrl` (the `forward.*` hook).
+    #[tokio::test]
+    async fn service_url_detection_emits_state() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create(
+            &h,
+            "dev",
+            "echo listening on http://localhost:3000/ ; sleep 5",
+            ScriptMode::Service,
+        )
+        .await;
+        h.services.script_start(id.clone()).await.expect("start");
+        let (url, _) = drain_until(&mut sub, Duration::from_secs(5), |v| {
+            if v["type"] == "script:state" {
+                v["data"]["detectedUrl"].as_str().map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .await;
+        assert!(url.contains("localhost:3000"), "detected url: {url}");
+        h.services.script_stop(id).await.expect("stop");
+    }
+
+    /// The unified host: a running script's PTY is visible to `terminal.list` and
+    /// its scrollback is readable via `terminal.getBuffer` — a terminal attaching
+    /// to a live script (§12.2).
+    #[tokio::test]
+    async fn terminal_attaches_to_running_script_pty() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create(
+            &h,
+            "svc",
+            "echo SCRIPT-PTY-MARK ; sleep 5",
+            ScriptMode::Service,
+        )
+        .await;
+        h.services.script_start(id.clone()).await.expect("start");
+        // Wait until the marker has streamed (so it is in the PTY scrollback).
+        drain_until(&mut sub, Duration::from_secs(5), |v| {
+            if v["type"] == "script:output" {
+                let bytes = v["data"]["chunk"].as_str().map(decode).unwrap_or_default();
+                contains(&bytes, b"SCRIPT-PTY-MARK").then_some(())
+            } else {
+                None
+            }
+        })
+        .await;
+
+        // The script's PTY appears in the workspace's terminal list...
+        let list = h.services.terminal_list(h.ws.clone()).await.expect("list");
+        let term_id = list["terminals"]
+            .as_array()
+            .expect("terminals")
+            .iter()
+            .filter_map(|t| t["id"].as_str())
+            .next()
+            .expect("script PTY listed as a terminal")
+            .to_string();
+
+        // ...and a terminal reads its scrollback (attach to a running script).
+        let buf = h
+            .services
+            .terminal_get_buffer(term_id, None)
+            .await
+            .expect("getBuffer");
+        let bytes = decode(buf["data"].as_str().expect("data"));
+        assert!(
+            contains(&bytes, b"SCRIPT-PTY-MARK"),
+            "terminal reads the running script's PTY output"
+        );
+        h.services.script_stop(id).await.expect("stop");
+    }
+}

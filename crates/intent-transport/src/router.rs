@@ -8,8 +8,8 @@
 
 use intent_core::{
     AgentDelegateInput, AgentId, Error, EventQueryParams, NoteAddInput, NoteCreate, NoteEditInput,
-    NoteEditLinesInput, NoteId, NoteUpdateInput, WorkspaceApi, WorkspaceCreate, WorkspaceId,
-    WorkspaceUpdate,
+    NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode, WorkspaceApi,
+    WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
 };
 use serde_json::{json, Map, Value};
 
@@ -1234,6 +1234,52 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             api.terminal_list(ws).await.map_err(domain_to_rpc)
         }
+        "script.list" => {
+            let ws = require_ws_note(params)?;
+            api.script_list(ws).await.map_err(domain_to_rpc)
+        }
+        "script.create" => {
+            let ws = require_ws_note(params)?;
+            let create = parse_script_create(params)?;
+            api.script_create(ws, create).await.map_err(domain_to_rpc)
+        }
+        "script.remove" => {
+            let script_id = require_str_param(params, "scriptId")?;
+            api.script_remove(script_id).await.map_err(domain_to_rpc)
+        }
+        "script.start" => {
+            let script_id = require_str_param(params, "scriptId")?;
+            api.script_start(script_id).await.map_err(domain_to_rpc)
+        }
+        "script.stop" => {
+            let script_id = require_str_param(params, "scriptId")?;
+            api.script_stop(script_id).await.map_err(domain_to_rpc)
+        }
+        "script.restart" => {
+            let script_id = require_str_param(params, "scriptId")?;
+            api.script_restart(script_id).await.map_err(domain_to_rpc)
+        }
+        "script.output" => {
+            let script_id = require_str_param(params, "scriptId")?;
+            let max_lines = opt_int(params, "maxLines");
+            api.script_output(script_id, max_lines)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "script.status" => {
+            let script_id = require_str_param(params, "scriptId")?;
+            api.script_status(script_id).await.map_err(domain_to_rpc)
+        }
+        "script.run" => {
+            let script_id = require_str_param(params, "scriptId")?;
+            let max_lines = opt_int(params, "maxLines");
+            // `timeoutSeconds` with the `timeout` alias (PROTOCOL §5.8).
+            let timeout_seconds =
+                opt_int(params, "timeoutSeconds").or_else(|| opt_int(params, "timeout"));
+            api.script_run(script_id, max_lines, timeout_seconds)
+                .await
+                .map_err(domain_to_rpc)
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }
@@ -1311,6 +1357,51 @@ fn opt_str_array(params: &Map<String, Value>, name: &str) -> Option<Vec<String>>
             .iter()
             .filter_map(Value::as_str)
             .map(str::to_string)
+            .collect()
+    })
+}
+
+/// Build [`ScriptCreateParams`] from `script.create` params: `name`, `command`,
+/// and `mode` (`service`|`command`) are required; the rest are optional.
+fn parse_script_create(params: &Map<String, Value>) -> Result<ScriptCreateParams, RpcErr> {
+    let name = require_str_param(params, "name")?;
+    let command = require_str_param(params, "command")?;
+    let mode = match require_str_param(params, "mode")?.as_str() {
+        "service" => ScriptMode::Service,
+        "command" => ScriptMode::Command,
+        other => {
+            return Err(rpc(
+                INVALID_PARAMS,
+                format!("Invalid mode: {other} (expected \"service\" or \"command\")"),
+            ))
+        }
+    };
+    Ok(ScriptCreateParams {
+        name,
+        command,
+        mode,
+        cwd: opt_str(params, "cwd"),
+        env: opt_string_map(params, "env"),
+        category: opt_str(params, "category"),
+        auto_start: opt_bool(params, "autoStart"),
+        script_id: opt_str(params, "scriptId"),
+    })
+}
+
+/// Optional boolean param (absent/null/non-bool → `None`).
+fn opt_bool(params: &Map<String, Value>, name: &str) -> Option<bool> {
+    params.get(name).and_then(Value::as_bool)
+}
+
+/// Optional string→string map param (absent/non-object → `None`); non-string
+/// values are skipped. Used for the `script.create` `env` overrides.
+fn opt_string_map(
+    params: &Map<String, Value>,
+    name: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    params.get(name).and_then(Value::as_object).map(|obj| {
+        obj.iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect()
     })
 }
