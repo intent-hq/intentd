@@ -18,6 +18,7 @@ mod comment_repo;
 mod diffs_repo;
 mod draft_repo;
 mod event_repo;
+mod memories_repo;
 mod metrics_repo;
 mod note_repo;
 mod settings_repo;

@@ -78,8 +78,8 @@ async fn migration_status_reports_current_after_open() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let status = store.migration_status().await.expect("migration status");
     assert!(status.is_current(), "fresh open must apply all migrations");
-    assert_eq!(status.expected, vec![1, 2, 3, 4, 5, 6, 7, 8]);
-    assert_eq!(status.applied, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(status.expected, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(status.applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
 }
 
 #[tokio::test]

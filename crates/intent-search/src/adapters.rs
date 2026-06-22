@@ -29,7 +29,7 @@ pub struct EventMatch {
 }
 
 /// `search.memories` hit: the memory id, a preview snippet, and an optional
-/// score. The memories store is deferred to M9; until then no matches are built.
+/// score, built over the BE memories store (§9.2, PROTOCOL §5.15).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryMatch {

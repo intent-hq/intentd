@@ -1926,8 +1926,8 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `search.memories`: substring search over the BE memories store. The
-    /// `memories` table is not created until M9; until then this returns an
+    /// `search.memories`: substring search over the BE memories store (§9.2).
+    /// Returns `{ requestId, matches: MemoryMatch[] }`; an empty store yields an
     /// empty match set (parity-safe, no error) (PROTOCOL §5.15).
     fn search_memories(
         &self,

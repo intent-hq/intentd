@@ -2713,7 +2713,7 @@ mod search {
 }
 
 /// Store-backed `search.*` adapters (M4.12): per-namespace matching, the global
-/// notes path, the memories deferral (empty, not error), and the streaming
+/// notes path, the store-backed memories path (empty + seeded), and the streaming
 /// `search:result`/`search:done` delivery + mid-stream cancellation (§5.15/§6.5).
 mod search_adapters {
     use std::time::Duration;
@@ -2876,7 +2876,7 @@ mod search_adapters {
     }
 
     #[tokio::test]
-    async fn memories_search_returns_empty_not_error() {
+    async fn memories_search_empty_store_returns_empty_not_error() {
         let (_tmp, store, ws) = store_with_ws().await;
         let svc = Services::new(store);
         let r = svc
@@ -2885,6 +2885,31 @@ mod search_adapters {
             .unwrap();
         assert_eq!(r["requestId"], "srch-m");
         assert_eq!(r["matches"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn memories_search_matches_seeded_row() {
+        let (_tmp, store, ws) = store_with_ws().await;
+        // Seed via the internal write path (no `memories.*` RPC, §18.5).
+        let mem = intent_core::Memory {
+            id: "mem-1".to_string(),
+            workspace_id: Some(ws.clone()),
+            content: "remember the needle here".to_string(),
+            tags: vec!["note".to_string()],
+            created_at: intent_core::now_iso(),
+            updated_at: None,
+        };
+        store.insert_memory(&mem).await.expect("insert memory");
+        let svc = Services::new(store);
+        let r = svc
+            .search_memories("needle".into(), Some(ws), Some("srch-m2".into()))
+            .await
+            .unwrap();
+        assert_eq!(r["requestId"], "srch-m2");
+        let matches = r["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["memoryId"], "mem-1");
+        assert!(matches[0]["preview"].as_str().unwrap().contains("needle"));
     }
 
     #[tokio::test]

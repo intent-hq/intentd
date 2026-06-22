@@ -1372,16 +1372,17 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
         let registry = self.search_cancels.clone();
+        let services = self.clone();
         Box::pin(async move {
-            // DEFERRAL (M9): the `memories` table does not exist yet. Return an
-            // empty match set (parity-safe, no error) until the store lands.
-            let _ = query;
-            let _ = workspace_id;
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            registry.register(&request_id);
-            registry.unregister(&request_id);
-            Ok(serde_json::json!({ "requestId": request_id, "matches": [] }))
+            let token = registry.register(&request_id);
+            // `workspaceId` is optional: scope to it when present, else span all.
+            let memories = memories::list(&store, workspace_id.as_ref()).await?;
+            let matches = search_ops::memory_matches(&memories, &query);
+            let matches = to_value_vec(matches)?;
+            Ok(services.deliver_search(request_id, workspace_id, matches, token))
         })
     }
 
@@ -6046,9 +6047,9 @@ pub mod event {}
 
 // Agent-Ecosystem modules (§18).
 mod mcp_servers;
+mod memories;
 mod rules;
 mod specialists;
-pub mod memories {}
 
 // Code Changes Review modules (§17).
 mod accept_changes;
