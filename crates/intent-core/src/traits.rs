@@ -1642,6 +1642,108 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     // ------------------------------------------------------------------------
+    // mcp.servers.* — external MCP-server lifecycle/config (PROTOCOL §5.22,
+    // §18.3). Config lives in the **sensitive** `mcp.servers` setting (`env`/
+    // `headers` redacted over the wire); runtime status is not persisted and
+    // transitions push `mcp.servers:status-changed`. Distinct from the §6.8
+    // agent→BE callback.
+    // ------------------------------------------------------------------------
+
+    /// `mcp.servers.list` → `{ servers: McpServerConfig[] }` — configured
+    /// external servers with sensitive `env`/`headers` redacted (PROTOCOL §5.22).
+    fn mcp_servers_list(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_servers_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.servers.create` → add a server definition; returns
+    /// `{ server: McpServerConfig }` (redacted) (PROTOCOL §5.22).
+    fn mcp_servers_create(
+        &self,
+        config: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = config;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_servers_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.servers.update` → edit an existing definition; returns
+    /// `{ server: McpServerConfig }` (redacted) (PROTOCOL §5.22).
+    fn mcp_servers_update(
+        &self,
+        server_id: String,
+        config: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (server_id, config);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_servers_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.servers.delete` → remove a definition (stopping it first); returns
+    /// `{ success: true }` (PROTOCOL §5.22).
+    fn mcp_servers_delete(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = server_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_servers_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.servers.toggle` → enable (start) / disable (stop) a server; returns
+    /// `{ status: McpServerStatus }` (PROTOCOL §5.22).
+    fn mcp_servers_toggle(
+        &self,
+        server_id: String,
+        enabled: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (server_id, enabled);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_servers_toggle not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.servers.restart` → stop-then-start a server; returns
+    /// `{ status: McpServerStatus }` (PROTOCOL §5.22).
+    fn mcp_servers_restart(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = server_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_servers_restart not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.servers.getStatus` → point read of one server's live status as
+    /// `{ status: McpServerStatus }` (PROTOCOL §5.22).
+    fn mcp_servers_get_status(
+        &self,
+        server_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = server_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_servers_get_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ------------------------------------------------------------------------
     // accept-changes.* — commit→push→PR→merge orchestration (PROTOCOL §5.18).
     // ------------------------------------------------------------------------
 

@@ -1395,6 +1395,74 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "mcp.servers.list" => {
+            // Global (no required scope); optional workspaceId per PROTOCOL §5.22.
+            let workspace_id = opt_workspace_id(params);
+            api.mcp_servers_list(workspace_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "mcp.servers.create" => {
+            require_present(params, "config")?;
+            let config = params.get("config").cloned().unwrap_or(Value::Null);
+            match api.mcp_servers_create(config).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.servers.update" => {
+            let server_id = require_str_param(params, "serverId")?;
+            require_present(params, "config")?;
+            let config = params.get("config").cloned().unwrap_or(Value::Null);
+            match api.mcp_servers_update(server_id, config).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.servers.delete" => {
+            let server_id = require_str_param(params, "serverId")?;
+            match api.mcp_servers_delete(server_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.servers.toggle" => {
+            let server_id = require_str_param(params, "serverId")?;
+            let enabled = params
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| rpc(INVALID_PARAMS, "enabled is required"))?;
+            match api.mcp_servers_toggle(server_id, enabled).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.servers.restart" => {
+            let server_id = require_str_param(params, "serverId")?;
+            match api.mcp_servers_restart(server_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.servers.getStatus" => {
+            let server_id = require_str_param(params, "serverId")?;
+            match api.mcp_servers_get_status(server_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }

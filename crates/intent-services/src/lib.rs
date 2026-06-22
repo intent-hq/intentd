@@ -52,6 +52,7 @@ mod terminal_ops;
 #[cfg(test)]
 mod tests;
 
+pub use mcp_servers::McpHub;
 pub use settings::{InMemorySecretStore, KeyringSecretStore, SecretStore};
 pub use terminal_ops::PtyTerminalHost;
 
@@ -131,6 +132,11 @@ pub struct Services {
     /// `None` resolves from `INTENTD_BUNDLED_SPECIALISTS_DIR` or the
     /// exe-relative `resources/specialists/`.
     specialists_bundled_dir: Option<PathBuf>,
+    /// Runtime manager for **external** MCP servers (§18.3): spawns/stops/
+    /// restarts stdio servers and runs the health monitor, pushing
+    /// `mcp.servers:status-changed`. Shared across clones (and with the
+    /// composition root, which spawns the monitor + reaps on shutdown).
+    mcp_hub: Arc<McpHub>,
 }
 
 impl Services {
@@ -152,6 +158,7 @@ impl Services {
             secrets: Arc::new(settings::KeyringSecretStore),
             specialists_user_dir: None,
             specialists_bundled_dir: None,
+            mcp_hub: Arc::new(McpHub::new()),
         }
     }
 
@@ -325,8 +332,28 @@ impl Services {
     /// must share the same [`Store`] as this services handle so the broadcast and
     /// the durable log stay consistent.
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
+        // The MCP hub publishes `mcp.servers:status-changed` onto the same bus.
+        self.mcp_hub.set_event_bus(bus.clone());
         self.event_bus = Some(bus);
         self
+    }
+
+    /// Borrow the shared [`McpHub`] (composition root: spawn the health monitor
+    /// + reap external MCP servers on shutdown, §18.3).
+    pub fn mcp_hub(&self) -> Arc<McpHub> {
+        self.mcp_hub.clone()
+    }
+
+    /// Start every enabled, non-disabled external MCP server on daemon boot
+    /// (§18.3). Best-effort; a failed spawn surfaces as an `error` status event.
+    pub async fn start_enabled_mcp_servers(&self) {
+        self.mcp_servers_service().start_enabled().await;
+    }
+
+    /// Build an [`McpServersService`](mcp_servers::McpServersService) view over the
+    /// store, secret store, and hub for one `mcp.servers.*` call.
+    fn mcp_servers_service(&self) -> mcp_servers::McpServersService<'_> {
+        mcp_servers::McpServersService::new(&self.store, self.secrets.as_ref(), &self.mcp_hub)
     }
 
     /// Borrow the underlying store (composition-root / diagnostics use).
@@ -1140,6 +1167,55 @@ impl WorkspaceApi for Services {
             self.specialists_service()
                 .delete(&id, &scope, workspace_path.as_deref().map(Path::new))
         })
+    }
+
+    fn mcp_servers_list(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.mcp_servers_service()
+                .list(workspace_id.as_ref().map(WorkspaceId::as_str))
+                .await
+        })
+    }
+
+    fn mcp_servers_create(
+        &self,
+        config: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_servers_service().create(config).await })
+    }
+
+    fn mcp_servers_update(
+        &self,
+        server_id: String,
+        config: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_servers_service().update(&server_id, config).await })
+    }
+
+    fn mcp_servers_delete(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_servers_service().delete(&server_id).await })
+    }
+
+    fn mcp_servers_toggle(
+        &self,
+        server_id: String,
+        enabled: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_servers_service().toggle(&server_id, enabled).await })
+    }
+
+    fn mcp_servers_restart(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_servers_service().restart(&server_id).await })
+    }
+
+    fn mcp_servers_get_status(
+        &self,
+        server_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_servers_service().get_status(&server_id).await })
     }
 
     fn search_in_files(
@@ -5969,9 +6045,9 @@ pub mod file {}
 pub mod event {}
 
 // Agent-Ecosystem modules (§18).
+mod mcp_servers;
 mod rules;
 mod specialists;
-pub mod mcp_servers {}
 pub mod memories {}
 
 // Code Changes Review modules (§17).

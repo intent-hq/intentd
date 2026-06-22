@@ -180,6 +180,14 @@ pub const DRAFT_CHANGED: &str = "draft:changed";
 // MCP events.
 pub const MCP_NOTIFICATION: &str = "mcp:notification";
 
+// External MCP-server lifecycle (new in intentd; PROTOCOL §5.22/§6.5, §18.3).
+// Emitted on every health/lifecycle transition (started/stopped/error/
+// restarting) of a **user-configured external** MCP server. The self-sufficient
+// payload `{ serverId, status: McpServerStatus }` carries the new runtime state
+// so a client re-renders without polling. Distinct from the agent→BE callback
+// (`mcp:notification`, §6.8).
+pub const MCP_SERVERS_STATUS_CHANGED: &str = "mcp.servers:status-changed";
+
 // Settings events (new in intentd; PROTOCOL §5.12/§6.5, §9.8). Emitted after a
 // successful `settings.update`/`settings.reset`; the self-sufficient payload
 // `{ changes: [{ path, value }] }` carries the applied pairs with **sensitive**
@@ -268,6 +276,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SEARCH_DONE,
     DRAFT_CHANGED,
     MCP_NOTIFICATION,
+    MCP_SERVERS_STATUS_CHANGED,
     SETTINGS_CHANGED,
 ];
 
