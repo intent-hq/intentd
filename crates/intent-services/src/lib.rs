@@ -4352,6 +4352,14 @@ impl Services {
         let ws = self.store.get_workspace(&workspace_id).await.map_err(|_| {
             Error::Internal(format!("Workspace not found: {}", workspace_id.as_str()))
         })?;
+        let extras = AcExtras {
+            trunk: accept_changes::trunk_branch(&ws),
+            up_to_commit_hash: json_opt_str(params.get("upToCommitHash")),
+            merge_strategy: json_opt_str(params.get("mergeStrategy")),
+            rebase_first: json_opt_bool(options, "rebaseFirst"),
+            local_only: json_opt_bool(options, "localOnly"),
+            undo_commits_metadata: parse_undo_metadata(params.get("undoCommitsMetadata")),
+        };
         if ws.is_remote {
             let msg = "remote workspaces are not supported by intentd yet";
             let step = accept_changes::step(action, "Execute", "failed", None, Some(msg));
@@ -4383,6 +4391,7 @@ impl Services {
                     stage_unstaged,
                     push_after,
                     create_pr_after,
+                    extras,
                 )
                 .await
             })
@@ -4407,6 +4416,7 @@ impl Services {
         stage_unstaged: bool,
         push_after: bool,
         create_pr_after: bool,
+        extras: AcExtras,
     ) -> Result<serde_json::Value> {
         let mut steps: Vec<serde_json::Value> = Vec::new();
         let mut result = serde_json::Map::new();
@@ -4519,10 +4529,68 @@ impl Services {
                     }
                 }
             }
+            "undo-commit" => {
+                if let Err(failed) = self
+                    .ac_undo_commit(
+                        workspace_id,
+                        worktree,
+                        extras.up_to_commit_hash.as_deref(),
+                        &extras.undo_commits_metadata,
+                        &mut steps,
+                    )
+                    .await
+                {
+                    return Ok(failed);
+                }
+            }
+            "undo-push" => {
+                if let Err(failed) = self
+                    .ac_undo_push(
+                        worktree,
+                        branch,
+                        extras.up_to_commit_hash.as_deref(),
+                        &mut steps,
+                    )
+                    .await
+                {
+                    return Ok(failed);
+                }
+            }
+            "reset-to-trunk" => {
+                if let Err(failed) = self
+                    .ac_reset_to_trunk(worktree, &extras.trunk, &mut steps, &mut result)
+                    .await
+                {
+                    return Ok(failed);
+                }
+            }
+            "rebase-onto-trunk" => {
+                if let Err(failed) = self
+                    .ac_rebase_onto_trunk(worktree, branch, &extras.trunk, &mut steps, &mut result)
+                    .await
+                {
+                    return Ok(failed);
+                }
+            }
+            "merge" => {
+                if let Err(failed) = self
+                    .ac_merge(
+                        workspace_id,
+                        worktree,
+                        branch,
+                        &extras,
+                        commit_message,
+                        &mut steps,
+                        &mut result,
+                    )
+                    .await
+                {
+                    return Ok(failed);
+                }
+            }
             other => {
-                // The TS local-trunk-merge / export / undo / reset / rebase paths
-                // depend on libgit2 merge/rebase/fetch + remote RPC not yet ported
-                // (the PR-merge step is `accept-changes.mergePR`).
+                // `export` stays deferred: the TS export path copies the changed
+                // files to an arbitrary target folder, which is not yet ported.
                 let msg = format!("the '{other}' action is not supported by intentd yet");
                 steps.push(accept_changes::step(
                     other,
@@ -4776,6 +4844,668 @@ impl Services {
         }
     }
 
+    /// `undo-commit`: soft-reset `HEAD` to `up_to_commit_hash` (keeping the undone
+    /// changes staged) and restore the agent attribution of the undone files.
+    /// On success it appends a completed step (no result payload); the missing-hash
+    /// and reset-failure paths return the parity-exact failure result.
+    async fn ac_undo_commit(
+        &self,
+        workspace_id: &WorkspaceId,
+        worktree: &Path,
+        up_to_commit_hash: Option<&str>,
+        metadata: &[UndoCommitMeta],
+        steps: &mut Vec<serde_json::Value>,
+    ) -> std::result::Result<(), serde_json::Value> {
+        let Some(hash) = up_to_commit_hash.filter(|h| !h.is_empty()) else {
+            // The TS early return pushes no step (empty `steps`).
+            return Err(accept_changes::accept_result(
+                false,
+                steps.clone(),
+                None,
+                Some("Commit hash required for undo-commit".to_string()),
+            ));
+        };
+
+        if let Err(e) = intent_git::reset::reset_soft(worktree, hash) {
+            return Err(ac_step_failure(
+                steps.clone(),
+                "undo-commit",
+                "Undo local commit",
+                Some(&e.to_string()),
+                "Failed to undo commit".to_string(),
+            ));
+        }
+
+        self.ac_restore_undo_attribution(workspace_id, worktree, metadata)
+            .await;
+
+        steps.push(accept_changes::step(
+            "undo-commit",
+            "Undo local commit",
+            "completed",
+            None,
+            None,
+        ));
+        Ok(())
+    }
+
+    /// Restore agent attribution for the files of the undone commits (mirrors the
+    /// TS `recordAgentWrite` loop): after the soft reset each changed path is
+    /// re-attributed to its original agent/task at whichever stage it now sits.
+    /// Best-effort — failures never fail the undo.
+    async fn ac_restore_undo_attribution(
+        &self,
+        workspace_id: &WorkspaceId,
+        worktree: &Path,
+        metadata: &[UndoCommitMeta],
+    ) {
+        if metadata.is_empty() {
+            return;
+        }
+        let status = match intent_git::status::status(worktree) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut by_path: HashMap<String, (bool, &'static str)> = HashMap::new();
+        for f in &status.files {
+            let word = match f.status {
+                intent_core::GitFileStatus::Added | intent_core::GitFileStatus::Untracked => {
+                    "added"
+                }
+                intent_core::GitFileStatus::Deleted => "deleted",
+                _ => "modified",
+            };
+            let key = crate::file_tracking::normalize_path(&f.path);
+            let entry = by_path.entry(key).or_insert((f.staged, word));
+            if f.staged {
+                *entry = (true, word);
+            }
+        }
+        for meta in metadata {
+            let Some(agent_id) = meta.agent_id.clone() else {
+                continue;
+            };
+            for file in &meta.files {
+                let key = crate::file_tracking::normalize_path(file);
+                let Some((staged, word)) = by_path.get(&key) else {
+                    continue;
+                };
+                let change = intent_store::NewTrackedChange {
+                    workspace_id: workspace_id.clone(),
+                    path: key.clone(),
+                    stage: if *staged { "staged" } else { "unstaged" }.to_string(),
+                    status: word.to_string(),
+                    agent_id: Some(agent_id.clone()),
+                    session_id: meta.linked_note_id.clone(),
+                    turn: None,
+                    commit_hash: None,
+                    old_blob_sha: None,
+                    new_blob_sha: None,
+                    additions: 0,
+                    deletions: 0,
+                };
+                let _ = crate::file_tracking::track_change(&self.store, change).await;
+            }
+        }
+    }
+
+    /// `undo-push`: force-push the earlier `up_to_commit_hash` onto the remote
+    /// branch (rewinding the remote), then refresh the local tracking ref. On
+    /// success it appends a completed step (no result payload).
+    async fn ac_undo_push(
+        &self,
+        worktree: &Path,
+        branch: &str,
+        up_to_commit_hash: Option<&str>,
+        steps: &mut Vec<serde_json::Value>,
+    ) -> std::result::Result<(), serde_json::Value> {
+        let Some(hash) = up_to_commit_hash.filter(|h| !h.is_empty()) else {
+            return Err(accept_changes::accept_result(
+                false,
+                steps.clone(),
+                None,
+                Some("Commit hash required for undo-push".to_string()),
+            ));
+        };
+
+        if let Err(e) = intent_git::push::push_refspec(worktree, "origin", hash, branch, true) {
+            return Err(ac_step_failure(
+                steps.clone(),
+                "undo-push",
+                "Undo pushed commits",
+                Some(&e.to_string()),
+                "Failed to undo push".to_string(),
+            ));
+        }
+        // `push_refspec` already advances the local tracking ref; the follow-up
+        // fetch (TS parity) is best-effort and never fails the undo.
+        let _ = intent_git::fetch::fetch(worktree, "origin", branch);
+
+        steps.push(accept_changes::step(
+            "undo-push",
+            "Undo pushed commits",
+            "completed",
+            None,
+            None,
+        ));
+        Ok(())
+    }
+
+    /// `reset-to-trunk`: hard-reset the branch to the trunk tip after verifying the
+    /// worktree is porcelain-clean and the trunk ref name is safe. Fetches
+    /// `origin/<trunk>` first (non-fatal). On success appends a completed step and
+    /// records `{ newHeadSha }`.
+    async fn ac_reset_to_trunk(
+        &self,
+        worktree: &Path,
+        trunk: &str,
+        steps: &mut Vec<serde_json::Value>,
+        result: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> std::result::Result<(), serde_json::Value> {
+        let status = match intent_git::status::status(worktree) {
+            Ok(s) => s,
+            Err(_) => {
+                return Err(ac_step_failure(
+                    steps.clone(),
+                    "reset-to-trunk",
+                    "Reset to trunk",
+                    Some("Failed to verify worktree state"),
+                    "Unable to verify worktree is clean before reset. Please try again."
+                        .to_string(),
+                ));
+            }
+        };
+        if !status.files.is_empty() {
+            return Err(ac_step_failure(
+                steps.clone(),
+                "reset-to-trunk",
+                "Reset to trunk",
+                Some("Cannot reset: uncommitted or staged changes exist"),
+                "Cannot reset while there are uncommitted or staged changes. Please commit or \
+                 discard changes first."
+                    .to_string(),
+            ));
+        }
+        if !accept_changes::is_safe_ref(trunk) {
+            return Err(ac_step_failure(
+                steps.clone(),
+                "reset-to-trunk",
+                "Reset to trunk",
+                Some("Invalid trunk branch name"),
+                format!("Invalid trunk branch name: {trunk}"),
+            ));
+        }
+
+        let has_remote = intent_git::remote::origin_url(worktree)
+            .map(|u| u.is_some())
+            .unwrap_or(false);
+        if has_remote {
+            let _ = intent_git::fetch::fetch(worktree, "origin", trunk);
+        }
+        let reset_target = if has_remote {
+            format!("origin/{trunk}")
+        } else {
+            trunk.to_string()
+        };
+
+        if let Err(e) = intent_git::reset::reset_hard(worktree, &reset_target) {
+            return Err(ac_step_failure(
+                steps.clone(),
+                "reset-to-trunk",
+                "Reset to trunk",
+                Some(&e.to_string()),
+                "Failed to reset to trunk".to_string(),
+            ));
+        }
+        let new_head = match intent_git::refs::rev_parse(worktree, "HEAD") {
+            Ok(h) => h,
+            Err(e) => {
+                return Err(ac_step_failure(
+                    steps.clone(),
+                    "reset-to-trunk",
+                    "Reset to trunk",
+                    Some(&e.to_string()),
+                    "Failed to reset to trunk".to_string(),
+                ));
+            }
+        };
+
+        steps.push(accept_changes::step(
+            "reset-to-trunk",
+            "Reset to trunk",
+            "completed",
+            None,
+            None,
+        ));
+        result.insert("newHeadSha".to_string(), serde_json::json!(new_head));
+        Ok(())
+    }
+
+    /// `rebase-onto-trunk`: validate the ref names, fetch `origin/<trunk>`
+    /// (non-fatal), abort early if merging would conflict, then rebase the branch
+    /// onto the trunk with auto-stash. On success appends a completed step and
+    /// records `{ autoRebased: true, newBaseSha? }`.
+    async fn ac_rebase_onto_trunk(
+        &self,
+        worktree: &Path,
+        branch: &str,
+        trunk: &str,
+        steps: &mut Vec<serde_json::Value>,
+        result: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> std::result::Result<(), serde_json::Value> {
+        if !accept_changes::is_safe_ref(trunk) {
+            return Err(ac_step_failure(
+                steps.clone(),
+                "rebase-onto-trunk",
+                "Rebase onto trunk",
+                Some("Invalid trunk branch name"),
+                format!("Invalid trunk branch name: {trunk}"),
+            ));
+        }
+        if !accept_changes::is_safe_ref(branch) {
+            return Err(ac_step_failure(
+                steps.clone(),
+                "rebase-onto-trunk",
+                "Rebase onto trunk",
+                Some("Invalid branch name"),
+                format!("Invalid branch name: {branch}"),
+            ));
+        }
+
+        let has_remote = intent_git::remote::origin_url(worktree)
+            .map(|u| u.is_some())
+            .unwrap_or(false);
+        let trunk_ref = if has_remote {
+            format!("origin/{trunk}")
+        } else {
+            trunk.to_string()
+        };
+        if has_remote {
+            let _ = intent_git::fetch::fetch(worktree, "origin", trunk);
+        }
+
+        let has_conflicts =
+            intent_git::conflicts::detect_merge_conflicts(worktree, branch, &trunk_ref)
+                .map(|m| m.has_conflicts)
+                .unwrap_or(false);
+        if has_conflicts {
+            return Err(ac_step_failure(
+                steps.clone(),
+                "rebase-onto-trunk",
+                "Rebase onto trunk",
+                Some("Conflicts detected. Please rebase manually."),
+                "Conflicts detected. Please rebase manually.".to_string(),
+            ));
+        }
+
+        let captured = intent_git::refs::rev_parse(worktree, &trunk_ref).ok();
+        let outcome = match intent_git::rebase::rebase_with_autostash(worktree, &trunk_ref) {
+            Ok(o) => o,
+            Err(e) => {
+                return Err(ac_step_failure(
+                    steps.clone(),
+                    "rebase-onto-trunk",
+                    "Rebase onto trunk",
+                    Some(&e.to_string()),
+                    e.to_string(),
+                ));
+            }
+        };
+        if !outcome.success {
+            let msg = outcome.error.clone().unwrap_or_else(|| {
+                "Rebase onto trunk failed. Please try rebasing manually.".to_string()
+            });
+            return Err(ac_step_failure(
+                steps.clone(),
+                "rebase-onto-trunk",
+                "Rebase onto trunk",
+                Some(&msg),
+                msg.clone(),
+            ));
+        }
+
+        steps.push(accept_changes::step(
+            "rebase-onto-trunk",
+            "Rebase onto trunk",
+            "completed",
+            None,
+            None,
+        ));
+        result.insert("autoRebased".to_string(), serde_json::json!(true));
+        if let Some(sha) = captured {
+            result.insert("newBaseSha".to_string(), serde_json::json!(sha));
+        }
+        Ok(())
+    }
+
+    /// `merge`: commit any staged changes, then advance the trunk to the branch
+    /// (locally via `update-ref`, or on the remote via a refspec push), rebasing
+    /// onto trunk first when the branch is behind. Mirrors the TS local-trunk /
+    /// remote-trunk merge flow incl. the squash strategy and auto-rebase.
+    #[allow(clippy::too_many_arguments)]
+    async fn ac_merge(
+        &self,
+        workspace_id: &WorkspaceId,
+        worktree: &Path,
+        branch: &str,
+        extras: &AcExtras,
+        commit_message: Option<String>,
+        steps: &mut Vec<serde_json::Value>,
+        result: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> std::result::Result<(), serde_json::Value> {
+        let trunk = extras.trunk.as_str();
+
+        // Commit any staged changes first (separate `commit` step, like the TS).
+        let status = match intent_git::status::status(worktree) {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(ac_step_failure(
+                    steps.clone(),
+                    "merge",
+                    "Merge to trunk",
+                    Some(&e.to_string()),
+                    e.to_string(),
+                ));
+            }
+        };
+        if status.files.iter().any(|f| f.staged) {
+            let message = commit_message
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| format!("Changes for merge to {trunk}"));
+            match self
+                .ac_commit(workspace_id, worktree, Some(message), None, false)
+                .await
+            {
+                Ok(_) => steps.push(accept_changes::step(
+                    "commit",
+                    "Commit staged changes",
+                    "completed",
+                    None,
+                    None,
+                )),
+                Err(e) => {
+                    return Err(ac_step_failure(
+                        steps.clone(),
+                        "commit",
+                        "Commit staged changes",
+                        Some(&e.to_string()),
+                        "Failed to commit staged changes".to_string(),
+                    ));
+                }
+            }
+        }
+
+        let has_remote = intent_git::remote::origin_url(worktree)
+            .map(|u| u.is_some())
+            .unwrap_or(false);
+        let is_pushed = has_remote
+            && intent_git::remote::remote_tracking_exists(worktree, "origin", branch)
+                .unwrap_or(false);
+        let has_diverged = is_pushed
+            && !intent_git::refs::is_ancestor(worktree, &format!("origin/{branch}"), branch)
+                .unwrap_or(false);
+
+        // Decide whether the remote carries the trunk branch.
+        let has_remote_trunk = if extras.local_only || !has_remote {
+            false
+        } else {
+            match intent_git::remote::ls_remote_has_branch(worktree, "origin", trunk) {
+                Ok(intent_git::remote::RemoteBranch::Present) => true,
+                Ok(intent_git::remote::RemoteBranch::Missing) => false,
+                Err(_) => {
+                    return Err(ac_step_failure(
+                        steps.clone(),
+                        "merge",
+                        "Merge to trunk",
+                        None,
+                        "Unable to reach remote 'origin'. Check your network connection and \
+                         authentication."
+                            .to_string(),
+                    ));
+                }
+            }
+        };
+
+        if has_remote_trunk {
+            if let Err(e) = intent_git::fetch::fetch(worktree, "origin", trunk) {
+                return Err(ac_step_failure(
+                    steps.clone(),
+                    "merge",
+                    "Merge to trunk",
+                    Some(&e.to_string()),
+                    e.to_string(),
+                ));
+            }
+        }
+
+        let trunk_ref = if has_remote_trunk {
+            format!("origin/{trunk}")
+        } else {
+            trunk.to_string()
+        };
+
+        if extras.rebase_first {
+            let outcome = match intent_git::rebase::rebase_with_autostash(worktree, &trunk_ref) {
+                Ok(o) => o,
+                Err(e) => {
+                    return Err(ac_step_failure(
+                        steps.clone(),
+                        "merge",
+                        "Merge to trunk",
+                        Some(&e.to_string()),
+                        e.to_string(),
+                    ));
+                }
+            };
+            if !outcome.success {
+                let step_err = outcome
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Failed to rebase".to_string());
+                let top_err = outcome
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Failed to rebase. Resolve conflicts manually.".to_string());
+                return Err(ac_step_failure(
+                    steps.clone(),
+                    "merge",
+                    "Merge to trunk",
+                    Some(&step_err),
+                    top_err,
+                ));
+            }
+        }
+
+        // Push the branch (force when we just rebased a pushed branch or it has
+        // diverged) so the remote feature ref matches local before the trunk move.
+        if has_remote_trunk {
+            let needs_force = (extras.rebase_first && is_pushed) || has_diverged;
+            if let Err(e) =
+                intent_git::push::push_refspec(worktree, "origin", "HEAD", branch, needs_force)
+            {
+                return Err(ac_step_failure(
+                    steps.clone(),
+                    "merge",
+                    "Merge to trunk",
+                    Some(&e.to_string()),
+                    e.to_string(),
+                ));
+            }
+        }
+
+        let can_fast_forward =
+            intent_git::refs::is_ancestor(worktree, &trunk_ref, "HEAD").unwrap_or(false);
+
+        let mut auto_rebased = false;
+        let mut rebase_base_sha: Option<String> = None;
+
+        if !can_fast_forward {
+            let fresh_conflicts =
+                intent_git::conflicts::detect_merge_conflicts(worktree, branch, &trunk_ref)
+                    .map(|m| m.has_conflicts)
+                    .unwrap_or(false);
+            if fresh_conflicts {
+                return Err(ac_step_failure(
+                    steps.clone(),
+                    "merge",
+                    "Merge to trunk",
+                    Some("Conflicts detected. Please rebase manually."),
+                    "Conflicts detected. Please rebase manually.".to_string(),
+                ));
+            }
+
+            let captured = intent_git::refs::rev_parse(worktree, &trunk_ref).ok();
+            let outcome = match intent_git::rebase::rebase_with_autostash(worktree, &trunk_ref) {
+                Ok(o) => o,
+                Err(e) => {
+                    return Err(ac_step_failure(
+                        steps.clone(),
+                        "merge",
+                        "Merge to trunk",
+                        Some(&e.to_string()),
+                        e.to_string(),
+                    ));
+                }
+            };
+            if !outcome.success {
+                let msg = outcome.error.clone().unwrap_or_else(|| {
+                    "Auto-rebase failed. Please try rebasing manually.".to_string()
+                });
+                return Err(ac_step_failure(
+                    steps.clone(),
+                    "merge",
+                    "Merge to trunk",
+                    Some(&msg),
+                    msg.clone(),
+                ));
+            }
+            auto_rebased = true;
+            rebase_base_sha = captured;
+
+            if has_remote_trunk
+                && intent_git::push::push_refspec(worktree, "origin", "HEAD", branch, true).is_err()
+            {
+                return Err(ac_step_failure(
+                    steps.clone(),
+                    "merge",
+                    "Merge to trunk",
+                    Some("Failed to push after rebase."),
+                    "Failed to push after rebase.".to_string(),
+                ));
+            }
+        }
+
+        // Advance the trunk to our work: a squash commit, or a fast-forward of the
+        // current HEAD. The parent/merge-base is the trunk tip (an ancestor of HEAD
+        // in every reachable path here, post fast-forward-check or rebase).
+        let merge_commit_hash = if extras.merge_strategy.as_deref() == Some("squash") {
+            let parent = match intent_git::refs::rev_parse(worktree, &trunk_ref) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err(ac_step_failure(
+                        steps.clone(),
+                        "merge",
+                        "Merge to trunk",
+                        Some(&e.to_string()),
+                        e.to_string(),
+                    ));
+                }
+            };
+            let message = commit_message
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| format!("Squashed commit from {branch}"));
+            let commit_hash = match intent_git::squash::commit_tree(worktree, &parent, &message) {
+                Ok(h) => h,
+                Err(e) => {
+                    return Err(ac_step_failure(
+                        steps.clone(),
+                        "merge",
+                        "Merge to trunk",
+                        Some(&e.to_string()),
+                        e.to_string(),
+                    ));
+                }
+            };
+            if let Err(e) = self
+                .ac_advance_trunk(worktree, trunk, &commit_hash, has_remote_trunk)
+                .await
+            {
+                return Err(ac_step_failure(
+                    steps.clone(),
+                    "merge",
+                    "Merge to trunk",
+                    Some(&e.to_string()),
+                    e.to_string(),
+                ));
+            }
+            commit_hash
+        } else {
+            let current = match intent_git::refs::rev_parse(worktree, "HEAD") {
+                Ok(h) => h,
+                Err(e) => {
+                    return Err(ac_step_failure(
+                        steps.clone(),
+                        "merge",
+                        "Merge to trunk",
+                        Some(&e.to_string()),
+                        e.to_string(),
+                    ));
+                }
+            };
+            if let Err(e) = self
+                .ac_advance_trunk(worktree, trunk, &current, has_remote_trunk)
+                .await
+            {
+                return Err(ac_step_failure(
+                    steps.clone(),
+                    "merge",
+                    "Merge to trunk",
+                    Some(&e.to_string()),
+                    e.to_string(),
+                ));
+            }
+            current
+        };
+
+        steps.push(accept_changes::step(
+            "merge",
+            "Merge to trunk",
+            "completed",
+            None,
+            None,
+        ));
+        result.insert(
+            "mergeCommitHash".to_string(),
+            serde_json::json!(merge_commit_hash),
+        );
+        if auto_rebased {
+            result.insert("autoRebased".to_string(), serde_json::json!(true));
+        }
+        if let Some(sha) = rebase_base_sha {
+            result.insert("newBaseSha".to_string(), serde_json::json!(sha));
+        }
+        Ok(())
+    }
+
+    /// Advance the trunk branch to `sha`: a fast-forward refspec push to the remote
+    /// trunk when it exists, else a local `update-ref` of `refs/heads/<trunk>`.
+    async fn ac_advance_trunk(
+        &self,
+        worktree: &Path,
+        trunk: &str,
+        sha: &str,
+        has_remote_trunk: bool,
+    ) -> Result<()> {
+        if has_remote_trunk {
+            intent_git::push::push_refspec(worktree, "origin", sha, trunk, false)?;
+        } else {
+            intent_git::squash::update_ref(worktree, &format!("refs/heads/{trunk}"), sha)?;
+        }
+        Ok(())
+    }
+
     /// Recompute the workspace metrics and broadcast `changes:metrics-changed` +
     /// `changes:git-status` after a mutating accept-changes step.
     async fn ac_emit_after_mutation(&self, workspace_id: &WorkspaceId, worktree: &Path) {
@@ -4830,6 +5560,22 @@ fn fail_step(
     accept_changes::accept_result(false, steps, result, Some(msg))
 }
 
+/// Build a failed `AcceptChangesResult` for a deferred accept-changes handler:
+/// append a failed step (`step_error` may differ from, or be absent for, the
+/// top-level `top_error`) and return `success:false` with no `result`. Mirrors
+/// the TS handlers, which set a generic top-level error while the step carries
+/// the specific cause (and a couple of paths set no step error at all).
+fn ac_step_failure(
+    mut steps: Vec<serde_json::Value>,
+    id: &str,
+    name: &str,
+    step_error: Option<&str>,
+    top_error: String,
+) -> serde_json::Value {
+    steps.push(accept_changes::step(id, name, "failed", None, step_error));
+    accept_changes::accept_result(false, steps, None, Some(top_error))
+}
+
 /// Parse an optional JSON string-array param into `Vec<String>` (non-strings
 /// skipped); absent/null/non-array → `None`.
 fn json_str_array(value: Option<&serde_json::Value>) -> Option<Vec<String>> {
@@ -4853,6 +5599,67 @@ fn json_opt_bool(options: Option<&serde_json::Value>, key: &str) -> bool {
         .and_then(|o| o.get(key))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+/// One entry of the `undo-commit` `undoCommitsMetadata` list: the agent/task that
+/// authored a now-undone commit and the files it touched, used to restore file
+/// attribution after the soft reset (mirrors the TS `recordAgentWrite` loop).
+struct UndoCommitMeta {
+    agent_id: Option<String>,
+    linked_note_id: Option<String>,
+    files: Vec<String>,
+}
+
+/// Parse the `undoCommitsMetadata` param into [`UndoCommitMeta`] entries
+/// (absent/non-array → empty); non-object entries are skipped.
+fn parse_undo_metadata(value: Option<&serde_json::Value>) -> Vec<UndoCommitMeta> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_object())
+                .map(|obj| UndoCommitMeta {
+                    agent_id: obj
+                        .get("agentId")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    linked_note_id: obj
+                        .get("linkedNoteId")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    files: obj
+                        .get("files")
+                        .and_then(|v| v.as_array())
+                        .map(|fs| {
+                            fs.iter()
+                                .filter_map(|f| f.as_str())
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The execute-action inputs specific to the deferred mutating handlers
+/// (`undo-commit` / `undo-push` / `reset-to-trunk` / `rebase-onto-trunk` /
+/// `merge`), bundled so [`Services::ac_run_pipeline`] keeps a manageable arity.
+struct AcExtras {
+    /// Trunk branch name (`baseRef` minus `origin/`, else `main`).
+    trunk: String,
+    /// `upToCommitHash` for the undo handlers (the reset/rewind target).
+    up_to_commit_hash: Option<String>,
+    /// `mergeStrategy` (`"squash"` selects the squash-commit path).
+    merge_strategy: Option<String>,
+    /// `options.rebaseFirst` — rebase onto trunk before merging.
+    rebase_first: bool,
+    /// `options.localOnly` — skip all remote operations during merge.
+    local_only: bool,
+    /// `undoCommitsMetadata` — attribution restore inputs for `undo-commit`.
+    undo_commits_metadata: Vec<UndoCommitMeta>,
 }
 
 /// Per-path attribution `(agent_id, session_id, turn)` carried across a

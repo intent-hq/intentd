@@ -36,6 +36,22 @@ pub(crate) fn validate_action(action: &str) -> Result<&'static str> {
         .ok_or_else(|| Error::InvalidParams(format!("invalid action: {action}")))
 }
 
+/// Branch-name guard mirroring the TS `SAFE_REF_PATTERN`
+/// (`/^[a-zA-Z0-9._\/][a-zA-Z0-9._\-\/]*$/`): a non-empty ref whose first
+/// character is alphanumeric or one of `._/`, with the remaining characters also
+/// allowing `-`. Used to reject unsafe branch names before the
+/// reset-to-trunk / rebase-onto-trunk / merge handlers act on them.
+pub(crate) fn is_safe_ref(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric() || matches!(first, '.' | '_' | '/')) {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
 /// Characters that are dangerous in shell contexts — any remote URL containing
 /// one is rejected (defense-in-depth; ports the TS `SHELL_UNSAFE_CHARS`).
 fn has_shell_unsafe_char(url: &str) -> bool {
@@ -452,6 +468,20 @@ mod tests {
         assert_eq!(validate_action("commit").unwrap(), "commit");
         assert_eq!(validate_action("create-pr").unwrap(), "create-pr");
         assert!(validate_action("nope").is_err());
+    }
+
+    #[test]
+    fn safe_ref_matches_ts_pattern() {
+        assert!(is_safe_ref("main"));
+        assert!(is_safe_ref("feature/foo-bar.baz_1"));
+        assert!(is_safe_ref("origin/main"));
+        assert!(is_safe_ref(".hidden"));
+        // First char cannot be '-'; shell-unsafe chars are rejected.
+        assert!(!is_safe_ref("-rf"));
+        assert!(!is_safe_ref(""));
+        assert!(!is_safe_ref("a b"));
+        assert!(!is_safe_ref("a;rm -rf"));
+        assert!(!is_safe_ref("$(whoami)"));
     }
 
     #[test]

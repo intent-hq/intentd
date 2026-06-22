@@ -14,9 +14,10 @@
 
 use std::path::Path;
 
-use git2::{Cred, PushOptions, RemoteCallbacks, Repository};
+use git2::{PushOptions, Repository};
 use intent_core::{Error, Result};
 
+use crate::auth::remote_callbacks;
 use crate::map_git_err;
 
 /// The outcome of a push: the branch and the commit SHA now on the remote.
@@ -48,10 +49,8 @@ pub fn push(worktree_path: &Path, remote: &str, branch: &str, force: bool) -> Re
 
     let mut remote_handle = repo.find_remote(remote).map_err(map_git_err)?;
 
-    let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(credentials_cb);
     let mut opts = PushOptions::new();
-    opts.remote_callbacks(callbacks);
+    opts.remote_callbacks(remote_callbacks());
 
     let prefix = if force { "+" } else { "" };
     let refspec = format!("{prefix}{local_ref}:{local_ref}");
@@ -77,27 +76,71 @@ pub fn push(worktree_path: &Path, remote: &str, branch: &str, force: bool) -> Re
     })
 }
 
-/// Best-effort credential resolution for non-local remotes: SSH agent for SSH
-/// remotes, then the configured credential helper, then default. Local/`file://`
-/// remotes never invoke this callback.
-fn credentials_cb(
-    url: &str,
-    username: Option<&str>,
-    allowed: git2::CredentialType,
-) -> std::result::Result<Cred, git2::Error> {
-    if allowed.contains(git2::CredentialType::SSH_KEY) {
-        if let Ok(cred) = Cred::ssh_key_from_agent(username.unwrap_or("git")) {
-            return Ok(cred);
-        }
+/// Push an arbitrary `src` revision (a SHA, `HEAD`, or branch name) to `remote`'s
+/// `refs/heads/<dst_branch>`, returning the pushed commit SHA. When `force` is set
+/// a non-fast-forward update is allowed (the `+` refspec prefix). Backs the
+/// accept-changes paths that push a commit other than the local branch tip: the
+/// `undo-push` rewind (`<sha>:refs/heads/<branch>`) and the remote `merge` trunk
+/// advance (`HEAD`/`<sha>:refs/heads/<trunk>`).
+///
+/// libgit2 resolves the local side of a push refspec as a reference (there is no
+/// `git push <sha>:<dst>` shortcut, nor `--force-with-lease`), so `src` is first
+/// resolved to its commit OID, written to a short-lived temporary ref that is
+/// deleted once the push returns, and pushed with a plain force when requested.
+pub fn push_refspec(
+    worktree_path: &Path,
+    remote: &str,
+    src: &str,
+    dst_branch: &str,
+    force: bool,
+) -> Result<String> {
+    if dst_branch.is_empty() {
+        return Err(Error::Internal(
+            "cannot push: empty destination branch".to_string(),
+        ));
     }
-    if allowed.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
-        if let Ok(config) = git2::Config::open_default() {
-            if let Ok(cred) = Cred::credential_helper(&config, url, username) {
-                return Ok(cred);
-            }
-        }
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    let oid = repo
+        .revparse_single(src)
+        .map_err(map_git_err)?
+        .peel_to_commit()
+        .map_err(map_git_err)?
+        .id();
+
+    let tmp_ref = format!(
+        "refs/intent/tmp-push-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    repo.reference(&tmp_ref, oid, true, "intent push-refspec temp")
+        .map_err(map_git_err)?;
+
+    let mut remote_handle = repo.find_remote(remote).map_err(map_git_err)?;
+    let mut opts = PushOptions::new();
+    opts.remote_callbacks(remote_callbacks());
+    let prefix = if force { "+" } else { "" };
+    let refspec = format!("{prefix}{tmp_ref}:refs/heads/{dst_branch}");
+    let push_result = remote_handle.push(&[refspec.as_str()], Some(&mut opts));
+
+    // Always remove the temporary ref, regardless of the push outcome.
+    if let Ok(mut r) = repo.find_reference(&tmp_ref) {
+        let _ = r.delete();
     }
-    Cred::default()
+    push_result.map_err(map_git_err)?;
+
+    // Advance the local remote-tracking ref so ahead/behind + isPushed reads see
+    // the new remote position without a follow-up fetch.
+    let tracking_ref = format!("refs/remotes/{remote}/{dst_branch}");
+    let _ = repo.reference(
+        &tracking_ref,
+        oid,
+        true,
+        &format!("update {tracking_ref} after push"),
+    );
+
+    Ok(oid.to_string())
 }
 
 #[cfg(test)]
@@ -155,5 +198,57 @@ mod tests {
         let dir = init_repo("push-empty-branch");
         commit_file(dir.path(), "a.txt", "x\n");
         assert!(push(dir.path(), "origin", "", false).is_err());
+    }
+
+    /// Force-push an earlier commit SHA onto a branch (the `undo-push` shape):
+    /// the bare remote rewinds to the older commit even though it is not the
+    /// local branch tip.
+    #[test]
+    fn push_refspec_force_rewinds_remote_branch() {
+        let dir = init_repo("push-refspec-src");
+        commit_file(dir.path(), "a.txt", "one\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let branch = crate::status::current_branch(&repo);
+        let first = repo.head().unwrap().target().unwrap().to_string();
+        commit_file(dir.path(), "b.txt", "two\n");
+
+        let bare_dir = std::env::temp_dir().join(format!(
+            "intent-git-refspec-bare-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        Repository::init_bare(&bare_dir).unwrap();
+        repo.remote("origin", bare_dir.to_str().unwrap()).unwrap();
+        // The remote starts at the latest commit.
+        let latest = push(dir.path(), "origin", &branch, false)
+            .unwrap()
+            .pushed_sha;
+
+        // Rewind the remote branch back to the first commit (force).
+        let pushed = push_refspec(dir.path(), "origin", &first, &branch, true).unwrap();
+        assert_eq!(pushed, first);
+        assert_ne!(pushed, latest);
+
+        let bare = Repository::open_bare(&bare_dir).unwrap();
+        let remote_oid = bare
+            .find_reference(&format!("refs/heads/{branch}"))
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        assert_eq!(remote_oid, first);
+
+        // The local tracking ref reflects the rewound remote position.
+        let tracking = repo
+            .find_reference(&format!("refs/remotes/origin/{branch}"))
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        assert_eq!(tracking, first);
+
+        let _ = std::fs::remove_dir_all(&bare_dir);
     }
 }
