@@ -1,0 +1,319 @@
+//! Over-the-wire `settings.*` slice (PROTOCOL §5.12, §9.8): drive
+//! `settings.list/get/update/reset` against the daemon over a temp UDS,
+//! proving camelCase shapes, sensitive-value **redaction** (no plaintext ever
+//! crosses the wire), atomic-batch validation (`-32602`), and the
+//! `settings:changed` event. Uses an in-memory secret store so the test never
+//! touches the real OS keychain.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use intent_core::WorkspaceApi;
+use intent_services::{EventBus, InMemorySecretStore, Services};
+use intent_store::Store;
+use intent_transport::serve_uds;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedReadHalf;
+use tokio::net::UnixStream;
+use tokio::sync::oneshot;
+use tokio::time::timeout;
+use uuid::Uuid;
+
+struct TempDb {
+    path: PathBuf,
+}
+impl TempDb {
+    fn new() -> Self {
+        Self {
+            path: std::env::temp_dir().join(format!("intentd-set-{}.db", Uuid::new_v4())),
+        }
+    }
+}
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
+        }
+    }
+}
+
+async fn connect_retry(socket: &PathBuf) -> UnixStream {
+    for _ in 0..100 {
+        if let Ok(s) = UnixStream::connect(socket).await {
+            return s;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("could not connect to {}", socket.display());
+}
+
+async fn send(write_half: &mut (impl AsyncWriteExt + Unpin), frame: &str) {
+    write_half.write_all(frame.as_bytes()).await.unwrap();
+    write_half.write_all(b"\n").await.unwrap();
+    write_half.flush().await.unwrap();
+}
+
+async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
+    let mut line = String::new();
+    let n = timeout(Duration::from_secs(2), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for a frame")
+        .expect("read failed");
+    assert!(n > 0, "connection closed unexpectedly");
+    serde_json::from_str(line.trim_end()).expect("invalid JSON frame")
+}
+
+/// Issue one JSON-RPC request and return the FULL response (incl. any `error`).
+async fn call(
+    write_half: &mut (impl AsyncWriteExt + Unpin),
+    reader: &mut BufReader<OwnedReadHalf>,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> Value {
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    send(write_half, &serde_json::to_string(&frame).unwrap()).await;
+    let resp = read_json(reader).await;
+    assert_eq!(resp["id"], id, "response id mismatch for {method}");
+    resp
+}
+
+/// Issue one request expecting success; returns `result` and asserts no error.
+async fn rpc(
+    write_half: &mut (impl AsyncWriteExt + Unpin),
+    reader: &mut BufReader<OwnedReadHalf>,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> Value {
+    let resp = call(write_half, reader, id, method, params).await;
+    assert!(resp.get("error").is_none(), "rpc {method} errored: {resp}");
+    resp["result"].clone()
+}
+
+async fn wait_for_subscriber_count(bus: &EventBus, target: usize) {
+    for _ in 0..100 {
+        if bus.subscriber_count() == target {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("subscriber_count never reached {target}");
+}
+
+/// Pull the `settings.list` entry for `path`.
+fn entry<'a>(list: &'a Value, path: &str) -> &'a Value {
+    list["settings"]
+        .as_array()
+        .expect("settings array")
+        .iter()
+        .find(|e| e["path"] == path)
+        .unwrap_or_else(|| panic!("missing setting {path}"))
+}
+
+const SECRET: &str = "ghp_super_secret_token_value_0123456789";
+
+#[tokio::test]
+async fn settings_round_trip_redaction_validation_and_event() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    // Publish onto the SAME bus the transport reads; inject an in-memory secret
+    // store so sensitive settings never touch the real keychain.
+    let services: Arc<dyn WorkspaceApi> = Arc::new(
+        Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_secret_store(Arc::new(InMemorySecretStore::default())),
+    );
+    let socket = std::env::temp_dir().join(format!("intentd-set-{}.sock", Uuid::new_v4()));
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let bus = bus.clone();
+        let socket = socket.clone();
+        async move {
+            let _ = serve_uds(services, bus, &socket, None, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        }
+    });
+
+    let (rpc_read, mut w) = connect_retry(&socket).await.into_split();
+    let mut r = BufReader::new(rpc_read);
+
+    // settings.list — defaults + a redacted sensitive value (unset → null).
+    let list = rpc(&mut w, &mut r, 1, "settings.list", json!({})).await;
+    assert_eq!(entry(&list, "git.autoCommit")["value"], json!(true));
+    assert_eq!(entry(&list, "git.autoCommit")["type"], "boolean");
+    let token = entry(&list, "sourceControl.github.token");
+    assert_eq!(token["value"], Value::Null, "unset secret reads as null");
+    assert_eq!(token["sensitive"], json!(true));
+    assert_eq!(entry(&list, "server.auth.token")["sensitive"], json!(true));
+
+    // settings.get — one definition with its (default) value.
+    let got = rpc(
+        &mut w,
+        &mut r,
+        2,
+        "settings.get",
+        json!({ "path": "git.autoCommit" }),
+    )
+    .await;
+    assert_eq!(got["value"], json!(true));
+    assert_eq!(got["definition"]["type"], "boolean");
+
+    // Validation → -32602, nothing applied (atomic batch).
+    for bad in [
+        json!([{ "path": "does.not.exist", "value": 1 }]),
+        json!([{ "path": "server.port", "value": 99 }]),
+        json!([{ "path": "logging.level", "value": "bogus" }]),
+        json!([{ "path": "server.auth.token", "value": "x" }]),
+    ] {
+        let resp = call(
+            &mut w,
+            &mut r,
+            3,
+            "settings.update",
+            json!({ "changes": bad }),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], -32602, "expected -32602 for {resp}");
+    }
+    // Atomic: a valid+invalid batch applies nothing.
+    let resp = call(
+        &mut w,
+        &mut r,
+        4,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "git.autoCommit", "value": false },
+            { "path": "server.port", "value": 70000 },
+        ] }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    let got = rpc(
+        &mut w,
+        &mut r,
+        5,
+        "settings.get",
+        json!({ "path": "git.autoCommit" }),
+    )
+    .await;
+    assert_eq!(
+        got["value"],
+        json!(true),
+        "nothing applied on a failed batch"
+    );
+
+    // Subscribe (no workspace scope → matches the global settings event).
+    let (sub_read, mut sw) = connect_retry(&socket).await.into_split();
+    let mut sr = BufReader::new(sub_read);
+    send(
+        &mut sw,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "events.subscribe",
+            "params": { "eventTypes": ["settings:changed"] },
+        }))
+        .unwrap(),
+    )
+    .await;
+    let _ = read_json(&mut sr).await;
+    wait_for_subscriber_count(&bus, 1).await;
+
+    // settings.update (non-secret) → applied + settings:changed (redacted).
+    let applied = rpc(
+        &mut w,
+        &mut r,
+        6,
+        "settings.update",
+        json!({ "changes": [{ "path": "git.autoCommit", "value": false }] }),
+    )
+    .await;
+    assert_eq!(applied["applied"][0]["path"], "git.autoCommit");
+    assert_eq!(applied["applied"][0]["value"], json!(false));
+    let ev = read_json(&mut sr).await;
+    assert_eq!(ev["method"], "events.event");
+    assert_eq!(ev["params"]["event"]["type"], "settings:changed");
+    assert_eq!(
+        ev["params"]["event"]["data"]["changes"][0],
+        json!({ "path": "git.autoCommit", "value": false })
+    );
+    let got = rpc(
+        &mut w,
+        &mut r,
+        7,
+        "settings.get",
+        json!({ "path": "git.autoCommit" }),
+    )
+    .await;
+    assert_eq!(got["value"], json!(false));
+
+    // settings.update (sensitive) → the secret is persisted to the keychain but
+    // NEVER echoed: applied value + event are redacted, get/list stay redacted.
+    let applied = rpc(
+        &mut w,
+        &mut r,
+        8,
+        "settings.update",
+        json!({ "changes": [{ "path": "sourceControl.github.token", "value": SECRET }] }),
+    )
+    .await;
+    let applied_text = serde_json::to_string(&applied).unwrap();
+    assert!(
+        !applied_text.contains(SECRET),
+        "secret leaked in update result"
+    );
+    assert_ne!(applied["applied"][0]["value"], json!(SECRET));
+    assert!(applied["applied"][0]["value"].is_string());
+    let ev = read_json(&mut sr).await;
+    let ev_text = serde_json::to_string(&ev).unwrap();
+    assert!(
+        !ev_text.contains(SECRET),
+        "secret leaked in settings:changed"
+    );
+
+    let got = rpc(
+        &mut w,
+        &mut r,
+        9,
+        "settings.get",
+        json!({ "path": "sourceControl.github.token" }),
+    )
+    .await;
+    assert!(!serde_json::to_string(&got).unwrap().contains(SECRET));
+    assert!(
+        got["value"].is_string(),
+        "set secret reads as a placeholder"
+    );
+    assert_ne!(got["value"], json!(SECRET));
+
+    let list = rpc(&mut w, &mut r, 10, "settings.list", json!({})).await;
+    assert!(
+        !serde_json::to_string(&list).unwrap().contains(SECRET),
+        "secret leaked in settings.list"
+    );
+
+    // settings.reset → restores the default + emits settings:changed.
+    let reset = rpc(
+        &mut w,
+        &mut r,
+        11,
+        "settings.reset",
+        json!({ "path": "git.autoCommit" }),
+    )
+    .await;
+    assert_eq!(reset, json!({ "path": "git.autoCommit", "value": true }));
+    let ev = read_json(&mut sr).await;
+    assert_eq!(ev["params"]["event"]["type"], "settings:changed");
+    assert_eq!(
+        ev["params"]["event"]["data"]["changes"][0],
+        json!({ "path": "git.autoCommit", "value": true })
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}

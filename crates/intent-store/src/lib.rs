@@ -20,6 +20,7 @@ mod draft_repo;
 mod event_repo;
 mod metrics_repo;
 mod note_repo;
+mod settings_repo;
 mod tracked_changes_repo;
 mod workspace_repo;
 

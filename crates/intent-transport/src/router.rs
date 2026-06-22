@@ -1068,6 +1068,38 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "settings.list" => {
+            // Global namespace (no workspaceId); sensitive values are redacted.
+            let r = api.settings_list().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "settings.get" => {
+            let path = require_str_param(params, "path")?;
+            match api.settings_get(path).await {
+                Ok(v) => Ok(v),
+                // Unknown path → -32602 with the raw message (no prefix).
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "settings.update" => {
+            require_present(params, "changes")?;
+            let changes = params.get("changes").cloned().unwrap_or(Value::Null);
+            match api.settings_update(changes).await {
+                Ok(v) => Ok(v),
+                // Unknown path / read-only / failed validation → -32602.
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "settings.reset" => {
+            let path = require_str_param(params, "path")?;
+            match api.settings_reset(path).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "accept-changes.getStatus" => {
             let ws = require_ws_note(params)?;
             let r = api

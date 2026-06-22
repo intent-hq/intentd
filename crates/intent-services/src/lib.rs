@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use base64::Engine as _;
 use intent_core::events::{
     CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED,
-    NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT,
+    NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED,
     TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
 };
 use intent_core::{
@@ -46,11 +46,13 @@ mod note_ops;
 mod pr_ops;
 mod script_ops;
 mod search_ops;
+mod settings;
 mod terminal_ops;
 
 #[cfg(test)]
 mod tests;
 
+pub use settings::{InMemorySecretStore, KeyringSecretStore, SecretStore};
 pub use terminal_ops::PtyTerminalHost;
 
 pub use agent_manager::{
@@ -117,6 +119,10 @@ pub struct Services {
     /// keyed by script id. Scripts run on the same [`pty`](Self::pty) host as
     /// `terminal.*`, so a terminal can attach to a running script (§12.2).
     scripts: script_ops::ScriptRegistry,
+    /// Secret persistence for **sensitive** settings (§9.8) — the keychain seam
+    /// behind `settings.*`. Defaults to the OS keychain ([`KeyringSecretStore`]);
+    /// tests inject an in-memory store so they never touch the real keychain.
+    secrets: Arc<dyn settings::SecretStore>,
 }
 
 impl Services {
@@ -135,7 +141,22 @@ impl Services {
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
             pty: Arc::new(intent_pty::PtyHost::new()),
             scripts: Arc::new(Mutex::new(HashMap::new())),
+            secrets: Arc::new(settings::KeyringSecretStore),
         }
+    }
+
+    /// Override the [`SecretStore`] backing sensitive settings (§9.8). The
+    /// composition root keeps the OS-keychain default; tests inject an in-memory
+    /// store so they never read/write the real user keychain.
+    pub fn with_secret_store(mut self, secrets: Arc<dyn settings::SecretStore>) -> Self {
+        self.secrets = secrets;
+        self
+    }
+
+    /// Build a [`SettingsService`](settings::SettingsService) view over the store
+    /// and secret store for one `settings.*` call.
+    fn settings_service(&self) -> settings::SettingsService<'_> {
+        settings::SettingsService::new(&self.store, self.secrets.as_ref())
     }
 
     /// Borrow the shared PTY host (composition root / ACP terminal-adapter use).
@@ -638,6 +659,23 @@ fn attention_changed_event(workspace_id: &WorkspaceId, attention: WorkspaceAtten
     }
 }
 
+/// Build a `settings:changed` event with the self-sufficient payload
+/// `{ changes: [{ path, value }] }` carrying the **redacted** applied pairs
+/// (PROTOCOL §6.5 / §9.8). Settings are global, so the event carries the empty
+/// workspace id; subscribers that omit a `workspaceId` filter still receive it.
+fn settings_changed_event(changes: Vec<serde_json::Value>) -> NewEvent {
+    NewEvent {
+        workspace_id: WorkspaceId::from_string(String::new()),
+        timestamp: now_iso(),
+        event_type: SETTINGS_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        data: serde_json::json!({ "changes": changes }),
+    }
+}
+
 /// Build a `comment:added` change event with the self-sufficient payload
 /// `{ noteId, commentId }` (PROTOCOL §6.5; intentd carries the ids so a client
 /// can locate/fetch the new comment).
@@ -922,6 +960,39 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn settings_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.settings_service().list().await })
+    }
+
+    fn settings_get(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.settings_service().get(&path).await })
+    }
+
+    fn settings_update(
+        &self,
+        changes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let applied = self.settings_service().update(&changes).await?;
+            if !applied.is_empty() {
+                publish_event(&self.event_bus, settings_changed_event(applied.clone())).await;
+            }
+            Ok(serde_json::json!({ "applied": applied }))
+        })
+    }
+
+    fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let result = self.settings_service().reset(&path).await?;
+            publish_event(
+                &self.event_bus,
+                settings_changed_event(vec![result.clone()]),
+            )
+            .await;
+            Ok(result)
+        })
+    }
+
     fn search_in_files(
         &self,
         workspace_id: WorkspaceId,
@@ -2964,7 +3035,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             // TS `ws.git.commit` gates on auto-commit (no userRequested bypass).
-            git_ops::assert_agent_commit_allowed(false)?;
+            git_ops::assert_agent_commit_allowed(&store, false).await?;
             // All commit failures surface as `-32603` (the TS handler wraps the
             // whole path in INTERNAL_ERROR), so a missing workspace is `Internal`.
             let ws = store
@@ -2992,7 +3063,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             // userRequested bypasses the auto-commit gate (TS parity).
-            git_ops::assert_agent_commit_allowed(user_requested)?;
+            git_ops::assert_agent_commit_allowed(&store, user_requested).await?;
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
@@ -4623,7 +4694,7 @@ impl Services {
         stage_unstaged: bool,
     ) -> Result<String> {
         // accept-changes is a user-initiated action → bypass the auto-commit gate.
-        git_ops::assert_agent_commit_allowed(true)?;
+        git_ops::assert_agent_commit_allowed(&self.store, true).await?;
         let message = message
             .filter(|m| !m.trim().is_empty())
             .ok_or_else(|| Error::Internal("Commit message is required".to_string()))?;

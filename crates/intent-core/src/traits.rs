@@ -1443,6 +1443,61 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     // ------------------------------------------------------------------------
+    // settings.* — BE-owned settings namespace (PROTOCOL §5.12, §9.8). Global
+    // (no `workspaceId`); sensitive values are redacted in list/get and never
+    // cross the wire in plaintext.
+    // ------------------------------------------------------------------------
+
+    /// `settings.list`: every setting definition with its (redacted) current
+    /// value — `{ settings: SettingDefinitionWithValue[] }` (PROTOCOL §5.12).
+    fn settings_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::settings_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `settings.get`: one setting as `{ path, value, definition }`; the value is
+    /// redacted when sensitive; unknown path → `-32602` (PROTOCOL §5.12).
+    fn settings_get(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = path;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::settings_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `settings.update`: atomic batch apply of `changes: [{ path, value }]`
+    /// (unknown path / read-only / failed validation → `-32602`, nothing
+    /// applied); returns `{ applied: [{ path, value }] }` redacted and emits
+    /// `settings:changed` on success (PROTOCOL §5.12).
+    fn settings_update(
+        &self,
+        changes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = changes;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::settings_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `settings.reset`: restore a setting's default, returning the redacted
+    /// `{ path, value }` and emitting `settings:changed`; unknown path → `-32602`
+    /// (PROTOCOL §5.12).
+    fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = path;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::settings_reset not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ------------------------------------------------------------------------
     // accept-changes.* — commit→push→PR→merge orchestration (PROTOCOL §5.18).
     // ------------------------------------------------------------------------
 

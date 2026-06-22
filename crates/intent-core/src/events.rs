@@ -180,6 +180,13 @@ pub const DRAFT_CHANGED: &str = "draft:changed";
 // MCP events.
 pub const MCP_NOTIFICATION: &str = "mcp:notification";
 
+// Settings events (new in intentd; PROTOCOL §5.12/§6.5, §9.8). Emitted after a
+// successful `settings.update`/`settings.reset`; the self-sufficient payload
+// `{ changes: [{ path, value }] }` carries the applied pairs with **sensitive**
+// values redacted (presence/placeholder only) so every connected client stays
+// in sync without leaking secrets.
+pub const SETTINGS_CHANGED: &str = "settings:changed";
+
 /// Every canonical event-type string in the taxonomy above. Useful for
 /// validation and the filter/subscription wiring added in later M2 tasks.
 pub const ALL_EVENT_TYPES: &[&str] = &[
@@ -261,6 +268,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SEARCH_DONE,
     DRAFT_CHANGED,
     MCP_NOTIFICATION,
+    SETTINGS_CHANGED,
 ];
 
 /// True iff `event_type` is part of the canonical taxonomy.
