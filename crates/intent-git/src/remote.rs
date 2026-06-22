@@ -10,10 +10,50 @@
 
 use std::path::Path;
 
-use git2::{Repository, RepositoryInitOptions};
+use git2::{Direction, Repository, RepositoryInitOptions};
 use intent_core::Result;
 
+use crate::auth::remote_callbacks;
 use crate::map_git_err;
+
+/// Whether a remote (reachable) carries a given branch — the `git ls-remote
+/// --heads <remote> <branch>` probe. Distinguishes a branch that is simply
+/// absent from a remote that could not be reached (see [`ls_remote_has_branch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteBranch {
+    /// The remote is reachable and advertises `refs/heads/<branch>`.
+    Present,
+    /// The remote is reachable but does not have the branch (local-only path).
+    Missing,
+}
+
+/// `git ls-remote --heads <remote> <branch>`: connect to `remote` and report
+/// whether it advertises `refs/heads/<branch>`. A reachable remote yields
+/// [`RemoteBranch::Present`]/[`RemoteBranch::Missing`]; an unreachable remote
+/// (network/auth failure) is surfaced as an `Err`, preserving the TS distinction
+/// between "branch missing → local-only" and "remote unreachable → error".
+pub fn ls_remote_has_branch(
+    worktree_path: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<RemoteBranch> {
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    let mut remote_handle = repo.find_remote(remote).map_err(map_git_err)?;
+    let connection = remote_handle
+        .connect_auth(Direction::Fetch, Some(remote_callbacks()), None)
+        .map_err(map_git_err)?;
+    let target = format!("refs/heads/{branch}");
+    let present = connection
+        .list()
+        .map_err(map_git_err)?
+        .iter()
+        .any(|head| head.name() == target);
+    Ok(if present {
+        RemoteBranch::Present
+    } else {
+        RemoteBranch::Missing
+    })
+}
 
 /// The `origin` remote URL, or `None` when the workspace has no `origin`.
 pub fn origin_url(worktree_path: &Path) -> Result<Option<String>> {
@@ -146,6 +186,52 @@ mod tests {
         let repo = Repository::open(&dir).unwrap();
         assert_eq!(crate::status::current_branch(&repo), "feature");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn unique_bare(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "intent-git-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn ls_remote_present_and_missing_against_reachable_bare() {
+        let src = test_init_repo("lsremote-src");
+        commit_file(src.path(), "a.txt", "one\n");
+        let repo = Repository::open(src.path()).unwrap();
+        let branch = crate::status::current_branch(&repo);
+
+        let bare_dir = unique_bare("lsremote-bare");
+        Repository::init_bare(&bare_dir).unwrap();
+        repo.remote("origin", bare_dir.to_str().unwrap()).unwrap();
+        crate::push::push(src.path(), "origin", &branch, false).unwrap();
+
+        // The pushed branch is advertised; a never-pushed branch is missing.
+        assert_eq!(
+            ls_remote_has_branch(src.path(), "origin", &branch).unwrap(),
+            RemoteBranch::Present
+        );
+        assert_eq!(
+            ls_remote_has_branch(src.path(), "origin", "no-such-branch").unwrap(),
+            RemoteBranch::Missing
+        );
+
+        let _ = std::fs::remove_dir_all(&bare_dir);
+    }
+
+    #[test]
+    fn ls_remote_unreachable_is_error() {
+        let src = test_init_repo("lsremote-unreachable");
+        commit_file(src.path(), "a.txt", "one\n");
+        let repo = Repository::open(src.path()).unwrap();
+        // Point origin at a path that does not exist — connecting must fail.
+        let missing = unique_bare("lsremote-missing-remote");
+        repo.remote("origin", missing.to_str().unwrap()).unwrap();
+        assert!(ls_remote_has_branch(src.path(), "origin", "main").is_err());
     }
 
     #[test]

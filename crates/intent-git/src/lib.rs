@@ -12,14 +12,21 @@ pub use intent_core::{
     GitMergeConflicts, GitStatus, Result,
 };
 
+pub mod auth;
 pub mod branches;
 pub mod commit;
 pub mod conflicts;
 pub mod diff;
+pub mod fetch;
 pub mod history;
 pub mod push;
+pub mod rebase;
+pub mod refs;
 pub mod remote;
+pub mod reset;
+pub mod squash;
 pub mod stage;
+pub mod stash;
 pub mod status;
 pub mod worktree;
 
@@ -29,4 +36,14 @@ mod testutil;
 /// Map a libgit2 error into the domain [`Error::Internal`] (`-32603`).
 pub(crate) fn map_git_err(e: git2::Error) -> Error {
     Error::Internal(e.message().to_string())
+}
+
+/// Whether a libgit2 error represents a merge/checkout conflict, mirroring the TS
+/// `message.includes('conflict')` classification (used to tell a conflicting
+/// rebase/stash-pop apart from an unrelated failure). Checks the structured error
+/// code first, then falls back to a case-insensitive message probe.
+pub(crate) fn is_conflict_error(e: &git2::Error) -> bool {
+    use git2::ErrorCode;
+    matches!(e.code(), ErrorCode::Conflict | ErrorCode::MergeConflict)
+        || e.message().to_lowercase().contains("conflict")
 }

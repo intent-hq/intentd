@@ -14,9 +14,10 @@
 
 use std::path::Path;
 
-use git2::{Cred, PushOptions, RemoteCallbacks, Repository};
+use git2::{PushOptions, Repository};
 use intent_core::{Error, Result};
 
+use crate::auth::remote_callbacks;
 use crate::map_git_err;
 
 /// The outcome of a push: the branch and the commit SHA now on the remote.
@@ -48,10 +49,8 @@ pub fn push(worktree_path: &Path, remote: &str, branch: &str, force: bool) -> Re
 
     let mut remote_handle = repo.find_remote(remote).map_err(map_git_err)?;
 
-    let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(credentials_cb);
     let mut opts = PushOptions::new();
-    opts.remote_callbacks(callbacks);
+    opts.remote_callbacks(remote_callbacks());
 
     let prefix = if force { "+" } else { "" };
     let refspec = format!("{prefix}{local_ref}:{local_ref}");
@@ -75,29 +74,6 @@ pub fn push(worktree_path: &Path, remote: &str, branch: &str, force: bool) -> Re
         branch: branch.to_string(),
         pushed_sha,
     })
-}
-
-/// Best-effort credential resolution for non-local remotes: SSH agent for SSH
-/// remotes, then the configured credential helper, then default. Local/`file://`
-/// remotes never invoke this callback.
-fn credentials_cb(
-    url: &str,
-    username: Option<&str>,
-    allowed: git2::CredentialType,
-) -> std::result::Result<Cred, git2::Error> {
-    if allowed.contains(git2::CredentialType::SSH_KEY) {
-        if let Ok(cred) = Cred::ssh_key_from_agent(username.unwrap_or("git")) {
-            return Ok(cred);
-        }
-    }
-    if allowed.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
-        if let Ok(config) = git2::Config::open_default() {
-            if let Ok(cred) = Cred::credential_helper(&config, url, username) {
-                return Ok(cred);
-            }
-        }
-    }
-    Cred::default()
 }
 
 #[cfg(test)]
