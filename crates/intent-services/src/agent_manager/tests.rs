@@ -167,6 +167,7 @@ fn mock_handle() -> AgentHandle {
         _child: None,
         _mcp_bridge: None,
         _mcp_config: None,
+        _rules_config: None,
     }
 }
 

@@ -1312,6 +1312,29 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        "rules.list" => {
+            // Optional workspaceId: present → include the workspace's read-only
+            // rule files; omitted → global user-override set only.
+            let workspace_id = opt_workspace_id(params);
+            api.rules_list(workspace_id).await.map_err(domain_to_rpc)
+        }
+        "rules.get" => {
+            let ws = require_ws_note(params)?;
+            let rule_type = require_str_param(params, "ruleType")?;
+            api.rules_get(ws, rule_type).await.map_err(domain_to_rpc)
+        }
+        "rules.update" => {
+            let ws = require_ws_note(params)?;
+            let rule_type = require_str_param(params, "ruleType")?;
+            let content = require_str_param(params, "content")?;
+            let enabled = opt_bool(params, "enabled");
+            match api.rules_update(ws, rule_type, content, enabled).await {
+                Ok(v) => Ok(v),
+                // Empty ruleType / over-long content → -32602 with the raw message.
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }

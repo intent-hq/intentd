@@ -1498,6 +1498,62 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     // ------------------------------------------------------------------------
+    // rules.* — user-rule overrides + (internal) prompt-injection (§18.1,
+    // PROTOCOL §5.21). `list`/`get` are reads; `update` upserts the user
+    // override. Only user-override entries are editable; file-sourced entries
+    // are read-only over the wire. The injection pipeline that assembles these
+    // into an agent's prompt is internal (§6.8) — not a method here.
+    // ------------------------------------------------------------------------
+
+    /// `rules.list`: all rule sources as `{ rules: RuleSet }` — every
+    /// user-override type with content plus, when `workspace_id` is given, the
+    /// live workspace rule files (read-only) (PROTOCOL §5.21).
+    fn rules_list(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::rules_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `rules.get`: `{ enabled, content, updatedAt }` for one user-override type
+    /// (PROTOCOL §5.21).
+    fn rules_get(
+        &self,
+        workspace_id: WorkspaceId,
+        rule_type: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, rule_type);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::rules_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `rules.update`: upsert a user-override body (+ optional `enabled`),
+    /// re-read the set, and emit `settings:changed`; returns `{ rules: RuleSet }`
+    /// (PROTOCOL §5.21).
+    fn rules_update(
+        &self,
+        workspace_id: WorkspaceId,
+        rule_type: String,
+        content: String,
+        enabled: Option<bool>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, rule_type, content, enabled);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::rules_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ------------------------------------------------------------------------
     // accept-changes.* — commit→push→PR→merge orchestration (PROTOCOL §5.18).
     // ------------------------------------------------------------------------
 

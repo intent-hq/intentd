@@ -3548,3 +3548,225 @@ mod script {
         h.services.script_stop(id).await.expect("stop");
     }
 }
+
+/// `rules.*` user-override CRUD over the `endUserRules` settings store + the
+/// internal prompt-assembly/injection pipeline (§18.1, PROTOCOL §5.21).
+mod rules {
+    use std::time::Duration;
+
+    use intent_core::{Error, WorkspaceApi, WorkspaceId};
+    use intent_store::Store;
+    use serde_json::Value;
+
+    use super::{workspace, TempDb};
+    use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+
+    struct TempTree(std::path::PathBuf);
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A worktree containing a `CLAUDE.md` workspace rule file.
+    fn worktree() -> TempTree {
+        let dir = std::env::temp_dir().join(format!("intentd-rules-svc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "ALWAYS run the linter.").unwrap();
+        TempTree(dir)
+    }
+
+    async fn setup(dir: &std::path::Path) -> (TempDb, Store, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.expect("ws");
+        let svc = Services::new(store.clone());
+        (tmp, store, svc, ws_id)
+    }
+
+    /// Find the entry in a `{ rules: { rules: [...] } }` result by ruleType.
+    fn entry<'a>(set: &'a Value, rule_type: &str) -> Option<&'a Value> {
+        set["rules"]["rules"]
+            .as_array()?
+            .iter()
+            .find(|e| e["ruleType"] == rule_type && e["source"] == "user-override")
+    }
+
+    #[tokio::test]
+    async fn update_then_get_roundtrips() {
+        let tree = worktree();
+        let (_tmp, _store, svc, ws) = setup(&tree.0).await;
+        svc.rules_update(
+            ws.clone(),
+            "base-system-prompt".into(),
+            "Be concise.".into(),
+            None,
+        )
+        .await
+        .expect("update");
+
+        let got = svc
+            .rules_get(ws, "base-system-prompt".into())
+            .await
+            .expect("get");
+        assert_eq!(got["content"], "Be concise.");
+        assert_eq!(got["enabled"], true);
+        assert!(got["updatedAt"].as_i64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn get_absent_type_reads_disabled_empty() {
+        let tree = worktree();
+        let (_tmp, _store, svc, ws) = setup(&tree.0).await;
+        let got = svc.rules_get(ws, "workspace".into()).await.expect("get");
+        assert_eq!(got["enabled"], false);
+        assert_eq!(got["content"], "");
+        assert_eq!(got["updatedAt"], 0);
+    }
+
+    #[tokio::test]
+    async fn list_returns_editable_override_and_readonly_file() {
+        let tree = worktree();
+        let (_tmp, _store, svc, ws) = setup(&tree.0).await;
+        // Upsert returns the re-read set directly (no extra fetch).
+        let set = svc
+            .rules_update(
+                ws.clone(),
+                "workspace".into(),
+                "Prefer small PRs.".into(),
+                None,
+            )
+            .await
+            .expect("update");
+        assert_eq!(set["rules"]["workspaceId"], ws.as_str());
+
+        let listed = svc.rules_list(Some(ws)).await.expect("list");
+        let user = entry(&listed, "workspace").expect("user-override entry");
+        assert_eq!(user["editable"], true);
+        assert_eq!(user["content"], "Prefer small PRs.");
+
+        // The live CLAUDE.md surfaces as a read-only file-sourced entry.
+        let file = listed["rules"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["source"] == "CLAUDE.md")
+            .expect("CLAUDE.md entry");
+        assert_eq!(file["editable"], false);
+        assert_eq!(file["ruleType"], "workspace");
+        assert!(file["path"].as_str().unwrap().ends_with("CLAUDE.md"));
+    }
+
+    #[tokio::test]
+    async fn over_long_content_rejected() {
+        let tree = worktree();
+        let (_tmp, _store, svc, ws) = setup(&tree.0).await;
+        let huge = "x".repeat(50_001);
+        let err = svc
+            .rules_update(ws, "base-system-prompt".into(), huge, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    #[tokio::test]
+    async fn assembly_layers_all_sources_in_precedence() {
+        let tree = worktree();
+        let (_tmp, store, svc, ws) = setup(&tree.0).await;
+        // base → specialization(agent type) → workspace → live workspace files.
+        svc.rules_update(
+            ws.clone(),
+            "base-system-prompt".into(),
+            "BASE_BODY".into(),
+            None,
+        )
+        .await
+        .unwrap();
+        svc.rules_update(ws.clone(), "task-loop".into(), "SPEC_BODY".into(), None)
+            .await
+            .unwrap();
+        svc.rules_update(
+            ws.clone(),
+            "workspace".into(),
+            "WS_OVERRIDE_BODY".into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop")
+            .await
+            .expect("assembled prompt");
+
+        let base = prompt.find("BASE_BODY").expect("base body");
+        let spec = prompt.find("SPEC_BODY").expect("specialization body");
+        let wsov = prompt
+            .find("WS_OVERRIDE_BODY")
+            .expect("workspace override body");
+        let file = prompt
+            .find("ALWAYS run the linter.")
+            .expect("CLAUDE.md body");
+        assert!(prompt.contains("## User Rules & Guidelines"));
+        assert!(
+            base < spec && spec < wsov && wsov < file,
+            "precedence order"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_override_excluded_from_assembly() {
+        let tree = worktree();
+        let (_tmp, store, svc, ws) = setup(&tree.0).await;
+        svc.rules_update(
+            ws.clone(),
+            "base-system-prompt".into(),
+            "HIDDEN_BODY".into(),
+            Some(false),
+        )
+        .await
+        .unwrap();
+        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop")
+            .await
+            .expect("assembled prompt (file still applies)");
+        assert!(!prompt.contains("HIDDEN_BODY"));
+        assert!(prompt.contains("ALWAYS run the linter."));
+    }
+
+    #[tokio::test]
+    async fn update_emits_settings_changed() {
+        let tree = worktree();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(tree.0.to_string_lossy().to_string());
+        store.insert_workspace(&w).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store.clone()).with_event_bus(bus.clone());
+        // Global event: subscribe without a workspace filter.
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        svc.rules_update(ws, "base-system-prompt".into(), "Be concise.".into(), None)
+            .await
+            .expect("update");
+
+        let batch = tokio::time::timeout(Duration::from_secs(2), recv(&mut sub))
+            .await
+            .expect("event delivered");
+        let ev = serde_json::to_value(&batch[0]).unwrap();
+        assert_eq!(ev["type"], "settings:changed");
+        let changes = ev["data"]["changes"].as_array().expect("changes");
+        assert_eq!(changes[0]["path"], "endUserRules");
+        assert_eq!(
+            changes[0]["value"]["base-system-prompt"]["content"],
+            "Be concise."
+        );
+    }
+
+    async fn recv(sub: &mut Subscription) -> Vec<intent_core::Event> {
+        sub.recv().await.expect("subscription open")
+    }
+}

@@ -993,6 +993,55 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn rules_list(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let path = match &workspace_id {
+                Some(ws) => ft_worktree(&self.store, ws).await,
+                None => None,
+            };
+            rules::RulesService::new(&self.store)
+                .list(
+                    workspace_id.as_ref().map(WorkspaceId::as_str),
+                    path.as_deref(),
+                )
+                .await
+        })
+    }
+
+    fn rules_get(
+        &self,
+        _workspace_id: WorkspaceId,
+        rule_type: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { rules::RulesService::new(&self.store).get(&rule_type).await })
+    }
+
+    fn rules_update(
+        &self,
+        workspace_id: WorkspaceId,
+        rule_type: String,
+        content: String,
+        enabled: Option<bool>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let path = ft_worktree(&self.store, &workspace_id).await;
+            let (rules, changed) = rules::RulesService::new(&self.store)
+                .update(
+                    &rule_type,
+                    &content,
+                    enabled,
+                    Some(workspace_id.as_str()),
+                    path.as_deref(),
+                )
+                .await?;
+            publish_event(&self.event_bus, settings_changed_event(vec![changed])).await;
+            Ok(rules)
+        })
+    }
+
     fn search_in_files(
         &self,
         workspace_id: WorkspaceId,
@@ -5820,7 +5869,7 @@ pub mod file {}
 pub mod event {}
 
 // Agent-Ecosystem modules (§18).
-pub mod rules {}
+mod rules;
 pub mod specialists {}
 pub mod mcp_servers {}
 pub mod memories {}

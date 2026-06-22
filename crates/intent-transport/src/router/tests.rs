@@ -2240,3 +2240,44 @@ async fn script_lifecycle_and_run_dispatch() {
         .unwrap();
     assert_eq!(err_code(&v), -32602);
 }
+
+#[tokio::test]
+async fn rules_methods_route_and_validate_params() {
+    // rules.list takes an optional workspaceId and must route to the (default)
+    // impl → -32603, proving it is registered (never -32601).
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"rules.list","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32603);
+
+    // rules.get requires workspaceId then ruleType.
+    let v = call(r#"{"jsonrpc":"2.0","id":2,"method":"rules.get","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":3,"method":"rules.get","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":4,"method":"rules.get","params":{"workspaceId":"ws-1","ruleType":"workspace"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+
+    // rules.update requires ruleType + content.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":5,"method":"rules.update","params":{"workspaceId":"ws-1","ruleType":"workspace"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":6,"method":"rules.update","params":{"workspaceId":"ws-1","ruleType":"workspace","content":"x"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+}
