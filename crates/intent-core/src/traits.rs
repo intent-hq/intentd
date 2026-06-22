@@ -1554,6 +1554,94 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     // ------------------------------------------------------------------------
+    // specialist.* — file-backed specialist definitions (PROTOCOL §5.11,
+    // §18.2). Global (no `workspaceId`); resolved 3-tier project > user >
+    // bundled. `list`/`get` read the resolved view; `create`/`edit`/`delete`
+    // write user/project markdown-with-frontmatter files (`bundled` is
+    // read-only). Nothing is persisted in SQLite.
+    // ------------------------------------------------------------------------
+
+    /// `specialist.list` → `{ specialists: SpecialistDef[] }` (user/project
+    /// files override bundled). An optional `workspace_path` adds the project
+    /// tier (PROTOCOL §5.11).
+    fn specialist_list(
+        &self,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_path;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::specialist_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `specialist.get` → `{ specialist: SpecialistDef }`, the resolved view;
+    /// unknown id → `-32602` (PROTOCOL §5.11).
+    fn specialist_get(
+        &self,
+        id: String,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, workspace_path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::specialist_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `specialist.create` → write a new user/project file (default scope
+    /// `user`); returns `{ specialist: SpecialistDef }` (PROTOCOL §5.11).
+    fn specialist_create(
+        &self,
+        id: String,
+        spec: serde_json::Value,
+        scope: Option<String>,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, spec, scope, workspace_path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::specialist_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `specialist.edit` → overwrite an existing user/project file; returns
+    /// `{ specialist: SpecialistDef }`; missing file → `-32602` (PROTOCOL §5.11).
+    fn specialist_edit(
+        &self,
+        id: String,
+        spec: serde_json::Value,
+        scope: String,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, spec, scope, workspace_path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::specialist_edit not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `specialist.delete` → remove a user/project file; returns
+    /// `{ success: true }`; missing/bundled id → `-32602` (PROTOCOL §5.11).
+    fn specialist_delete(
+        &self,
+        id: String,
+        scope: String,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, scope, workspace_path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::specialist_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ------------------------------------------------------------------------
     // accept-changes.* — commit→push→PR→merge orchestration (PROTOCOL §5.18).
     // ------------------------------------------------------------------------
 

@@ -1335,6 +1335,66 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "specialist.list" => {
+            // Global (no workspaceId); optional workspacePath adds the project
+            // tier on top of user > bundled (PROTOCOL §5.11).
+            let workspace_path = opt_str(params, "workspacePath");
+            api.specialist_list(workspace_path)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "specialist.get" => {
+            let id = require_str_param(params, "id")?;
+            let workspace_path = opt_str(params, "workspacePath");
+            match api.specialist_get(id, workspace_path).await {
+                Ok(v) => Ok(v),
+                // Unknown id / invalid id → -32602 with the raw message.
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "specialist.create" => {
+            let id = require_str_param(params, "id")?;
+            require_present(params, "spec")?;
+            let spec = params.get("spec").cloned().unwrap_or(Value::Null);
+            let scope = opt_str(params, "scope");
+            let workspace_path = opt_str(params, "workspacePath");
+            match api.specialist_create(id, spec, scope, workspace_path).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "specialist.edit" => {
+            let id = require_str_param(params, "id")?;
+            require_present(params, "spec")?;
+            let spec = params.get("spec").cloned().unwrap_or(Value::Null);
+            let scope = require_str_param(params, "scope")?;
+            let workspace_path = opt_str(params, "workspacePath");
+            match api.specialist_edit(id, spec, scope, workspace_path).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "specialist.delete" => {
+            let id = require_str_param(params, "id")?;
+            let scope = require_str_param(params, "scope")?;
+            let workspace_path = opt_str(params, "workspacePath");
+            match api.specialist_delete(id, scope, workspace_path).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }

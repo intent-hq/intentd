@@ -123,6 +123,14 @@ pub struct Services {
     /// behind `settings.*`. Defaults to the OS keychain ([`KeyringSecretStore`]);
     /// tests inject an in-memory store so they never touch the real keychain.
     secrets: Arc<dyn settings::SecretStore>,
+    /// Override for the **user** specialists directory (§18.2). `None` resolves
+    /// to `~/.augment/specialists/`; tests inject a temp dir for hermetic
+    /// 3-tier coverage.
+    specialists_user_dir: Option<PathBuf>,
+    /// Override for the **bundled** (read-only) specialists directory (§18.2).
+    /// `None` resolves from `INTENTD_BUNDLED_SPECIALISTS_DIR` or the
+    /// exe-relative `resources/specialists/`.
+    specialists_bundled_dir: Option<PathBuf>,
 }
 
 impl Services {
@@ -142,6 +150,8 @@ impl Services {
             pty: Arc::new(intent_pty::PtyHost::new()),
             scripts: Arc::new(Mutex::new(HashMap::new())),
             secrets: Arc::new(settings::KeyringSecretStore),
+            specialists_user_dir: None,
+            specialists_bundled_dir: None,
         }
     }
 
@@ -151,6 +161,29 @@ impl Services {
     pub fn with_secret_store(mut self, secrets: Arc<dyn settings::SecretStore>) -> Self {
         self.secrets = secrets;
         self
+    }
+
+    /// Override the **user** and **bundled** specialist directory roots (§18.2).
+    /// The composition root keeps the env/HOME defaults; tests inject temp dirs
+    /// so the 3-tier resolution is hermetic. The project tier always comes from
+    /// each call's `workspacePath`.
+    pub fn with_specialist_dirs(
+        mut self,
+        user_dir: Option<PathBuf>,
+        bundled_dir: Option<PathBuf>,
+    ) -> Self {
+        self.specialists_user_dir = user_dir;
+        self.specialists_bundled_dir = bundled_dir;
+        self
+    }
+
+    /// Build a [`SpecialistsService`](specialists::SpecialistsService) view over
+    /// the configured directory roots for one `specialist.*` call.
+    fn specialists_service(&self) -> specialists::SpecialistsService {
+        specialists::SpecialistsService::new(
+            self.specialists_user_dir.clone(),
+            self.specialists_bundled_dir.clone(),
+        )
     }
 
     /// Build a [`SettingsService`](settings::SettingsService) view over the store
@@ -1039,6 +1072,73 @@ impl WorkspaceApi for Services {
                 .await?;
             publish_event(&self.event_bus, settings_changed_event(vec![changed])).await;
             Ok(rules)
+        })
+    }
+
+    fn specialist_list(
+        &self,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.specialists_service()
+                .list(workspace_path.as_deref().map(Path::new))
+        })
+    }
+
+    fn specialist_get(
+        &self,
+        id: String,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.specialists_service()
+                .get(&id, workspace_path.as_deref().map(Path::new))
+        })
+    }
+
+    fn specialist_create(
+        &self,
+        id: String,
+        spec: serde_json::Value,
+        scope: Option<String>,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.specialists_service().create(
+                &id,
+                &spec,
+                scope.as_deref(),
+                workspace_path.as_deref().map(Path::new),
+            )
+        })
+    }
+
+    fn specialist_edit(
+        &self,
+        id: String,
+        spec: serde_json::Value,
+        scope: String,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.specialists_service().edit(
+                &id,
+                &spec,
+                &scope,
+                workspace_path.as_deref().map(Path::new),
+            )
+        })
+    }
+
+    fn specialist_delete(
+        &self,
+        id: String,
+        scope: String,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.specialists_service()
+                .delete(&id, &scope, workspace_path.as_deref().map(Path::new))
         })
     }
 
@@ -5870,7 +5970,7 @@ pub mod event {}
 
 // Agent-Ecosystem modules (§18).
 mod rules;
-pub mod specialists {}
+mod specialists;
 pub mod mcp_servers {}
 pub mod memories {}
 
