@@ -498,6 +498,7 @@ struct AgentHandle {
     _child: Option<Child>,
     _mcp_bridge: Option<McpBridge>,
     _mcp_config: Option<TempConfigFile>,
+    _rules_config: Option<TempConfigFile>,
 }
 
 impl Drop for AgentHandle {
@@ -630,11 +631,31 @@ impl AgentManager {
             mcp_config = Some(TempConfigFile { path });
         }
 
+        // Assemble the effective system prompt (the §18.1 injection pipeline:
+        // base/specialization/workspace user overrides + live workspace rule
+        // files) into a temp `--rules` file when the caller supplies none. The
+        // handle owns the temp file so it outlives the child that reads it.
+        let mut rules_config: Option<TempConfigFile> = None;
+        let mut rules_file_path: Option<String> = None;
+        if opts.rules_file.is_none() {
+            if let Some(prompt) =
+                crate::rules::assemble_system_prompt(&self.services.store, Some(&cwd), agent_type)
+                    .await
+            {
+                let path =
+                    std::env::temp_dir().join(format!("intentd-rules-{}.md", Uuid::new_v4()));
+                if std::fs::write(&path, prompt.as_bytes()).is_ok() {
+                    rules_file_path = Some(path.to_string_lossy().into_owned());
+                    rules_config = Some(TempConfigFile { path });
+                }
+            }
+        }
+
         // Reconstruct the spawn options with the generated config path injected.
         let mut spawn_opts = SpawnOptions::new(opts.provider);
         spawn_opts.model = opts.model;
         spawn_opts.cwd = opts.cwd;
-        spawn_opts.rules_file = opts.rules_file;
+        spawn_opts.rules_file = opts.rules_file.or(rules_file_path.as_deref());
         spawn_opts.quiet = opts.quiet;
         spawn_opts.provider_binary = opts.provider_binary;
         spawn_opts.extra_env = opts.extra_env.clone();
@@ -690,6 +711,7 @@ impl AgentManager {
             _child: Some(child),
             _mcp_bridge: Some(bridge),
             _mcp_config: mcp_config,
+            _rules_config: rules_config,
         };
         self.handles.lock().unwrap().insert(agent_id, handle);
         Ok(())

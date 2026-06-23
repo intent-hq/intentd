@@ -1675,6 +1675,7 @@ dependencies = [
  "intent-search",
  "intent-sourcecontrol",
  "intent-store",
+ "keyring",
  "nix 0.29.0",
  "notify",
  "serde",

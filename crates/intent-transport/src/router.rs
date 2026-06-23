@@ -1068,6 +1068,38 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "settings.list" => {
+            // Global namespace (no workspaceId); sensitive values are redacted.
+            let r = api.settings_list().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "settings.get" => {
+            let path = require_str_param(params, "path")?;
+            match api.settings_get(path).await {
+                Ok(v) => Ok(v),
+                // Unknown path → -32602 with the raw message (no prefix).
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "settings.update" => {
+            require_present(params, "changes")?;
+            let changes = params.get("changes").cloned().unwrap_or(Value::Null);
+            match api.settings_update(changes).await {
+                Ok(v) => Ok(v),
+                // Unknown path / read-only / failed validation → -32602.
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "settings.reset" => {
+            let path = require_str_param(params, "path")?;
+            match api.settings_reset(path).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "accept-changes.getStatus" => {
             let ws = require_ws_note(params)?;
             let r = api
@@ -1279,6 +1311,157 @@ async fn dispatch(
             api.script_run(script_id, max_lines, timeout_seconds)
                 .await
                 .map_err(domain_to_rpc)
+        }
+        "rules.list" => {
+            // Optional workspaceId: present → include the workspace's read-only
+            // rule files; omitted → global user-override set only.
+            let workspace_id = opt_workspace_id(params);
+            api.rules_list(workspace_id).await.map_err(domain_to_rpc)
+        }
+        "rules.get" => {
+            let ws = require_ws_note(params)?;
+            let rule_type = require_str_param(params, "ruleType")?;
+            api.rules_get(ws, rule_type).await.map_err(domain_to_rpc)
+        }
+        "rules.update" => {
+            let ws = require_ws_note(params)?;
+            let rule_type = require_str_param(params, "ruleType")?;
+            let content = require_str_param(params, "content")?;
+            let enabled = opt_bool(params, "enabled");
+            match api.rules_update(ws, rule_type, content, enabled).await {
+                Ok(v) => Ok(v),
+                // Empty ruleType / over-long content → -32602 with the raw message.
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "specialist.list" => {
+            // Global (no workspaceId); optional workspacePath adds the project
+            // tier on top of user > bundled (PROTOCOL §5.11).
+            let workspace_path = opt_str(params, "workspacePath");
+            api.specialist_list(workspace_path)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "specialist.get" => {
+            let id = require_str_param(params, "id")?;
+            let workspace_path = opt_str(params, "workspacePath");
+            match api.specialist_get(id, workspace_path).await {
+                Ok(v) => Ok(v),
+                // Unknown id / invalid id → -32602 with the raw message.
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "specialist.create" => {
+            let id = require_str_param(params, "id")?;
+            require_present(params, "spec")?;
+            let spec = params.get("spec").cloned().unwrap_or(Value::Null);
+            let scope = opt_str(params, "scope");
+            let workspace_path = opt_str(params, "workspacePath");
+            match api.specialist_create(id, spec, scope, workspace_path).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "specialist.edit" => {
+            let id = require_str_param(params, "id")?;
+            require_present(params, "spec")?;
+            let spec = params.get("spec").cloned().unwrap_or(Value::Null);
+            let scope = require_str_param(params, "scope")?;
+            let workspace_path = opt_str(params, "workspacePath");
+            match api.specialist_edit(id, spec, scope, workspace_path).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "specialist.delete" => {
+            let id = require_str_param(params, "id")?;
+            let scope = require_str_param(params, "scope")?;
+            let workspace_path = opt_str(params, "workspacePath");
+            match api.specialist_delete(id, scope, workspace_path).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.servers.list" => {
+            // Global (no required scope); optional workspaceId per PROTOCOL §5.22.
+            let workspace_id = opt_workspace_id(params);
+            api.mcp_servers_list(workspace_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "mcp.servers.create" => {
+            require_present(params, "config")?;
+            let config = params.get("config").cloned().unwrap_or(Value::Null);
+            match api.mcp_servers_create(config).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.servers.update" => {
+            let server_id = require_str_param(params, "serverId")?;
+            require_present(params, "config")?;
+            let config = params.get("config").cloned().unwrap_or(Value::Null);
+            match api.mcp_servers_update(server_id, config).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.servers.delete" => {
+            let server_id = require_str_param(params, "serverId")?;
+            match api.mcp_servers_delete(server_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.servers.toggle" => {
+            let server_id = require_str_param(params, "serverId")?;
+            let enabled = params
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| rpc(INVALID_PARAMS, "enabled is required"))?;
+            match api.mcp_servers_toggle(server_id, enabled).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.servers.restart" => {
+            let server_id = require_str_param(params, "serverId")?;
+            match api.mcp_servers_restart(server_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.servers.getStatus" => {
+            let server_id = require_str_param(params, "serverId")?;
+            match api.mcp_servers_get_status(server_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
         }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }

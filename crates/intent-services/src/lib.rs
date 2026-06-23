@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use base64::Engine as _;
 use intent_core::events::{
     CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED,
-    NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT,
+    NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED,
     TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
 };
 use intent_core::{
@@ -46,11 +46,14 @@ mod note_ops;
 mod pr_ops;
 mod script_ops;
 mod search_ops;
+mod settings;
 mod terminal_ops;
 
 #[cfg(test)]
 mod tests;
 
+pub use mcp_servers::McpHub;
+pub use settings::{InMemorySecretStore, KeyringSecretStore, SecretStore};
 pub use terminal_ops::PtyTerminalHost;
 
 pub use agent_manager::{
@@ -117,6 +120,23 @@ pub struct Services {
     /// keyed by script id. Scripts run on the same [`pty`](Self::pty) host as
     /// `terminal.*`, so a terminal can attach to a running script (§12.2).
     scripts: script_ops::ScriptRegistry,
+    /// Secret persistence for **sensitive** settings (§9.8) — the keychain seam
+    /// behind `settings.*`. Defaults to the OS keychain ([`KeyringSecretStore`]);
+    /// tests inject an in-memory store so they never touch the real keychain.
+    secrets: Arc<dyn settings::SecretStore>,
+    /// Override for the **user** specialists directory (§18.2). `None` resolves
+    /// to `~/.augment/specialists/`; tests inject a temp dir for hermetic
+    /// 3-tier coverage.
+    specialists_user_dir: Option<PathBuf>,
+    /// Override for the **bundled** (read-only) specialists directory (§18.2).
+    /// `None` resolves from `INTENTD_BUNDLED_SPECIALISTS_DIR` or the
+    /// exe-relative `resources/specialists/`.
+    specialists_bundled_dir: Option<PathBuf>,
+    /// Runtime manager for **external** MCP servers (§18.3): spawns/stops/
+    /// restarts stdio servers and runs the health monitor, pushing
+    /// `mcp.servers:status-changed`. Shared across clones (and with the
+    /// composition root, which spawns the monitor + reaps on shutdown).
+    mcp_hub: Arc<McpHub>,
 }
 
 impl Services {
@@ -135,7 +155,48 @@ impl Services {
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
             pty: Arc::new(intent_pty::PtyHost::new()),
             scripts: Arc::new(Mutex::new(HashMap::new())),
+            secrets: Arc::new(settings::KeyringSecretStore),
+            specialists_user_dir: None,
+            specialists_bundled_dir: None,
+            mcp_hub: Arc::new(McpHub::new()),
         }
+    }
+
+    /// Override the [`SecretStore`] backing sensitive settings (§9.8). The
+    /// composition root keeps the OS-keychain default; tests inject an in-memory
+    /// store so they never read/write the real user keychain.
+    pub fn with_secret_store(mut self, secrets: Arc<dyn settings::SecretStore>) -> Self {
+        self.secrets = secrets;
+        self
+    }
+
+    /// Override the **user** and **bundled** specialist directory roots (§18.2).
+    /// The composition root keeps the env/HOME defaults; tests inject temp dirs
+    /// so the 3-tier resolution is hermetic. The project tier always comes from
+    /// each call's `workspacePath`.
+    pub fn with_specialist_dirs(
+        mut self,
+        user_dir: Option<PathBuf>,
+        bundled_dir: Option<PathBuf>,
+    ) -> Self {
+        self.specialists_user_dir = user_dir;
+        self.specialists_bundled_dir = bundled_dir;
+        self
+    }
+
+    /// Build a [`SpecialistsService`](specialists::SpecialistsService) view over
+    /// the configured directory roots for one `specialist.*` call.
+    fn specialists_service(&self) -> specialists::SpecialistsService {
+        specialists::SpecialistsService::new(
+            self.specialists_user_dir.clone(),
+            self.specialists_bundled_dir.clone(),
+        )
+    }
+
+    /// Build a [`SettingsService`](settings::SettingsService) view over the store
+    /// and secret store for one `settings.*` call.
+    fn settings_service(&self) -> settings::SettingsService<'_> {
+        settings::SettingsService::new(&self.store, self.secrets.as_ref())
     }
 
     /// Borrow the shared PTY host (composition root / ACP terminal-adapter use).
@@ -271,8 +332,28 @@ impl Services {
     /// must share the same [`Store`] as this services handle so the broadcast and
     /// the durable log stay consistent.
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
+        // The MCP hub publishes `mcp.servers:status-changed` onto the same bus.
+        self.mcp_hub.set_event_bus(bus.clone());
         self.event_bus = Some(bus);
         self
+    }
+
+    /// Borrow the shared [`McpHub`] (composition root: spawn the health monitor
+    /// + reap external MCP servers on shutdown, §18.3).
+    pub fn mcp_hub(&self) -> Arc<McpHub> {
+        self.mcp_hub.clone()
+    }
+
+    /// Start every enabled, non-disabled external MCP server on daemon boot
+    /// (§18.3). Best-effort; a failed spawn surfaces as an `error` status event.
+    pub async fn start_enabled_mcp_servers(&self) {
+        self.mcp_servers_service().start_enabled().await;
+    }
+
+    /// Build an [`McpServersService`](mcp_servers::McpServersService) view over the
+    /// store, secret store, and hub for one `mcp.servers.*` call.
+    fn mcp_servers_service(&self) -> mcp_servers::McpServersService<'_> {
+        mcp_servers::McpServersService::new(&self.store, self.secrets.as_ref(), &self.mcp_hub)
     }
 
     /// Borrow the underlying store (composition-root / diagnostics use).
@@ -638,6 +719,23 @@ fn attention_changed_event(workspace_id: &WorkspaceId, attention: WorkspaceAtten
     }
 }
 
+/// Build a `settings:changed` event with the self-sufficient payload
+/// `{ changes: [{ path, value }] }` carrying the **redacted** applied pairs
+/// (PROTOCOL §6.5 / §9.8). Settings are global, so the event carries the empty
+/// workspace id; subscribers that omit a `workspaceId` filter still receive it.
+fn settings_changed_event(changes: Vec<serde_json::Value>) -> NewEvent {
+    NewEvent {
+        workspace_id: WorkspaceId::from_string(String::new()),
+        timestamp: now_iso(),
+        event_type: SETTINGS_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        data: serde_json::json!({ "changes": changes }),
+    }
+}
+
 /// Build a `comment:added` change event with the self-sufficient payload
 /// `{ noteId, commentId }` (PROTOCOL §6.5; intentd carries the ids so a client
 /// can locate/fetch the new comment).
@@ -922,6 +1020,204 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn settings_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.settings_service().list().await })
+    }
+
+    fn settings_get(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.settings_service().get(&path).await })
+    }
+
+    fn settings_update(
+        &self,
+        changes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let applied = self.settings_service().update(&changes).await?;
+            if !applied.is_empty() {
+                publish_event(&self.event_bus, settings_changed_event(applied.clone())).await;
+            }
+            Ok(serde_json::json!({ "applied": applied }))
+        })
+    }
+
+    fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let result = self.settings_service().reset(&path).await?;
+            publish_event(
+                &self.event_bus,
+                settings_changed_event(vec![result.clone()]),
+            )
+            .await;
+            Ok(result)
+        })
+    }
+
+    fn rules_list(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let path = match &workspace_id {
+                Some(ws) => ft_worktree(&self.store, ws).await,
+                None => None,
+            };
+            rules::RulesService::new(&self.store)
+                .list(
+                    workspace_id.as_ref().map(WorkspaceId::as_str),
+                    path.as_deref(),
+                )
+                .await
+        })
+    }
+
+    fn rules_get(
+        &self,
+        _workspace_id: WorkspaceId,
+        rule_type: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { rules::RulesService::new(&self.store).get(&rule_type).await })
+    }
+
+    fn rules_update(
+        &self,
+        workspace_id: WorkspaceId,
+        rule_type: String,
+        content: String,
+        enabled: Option<bool>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let path = ft_worktree(&self.store, &workspace_id).await;
+            let (rules, changed) = rules::RulesService::new(&self.store)
+                .update(
+                    &rule_type,
+                    &content,
+                    enabled,
+                    Some(workspace_id.as_str()),
+                    path.as_deref(),
+                )
+                .await?;
+            publish_event(&self.event_bus, settings_changed_event(vec![changed])).await;
+            Ok(rules)
+        })
+    }
+
+    fn specialist_list(
+        &self,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.specialists_service()
+                .list(workspace_path.as_deref().map(Path::new))
+        })
+    }
+
+    fn specialist_get(
+        &self,
+        id: String,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.specialists_service()
+                .get(&id, workspace_path.as_deref().map(Path::new))
+        })
+    }
+
+    fn specialist_create(
+        &self,
+        id: String,
+        spec: serde_json::Value,
+        scope: Option<String>,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.specialists_service().create(
+                &id,
+                &spec,
+                scope.as_deref(),
+                workspace_path.as_deref().map(Path::new),
+            )
+        })
+    }
+
+    fn specialist_edit(
+        &self,
+        id: String,
+        spec: serde_json::Value,
+        scope: String,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.specialists_service().edit(
+                &id,
+                &spec,
+                &scope,
+                workspace_path.as_deref().map(Path::new),
+            )
+        })
+    }
+
+    fn specialist_delete(
+        &self,
+        id: String,
+        scope: String,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.specialists_service()
+                .delete(&id, &scope, workspace_path.as_deref().map(Path::new))
+        })
+    }
+
+    fn mcp_servers_list(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.mcp_servers_service()
+                .list(workspace_id.as_ref().map(WorkspaceId::as_str))
+                .await
+        })
+    }
+
+    fn mcp_servers_create(
+        &self,
+        config: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_servers_service().create(config).await })
+    }
+
+    fn mcp_servers_update(
+        &self,
+        server_id: String,
+        config: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_servers_service().update(&server_id, config).await })
+    }
+
+    fn mcp_servers_delete(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_servers_service().delete(&server_id).await })
+    }
+
+    fn mcp_servers_toggle(
+        &self,
+        server_id: String,
+        enabled: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_servers_service().toggle(&server_id, enabled).await })
+    }
+
+    fn mcp_servers_restart(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_servers_service().restart(&server_id).await })
+    }
+
+    fn mcp_servers_get_status(
+        &self,
+        server_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_servers_service().get_status(&server_id).await })
+    }
+
     fn search_in_files(
         &self,
         workspace_id: WorkspaceId,
@@ -1076,16 +1372,17 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
         let registry = self.search_cancels.clone();
+        let services = self.clone();
         Box::pin(async move {
-            // DEFERRAL (M9): the `memories` table does not exist yet. Return an
-            // empty match set (parity-safe, no error) until the store lands.
-            let _ = query;
-            let _ = workspace_id;
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            registry.register(&request_id);
-            registry.unregister(&request_id);
-            Ok(serde_json::json!({ "requestId": request_id, "matches": [] }))
+            let token = registry.register(&request_id);
+            // `workspaceId` is optional: scope to it when present, else span all.
+            let memories = memories::list(&store, workspace_id.as_ref()).await?;
+            let matches = search_ops::memory_matches(&memories, &query);
+            let matches = to_value_vec(matches)?;
+            Ok(services.deliver_search(request_id, workspace_id, matches, token))
         })
     }
 
@@ -2964,7 +3261,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             // TS `ws.git.commit` gates on auto-commit (no userRequested bypass).
-            git_ops::assert_agent_commit_allowed(false)?;
+            git_ops::assert_agent_commit_allowed(&store, false).await?;
             // All commit failures surface as `-32603` (the TS handler wraps the
             // whole path in INTERNAL_ERROR), so a missing workspace is `Internal`.
             let ws = store
@@ -2992,7 +3289,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             // userRequested bypasses the auto-commit gate (TS parity).
-            git_ops::assert_agent_commit_allowed(user_requested)?;
+            git_ops::assert_agent_commit_allowed(&store, user_requested).await?;
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
@@ -4623,7 +4920,7 @@ impl Services {
         stage_unstaged: bool,
     ) -> Result<String> {
         // accept-changes is a user-initiated action → bypass the auto-commit gate.
-        git_ops::assert_agent_commit_allowed(true)?;
+        git_ops::assert_agent_commit_allowed(&self.store, true).await?;
         let message = message
             .filter(|m| !m.trim().is_empty())
             .ok_or_else(|| Error::Internal("Commit message is required".to_string()))?;
@@ -5749,10 +6046,10 @@ pub mod file {}
 pub mod event {}
 
 // Agent-Ecosystem modules (§18).
-pub mod rules {}
-pub mod specialists {}
-pub mod mcp_servers {}
-pub mod memories {}
+mod mcp_servers;
+mod memories;
+mod rules;
+mod specialists;
 
 // Code Changes Review modules (§17).
 mod accept_changes;

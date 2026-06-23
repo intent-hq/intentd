@@ -1443,6 +1443,307 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     // ------------------------------------------------------------------------
+    // settings.* — BE-owned settings namespace (PROTOCOL §5.12, §9.8). Global
+    // (no `workspaceId`); sensitive values are redacted in list/get and never
+    // cross the wire in plaintext.
+    // ------------------------------------------------------------------------
+
+    /// `settings.list`: every setting definition with its (redacted) current
+    /// value — `{ settings: SettingDefinitionWithValue[] }` (PROTOCOL §5.12).
+    fn settings_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::settings_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `settings.get`: one setting as `{ path, value, definition }`; the value is
+    /// redacted when sensitive; unknown path → `-32602` (PROTOCOL §5.12).
+    fn settings_get(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = path;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::settings_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `settings.update`: atomic batch apply of `changes: [{ path, value }]`
+    /// (unknown path / read-only / failed validation → `-32602`, nothing
+    /// applied); returns `{ applied: [{ path, value }] }` redacted and emits
+    /// `settings:changed` on success (PROTOCOL §5.12).
+    fn settings_update(
+        &self,
+        changes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = changes;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::settings_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `settings.reset`: restore a setting's default, returning the redacted
+    /// `{ path, value }` and emitting `settings:changed`; unknown path → `-32602`
+    /// (PROTOCOL §5.12).
+    fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = path;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::settings_reset not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ------------------------------------------------------------------------
+    // rules.* — user-rule overrides + (internal) prompt-injection (§18.1,
+    // PROTOCOL §5.21). `list`/`get` are reads; `update` upserts the user
+    // override. Only user-override entries are editable; file-sourced entries
+    // are read-only over the wire. The injection pipeline that assembles these
+    // into an agent's prompt is internal (§6.8) — not a method here.
+    // ------------------------------------------------------------------------
+
+    /// `rules.list`: all rule sources as `{ rules: RuleSet }` — every
+    /// user-override type with content plus, when `workspace_id` is given, the
+    /// live workspace rule files (read-only) (PROTOCOL §5.21).
+    fn rules_list(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::rules_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `rules.get`: `{ enabled, content, updatedAt }` for one user-override type
+    /// (PROTOCOL §5.21).
+    fn rules_get(
+        &self,
+        workspace_id: WorkspaceId,
+        rule_type: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, rule_type);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::rules_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `rules.update`: upsert a user-override body (+ optional `enabled`),
+    /// re-read the set, and emit `settings:changed`; returns `{ rules: RuleSet }`
+    /// (PROTOCOL §5.21).
+    fn rules_update(
+        &self,
+        workspace_id: WorkspaceId,
+        rule_type: String,
+        content: String,
+        enabled: Option<bool>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, rule_type, content, enabled);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::rules_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ------------------------------------------------------------------------
+    // specialist.* — file-backed specialist definitions (PROTOCOL §5.11,
+    // §18.2). Global (no `workspaceId`); resolved 3-tier project > user >
+    // bundled. `list`/`get` read the resolved view; `create`/`edit`/`delete`
+    // write user/project markdown-with-frontmatter files (`bundled` is
+    // read-only). Nothing is persisted in SQLite.
+    // ------------------------------------------------------------------------
+
+    /// `specialist.list` → `{ specialists: SpecialistDef[] }` (user/project
+    /// files override bundled). An optional `workspace_path` adds the project
+    /// tier (PROTOCOL §5.11).
+    fn specialist_list(
+        &self,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_path;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::specialist_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `specialist.get` → `{ specialist: SpecialistDef }`, the resolved view;
+    /// unknown id → `-32602` (PROTOCOL §5.11).
+    fn specialist_get(
+        &self,
+        id: String,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, workspace_path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::specialist_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `specialist.create` → write a new user/project file (default scope
+    /// `user`); returns `{ specialist: SpecialistDef }` (PROTOCOL §5.11).
+    fn specialist_create(
+        &self,
+        id: String,
+        spec: serde_json::Value,
+        scope: Option<String>,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, spec, scope, workspace_path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::specialist_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `specialist.edit` → overwrite an existing user/project file; returns
+    /// `{ specialist: SpecialistDef }`; missing file → `-32602` (PROTOCOL §5.11).
+    fn specialist_edit(
+        &self,
+        id: String,
+        spec: serde_json::Value,
+        scope: String,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, spec, scope, workspace_path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::specialist_edit not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `specialist.delete` → remove a user/project file; returns
+    /// `{ success: true }`; missing/bundled id → `-32602` (PROTOCOL §5.11).
+    fn specialist_delete(
+        &self,
+        id: String,
+        scope: String,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, scope, workspace_path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::specialist_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ------------------------------------------------------------------------
+    // mcp.servers.* — external MCP-server lifecycle/config (PROTOCOL §5.22,
+    // §18.3). Config lives in the **sensitive** `mcp.servers` setting (`env`/
+    // `headers` redacted over the wire); runtime status is not persisted and
+    // transitions push `mcp.servers:status-changed`. Distinct from the §6.8
+    // agent→BE callback.
+    // ------------------------------------------------------------------------
+
+    /// `mcp.servers.list` → `{ servers: McpServerConfig[] }` — configured
+    /// external servers with sensitive `env`/`headers` redacted (PROTOCOL §5.22).
+    fn mcp_servers_list(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_servers_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.servers.create` → add a server definition; returns
+    /// `{ server: McpServerConfig }` (redacted) (PROTOCOL §5.22).
+    fn mcp_servers_create(
+        &self,
+        config: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = config;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_servers_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.servers.update` → edit an existing definition; returns
+    /// `{ server: McpServerConfig }` (redacted) (PROTOCOL §5.22).
+    fn mcp_servers_update(
+        &self,
+        server_id: String,
+        config: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (server_id, config);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_servers_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.servers.delete` → remove a definition (stopping it first); returns
+    /// `{ success: true }` (PROTOCOL §5.22).
+    fn mcp_servers_delete(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = server_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_servers_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.servers.toggle` → enable (start) / disable (stop) a server; returns
+    /// `{ status: McpServerStatus }` (PROTOCOL §5.22).
+    fn mcp_servers_toggle(
+        &self,
+        server_id: String,
+        enabled: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (server_id, enabled);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_servers_toggle not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.servers.restart` → stop-then-start a server; returns
+    /// `{ status: McpServerStatus }` (PROTOCOL §5.22).
+    fn mcp_servers_restart(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = server_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_servers_restart not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.servers.getStatus` → point read of one server's live status as
+    /// `{ status: McpServerStatus }` (PROTOCOL §5.22).
+    fn mcp_servers_get_status(
+        &self,
+        server_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = server_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_servers_get_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ------------------------------------------------------------------------
     // accept-changes.* — commit→push→PR→merge orchestration (PROTOCOL §5.18).
     // ------------------------------------------------------------------------
 
@@ -1625,8 +1926,8 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `search.memories`: substring search over the BE memories store. The
-    /// `memories` table is not created until M9; until then this returns an
+    /// `search.memories`: substring search over the BE memories store (§9.2).
+    /// Returns `{ requestId, matches: MemoryMatch[] }`; an empty store yields an
     /// empty match set (parity-safe, no error) (PROTOCOL §5.15).
     fn search_memories(
         &self,

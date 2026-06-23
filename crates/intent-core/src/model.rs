@@ -1325,6 +1325,23 @@ pub struct Draft {
     pub updated_at: String,
 }
 
+/// Long-term agent memory row (§9.2, §9.12, §18.5). Persisted to the `memories`
+/// table and surfaced to agents internally (no `memories.*` RPC in v1); a `null`
+/// `workspaceId` denotes a global memory. `search.memories` (§5.15) reads this.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Memory {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<WorkspaceId>,
+    pub content: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

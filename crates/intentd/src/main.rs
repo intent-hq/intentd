@@ -219,6 +219,13 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
     // family. Disabled entirely when `events.streamRetentionHours == 0`.
     let retention_task =
         spawn_stream_retention_loop(retention_store, config.stream_retention_hours);
+    // External MCP servers (§18.3): start every enabled, non-disabled server,
+    // then run the health monitor (periodic ping + auto-restart pushing
+    // `mcp.servers:status-changed`). The hub is reaped on shutdown so no orphan
+    // server processes remain (PTY-host reaping parity).
+    services.start_enabled_mcp_servers().await;
+    let mcp_hub = services.mcp_hub();
+    let mcp_monitor = mcp_hub.spawn_health_monitor();
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     // Start a filesystem watcher per active workspace with a resolvable on-disk
     // path; each publishes debounced `file:changed` events to the shared bus.
@@ -295,6 +302,10 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
     if let Some(retention_task) = retention_task {
         retention_task.abort();
     }
+    // Stop the MCP health monitor and reap every external MCP server's process
+    // group so no orphan stdio servers survive the daemon (§18.3).
+    mcp_monitor.abort();
+    mcp_hub.shutdown().await;
     manager.shutdown().await;
     Ok(())
 }

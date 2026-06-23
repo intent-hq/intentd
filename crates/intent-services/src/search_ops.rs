@@ -6,10 +6,10 @@
 
 use std::path::PathBuf;
 
-use intent_core::{AgentSession, Error, Event, Note, Result, WorkspaceId};
+use intent_core::{AgentSession, Error, Event, Memory, Note, Result, WorkspaceId};
 use intent_search::{
     contains_ci, extract_symbol, make_preview, CodebaseMatch, ContentSearchResult, EventMatch,
-    MessageMatch, NoteMatch,
+    MemoryMatch, MessageMatch, NoteMatch,
 };
 use intent_store::Store;
 use serde_json::Value;
@@ -136,6 +136,24 @@ pub(crate) fn note_matches(notes: &[Note], query: &str) -> Vec<NoteMatch> {
         out.push(NoteMatch {
             note_id: note.id.as_str().to_string(),
             preview: make_preview(&text, query),
+            score: None,
+        });
+    }
+    out
+}
+
+/// Build `search.memories` matches over the memories store (§5.15). The
+/// searchable text is the memory content; the workspace scoping is applied by
+/// the caller's store query.
+pub(crate) fn memory_matches(memories: &[Memory], query: &str) -> Vec<MemoryMatch> {
+    let mut out = Vec::new();
+    for memory in memories {
+        if !contains_ci(&memory.content, query) {
+            continue;
+        }
+        out.push(MemoryMatch {
+            memory_id: memory.id.clone(),
+            preview: make_preview(&memory.content, query),
             score: None,
         });
     }
