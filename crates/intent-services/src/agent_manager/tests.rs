@@ -6,10 +6,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use intent_acp::{Connection, ConnectionHooks, EventSink};
-use intent_core::{AgentId, WorkspaceId};
+use intent_acp::{Connection, ConnectionHooks, EventSink, IncomingNotification};
+use intent_core::{
+    now_iso, AgentId, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
+    WorkspaceId, WorkspaceStatus,
+};
 use intent_store::Store;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, Mutex as TokioMutex};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use super::{
@@ -453,4 +459,260 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         diffs[0].hunks_json.contains("CHANGED"),
         "extracted hunks carry the new line"
     );
+}
+
+const MGR_ACP_SID: &str = "mgr-acp-new";
+
+/// Configurable mock agent: `initialize` advertises `loadSession` per `load_cap`;
+/// `session/new` mints [`MGR_ACP_SID`]; `session/load` succeeds; everything else
+/// (e.g. `authenticate`) resolves with `{}`.
+fn spawn_cfg_mock_agent<R, W>(read: R, write: W, load_cap: bool) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": load_cap } })
+                }
+                "session/new" => json!({ "sessionId": MGR_ACP_SID }),
+                "session/load" => json!({}),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// Track a handle wired to a configurable mock agent (parity with `create_agent`
+/// minus a real child), returning the agent task handle.
+fn track_mock_agent(mgr: &AgentManager, id: &AgentId, load_cap: bool) -> JoinHandle<()> {
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent = spawn_cfg_mock_agent(c2a_agent, a2c_agent, load_cap);
+    let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
+    let connection = Arc::new(Connection::new(
+        c2a_client,
+        a2c_client,
+        None,
+        ConnectionHooks {
+            notifications: Some(note_tx),
+            ..ConnectionHooks::default()
+        },
+    ));
+    mgr.handles.lock().unwrap().insert(
+        id.clone(),
+        AgentHandle {
+            connection,
+            notifications: Arc::new(TokioMutex::new(note_rx)),
+            serve_task: tokio::spawn(async {}),
+            _child: None,
+            _mcp_bridge: None,
+            _mcp_config: None,
+            _rules_config: None,
+        },
+    );
+    mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
+    agent
+}
+
+/// A test provider that skips `authenticate` (deterministic handshake).
+fn test_provider() -> intent_providers::ProviderConfig {
+    intent_providers::ProviderConfig {
+        supports_authenticate: false,
+        ..*intent_providers::provider_config(intent_providers::default_provider_id())
+    }
+}
+
+async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
+    let ts = now_iso();
+    let workspace = Workspace {
+        id: ws.clone(),
+        title: "WS".to_string(),
+        branch: "main".to_string(),
+        base_ref: None,
+        base_commit_sha: None,
+        status: WorkspaceStatus::Active,
+        status_message: None,
+        activity: WorkspaceActivity::Idle,
+        attention: WorkspaceAttention::None,
+        created_at: ts.clone(),
+        updated_at: ts.clone(),
+        last_activity: None,
+        tags: vec![],
+        path: None,
+        repository_path: None,
+        repository_owner: None,
+        repository_name: None,
+        worktree_path: None,
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
+        archived: false,
+        archived_at: None,
+    };
+    let session = AgentSession {
+        id: id.clone(),
+        workspace_id: ws.clone(),
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Builder".to_string(),
+        name_explicitly_set: false,
+        model: None,
+        provider: None,
+        system_prompt: None,
+        status: AgentStatus::Pending,
+        is_active: true,
+        messages: Vec::new(),
+        stats: None,
+        created_at: ts.clone(),
+        updated_at: ts,
+    };
+    mgr.services
+        .store
+        .insert_workspace(&workspace)
+        .await
+        .expect("insert ws");
+    mgr.services
+        .store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert session");
+}
+
+#[tokio::test]
+async fn start_session_opens_first_session_without_recreate_flag() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-new"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+
+    let sid = mgr
+        .start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect("first session");
+    assert_eq!(sid, MGR_ACP_SID);
+    assert!(!mgr.take_recreated(&id), "brand-new agent is not flagged");
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(stored.acp_session_id.as_deref(), Some(MGR_ACP_SID));
+}
+
+#[tokio::test]
+async fn start_session_resumes_when_load_supported() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-resume"));
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_acp_session_id(&id, "existing-id")
+        .await
+        .unwrap();
+    let _agent = track_mock_agent(&mgr, &id, true);
+
+    let sid = mgr
+        .start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect("resume");
+    assert_eq!(sid, "existing-id", "session/load resumes the stored id");
+    assert!(!mgr.take_recreated(&id), "resume needs no history resend");
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(stored.acp_session_id.as_deref(), Some("existing-id"));
+}
+
+#[tokio::test]
+async fn start_session_recreates_and_flags_when_load_unsupported() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-recreate"));
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_acp_session_id(&id, "stale-id")
+        .await
+        .unwrap();
+    let _agent = track_mock_agent(&mgr, &id, false);
+
+    let sid = mgr
+        .start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect("recreate");
+    assert_eq!(sid, MGR_ACP_SID, "fresh session replaces the lost id");
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(stored.acp_session_id.as_deref(), Some(MGR_ACP_SID));
+    // The recreate flag is set so the next turn resends history; take() clears it.
+    assert!(mgr.take_recreated(&id), "recreate flags a history resend");
+    assert!(!mgr.take_recreated(&id), "flag is cleared once taken");
+}
+
+#[tokio::test]
+async fn build_turn_prompt_prepends_history_once_after_recreate() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-hist"));
+    seed_agent(&mgr, &ws, &id).await;
+    // Prior transcript + the just-persisted current user message (the last row).
+    for (role, text) in [
+        ("user", "first question"),
+        ("assistant", "first answer"),
+        ("user", "current message"),
+    ] {
+        mgr.services
+            .store
+            .append_agent_message(
+                &id,
+                role,
+                &json!([{ "type": "text", "text": text }]),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+    }
+    mgr.recreated.lock().unwrap().insert(id.clone());
+
+    let prompt = mgr.build_turn_prompt(&id, "current message").await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(text.contains("<supervisor>"), "history XML is prepended");
+    assert!(text.contains("first question"));
+    assert!(text.contains("first answer"));
+    assert!(
+        !text.contains("<text>current message</text>"),
+        "current message is excluded from the rendered history"
+    );
+    assert!(
+        text.trim_end().ends_with("current message"),
+        "ends with the live prompt"
+    );
+
+    // The flag is consumed: a follow-up turn sends only the message text.
+    let plain = mgr.build_turn_prompt(&id, "next message").await;
+    let plain_text = serde_json::to_value(&plain).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(plain_text, "next message");
 }

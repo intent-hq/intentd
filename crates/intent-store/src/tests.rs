@@ -830,6 +830,41 @@ async fn agent_acp_session_id_is_write_once() {
 }
 
 #[tokio::test]
+async fn replace_acp_session_id_overwrites_existing() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+
+    // Replacing a write-once id is exactly the resume-impossible fallback: the
+    // explicit replace path overwrites where `set_acp_session_id` would reject.
+    store
+        .set_acp_session_id(&agent_id, "acp-1")
+        .await
+        .expect("first set");
+    store
+        .replace_acp_session_id(&agent_id, "acp-2")
+        .await
+        .expect("replace overwrites");
+    let stored = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(stored.acp_session_id.as_deref(), Some("acp-2"));
+
+    // A missing session surfaces NotFound rather than a silent no-op.
+    assert!(store
+        .replace_acp_session_id(&AgentId::new(), "acp-x")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn agent_provider_is_immutable_once_set() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");

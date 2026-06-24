@@ -86,6 +86,28 @@ impl Services {
         Ok(acp_session_id)
     }
 
+    /// Open a FRESH ACP session that REPLACES a lost/unsupported stored id (the
+    /// resume-impossible fallback): `session/new` then overwrite the persisted
+    /// `acpSessionId` via the explicit replace path. Unlike [`open_acp_session`]
+    /// (write-once first-set) this is used ONLY when resume is impossible —
+    /// `loadSession` unsupported or `session/load` failed (§6.5).
+    pub async fn recreate_acp_session(
+        &self,
+        conn: &Connection,
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<String> {
+        let resp = session::new_session(conn, cwd, mcp_servers)
+            .await
+            .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
+        let acp_session_id = resp.session_id.0.to_string();
+        self.store
+            .replace_acp_session_id(agent_id, &acp_session_id)
+            .await?;
+        Ok(acp_session_id)
+    }
+
     /// Resume the agent's persisted `acpSessionId` via `session/load`, but only
     /// when one was stored and the agent advertised the `loadSession` capability.
     /// Returns the resumed id, or `None` when resume is not possible (§6.5).

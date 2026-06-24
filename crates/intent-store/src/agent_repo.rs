@@ -138,6 +138,22 @@ impl Store {
         Ok(())
     }
 
+    /// Replace `acp_session_id` unconditionally, overwriting any existing value.
+    /// Unlike [`Store::set_acp_session_id`] (write-once), this is used ONLY on
+    /// the resume-impossible fallback, where a fresh `session/new` replaces a
+    /// lost ACP session id (§6.5). `NotFound` if the session is absent.
+    pub async fn replace_acp_session_id(&self, id: &AgentId, acp_session_id: &str) -> Result<()> {
+        // Ensure the session exists (surfaces NotFound rather than a silent no-op).
+        let _ = self.get_agent_session(id).await?;
+        sqlx::query("UPDATE agent_session SET acp_session_id=? WHERE id=?")
+            .bind(acp_session_id)
+            .bind(&id.0)
+            .execute(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("replace acp session id failed: {e}")))?;
+        Ok(())
+    }
+
     /// Delete an agent session and its message log (the `agent_message` rows
     /// cascade). Returns whether a row was removed (`agent.delete`, §5.5).
     pub async fn delete_agent_session(&self, id: &AgentId) -> Result<bool> {

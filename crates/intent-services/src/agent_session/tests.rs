@@ -340,3 +340,24 @@ async fn resume_requires_capability_and_stored_id() {
         Some(ACP_SID.to_string())
     );
 }
+
+#[tokio::test]
+async fn recreate_acp_session_replaces_stored_id() {
+    let (_tmp, services, bus, agent_id, _ws) = setup().await;
+    let (conn, _rx, _agent) = connect();
+
+    // A stale id is persisted (the resume-impossible fallback case).
+    bus.store()
+        .set_acp_session_id(&agent_id, "stale-id")
+        .await
+        .unwrap();
+
+    // recreate opens a fresh session and overwrites the write-once id.
+    let sid = services
+        .recreate_acp_session(&conn, &agent_id, "/tmp/ws", Vec::new())
+        .await
+        .expect("recreate session");
+    assert_eq!(sid, ACP_SID);
+    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
+}

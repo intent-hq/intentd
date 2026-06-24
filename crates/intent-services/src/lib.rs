@@ -43,6 +43,7 @@ mod drafts;
 mod event_ops;
 pub mod events;
 mod git_ops;
+mod history_xml;
 mod note_ops;
 mod pr_ops;
 mod script_ops;

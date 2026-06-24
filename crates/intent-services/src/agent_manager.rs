@@ -533,6 +533,12 @@ pub struct AgentManager {
     /// Abortable background turn workers, keyed by agent. `stop`/`forceMessage`
     /// abort the in-flight worker (interrupting the current stream).
     workers: Arc<Mutex<HashMap<AgentId, JoinHandle<()>>>>,
+    /// Agents whose ACP session was recreated (the resume-impossible fallback in
+    /// [`AgentManager::start_session`] replaced a lost `acpSessionId` with a fresh
+    /// `session/new`). The next turn prepends the prior conversation history as
+    /// `<supervisor>` XML so the fresh session has context, then clears the flag
+    /// (parity: TS `sessionWasRecreated`).
+    recreated: Arc<Mutex<HashSet<AgentId>>>,
 }
 
 impl AgentManager {
@@ -550,6 +556,7 @@ impl AgentManager {
             busy: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
+            recreated: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -738,10 +745,21 @@ impl AgentManager {
         to_auggie_mcp_config(&servers)
     }
 
-    /// Complete the connection handshake and open an ACP session for a spawned
-    /// agent (the agent→BE MCP server is delivered out-of-band via the generated
-    /// `--mcp-config`, so `session/new` carries no `mcpServers`). Returns the
-    /// persisted `acpSessionId` to drive [`AgentManager::run_turn`].
+    /// Complete the connection handshake and establish an ACP session for a
+    /// spawned agent (the agent→BE MCP server is delivered out-of-band via the
+    /// generated `--mcp-config`, so `session/new` carries no `mcpServers`). On a
+    /// daemon respawn the agent may already have a persisted `acpSessionId`:
+    ///
+    /// 1. Resume it via `session/load` when the agent advertised `loadSession` —
+    ///    the agent keeps its prior context, so no history resend is needed.
+    /// 2. Otherwise (no `loadSession`, or `session/load` failed) fall back to a
+    ///    fresh `session/new` that REPLACES the lost id (relaxing the write-once
+    ///    invariant only here) and flag the agent so the next turn resends the
+    ///    prior conversation history as `<supervisor>` XML.
+    /// 3. With no persisted id (a brand-new agent) open a first session and
+    ///    persist it write-once.
+    ///
+    /// Returns the `acpSessionId` to drive [`AgentManager::run_turn`] (§6.5).
     pub async fn start_session(
         &self,
         agent_id: &AgentId,
@@ -755,12 +773,88 @@ impl AgentManager {
                 .connection
                 .clone()
         };
-        handshake(conn.as_ref(), provider)
+        let handshake = handshake(conn.as_ref(), provider)
             .await
             .map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
+
+        // Whether a prior session id is persisted decides the no-resume branch:
+        // a brand-new agent (no id) opens a first session; an agent with a lost
+        // id recreates and resends history.
+        let had_stored = self
+            .services
+            .store
+            .get_agent_session(agent_id)
+            .await?
+            .acp_session_id
+            .is_some();
+
+        // 1) Try to resume the persisted session (gated on stored id + capability).
+        match self
+            .services
+            .resume_acp_session(
+                conn.as_ref(),
+                &handshake.initialize,
+                agent_id,
+                cwd.clone(),
+                Vec::new(),
+            )
+            .await
+        {
+            Ok(Some(acp_session_id)) => return Ok(acp_session_id),
+            Ok(None) => {}
+            // `session/load` was attempted but failed → fall through to recreate.
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "session/load failed; recreating");
+            }
+        }
+
+        // 2) Resume impossible but a session existed → recreate + flag for resend.
+        if had_stored {
+            let acp_session_id = self
+                .services
+                .recreate_acp_session(conn.as_ref(), agent_id, cwd, Vec::new())
+                .await?;
+            self.recreated.lock().unwrap().insert(agent_id.clone());
+            return Ok(acp_session_id);
+        }
+
+        // 3) Brand-new agent → open and persist the first session (write-once).
         self.services
             .open_acp_session(conn.as_ref(), agent_id, cwd, Vec::new())
             .await
+    }
+
+    /// Take (clear) the recreate flag for `agent_id`: `true` when the agent's ACP
+    /// session was recreated by the resume-impossible fallback since the last
+    /// turn, meaning the next prompt must resend the prior conversation history.
+    fn take_recreated(&self, agent_id: &AgentId) -> bool {
+        self.recreated.lock().unwrap().remove(agent_id)
+    }
+
+    /// Build the prompt blocks for an agent's next turn. Normally just the user
+    /// `content`; but when the ACP session was recreated (the resume-impossible
+    /// fallback), prepend the prior conversation history as `<supervisor>` XML so
+    /// the fresh session has context, then clear the flag (parity: TS
+    /// `sessionWasRecreated` → `formatHistoryAsXml`). The just-persisted current
+    /// user message is excluded from the rendered history.
+    async fn build_turn_prompt(&self, agent_id: &AgentId, content: &str) -> Vec<ContentBlock> {
+        if !self.take_recreated(agent_id) {
+            return text_prompt(content);
+        }
+        let messages = self
+            .services
+            .store
+            .get_agent_messages(agent_id, None)
+            .await
+            .unwrap_or_default();
+        // The current user message was already appended → render all but the last.
+        let prior = messages.split_last().map(|(_, rest)| rest).unwrap_or(&[]);
+        if prior.is_empty() {
+            return text_prompt(content);
+        }
+        let history_xml =
+            crate::history_xml::format_history_as_xml(prior, crate::history_xml::MAX_HISTORY_CHARS);
+        text_prompt(&format!("{history_xml}\n\n{content}"))
     }
 
     /// Drive one `session/prompt` turn for `agent_id`, marking it active for the
@@ -806,6 +900,9 @@ impl AgentManager {
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
         }
+        // Drop any pending recreate flag: the next spawn re-decides resume vs
+        // recreate from scratch, so a stale flag must not survive a teardown.
+        self.recreated.lock().unwrap().remove(agent_id);
         self.end_turn(agent_id).await;
         let handle = self.handles.lock().unwrap().remove(agent_id);
         let removed = handle.is_some();
@@ -1230,13 +1327,9 @@ async fn run_message_worker(
     'outer: loop {
         match mgr.ensure_started(&agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
+                let prompt = mgr.build_turn_prompt(&agent_id, &content).await;
                 if let Err(e) = mgr
-                    .run_turn(
-                        &agent_id,
-                        &workspace_id,
-                        &acp_session_id,
-                        text_prompt(&content),
-                    )
+                    .run_turn(&agent_id, &workspace_id, &acp_session_id, prompt)
                     .await
                 {
                     tracing::warn!(agent = %agent_id, error = %e, "agent turn failed");
