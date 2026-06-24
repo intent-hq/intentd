@@ -137,6 +137,10 @@ pub struct Services {
     /// `mcp.servers:status-changed`. Shared across clones (and with the
     /// composition root, which spawns the monitor + reaps on shutdown).
     mcp_hub: Arc<McpHub>,
+    /// Context engine backing `search.codebase` retrieval (§8). Defaults to the
+    /// `auggie`-backed engine; `search.codebase` falls back to the ripgrep/symbol
+    /// path when the engine is `Unavailable` (§8.3). Shared across clones.
+    context_engine: Arc<dyn intent_context::ContextEngine>,
 }
 
 impl Services {
@@ -159,7 +163,17 @@ impl Services {
             specialists_user_dir: None,
             specialists_bundled_dir: None,
             mcp_hub: Arc::new(McpHub::new()),
+            context_engine: Arc::new(intent_context::AuggieContextEngine::new()),
         }
+    }
+
+    /// Override the context engine backing `search.codebase` (§8). The
+    /// composition root keeps the `auggie`-backed default; tests inject a fake
+    /// engine to exercise the engine-available and graceful-degradation paths
+    /// (§8.3).
+    pub fn with_context_engine(mut self, engine: Arc<dyn intent_context::ContextEngine>) -> Self {
+        self.context_engine = engine;
+        self
     }
 
     /// Override the [`SecretStore`] backing sensitive settings (§9.8). The
@@ -1413,6 +1427,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let registry = self.search_cancels.clone();
+        let engine = self.context_engine.clone();
         let services = self.clone();
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
@@ -1421,6 +1436,39 @@ impl WorkspaceApi for Services {
                 None => return Ok(serde_json::json!({ "requestId": request_id, "matches": [] })),
             };
             let token = registry.register(&request_id);
+
+            // Prefer the context engine when it is available, mapping its hits
+            // to `CodebaseMatch` (§5.15 parity). When the engine is `Unavailable`
+            // — or a retrieval errors — degrade to the ripgrep/symbol path rather
+            // than failing the search (§8.3).
+            if let intent_core::EngineAvailability::Available { .. } = engine.availability().await {
+                let req = intent_core::RetrieveRequest {
+                    workspace_id: workspace_id.clone(),
+                    workspace_path: root.clone(),
+                    query: query.clone(),
+                    max_results: None,
+                };
+                match engine.retrieve(req).await {
+                    Ok(result) => {
+                        let matches = search_ops::engine_matches(&result);
+                        let matches = to_value_vec(matches)?;
+                        return Ok(services.deliver_search(
+                            request_id,
+                            Some(workspace_id),
+                            matches,
+                            token,
+                        ));
+                    }
+                    Err(intent_core::ContextError::Unavailable { .. }) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "context engine retrieval failed; falling back to ripgrep"
+                        );
+                    }
+                }
+            }
+
             let opts = intent_search::SearchOpts::default();
             let outcome = {
                 let token = token.clone();

@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use intent_core::{AgentSession, Error, Event, Memory, Note, Result, WorkspaceId};
+use intent_core::{AgentSession, Error, Event, Memory, Note, Result, RetrieveResult, WorkspaceId};
 use intent_search::{
     contains_ci, extract_symbol, make_preview, CodebaseMatch, ContentSearchResult, EventMatch,
     MemoryMatch, MessageMatch, NoteMatch,
@@ -177,6 +177,23 @@ pub(crate) fn codebase_matches(content: &ContentSearchResult) -> Vec<CodebaseMat
                 preview: m.preview.clone(),
                 score: Some(score),
             }
+        })
+        .collect()
+}
+
+/// Map context-engine retrieval hits into `search.codebase` matches, preserving
+/// the engine's file/symbol/line/preview and optional relevance `score` (§5.15
+/// parity; engine hits may carry a `score`).
+pub(crate) fn engine_matches(result: &RetrieveResult) -> Vec<CodebaseMatch> {
+    result
+        .items
+        .iter()
+        .map(|item| CodebaseMatch {
+            file: item.file.clone(),
+            symbol: item.symbol.clone(),
+            line: item.line,
+            preview: item.preview.clone(),
+            score: item.score,
         })
         .collect()
 }
