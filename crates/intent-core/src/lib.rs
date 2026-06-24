@@ -26,7 +26,7 @@ pub use model::{
     CommentThreadSummary, CommentType, CommentWire, ContentType, Draft, Event, EventActor,
     EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus,
     GitAgentCommitResult, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts,
-    GitStatus, Memory, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
+    GitStatus, KnownRepo, Memory, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
     NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteSetContentResult,
     NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, PullRequestInfo,
     PullRequestStatus, ReadAssetResult, Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState,

@@ -1352,6 +1352,25 @@ pub struct Memory {
     pub updated_at: Option<String>,
 }
 
+/// A persistently-registered repository (parity with the TS `KnownRepo`). Backs
+/// the `repo.list` method that populates the Create-Workspace picker. Timestamps
+/// are ISO-8601 strings; `owner` is omitted from the wire when absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownRepo {
+    /// Absolute path to the repository.
+    pub path: String,
+    /// Repository name (typically the folder name).
+    pub name: String,
+    /// GitHub organization or user who owns this repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// ISO timestamp of when this repo was first added.
+    pub added_at: String,
+    /// ISO timestamp of when this repo was last used (workspace created).
+    pub last_used_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1420,6 +1439,37 @@ mod tests {
         );
         let back: Event = serde_json::from_value(wire).unwrap();
         assert_eq!(back, event);
+    }
+
+    #[test]
+    fn known_repo_wire_shape_matches_ts() {
+        // Mirrors `KnownRepo` in src/shared/types/known-repo.ts: camelCase
+        // `addedAt`/`lastUsedAt`, and `owner` omitted when absent.
+        let with_owner = KnownRepo {
+            path: "/Users/me/src/intent".to_string(),
+            name: "intent".to_string(),
+            owner: Some("cloudlands-ai".to_string()),
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            last_used_at: "2026-01-02T00:00:00Z".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&with_owner).unwrap(),
+            json!({
+                "path": "/Users/me/src/intent",
+                "name": "intent",
+                "owner": "cloudlands-ai",
+                "addedAt": "2026-01-01T00:00:00Z",
+                "lastUsedAt": "2026-01-02T00:00:00Z"
+            })
+        );
+        // `owner: None` omits the key entirely (no `null`).
+        let no_owner = KnownRepo {
+            owner: None,
+            ..with_owner.clone()
+        };
+        let wire = serde_json::to_value(&no_owner).unwrap();
+        assert!(wire.get("owner").is_none());
+        assert_eq!(serde_json::from_value::<KnownRepo>(wire).unwrap(), no_owner);
     }
 
     #[test]
