@@ -339,6 +339,10 @@ async fn resume_requires_capability_and_stored_id() {
             .unwrap(),
         Some(ACP_SID.to_string())
     );
+
+    // A successful resume keeps the stored id canonical (no overwrite).
+    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
 }
 
 #[tokio::test]
@@ -352,12 +356,23 @@ async fn recreate_acp_session_replaces_stored_id() {
         .await
         .unwrap();
 
-    // recreate opens a fresh session and overwrites the write-once id.
+    // recreate opens a fresh session and CAS-swaps the lost id for the new one.
     let sid = services
-        .recreate_acp_session(&conn, &agent_id, "/tmp/ws", Vec::new())
+        .recreate_acp_session(&conn, &agent_id, "stale-id", "/tmp/ws", Vec::new())
         .await
         .expect("recreate session");
     assert_eq!(sid, ACP_SID);
+    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
+
+    // No-clobber: recreating again with a stale expected-old reuses the stored
+    // canonical id rather than overwriting it (a second session/new is opened
+    // but the CAS declines to swap).
+    let sid = services
+        .recreate_acp_session(&conn, &agent_id, "stale-id", "/tmp/ws", Vec::new())
+        .await
+        .expect("recreate session");
+    assert_eq!(sid, ACP_SID, "diverged expected-old keeps the canonical id");
     let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
     assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
 }

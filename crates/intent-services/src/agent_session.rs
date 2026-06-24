@@ -87,25 +87,30 @@ impl Services {
     }
 
     /// Open a FRESH ACP session that REPLACES a lost/unsupported stored id (the
-    /// resume-impossible fallback): `session/new` then overwrite the persisted
-    /// `acpSessionId` via the explicit replace path. Unlike [`open_acp_session`]
-    /// (write-once first-set) this is used ONLY when resume is impossible —
-    /// `loadSession` unsupported or `session/load` failed (§6.5).
+    /// resume-impossible fallback): `session/new` then compare-and-swap the
+    /// persisted `acpSessionId` from `expected_old` (the id we just failed to
+    /// load) to the fresh one. Unlike [`open_acp_session`] (write-once first-set)
+    /// this is used ONLY when resume is impossible — `loadSession` unsupported or
+    /// `session/load` failed (§6.5). The CAS keeps the id canonical: if a
+    /// concurrent recreate already swapped it, the stored value is returned and
+    /// reused instead of being clobbered. Returns the canonical `acpSessionId`.
     pub async fn recreate_acp_session(
         &self,
         conn: &Connection,
         agent_id: &AgentId,
+        expected_old: &str,
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<String> {
         let resp = session::new_session(conn, cwd, mcp_servers)
             .await
             .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
-        let acp_session_id = resp.session_id.0.to_string();
-        self.store
-            .replace_acp_session_id(agent_id, &acp_session_id)
+        let new_acp_session_id = resp.session_id.0.to_string();
+        let canonical = self
+            .store
+            .replace_acp_session_id(agent_id, expected_old, &new_acp_session_id)
             .await?;
-        Ok(acp_session_id)
+        Ok(canonical)
     }
 
     /// Resume the agent's persisted `acpSessionId` via `session/load`, but only

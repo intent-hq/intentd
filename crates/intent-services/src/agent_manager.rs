@@ -721,6 +721,20 @@ impl AgentManager {
             _mcp_config: mcp_config,
             _rules_config: rules_config,
         };
+        // Concurrency safety: fully reap any stale handle + child for this agent
+        // BEFORE installing the new one, reusing the process-group teardown.
+        // A bare `insert` would only drop the old handle (aborting its serve
+        // loop, with `kill_on_drop` reaping just the direct child) — orphaning
+        // grandchildren and risking a lingering streamer from a lost/old session
+        // that could keep appending to the agentId-keyed transcript. The
+        // per-agent single-flight slot serializes turns; this closes the
+        // respawn-time window. (Drop the lock before awaiting the kill.)
+        let stale = self.handles.lock().unwrap().remove(&agent_id);
+        if let Some(mut stale) = stale {
+            if let Some(child) = stale._child.take() {
+                kill_child_tree(child).await;
+            }
+        }
         self.handles.lock().unwrap().insert(agent_id, handle);
         Ok(())
     }
@@ -777,16 +791,15 @@ impl AgentManager {
             .await
             .map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
 
-        // Whether a prior session id is persisted decides the no-resume branch:
-        // a brand-new agent (no id) opens a first session; an agent with a lost
-        // id recreates and resends history.
-        let had_stored = self
+        // The persisted id (if any) decides the no-resume branch: a brand-new
+        // agent (no id) opens a first session; an agent with a lost id recreates
+        // (CAS-replacing exactly this id) and resends history.
+        let stored_id = self
             .services
             .store
             .get_agent_session(agent_id)
             .await?
-            .acp_session_id
-            .is_some();
+            .acp_session_id;
 
         // 1) Try to resume the persisted session (gated on stored id + capability).
         match self
@@ -809,10 +822,16 @@ impl AgentManager {
         }
 
         // 2) Resume impossible but a session existed → recreate + flag for resend.
-        if had_stored {
+        // The fresh `session/new` runs on the child just spawned for this turn
+        // (the lost session's child, if any, was already reaped before the
+        // respawn — see `create_agent`'s defensive teardown), so no streamer from
+        // the old session can append to the agentId-keyed transcript. The CAS
+        // replace keeps the id canonical, swapping only the exact id we failed to
+        // load.
+        if let Some(expected_old) = stored_id {
             let acp_session_id = self
                 .services
-                .recreate_acp_session(conn.as_ref(), agent_id, cwd, Vec::new())
+                .recreate_acp_session(conn.as_ref(), agent_id, &expected_old, cwd, Vec::new())
                 .await?;
             self.recreated.lock().unwrap().insert(agent_id.clone());
             return Ok(acp_session_id);

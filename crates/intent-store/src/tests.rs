@@ -830,7 +830,7 @@ async fn agent_acp_session_id_is_write_once() {
 }
 
 #[tokio::test]
-async fn replace_acp_session_id_overwrites_existing() {
+async fn replace_acp_session_id_is_no_clobber_cas() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
@@ -844,22 +844,34 @@ async fn replace_acp_session_id_overwrites_existing() {
         .await
         .expect("insert session");
 
-    // Replacing a write-once id is exactly the resume-impossible fallback: the
-    // explicit replace path overwrites where `set_acp_session_id` would reject.
     store
         .set_acp_session_id(&agent_id, "acp-1")
         .await
         .expect("first set");
-    store
-        .replace_acp_session_id(&agent_id, "acp-2")
+
+    // CAS no-clobber: a stale expected-old does NOT overwrite the canonical id;
+    // the stored value is returned for the caller to reuse.
+    let kept = store
+        .replace_acp_session_id(&agent_id, "wrong-old", "acp-2")
         .await
-        .expect("replace overwrites");
+        .expect("cas returns canonical");
+    assert_eq!(kept, "acp-1", "diverged expected-old reuses the stored id");
+    let stored = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(stored.acp_session_id.as_deref(), Some("acp-1"));
+
+    // CAS swap: a matching expected-old replaces with the fresh id (the
+    // resume-impossible fallback, where `set_acp_session_id` would reject).
+    let swapped = store
+        .replace_acp_session_id(&agent_id, "acp-1", "acp-2")
+        .await
+        .expect("cas swaps on match");
+    assert_eq!(swapped, "acp-2");
     let stored = store.get_agent_session(&agent_id).await.expect("get");
     assert_eq!(stored.acp_session_id.as_deref(), Some("acp-2"));
 
     // A missing session surfaces NotFound rather than a silent no-op.
     assert!(store
-        .replace_acp_session_id(&AgentId::new(), "acp-x")
+        .replace_acp_session_id(&AgentId::new(), "acp-2", "acp-x")
         .await
         .is_err());
 }
