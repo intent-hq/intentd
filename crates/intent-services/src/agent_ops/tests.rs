@@ -343,14 +343,70 @@ async fn subscribe_then_unsubscribe_roundtrips() {
     assert!(matches!(err, Error::Internal(_)));
 }
 
+/// A delegated caller (child whose `parentAgentId` is set) delivers the report
+/// to the parent via the send-message path and returns the TS-shaped result.
 #[tokio::test]
-async fn report_to_parent_rejects_non_delegated() {
+async fn report_to_parent_delivers_for_delegated_caller() {
     let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let created = svc
+        .agent_create_op(ws.clone(), Some("Child".into()), None, Some(parent.clone()))
+        .await
+        .expect("create delegated child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let report = "done: shipped the thing";
+    let result = svc
+        .agent_report_to_parent_op(ws.clone(), json!(report), Some(child))
+        .await
+        .expect("report delivered");
+    assert_eq!(result["ok"], json!(true));
+    assert_eq!(result["parentAgentId"].as_str(), Some(parent.0.as_str()));
+    assert_eq!(result["reportLength"], json!(report.chars().count() as i64));
+    assert!(result["savedAt"].is_string());
+
+    // The report reached the parent's transcript via agent_send_message_op.
+    let parent_session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(parent_session.messages.len(), 1);
+}
+
+/// A non-delegated caller (created directly, no `parentAgentId`) is rejected
+/// with `-32603` and the canonical message.
+#[tokio::test]
+async fn report_to_parent_rejects_non_delegated_caller() {
+    let (_t, svc, ws) = setup().await;
+    let solo = create_agent(&svc, &ws, "Solo").await;
     let err = svc
-        .agent_report_to_parent(ws, json!("a report"))
+        .agent_report_to_parent_op(ws, json!("a report"), Some(solo))
         .await
         .expect_err("not delegated");
-    assert!(matches!(err, Error::Internal(_)));
+    match err {
+        Error::Internal(m) => {
+            assert_eq!(m, "report_to_parent is only available to delegated agents")
+        }
+        other => panic!("expected Internal, got {other:?}"),
+    }
+}
+
+/// The RPC front door (no caller context, `caller_agent_id = None`) keeps
+/// returning `-32603` exactly as before.
+#[tokio::test]
+async fn report_to_parent_rejects_rpc_front_door() {
+    let (_t, svc, ws) = setup().await;
+    let err = svc
+        .agent_report_to_parent(ws, json!("a report"), None)
+        .await
+        .expect_err("no caller context");
+    match err {
+        Error::Internal(m) => {
+            assert_eq!(m, "report_to_parent is only available to delegated agents")
+        }
+        other => panic!("expected Internal, got {other:?}"),
+    }
 }
 
 #[tokio::test]

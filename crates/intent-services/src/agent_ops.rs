@@ -518,6 +518,47 @@ impl Services {
         Ok(out)
     }
 
+    /// `agent.reportToParent`: a delegated child reports back to its parent
+    /// (PROTOCOL §5.5). Caller identity comes only from the MCP front door; the
+    /// RPC dispatch path passes `None`, so it always surfaces `-32603`. When the
+    /// caller has no `parentAgentId` (created directly by a user), this is also
+    /// `-32603`. Otherwise the report is delivered to the parent by reusing the
+    /// send-message path.
+    pub(crate) async fn agent_report_to_parent_op(
+        &self,
+        _workspace_id: WorkspaceId,
+        report: Value,
+        caller_agent_id: Option<AgentId>,
+    ) -> Result<Value> {
+        let not_delegated = || {
+            Error::Internal("report_to_parent is only available to delegated agents".to_string())
+        };
+        let caller = caller_agent_id.ok_or_else(not_delegated)?;
+        let session = self.load_session_internal(&caller).await?;
+        let parent = session.parent_agent_id.ok_or_else(not_delegated)?;
+        // `report` is declared as a string on the MCP surface; coerce other
+        // JSON shapes to their textual form for delivery.
+        let report_text = match &report {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let report_len = report_text.chars().count() as i64;
+        // NOTE: TS persists a `completionReport` on the child that the parent
+        // reads on completion; here we deliver eagerly via the send-message path
+        // (no completion-subscription/waitMode behavior). The returned shape
+        // mirrors the TS service result: { ok, parentAgentId, reportLength,
+        // savedAt }.
+        let _ = self
+            .agent_send_message_op(parent.clone(), report_text, None)
+            .await?;
+        Ok(json!({
+            "ok": true,
+            "parentAgentId": parent,
+            "reportLength": report_len,
+            "savedAt": now_iso(),
+        }))
+    }
+
     /// `agent.delegate`: create a session and (best-effort) assign it to the
     /// target task note (PROTOCOL §5.5).
     pub(crate) async fn agent_delegate_op(

@@ -763,8 +763,9 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             require_present(params, "report")?;
             let report = params.get("report").cloned().unwrap_or(Value::Null);
+            // No agent-caller context over the RPC front door → always -32603.
             let result = api
-                .agent_report_to_parent(ws, report)
+                .agent_report_to_parent(ws, report, None)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

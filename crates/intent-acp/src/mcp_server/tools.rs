@@ -235,4 +235,9 @@ static ALL_TOOLS: &[ToolDef] = &[
             p("skipAutoCommit", "boolean", false),
         ],
     },
+    ToolDef {
+        name: "report_to_parent_workspace-mcp",
+        description: "Send a completion report to your parent agent (delegated agents only).",
+        params: &[p("report", "string", true)],
+    },
 ];

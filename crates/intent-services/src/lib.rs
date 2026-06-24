@@ -3889,14 +3889,11 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         report: serde_json::Value,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            let _ = (workspace_id, report);
-            // No agent-caller context over the RPC dispatch path → never a
-            // delegated agent (TS surfaces this as -32603).
-            Err(Error::Internal(
-                "report_to_parent is only available to delegated agents".to_string(),
-            ))
+            self.agent_report_to_parent_op(workspace_id, report, caller_agent_id)
+                .await
         })
     }
 

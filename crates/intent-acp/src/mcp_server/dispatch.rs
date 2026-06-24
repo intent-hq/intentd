@@ -253,6 +253,14 @@ impl WorkspaceMcpServer {
                     self.caller_agent_id.clone(),
                 )
                 .await),
+            "report_to_parent_workspace-mcp" => {
+                let report = args.get("report").cloned().ok_or_else(|| {
+                    Error::InvalidParams("missing required parameter: report".to_string())
+                })?;
+                val(api
+                    .agent_report_to_parent(ws, report, self.caller_agent_id.clone())
+                    .await)
+            }
             other => Err(Error::InvalidParams(format!("Tool not found: {other}"))),
         }
     }

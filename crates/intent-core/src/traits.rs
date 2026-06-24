@@ -722,12 +722,18 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `agent.reportToParent`: child→parent report; `-32603` when the caller is
     /// not a delegated agent (PROTOCOL §5.5).
+    ///
+    /// `caller_agent_id` is the agent invoking the tool: the MCP front door
+    /// passes `Some(caller)` so the impl can resolve the caller's
+    /// `parentAgentId`; the FE/RPC front door passes `None`, which always
+    /// surfaces `-32603` (there is no caller context to be a delegated agent).
     fn agent_report_to_parent(
         &self,
         workspace_id: WorkspaceId,
         report: serde_json::Value,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, report);
+        let _ = (workspace_id, report, caller_agent_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_report_to_parent not implemented".to_string(),
