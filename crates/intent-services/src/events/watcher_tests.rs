@@ -1,6 +1,7 @@
 //! Integration test for [`FileWatcher`] over a real temp directory + SQLite
 //! store: writing/removing a file under the watched root publishes debounced
-//! `file:changed` events whose payload matches the TS `FileChangedEvent` shape.
+//! `file:*` events (create → `file:created`, delete → `file:deleted`, modify →
+//! `file:changed`) whose payload matches the TS `FileChangedEvent` shape.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -52,7 +53,7 @@ impl Drop for TempDb {
     }
 }
 
-/// Drain the subscription until a `file:changed` event for `rel_path` (and, when
+/// Drain the subscription until a `file:*` event for `rel_path` (and, when
 /// `action` is set, that exact action) arrives or `overall` elapses.
 async fn next_for(
     sub: &mut super::bus::Subscription,
@@ -69,7 +70,7 @@ async fn next_for(
         match timeout(remaining, sub.recv()).await {
             Ok(Some(batch)) => {
                 for ev in batch {
-                    if ev.event_type != "file:changed" {
+                    if !ev.event_type.starts_with("file:") {
                         continue;
                     }
                     if ev.data["relativePath"] != rel_path {
@@ -87,7 +88,7 @@ async fn next_for(
 }
 
 #[tokio::test]
-async fn create_and_delete_emit_file_changed() {
+async fn create_and_delete_emit_distinct_file_events() {
     let db = TempDb::new();
     let store = Store::open(&db.path).await.expect("open store");
     let bus = EventBus::new(store);
@@ -107,17 +108,26 @@ async fn create_and_delete_emit_file_changed() {
     let ev = next_for(&mut sub, "foo.txt", None, Duration::from_secs(5))
         .await
         .expect("create/modify event for foo.txt");
-    assert_eq!(ev.event_type, "file:changed");
     assert_eq!(ev.data["path"], "foo.txt");
     assert_eq!(ev.data["relativePath"], "foo.txt");
     assert_eq!(ev.actor.actor_type, ActorType::System);
+    // A fresh write coalesces to `create` (file:created); if the OS only reports
+    // the content write it stays `modify` (file:changed). Either way the type
+    // tracks the action per the TS `getEventType` taxonomy.
     let action = ev.data["action"].as_str().expect("action string");
     assert!(action == "create" || action == "modify", "got {action}");
+    let expected_type = if action == "create" {
+        "file:created"
+    } else {
+        "file:changed"
+    };
+    assert_eq!(ev.event_type, expected_type);
 
     std::fs::remove_file(&file).expect("remove file");
     let ev = next_for(&mut sub, "foo.txt", Some("delete"), Duration::from_secs(5))
         .await
         .expect("delete event for foo.txt");
+    assert_eq!(ev.event_type, "file:deleted");
     assert_eq!(ev.data["action"], "delete");
     assert_eq!(ev.workspace_id, ws);
 }

@@ -335,6 +335,17 @@ async fn crud_mutations_emit_change_events_over_uds() {
     assert_eq!(e["data"]["newStatus"], "in_progress");
     assert!(e["data"]["changedAt"].is_string());
 
+    // The status change recomputes the ready set → task:ready-tasks-changed
+    // carrying the full readyTaskIds list plus the triggering transition.
+    let ev = read_json(&mut sub_reader).await;
+    let e = &ev["params"]["event"];
+    assert_eq!(e["type"], "task:ready-tasks-changed");
+    assert_eq!(e["data"]["readyTaskIds"], json!([note_id]));
+    assert_eq!(e["data"]["triggeredBy"]["noteId"], note_id.as_str());
+    assert_eq!(e["data"]["triggeredBy"]["previousStatus"], "not_started");
+    assert_eq!(e["data"]["triggeredBy"]["newStatus"], "in_progress");
+    assert!(e["data"]["computedAt"].is_string());
+
     // comment.add → comment:added { noteId, commentId }.
     let added = rpc(
         &mut rpc_write,

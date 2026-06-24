@@ -914,6 +914,49 @@ mod change_event_parity {
     }
 
     #[tokio::test]
+    async fn ready_tasks_changed_payload() {
+        let h = harness().await;
+        // Parent task with one child; both start not_started. The parent is
+        // blocked by its incomplete child, so neither is ready yet.
+        let mut parent = note(&h.ws, "parent", "p");
+        parent.task = Some(TaskMetadata {
+            status: TaskStatus::NotStarted,
+            ..Default::default()
+        });
+        let mut child = note(&h.ws, "child", "c");
+        child.parent_id = Some(parent.id.clone());
+        child.task = Some(TaskMetadata {
+            status: TaskStatus::NotStarted,
+            ..Default::default()
+        });
+        h.store.insert_note(&parent).await.expect("insert parent");
+        h.store.insert_note(&child).await.expect("insert child");
+
+        let mut sub = subscribe(&h);
+        // Completing the child recomputes the ready set: the child is now
+        // terminal (excluded), and the parent's only child is complete, so the
+        // parent becomes the sole ready task.
+        h.services
+            .task_update_note_status(h.ws.clone(), child.id.clone(), "complete".to_string())
+            .await
+            .expect("status");
+
+        // First: task:status-changed for the child.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:status-changed");
+        assert_eq!(ev["data"]["noteId"], "child");
+
+        // Then: task:ready-tasks-changed with the recomputed set + trigger.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["parent"]));
+        assert_eq!(ev["data"]["triggeredBy"]["noteId"], "child");
+        assert_eq!(ev["data"]["triggeredBy"]["previousStatus"], "not_started");
+        assert_eq!(ev["data"]["triggeredBy"]["newStatus"], "complete");
+        assert!(ev["data"]["computedAt"].is_string());
+    }
+
+    #[tokio::test]
     async fn comment_added_payload() {
         let h = harness().await;
         let tn = note(&h.ws, "n-1", "hello world");

@@ -1,15 +1,16 @@
-//! Filesystem watcher → `file:changed` events (§10).
+//! Filesystem watcher → `file:*` events (§10).
 //!
 //! Ports the workspace file-watch slice from `~/src/intent/`: the `notify`
 //! recursive watch + per-path debounce of
 //! `workspace/main/change-detection/file-watcher.ts` (`fileWatcherDebounce`,
-//! `handleFileEvent`) and the canonical wire shape of
-//! `events/types.ts` `FileChangedEvent` — every mutation is a single
-//! `file:changed` event whose `data.action` is `create|modify|delete|rename`
-//! (`file:created/deleted/renamed` stay reserved-but-unused, per
-//! [`intent_core::events`]). Raw FS callbacks (sync, off-runtime) feed a tokio
-//! debounce task that coalesces rapid changes per path before publishing to the
-//! [`EventBus`].
+//! `handleFileEvent`) and the canonical event-type taxonomy of
+//! `change-detection/change-processor.ts` (`getEventType`): a `create` becomes
+//! `file:created`, a `delete` becomes `file:deleted`, and both `modify` and
+//! `rename` stay `file:changed` (`file:renamed` is never emitted). The
+//! `data.action` discriminant always carries the raw `create|modify|delete|
+//! rename` verb regardless of the event type, matching the TS `FileChangedEvent`
+//! wire shape. Raw FS callbacks (sync, off-runtime) feed a tokio debounce task
+//! that coalesces rapid changes per path before publishing to the [`EventBus`].
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -82,6 +83,18 @@ impl Action {
             Action::Modify => "modify",
             Action::Delete => "delete",
             Action::Rename => "rename",
+        }
+    }
+
+    /// Canonical `file:*` event type for this action, mirroring the TS
+    /// `change-processor.ts` `getEventType`: `create`/`delete` get their own
+    /// types; `modify` and `rename` collapse onto `file:changed`.
+    fn event_type(self) -> &'static str {
+        use intent_core::events::{FILE_CHANGED, FILE_CREATED, FILE_DELETED};
+        match self {
+            Action::Create => FILE_CREATED,
+            Action::Delete => FILE_DELETED,
+            Action::Modify | Action::Rename => FILE_CHANGED,
         }
     }
 
@@ -265,14 +278,16 @@ async fn flush_all(
     }
 }
 
-/// Emit one `file:changed` event matching the TS `FileChangedEvent` wire shape:
+/// Emit one `file:*` event matching the TS `FileChangedEvent` wire shape:
 /// `data.{path,relativePath,action}` (both paths workspace-relative) attributed
-/// to the system actor.
+/// to the system actor. The event type follows [`Action::event_type`]
+/// (`file:created`/`file:deleted`/`file:changed`) while `data.action` always
+/// carries the raw verb.
 async fn publish(bus: &EventBus, workspace_id: &WorkspaceId, relative: &str, action: Action) {
     let event = NewEvent {
         workspace_id: workspace_id.clone(),
         timestamp: now_iso(),
-        event_type: intent_core::events::FILE_CHANGED.to_string(),
+        event_type: action.event_type().to_string(),
         actor: EventActor {
             actor_type: ActorType::System,
             id: Some("system".to_string()),
@@ -290,7 +305,7 @@ async fn publish(bus: &EventBus, workspace_id: &WorkspaceId, relative: &str, act
         }),
     };
     if let Err(e) = bus.publish(&event).await {
-        tracing::warn!(error = %e, path = relative, "failed to publish file:changed event");
+        tracing::warn!(error = %e, path = relative, "failed to publish file:* event");
     }
 }
 
@@ -320,6 +335,17 @@ mod tests {
             Some(Action::Modify)
         );
         assert_eq!(action_for(&EventKind::Other), None);
+    }
+
+    #[test]
+    fn event_type_matches_ts_taxonomy() {
+        use intent_core::events::{FILE_CHANGED, FILE_CREATED, FILE_DELETED};
+        // change-processor.ts getEventType: create/delete get distinct types;
+        // modify/rename collapse onto file:changed (file:renamed is never emitted).
+        assert_eq!(Action::Create.event_type(), FILE_CREATED);
+        assert_eq!(Action::Delete.event_type(), FILE_DELETED);
+        assert_eq!(Action::Modify.event_type(), FILE_CHANGED);
+        assert_eq!(Action::Rename.event_type(), FILE_CHANGED);
     }
 
     #[test]

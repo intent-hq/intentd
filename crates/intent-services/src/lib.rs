@@ -14,7 +14,8 @@ use base64::Engine as _;
 use intent_core::events::{
     CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED,
     NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED,
-    TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
+    TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED,
 };
 use intent_core::{
     iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId, AgentLite,
@@ -695,6 +696,116 @@ fn task_status_changed_event(
             "previousStatus": status_word(previous_status),
             "newStatus": status_word(new_status),
             "changedAt": changed_at,
+        }),
+    }
+}
+
+/// True for the TS `TERMINAL_STATUSES` (`notes/utils/task-tree-utils.ts`): a
+/// terminal task is excluded from the flattened ready-task traversal.
+fn is_terminal_task_status(status: TaskStatus) -> bool {
+    matches!(status, TaskStatus::Complete | TaskStatus::Cancelled)
+}
+
+/// Compute the ordered ready task note IDs for a workspace, porting
+/// `flattenTaskTree` + `findReadyTasks` (`notes/utils/task-tree-utils.ts`):
+/// non-terminal task notes in leaves-first post-order (by `peerOrder`, then
+/// `createdAt`), keeping only those whose task children are all `complete`.
+fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
+    // flattenTaskTree: only non-terminal task notes participate, keyed by parent.
+    let mut children: HashMap<Option<&str>, Vec<&Note>> = HashMap::new();
+    for n in notes {
+        if n.task
+            .as_ref()
+            .is_some_and(|t| !is_terminal_task_status(t.status))
+        {
+            let parent = n.parent_id.as_ref().map(|p| p.as_str());
+            children.entry(parent).or_default().push(n);
+        }
+    }
+    if children.is_empty() {
+        return Vec::new();
+    }
+    // Sort each sibling level by peerOrder (default 0), then createdAt (older first).
+    for level in children.values_mut() {
+        level.sort_by(|a, b| {
+            let ao = a.task.as_ref().and_then(|t| t.peer_order).unwrap_or(0);
+            let bo = b.task.as_ref().and_then(|t| t.peer_order).unwrap_or(0);
+            ao.cmp(&bo).then_with(|| a.created_at.cmp(&b.created_at))
+        });
+    }
+    // Post-order DFS (children before parent), starting at the root level.
+    fn traverse<'a>(
+        parent: Option<&'a str>,
+        children: &HashMap<Option<&'a str>, Vec<&'a Note>>,
+        out: &mut Vec<&'a Note>,
+    ) {
+        if let Some(level) = children.get(&parent) {
+            for child in level {
+                traverse(Some(child.id.as_str()), children, out);
+                out.push(child);
+            }
+        }
+    }
+    let mut flattened: Vec<&Note> = Vec::new();
+    traverse(None, &children, &mut flattened);
+
+    // findReadyTasks: ready iff every task child (over ALL notes, including
+    // terminal ones) is `complete`.
+    let mut all_children: HashMap<&str, Vec<&Note>> = HashMap::new();
+    for n in notes {
+        if n.task.is_some() {
+            if let Some(parent) = n.parent_id.as_ref() {
+                all_children.entry(parent.as_str()).or_default().push(n);
+            }
+        }
+    }
+    flattened
+        .into_iter()
+        .filter(|n| {
+            all_children
+                .get(n.id.as_str())
+                .map(|kids| {
+                    kids.iter().all(|c| {
+                        c.task
+                            .as_ref()
+                            .map(|t| t.status == TaskStatus::Complete)
+                            .unwrap_or(true)
+                    })
+                })
+                .unwrap_or(true)
+        })
+        .map(|n| n.id.0.clone())
+        .collect()
+}
+
+/// Build a `task:ready-tasks-changed` change event with the TS-parity payload
+/// `{ readyTaskIds, triggeredBy: { noteId, previousStatus, newStatus },
+/// computedAt }` (`notes.service.ts` `emitReadyTasksChanged`).
+fn ready_tasks_changed_event(
+    workspace_id: &WorkspaceId,
+    ready_task_ids: Vec<String>,
+    triggered_by_note: &NoteId,
+    previous_status: TaskStatus,
+    new_status: TaskStatus,
+    computed_at: &str,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: TASK_READY_TASKS_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "readyTaskIds": ready_task_ids,
+            "triggeredBy": {
+                "noteId": triggered_by_note.as_str(),
+                "previousStatus": status_word(previous_status),
+                "newStatus": status_word(new_status),
+            },
+            "computedAt": computed_at,
         }),
     }
 }
@@ -2318,6 +2429,22 @@ impl WorkspaceApi for Services {
                         previous_status,
                         new_status,
                         &now,
+                    ),
+                )
+                .await;
+                // Then recompute + broadcast the ready-task set, mirroring the
+                // `emitReadyTasksChanged` call that follows `task:status-changed`.
+                let all = store.list_notes(&note.workspace_id).await?;
+                let ready_task_ids = compute_ready_task_ids(&all);
+                publish_event(
+                    &bus,
+                    ready_tasks_changed_event(
+                        &note.workspace_id,
+                        ready_task_ids,
+                        &note.id,
+                        previous_status,
+                        new_status,
+                        &now_iso(),
                     ),
                 )
                 .await;
