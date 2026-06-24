@@ -323,6 +323,7 @@ impl Services {
         workspace_id: WorkspaceId,
         name: Option<String>,
         model: Option<String>,
+        parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
         let now = now_iso();
         let name_explicitly_set = name.is_some();
@@ -331,7 +332,7 @@ impl Services {
         let session = AgentSession {
             id: AgentId(format!("agent-{}", Uuid::new_v4())),
             workspace_id,
-            parent_agent_id: None,
+            parent_agent_id,
             backend_session_id: None,
             acp_session_id: None,
             name,
@@ -523,9 +524,10 @@ impl Services {
         &self,
         workspace_id: WorkspaceId,
         input: intent_core::AgentDelegateInput,
+        parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
         let created = self
-            .agent_create_op(workspace_id.clone(), None, input.model)
+            .agent_create_op(workspace_id.clone(), None, input.model, parent_agent_id)
             .await?;
         let agent_id = created["agent"]["id"]
             .as_str()
@@ -581,7 +583,7 @@ impl Services {
             return Ok(json!({ "ok": true, "agentId": agent, "created": false, "result": result }));
         }
         let created = self
-            .agent_create_op(workspace_id.clone(), None, model)
+            .agent_create_op(workspace_id.clone(), None, model, None)
             .await?;
         let agent_id = created["agent"]["id"]
             .as_str()

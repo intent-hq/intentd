@@ -250,6 +250,7 @@ impl WorkspaceMcpServer {
                         wait_mode: opt_str(args, "waitMode"),
                         skip_auto_commit: opt_bool(args, "skipAutoCommit"),
                     },
+                    self.caller_agent_id.clone(),
                 )
                 .await),
             other => Err(Error::InvalidParams(format!("Tool not found: {other}"))),

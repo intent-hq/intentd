@@ -608,8 +608,9 @@ async fn dispatch(
             let name = opt_str(params, "name");
             let model = opt_str(params, "model");
             let specialist_id = opt_str(params, "specialistId");
+            // FE/RPC front door: top-level creates stay parentless.
             let result = api
-                .agent_create(ws, name, model, specialist_id)
+                .agent_create(ws, name, model, specialist_id, None)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -620,7 +621,11 @@ async fn dispatch(
             rest.remove("workspaceId");
             let input: AgentDelegateInput = serde_json::from_value(Value::Object(rest))
                 .map_err(|e| rpc(INVALID_PARAMS, format!("invalid params: {e}")))?;
-            let result = api.agent_delegate(ws, input).await.map_err(domain_to_rpc)?;
+            // FE/RPC front door: top-level creates stay parentless.
+            let result = api
+                .agent_delegate(ws, input, None)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(result)
         }
         "agent.sendToTask" => {

@@ -425,12 +425,17 @@ pub trait WorkspaceApi: Send + Sync {
     /// the shared MCP surface agents call back into; the runtime wiring
     /// (spawn/ACP) lands in a later milestone, so the default returns an
     /// internal error and the result is the opaque service value.
+    ///
+    /// `parent_agent_id` is the caller/spawning agent: the MCP front door passes
+    /// `Some(caller)` to stamp the child's `parentAgentId`; the FE/RPC front door
+    /// passes `None` (top-level creates stay parentless).
     fn agent_delegate(
         &self,
         workspace_id: WorkspaceId,
         input: AgentDelegateInput,
+        parent_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, input);
+        let _ = (workspace_id, input, parent_agent_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_delegate not implemented".to_string(),
@@ -482,14 +487,19 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `agent.create`: persist a new agent session; returns `{ agent: { id, name } }`
     /// (the process spawns lazily on first turn) (PROTOCOL §5.5).
+    ///
+    /// `parent_agent_id` is the caller/spawning agent: the MCP front door passes
+    /// `Some(caller)` to stamp the child's `parentAgentId`; the FE/RPC front door
+    /// passes `None` (top-level creates stay parentless).
     fn agent_create(
         &self,
         workspace_id: WorkspaceId,
         name: Option<String>,
         model: Option<String>,
         specialist_id: Option<String>,
+        parent_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, name, model, specialist_id);
+        let _ = (workspace_id, name, model, specialist_id, parent_agent_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_create not implemented".to_string(),

@@ -3,10 +3,12 @@
 //! lifecycle, send/force semantics, summary, model catalog, and subscriptions.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use intent_acp::WorkspaceMcpServer;
 use intent_core::{
-    now_iso, AgentId, Error, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
-    WorkspaceId, WorkspaceStatus,
+    now_iso, AgentDelegateInput, AgentId, Error, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
 use serde_json::json;
@@ -84,6 +86,7 @@ async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
             ws.clone(),
             Some(name.to_string()),
             Some("auggie:sonnet4.5".into()),
+            None,
         )
         .await
         .expect("create");
@@ -358,4 +361,54 @@ async fn get_subscriptions_has_stable_shape() {
     assert!(r["subscriptions"].is_array());
     assert!(r["delegationGroups"].is_array());
     assert!(r["agentStatuses"].is_object());
+}
+
+/// A delegate through the MCP front door (caller set) stamps the child's
+/// `parentAgentId`; the same op through the RPC front door (caller `None`)
+/// leaves it null.
+#[tokio::test]
+async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
+    let (_t, svc, ws) = setup().await;
+
+    // MCP front door: caller set -> child parentAgentId == caller.
+    let caller = AgentId::from("agent-00000000-0000-0000-0000-0000000caller");
+    let api: Arc<dyn WorkspaceApi> = Arc::new(svc.clone());
+    let server =
+        WorkspaceMcpServer::new(api, ws.clone()).with_caller_agent_id(Some(caller.clone()));
+    let resp = server
+        .handle_message(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "delegate_task_workspace-mcp",
+                "arguments": { "agentInstructions": "do work" }
+            }
+        }))
+        .await
+        .expect("mcp response");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    let parsed: serde_json::Value = serde_json::from_str(text).expect("tool json");
+    let child_id = AgentId::from(parsed["agentId"].as_str().expect("agentId"));
+    let child = svc
+        .store()
+        .get_agent_session(&child_id)
+        .await
+        .expect("child session");
+    assert_eq!(child.parent_agent_id, Some(caller));
+
+    // RPC front door: caller None -> child parentAgentId null.
+    let rpc_resp = svc
+        .agent_delegate(ws.clone(), AgentDelegateInput::default(), None)
+        .await
+        .expect("rpc delegate");
+    let rpc_child_id = AgentId::from(rpc_resp["agentId"].as_str().expect("rpc agentId"));
+    let rpc_child = svc
+        .store()
+        .get_agent_session(&rpc_child_id)
+        .await
+        .expect("rpc child session");
+    assert_eq!(rpc_child.parent_agent_id, None);
 }

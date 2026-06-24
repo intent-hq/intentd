@@ -3678,8 +3678,12 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         input: AgentDelegateInput,
+        parent_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_delegate_op(workspace_id, input).await })
+        Box::pin(async move {
+            self.agent_delegate_op(workspace_id, input, parent_agent_id)
+                .await
+        })
     }
 
     fn agent_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
@@ -3709,8 +3713,12 @@ impl WorkspaceApi for Services {
         name: Option<String>,
         model: Option<String>,
         _specialist_id: Option<String>,
+        parent_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_create_op(workspace_id, name, model).await })
+        Box::pin(async move {
+            self.agent_create_op(workspace_id, name, model, parent_agent_id)
+                .await
+        })
     }
 
     fn agent_send_to_task(
