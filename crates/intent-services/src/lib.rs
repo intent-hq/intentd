@@ -660,6 +660,7 @@ fn note_change_event(
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "noteId": note_id.as_str(),
             "title": title,
@@ -687,6 +688,7 @@ fn task_status_changed_event(
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "noteId": note_id.as_str(),
             "noteTitle": note_title,
@@ -708,6 +710,7 @@ fn activity_changed_event(workspace_id: &WorkspaceId, activity: WorkspaceActivit
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "activity": activity,
@@ -726,6 +729,7 @@ fn attention_changed_event(workspace_id: &WorkspaceId, attention: WorkspaceAtten
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "attention": attention,
@@ -746,6 +750,7 @@ fn settings_changed_event(changes: Vec<serde_json::Value>) -> NewEvent {
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({ "changes": changes }),
     }
 }
@@ -762,6 +767,7 @@ fn comment_added_event(workspace_id: &WorkspaceId, note_id: &NoteId, comment_id:
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "noteId": note_id.as_str(),
             "commentId": comment_id,
@@ -781,6 +787,7 @@ fn pr_linked_event(ws: &Workspace) -> NewEvent {
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "workspaceId": ws.id.as_str(),
             "prNumber": ws.pr_number,
@@ -802,6 +809,7 @@ fn pr_updated_event(ws: &Workspace) -> NewEvent {
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "workspaceId": ws.id.as_str(),
             "prNumber": ws.pr_number,
@@ -822,6 +830,7 @@ fn pr_unlinked_event(workspace_id: &WorkspaceId) -> NewEvent {
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({ "workspaceId": workspace_id.as_str() }),
     }
 }
@@ -837,6 +846,7 @@ fn changes_git_status_event(workspace_id: &WorkspaceId, status: serde_json::Valu
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "status": status,
@@ -858,6 +868,7 @@ fn changes_metrics_changed_event(
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "metrics": metrics,
@@ -897,6 +908,7 @@ fn search_result_event(
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "requestId": request_id,
             "matches": matches,
@@ -920,6 +932,7 @@ fn search_done_event(
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "requestId": request_id,
             "total": total,

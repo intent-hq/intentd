@@ -219,6 +219,7 @@ impl Services {
             session_id: Some(agent_id.0.clone()),
             correlation_id: None,
             parent_event_id: None,
+            metadata: None,
             data,
         };
         crate::publish_event(&self.event_bus, event).await;

@@ -772,6 +772,7 @@ fn script_event(workspace_id: &WorkspaceId, event_type: &str, data: Value) -> Ne
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data,
     }
 }

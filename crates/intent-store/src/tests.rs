@@ -78,8 +78,8 @@ async fn migration_status_reports_current_after_open() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let status = store.migration_status().await.expect("migration status");
     assert!(status.is_current(), "fresh open must apply all migrations");
-    assert_eq!(status.expected, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
-    assert_eq!(status.applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(status.expected, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(status.applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 }
 
 #[tokio::test]
@@ -371,6 +371,7 @@ fn file_event(ws: &WorkspaceId, ts: &str, path: &str, actor: EventActor) -> NewE
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: json!({ "path": path, "action": "modify" }),
     }
 }
@@ -431,6 +432,7 @@ async fn event_round_trip_and_queries() {
             session_id: Some("sess-1".to_string()),
             correlation_id: None,
             parent_event_id: None,
+            metadata: None,
             data: json!({ "tool": "edit" }),
         })
         .await
@@ -534,8 +536,57 @@ fn typed_event(ws: &WorkspaceId, ts: &str, event_type: &str, actor: EventActor) 
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: json!({}),
     }
+}
+
+#[tokio::test]
+async fn event_metadata_round_trips_through_store() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let actor = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-9".to_string()),
+        ..Default::default()
+    };
+
+    // With metadata: persists and reads back the camelCase `metadata` object.
+    let with_meta = NewEvent {
+        workspace_id: ws.clone(),
+        timestamp: "2026-01-01T00:00:01Z".to_string(),
+        event_type: events::AGENT_MESSAGE.to_string(),
+        actor: actor.clone(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: Some(json!({ "source": "test", "retryCount": 2 })),
+        data: json!({}),
+    };
+    let inserted = store.insert_event(&with_meta).await.expect("insert");
+    assert_eq!(
+        inserted.metadata,
+        Some(json!({ "source": "test", "retryCount": 2 }))
+    );
+
+    // Without metadata: stays `None` through the round-trip (column is NULL).
+    let without_meta = NewEvent {
+        timestamp: "2026-01-01T00:00:02Z".to_string(),
+        metadata: None,
+        ..with_meta.clone()
+    };
+    store.insert_event(&without_meta).await.expect("insert");
+
+    let all = store.events_by_workspace(&ws, 10).await.expect("query");
+    assert_eq!(all.len(), 2);
+    let newest = &all[0];
+    assert_eq!(newest.metadata, None);
+    let oldest = &all[1];
+    assert_eq!(
+        oldest.metadata,
+        Some(json!({ "source": "test", "retryCount": 2 }))
+    );
 }
 
 #[tokio::test]

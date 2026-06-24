@@ -192,6 +192,7 @@ impl EventSink for BusEventSink {
                 session_id: event.session_id,
                 correlation_id: None,
                 parent_event_id: None,
+                metadata: None,
                 data: event.data,
             };
             if let Err(e) = self.bus.publish(&new_event).await {

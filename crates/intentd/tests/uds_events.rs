@@ -49,6 +49,7 @@ fn new_event(event_type: &str, workspace_id: &str) -> NewEvent {
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({ "noteId": "spec", "action": "update" }),
     }
 }

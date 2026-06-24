@@ -544,6 +544,7 @@ impl WorkspaceApi for FakeApi {
                 session_id: None,
                 correlation_id: None,
                 parent_event_id: None,
+                metadata: None,
                 data: serde_json::json!({}),
             }])
         })

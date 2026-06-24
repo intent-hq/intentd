@@ -570,6 +570,7 @@ async fn insert_file_event(
             session_id: None,
             correlation_id: None,
             parent_event_id: None,
+            metadata: None,
             data: serde_json::json!({ "path": path, "relativePath": path, "action": "modify" }),
         })
         .await
@@ -2834,6 +2835,7 @@ mod search_adapters {
                 session_id: None,
                 correlation_id: None,
                 parent_event_id: None,
+                metadata: None,
                 data: json!({ "path": "src/alpha.rs", "action": "modify" }),
             })
             .await

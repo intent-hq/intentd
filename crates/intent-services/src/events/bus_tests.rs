@@ -45,6 +45,7 @@ fn new_event(event_type: &str, actor_id: Option<&str>, actor_type: ActorType) ->
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: json!({}),
     }
 }

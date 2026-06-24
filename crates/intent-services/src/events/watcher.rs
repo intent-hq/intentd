@@ -282,6 +282,7 @@ async fn publish(bus: &EventBus, workspace_id: &WorkspaceId, relative: &str, act
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: json!({
             "path": relative,
             "relativePath": relative,

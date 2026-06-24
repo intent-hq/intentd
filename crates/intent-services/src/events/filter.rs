@@ -174,6 +174,7 @@ mod tests {
             session_id: None,
             correlation_id: None,
             parent_event_id: None,
+            metadata: None,
             data: json!({}),
         }
     }
