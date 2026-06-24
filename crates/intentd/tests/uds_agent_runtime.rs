@@ -106,6 +106,46 @@ async fn read_json(reader: &mut BufReader<OwnedReadHalf>, secs: u64) -> Value {
     serde_json::from_str(line.trim_end()).expect("invalid JSON frame")
 }
 
+/// Launch the REAL `intentd serve` daemon over the mock ACP provider with the
+/// given `MOCK_AGENT_BEHAVIOR`, returning the live process guard + its UDS path.
+/// Panics (dumping the daemon log) if it never starts listening.
+async fn launch_daemon(data_dir: &PathBuf, script: &str, behavior: &str) -> (Daemon, PathBuf) {
+    let log_path = data_dir.join("daemon.log");
+    let log = std::fs::File::create(&log_path).expect("create daemon log");
+    let child = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("serve")
+        .env("INTENTD_DATA_DIR", data_dir)
+        .env("MOCK_AGENT_SCRIPT_PATH", script)
+        .env("MOCK_AGENT_BEHAVIOR", behavior)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("spawn intentd serve");
+    let daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    if timeout(Duration::from_secs(10), async {
+        loop {
+            if UnixStream::connect(&socket).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let logs = std::fs::read_to_string(&log_path).unwrap_or_default();
+        panic!(
+            "daemon never listened on {}\n--- daemon log ---\n{logs}",
+            socket.display()
+        );
+    }
+    (daemon, socket)
+}
+
 /// Issue one request on a response-only connection and return its `result`.
 async fn rpc(
     write_half: &mut (impl AsyncWriteExt + Unpin),
@@ -304,5 +344,187 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
                 .unwrap_or_default()
                 .contains(MARKER),
         "note mutated by the daemon-spawned MCP tool call: {note}"
+    );
+}
+
+/// `agent.stop` keep-alive parity (#13/#14): stopping a mid-turn agent must
+/// INTERRUPT it (cancel the turn, keep the child alive) — not kill it — and emit
+/// the single terminal `agent:stream:end`. We then prove keep-alive by sending a
+/// follow-up message that RESUMES the same child/session (the mock reports
+/// `turn=2`, which a respawned process — fresh `promptCount` — could never do).
+#[tokio::test]
+async fn agent_stop_interrupts_keep_alive_and_emits_terminal_stream_end_over_uds() {
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping agent.stop keep-alive E2E: node not on PATH");
+        return;
+    }
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("skipping agent.stop keep-alive E2E: script not found at {script}");
+        return;
+    }
+
+    let data_dir =
+        std::env::temp_dir().join(format!("itd-{}", &Uuid::new_v4().simple().to_string()[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let db_path = data_dir.join("intentd.db");
+    let ws = WorkspaceId::new();
+    {
+        let store = Store::open(&db_path).await.expect("open store");
+        store
+            .insert_workspace(&workspace(&ws))
+            .await
+            .expect("insert ws");
+    }
+
+    // The first turn streams a chunk then parks until `session/cancel`, so the
+    // daemon can `agent.stop` it mid-turn; the child stays alive for the resume.
+    let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
+    let (_daemon, socket) = launch_daemon(&data_dir, &script, &behavior).await;
+
+    // Subscriber connection (before the turn so no events are missed).
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "events.subscribe",
+            "params": { "eventTypes": ["agent:*"], "workspaceId": ws.0 } }),
+    )
+    .await;
+    let sub_resp = read_json(&mut sub_reader, 5).await;
+    assert!(
+        sub_resp["result"]["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // RPC connection — create the agent and start the (blocking) first turn.
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = BufReader::new(rpc_read);
+    let created = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws.0, "name": "OTW", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws.0, "agentId": agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Wait for the in-flight chunk so we know the turn is parked before stopping.
+    let mut saw_block_chunk = false;
+    for _ in 0..50 {
+        let frame = read_json(&mut sub_reader, 30).await;
+        if frame["method"] != "events.event" {
+            continue;
+        }
+        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+            && frame["params"]["event"]["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streaming-before-cancel")
+        {
+            saw_block_chunk = true;
+            break;
+        }
+    }
+    assert!(saw_block_chunk, "first turn streamed a chunk and parked");
+
+    // Stop the agent mid-turn. Per TS keep-alive this interrupts (does NOT kill).
+    let stopped = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        12,
+        "agent.stop",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(stopped["success"], true, "stop ok: {stopped}");
+
+    // A terminal `agent:stream:end` is emitted ON STOP (parity #14).
+    let mut saw_stop_stream_end = false;
+    for _ in 0..50 {
+        let frame = read_json(&mut sub_reader, 30).await;
+        if frame["method"] != "events.event" {
+            continue;
+        }
+        if frame["params"]["event"]["type"] == "agent:stream:end" {
+            assert_eq!(
+                frame["params"]["event"]["data"]["agentId"]
+                    .as_str()
+                    .unwrap_or_default(),
+                agent_id,
+                "terminal stream:end carries the agent id"
+            );
+            saw_stop_stream_end = true;
+            break;
+        }
+    }
+    assert!(
+        saw_stop_stream_end,
+        "terminal agent:stream:end emitted on stop"
+    );
+
+    // Keep-alive: a follow-up message resumes the SAME child/session. The mock
+    // reports `turn=2` (its per-process counter survived the stop), which a
+    // respawned child could not — proving the process was interrupted, not killed.
+    let resumed = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws.0, "agentId": agent_id, "content": "second" }),
+    )
+    .await;
+    assert_eq!(resumed["success"], true, "resume sendMessage ok: {resumed}");
+
+    let mut saw_resume_chunk = false;
+    let mut saw_resume_end = false;
+    for _ in 0..50 {
+        let frame = read_json(&mut sub_reader, 30).await;
+        if frame["method"] != "events.event" {
+            continue;
+        }
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:stream:chunk") => {
+                if frame["params"]["event"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("turn=2")
+                {
+                    saw_resume_chunk = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                saw_resume_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_resume_chunk,
+        "follow-up turn resumed the SAME process (mock reported turn=2)"
+    );
+    assert!(
+        saw_resume_end,
+        "resumed turn emits its own terminal stream:end"
     );
 }

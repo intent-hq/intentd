@@ -14,6 +14,13 @@ import { spawn } from 'node:child_process';
 
 const SESSION_ID = 'mock-session-1';
 
+// Per-process turn counter + the ids of prompts parked by `blockUntilCancel`.
+// These persist across messages within ONE child, so a follow-up prompt landing
+// with `promptCount > 1` proves the daemon resumed the SAME process (keep-alive)
+// rather than respawning it.
+let promptCount = 0;
+const pendingPromptIds = [];
+
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n');
 }
@@ -87,11 +94,23 @@ function callWorkspaceTool(toolCall) {
 }
 
 async function handlePrompt(id) {
+  promptCount += 1;
   let behavior = {};
   try {
     behavior = JSON.parse(process.env.MOCK_AGENT_BEHAVIOR || '{}');
   } catch {
     behavior = {};
+  }
+  // Keep-alive interrupt test: the FIRST turn streams a chunk then parks without
+  // resolving, so the daemon can issue `agent.stop` mid-turn. It is left pending
+  // until a `session/cancel` arrives; the child stays alive for the follow-up.
+  if (behavior.blockUntilCancel && promptCount === 1) {
+    note('session/update', {
+      sessionId: SESSION_ID,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'streaming-before-cancel' } },
+    });
+    pendingPromptIds.push(id);
+    return;
   }
   if (behavior.toolCall) {
     try {
@@ -102,7 +121,10 @@ async function handlePrompt(id) {
       return result(id, { stopReason: 'refusal' });
     }
   }
-  const text = behavior.response || 'Mock agent completed.';
+  const base = behavior.response || 'Mock agent completed.';
+  // In keep-alive mode, stamp the turn count so a resumed follow-up turn is
+  // distinguishable from a fresh spawn (which would report `turn=1`).
+  const text = behavior.blockUntilCancel ? `${base} turn=${promptCount}` : base;
   note('session/update', {
     sessionId: SESSION_ID,
     update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
@@ -123,7 +145,13 @@ async function dispatch(msg) {
     case 'session/prompt':
       return handlePrompt(msg.id);
     case 'session/cancel':
-      return; // notification — no reply
+      // Resolve any turn parked by `blockUntilCancel` with a `cancelled` stop
+      // reason and stay alive for a follow-up (resume) prompt — the observable
+      // keep-alive interrupt. Notification itself gets no reply.
+      while (pendingPromptIds.length) {
+        result(pendingPromptIds.shift(), { stopReason: 'cancelled' });
+      }
+      return;
     default:
       if (msg.id !== undefined)
         send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: `no ${msg.method}` } });

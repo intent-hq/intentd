@@ -3720,10 +3720,12 @@ impl WorkspaceApi for Services {
 
     fn agent_stop(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            // Cancel the in-flight stream + kill the child via the manager when
-            // attached; the result is `{ success: true }` either way (§5.5).
+            // Interrupt the in-flight turn while KEEPING the child alive (TS
+            // `agent.stop` keep-alive: `provider.interrupt()`), emitting the
+            // terminal `agent:stream:end`; falls back to a hard kill only when no
+            // live session can be interrupted. `{ success: true }` either way (§5.5).
             if let Some(manager) = self.agent_manager() {
-                manager.stop(&agent_id).await;
+                manager.interrupt(&agent_id).await;
             }
             Ok(serde_json::json!({ "success": true }))
         })
