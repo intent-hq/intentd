@@ -15,8 +15,8 @@ use intent_services::{
 };
 use intent_store::Store;
 use intent_transport::{
-    detect_has_display, ensure_tls_certificate, get_or_create_token, serve_uds, CertStatus,
-    KeyringTokenStore, SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
+    detect_has_display, ensure_tls_certificate, generate_token, get_or_create_token, serve_uds,
+    CertStatus, KeyringTokenStore, SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
 
@@ -85,6 +85,14 @@ enum Command {
         #[arg(long)]
         from: PathBuf,
     },
+    /// Print WSS pairing credentials (bearer token + TLS fingerprint); --rotate
+    /// regenerates the token.
+    Token {
+        /// Mint and persist a NEW token, replacing the old one. Ignored when
+        /// `INTENTD_AUTH_TOKEN` is set (the token is fixed by the env var).
+        #[arg(long)]
+        rotate: bool,
+    },
 }
 
 /// Sub-actions for `intentd service` (daemonization, §5.8).
@@ -110,7 +118,40 @@ async fn main() -> ExitCode {
         Command::Service { action } => to_exit(cmd_service(&action)),
         Command::McpBridge { connect } => to_exit(cmd_mcp_bridge(&connect).await),
         Command::Import { from } => to_exit(cmd_import(&from).await),
+        Command::Token { rotate } => to_exit(cmd_token(rotate)),
     }
+}
+
+/// Print the WSS pairing credentials (§5.2/§5.3): the bearer token a client
+/// sends and the TLS cert fingerprint it pins. Resolves the token via
+/// [`resolve_token_store`] (env seam ⇒ keychain) and the fingerprint via
+/// [`ensure_tls_certificate`] (the same cert `serve` reuses, so it is stable to
+/// pin). `rotate` mints+persists a NEW token first — but when
+/// `INTENTD_AUTH_TOKEN` is set the token is fixed by the env var and cannot be
+/// rotated: a note is written to stderr and the env token is printed unchanged.
+/// The token is never logged via `tracing`; both lines go to stdout.
+fn cmd_token(rotate: bool) -> anyhow::Result<()> {
+    let config = resolve_config()?;
+    std::fs::create_dir_all(&config.data_dir)?;
+    let store = resolve_token_store();
+    let env_fixed = std::env::var("INTENTD_AUTH_TOKEN")
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+    let token = if rotate && !env_fixed {
+        generate_token(&*store).map_err(|e| anyhow::anyhow!(e.to_string()))?
+    } else {
+        if rotate {
+            eprintln!(
+                "note: INTENTD_AUTH_TOKEN is set; the token is fixed by the env var and cannot be rotated"
+            );
+        }
+        get_or_create_token(&*store).map_err(|e| anyhow::anyhow!(e.to_string()))?
+    };
+    let tls =
+        ensure_tls_certificate(&config.data_dir).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    println!("token:       {token}");
+    println!("fingerprint: {}", tls.fingerprint256);
+    Ok(())
 }
 
 /// Migrate a legacy Intent `userData` dir into intentd's SQLite store (§9.7).
