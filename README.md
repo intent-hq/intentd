@@ -11,12 +11,14 @@ agent acting as an MCP client) are thin: all business logic lives in the daemon.
 ## What it is
 
 - **Local-first.** The default transport is a **Unix-domain socket** (mode `0600`,
-  newline-delimited JSON-RPC frames). LAN transports (TCP/TLS/WSS) are planned, not built.
+  newline-delimited JSON-RPC frames). A secure **WSS/TLS** LAN transport (bearer auth,
+  origin allow-list, TLS fingerprint pinning) and **mDNS discovery** run alongside it; there
+  is no plaintext TCP product transport.
 - **Single source of truth.** The daemon owns all durable state in **SQLite** (via `sqlx`
   with embedded migrations); clients hold only ephemeral UI state.
 - **One service layer, many transports.** Transports are thin; the shared `WorkspaceApi`
-  service surface is the single code path every listener (and, later, the agent-facing MCP
-  server) calls.
+  service surface is the single code path every listener — and the agent-facing MCP
+  server — calls.
 
 ## Architecture
 
@@ -27,7 +29,7 @@ root that wires concrete implementations together.
 
 ```text
                        ┌──────────────────────────────┐
-                       │     intentd (bin)            │  CLI: serve / call / status / doctor
+                       │     intentd (bin)            │  CLI: serve / call / status / stop / doctor / …
                        │   composition root (§3.2)    │  wires store → services → transport
                        └───────────────┬──────────────┘
                                        │
@@ -47,18 +49,23 @@ root that wires concrete implementations together.
                                               └──────────────────┘  WorkspaceApi trait
 ```
 
-Stub crates (present and compiling, implementation deferred to later waves):
-`intent-acp`, `intent-providers`, `intent-sourcecontrol`, `intent-git`, `intent-context`,
-`intent-pty`, `intent-search`.
+The diagram shows the core service path. The composition root also wires the ACP agent
+runtime, source-control, git, PTY, and search engines into the service layer.
 
 | Crate | Role |
 | --- | --- |
-| `intent-core` | Leaf domain vocabulary: ids, `Error`→JSON-RPC code mapping, `Config`/path resolution, `Workspace`/`Note` model, the `WorkspaceApi` trait. |
+| `intent-core` | Leaf domain vocabulary: ids, `Error`→JSON-RPC code mapping, `Config`/path resolution, domain model, the `WorkspaceApi` trait. |
 | `intent-store` | SQLite persistence via `sqlx` + embedded migrations. |
-| `intent-services` | `WorkspaceApi` implementation (the shared service surface). |
-| `intent-transport` | JSON-RPC router + UDS listener (TLS/auth/mDNS/heartbeat are stubs). |
-| `intentd` | Binary composition root + CLI (`serve`/`call`/`status`/`doctor`). |
-| `intent-acp` / `intent-providers` / `intent-sourcecontrol` / `intent-git` / `intent-context` / `intent-pty` / `intent-search` | Stub crates for future waves. |
+| `intent-services` | `WorkspaceApi` implementation (the shared service surface) + the `AgentManager`, MCP callback server, and per-domain ops. |
+| `intent-transport` | JSON-RPC router + UDS listener, the WSS/TLS listener, bearer auth + origin allow-list, mDNS discovery, and heartbeat. |
+| `intentd` | Binary composition root + CLI (`serve`/`call`/`status`/`stop`/`doctor`/`import`/`service`/`mcp-bridge`). |
+| `intent-acp` | ACP client core + `AgentManager` orchestration, agent→BE MCP callback server, and the loopback MCP bridge. |
+| `intent-providers` | Provider registry + model resolution for spawning agent runtimes. |
+| `intent-sourcecontrol` | GitHub/PR via `octocrab` (REST + GraphQL), token resolution, GHE support. |
+| `intent-git` | Local git over `libgit2` (status/stage/commit/branches/merge-conflict + worktree/diff helpers). |
+| `intent-context` | Ripgrep/symbol-backed context engine (auggie codebase-retrieval is **won't-port**). |
+| `intent-pty` | Unified `portable-pty` host for interactive terminals **and** scripts. |
+| `intent-search` | Gitignore-aware content + filename search over ripgrep/`ignore`/`globset`. |
 
 ## Quickstart
 
@@ -87,25 +94,49 @@ database (`intentd.db`) and the socket (`intentd.sock`).
 
 ## Current status
 
-This repo currently implements a **thin UDS vertical slice** that proves the architecture
-end-to-end. Be aware of what is real versus planned:
+The backend port is well past a vertical slice: Milestones 1–10 are implemented, plus the
+recent-repository registry, ACP session resume-on-respawn, and iOS-driven wire-parity fixes.
+For the authoritative, dated progress log see
+`docs/00_initial_porting/BREADCRUMBS.md` in the monorepo.
 
 **Implemented**
 
-- JSON-RPC 2.0 over a Unix-domain socket (newline-delimited, mode `0600`).
-- Methods: `workspace.list` and `note.list`, served from SQLite.
-- CLI subcommands: `intentd serve --listen uds`, `intentd call <method> [--params '<json>']`,
-  `intentd status`, `intentd doctor`.
+- **JSON-RPC surface (~143 request methods + 1 server-initiated `events.event` notification),
+  served from SQLite,** across these namespaces:
+  - Domain CRUD: `workspace.*` (9), `repo.*` (1, recent-repository registry), `note.*` (12),
+    `task.*` (8), `comment.*` (5).
+  - Events: `event.*` (7) + the `events.*` subscribe/unsubscribe fast-path and `events.event`
+    push notification.
+  - Source control & review: `git.*` (6), `pr.*` (12, active-PR gated), `file-tracking.*` (8),
+    `metrics.*` (4), `accept-changes.*` (5).
+  - Search, terminals & scripts: `search.*` (8), `terminal.*` (6), `script.*` (9).
+  - Agent ecosystem: `settings.*` (4), `rules.*` (3), `specialist.*` (5), `mcp.servers.*` (7).
+  - intentd transport extensions: `host.status`, `forward.*` (3), `client.hello`,
+    `drafts.*` (3).
+  - Plus the `agent.*` ACP runtime surface (24).
+- **Transports:** UDS (default, mode `0600`) and a **WSS/TLS** LAN listener with bearer auth,
+  origin allow-list, and TLS fingerprint pinning, plus **mDNS discovery**.
+- **ACP agent runtime:** provider registry, ACP client, `AgentManager`, the agent→BE MCP
+  callback server, live spawn-wiring, and the `mcp-bridge` stdio↔TCP proxy.
+- **Source control:** GitHub/PR via `octocrab`, local git via `libgit2`, the change-tracking
+  / accept-changes pipeline, and ripgrep-backed search.
+- **Terminals & scripts:** a unified `intent-pty` host backing both interactive terminals and
+  scripts (back-fill-then-tail scrollback, multi-client fan-out, process-group reaping).
+- **CLI:** `serve`, `call`, `status`, `stop`, `doctor`, `import`, `service install|uninstall|status`,
+  and `mcp-bridge`.
+- **Persistence:** SQLite via `sqlx` with embedded migrations through `0012_known_repo`
+  (WAL, `foreign_keys`, `busy_timeout`).
 - Standard JSON-RPC error codes: `-32700`, `-32600`, `-32601`, `-32602`, `-32603`.
 
-**Planned / not yet implemented**
+**Won't port**
 
-- The remaining ~104 methods in `PROTOCOL.md` (the full `workspace.*`/`note.*`/`comment.*`/
-  `task.*`/`agent.*`/`git.*`/`pr.*`/`script.*`/`file.*`/`event.*`/… catalog).
-- TCP/TLS/WSS transport, mDNS discovery, bearer auth + origin allow-list.
-- ACP client + agent-facing MCP server, provider spawning, GitHub source control, context
-  engine, PTY/terminals, and search — these crates exist today only as stubs.
-- Event bus + `events.*` subscriptions.
+- auggie codebase-retrieval (no structured CLI; `search.codebase` stays ripgrep/symbol-backed).
+- `mcp.servers` **http/sse** transports (stdio only).
+- the `accept-changes.execute` **`export`** action and the legacy `memories.*` RPC.
+
+**Planned**
+
+- The Tauri/Svelte desktop frontend (not yet a submodule; will live in the monorepo).
 
 ## Development
 
