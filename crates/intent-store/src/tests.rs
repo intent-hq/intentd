@@ -79,8 +79,14 @@ async fn migration_status_reports_current_after_open() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let status = store.migration_status().await.expect("migration status");
     assert!(status.is_current(), "fresh open must apply all migrations");
-    assert_eq!(status.expected, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-    assert_eq!(status.applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(
+        status.expected,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    );
+    assert_eq!(
+        status.applied,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    );
 }
 
 #[tokio::test]
@@ -710,6 +716,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
     AgentSession {
         id: id.clone(),
         workspace_id: ws.clone(),
+        parent_agent_id: None,
         backend_session_id: None,
         acp_session_id: None,
         name: "Builder".to_string(),
@@ -794,6 +801,63 @@ async fn agent_session_round_trip_and_append_only_log() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, agent_id);
     assert_eq!(listed[0].messages.len(), 2);
+}
+
+#[tokio::test]
+async fn agent_session_parent_agent_id_round_trips() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+
+    // Default: no parent linkage persists as None.
+    let orphan = AgentId::from("agent-11111111-2222-3333-4444-555555555555");
+    store
+        .insert_agent_session(&sample_agent_session(&orphan, &ws))
+        .await
+        .expect("insert orphan");
+    assert_eq!(
+        store
+            .get_agent_session(&orphan)
+            .await
+            .expect("get")
+            .parent_agent_id,
+        None
+    );
+
+    // Inserted parent linkage round-trips on get and list.
+    let parent = AgentId::from("agent-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+    let child = AgentId::from("agent-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+    let mut session = sample_agent_session(&child, &ws);
+    session.parent_agent_id = Some(parent.clone());
+    store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert child");
+    assert_eq!(
+        store
+            .get_agent_session(&child)
+            .await
+            .expect("get")
+            .parent_agent_id,
+        Some(parent.clone())
+    );
+
+    // Update clears the linkage back to None.
+    let mut cleared = store.get_agent_session(&child).await.expect("get");
+    cleared.parent_agent_id = None;
+    store.update_agent_session(&cleared).await.expect("update");
+    assert_eq!(
+        store
+            .get_agent_session(&child)
+            .await
+            .expect("get")
+            .parent_agent_id,
+        None
+    );
 }
 
 #[tokio::test]

@@ -1013,6 +1013,8 @@ pub struct AgentSession {
     pub id: AgentId,
     pub workspace_id: WorkspaceId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_session_id: Option<AgentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,
@@ -1046,6 +1048,8 @@ pub struct AgentSession {
 pub struct AgentLite {
     pub id: AgentId,
     pub workspace_id: WorkspaceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<AgentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_session_id: Option<AgentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1083,6 +1087,7 @@ impl AgentLite {
         Self {
             id: session.id,
             workspace_id: session.workspace_id,
+            parent_agent_id: session.parent_agent_id,
             backend_session_id: session.backend_session_id,
             acp_session_id: session.acp_session_id,
             name: session.name,
@@ -1651,6 +1656,7 @@ mod tests {
         let session = AgentSession {
             id: AgentId::from("agent-1"),
             workspace_id: WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
             backend_session_id: Some(AgentId::from("backend-9")),
             acp_session_id: Some("acp-uuid".to_string()),
             name: "Builder".to_string(),

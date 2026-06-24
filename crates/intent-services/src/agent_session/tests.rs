@@ -194,6 +194,7 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
     AgentSession {
         id: agent_id.clone(),
         workspace_id: workspace_id.clone(),
+        parent_agent_id: None,
         backend_session_id: None,
         acp_session_id: None,
         name: "Builder".to_string(),

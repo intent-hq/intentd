@@ -445,7 +445,9 @@ mod mcp_tests {
         build_baseline_mcp_env, is_likely_secret_env_key, merge_mcp_env,
         redact_mcp_env_for_logging, EnvMap, REDACTED_VALUE,
     };
-    use crate::tool_restrictions::{get_tool_denylist_for_agent_type, SUBAGENT_TOOLS};
+    use crate::tool_restrictions::{
+        get_tool_denylist_for_agent_type, AGENT_CREATION_TOOLS, SUBAGENT_TOOLS,
+    };
     use crate::WorkspaceMcpServer;
 
     /// A `WorkspaceApi` that records the `add_to_note` calls it receives so a tool
@@ -597,6 +599,17 @@ mod mcp_tests {
         let cm = get_tool_denylist_for_agent_type("commit-message");
         assert!(cm.contains(&"add_to_note_workspace-mcp"));
         assert!(cm.contains(&"str-replace-editor"));
+    }
+
+    #[test]
+    fn report_to_parent_is_an_agent_creation_tool_and_denied_for_background_types() {
+        // It lives in the agent-orchestration group alongside delegate/send.
+        assert!(AGENT_CREATION_TOOLS.contains(&"report_to_parent_workspace-mcp"));
+        // Pure-text background agents (full denylist) cannot call it.
+        let cm = get_tool_denylist_for_agent_type("commit-message");
+        assert!(cm.contains(&"report_to_parent_workspace-mcp"));
+        // Interactive/foreground agents stay unrestricted.
+        assert!(get_tool_denylist_for_agent_type("interactive").is_empty());
     }
 
     #[test]

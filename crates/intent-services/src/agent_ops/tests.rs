@@ -3,10 +3,12 @@
 //! lifecycle, send/force semantics, summary, model catalog, and subscriptions.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use intent_acp::WorkspaceMcpServer;
 use intent_core::{
-    now_iso, AgentId, Error, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
-    WorkspaceId, WorkspaceStatus,
+    now_iso, AgentDelegateInput, AgentId, Error, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
 use serde_json::json;
@@ -84,6 +86,7 @@ async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
             ws.clone(),
             Some(name.to_string()),
             Some("auggie:sonnet4.5".into()),
+            None,
         )
         .await
         .expect("create");
@@ -340,14 +343,70 @@ async fn subscribe_then_unsubscribe_roundtrips() {
     assert!(matches!(err, Error::Internal(_)));
 }
 
+/// A delegated caller (child whose `parentAgentId` is set) delivers the report
+/// to the parent via the send-message path and returns the TS-shaped result.
 #[tokio::test]
-async fn report_to_parent_rejects_non_delegated() {
+async fn report_to_parent_delivers_for_delegated_caller() {
     let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let created = svc
+        .agent_create_op(ws.clone(), Some("Child".into()), None, Some(parent.clone()))
+        .await
+        .expect("create delegated child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let report = "done: shipped the thing";
+    let result = svc
+        .agent_report_to_parent_op(ws.clone(), json!(report), Some(child))
+        .await
+        .expect("report delivered");
+    assert_eq!(result["ok"], json!(true));
+    assert_eq!(result["parentAgentId"].as_str(), Some(parent.0.as_str()));
+    assert_eq!(result["reportLength"], json!(report.chars().count() as i64));
+    assert!(result["savedAt"].is_string());
+
+    // The report reached the parent's transcript via agent_send_message_op.
+    let parent_session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(parent_session.messages.len(), 1);
+}
+
+/// A non-delegated caller (created directly, no `parentAgentId`) is rejected
+/// with `-32603` and the canonical message.
+#[tokio::test]
+async fn report_to_parent_rejects_non_delegated_caller() {
+    let (_t, svc, ws) = setup().await;
+    let solo = create_agent(&svc, &ws, "Solo").await;
     let err = svc
-        .agent_report_to_parent(ws, json!("a report"))
+        .agent_report_to_parent_op(ws, json!("a report"), Some(solo))
         .await
         .expect_err("not delegated");
-    assert!(matches!(err, Error::Internal(_)));
+    match err {
+        Error::Internal(m) => {
+            assert_eq!(m, "report_to_parent is only available to delegated agents")
+        }
+        other => panic!("expected Internal, got {other:?}"),
+    }
+}
+
+/// The RPC front door (no caller context, `caller_agent_id = None`) keeps
+/// returning `-32603` exactly as before.
+#[tokio::test]
+async fn report_to_parent_rejects_rpc_front_door() {
+    let (_t, svc, ws) = setup().await;
+    let err = svc
+        .agent_report_to_parent(ws, json!("a report"), None)
+        .await
+        .expect_err("no caller context");
+    match err {
+        Error::Internal(m) => {
+            assert_eq!(m, "report_to_parent is only available to delegated agents")
+        }
+        other => panic!("expected Internal, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -358,4 +417,154 @@ async fn get_subscriptions_has_stable_shape() {
     assert!(r["subscriptions"].is_array());
     assert!(r["delegationGroups"].is_array());
     assert!(r["agentStatuses"].is_object());
+}
+
+/// A delegate through the MCP front door (caller set) stamps the child's
+/// `parentAgentId`; the same op through the RPC front door (caller `None`)
+/// leaves it null.
+#[tokio::test]
+async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
+    let (_t, svc, ws) = setup().await;
+
+    // MCP front door: caller set -> child parentAgentId == caller.
+    let caller = AgentId::from("agent-00000000-0000-0000-0000-0000000caller");
+    let api: Arc<dyn WorkspaceApi> = Arc::new(svc.clone());
+    let server =
+        WorkspaceMcpServer::new(api, ws.clone()).with_caller_agent_id(Some(caller.clone()));
+    let resp = server
+        .handle_message(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "delegate_task_workspace-mcp",
+                "arguments": { "agentInstructions": "do work" }
+            }
+        }))
+        .await
+        .expect("mcp response");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    let parsed: serde_json::Value = serde_json::from_str(text).expect("tool json");
+    let child_id = AgentId::from(parsed["agentId"].as_str().expect("agentId"));
+    let child = svc
+        .store()
+        .get_agent_session(&child_id)
+        .await
+        .expect("child session");
+    assert_eq!(child.parent_agent_id, Some(caller));
+
+    // RPC front door: caller None -> child parentAgentId null.
+    let rpc_resp = svc
+        .agent_delegate(ws.clone(), AgentDelegateInput::default(), None)
+        .await
+        .expect("rpc delegate");
+    let rpc_child_id = AgentId::from(rpc_resp["agentId"].as_str().expect("rpc agentId"));
+    let rpc_child = svc
+        .store()
+        .get_agent_session(&rpc_child_id)
+        .await
+        .expect("rpc child session");
+    assert_eq!(rpc_child.parent_agent_id, None);
+}
+
+/// End-to-end parent-tracking loop driven entirely through the MCP front door
+/// (`WorkspaceMcpServer` dispatch -> `Services` -> `Store`): a parent delegates a
+/// child (caller set, so the child's `parentAgentId` == parent), then the child
+/// reports back via `report_to_parent_workspace-mcp` (caller-aware) and the
+/// report lands in the parent's transcript. The same report tool through a
+/// caller-less server (the RPC / no-caller path) yields a `-32603` JSON-RPC
+/// error. This is the service-level integration coverage chosen over a
+/// node-gated UDS E2E so the full loop is exercised deterministically without an
+/// external `node` dependency.
+#[tokio::test]
+async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let api: Arc<dyn WorkspaceApi> = Arc::new(svc.clone());
+
+    // Parent delegates a child through the MCP front door (caller = parent).
+    let parent_server =
+        WorkspaceMcpServer::new(api.clone(), ws.clone()).with_caller_agent_id(Some(parent.clone()));
+    let resp = parent_server
+        .handle_message(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "delegate_task_workspace-mcp",
+                "arguments": { "agentInstructions": "do work" }
+            }
+        }))
+        .await
+        .expect("delegate response");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    let parsed: serde_json::Value = serde_json::from_str(text).expect("tool json");
+    let child = AgentId::from(parsed["agentId"].as_str().expect("agentId"));
+
+    // The child carries the parent linkage stamped from the caller identity.
+    let child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    assert_eq!(child_session.parent_agent_id, Some(parent.clone()));
+
+    // Child reports back through the MCP front door (caller = child).
+    let child_server =
+        WorkspaceMcpServer::new(api.clone(), ws.clone()).with_caller_agent_id(Some(child.clone()));
+    let report = "done: shipped the thing";
+    let report_resp = child_server
+        .handle_message(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "report_to_parent_workspace-mcp",
+                "arguments": { "report": report }
+            }
+        }))
+        .await
+        .expect("report response");
+    let report_text = report_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("report text");
+    let report_parsed: serde_json::Value = serde_json::from_str(report_text).expect("report json");
+    assert_eq!(report_parsed["ok"], json!(true));
+    assert_eq!(
+        report_parsed["parentAgentId"].as_str(),
+        Some(parent.0.as_str())
+    );
+
+    // The report reached the parent's transcript via the send-message path.
+    let parent_session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(parent_session.messages.len(), 1);
+    let delivered = serde_json::to_string(&parent_session.messages).expect("serialize messages");
+    assert!(
+        delivered.contains(report),
+        "parent transcript should contain the report text"
+    );
+
+    // RPC / no-caller path: the report tool surfaces a -32603 JSON-RPC error.
+    let no_caller_server = WorkspaceMcpServer::new(api, ws.clone());
+    let err_resp = no_caller_server
+        .handle_message(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "report_to_parent_workspace-mcp",
+                "arguments": { "report": "orphan" }
+            }
+        }))
+        .await
+        .expect("error response");
+    assert_eq!(err_resp["error"]["code"], json!(-32603));
 }

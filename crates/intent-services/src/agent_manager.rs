@@ -615,11 +615,11 @@ impl AgentManager {
         // uses, with the §18.4 denylist for this agent type applied, served over
         // a loopback bridge a real spawned child reaches via `--mcp-config`.
         let api: Arc<dyn WorkspaceApi> = Arc::new(self.services.clone());
-        let server = Arc::new(WorkspaceMcpServer::for_agent_type(
-            api,
-            workspace_id.clone(),
-            agent_type,
-        ));
+        let server = Arc::new(
+            WorkspaceMcpServer::for_agent_type(api, workspace_id.clone(), agent_type)
+                // Caller-aware tools attribute back to this spawning agent.
+                .with_caller_agent_id(Some(agent_id.clone())),
+        );
         let bridge = serve_workspace_mcp_tcp(server)
             .await
             .map_err(|e| Error::Internal(format!("mcp bridge bind failed: {e}")))?;

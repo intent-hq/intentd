@@ -3678,8 +3678,12 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         input: AgentDelegateInput,
+        parent_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_delegate_op(workspace_id, input).await })
+        Box::pin(async move {
+            self.agent_delegate_op(workspace_id, input, parent_agent_id)
+                .await
+        })
     }
 
     fn agent_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
@@ -3709,8 +3713,12 @@ impl WorkspaceApi for Services {
         name: Option<String>,
         model: Option<String>,
         _specialist_id: Option<String>,
+        parent_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_create_op(workspace_id, name, model).await })
+        Box::pin(async move {
+            self.agent_create_op(workspace_id, name, model, parent_agent_id)
+                .await
+        })
     }
 
     fn agent_send_to_task(
@@ -3881,14 +3889,11 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         report: serde_json::Value,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            let _ = (workspace_id, report);
-            // No agent-caller context over the RPC dispatch path → never a
-            // delegated agent (TS surfaces this as -32603).
-            Err(Error::Internal(
-                "report_to_parent is only available to delegated agents".to_string(),
-            ))
+            self.agent_report_to_parent_op(workspace_id, report, caller_agent_id)
+                .await
         })
     }
 

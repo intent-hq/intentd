@@ -15,7 +15,8 @@ use uuid::Uuid;
 use crate::{enum_from_db, enum_to_db, Store};
 
 const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session_id, name, \
-    name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at";
+    name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, \
+    parent_agent_id";
 
 impl Store {
     /// Insert an agent-session row. `messages`/`stats` are not persisted here;
@@ -23,7 +24,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&s.id.0)
@@ -39,6 +40,7 @@ impl Store {
             .bind(&s.system_prompt)
             .bind(&s.created_at)
             .bind(&s.updated_at)
+            .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
@@ -100,7 +102,7 @@ impl Store {
         sqlx::query(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
-             updated_at=? WHERE id=?",
+             updated_at=?, parent_agent_id=? WHERE id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.acp_session_id)
@@ -112,6 +114,7 @@ impl Store {
         .bind(s.is_active as i64)
         .bind(&s.system_prompt)
         .bind(&s.updated_at)
+        .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.id.0)
         .execute(self.pool())
         .await
@@ -197,9 +200,11 @@ impl Store {
 
 fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
     let backend: Option<String> = col(row, "backend_session_id")?;
+    let parent: Option<String> = col(row, "parent_agent_id")?;
     Ok(AgentSession {
         id: AgentId(col(row, "id")?),
         workspace_id: WorkspaceId(col(row, "workspace_id")?),
+        parent_agent_id: parent.map(AgentId),
         backend_session_id: backend.map(AgentId),
         acp_session_id: col(row, "acp_session_id")?,
         name: col(row, "name")?,

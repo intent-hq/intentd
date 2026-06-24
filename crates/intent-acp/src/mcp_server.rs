@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use intent_core::{WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
 use crate::tool_restrictions::get_tool_denylist_for_agent_type;
@@ -30,6 +30,10 @@ pub struct WorkspaceMcpServer {
     denylist: HashSet<String>,
     name: String,
     version: String,
+    /// The agent this server front-doors for. Caller-aware tools (e.g.
+    /// `delegate_task`) attribute their actions to this id so children can be
+    /// stamped with their spawning parent. `None` for the FE/RPC front door.
+    caller_agent_id: Option<AgentId>,
 }
 
 impl WorkspaceMcpServer {
@@ -41,6 +45,7 @@ impl WorkspaceMcpServer {
             denylist: HashSet::new(),
             name: "workspace-mcp".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            caller_agent_id: None,
         }
     }
 
@@ -68,6 +73,13 @@ impl WorkspaceMcpServer {
         S: Into<String>,
     {
         self.denylist = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set the calling agent this server front-doors for (the spawn-time wiring
+    /// point). Caller-aware tools attribute their actions to this id.
+    pub fn with_caller_agent_id(mut self, caller: Option<AgentId>) -> Self {
+        self.caller_agent_id = caller;
         self
     }
 

@@ -33,6 +33,7 @@ pub const AGENT_CREATION_TOOLS: &[&str] = &[
     "send_message_to_agent_workspace-mcp",
     "send_message_to_task_agent_workspace-mcp",
     "wake_or_create_task_agent_workspace-mcp",
+    "report_to_parent_workspace-mcp",
 ];
 
 /// Note + task + comment + primitive mutation tools.
