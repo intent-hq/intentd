@@ -570,6 +570,7 @@ async fn insert_file_event(
             session_id: None,
             correlation_id: None,
             parent_event_id: None,
+            metadata: None,
             data: serde_json::json!({ "path": path, "relativePath": path, "action": "modify" }),
         })
         .await
@@ -910,6 +911,49 @@ mod change_event_parity {
         assert_eq!(ev["data"]["previousStatus"], "not_started");
         assert_eq!(ev["data"]["newStatus"], "in_progress");
         assert!(ev["data"]["changedAt"].is_string());
+    }
+
+    #[tokio::test]
+    async fn ready_tasks_changed_payload() {
+        let h = harness().await;
+        // Parent task with one child; both start not_started. The parent is
+        // blocked by its incomplete child, so neither is ready yet.
+        let mut parent = note(&h.ws, "parent", "p");
+        parent.task = Some(TaskMetadata {
+            status: TaskStatus::NotStarted,
+            ..Default::default()
+        });
+        let mut child = note(&h.ws, "child", "c");
+        child.parent_id = Some(parent.id.clone());
+        child.task = Some(TaskMetadata {
+            status: TaskStatus::NotStarted,
+            ..Default::default()
+        });
+        h.store.insert_note(&parent).await.expect("insert parent");
+        h.store.insert_note(&child).await.expect("insert child");
+
+        let mut sub = subscribe(&h);
+        // Completing the child recomputes the ready set: the child is now
+        // terminal (excluded), and the parent's only child is complete, so the
+        // parent becomes the sole ready task.
+        h.services
+            .task_update_note_status(h.ws.clone(), child.id.clone(), "complete".to_string())
+            .await
+            .expect("status");
+
+        // First: task:status-changed for the child.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:status-changed");
+        assert_eq!(ev["data"]["noteId"], "child");
+
+        // Then: task:ready-tasks-changed with the recomputed set + trigger.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["parent"]));
+        assert_eq!(ev["data"]["triggeredBy"]["noteId"], "child");
+        assert_eq!(ev["data"]["triggeredBy"]["previousStatus"], "not_started");
+        assert_eq!(ev["data"]["triggeredBy"]["newStatus"], "complete");
+        assert!(ev["data"]["computedAt"].is_string());
     }
 
     #[tokio::test]
@@ -2834,6 +2878,7 @@ mod search_adapters {
                 session_id: None,
                 correlation_id: None,
                 parent_event_id: None,
+                metadata: None,
                 data: json!({ "path": "src/alpha.rs", "action": "modify" }),
             })
             .await
@@ -2912,6 +2957,79 @@ mod search_adapters {
         assert!(matches[0]["preview"].as_str().unwrap().contains("needle"));
     }
 
+    /// A fake [`ContextEngine`] so the engine-available and graceful-degradation
+    /// paths of `search.codebase` are exercised deterministically (§8.3),
+    /// independent of whether `auggie` is on the host PATH.
+    struct FakeEngine {
+        availability: intent_core::EngineAvailability,
+        result: std::result::Result<intent_core::RetrieveResult, ()>,
+    }
+
+    #[async_trait::async_trait]
+    impl intent_core::ContextEngine for FakeEngine {
+        async fn availability(&self) -> intent_core::EngineAvailability {
+            self.availability.clone()
+        }
+
+        async fn retrieve(
+            &self,
+            _req: intent_core::RetrieveRequest,
+        ) -> std::result::Result<intent_core::RetrieveResult, intent_core::ContextError> {
+            self.result
+                .clone()
+                .map_err(|()| intent_core::ContextError::Unavailable {
+                    reason: "needs login".to_string(),
+                })
+        }
+    }
+
+    /// (a) When the context engine is available it backs `search.codebase`: the
+    /// returned matches are the engine's hits (carrying their `score`), not the
+    /// ripgrep/symbol output (§5.15, §8).
+    #[tokio::test]
+    async fn codebase_search_uses_context_engine_when_available() {
+        let dir = std::env::temp_dir().join(format!("intentd-search-eng-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().to_string());
+        store.insert_workspace(&w).await.expect("ws");
+        let engine = FakeEngine {
+            availability: intent_core::EngineAvailability::Available {
+                name: "fake".to_string(),
+                version: Some("9.9.9".to_string()),
+            },
+            result: Ok(intent_core::RetrieveResult {
+                items: vec![intent_core::RetrievedItem {
+                    file: "src/engine_hit.rs".to_string(),
+                    symbol: Some("Widget".to_string()),
+                    line: Some(7),
+                    preview: "struct Widget".to_string(),
+                    score: Some(0.87),
+                }],
+            }),
+        };
+        let svc = Services::new(store).with_context_engine(std::sync::Arc::new(engine));
+        let r = svc
+            .search_codebase(ws, "widget".into(), Some("srch-eng".into()))
+            .await
+            .unwrap();
+        assert_eq!(r["requestId"], "srch-eng");
+        let matches = r["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["file"], "src/engine_hit.rs");
+        assert_eq!(matches[0]["symbol"], "Widget");
+        assert_eq!(matches[0]["line"], 7);
+        assert_eq!(matches[0]["score"], 0.87);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (b) When the engine is `Unavailable`, `search.codebase` degrades to the
+    /// ripgrep/symbol path without erroring (§8.3). An injected `Unavailable`
+    /// engine makes this deterministic regardless of the host PATH.
     #[tokio::test]
     async fn codebase_search_returns_symbol_matches() {
         let dir = std::env::temp_dir().join(format!("intentd-search-cb-{}", uuid::Uuid::new_v4()));
@@ -2923,11 +3041,55 @@ mod search_adapters {
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().to_string());
         store.insert_workspace(&w).await.expect("ws");
-        let svc = Services::new(store);
+        let engine = FakeEngine {
+            availability: intent_core::EngineAvailability::Unavailable {
+                reason: "auggie not found on PATH".to_string(),
+            },
+            result: Err(()),
+        };
+        let svc = Services::new(store).with_context_engine(std::sync::Arc::new(engine));
         let r = svc
             .search_codebase(ws, "main".into(), Some("srch-c".into()))
             .await
             .unwrap();
+        let matches = r["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["file"], "src/main.rs");
+        assert_eq!(matches[0]["symbol"], "main");
+        assert!(matches[0]["score"].is_number());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (c) When the engine reports `Available` (binary present — e.g. auggie on
+    /// PATH) but `retrieve()` returns `Unavailable`, `search.codebase` degrades to
+    /// the ripgrep/symbol path without erroring. This is the Option-A reality
+    /// (M10 CE-3): auggie exposes no structured codebase-retrieval CLI, so its
+    /// `retrieve()` is always `Unavailable` even while `availability()` is
+    /// `Available` for `intentd doctor` (§8.3).
+    #[tokio::test]
+    async fn codebase_search_degrades_when_available_engine_cannot_retrieve() {
+        let dir = std::env::temp_dir().join(format!("intentd-search-deg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().to_string());
+        store.insert_workspace(&w).await.expect("ws");
+        let engine = FakeEngine {
+            availability: intent_core::EngineAvailability::Available {
+                name: "auggie".to_string(),
+                version: Some("0.29.0".to_string()),
+            },
+            result: Err(()),
+        };
+        let svc = Services::new(store).with_context_engine(std::sync::Arc::new(engine));
+        let r = svc
+            .search_codebase(ws, "main".into(), Some("srch-deg".into()))
+            .await
+            .unwrap();
+        assert_eq!(r["requestId"], "srch-deg");
         let matches = r["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0]["file"], "src/main.rs");

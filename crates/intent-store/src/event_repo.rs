@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{enum_to_db, Store};
 
 const EVENT_COLUMNS: &str = "id, workspace_id, timestamp, event_type, actor, session_id, \
-    correlation_id, parent_event_id, data_json";
+    correlation_id, parent_event_id, metadata_json, data_json";
 
 /// Input to [`Store::insert_event`]: an event without its id. The repository
 /// mints a UUIDv7 `id` and returns the persisted [`Event`].
@@ -27,6 +27,7 @@ pub struct NewEvent {
     pub session_id: Option<String>,
     pub correlation_id: Option<String>,
     pub parent_event_id: Option<String>,
+    pub metadata: Option<serde_json::Value>,
     pub data: serde_json::Value,
 }
 
@@ -55,7 +56,13 @@ impl Store {
             .map_err(|e| Error::Internal(format!("encode actor failed: {e}")))?;
         let data_json = serde_json::to_string(&ev.data)
             .map_err(|e| Error::Internal(format!("encode data_json failed: {e}")))?;
-        let sql = format!("INSERT INTO event ({EVENT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?)");
+        let metadata_json = ev
+            .metadata
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| Error::Internal(format!("encode metadata_json failed: {e}")))?;
+        let sql = format!("INSERT INTO event ({EVENT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?)");
         sqlx::query(&sql)
             .bind(&id)
             .bind(&ev.workspace_id.0)
@@ -65,6 +72,7 @@ impl Store {
             .bind(&ev.session_id)
             .bind(&ev.correlation_id)
             .bind(&ev.parent_event_id)
+            .bind(&metadata_json)
             .bind(&data_json)
             .execute(self.pool())
             .await
@@ -78,6 +86,7 @@ impl Store {
             session_id: ev.session_id.clone(),
             correlation_id: ev.correlation_id.clone(),
             parent_event_id: ev.parent_event_id.clone(),
+            metadata: ev.metadata.clone(),
             data: ev.data.clone(),
         })
     }
@@ -246,6 +255,10 @@ fn map_event_row(row: &SqliteRow) -> Result<Event> {
         .map_err(|e| Error::Internal(format!("decode actor failed: {e}")))?;
     let data: serde_json::Value = serde_json::from_str(&col::<String>(row, "data_json")?)
         .map_err(|e| Error::Internal(format!("decode data_json failed: {e}")))?;
+    let metadata: Option<serde_json::Value> = col::<Option<String>>(row, "metadata_json")?
+        .map(|s| serde_json::from_str(&s))
+        .transpose()
+        .map_err(|e| Error::Internal(format!("decode metadata_json failed: {e}")))?;
     Ok(Event {
         id: col(row, "id")?,
         workspace_id: WorkspaceId(col(row, "workspace_id")?),
@@ -255,6 +268,7 @@ fn map_event_row(row: &SqliteRow) -> Result<Event> {
         session_id: col(row, "session_id")?,
         correlation_id: col(row, "correlation_id")?,
         parent_event_id: col(row, "parent_event_id")?,
+        metadata,
         data,
     })
 }

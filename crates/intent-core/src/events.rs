@@ -7,9 +7,11 @@
 //! (publish/subscribe) lands in later Milestone 2 tasks; this module only fixes
 //! the string vocabulary plus a small membership helper for filter wiring.
 
-// File events. Canonical taxonomy lives on `data.action`
-// (`create|modify|delete|rename`); `file:created/deleted/renamed` are
-// reserved-but-unused (no emitter) per the TS source.
+// File events. The watcher picks the type via the TS `change-processor.ts`
+// `getEventType` mapping: `create` → `file:created`, `delete` → `file:deleted`,
+// and both `modify` and `rename` → `file:changed`. `data.action` always carries
+// the raw `create|modify|delete|rename` verb. `file:renamed` is part of the
+// taxonomy but stays reserved-but-unused (no emitter), matching the TS source.
 pub const FILE_CHANGED: &str = "file:changed";
 pub const FILE_CREATED: &str = "file:created";
 pub const FILE_DELETED: &str = "file:deleted";

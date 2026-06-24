@@ -108,6 +108,7 @@ fn draft_changed_event(
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "agentId": agent_id.as_str(),

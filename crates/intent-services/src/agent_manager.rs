@@ -192,6 +192,7 @@ impl EventSink for BusEventSink {
                 session_id: event.session_id,
                 correlation_id: None,
                 parent_event_id: None,
+                metadata: None,
                 data: event.data,
             };
             if let Err(e) = self.bus.publish(&new_event).await {
@@ -815,6 +816,79 @@ impl AgentManager {
         }
         self.registry.deregister(agent_id);
         removed
+    }
+
+    /// Interrupt one agent's in-flight turn WITHOUT killing its child — the TS
+    /// `agent.stop` keep-alive semantics (`ConsolidatedBackend.backendStop` with
+    /// `killProcess: false` → `provider.interrupt()`): cancel the current turn
+    /// over the wire (`session/cancel`), abort the draining worker, release the
+    /// in-flight slot, mark the process idle, and emit the single terminal
+    /// `agent:stream:end` (the aborted worker can no longer emit it). The child +
+    /// ACP session stay alive, so a follow-up `agent.sendMessage` resumes the
+    /// same session. Falls back to the hard [`AgentManager::stop`] kill ONLY when
+    /// no live session is available to interrupt (no handle / no `acpSessionId`),
+    /// the Rust analog of TS reserving the kill for `killProcess: true`. Returns
+    /// whether an agent was found.
+    pub async fn interrupt(&self, agent_id: &AgentId) -> bool {
+        // The live connection is the interrupt capability; grab it WITHOUT
+        // removing the handle so the child stays alive for resume.
+        let conn = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .map(|h| h.connection.clone());
+        let Some(conn) = conn else {
+            // No live session to interrupt → keep-alive is a no-op; fall back to
+            // the hard kill path (itself a no-op when the agent is already gone).
+            return self.stop(agent_id).await;
+        };
+        // Resolve the persisted session for the workspace (terminal event) + the
+        // `acpSessionId` to cancel. Without an `acpSessionId` there is no
+        // in-flight turn to interrupt, so fall back to the kill path.
+        let session = self.services.store.get_agent_session(agent_id).await.ok();
+        let acp_session_id = session.as_ref().and_then(|s| s.acp_session_id.clone());
+        let Some(acp_session_id) = acp_session_id else {
+            return self.stop(agent_id).await;
+        };
+        // Abort the in-flight worker so it stops draining the turn/queue; the
+        // child is kept alive (unlike `stop`, which also kills the child).
+        if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
+            worker.abort();
+        }
+        // Cancel the current turn over the wire (keep-alive interrupt). The agent
+        // resolves its in-flight `session/prompt` with `StopReason::Cancelled`;
+        // best-effort — a wire error never blocks the stop.
+        if let Err(e) = intent_acp::session::cancel(&conn, &acp_session_id).await {
+            tracing::warn!(agent = %agent_id, error = %e, "session/cancel failed");
+        }
+        // Release the in-flight slot (recomputes workspace activity) and capture
+        // the owning workspace BEFORE the slot is dropped so the terminal event
+        // is stamped on the right workspace; fall back to the persisted session.
+        let workspace_id = self
+            .agent_ws
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .cloned()
+            .or_else(|| session.as_ref().map(|s| s.workspace_id.clone()));
+        self.end_turn(agent_id).await;
+        // Mark the process idle (reapable) but keep its handle so it survives for
+        // a follow-up resume.
+        self.registry.mark_idle(agent_id);
+        // Emit the single terminal `agent:stream:end` on stop (parity #14): the
+        // aborted worker's `run_prompt_turn` no longer reaches its own emit.
+        if let Some(workspace_id) = workspace_id {
+            self.services
+                .publish_agent_event(
+                    &workspace_id,
+                    agent_id,
+                    intent_core::events::AGENT_STREAM_END,
+                    json!({ "agentId": agent_id.0 }),
+                )
+                .await;
+        }
+        true
     }
 
     /// Whether a turn loop is currently in flight for `agent_id` (consulted by

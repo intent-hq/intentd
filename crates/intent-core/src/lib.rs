@@ -36,4 +36,7 @@ pub use model::{
     TopChangedFile, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceCreate,
     WorkspaceEventSummary, WorkspaceStatus, WorkspaceUpdate,
 };
-pub use traits::{BoxFuture, ContextEngine, WorkspaceApi};
+pub use traits::{
+    BoxFuture, ContextEngine, ContextError, EngineAvailability, RetrieveRequest, RetrieveResult,
+    RetrievedItem, WorkspaceApi,
+};

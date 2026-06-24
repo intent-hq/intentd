@@ -14,7 +14,8 @@ use base64::Engine as _;
 use intent_core::events::{
     CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED,
     NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED,
-    TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
+    TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED,
 };
 use intent_core::{
     iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId, AgentLite,
@@ -137,6 +138,10 @@ pub struct Services {
     /// `mcp.servers:status-changed`. Shared across clones (and with the
     /// composition root, which spawns the monitor + reaps on shutdown).
     mcp_hub: Arc<McpHub>,
+    /// Context engine backing `search.codebase` retrieval (§8). Defaults to the
+    /// `auggie`-backed engine; `search.codebase` falls back to the ripgrep/symbol
+    /// path when the engine is `Unavailable` (§8.3). Shared across clones.
+    context_engine: Arc<dyn intent_context::ContextEngine>,
 }
 
 impl Services {
@@ -159,7 +164,17 @@ impl Services {
             specialists_user_dir: None,
             specialists_bundled_dir: None,
             mcp_hub: Arc::new(McpHub::new()),
+            context_engine: Arc::new(intent_context::AuggieContextEngine::new()),
         }
+    }
+
+    /// Override the context engine backing `search.codebase` (§8). The
+    /// composition root keeps the `auggie`-backed default; tests inject a fake
+    /// engine to exercise the engine-available and graceful-degradation paths
+    /// (§8.3).
+    pub fn with_context_engine(mut self, engine: Arc<dyn intent_context::ContextEngine>) -> Self {
+        self.context_engine = engine;
+        self
     }
 
     /// Override the [`SecretStore`] backing sensitive settings (§9.8). The
@@ -646,6 +661,7 @@ fn note_change_event(
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "noteId": note_id.as_str(),
             "title": title,
@@ -673,12 +689,123 @@ fn task_status_changed_event(
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "noteId": note_id.as_str(),
             "noteTitle": note_title,
             "previousStatus": status_word(previous_status),
             "newStatus": status_word(new_status),
             "changedAt": changed_at,
+        }),
+    }
+}
+
+/// True for the TS `TERMINAL_STATUSES` (`notes/utils/task-tree-utils.ts`): a
+/// terminal task is excluded from the flattened ready-task traversal.
+fn is_terminal_task_status(status: TaskStatus) -> bool {
+    matches!(status, TaskStatus::Complete | TaskStatus::Cancelled)
+}
+
+/// Compute the ordered ready task note IDs for a workspace, porting
+/// `flattenTaskTree` + `findReadyTasks` (`notes/utils/task-tree-utils.ts`):
+/// non-terminal task notes in leaves-first post-order (by `peerOrder`, then
+/// `createdAt`), keeping only those whose task children are all `complete`.
+fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
+    // flattenTaskTree: only non-terminal task notes participate, keyed by parent.
+    let mut children: HashMap<Option<&str>, Vec<&Note>> = HashMap::new();
+    for n in notes {
+        if n.task
+            .as_ref()
+            .is_some_and(|t| !is_terminal_task_status(t.status))
+        {
+            let parent = n.parent_id.as_ref().map(|p| p.as_str());
+            children.entry(parent).or_default().push(n);
+        }
+    }
+    if children.is_empty() {
+        return Vec::new();
+    }
+    // Sort each sibling level by peerOrder (default 0), then createdAt (older first).
+    for level in children.values_mut() {
+        level.sort_by(|a, b| {
+            let ao = a.task.as_ref().and_then(|t| t.peer_order).unwrap_or(0);
+            let bo = b.task.as_ref().and_then(|t| t.peer_order).unwrap_or(0);
+            ao.cmp(&bo).then_with(|| a.created_at.cmp(&b.created_at))
+        });
+    }
+    // Post-order DFS (children before parent), starting at the root level.
+    fn traverse<'a>(
+        parent: Option<&'a str>,
+        children: &HashMap<Option<&'a str>, Vec<&'a Note>>,
+        out: &mut Vec<&'a Note>,
+    ) {
+        if let Some(level) = children.get(&parent) {
+            for child in level {
+                traverse(Some(child.id.as_str()), children, out);
+                out.push(child);
+            }
+        }
+    }
+    let mut flattened: Vec<&Note> = Vec::new();
+    traverse(None, &children, &mut flattened);
+
+    // findReadyTasks: ready iff every task child (over ALL notes, including
+    // terminal ones) is `complete`.
+    let mut all_children: HashMap<&str, Vec<&Note>> = HashMap::new();
+    for n in notes {
+        if n.task.is_some() {
+            if let Some(parent) = n.parent_id.as_ref() {
+                all_children.entry(parent.as_str()).or_default().push(n);
+            }
+        }
+    }
+    flattened
+        .into_iter()
+        .filter(|n| {
+            all_children
+                .get(n.id.as_str())
+                .map(|kids| {
+                    kids.iter().all(|c| {
+                        c.task
+                            .as_ref()
+                            .map(|t| t.status == TaskStatus::Complete)
+                            .unwrap_or(true)
+                    })
+                })
+                .unwrap_or(true)
+        })
+        .map(|n| n.id.0.clone())
+        .collect()
+}
+
+/// Build a `task:ready-tasks-changed` change event with the TS-parity payload
+/// `{ readyTaskIds, triggeredBy: { noteId, previousStatus, newStatus },
+/// computedAt }` (`notes.service.ts` `emitReadyTasksChanged`).
+fn ready_tasks_changed_event(
+    workspace_id: &WorkspaceId,
+    ready_task_ids: Vec<String>,
+    triggered_by_note: &NoteId,
+    previous_status: TaskStatus,
+    new_status: TaskStatus,
+    computed_at: &str,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: TASK_READY_TASKS_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "readyTaskIds": ready_task_ids,
+            "triggeredBy": {
+                "noteId": triggered_by_note.as_str(),
+                "previousStatus": status_word(previous_status),
+                "newStatus": status_word(new_status),
+            },
+            "computedAt": computed_at,
         }),
     }
 }
@@ -694,6 +821,7 @@ fn activity_changed_event(workspace_id: &WorkspaceId, activity: WorkspaceActivit
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "activity": activity,
@@ -712,6 +840,7 @@ fn attention_changed_event(workspace_id: &WorkspaceId, attention: WorkspaceAtten
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "attention": attention,
@@ -732,6 +861,7 @@ fn settings_changed_event(changes: Vec<serde_json::Value>) -> NewEvent {
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({ "changes": changes }),
     }
 }
@@ -748,6 +878,7 @@ fn comment_added_event(workspace_id: &WorkspaceId, note_id: &NoteId, comment_id:
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "noteId": note_id.as_str(),
             "commentId": comment_id,
@@ -767,6 +898,7 @@ fn pr_linked_event(ws: &Workspace) -> NewEvent {
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "workspaceId": ws.id.as_str(),
             "prNumber": ws.pr_number,
@@ -788,6 +920,7 @@ fn pr_updated_event(ws: &Workspace) -> NewEvent {
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "workspaceId": ws.id.as_str(),
             "prNumber": ws.pr_number,
@@ -808,6 +941,7 @@ fn pr_unlinked_event(workspace_id: &WorkspaceId) -> NewEvent {
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({ "workspaceId": workspace_id.as_str() }),
     }
 }
@@ -823,6 +957,7 @@ fn changes_git_status_event(workspace_id: &WorkspaceId, status: serde_json::Valu
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "status": status,
@@ -844,6 +979,7 @@ fn changes_metrics_changed_event(
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "metrics": metrics,
@@ -883,6 +1019,7 @@ fn search_result_event(
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "requestId": request_id,
             "matches": matches,
@@ -906,6 +1043,7 @@ fn search_done_event(
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({
             "requestId": request_id,
             "total": total,
@@ -1413,6 +1551,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let registry = self.search_cancels.clone();
+        let engine = self.context_engine.clone();
         let services = self.clone();
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
@@ -1421,6 +1560,39 @@ impl WorkspaceApi for Services {
                 None => return Ok(serde_json::json!({ "requestId": request_id, "matches": [] })),
             };
             let token = registry.register(&request_id);
+
+            // Prefer the context engine when it is available, mapping its hits
+            // to `CodebaseMatch` (§5.15 parity). When the engine is `Unavailable`
+            // — or a retrieval errors — degrade to the ripgrep/symbol path rather
+            // than failing the search (§8.3).
+            if let intent_core::EngineAvailability::Available { .. } = engine.availability().await {
+                let req = intent_core::RetrieveRequest {
+                    workspace_id: workspace_id.clone(),
+                    workspace_path: root.clone(),
+                    query: query.clone(),
+                    max_results: None,
+                };
+                match engine.retrieve(req).await {
+                    Ok(result) => {
+                        let matches = search_ops::engine_matches(&result);
+                        let matches = to_value_vec(matches)?;
+                        return Ok(services.deliver_search(
+                            request_id,
+                            Some(workspace_id),
+                            matches,
+                            token,
+                        ));
+                    }
+                    Err(intent_core::ContextError::Unavailable { .. }) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "context engine retrieval failed; falling back to ripgrep"
+                        );
+                    }
+                }
+            }
+
             let opts = intent_search::SearchOpts::default();
             let outcome = {
                 let token = token.clone();
@@ -2257,6 +2429,22 @@ impl WorkspaceApi for Services {
                         previous_status,
                         new_status,
                         &now,
+                    ),
+                )
+                .await;
+                // Then recompute + broadcast the ready-task set, mirroring the
+                // `emitReadyTasksChanged` call that follows `task:status-changed`.
+                let all = store.list_notes(&note.workspace_id).await?;
+                let ready_task_ids = compute_ready_task_ids(&all);
+                publish_event(
+                    &bus,
+                    ready_tasks_changed_event(
+                        &note.workspace_id,
+                        ready_task_ids,
+                        &note.id,
+                        previous_status,
+                        new_status,
+                        &now_iso(),
                     ),
                 )
                 .await;
@@ -3532,10 +3720,12 @@ impl WorkspaceApi for Services {
 
     fn agent_stop(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            // Cancel the in-flight stream + kill the child via the manager when
-            // attached; the result is `{ success: true }` either way (§5.5).
+            // Interrupt the in-flight turn while KEEPING the child alive (TS
+            // `agent.stop` keep-alive: `provider.interrupt()`), emitting the
+            // terminal `agent:stream:end`; falls back to a hard kill only when no
+            // live session can be interrupted. `{ success: true }` either way (§5.5).
             if let Some(manager) = self.agent_manager() {
-                manager.stop(&agent_id).await;
+                manager.interrupt(&agent_id).await;
             }
             Ok(serde_json::json!({ "success": true }))
         })

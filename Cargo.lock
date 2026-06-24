@@ -1602,13 +1602,19 @@ dependencies = [
 name = "intent-context"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "directories",
  "intent-core",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "intent-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "directories",
  "serde",
  "serde_json",

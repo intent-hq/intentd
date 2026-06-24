@@ -128,6 +128,7 @@ fn event_notification_envelope_matches_protocol() {
         session_id: Some("sess-ignored".to_string()),
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data: serde_json::json!({ "noteId": "spec", "action": "update" }),
     };
     let frame = build_event_notification("ws-sub-1", &event);

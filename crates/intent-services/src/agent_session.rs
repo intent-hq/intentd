@@ -204,7 +204,10 @@ impl Services {
     }
 
     /// Build and publish an agent streaming event onto the bus (§6.6/§10).
-    async fn publish_agent_event(
+    /// `pub(crate)` so the [`AgentManager`] stop path can emit the terminal
+    /// `agent:stream:end` when it interrupts a turn (the worker that would
+    /// otherwise emit it is aborted).
+    pub(crate) async fn publish_agent_event(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
@@ -219,6 +222,7 @@ impl Services {
             session_id: Some(agent_id.0.clone()),
             correlation_id: None,
             parent_event_id: None,
+            metadata: None,
             data,
         };
         crate::publish_event(&self.event_bus, event).await;

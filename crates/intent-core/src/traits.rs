@@ -1,7 +1,10 @@
 //! Cross-layer traits implemented by higher crates (§3.2, §6.8).
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId};
@@ -2266,5 +2269,92 @@ pub trait WorkspaceApi: Send + Sync {
     }
 }
 
-/// Context-engine abstraction implemented by `intent-context` (§3.1).
-pub trait ContextEngine: Send + Sync {}
+/// Whether a context engine is usable right now (§8.1). `Unavailable` is a
+/// first-class, non-error state — never something that fails a request (§8.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EngineAvailability {
+    /// A working engine is present; `version` is best-effort.
+    Available {
+        name: String,
+        version: Option<String>,
+    },
+    /// No usable engine (not installed, not logged in, …) — not an error.
+    Unavailable { reason: String },
+}
+
+/// Natural-language code/context retrieval request scoped to a workspace (§8.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetrieveRequest {
+    pub workspace_id: WorkspaceId,
+    pub workspace_path: PathBuf,
+    pub query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<usize>,
+}
+
+/// A single retrieved code/context hit (§8.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetrievedItem {
+    /// Workspace-relative file path.
+    pub file: String,
+    /// Detected symbol/identifier, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// 1-based line, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    /// Snippet/preview of the matched content.
+    pub preview: String,
+    /// Relevance score, when provided by the engine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+}
+
+/// The result of a [`ContextEngine::retrieve`] call (§8.1).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetrieveResult {
+    pub items: Vec<RetrievedItem>,
+}
+
+/// Errors raised by a [`ContextEngine`] (§8.1, §11.1). Construction never fails
+/// the daemon and `availability()` never errors; these surface only from
+/// `retrieve()`.
+#[derive(Debug, thiserror::Error)]
+pub enum ContextError {
+    /// No usable engine for this request (maps to `ContextUnavailable`, §11.1).
+    #[error("context engine unavailable: {reason}")]
+    Unavailable { reason: String },
+    /// Spawning the engine process failed.
+    #[error("failed to spawn context engine: {0}")]
+    Spawn(String),
+    /// The engine did not return within the timeout.
+    #[error("context engine timed out")]
+    Timeout,
+    /// The engine ran but exited unsuccessfully.
+    #[error("context engine failed: {0}")]
+    CommandFailed(String),
+    /// The engine's output could not be parsed.
+    #[error("failed to parse context engine output: {0}")]
+    Parse(String),
+}
+
+/// Context-engine abstraction implemented by `intent-context` (§3.1, §8.1).
+///
+/// Code retrieval is an **optional** capability: the daemon degrades gracefully
+/// when no engine is available (§8.3). `availability()` is a non-error probe;
+/// only `retrieve()` can fail with [`ContextError`].
+#[async_trait::async_trait]
+pub trait ContextEngine: Send + Sync {
+    /// Is a working engine available right now?
+    async fn availability(&self) -> EngineAvailability;
+
+    /// Natural-language code/context retrieval scoped to a workspace.
+    async fn retrieve(
+        &self,
+        req: RetrieveRequest,
+    ) -> std::result::Result<RetrieveResult, ContextError>;
+}

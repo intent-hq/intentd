@@ -844,6 +844,8 @@ pub struct Event {
     pub correlation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
     #[serde(default)]
     pub data: serde_json::Value,
 }
@@ -1367,6 +1369,7 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             correlation_id: None,
             parent_event_id: None,
+            metadata: None,
             data: json!({ "path": "src/a.rs", "action": "modify" }),
         };
         assert_eq!(
@@ -1383,6 +1386,31 @@ mod tests {
         );
         // Round-trips back to an equal value.
         let back: Event = serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
+        assert_eq!(back, event);
+    }
+
+    #[test]
+    fn event_metadata_serializes_camel_case() {
+        // Mirrors `WorkspaceEventBase.metadata` in events/types.ts: an optional
+        // free-form object emitted under the camelCase `metadata` key.
+        let event = Event {
+            id: "01900000-0000-7000-8000-000000000001".to_string(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "agent:message".to_string(),
+            actor: EventActor::default(),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: Some(json!({ "source": "test", "retryCount": 2 })),
+            data: json!({}),
+        };
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            wire["metadata"],
+            json!({ "source": "test", "retryCount": 2 })
+        );
+        let back: Event = serde_json::from_value(wire).unwrap();
         assert_eq!(back, event);
     }
 

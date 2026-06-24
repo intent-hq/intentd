@@ -958,7 +958,7 @@ async fn cmd_doctor() -> ExitCode {
         ok = false;
     }
     report_github_token();
-    report_context_engine();
+    report_context_engine().await;
     report_host_capabilities();
 
     if ok {
@@ -1033,13 +1033,19 @@ fn report_github_token() {
     }
 }
 
-/// §5.7 context-engine availability: best-effort `auggie` PATH probe. Non-fatal
-/// — codebase retrieval degrades gracefully when the engine is absent (§8.3).
-fn report_context_engine() {
-    match intent_providers::resolve_on_path("auggie") {
-        Some(p) => println!("[ok] context engine: auggie available ({})", p.display()),
-        None => {
-            println!("[--] context engine: auggie not on PATH (retrieval degrades gracefully)")
+/// §5.7 context-engine availability via the real [`ContextEngine::availability`]
+/// probe (§8.1). Non-fatal — codebase retrieval degrades gracefully when the
+/// engine is absent or unauthenticated (§8.3).
+async fn report_context_engine() {
+    use intent_context::{AuggieContextEngine, ContextEngine, EngineAvailability};
+    let engine = AuggieContextEngine::new();
+    match engine.availability().await {
+        EngineAvailability::Available { name, version } => {
+            let version = version.unwrap_or_else(|| "unknown".to_string());
+            println!("[ok] context engine: {name} available (version {version})");
+        }
+        EngineAvailability::Unavailable { reason } => {
+            println!("[--] context engine: unavailable ({reason}) — retrieval degrades gracefully")
         }
     }
 }

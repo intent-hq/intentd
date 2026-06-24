@@ -228,6 +228,7 @@ fn terminal_event(workspace_id: &WorkspaceId, event_type: &str, data: Value) -> 
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
+        metadata: None,
         data,
     }
 }

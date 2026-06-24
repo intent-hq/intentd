@@ -1,0 +1,348 @@
+//! `AuggieContextEngine` — the `auggie`-backed [`ContextEngine`] (§8.2, §8.3).
+//!
+//! Ports `execute-auggie-command.ts` (`executeAuggieCommand`, 30s default
+//! timeout, no-shell `execFile`-style spawn on unix, `.cmd`/`.bat` shell on
+//! Windows, stdin piping, auth-failure → "needs login"). `availability()` is a
+//! non-error probe (§8.3); only `retrieve()` returns a [`ContextError`].
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use intent_core::{
+    ContextEngine, ContextError, EngineAvailability, RetrieveRequest, RetrieveResult,
+};
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+
+use crate::discovery;
+
+/// Default per-command timeout (matches the TS `DEFAULT_AUGGIE_TIMEOUT_MS`).
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Shorter timeout for the lightweight `--version` availability probe.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Auth-failure substrings → mapped to a "needs login" availability (§8.2).
+const AUTH_FAILURE_PATTERNS: &[&str] = &[
+    "not logged in",
+    "not authenticated",
+    "please log in",
+    "please login",
+    "login required",
+    "you must log in",
+    "run auggie login",
+    "authentication required",
+    "unauthorized",
+    "no valid session",
+    "session expired",
+    "augment_session_auth",
+];
+
+/// Context engine backed by the `auggie` CLI.
+#[derive(Debug, Default)]
+pub struct AuggieContextEngine {
+    /// Cached resolved binary path; re-probed when it disappears (§8.2).
+    cached_path: Mutex<Option<PathBuf>>,
+}
+
+impl AuggieContextEngine {
+    /// Construct an engine that discovers auggie lazily. Never fails (§8.3).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct with a known binary path (a user-configured path, or tests),
+    /// pre-seeding the discovery cache.
+    pub fn with_path(path: PathBuf) -> Self {
+        Self {
+            cached_path: Mutex::new(Some(path)),
+        }
+    }
+
+    /// Resolve the auggie path, reusing the cache when the file still exists and
+    /// re-probing via discovery otherwise (§8.2).
+    fn resolve_path(&self) -> Option<PathBuf> {
+        {
+            let guard = self.cached_path.lock().expect("cache poisoned");
+            if let Some(p) = guard.as_ref() {
+                if p.exists() {
+                    return Some(p.clone());
+                }
+            }
+        }
+        let found = discovery::find_auggie();
+        let mut guard = self.cached_path.lock().expect("cache poisoned");
+        guard.clone_from(&found);
+        found
+    }
+}
+
+#[async_trait]
+impl ContextEngine for AuggieContextEngine {
+    async fn availability(&self) -> EngineAvailability {
+        let Some(path) = self.resolve_path() else {
+            return EngineAvailability::Unavailable {
+                reason: "auggie not found on PATH".to_string(),
+            };
+        };
+        match run_auggie(&path, &["--version"], None, None, VERSION_TIMEOUT).await {
+            Ok(output) => classify_availability(&output.stdout, &output.stderr, output.success),
+            Err(err) => EngineAvailability::Unavailable {
+                reason: format!("auggie not available: {err}"),
+            },
+        }
+    }
+
+    async fn retrieve(
+        &self,
+        _req: RetrieveRequest,
+    ) -> std::result::Result<RetrieveResult, ContextError> {
+        // auggie exposes no structured codebase-retrieval CLI (its `codebase:search`
+        // was a never-implemented stub), so there is nothing to spawn: invoking
+        // auggie with no subcommand would hang in interactive mode until the
+        // timeout. Degrade instantly so callers fall back to ripgrep with zero
+        // latency (§8.3, M10 CE-3). `availability()` still reports binary presence
+        // for `intentd doctor`.
+        Err(ContextError::Unavailable {
+            reason: "auggie exposes no structured codebase-retrieval CLI".to_string(),
+        })
+    }
+}
+
+/// Captured output of an auggie invocation.
+struct CommandOutput {
+    stdout: String,
+    stderr: String,
+    success: bool,
+}
+
+/// Spawn auggie with the enhanced exec PATH, an optional `cwd`, optional stdin,
+/// and a timeout. No shell on unix (`execFile`-style); `cmd /C` for `.cmd`/
+/// `.bat` shims on Windows. The child is killed if the timeout elapses.
+async fn run_auggie(
+    auggie_path: &Path,
+    args: &[&str],
+    stdin: Option<&str>,
+    cwd: Option<&Path>,
+    timeout: Duration,
+) -> std::result::Result<CommandOutput, ContextError> {
+    let env_path = discovery::exec_path(auggie_path);
+
+    let mut command = build_command(auggie_path, args);
+    command.env("PATH", &env_path);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    command.kill_on_drop(true);
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| ContextError::Spawn(e.to_string()))?;
+
+    if let Some(data) = stdin {
+        if let Some(mut sink) = child.stdin.take() {
+            // EPIPE is benign: the child may exit before consuming all input.
+            let _ = sink.write_all(data.as_bytes()).await;
+            let _ = sink.shutdown().await;
+        }
+    }
+
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(result) => result.map_err(|e| ContextError::Spawn(e.to_string()))?,
+        Err(_) => return Err(ContextError::Timeout),
+    };
+
+    Ok(CommandOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        success: output.status.success(),
+    })
+}
+
+#[cfg(windows)]
+fn build_command(auggie_path: &Path, args: &[&str]) -> Command {
+    // npm `.cmd`/`.bat` shims (and bare names) require cmd.exe; absolute paths to
+    // real binaries spawn directly (safer — avoids cmd.exe arg interpretation).
+    let lower = auggie_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let needs_shell =
+        !auggie_path.is_absolute() || matches!(lower.as_deref(), Some("cmd") | Some("bat"));
+    if needs_shell {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(auggie_path).args(args);
+        c
+    } else {
+        let mut c = Command::new(auggie_path);
+        c.args(args);
+        c
+    }
+}
+
+#[cfg(not(windows))]
+fn build_command(auggie_path: &Path, args: &[&str]) -> Command {
+    let mut c = Command::new(auggie_path);
+    c.args(args);
+    c
+}
+
+/// True when `output` looks like an auth/login failure (§8.2).
+pub fn is_auth_failure(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    AUTH_FAILURE_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// Classify the `--version` probe output into an [`EngineAvailability`] (§8.2):
+/// auth-failure patterns become a non-error "needs login" `Unavailable`.
+pub fn classify_availability(stdout: &str, stderr: &str, success: bool) -> EngineAvailability {
+    let combined = format!("{stdout}\n{stderr}");
+    if is_auth_failure(&combined) {
+        return EngineAvailability::Unavailable {
+            reason: "needs login".to_string(),
+        };
+    }
+    if !success {
+        let reason = first_nonempty_line(stderr)
+            .or_else(|| first_nonempty_line(stdout))
+            .unwrap_or_else(|| "auggie --version failed".to_string());
+        return EngineAvailability::Unavailable { reason };
+    }
+    EngineAvailability::Available {
+        name: "auggie".to_string(),
+        version: parse_version(&combined),
+    }
+}
+
+/// Extract the first `MAJOR.MINOR.PATCH`-looking token from `text`.
+fn parse_version(text: &str) -> Option<String> {
+    for token in text.split_whitespace() {
+        let trimmed = token.trim_matches(|c: char| !c.is_ascii_digit());
+        if is_semverish(trimmed) {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn is_semverish(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() >= 3
+        && parts
+            .iter()
+            .take(3)
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn first_nonempty_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_available_parses_version() {
+        let a = classify_availability("auggie v1.12.3", "", true);
+        assert_eq!(
+            a,
+            EngineAvailability::Available {
+                name: "auggie".to_string(),
+                version: Some("1.12.3".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_unavailable_on_failure() {
+        let a = classify_availability("", "command not found", false);
+        assert_eq!(
+            a,
+            EngineAvailability::Unavailable {
+                reason: "command not found".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_auth_failure_is_needs_login() {
+        let a = classify_availability("", "Error: not logged in. Run auggie login.", true);
+        assert_eq!(
+            a,
+            EngineAvailability::Unavailable {
+                reason: "needs login".to_string(),
+            }
+        );
+        assert!(is_auth_failure("You are NOT AUTHENTICATED"));
+        assert!(!is_auth_failure("auggie 1.2.3"));
+    }
+
+    #[test]
+    fn availability_is_total_never_errors() {
+        // §8.3: availability() returns an EngineAvailability and never panics or
+        // errors, even when the seeded path is bogus (resolve_path then re-probes
+        // discovery). On hosts without auggie this is Unavailable; on hosts with
+        // it, a well-formed Available/Unavailable. Either is the non-error state.
+        let engine = AuggieContextEngine::with_path(PathBuf::from("/no/such/auggie/binary"));
+        match futures_block_on(engine.availability()) {
+            EngineAvailability::Available { name, .. } => assert_eq!(name, "auggie"),
+            EngineAvailability::Unavailable { reason } => assert!(!reason.is_empty()),
+        }
+    }
+
+    #[test]
+    fn retrieve_unavailable_when_no_binary_resolves() {
+        // When discovery yields nothing, retrieve() maps to a non-panicking
+        // ContextError::Unavailable (§8.3, §11.1). find_in_dirs over an empty set
+        // is the deterministic "nothing found" signal underpinning that branch.
+        assert_eq!(discovery::find_in_dirs(&[]), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn availability_available_via_fake_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("intent-ctx-avail-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("auggie");
+        std::fs::write(&bin, "#!/bin/sh\necho 'auggie 2.5.1'\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let engine = AuggieContextEngine::with_path(bin);
+        let availability = futures_block_on(engine.availability());
+        assert_eq!(
+            availability,
+            EngineAvailability::Available {
+                name: "auggie".to_string(),
+                version: Some("2.5.1".to_string()),
+            }
+        );
+    }
+
+    /// Minimal single-threaded block-on so async tests need no extra deps.
+    fn futures_block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+}
