@@ -833,6 +833,11 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "repo.list" => {
+            // No params; returns `{ repos: KnownRepo[] }` with camelCase keys.
+            let r = api.repo_list().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "git.commit" => {
             let ws = require_ws_note(params)?;
             let message = require_str_param(params, "message")?;

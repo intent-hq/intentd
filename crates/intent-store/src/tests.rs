@@ -79,8 +79,8 @@ async fn migration_status_reports_current_after_open() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let status = store.migration_status().await.expect("migration status");
     assert!(status.is_current(), "fresh open must apply all migrations");
-    assert_eq!(status.expected, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-    assert_eq!(status.applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(status.expected, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(status.applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 }
 
 #[tokio::test]
@@ -1039,4 +1039,65 @@ async fn drafts_are_isolated_by_client_and_cascade_on_workspace_delete() {
         store.get_draft(&ws, &agent, &a).await.unwrap().is_none(),
         "ON DELETE CASCADE removes drafts with their workspace"
     );
+}
+
+#[tokio::test]
+async fn known_repo_upsert_idempotent_on_path() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    store
+        .upsert_known_repo("/src/a", "a", Some("owner-a"))
+        .await
+        .expect("insert");
+    // Re-upserting the same path must not create a duplicate row.
+    store
+        .upsert_known_repo("/src/a", "a", Some("owner-a"))
+        .await
+        .expect("upsert");
+    let repos = store.list_known_repos().await.expect("list");
+    assert_eq!(repos.len(), 1, "path is unique");
+    let added_at = repos[0].added_at.clone();
+
+    // Conflict updates name/owner when provided and keeps the original addedAt.
+    store
+        .upsert_known_repo("/src/a", "a-renamed", Some("owner-b"))
+        .await
+        .expect("update");
+    let repos = store.list_known_repos().await.expect("list");
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0].name, "a-renamed");
+    assert_eq!(repos[0].owner.as_deref(), Some("owner-b"));
+    assert_eq!(repos[0].added_at, added_at, "addedAt is preserved");
+
+    // An absent owner preserves the existing one (TS `?? existing`).
+    store
+        .upsert_known_repo("/src/a", "a-renamed", None)
+        .await
+        .expect("update no owner");
+    let repos = store.list_known_repos().await.expect("list");
+    assert_eq!(repos[0].owner.as_deref(), Some("owner-b"));
+}
+
+#[tokio::test]
+async fn known_repo_list_orders_by_last_used_desc() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    // Insert three repos; each upsert stamps last_used_at = now, so the most
+    // recently upserted sorts first. Small sleeps keep the ISO timestamps
+    // strictly ordered regardless of clock resolution.
+    let gap = std::time::Duration::from_millis(5);
+    store.upsert_known_repo("/src/a", "a", None).await.unwrap();
+    tokio::time::sleep(gap).await;
+    store.upsert_known_repo("/src/b", "b", None).await.unwrap();
+    tokio::time::sleep(gap).await;
+    store.upsert_known_repo("/src/c", "c", None).await.unwrap();
+    tokio::time::sleep(gap).await;
+    // Bump /src/a so it becomes the most-recently-used.
+    store.upsert_known_repo("/src/a", "a", None).await.unwrap();
+
+    let repos = store.list_known_repos().await.expect("list");
+    let paths: Vec<&str> = repos.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(paths, vec!["/src/a", "/src/c", "/src/b"]);
 }

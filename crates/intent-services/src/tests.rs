@@ -3958,3 +3958,97 @@ mod rules {
         sub.recv().await.expect("subscription open")
     }
 }
+
+mod known_repo {
+    use super::*;
+    use crate::sync_repos_from_workspaces;
+    use intent_core::WorkspaceCreate;
+
+    fn ws_with_repo(
+        id: &WorkspaceId,
+        repo_path: Option<&str>,
+        repo_name: Option<&str>,
+        repo_owner: Option<&str>,
+    ) -> Workspace {
+        Workspace {
+            repository_path: repo_path.map(str::to_string),
+            repository_name: repo_name.map(str::to_string),
+            repository_owner: repo_owner.map(str::to_string),
+            ..workspace(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn one_time_sync_upserts_repos_from_workspaces() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        // Explicit name + owner.
+        store
+            .insert_workspace(&ws_with_repo(
+                &WorkspaceId::new(),
+                Some("/src/intent"),
+                Some("intent"),
+                Some("cloudlands-ai"),
+            ))
+            .await
+            .expect("ws1");
+        // No name → basename of path; no owner.
+        store
+            .insert_workspace(&ws_with_repo(
+                &WorkspaceId::new(),
+                Some("/home/me/other-repo"),
+                None,
+                None,
+            ))
+            .await
+            .expect("ws2");
+        // No repository_path → skipped entirely.
+        store
+            .insert_workspace(&ws_with_repo(&WorkspaceId::new(), None, None, None))
+            .await
+            .expect("ws3");
+
+        sync_repos_from_workspaces(&store).await.expect("sync");
+
+        let repos = store.list_known_repos().await.expect("list");
+        assert_eq!(repos.len(), 2, "only repos with a repository_path sync");
+        let by_path: std::collections::HashMap<_, _> =
+            repos.iter().map(|r| (r.path.as_str(), r)).collect();
+        assert_eq!(by_path["/src/intent"].name, "intent");
+        assert_eq!(
+            by_path["/src/intent"].owner.as_deref(),
+            Some("cloudlands-ai")
+        );
+        assert_eq!(by_path["/home/me/other-repo"].name, "other-repo");
+        assert_eq!(by_path["/home/me/other-repo"].owner, None);
+
+        // Re-running the sync is idempotent on path (no duplicate rows).
+        sync_repos_from_workspaces(&store).await.expect("resync");
+        assert_eq!(store.list_known_repos().await.expect("list").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_workspace_registers_repo_visible_in_repo_list() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store);
+
+        svc.create_workspace(WorkspaceCreate {
+            repository_path: Some("/src/intent".to_string()),
+            repository_name: Some("intent".to_string()),
+            repository_owner: Some("cloudlands-ai".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("create");
+
+        let v = svc.repo_list().await.expect("repo_list");
+        let repos = v["repos"].as_array().expect("repos array");
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0]["path"], "/src/intent");
+        assert_eq!(repos[0]["name"], "intent");
+        assert_eq!(repos[0]["owner"], "cloudlands-ai");
+        assert!(repos[0]["addedAt"].is_string());
+        assert!(repos[0]["lastUsedAt"].is_string());
+    }
+}

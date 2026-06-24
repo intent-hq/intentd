@@ -1095,6 +1095,18 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `repo.list`: the persistent known-repository registry, most-recently-used
+    /// first, as `{ repos: KnownRepo[] }` (PROTOCOL §5.6). Populates the iOS
+    /// Create-Workspace picker; the first invocation also lazily syncs repos from
+    /// existing workspaces (never blocking/failing the response).
+    fn repo_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::repo_list not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `pr.status`: the active PR's state, mergeability, and summary. Requires an
     /// active PR; otherwise `-32603` (PROTOCOL §5.7).
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {

@@ -656,6 +656,22 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn repo_list(&self) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "repos": [
+                    {
+                        "path": "/src/intent",
+                        "name": "intent",
+                        "owner": "cloudlands-ai",
+                        "addedAt": "t0",
+                        "lastUsedAt": "t1"
+                    }
+                ]
+            }))
+        })
+    }
+
     fn git_commit(
         &self,
         _workspace_id: WorkspaceId,
@@ -1715,6 +1731,19 @@ async fn git_get_branches_unknown_repo_is_minus_32602_with_message() {
         v["error"]["message"],
         serde_json::json!("Unknown or unauthorized repository path")
     );
+}
+
+#[tokio::test]
+async fn repo_list_returns_repos_with_camelcase_keys() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"repo.list","params":{}}"#)
+        .await
+        .unwrap();
+    let repo = &v["result"]["repos"][0];
+    assert_eq!(repo["path"], serde_json::json!("/src/intent"));
+    assert_eq!(repo["name"], serde_json::json!("intent"));
+    assert_eq!(repo["owner"], serde_json::json!("cloudlands-ai"));
+    assert_eq!(repo["addedAt"], serde_json::json!("t0"));
+    assert_eq!(repo["lastUsedAt"], serde_json::json!("t1"));
 }
 
 #[tokio::test]

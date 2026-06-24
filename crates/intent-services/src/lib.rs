@@ -645,6 +645,49 @@ pub(crate) fn system_actor() -> intent_core::EventActor {
     }
 }
 
+/// Process-level guard mirroring the TS `repoRegistrySynced` flag: the
+/// workspace→registry sync runs at most once per daemon lifetime, on the first
+/// `repo.list` call.
+static REPO_REGISTRY_SYNCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Resolve a known-repo display name from an optional explicit name plus the
+/// repo path, mirroring TS `repositoryName || path.split('/').pop() || 'Unknown'`
+/// (an empty explicit name falls through to the basename).
+fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
+    if let Some(n) = explicit {
+        if !n.is_empty() {
+            return n.to_string();
+        }
+    }
+    let base = path.rsplit('/').next().unwrap_or("");
+    if base.is_empty() {
+        "Unknown".to_string()
+    } else {
+        base.to_string()
+    }
+}
+
+/// Upsert into the registry every workspace that carries a `repository_path`
+/// (TS `repo.list` one-time sync). Best-effort: callers ignore the result so a
+/// sync failure never blocks/fails the `repo.list` response.
+async fn sync_repos_from_workspaces(store: &Store) -> Result<()> {
+    let workspaces = store.list_workspaces(true).await?;
+    for ws in workspaces {
+        let Some(repo_path) = ws.repository_path.as_deref() else {
+            continue;
+        };
+        if repo_path.is_empty() {
+            continue;
+        }
+        let name = known_repo_name(ws.repository_name.as_deref(), repo_path);
+        store
+            .upsert_known_repo(repo_path, &name, ws.repository_owner.as_deref())
+            .await?;
+    }
+    Ok(())
+}
+
 /// Build a `note:created`/`note:updated`/`note:deleted` change event with the
 /// TS-parity payload `{ noteId, title, action }` (`notes.service.ts`).
 fn note_change_event(
@@ -1792,6 +1835,25 @@ impl WorkspaceApi for Services {
                 archived_at: None,
             };
             store.insert_workspace(&ws).await?;
+            // Register the repo in the persistent registry so it survives
+            // workspace deletion and appears in `repo.list` without a restart
+            // (TS `workspace.service` `addRepo` hook). Best-effort: a registry
+            // failure must not fail workspace creation.
+            let repo_path = ws
+                .repository_path
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .or(ws.path.as_deref())
+                .filter(|p| !p.is_empty());
+            if let Some(repo_path) = repo_path {
+                let name = known_repo_name(ws.repository_name.as_deref(), repo_path);
+                if let Err(e) = store
+                    .upsert_known_repo(repo_path, &name, ws.repository_owner.as_deref())
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to register repo in registry");
+                }
+            }
             Ok(ws)
         })
     }
@@ -3443,6 +3505,35 @@ impl WorkspaceApi for Services {
                 ));
             }
             intent_git::branches::get_branches(std::path::Path::new(&repo_path), include_remote)
+        })
+    }
+
+    fn repo_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Return the known repos immediately — don't block on the sync.
+            let repos = store.list_known_repos().await?;
+            // One-time background sync: register repos from existing workspaces
+            // so pre-existing workspaces (created before this feature) get
+            // picked up. Spawned so it never blocks/fails the response, and
+            // guarded to run at most once per process (TS `repoRegistrySynced`).
+            if REPO_REGISTRY_SYNCED
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = sync_repos_from_workspaces(&store).await {
+                        tracing::warn!(error = %e, "failed to sync workspace repos to registry");
+                    }
+                });
+            }
+            Ok(serde_json::json!({ "repos": repos }))
         })
     }
 
