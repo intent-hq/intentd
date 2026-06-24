@@ -981,7 +981,10 @@ pub struct SessionStats {
 /// One row of the append-only agent conversation log (§9.2 `agent_message`).
 /// `seq` is monotonic per agent (enforced by `UNIQUE(agent_id, seq)`); `content`
 /// holds the message's JSON content blocks. Names use camelCase to match the
-/// wire shape returned by `agent.getConversation` (PROTOCOL §5.5).
+/// wire shape returned by `agent.getConversation` (PROTOCOL §5.5). The `content`
+/// and `created_at` fields serialize as `contentBlocks`/`timestamp` to match the
+/// TS `AgentMessage` (`src/shared/types/agent-message.ts`); the Rust identifiers
+/// stay `content`/`created_at` so DB code and call sites are unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentMessage {
@@ -990,7 +993,9 @@ pub struct AgentMessage {
     pub seq: i64,
     /// `user` | `assistant` | `tool` | `system`.
     pub role: String,
+    #[serde(rename = "contentBlocks")]
     pub content: serde_json::Value,
+    #[serde(rename = "timestamp")]
     pub created_at: String,
 }
 
@@ -1632,8 +1637,8 @@ mod tests {
                     "agentId": "agent-1",
                     "seq": 0,
                     "role": "user",
-                    "content": [{ "type": "text", "text": "hi" }],
-                    "createdAt": "t0"
+                    "contentBlocks": [{ "type": "text", "text": "hi" }],
+                    "timestamp": "t0"
                 }],
                 "createdAt": "t0",
                 "updatedAt": "t1"
@@ -1642,5 +1647,39 @@ mod tests {
         let back: AgentSession =
             serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
         assert_eq!(back, session);
+    }
+
+    /// `AgentMessage` serializes its block array and timestamp under the TS wire
+    /// names `contentBlocks`/`timestamp` (`agent-message.ts`) — never `content`/
+    /// `createdAt` — so the iOS conversation view renders populated bubbles.
+    #[test]
+    fn agent_message_content_blocks_timestamp_wire_parity() {
+        let message = AgentMessage {
+            id: "msg-1".to_string(),
+            agent_id: AgentId::from("agent-1"),
+            seq: 0,
+            role: "user".to_string(),
+            content: json!([{ "type": "text", "text": "hi" }]),
+            created_at: "t0".to_string(),
+        };
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "id": "msg-1",
+                "agentId": "agent-1",
+                "seq": 0,
+                "role": "user",
+                "contentBlocks": [{ "type": "text", "text": "hi" }],
+                "timestamp": "t0"
+            })
+        );
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("contentBlocks"));
+        assert!(obj.contains_key("timestamp"));
+        assert!(!obj.contains_key("content"));
+        assert!(!obj.contains_key("createdAt"));
+        let back: AgentMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(back, message);
     }
 }

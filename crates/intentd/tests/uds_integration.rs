@@ -469,7 +469,14 @@ async fn uds_slice_end_to_end() {
     .await;
     assert_eq!(resp["result"]["agentId"], json!(agent_id));
     assert_eq!(resp["result"]["totalMessages"], json!(1));
-    assert_eq!(resp["result"]["messages"][0]["role"], json!("user"));
+    let message = &resp["result"]["messages"][0];
+    assert_eq!(message["role"], json!("user"));
+    // Wire shape matches TS `AgentMessage`: `contentBlocks` + `timestamp`,
+    // never `content`/`createdAt` (so the iOS conversation view renders).
+    assert!(message["contentBlocks"].is_array());
+    assert!(message["timestamp"].is_string());
+    assert!(message.get("content").is_none());
+    assert!(message.get("createdAt").is_none());
 
     // (t) agent.get unknown → -32602 "Agent not found".
     let resp = send(
