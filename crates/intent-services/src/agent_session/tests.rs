@@ -290,6 +290,122 @@ async fn prompt_turn_streams_events_and_accumulates() {
     );
 }
 
+/// A `session/update` notification shaped like the prior-conversation replay
+/// `session/load` buffers before it returns (built directly, not via the wire).
+fn replay_chunk(text: &str) -> IncomingNotification {
+    IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text } }
+        }),
+    }
+}
+
+fn replay_tool() -> IncomingNotification {
+    IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "old",
+                "title": "Edit src/old.rs", "kind": "edit", "status": "in_progress",
+                "rawInput": { "path": "src/old.rs" } }
+        }),
+    }
+}
+
+/// The `session/load` replay burst buffered in the handle's channel is discarded
+/// (no events published, transcript untouched), while a subsequent real turn
+/// still streams its updates and accumulates the assistant message.
+#[tokio::test]
+async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    // Simulate the post-resume buffered replay: a burst already in the channel.
+    let (replay_tx, mut replay_rx) = mpsc::unbounded_channel();
+    replay_tx
+        .send(replay_chunk("Hi, I am the prior "))
+        .expect("buffer replay update");
+    replay_tx
+        .send(replay_chunk("greeting from last session"))
+        .expect("buffer replay update");
+    replay_tx.send(replay_tool()).expect("buffer replay tool");
+    drop(replay_tx);
+
+    // The bounded drain empties the burst and cannot hang.
+    timeout(
+        Duration::from_secs(2),
+        Services::drain_replay_notifications(&mut replay_rx),
+    )
+    .await
+    .expect("drain settles within the cap");
+    assert!(replay_rx.try_recv().is_err(), "replay channel emptied");
+
+    // Dropping the replay produced no events and no transcript message.
+    assert!(
+        timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .is_err(),
+        "no events published for the dropped replay burst"
+    );
+    assert!(
+        bus.store()
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "replay is not appended to the transcript"
+    );
+
+    // A subsequent real turn still streams + accumulates normally.
+    let (conn, mut note_rx, _agent) = connect();
+    let stop = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+        )
+        .await
+        .expect("turn completes");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+
+    let mut events = Vec::new();
+    while events.len() < 4 {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(
+        types,
+        vec![
+            "agent:stream:chunk",
+            "agent:stream:chunk",
+            "agent:tool:call",
+            "agent:stream:end",
+        ],
+        "the real turn streams its own updates after the replay was dropped"
+    );
+
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1, "only the real turn is accumulated");
+    assert_eq!(
+        messages[0].content,
+        json!([{ "type": "text", "text": "Hello world" }])
+    );
+}
+
 #[tokio::test]
 async fn open_acp_session_persists_id() {
     let (_tmp, services, bus, agent_id, _ws) = setup().await;

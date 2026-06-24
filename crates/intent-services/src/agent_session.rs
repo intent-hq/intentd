@@ -137,6 +137,42 @@ impl Services {
         Ok(Some(acp_session_id))
     }
 
+    /// Discard the `session/update` burst that `session/load` replays after a
+    /// successful resume: auggie re-streams the prior conversation as
+    /// notifications written to the wire *before* `session/load` returns, so they
+    /// buffer in the agent handle's unbounded channel. Left in place they would
+    /// leak into the next [`run_prompt_turn`](Self::run_prompt_turn), re-emitting
+    /// old messages as live `agent:stream:chunk` events and re-accumulating them
+    /// into the transcript. Draining them here mirrors TS's "drop `session/update`
+    /// when there is no active streaming handler" gate (acp-provider.ts).
+    ///
+    /// Bounded so it cannot hang: empty whatever is already buffered with
+    /// non-blocking `try_recv`, then wait out a short settle window for stragglers
+    /// that may land just after `load_session` resolved (a per-message `recv`
+    /// timeout; stop once the channel stays quiet), capping the total wait. The
+    /// per-agent single-flight slot serialises this, so a brief block on the
+    /// resume path is acceptable.
+    pub(crate) async fn drain_replay_notifications(
+        notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
+    ) {
+        use tokio::time::{timeout, Duration, Instant};
+        const SETTLE: Duration = Duration::from_millis(50);
+        const CAP: Duration = Duration::from_millis(500);
+        let deadline = Instant::now() + CAP;
+        loop {
+            while notifications.try_recv().is_ok() {}
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match timeout(SETTLE.min(remaining), notifications.recv()).await {
+                Ok(Some(_)) => continue, // a straggler arrived → keep draining
+                Ok(None) => break,       // channel closed
+                Err(_) => break,         // quiet for the settle window → done
+            }
+        }
+    }
+
     /// Drive a `session/prompt` turn: stream `session/update`s onto the bus and
     /// accumulate the transcript while the turn runs, then append the assistant
     /// message and emit the single terminal `agent:stream:end`. Returns the

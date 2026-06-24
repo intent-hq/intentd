@@ -813,7 +813,25 @@ impl AgentManager {
             )
             .await
         {
-            Ok(Some(acp_session_id)) => return Ok(acp_session_id),
+            Ok(Some(acp_session_id)) => {
+                // `session/load` replays the prior conversation as a buffered
+                // `session/update` burst; discard it before the first turn so it
+                // is neither re-published as events nor re-accumulated into the
+                // transcript (parity with TS's "no active streaming handler ⇒
+                // drop"). Only the resume path needs this settle-window drain —
+                // new/recreate sessions have no buffered replay.
+                let notes = self
+                    .handles
+                    .lock()
+                    .unwrap()
+                    .get(agent_id)
+                    .map(|h| h.notifications.clone());
+                if let Some(notes) = notes {
+                    let mut guard = notes.lock().await;
+                    Services::drain_replay_notifications(&mut guard).await;
+                }
+                return Ok(acp_session_id);
+            }
             Ok(None) => {}
             // `session/load` was attempted but failed → fall through to recreate.
             Err(e) => {
