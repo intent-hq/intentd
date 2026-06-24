@@ -830,6 +830,53 @@ async fn agent_acp_session_id_is_write_once() {
 }
 
 #[tokio::test]
+async fn replace_acp_session_id_is_no_clobber_cas() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+
+    store
+        .set_acp_session_id(&agent_id, "acp-1")
+        .await
+        .expect("first set");
+
+    // CAS no-clobber: a stale expected-old does NOT overwrite the canonical id;
+    // the stored value is returned for the caller to reuse.
+    let kept = store
+        .replace_acp_session_id(&agent_id, "wrong-old", "acp-2")
+        .await
+        .expect("cas returns canonical");
+    assert_eq!(kept, "acp-1", "diverged expected-old reuses the stored id");
+    let stored = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(stored.acp_session_id.as_deref(), Some("acp-1"));
+
+    // CAS swap: a matching expected-old replaces with the fresh id (the
+    // resume-impossible fallback, where `set_acp_session_id` would reject).
+    let swapped = store
+        .replace_acp_session_id(&agent_id, "acp-1", "acp-2")
+        .await
+        .expect("cas swaps on match");
+    assert_eq!(swapped, "acp-2");
+    let stored = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(stored.acp_session_id.as_deref(), Some("acp-2"));
+
+    // A missing session surfaces NotFound rather than a silent no-op.
+    assert!(store
+        .replace_acp_session_id(&AgentId::new(), "acp-2", "acp-x")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn agent_provider_is_immutable_once_set() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");

@@ -86,6 +86,33 @@ impl Services {
         Ok(acp_session_id)
     }
 
+    /// Open a FRESH ACP session that REPLACES a lost/unsupported stored id (the
+    /// resume-impossible fallback): `session/new` then compare-and-swap the
+    /// persisted `acpSessionId` from `expected_old` (the id we just failed to
+    /// load) to the fresh one. Unlike [`open_acp_session`] (write-once first-set)
+    /// this is used ONLY when resume is impossible — `loadSession` unsupported or
+    /// `session/load` failed (§6.5). The CAS keeps the id canonical: if a
+    /// concurrent recreate already swapped it, the stored value is returned and
+    /// reused instead of being clobbered. Returns the canonical `acpSessionId`.
+    pub async fn recreate_acp_session(
+        &self,
+        conn: &Connection,
+        agent_id: &AgentId,
+        expected_old: &str,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<String> {
+        let resp = session::new_session(conn, cwd, mcp_servers)
+            .await
+            .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
+        let new_acp_session_id = resp.session_id.0.to_string();
+        let canonical = self
+            .store
+            .replace_acp_session_id(agent_id, expected_old, &new_acp_session_id)
+            .await?;
+        Ok(canonical)
+    }
+
     /// Resume the agent's persisted `acpSessionId` via `session/load`, but only
     /// when one was stored and the agent advertised the `loadSession` capability.
     /// Returns the resumed id, or `None` when resume is not possible (§6.5).
@@ -108,6 +135,42 @@ impl Services {
             .await
             .map_err(|e| Error::Internal(format!("session/load failed: {e}")))?;
         Ok(Some(acp_session_id))
+    }
+
+    /// Discard the `session/update` burst that `session/load` replays after a
+    /// successful resume: auggie re-streams the prior conversation as
+    /// notifications written to the wire *before* `session/load` returns, so they
+    /// buffer in the agent handle's unbounded channel. Left in place they would
+    /// leak into the next [`run_prompt_turn`](Self::run_prompt_turn), re-emitting
+    /// old messages as live `agent:stream:chunk` events and re-accumulating them
+    /// into the transcript. Draining them here mirrors TS's "drop `session/update`
+    /// when there is no active streaming handler" gate (acp-provider.ts).
+    ///
+    /// Bounded so it cannot hang: empty whatever is already buffered with
+    /// non-blocking `try_recv`, then wait out a short settle window for stragglers
+    /// that may land just after `load_session` resolved (a per-message `recv`
+    /// timeout; stop once the channel stays quiet), capping the total wait. The
+    /// per-agent single-flight slot serialises this, so a brief block on the
+    /// resume path is acceptable.
+    pub(crate) async fn drain_replay_notifications(
+        notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
+    ) {
+        use tokio::time::{timeout, Duration, Instant};
+        const SETTLE: Duration = Duration::from_millis(50);
+        const CAP: Duration = Duration::from_millis(500);
+        let deadline = Instant::now() + CAP;
+        loop {
+            while notifications.try_recv().is_ok() {}
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match timeout(SETTLE.min(remaining), notifications.recv()).await {
+                Ok(Some(_)) => continue, // a straggler arrived → keep draining
+                Ok(None) => break,       // channel closed
+                Err(_) => break,         // quiet for the settle window → done
+            }
+        }
     }
 
     /// Drive a `session/prompt` turn: stream `session/update`s onto the bus and

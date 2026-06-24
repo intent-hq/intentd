@@ -138,6 +138,51 @@ impl Store {
         Ok(())
     }
 
+    /// Compare-and-swap `acp_session_id` on the resume-impossible fallback: swap
+    /// the stored id for `new_acp_session_id` ONLY when it currently equals
+    /// `expected_old` (the id we just failed to `session/load`). If it has since
+    /// diverged — e.g. a concurrent recreate already swapped it — the stored
+    /// value is left untouched and returned, so the canonical id is never
+    /// clobbered. Returns the canonical id after the operation. Unlike
+    /// [`Store::set_acp_session_id`] (strict write-once for the first set), this
+    /// is the ONLY relaxation, scoped to the fallback (§6.5). `NotFound` if the
+    /// session is absent.
+    pub async fn replace_acp_session_id(
+        &self,
+        id: &AgentId,
+        expected_old: &str,
+        new_acp_session_id: &str,
+    ) -> Result<String> {
+        let current = self.get_agent_session(id).await?;
+        match current.acp_session_id.as_deref() {
+            // The id we failed to load is still canonical → swap in the fresh one.
+            Some(existing) if existing == expected_old => {
+                self.write_acp_session_id(id, new_acp_session_id).await?;
+                Ok(new_acp_session_id.to_string())
+            }
+            // Diverged (a concurrent recreate already swapped) → reuse the stored
+            // canonical value instead of clobbering it.
+            Some(existing) => Ok(existing.to_string()),
+            // Nothing stored to clobber → set the fresh id.
+            None => {
+                self.write_acp_session_id(id, new_acp_session_id).await?;
+                Ok(new_acp_session_id.to_string())
+            }
+        }
+    }
+
+    /// Unconditional `acp_session_id` write helper shared by the CAS replace
+    /// branches (callers gate the overwrite policy before invoking this).
+    async fn write_acp_session_id(&self, id: &AgentId, acp_session_id: &str) -> Result<()> {
+        sqlx::query("UPDATE agent_session SET acp_session_id=? WHERE id=?")
+            .bind(acp_session_id)
+            .bind(&id.0)
+            .execute(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("replace acp session id failed: {e}")))?;
+        Ok(())
+    }
+
     /// Delete an agent session and its message log (the `agent_message` rows
     /// cascade). Returns whether a row was removed (`agent.delete`, §5.5).
     pub async fn delete_agent_session(&self, id: &AgentId) -> Result<bool> {
