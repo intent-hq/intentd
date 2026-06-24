@@ -35,6 +35,7 @@ fn sample_ws() -> Workspace {
         last_activity: None,
         tags: vec![],
         path: None,
+        repository_path: None,
         repository_owner: None,
         repository_name: None,
         worktree_path: None,

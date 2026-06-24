@@ -54,7 +54,8 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         updated_at: ts.clone(),
         last_activity: Some(ts),
         tags: vec!["alpha".to_string(), "beta".to_string()],
-        path: None,
+        path: Some("/tmp/ws-meta".to_string()),
+        repository_path: Some("/tmp/repo".to_string()),
         repository_owner: Some("cloudlands-ai".to_string()),
         repository_name: Some("intentd".to_string()),
         worktree_path: None,
@@ -78,8 +79,8 @@ async fn migration_status_reports_current_after_open() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let status = store.migration_status().await.expect("migration status");
     assert!(status.is_current(), "fresh open must apply all migrations");
-    assert_eq!(status.expected, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-    assert_eq!(status.applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(status.expected, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(status.applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 }
 
 #[tokio::test]
@@ -113,6 +114,9 @@ async fn workspace_round_trip_and_archive_filter() {
     assert_eq!(got.attention, WorkspaceAttention::Unread);
     assert_eq!(got.pr_number, Some(42));
     assert_eq!(got.repository_name, Some("intentd".to_string()));
+    // `path` and `repository_path` survive insert → list (§9.1 TS parity).
+    assert_eq!(got.path, Some("/tmp/ws-meta".to_string()));
+    assert_eq!(got.repository_path, Some("/tmp/repo".to_string()));
     assert!(!got.archived);
 }
 
@@ -135,16 +139,24 @@ async fn workspace_get_update_delete() {
     let missing = store.get_workspace(&WorkspaceId::from("nope")).await;
     assert!(matches!(missing, Err(intent_core::Error::NotFound(_))));
 
+    // `path`/`repository_path` round-trip through insert → get.
+    assert_eq!(got.path, Some("/tmp/ws-meta".to_string()));
+    assert_eq!(got.repository_path, Some("/tmp/repo".to_string()));
+
     // update (full row replace)
     let mut updated = got.clone();
     updated.title = "Renamed".to_string();
     updated.attention = WorkspaceAttention::None;
     updated.tags = vec!["x".to_string()];
+    updated.path = Some("/tmp/ws-meta2".to_string());
+    updated.repository_path = Some("/tmp/repo2".to_string());
     store.update_workspace(&updated).await.expect("update");
     let reread = store.get_workspace(&id).await.expect("reget");
     assert_eq!(reread.title, "Renamed");
     assert_eq!(reread.attention, WorkspaceAttention::None);
     assert_eq!(reread.tags, vec!["x".to_string()]);
+    assert_eq!(reread.path, Some("/tmp/ws-meta2".to_string()));
+    assert_eq!(reread.repository_path, Some("/tmp/repo2".to_string()));
 
     // update missing → NotFound
     let mut ghost = updated.clone();
