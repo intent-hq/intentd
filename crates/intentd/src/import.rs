@@ -405,9 +405,9 @@ mod tests {
                 "updatedAt": "2026-01-01T00:00:00Z",
                 "messages": [
                     {"id": "m1", "agentId": "agent-1", "seq": 0, "role": "user",
-                     "content": "hi", "createdAt": "2026-01-01T00:00:01Z"},
+                     "contentBlocks": "hi", "timestamp": "2026-01-01T00:00:01Z"},
                     {"id": "m2", "agentId": "agent-1", "seq": 1, "role": "assistant",
-                     "content": "hello", "createdAt": "2026-01-01T00:00:02Z"}
+                     "contentBlocks": "hello", "timestamp": "2026-01-01T00:00:02Z"}
                 ]
             })
             .to_string(),

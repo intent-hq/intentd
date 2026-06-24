@@ -156,8 +156,10 @@ async fn get_conversation_truncates_to_limit() {
     assert_eq!(res["truncated"], true);
     let messages = res["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 2);
-    // Most-recent kept, oldest→newest order.
-    assert_eq!(messages[1]["content"][0]["text"], "m4");
+    // Most-recent kept, oldest→newest order. Wire key is `contentBlocks`
+    // (TS `AgentMessage`), never `content`.
+    assert_eq!(messages[1]["contentBlocks"][0]["text"], "m4");
+    assert!(messages[1].get("content").is_none());
 }
 
 #[tokio::test]
