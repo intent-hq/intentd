@@ -468,3 +468,103 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
         .expect("rpc child session");
     assert_eq!(rpc_child.parent_agent_id, None);
 }
+
+/// End-to-end parent-tracking loop driven entirely through the MCP front door
+/// (`WorkspaceMcpServer` dispatch -> `Services` -> `Store`): a parent delegates a
+/// child (caller set, so the child's `parentAgentId` == parent), then the child
+/// reports back via `report_to_parent_workspace-mcp` (caller-aware) and the
+/// report lands in the parent's transcript. The same report tool through a
+/// caller-less server (the RPC / no-caller path) yields a `-32603` JSON-RPC
+/// error. This is the service-level integration coverage chosen over a
+/// node-gated UDS E2E so the full loop is exercised deterministically without an
+/// external `node` dependency.
+#[tokio::test]
+async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let api: Arc<dyn WorkspaceApi> = Arc::new(svc.clone());
+
+    // Parent delegates a child through the MCP front door (caller = parent).
+    let parent_server =
+        WorkspaceMcpServer::new(api.clone(), ws.clone()).with_caller_agent_id(Some(parent.clone()));
+    let resp = parent_server
+        .handle_message(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "delegate_task_workspace-mcp",
+                "arguments": { "agentInstructions": "do work" }
+            }
+        }))
+        .await
+        .expect("delegate response");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    let parsed: serde_json::Value = serde_json::from_str(text).expect("tool json");
+    let child = AgentId::from(parsed["agentId"].as_str().expect("agentId"));
+
+    // The child carries the parent linkage stamped from the caller identity.
+    let child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    assert_eq!(child_session.parent_agent_id, Some(parent.clone()));
+
+    // Child reports back through the MCP front door (caller = child).
+    let child_server =
+        WorkspaceMcpServer::new(api.clone(), ws.clone()).with_caller_agent_id(Some(child.clone()));
+    let report = "done: shipped the thing";
+    let report_resp = child_server
+        .handle_message(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "report_to_parent_workspace-mcp",
+                "arguments": { "report": report }
+            }
+        }))
+        .await
+        .expect("report response");
+    let report_text = report_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("report text");
+    let report_parsed: serde_json::Value = serde_json::from_str(report_text).expect("report json");
+    assert_eq!(report_parsed["ok"], json!(true));
+    assert_eq!(
+        report_parsed["parentAgentId"].as_str(),
+        Some(parent.0.as_str())
+    );
+
+    // The report reached the parent's transcript via the send-message path.
+    let parent_session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(parent_session.messages.len(), 1);
+    let delivered = serde_json::to_string(&parent_session.messages).expect("serialize messages");
+    assert!(
+        delivered.contains(report),
+        "parent transcript should contain the report text"
+    );
+
+    // RPC / no-caller path: the report tool surfaces a -32603 JSON-RPC error.
+    let no_caller_server = WorkspaceMcpServer::new(api, ws.clone());
+    let err_resp = no_caller_server
+        .handle_message(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "report_to_parent_workspace-mcp",
+                "arguments": { "report": "orphan" }
+            }
+        }))
+        .await
+        .expect("error response");
+    assert_eq!(err_resp["error"]["code"], json!(-32603));
+}
