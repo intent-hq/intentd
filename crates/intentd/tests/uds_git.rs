@@ -55,6 +55,7 @@ fn seed_workspace(id: &WorkspaceId, worktree: &str) -> Workspace {
         last_activity: None,
         tags: vec![],
         path: Some(worktree.to_string()),
+        repository_path: None,
         repository_owner: None,
         repository_name: None,
         worktree_path: Some(worktree.to_string()),

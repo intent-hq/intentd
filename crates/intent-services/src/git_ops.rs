@@ -34,11 +34,11 @@ pub(crate) async fn assert_agent_commit_allowed(store: &Store, user_requested: b
 }
 
 /// Resolve a workspace's worktree path: the explicit `worktreePath`, else the
-/// repository `path`. `None` when neither is set.
+/// `repositoryPath` (TS parity). `None` when neither is set.
 pub(crate) fn worktree_path(ws: &Workspace) -> Option<PathBuf> {
     ws.worktree_path
         .as_ref()
-        .or(ws.path.as_ref())
+        .or(ws.repository_path.as_ref())
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
 }

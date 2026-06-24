@@ -163,6 +163,7 @@ fn workspace(id: &WorkspaceId, worktree: &Path) -> Workspace {
         last_activity: None,
         tags: vec![],
         path: None,
+        repository_path: None,
         repository_owner: None,
         repository_name: None,
         worktree_path: Some(worktree.to_string_lossy().to_string()),

@@ -388,6 +388,7 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         last_activity: None,
         tags: vec![],
         path: None,
+        repository_path: None,
         repository_owner: None,
         repository_name: None,
         worktree_path: Some(repo.dir.display().to_string()),

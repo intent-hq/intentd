@@ -10,16 +10,16 @@ use sqlx::Row;
 use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, Store};
 
 const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, status, \
-    status_message, attention, repository_owner, repository_name, worktree_path, scope, \
-    skip_worktree, is_remote, default_model, pr_number, pr_url, pr_status, active_pull_request, \
-    archived, archived_at, tags, created_at, updated_at, last_activity";
+    status_message, attention, path, repository_path, repository_owner, repository_name, \
+    worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, pr_status, \
+    active_pull_request, archived, archived_at, tags, created_at, updated_at, last_activity";
 
 impl Store {
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
     pub async fn insert_workspace(&self, ws: &Workspace) -> Result<()> {
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -30,6 +30,8 @@ impl Store {
             .bind(enum_to_db(&ws.status)?)
             .bind(&ws.status_message)
             .bind(enum_to_db(&ws.attention)?)
+            .bind(&ws.path)
+            .bind(&ws.repository_path)
             .bind(&ws.repository_owner)
             .bind(&ws.repository_name)
             .bind(&ws.worktree_path)
@@ -72,10 +74,11 @@ impl Store {
     pub async fn update_workspace(&self, ws: &Workspace) -> Result<()> {
         let res = sqlx::query(
             "UPDATE workspace SET title=?, branch=?, base_ref=?, base_commit_sha=?, status=?, \
-             status_message=?, attention=?, repository_owner=?, repository_name=?, \
-             worktree_path=?, scope=?, skip_worktree=?, is_remote=?, default_model=?, \
-             pr_number=?, pr_url=?, pr_status=?, active_pull_request=?, archived=?, \
-             archived_at=?, tags=?, created_at=?, updated_at=?, last_activity=? WHERE id=?",
+             status_message=?, attention=?, path=?, repository_path=?, repository_owner=?, \
+             repository_name=?, worktree_path=?, scope=?, skip_worktree=?, is_remote=?, \
+             default_model=?, pr_number=?, pr_url=?, pr_status=?, active_pull_request=?, \
+             archived=?, archived_at=?, tags=?, created_at=?, updated_at=?, last_activity=? \
+             WHERE id=?",
         )
         .bind(&ws.title)
         .bind(&ws.branch)
@@ -84,6 +87,8 @@ impl Store {
         .bind(enum_to_db(&ws.status)?)
         .bind(&ws.status_message)
         .bind(enum_to_db(&ws.attention)?)
+        .bind(&ws.path)
+        .bind(&ws.repository_path)
         .bind(&ws.repository_owner)
         .bind(&ws.repository_name)
         .bind(&ws.worktree_path)
@@ -196,8 +201,8 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         updated_at: col(row, "updated_at")?,
         last_activity: col(row, "last_activity")?,
         tags: tags_from_db(&col::<String>(row, "tags")?)?,
-        // Not persisted in this slice.
-        path: None,
+        path: col(row, "path")?,
+        repository_path: col(row, "repository_path")?,
         repository_owner: col(row, "repository_owner")?,
         repository_name: col(row, "repository_name")?,
         worktree_path: col(row, "worktree_path")?,

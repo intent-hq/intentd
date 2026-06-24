@@ -1774,6 +1774,7 @@ impl WorkspaceApi for Services {
                 last_activity: None,
                 tags: input.tags.unwrap_or_default(),
                 path: input.path,
+                repository_path: input.repository_path,
                 repository_owner: input.repository_owner,
                 repository_name: input.repository_name,
                 worktree_path: input.worktree_path,
@@ -1825,6 +1826,9 @@ impl WorkspaceApi for Services {
             }
             if let Some(v) = update.path {
                 ws.path = Some(v);
+            }
+            if let Some(v) = update.repository_path {
+                ws.repository_path = Some(v);
             }
             if let Some(v) = update.repository_owner {
                 ws.repository_owner = Some(v);
