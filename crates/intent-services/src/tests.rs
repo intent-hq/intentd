@@ -3060,6 +3060,44 @@ mod search_adapters {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// (c) When the engine reports `Available` (binary present — e.g. auggie on
+    /// PATH) but `retrieve()` returns `Unavailable`, `search.codebase` degrades to
+    /// the ripgrep/symbol path without erroring. This is the Option-A reality
+    /// (M10 CE-3): auggie exposes no structured codebase-retrieval CLI, so its
+    /// `retrieve()` is always `Unavailable` even while `availability()` is
+    /// `Available` for `intentd doctor` (§8.3).
+    #[tokio::test]
+    async fn codebase_search_degrades_when_available_engine_cannot_retrieve() {
+        let dir = std::env::temp_dir().join(format!("intentd-search-deg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().to_string());
+        store.insert_workspace(&w).await.expect("ws");
+        let engine = FakeEngine {
+            availability: intent_core::EngineAvailability::Available {
+                name: "auggie".to_string(),
+                version: Some("0.29.0".to_string()),
+            },
+            result: Err(()),
+        };
+        let svc = Services::new(store).with_context_engine(std::sync::Arc::new(engine));
+        let r = svc
+            .search_codebase(ws, "main".into(), Some("srch-deg".into()))
+            .await
+            .unwrap();
+        assert_eq!(r["requestId"], "srch-deg");
+        let matches = r["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["file"], "src/main.rs");
+        assert_eq!(matches[0]["symbol"], "main");
+        assert!(matches[0]["score"].is_number());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     struct StreamHarness {
         _tmp: TempDb,
         store: Store,

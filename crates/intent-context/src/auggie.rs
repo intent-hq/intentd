@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use intent_core::{
-    ContextEngine, ContextError, EngineAvailability, RetrieveRequest, RetrieveResult, RetrievedItem,
+    ContextEngine, ContextError, EngineAvailability, RetrieveRequest, RetrieveResult,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -98,54 +98,18 @@ impl ContextEngine for AuggieContextEngine {
 
     async fn retrieve(
         &self,
-        req: RetrieveRequest,
+        _req: RetrieveRequest,
     ) -> std::result::Result<RetrieveResult, ContextError> {
-        let path = self
-            .resolve_path()
-            .ok_or_else(|| ContextError::Unavailable {
-                reason: "auggie not found on PATH".to_string(),
-            })?;
-
-        // The concrete codebase-search subcommand is wired by CE-2; the query is
-        // piped on stdin (it may contain spaces) and the workspace path is the
-        // child's working directory.
-        let args = retrieve_args(&req);
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let output = run_auggie(
-            &path,
-            &arg_refs,
-            Some(&req.query),
-            Some(req.workspace_path.as_path()),
-            DEFAULT_TIMEOUT,
-        )
-        .await?;
-
-        if !output.success {
-            let combined = format!("{}\n{}", output.stdout, output.stderr);
-            if is_auth_failure(&combined) {
-                return Err(ContextError::Unavailable {
-                    reason: "needs login".to_string(),
-                });
-            }
-            let reason = first_nonempty_line(&output.stderr)
-                .or_else(|| first_nonempty_line(&output.stdout))
-                .unwrap_or_else(|| "auggie retrieval failed".to_string());
-            return Err(ContextError::CommandFailed(reason));
-        }
-
-        let mut result = parse_retrieve_output(&output.stdout)?;
-        if let Some(max) = req.max_results {
-            result.items.truncate(max);
-        }
-        Ok(result)
+        // auggie exposes no structured codebase-retrieval CLI (its `codebase:search`
+        // was a never-implemented stub), so there is nothing to spawn: invoking
+        // auggie with no subcommand would hang in interactive mode until the
+        // timeout. Degrade instantly so callers fall back to ripgrep with zero
+        // latency (§8.3, M10 CE-3). `availability()` still reports binary presence
+        // for `intentd doctor`.
+        Err(ContextError::Unavailable {
+            reason: "auggie exposes no structured codebase-retrieval CLI".to_string(),
+        })
     }
-}
-
-/// Assemble the auggie retrieval args. The concrete codebase-search subcommand
-/// is finalized in CE-2; the query is piped on stdin and `max_results` is
-/// applied to the parsed result set.
-fn retrieve_args(_req: &RetrieveRequest) -> Vec<String> {
-    Vec::new()
 }
 
 /// Captured output of an auggie invocation.
@@ -287,62 +251,6 @@ fn first_nonempty_line(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Parse auggie's retrieval output into a [`RetrieveResult`] (§8.2). Accepts
-/// either a top-level JSON array of hits or an object with a `matches`/
-/// `results`/`items` array; each hit's fields are read leniently.
-pub fn parse_retrieve_output(stdout: &str) -> std::result::Result<RetrieveResult, ContextError> {
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        return Ok(RetrieveResult::default());
-    }
-    let value: serde_json::Value =
-        serde_json::from_str(trimmed).map_err(|e| ContextError::Parse(e.to_string()))?;
-
-    let array = match &value {
-        serde_json::Value::Array(items) => items.as_slice(),
-        serde_json::Value::Object(map) => map
-            .get("matches")
-            .or_else(|| map.get("results"))
-            .or_else(|| map.get("items"))
-            .and_then(serde_json::Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]),
-        _ => &[],
-    };
-
-    let items = array.iter().filter_map(parse_item).collect();
-    Ok(RetrieveResult { items })
-}
-
-fn parse_item(value: &serde_json::Value) -> Option<RetrievedItem> {
-    let obj = value.as_object()?;
-    let file = obj
-        .get("file")
-        .or_else(|| obj.get("path"))
-        .and_then(serde_json::Value::as_str)?
-        .to_string();
-    let symbol = obj
-        .get("symbol")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let line = obj.get("line").and_then(serde_json::Value::as_u64);
-    let preview = obj
-        .get("preview")
-        .or_else(|| obj.get("snippet"))
-        .or_else(|| obj.get("text"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let score = obj.get("score").and_then(serde_json::Value::as_f64);
-    Some(RetrievedItem {
-        file,
-        symbol,
-        line,
-        preview,
-        score,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,53 +289,6 @@ mod tests {
         );
         assert!(is_auth_failure("You are NOT AUTHENTICATED"));
         assert!(!is_auth_failure("auggie 1.2.3"));
-    }
-
-    #[test]
-    fn parse_output_array_of_hits() {
-        let json = r#"[
-            {"file":"src/a.rs","symbol":"foo","line":12,"preview":"fn foo()","score":0.9},
-            {"path":"src/b.rs","snippet":"bar"}
-        ]"#;
-        let result = parse_retrieve_output(json).unwrap();
-        assert_eq!(result.items.len(), 2);
-        assert_eq!(
-            result.items[0],
-            RetrievedItem {
-                file: "src/a.rs".to_string(),
-                symbol: Some("foo".to_string()),
-                line: Some(12),
-                preview: "fn foo()".to_string(),
-                score: Some(0.9),
-            }
-        );
-        assert_eq!(result.items[1].file, "src/b.rs");
-        assert_eq!(result.items[1].preview, "bar");
-        assert_eq!(result.items[1].symbol, None);
-    }
-
-    #[test]
-    fn parse_output_object_with_matches() {
-        let json = r#"{"matches":[{"file":"x.rs","preview":"hit"}]}"#;
-        let result = parse_retrieve_output(json).unwrap();
-        assert_eq!(result.items.len(), 1);
-        assert_eq!(result.items[0].file, "x.rs");
-    }
-
-    #[test]
-    fn parse_output_empty_is_default() {
-        assert_eq!(
-            parse_retrieve_output("   ").unwrap(),
-            RetrieveResult::default()
-        );
-    }
-
-    #[test]
-    fn parse_output_invalid_json_errors() {
-        assert!(matches!(
-            parse_retrieve_output("{not json"),
-            Err(ContextError::Parse(_))
-        ));
     }
 
     #[test]
