@@ -2789,6 +2789,7 @@ mod search_adapters {
         let session = AgentSession {
             id: id.clone(),
             workspace_id: ws.clone(),
+            parent_agent_id: None,
             backend_session_id: None,
             acp_session_id: None,
             name: "A".to_string(),

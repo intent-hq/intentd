@@ -331,6 +331,7 @@ impl Services {
         let session = AgentSession {
             id: AgentId(format!("agent-{}", Uuid::new_v4())),
             workspace_id,
+            parent_agent_id: None,
             backend_session_id: None,
             acp_session_id: None,
             name,
