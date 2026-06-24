@@ -560,9 +560,15 @@ mod tests {
     #[tokio::test]
     async fn late_subscriber_backfills_history_then_tails_live() {
         let host = PtyHost::new();
-        let id = host.spawn(cat_spec("s")).unwrap();
-
-        host.write(id, b"HIST\n").unwrap();
+        // Emit the history marker from the program's own stdout (one production),
+        // not via stdin: a stdin write is echoed by the PTY line discipline AND by
+        // `cat`, producing `HIST` twice. If an attach cut falls between those two
+        // productions, the second copy is genuine post-snapshot output and lands
+        // live — a test-marker race, not a seam bug. Sourcing it once keeps the
+        // back-fill→tail seam deterministic without weakening the assertions.
+        let mut spec = SpawnSpec::new("s", "sh");
+        spec.args = vec!["-c".into(), "printf 'HIST\\n'; exec cat".into()];
+        let id = host.spawn(spec).unwrap();
 
         // Poll fresh attachments until the reader has captured the history.
         let deadline = Instant::now() + Duration::from_secs(5);
