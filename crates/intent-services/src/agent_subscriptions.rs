@@ -32,31 +32,32 @@ pub(crate) struct CompletionWatch {
     pub created_at: String,
 }
 
-/// Placeholder fan-in table for `waitMode: "after_all"` delegation groups.
-///
-// TODO(AS-4): wire the after_all delegation-group logic — track expected vs.
-// completed vs. deleted child agents and fire a single grouped delivery once the
-// whole group settles. AS-2 defines the record shape only; nothing populates or
-// consumes this table yet.
-#[allow(dead_code)]
+/// Fan-in table for `waitMode: "after_all"` delegation groups. All children a
+/// parent delegates with `after_all` share one open group; it fires a single
+/// aggregated wake to the parent once it is sealed (the parent went idle, so the
+/// expected set is final) and every expected child has completed or been deleted.
 #[derive(Debug, Clone)]
 pub(crate) struct DelegationGroup {
     pub group_id: String,
     pub parent_agent_id: AgentId,
+    // Retained for parity with the TS group shape; not read by the fan-in.
+    #[allow(dead_code)]
     pub await_mode: String,
     pub expected_agent_ids: Vec<AgentId>,
     pub completed_agent_ids: Vec<AgentId>,
     pub deleted_agent_ids: Vec<AgentId>,
+    // Retained for parity with the TS group shape; not read by the fan-in.
+    #[allow(dead_code)]
     pub subscription_id: Option<String>,
+    pub sealed: bool,
     pub delivered: bool,
+    pub event_summaries: Vec<String>,
 }
 
 /// Per-workspace registry state held behind the `Services` mutex.
 #[derive(Debug, Default)]
 pub(crate) struct WorkspaceWatches {
     pub subscriptions: Vec<CompletionWatch>,
-    // TODO(AS-4): populated/consumed by the after_all delegation-group logic.
-    #[allow(dead_code)]
     pub delegation_groups: Vec<DelegationGroup>,
 }
 
@@ -171,4 +172,196 @@ impl Services {
             .retain(|s| &s.parent_agent_id != parent_agent_id);
         before - w.subscriptions.len()
     }
+
+    /// Return the open (unsealed && undelivered) delegation group for `parent_id`,
+    /// creating a fresh one if none exists. All `after_all` children delegated by
+    /// the same parent turn share this group; a sealed/delivered group is never
+    /// reused, so a later turn opens a new one.
+    pub(crate) fn get_or_create_delegation_group(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_id: &AgentId,
+    ) -> String {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let entry = guard.entry(workspace_id.clone()).or_default();
+        if let Some(g) = entry
+            .delegation_groups
+            .iter()
+            .find(|g| &g.parent_agent_id == parent_id && !g.sealed && !g.delivered)
+        {
+            return g.group_id.clone();
+        }
+        let group_id = Uuid::new_v4().to_string();
+        entry.delegation_groups.push(DelegationGroup {
+            group_id: group_id.clone(),
+            parent_agent_id: parent_id.clone(),
+            await_mode: "after_all".to_string(),
+            expected_agent_ids: Vec::new(),
+            completed_agent_ids: Vec::new(),
+            deleted_agent_ids: Vec::new(),
+            subscription_id: None,
+            sealed: false,
+            delivered: false,
+            event_summaries: Vec::new(),
+        });
+        group_id
+    }
+
+    /// Add `child_id` to a group's expected set (idempotent).
+    pub(crate) fn enroll_child_in_group(
+        &self,
+        workspace_id: &WorkspaceId,
+        group_id: &str,
+        child_id: &AgentId,
+    ) {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let Some(w) = guard.get_mut(workspace_id) else {
+            return;
+        };
+        if let Some(g) = w
+            .delegation_groups
+            .iter_mut()
+            .find(|g| g.group_id == group_id)
+        {
+            if !g.expected_agent_ids.contains(child_id) {
+                g.expected_agent_ids.push(child_id.clone());
+            }
+        }
+    }
+
+    /// Seal the parent's open group (its delegating turn ended, so the expected
+    /// set is final); returns the sealed group id, or `None` if none was open.
+    pub(crate) fn seal_group_for_parent(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_id: &AgentId,
+    ) -> Option<String> {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let w = guard.get_mut(workspace_id)?;
+        let g = w
+            .delegation_groups
+            .iter_mut()
+            .find(|g| &g.parent_agent_id == parent_id && !g.sealed && !g.delivered)?;
+        g.sealed = true;
+        Some(g.group_id.clone())
+    }
+
+    /// Record one child's completion in its group (idempotent): adds it to the
+    /// completed or deleted set and pushes a summary line. No-ops if the child is
+    /// not expected or already recorded, or if the group no longer exists.
+    pub(crate) fn record_group_child_completion(
+        &self,
+        workspace_id: &WorkspaceId,
+        group_id: &str,
+        child_id: &AgentId,
+        deleted: bool,
+        summary: String,
+    ) {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let Some(w) = guard.get_mut(workspace_id) else {
+            return;
+        };
+        let Some(g) = w
+            .delegation_groups
+            .iter_mut()
+            .find(|g| g.group_id == group_id)
+        else {
+            return;
+        };
+        if !g.expected_agent_ids.contains(child_id) {
+            return;
+        }
+        if g.completed_agent_ids.contains(child_id) || g.deleted_agent_ids.contains(child_id) {
+            return;
+        }
+        if deleted {
+            g.deleted_agent_ids.push(child_id.clone());
+        } else {
+            g.completed_agent_ids.push(child_id.clone());
+        }
+        g.event_summaries.push(summary);
+    }
+
+    /// Atomically claim a group for delivery if it is sealed, complete, and not
+    /// yet delivered: flips `delivered`, removes it from the table, and returns a
+    /// clone. Returns `None` otherwise, so the aggregated wake fires exactly once.
+    pub(crate) fn take_group_if_ready(
+        &self,
+        workspace_id: &WorkspaceId,
+        group_id: &str,
+    ) -> Option<DelegationGroup> {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let w = guard.get_mut(workspace_id)?;
+        let idx = w
+            .delegation_groups
+            .iter()
+            .position(|g| g.group_id == group_id)?;
+        if !(w.delegation_groups[idx].sealed
+            && !w.delegation_groups[idx].delivered
+            && is_group_complete(&w.delegation_groups[idx]))
+        {
+            return None;
+        }
+        let mut group = w.delegation_groups.remove(idx);
+        group.delivered = true;
+        Some(group)
+    }
+
+    /// Drop every completion watch carrying `group_id`; returns the count removed.
+    pub(crate) fn remove_group_watches(&self, workspace_id: &WorkspaceId, group_id: &str) -> usize {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let Some(w) = guard.get_mut(workspace_id) else {
+            return 0;
+        };
+        let before = w.subscriptions.len();
+        w.subscriptions
+            .retain(|s| s.group_id.as_deref() != Some(group_id));
+        before - w.subscriptions.len()
+    }
+
+    /// Test-only snapshot of a parent's delegation group, if one exists.
+    #[cfg(test)]
+    pub(crate) fn delegation_group_for_parent(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_id: &AgentId,
+    ) -> Option<DelegationGroup> {
+        self.agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .get(workspace_id)
+            .and_then(|w| {
+                w.delegation_groups
+                    .iter()
+                    .find(|g| &g.parent_agent_id == parent_id)
+                    .cloned()
+            })
+    }
+}
+
+/// A group is complete when it has at least one expected child and every
+/// expected child is in the completed or deleted set.
+fn is_group_complete(group: &DelegationGroup) -> bool {
+    !group.expected_agent_ids.is_empty()
+        && group.expected_agent_ids.iter().all(|id| {
+            group.completed_agent_ids.contains(id) || group.deleted_agent_ids.contains(id)
+        })
 }

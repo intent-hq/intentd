@@ -573,6 +573,14 @@ impl Services {
         let child = AgentId::from(child_id.as_str());
         self.deliver_completion_to_watches(&event.workspace_id, &child, event)
             .await;
+        // An agent going idle ends its delegating turn, so seal that parent's
+        // open after_all group (the expected set is now final) and try to fire it
+        // — covers the case where every child finished before the parent idled.
+        if event.event_type == AGENT_IDLE {
+            if let Some(gid) = self.seal_group_for_parent(&event.workspace_id, &child) {
+                self.try_fire_group(&event.workspace_id, &gid).await;
+            }
+        }
     }
 
     /// Wake every parent whose oneShot watch matches child_id, then drop that
@@ -586,10 +594,14 @@ impl Services {
         event: &Event,
     ) {
         for watch in self.find_watches_for_child(workspace_id, child_id) {
-            if watch.group_id.is_some() {
-                // TODO(AS-4): enroll this completion in the parent's after_all
-                // delegation group and fire a single grouped wake once the whole
-                // group settles. Leave the group watch in place for now.
+            if let Some(gid) = watch.group_id.clone() {
+                // Route the child's completion into the parent's after_all
+                // delegation group instead of waking immediately. The group's own
+                // fire path removes these watches once it settles (AS-4).
+                let deleted = event.event_type == AGENT_DELETED;
+                let summary = format_group_child_line(child_id, event);
+                self.record_group_child_completion(workspace_id, &gid, child_id, deleted, summary);
+                self.try_fire_group(workspace_id, &gid).await;
                 continue;
             }
             let wake = format_completion_wake(child_id, event);
@@ -608,6 +620,30 @@ impl Services {
                 self.remove_watch(workspace_id, &watch.id);
             }
         }
+    }
+
+    /// Fire a delegation group's single aggregated wake if it is ready (sealed,
+    /// complete, undelivered). `take_group_if_ready` flips `delivered` and removes
+    /// the group atomically, so this fires at most once even under concurrent
+    /// completions; on a send error we log and accept the dropped wake (mirroring
+    /// the immediate path's best-effort delivery).
+    pub(crate) async fn try_fire_group(&self, workspace_id: &WorkspaceId, group_id: &str) {
+        let Some(group) = self.take_group_if_ready(workspace_id, group_id) else {
+            return;
+        };
+        let wake = format_group_wake(&group);
+        if let Err(e) = self
+            .agent_send_message_op(group.parent_agent_id.clone(), wake, None)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                parent = %group.parent_agent_id.0,
+                group = %group_id,
+                "failed to deliver aggregated after_all wake to parent"
+            );
+        }
+        self.remove_group_watches(workspace_id, group_id);
     }
 }
 
@@ -1243,6 +1279,58 @@ fn format_completion_wake(child_id: &AgentId, event: &Event) -> String {
         if !err.is_empty() {
             msg.push_str(&format!(" Error: {err}"));
         }
+    }
+    msg
+}
+
+/// Build one per-child summary line for a delegation group's aggregated wake.
+/// A compact sibling of [`format_completion_wake`] without the standalone
+/// `[WORKSPACE EVENTS]` framing, since the group header carries that.
+fn format_group_child_line(child_id: &AgentId, event: &Event) -> String {
+    let kind = match event.event_type.as_str() {
+        AGENT_IDLE => "completed",
+        AGENT_FAILED => "failed",
+        AGENT_DELETED => "was deleted",
+        other => other,
+    };
+    let label = event
+        .data
+        .get("agentName")
+        .and_then(|v| v.as_str())
+        .or(event.actor.name.as_deref())
+        .map(|name| format!("{name} ({})", child_id.0))
+        .unwrap_or_else(|| child_id.0.clone());
+    let mut line = format!("- {label} {kind}.");
+    if let Some(summary) = event
+        .data
+        .get("lastResponseSummary")
+        .and_then(|v| v.as_str())
+    {
+        if !summary.is_empty() {
+            line.push_str(&format!(" Summary: {summary}"));
+        }
+    }
+    if let Some(err) = event.data.get("error").and_then(|v| v.as_str()) {
+        if !err.is_empty() {
+            line.push_str(&format!(" Error: {err}"));
+        }
+    }
+    line
+}
+
+/// Build the single aggregated wake for a settled after_all delegation group: a
+/// header with the child count and completionStatus (`partial` when any child was
+/// deleted, else `completed`) followed by the accumulated per-child lines.
+fn format_group_wake(group: &agent_subscriptions::DelegationGroup) -> String {
+    let total = group.expected_agent_ids.len();
+    let partial = !group.deleted_agent_ids.is_empty();
+    let status = if partial { "partial" } else { "completed" };
+    let mut msg = format!(
+        "[WORKSPACE EVENTS] All {total} delegated child agent(s) settled (completionStatus: {status})."
+    );
+    for line in &group.event_summaries {
+        msg.push('\n');
+        msg.push_str(line);
     }
     msg
 }

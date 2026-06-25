@@ -624,25 +624,37 @@ impl Services {
         // RPC front door (`None`) registers nothing. `after_all` defers to the
         // delegation-group fan-in (AS-4); `immediate`/default registers a oneShot.
         if let Some(parent) = parent_agent_id {
-            if wait_mode.as_deref() == Some(WAIT_MODE_AFTER_ALL) {
-                // TODO(AS-4): instead of a standalone oneShot, enroll this child in
-                // the parent's `after_all` delegation group and register the group
-                // subscription once the whole group is known.
-            } else {
-                // Best-effort guard: skip if the parent agent is already deleted
-                // (TS `selectIsAgentDeleted`).
-                let parent_session = self.store.get_agent_session(&parent).await.ok();
-                let parent_deleted = parent_session
-                    .as_ref()
-                    .map(|s| s.status == AgentStatus::Deleted)
-                    .unwrap_or(false);
-                if !parent_deleted {
-                    let parent_name = parent_session.map(|s| s.name).unwrap_or_default();
+            // Best-effort guard: skip if the parent agent is already deleted
+            // (TS `selectIsAgentDeleted`).
+            let parent_session = self.store.get_agent_session(&parent).await.ok();
+            let parent_deleted = parent_session
+                .as_ref()
+                .map(|s| s.status == AgentStatus::Deleted)
+                .unwrap_or(false);
+            if !parent_deleted {
+                let parent_name = parent_session.map(|s| s.name).unwrap_or_default();
+                let child = AgentId::from(agent_id.as_str());
+                if wait_mode.as_deref() == Some(WAIT_MODE_AFTER_ALL) {
+                    // Enroll the child in the parent's after_all delegation group
+                    // and register a group watch (group_id = Some, not oneShot) so
+                    // the delivery worker routes its completion into the group
+                    // fan-in instead of waking the parent immediately (AS-4).
+                    let gid = self.get_or_create_delegation_group(&workspace_id, &parent);
+                    self.enroll_child_in_group(&workspace_id, &gid, &child);
                     self.register_completion_watch(
                         &workspace_id,
                         parent,
                         parent_name,
-                        AgentId::from(agent_id.as_str()),
+                        child,
+                        false,
+                        Some(gid),
+                    );
+                } else {
+                    self.register_completion_watch(
+                        &workspace_id,
+                        parent,
+                        parent_name,
+                        child,
                         true,
                         None,
                     );
