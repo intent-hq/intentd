@@ -1081,10 +1081,12 @@ impl AgentManager {
         message_id: Option<String>,
     ) -> Result<Value> {
         if !self.try_begin(&agent_id, &workspace_id).await {
-            let queued = self.services.enqueue_message(&agent_id, content, None);
-            return Ok(
-                json!({ "success": true, "queued": true, "queuedMessage": queued.to_value() }),
-            );
+            let (queued, position) = self.services.enqueue_message(&agent_id, content, None);
+            return Ok(json!({
+                "success": true,
+                "queued": true,
+                "queuedMessage": queued.to_value(position),
+            }));
         }
         let message_id = message_id.unwrap_or_else(new_message_id);
         let blocks = user_text_blocks(&content);
@@ -1098,10 +1100,12 @@ impl AgentManager {
             // Store write failed (e.g. session not yet persisted) → auto-queue,
             // matching the `agent.sendMessage` fallback (PROTOCOL §5.5).
             self.end_turn(&agent_id).await;
-            let queued = self.services.enqueue_message(&agent_id, content, None);
-            return Ok(
-                json!({ "success": true, "queued": true, "queuedMessage": queued.to_value() }),
-            );
+            let (queued, position) = self.services.enqueue_message(&agent_id, content, None);
+            return Ok(json!({
+                "success": true,
+                "queued": true,
+                "queuedMessage": queued.to_value(position),
+            }));
         }
         self.spawn_worker(agent_id, workspace_id, content);
         Ok(json!({ "success": true, "queued": false, "messageId": message_id }))

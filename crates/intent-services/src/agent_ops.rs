@@ -29,20 +29,22 @@ const MAX_CONVERSATION_MESSAGES: i64 = 200;
 #[derive(Debug, Clone)]
 pub(crate) struct QueuedMessage {
     pub id: String,
-    pub agent_id: String,
     pub content: String,
     pub image_blocks: Option<Value>,
-    pub created_at: String,
+    pub queued_at: String,
 }
 
 impl QueuedMessage {
-    /// The camelCase wire shape for `agent.getQueue` / queue results.
-    pub(crate) fn to_value(&self) -> Value {
+    /// The camelCase wire shape for `agent.getQueue` / queue results, matching the
+    /// TS `QueuedMessage` and the iOS decoder (`{id, content, queuedAt, position,
+    /// imageBlocks?}`). `position` is the entry's 0-based index in the queue (0 =
+    /// next to be sent) and is supplied by the caller since it is positional.
+    pub(crate) fn to_value(&self, position: usize) -> Value {
         let mut v = json!({
             "id": self.id,
-            "agentId": self.agent_id,
             "content": self.content,
-            "createdAt": self.created_at,
+            "queuedAt": self.queued_at,
+            "position": position,
         });
         if let Some(blocks) = &self.image_blocks {
             v["imageBlocks"] = blocks.clone();
@@ -149,6 +151,19 @@ pub(crate) fn last_response_and_digest(
         return (last_response, digest);
     }
     (None, None)
+}
+
+/// Derive `lastUserMessage` from the most-recent `user` message's text blocks
+/// (joined), porting the TS `agent.list`/`agent.get` activity field.
+pub(crate) fn last_user_message(messages: &[AgentMessage]) -> Option<String> {
+    for msg in messages.iter().rev() {
+        if msg.role != "user" {
+            continue;
+        }
+        let text = text_blocks(&msg.content).join("\n").trim().to_string();
+        return if text.is_empty() { None } else { Some(text) };
+    }
+    None
 }
 
 /// Capture the first `start..end` span's inner text (for digest extraction).
@@ -275,8 +290,9 @@ fn user_content_blocks(content: &str) -> Value {
 /// Project an [`AgentSession`] (with its loaded messages) into [`AgentLite`].
 fn project_lite(session: AgentSession) -> AgentLite {
     let (last_response, digest) = last_response_and_digest(&session.messages);
+    let last_user = last_user_message(&session.messages);
     let count = session.messages.len() as u64;
-    AgentLite::from_session(session, count, last_response, digest)
+    AgentLite::from_session(session, count, last_response, last_user, digest)
 }
 
 impl Services {
@@ -323,6 +339,7 @@ impl Services {
         workspace_id: WorkspaceId,
         name: Option<String>,
         model: Option<String>,
+        specialist: Option<String>,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
         let now = now_iso();
@@ -340,6 +357,7 @@ impl Services {
             model,
             provider: None,
             system_prompt: None,
+            specialist,
             status: AgentStatus::Pending,
             is_active: false,
             messages: Vec::new(),
@@ -401,8 +419,8 @@ impl Services {
         content: String,
         image_blocks: Option<Value>,
     ) -> Result<Value> {
-        let queued = self.enqueue_message(&agent_id, content, image_blocks);
-        Ok(json!({ "success": true, "queuedMessage": queued.to_value() }))
+        let (queued, position) = self.enqueue_message(&agent_id, content, image_blocks);
+        Ok(json!({ "success": true, "queuedMessage": queued.to_value(position) }))
     }
 
     /// `agent.getQueue` (PROTOCOL §5.5).
@@ -412,9 +430,9 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .get(&agent_id)
-            .map(|q| q.iter().map(QueuedMessage::to_value).collect())
+            .map(|q| q.iter().enumerate().map(|(i, m)| m.to_value(i)).collect())
             .unwrap_or_default();
-        Ok(json!({ "queue": queue }))
+        Ok(json!({ "success": true, "queue": queue }))
     }
 
     /// `agent.editQueuedMessage` (PROTOCOL §5.5).
@@ -431,12 +449,12 @@ impl Services {
         let queue = guard
             .get_mut(&agent_id)
             .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
-        let msg = queue
-            .iter_mut()
-            .find(|m| m.id == message_id)
+        let position = queue
+            .iter()
+            .position(|m| m.id == message_id)
             .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
-        msg.content = content;
-        Ok(json!({ "success": true, "queuedMessage": msg.to_value() }))
+        queue[position].content = content;
+        Ok(json!({ "success": true, "queuedMessage": queue[position].to_value(position) }))
     }
 
     /// `agent.removeQueuedMessage` (PROTOCOL §5.5).
@@ -477,8 +495,12 @@ impl Services {
         {
             Ok(_) => Ok(json!({ "success": true, "queued": false, "messageId": message_id })),
             Err(_) => {
-                let queued = self.enqueue_message(&agent_id, content, None);
-                Ok(json!({ "success": true, "queued": true, "queuedMessage": queued.to_value() }))
+                let (queued, position) = self.enqueue_message(&agent_id, content, None);
+                Ok(json!({
+                    "success": true,
+                    "queued": true,
+                    "queuedMessage": queued.to_value(position),
+                }))
             }
         }
     }
@@ -568,7 +590,13 @@ impl Services {
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
         let created = self
-            .agent_create_op(workspace_id.clone(), None, input.model, parent_agent_id)
+            .agent_create_op(
+                workspace_id.clone(),
+                None,
+                input.model,
+                input.specialist,
+                parent_agent_id,
+            )
             .await?;
         let agent_id = created["agent"]["id"]
             .as_str()
@@ -624,7 +652,7 @@ impl Services {
             return Ok(json!({ "ok": true, "agentId": agent, "created": false, "result": result }));
         }
         let created = self
-            .agent_create_op(workspace_id.clone(), None, model, None)
+            .agent_create_op(workspace_id.clone(), None, model, None, None)
             .await?;
         let agent_id = created["agent"]["id"]
             .as_str()
@@ -652,27 +680,28 @@ impl Services {
         }
     }
 
-    /// Push a message onto an agent's in-memory queue and return it.
+    /// Push a message onto an agent's in-memory queue and return it together with
+    /// its 0-based `position` in the queue (the index just appended).
     pub(crate) fn enqueue_message(
         &self,
         agent_id: &AgentId,
         content: String,
         image_blocks: Option<Value>,
-    ) -> QueuedMessage {
+    ) -> (QueuedMessage, usize) {
         let queued = QueuedMessage {
             id: new_message_id(),
-            agent_id: agent_id.0.clone(),
             content,
             image_blocks,
-            created_at: now_iso(),
+            queued_at: now_iso(),
         };
-        self.agent_queues
+        let mut guard = self
+            .agent_queues
             .lock()
-            .expect("agent queue registry poisoned")
-            .entry(agent_id.clone())
-            .or_default()
-            .push(queued.clone());
-        queued
+            .expect("agent queue registry poisoned");
+        let queue = guard.entry(agent_id.clone()).or_default();
+        queue.push(queued.clone());
+        let position = queue.len() - 1;
+        (queued, position)
     }
 
     /// Pop the oldest queued message for an agent (FIFO), if any. Used by the

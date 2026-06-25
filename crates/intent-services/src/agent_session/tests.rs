@@ -186,6 +186,9 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         active_pull_request: None,
         archived: false,
         archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
     }
 }
 
@@ -202,6 +205,7 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         model: None,
         provider: None,
         system_prompt: None,
+        specialist: None,
         status: AgentStatus::Pending,
         is_active: true,
         messages: Vec::new(),
