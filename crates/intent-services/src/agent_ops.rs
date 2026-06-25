@@ -13,6 +13,10 @@ use intent_core::{
     now_iso, AgentId, AgentLite, AgentMessage, AgentSession, AgentStatus, Error, NoteId, Result,
     WorkspaceApi, WorkspaceId,
 };
+
+/// `waitMode` value that defers the completion watch into an `after_all`
+/// delegation group (AS-4) rather than registering a standalone oneShot here.
+const WAIT_MODE_AFTER_ALL: &str = "after_all";
 use intent_providers::models::PROVIDER_MODEL_TIERS;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -567,8 +571,14 @@ impl Services {
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
+        let wait_mode = input.wait_mode.clone();
         let created = self
-            .agent_create_op(workspace_id.clone(), None, input.model, parent_agent_id)
+            .agent_create_op(
+                workspace_id.clone(),
+                None,
+                input.model,
+                parent_agent_id.clone(),
+            )
             .await?;
         let agent_id = created["agent"]["id"]
             .as_str()
@@ -580,8 +590,38 @@ impl Services {
             .to_string();
         if let Some(task_note_id) = input.task_note_id.clone().or(input.note_id.clone()) {
             let _ = self
-                .assign_agent(workspace_id, task_note_id, agent_id.clone())
+                .assign_agent(workspace_id.clone(), task_note_id, agent_id.clone())
                 .await;
+        }
+        // Auto-subscribe the delegating caller to the child's completion (AS-2).
+        // Only the MCP front door carries a caller (`parent_agent_id = Some`); the
+        // RPC front door (`None`) registers nothing. `after_all` defers to the
+        // delegation-group fan-in (AS-4); `immediate`/default registers a oneShot.
+        if let Some(parent) = parent_agent_id {
+            if wait_mode.as_deref() == Some(WAIT_MODE_AFTER_ALL) {
+                // TODO(AS-4): instead of a standalone oneShot, enroll this child in
+                // the parent's `after_all` delegation group and register the group
+                // subscription once the whole group is known.
+            } else {
+                // Best-effort guard: skip if the parent agent is already deleted
+                // (TS `selectIsAgentDeleted`).
+                let parent_session = self.store.get_agent_session(&parent).await.ok();
+                let parent_deleted = parent_session
+                    .as_ref()
+                    .map(|s| s.status == AgentStatus::Deleted)
+                    .unwrap_or(false);
+                if !parent_deleted {
+                    let parent_name = parent_session.map(|s| s.name).unwrap_or_default();
+                    self.register_completion_watch(
+                        &workspace_id,
+                        parent,
+                        parent_name,
+                        AgentId::from(agent_id.as_str()),
+                        true,
+                        None,
+                    );
+                }
+            }
         }
         Ok(json!({ "ok": true, "agentId": agent_id, "name": name }))
     }

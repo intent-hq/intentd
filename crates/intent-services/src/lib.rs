@@ -39,6 +39,7 @@ pub use intent_core::{Error, Result, WorkspaceApi};
 mod agent_manager;
 mod agent_ops;
 mod agent_session;
+mod agent_subscriptions;
 mod drafts;
 mod event_ops;
 pub mod events;
@@ -87,6 +88,12 @@ pub struct Services {
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
     /// with the end-to-end orchestration flow; the queue surface itself is here.
     agent_queues: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Daemon-owned parent→child completion-watch registry (AS-2), keyed by
+    /// workspace. A oneShot watch is registered when an agent delegates with
+    /// `waitMode` `immediate` over the MCP front door; the delivery worker (AS-3)
+    /// and the `after_all` group fan-in (AS-4) consume it later. Shared across
+    /// clones like the other in-memory registries.
+    agent_subscriptions: Arc<Mutex<HashMap<WorkspaceId, agent_subscriptions::WorkspaceWatches>>>,
     /// Back-reference to the runtime [`AgentManager`] so the `agent.*` RPC
     /// handlers drive the real spawn/turn/MCP loop (§6.8). Held as a [`Weak`] to
     /// break the `AgentManager → Services` ownership cycle; the composition root
@@ -154,6 +161,7 @@ impl Services {
             event_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
+            agent_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
