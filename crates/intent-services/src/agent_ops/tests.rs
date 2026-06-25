@@ -568,3 +568,163 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
         .expect("error response");
     assert_eq!(err_resp["error"]["code"], json!(-32603));
 }
+
+// ===========================================================================
+// AS-2: completion-watch registry + auto-subscribe on delegate (immediate mode)
+// ===========================================================================
+
+/// The registry helpers register/find/list/remove parent→child watches.
+#[tokio::test]
+async fn completion_watch_registry_register_find_list_remove() {
+    let (_t, svc, ws) = setup().await;
+    let parent = AgentId::from("agent-00000000-0000-0000-0000-00000000paren");
+    let child_a = AgentId::from("agent-00000000-0000-0000-0000-0000000child");
+    let child_b = AgentId::from("agent-00000000-0000-0000-0000-000000childb");
+
+    let sub_a = svc.register_completion_watch(
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child_a.clone(),
+        true,
+        None,
+    );
+    let sub_b = svc.register_completion_watch(
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child_b.clone(),
+        true,
+        None,
+    );
+    assert_ne!(sub_a, sub_b);
+
+    let for_child_a = svc.find_watches_for_child(&ws, &child_a);
+    assert_eq!(for_child_a.len(), 1);
+    assert_eq!(for_child_a[0].id, sub_a);
+    assert!(for_child_a[0].one_shot);
+    assert_eq!(for_child_a[0].parent_agent_id, parent);
+    assert_eq!(for_child_a[0].child_agent_id, child_a);
+
+    assert_eq!(svc.list_watches_for_parent(&ws, &parent).len(), 2);
+
+    assert!(svc.remove_watch(&ws, &sub_a));
+    assert!(!svc.remove_watch(&ws, &sub_a));
+    assert!(svc.find_watches_for_child(&ws, &child_a).is_empty());
+    assert_eq!(svc.list_watches_for_parent(&ws, &parent).len(), 1);
+
+    assert_eq!(svc.remove_all_for_parent(&ws, &parent), 1);
+    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+}
+
+/// MCP front door (caller set), default wait mode: exactly one oneShot watch is
+/// registered linking the caller (parent) to the freshly created child.
+#[tokio::test]
+async fn delegate_immediate_registers_one_oneshot_watch_for_mcp_caller() {
+    let (_t, svc, ws) = setup().await;
+    let caller = AgentId::from("agent-00000000-0000-0000-0000-0000000caller");
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput::default(),
+            Some(caller.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1);
+    assert!(watches[0].one_shot);
+    assert_eq!(watches[0].child_agent_id, child);
+    assert_eq!(svc.find_watches_for_child(&ws, &child).len(), 1);
+}
+
+/// RPC front door (caller `None`): no watch is registered.
+#[tokio::test]
+async fn delegate_rpc_path_registers_no_watch() {
+    let (_t, svc, ws) = setup().await;
+    let resp = svc
+        .agent_delegate_op(ws.clone(), AgentDelegateInput::default(), None)
+        .await
+        .expect("rpc delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    assert!(svc.find_watches_for_child(&ws, &child).is_empty());
+}
+
+/// `wait_mode == "after_all"` defers to AS-4: no oneShot is registered here even
+/// with a caller present.
+#[tokio::test]
+async fn delegate_after_all_registers_no_watch_here() {
+    let (_t, svc, ws) = setup().await;
+    let caller = AgentId::from("agent-00000000-0000-0000-0000-0000000caller");
+    let input = AgentDelegateInput {
+        wait_mode: Some("after_all".into()),
+        ..Default::default()
+    };
+    svc.agent_delegate_op(ws.clone(), input, Some(caller.clone()))
+        .await
+        .expect("delegate after_all");
+    assert!(svc.list_watches_for_parent(&ws, &caller).is_empty());
+}
+
+/// The deleted-parent guard skips registration when the caller's session is
+/// flagged `deleted` (TS `selectIsAgentDeleted`).
+#[tokio::test]
+async fn delegate_skips_watch_when_parent_deleted() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    session.status = intent_core::AgentStatus::Deleted;
+    svc.store()
+        .update_agent_session(&session)
+        .await
+        .expect("flag deleted");
+
+    svc.agent_delegate_op(
+        ws.clone(),
+        AgentDelegateInput::default(),
+        Some(parent.clone()),
+    )
+    .await
+    .expect("delegate");
+    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+}
+
+/// End-to-end through the MCP front door: delegating with a caller registers
+/// exactly one oneShot watch for the child returned by the tool.
+#[tokio::test]
+async fn mcp_delegate_immediate_registers_oneshot_watch() {
+    let (_t, svc, ws) = setup().await;
+    let caller = AgentId::from("agent-00000000-0000-0000-0000-0000000caller");
+    let api: Arc<dyn WorkspaceApi> = Arc::new(svc.clone());
+    let server =
+        WorkspaceMcpServer::new(api, ws.clone()).with_caller_agent_id(Some(caller.clone()));
+    let resp = server
+        .handle_message(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "delegate_task_workspace-mcp",
+                "arguments": { "agentInstructions": "do work" }
+            }
+        }))
+        .await
+        .expect("mcp response");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    let parsed: serde_json::Value = serde_json::from_str(text).expect("tool json");
+    let child = AgentId::from(parsed["agentId"].as_str().expect("agentId"));
+
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].child_agent_id, child);
+    assert!(watches[0].one_shot);
+}
