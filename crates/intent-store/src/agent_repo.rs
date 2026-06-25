@@ -16,7 +16,7 @@ use crate::{enum_from_db, enum_to_db, Store};
 
 const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session_id, name, \
     name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, \
-    parent_agent_id";
+    parent_agent_id, specialist";
 
 impl Store {
     /// Insert an agent-session row. `messages`/`stats` are not persisted here;
@@ -24,7 +24,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&s.id.0)
@@ -41,6 +41,7 @@ impl Store {
             .bind(&s.created_at)
             .bind(&s.updated_at)
             .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
+            .bind(&s.specialist)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
@@ -102,7 +103,7 @@ impl Store {
         sqlx::query(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
-             updated_at=?, parent_agent_id=? WHERE id=?",
+             updated_at=?, parent_agent_id=?, specialist=? WHERE id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.acp_session_id)
@@ -115,6 +116,7 @@ impl Store {
         .bind(&s.system_prompt)
         .bind(&s.updated_at)
         .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
+        .bind(&s.specialist)
         .bind(&s.id.0)
         .execute(self.pool())
         .await
@@ -211,6 +213,7 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         name_explicitly_set: col::<i64>(row, "name_explicitly_set")? != 0,
         model: col(row, "model")?,
         provider: col(row, "provider")?,
+        specialist: col(row, "specialist")?,
         status: enum_from_db::<AgentStatus>(&col::<String>(row, "status")?)?,
         is_active: col::<i64>(row, "is_active")? != 0,
         system_prompt: col(row, "system_prompt")?,

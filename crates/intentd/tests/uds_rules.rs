@@ -71,6 +71,9 @@ fn sample_ws(id: &WorkspaceId, worktree: &std::path::Path) -> Workspace {
         active_pull_request: None,
         archived: false,
         archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
     }
 }
 

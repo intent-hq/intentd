@@ -105,6 +105,9 @@ fn workspace(id: &WorkspaceId, worktree: &str, branch: &str) -> Workspace {
         active_pull_request: None,
         archived: false,
         archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
     }
 }
 

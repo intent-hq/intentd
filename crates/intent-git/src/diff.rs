@@ -136,6 +136,53 @@ pub fn diff_range(repo_path: &Path, base_ref: &str) -> Result<Vec<FileDiff>> {
     diff_to_file_summaries(&diff)
 }
 
+/// Aggregate `git diff HEAD` rollup for a workspace card (ports the TS
+/// `computeWorkspaceDiffSummary`): returns `(total_files, total_additions,
+/// total_deletions)`.
+///
+/// `total_files` counts tracked changes vs `HEAD` (staged + unstaged) **plus**
+/// untracked files (matching `git diff --name-only HEAD` ∪ `ls-files --others`);
+/// `total_additions`/`total_deletions` sum line stats over the **tracked**
+/// changes only (untracked content excluded, matching `git diff --numstat HEAD`).
+/// An unborn `HEAD` (no commit) has no diff base — like the TS `git diff HEAD`
+/// failing — so `(0, 0, 0)` is returned and callers omit the summary.
+pub fn head_diff_rollup(repo_path: &Path) -> Result<(usize, usize, usize)> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let Some(head_tree) = repo
+        .head()
+        .ok()
+        .and_then(|h| h.target())
+        .and_then(|oid| repo.find_commit(oid).ok())
+        .and_then(|c| c.tree().ok())
+    else {
+        return Ok((0, 0, 0));
+    };
+
+    // Tracked changes vs HEAD (staged + unstaged); untracked excluded — line stats.
+    let tracked = repo
+        .diff_tree_to_workdir_with_index(Some(&head_tree), None)
+        .map_err(map_git_err)?;
+    let mut total_additions = 0usize;
+    let mut total_deletions = 0usize;
+    for i in 0..tracked.deltas().len() {
+        if let Some(patch) = Patch::from_diff(&tracked, i).map_err(map_git_err)? {
+            let (_ctx, adds, dels) = patch.line_stats().map_err(map_git_err)?;
+            total_additions += adds;
+            total_deletions += dels;
+        }
+    }
+
+    // Same diff including untracked files → unique changed-file count.
+    let mut opts = DiffOptions::new();
+    opts.include_untracked(true).recurse_untracked_dirs(true);
+    let with_untracked = repo
+        .diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut opts))
+        .map_err(map_git_err)?;
+    let total_files = with_untracked.deltas().len();
+
+    Ok((total_files, total_additions, total_deletions))
+}
+
 /// Build per-file [`FileDiff`] summaries (path + line stats + blob SHAs) from a
 /// computed [`git2::Diff`].
 fn diff_to_file_summaries(diff: &git2::Diff) -> Result<Vec<FileDiff>> {
@@ -350,6 +397,27 @@ mod tests {
         assert!(hunks_index_to_workdir(dir.path(), "a.txt")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn head_diff_rollup_counts_tracked_changes_and_untracked_files() {
+        let dir = init_repo("diff-rollup");
+        commit_file(dir.path(), "a.txt", "line1\nline2\nline3\n");
+        // Tracked modification: 1 replaced line (1 add + 1 del) + 1 appended add.
+        write_file(dir.path(), "a.txt", "line1\nCHANGED\nline3\nline4\n");
+        // Untracked file: counts toward total_files, not toward line totals.
+        write_file(dir.path(), "new.txt", "hello\nworld\n");
+        let (total_files, total_additions, total_deletions) = head_diff_rollup(dir.path()).unwrap();
+        assert_eq!(total_files, 2);
+        assert_eq!(total_additions, 2);
+        assert_eq!(total_deletions, 1);
+    }
+
+    #[test]
+    fn head_diff_rollup_clean_tree_is_zero() {
+        let dir = init_repo("diff-rollup-clean");
+        commit_file(dir.path(), "a.txt", "seed\n");
+        assert_eq!(head_diff_rollup(dir.path()).unwrap(), (0, 0, 0));
     }
 
     #[test]

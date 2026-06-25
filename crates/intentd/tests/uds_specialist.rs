@@ -271,18 +271,13 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     assert_eq!(got["specialist"]["source"], "project");
     assert_eq!(got["specialist"]["name"], "Project Implementor");
 
-    // list with workspacePath merges all three tiers (project wins per id).
-    let list = ok(
-        &mut w,
-        &mut r,
-        8,
-        "specialist.list",
-        json!({ "workspacePath": wp }),
-    )
-    .await;
+    // list matches the TS WSS signature: no params; merges user > bundled only
+    // (no project tier). The user-scoped `implementor` override wins over bundled;
+    // the project file created above is NOT surfaced by `list`.
+    let list = ok(&mut w, &mut r, 8, "specialist.list", json!({})).await;
     let specs = list["specialists"].as_array().unwrap();
     let imp = specs.iter().find(|s| s["id"] == "implementor").unwrap();
-    assert_eq!(imp["source"], "project");
+    assert_eq!(imp["source"], "user");
     assert!(specs.iter().any(|s| s["id"] == "reviewer"));
     assert!(specs.iter().any(|s| s["id"] == "verifier"));
 

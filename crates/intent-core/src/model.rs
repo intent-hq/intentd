@@ -9,12 +9,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId};
 
-/// Workspace lifecycle (§9.1).
+/// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
+/// Wire values are the PascalCase variant names (`Active`/`Inactive`/`Archived`/
+/// `Deleted`), matching the TS string enum exactly; these are also the stored DB
+/// words (the column DEFAULT is unused — inserts always bind explicitly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum WorkspaceStatus {
     #[default]
     Active,
+    Inactive,
     Archived,
     Deleted,
 }
@@ -112,35 +115,142 @@ pub struct Workspace {
     pub id: WorkspaceId,
     pub title: String,
     pub branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_commit_sha: Option<String>,
     pub status: WorkspaceStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_message: Option<String>,
     /// Derived, read-only; never persisted (§9.9).
     pub activity: WorkspaceActivity,
     pub attention: WorkspaceAttention,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
     pub skip_worktree: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_script: Option<String>,
     pub is_remote: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
     /// Persisted PR lifecycle status for the linked PR (§7.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_status: Option<PullRequestStatus>,
     /// Persisted snapshot of the linked PR (§7.6); refreshed in the background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_pull_request: Option<PullRequestInfo>,
     pub archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<String>,
+    /// Card-aggregate rollups (§9.1). Populated only on the `workspace.list` /
+    /// `workspace.get` emit paths (omitted elsewhere, e.g. `create`/`update`).
+    /// The iOS coverflow cards read `taskStats`, `agentSummary`, and
+    /// `diffSummary`; each is omitted (not `null`) when not computable so absent
+    /// simply yields a sparser card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_stats: Option<WorkspaceTaskStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_summary: Option<WorkspaceAgentSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_summary: Option<WorkspaceDiffSummary>,
+}
+
+/// `Workspace.taskStats` card aggregate (§9.1; TS `WorkspaceTaskStats`). Ports
+/// the canonical `computeTaskStats` (`task-stats.ts`): `total` excludes
+/// `cancelled`, `completed` counts `complete`, and `inProgress` counts
+/// `in_progress` + `review_required`. The optional renderer-only per-task
+/// `tasks` array is omitted (the server source-of-truth emits only the counts).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceTaskStats {
+    pub total: usize,
+    pub completed: usize,
+    pub in_progress: usize,
+}
+
+/// One entry of [`WorkspaceAgentSummary::agents`] (§5.5 card; TS
+/// `WorkspaceAgentInfo`). The live iOS `WorkspaceStore.parseWorkspace` decodes
+/// `id`/`name`/`status`/`isStreaming`/`isResponding` as non-optional and
+/// `specialist`/`lastActivity` as optional. `status` carries the same wire
+/// strings as `agent.list`; `isStreaming`/`isResponding` are always `false`
+/// (the headless backend has no live stream state — `status` carries liveness,
+/// matching the `AgentLite` Wave 1a decision).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceAgentInfo {
+    pub id: AgentId,
+    pub name: String,
+    pub status: AgentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specialist: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<String>,
+    pub is_streaming: bool,
+    pub is_responding: bool,
+}
+
+/// `Workspace.agentSummary` card aggregate. The iOS coverflow reads the richer
+/// `{ count, agents }` object (the live `WorkspaceStore.parseWorkspace`
+/// consumer); `agentIds` is additionally emitted alongside it for forward-compat
+/// with the TS `WorkspaceAgentIdSummary { agentIds }` (a future
+/// desktop-on-intentd reads `agentSummary?.agentIds ?? []`). `agentIds` lists
+/// the same agents used to build `agents` in the same order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceAgentSummary {
+    pub count: usize,
+    pub agents: Vec<WorkspaceAgentInfo>,
+    pub agent_ids: Vec<AgentId>,
+}
+
+/// One entry of [`WorkspaceDiffSummary::files`] (TS `WorkspaceDiffSummaryFile`).
+/// The on-demand workspace card summary emits an empty `files` array (per-file
+/// detail is fetched via the dedicated diff endpoints), but the type matches the
+/// TS wire shape for completeness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDiffSummaryFile {
+    pub path: String,
+    /// `create` | `modify` | `delete` | `rename` (TS `DiffSummaryFileAction`).
+    pub action: String,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+/// `Workspace.diffSummary` card aggregate (§9.1; TS `WorkspaceDiffSummary`).
+/// Ports the on-demand `computeWorkspaceDiffSummary` (`workspace-summaries.ts`):
+/// `totalFiles` counts changed-vs-`HEAD` (staged+unstaged) plus untracked files;
+/// `totalAdditions`/`totalDeletions` sum line stats over the tracked changes.
+/// iOS reads `totalFiles`; `files` mirrors the on-demand source (empty array).
+/// Omitted from a workspace when there are no changes (or no git worktree).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDiffSummary {
+    pub schema_version: u32,
+    pub updated_at: String,
+    pub total_files: usize,
+    pub total_additions: usize,
+    pub total_deletions: usize,
+    pub files: Vec<WorkspaceDiffSummaryFile>,
 }
 
 /// Wire input for `workspace.create` (PROTOCOL §5.1). All fields are optional;
@@ -1027,6 +1137,11 @@ pub struct AgentSession {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// Specialist id this agent was created with (`agent.create`'s `specialistId`),
+    /// surfaced as `metadata.specialist` in the `AgentLite` projection. `None` for
+    /// plain (non-specialist) agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specialist: Option<String>,
     pub status: AgentStatus,
     #[serde(default)]
     pub is_active: bool,
@@ -1038,11 +1153,30 @@ pub struct AgentSession {
     pub updated_at: String,
 }
 
+/// Nested `metadata` object on [`AgentLite`] (PROTOCOL §5.5). Mirrors the subset
+/// of the TS `AgentMetadata` the iOS `AgentSession.parseAgent` reads:
+/// `isBackground`, `specialist`, `createdByAgentId` (the parent/spawning agent),
+/// and `taskNoteId`. `isBackground` is always emitted (iOS reads it with a
+/// `false` default); the rest are omitted when absent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMetadata {
+    pub is_background: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specialist: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_note_id: Option<NoteId>,
+}
+
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
 /// the TS `AgentLite`: the full [`AgentSession`] with `messages` and
 /// `systemPrompt` stripped (clients fetch the transcript via
-/// `agent.getConversation`), plus a derived `messageCount` and the
-/// `lastAgentResponse` / `digest` computed from the last assistant message.
+/// `agent.getConversation`), plus a derived `messageCount`, the
+/// `lastAgentResponse` / `digest` / `lastUserMessage` computed from the
+/// transcript, a nested `metadata` object, and the runtime activity flags the
+/// iOS coverflow reads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentLite {
@@ -1064,15 +1198,31 @@ pub struct AgentLite {
     pub status: AgentStatus,
     #[serde(default)]
     pub is_active: bool,
+    /// Runtime activity flags (iOS `isStreaming`/`isProcessing`/`isResponding`).
+    /// The headless backend has no live stream state in this projection, so all
+    /// three are `false`; `status` (+ `isActive`) carry the liveness signal.
+    #[serde(default)]
+    pub is_streaming: bool,
+    #[serde(default)]
+    pub is_processing: bool,
+    #[serde(default)]
+    pub is_responding: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<SessionStats>,
     pub created_at: String,
     pub updated_at: String,
+    /// Most-recent activity timestamp; derived from `updated_at` (iOS falls back
+    /// to this after `updatedAt`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<String>,
     pub message_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_agent_response: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_user_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+    pub metadata: AgentMetadata,
 }
 
 impl AgentLite {
@@ -1082,8 +1232,15 @@ impl AgentLite {
         session: AgentSession,
         message_count: u64,
         last_agent_response: Option<String>,
+        last_user_message: Option<String>,
         digest: Option<String>,
     ) -> Self {
+        let metadata = AgentMetadata {
+            is_background: false,
+            specialist: session.specialist,
+            created_by_agent_id: session.parent_agent_id.clone(),
+            task_note_id: None,
+        };
         Self {
             id: session.id,
             workspace_id: session.workspace_id,
@@ -1096,12 +1253,18 @@ impl AgentLite {
             provider: session.provider,
             status: session.status,
             is_active: session.is_active,
+            is_streaming: false,
+            is_processing: false,
+            is_responding: false,
             stats: session.stats,
+            last_activity: Some(session.updated_at.clone()),
             created_at: session.created_at,
             updated_at: session.updated_at,
             message_count,
             last_agent_response,
+            last_user_message,
             digest,
+            metadata,
         }
     }
 }
@@ -1648,6 +1811,218 @@ mod tests {
         }
     }
 
+    /// `WorkspaceStatus` serializes to the PascalCase TS `WorkspaceStatus` string
+    /// enum (`src/shared/types.ts`): `Active`/`Inactive`/`Archived`/`Deleted`.
+    #[test]
+    fn workspace_status_wire_forms_match_ts() {
+        for (variant, wire) in [
+            (WorkspaceStatus::Active, "\"Active\""),
+            (WorkspaceStatus::Inactive, "\"Inactive\""),
+            (WorkspaceStatus::Archived, "\"Archived\""),
+            (WorkspaceStatus::Deleted, "\"Deleted\""),
+        ] {
+            assert_eq!(serde_json::to_string(&variant).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<WorkspaceStatus>(wire).unwrap(),
+                variant
+            );
+        }
+    }
+
+    /// `Workspace` emits PascalCase `status` and omits absent optionals
+    /// (`skip_serializing_if`) so the iOS decoder sees the documented field set
+    /// without nulls.
+    #[test]
+    fn workspace_status_pascal_and_optionals_absent() {
+        let ts = "2026-01-01T00:00:00Z".to_string();
+        let ws = Workspace {
+            id: WorkspaceId::from("ws-1"),
+            title: "WS".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+        };
+        let v = serde_json::to_value(&ws).unwrap();
+        assert_eq!(v["status"], "Active");
+        // Absent optionals are omitted, not serialized as null.
+        for key in [
+            "statusMessage",
+            "baseRef",
+            "prNumber",
+            "prStatus",
+            "activePullRequest",
+            "repositoryOwner",
+            "lastActivity",
+            "archivedAt",
+        ] {
+            assert!(v.get(key).is_none(), "expected `{key}` to be omitted");
+        }
+        // Round-trips back with optionals defaulted to None.
+        let back: Workspace = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ws);
+    }
+
+    /// The card aggregates serialize with the exact nested field names + casing
+    /// the iOS `WorkspaceStore.parseWorkspace` reads (`taskStats.{total,
+    /// completed,inProgress}`, `agentSummary.{count,agents[]}` with
+    /// `WorkspaceAgentInfo`, `diffSummary.{totalFiles,...}`).
+    #[test]
+    fn workspace_card_aggregates_nested_wire_shape() {
+        let ts = "2026-01-01T00:00:00Z".to_string();
+        let agent = WorkspaceAgentInfo {
+            id: AgentId::from("agent-1"),
+            name: "Builder".to_string(),
+            status: AgentStatus::Active,
+            specialist: Some("implementor".to_string()),
+            last_activity: Some(ts.clone()),
+            is_streaming: false,
+            is_responding: false,
+        };
+        let summary = WorkspaceAgentSummary {
+            count: 1,
+            agents: vec![agent],
+            agent_ids: vec![AgentId::from("agent-1")],
+        };
+        let task_stats = WorkspaceTaskStats {
+            total: 3,
+            completed: 1,
+            in_progress: 1,
+        };
+        let diff = WorkspaceDiffSummary {
+            schema_version: 1,
+            updated_at: ts.clone(),
+            total_files: 2,
+            total_additions: 10,
+            total_deletions: 4,
+            files: vec![],
+        };
+        let v = serde_json::to_value(&task_stats).unwrap();
+        assert_eq!(v["total"], 3);
+        assert_eq!(v["completed"], 1);
+        assert_eq!(v["inProgress"], 1);
+
+        let v = serde_json::to_value(&summary).unwrap();
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["agents"][0]["id"], "agent-1");
+        assert_eq!(v["agents"][0]["name"], "Builder");
+        assert_eq!(v["agents"][0]["status"], "active");
+        assert_eq!(v["agents"][0]["specialist"], "implementor");
+        assert_eq!(v["agents"][0]["lastActivity"], ts);
+        assert_eq!(v["agents"][0]["isStreaming"], false);
+        assert_eq!(v["agents"][0]["isResponding"], false);
+        // `agentIds` is emitted alongside `agents` (forward-compat TS parity).
+        assert_eq!(v["agentIds"][0], "agent-1");
+        assert_eq!(v["agentIds"].as_array().unwrap().len(), 1);
+
+        let v = serde_json::to_value(&diff).unwrap();
+        assert_eq!(v["schemaVersion"], 1);
+        assert_eq!(v["totalFiles"], 2);
+        assert_eq!(v["totalAdditions"], 10);
+        assert_eq!(v["totalDeletions"], 4);
+        assert!(v["files"].is_array());
+    }
+
+    /// `WorkspaceDiffSummaryFile` matches the TS per-file wire shape.
+    #[test]
+    fn workspace_diff_summary_file_wire_shape() {
+        let f = WorkspaceDiffSummaryFile {
+            path: "src/main.rs".to_string(),
+            action: "modify".to_string(),
+            additions: 3,
+            deletions: 1,
+        };
+        let v = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["path"], "src/main.rs");
+        assert_eq!(v["action"], "modify");
+        assert_eq!(v["additions"], 3);
+        assert_eq!(v["deletions"], 1);
+    }
+
+    /// `WorkspaceAgentInfo` omits the optional `specialist`/`lastActivity` keys
+    /// when absent (not `null`), while the non-optional flags stay present.
+    #[test]
+    fn workspace_agent_info_optionals_absent() {
+        let agent = WorkspaceAgentInfo {
+            id: AgentId::from("agent-2"),
+            name: "Plain".to_string(),
+            status: AgentStatus::Pending,
+            specialist: None,
+            last_activity: None,
+            is_streaming: false,
+            is_responding: false,
+        };
+        let v = serde_json::to_value(&agent).unwrap();
+        assert!(v.get("specialist").is_none());
+        assert!(v.get("lastActivity").is_none());
+        assert_eq!(v["status"], "pending");
+        assert_eq!(v["isStreaming"], false);
+        assert_eq!(v["isResponding"], false);
+    }
+
+    /// `AgentLite` carries the nested `metadata` object (`isBackground`/
+    /// `specialist`/`createdByAgentId`/`taskNoteId`) and the activity flags the
+    /// iOS `AgentSession.parseAgent` reads.
+    #[test]
+    fn agent_lite_metadata_and_activity_wire_shape() {
+        let ts = "t1".to_string();
+        let session = AgentSession {
+            id: AgentId::from("agent-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            parent_agent_id: Some(AgentId::from("agent-parent")),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Builder".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: Some("implementor".to_string()),
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            created_at: "t0".to_string(),
+            updated_at: ts.clone(),
+        };
+        let lite = AgentLite::from_session(session, 0, None, Some("hi".to_string()), None);
+        let v = serde_json::to_value(&lite).unwrap();
+        assert_eq!(v["metadata"]["specialist"], "implementor");
+        assert_eq!(v["metadata"]["isBackground"], false);
+        assert_eq!(v["metadata"]["createdByAgentId"], "agent-parent");
+        assert_eq!(v["isStreaming"], false);
+        assert_eq!(v["isProcessing"], false);
+        assert_eq!(v["isResponding"], false);
+        assert_eq!(v["lastUserMessage"], "hi");
+        assert_eq!(v["lastActivity"], "t1");
+    }
+
     /// `AgentSession` serializes to the camelCase `agent-session.ts` wire shape:
     /// `backendSessionId`/`acpSessionId`/`nameExplicitlySet`/`isActive`/
     /// `systemPrompt`, with absent optionals omitted and a nested message log.
@@ -1664,6 +2039,7 @@ mod tests {
             model: Some("opus".to_string()),
             provider: Some("auggie".to_string()),
             system_prompt: None,
+            specialist: None,
             status: AgentStatus::Active,
             is_active: true,
             messages: vec![AgentMessage {

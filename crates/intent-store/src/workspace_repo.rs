@@ -218,5 +218,10 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         active_pull_request,
         archived: col::<i64>(row, "archived")? != 0,
         archived_at: col(row, "archived_at")?,
+        // Card aggregates are computed on the workspace.list/get emit path
+        // (intent-services), never persisted.
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
     })
 }
