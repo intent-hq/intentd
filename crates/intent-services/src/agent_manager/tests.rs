@@ -21,7 +21,7 @@ use tokio::time::timeout;
 use super::{
     compute_process_cap, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry,
 };
-use crate::events::EventBus;
+use crate::events::{EventBus, SubscriptionFilter};
 use crate::Services;
 
 struct TempDb {
@@ -144,12 +144,19 @@ async fn lifecycle_active_processes_are_not_reaped() {
 }
 
 async fn manager() -> (TempDb, AgentManager) {
+    let (tmp, mgr, _bus) = manager_with_bus().await;
+    (tmp, mgr)
+}
+
+/// Like [`manager`] but also returns the [`EventBus`] so a test can subscribe and
+/// assert which lifecycle events the manager publishes.
+async fn manager_with_bus() -> (TempDb, AgentManager, EventBus) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store).with_event_bus(bus.clone());
-    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
-    (tmp, AgentManager::new(services, sink, 8))
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    (tmp, AgentManager::new(services, sink, 8), bus)
 }
 
 /// A passive agent handle over an in-memory duplex connection (no child).
@@ -716,4 +723,43 @@ async fn build_turn_prompt_prepends_history_once_after_recreate() {
         .unwrap()
         .to_string();
     assert_eq!(plain_text, "next message");
+}
+
+/// The keep-alive interrupt path emits ONLY the terminal `agent:stream:end` and
+/// deliberately NOT `agent:idle`: an interrupted agent is about to resume, so
+/// waking parents on idle would be premature (mirrors the TS interrupt
+/// suppression in `emitAgentIdleEvent`).
+#[tokio::test]
+async fn interrupt_emits_terminal_stream_end_but_no_idle() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    // An `acpSessionId` is required for the keep-alive interrupt (otherwise
+    // `interrupt` falls back to the hard `stop` kill path).
+    mgr.services
+        .store
+        .set_acp_session_id(&id, "acp-int")
+        .await
+        .unwrap();
+    // Claim the in-flight slot so the interrupt exercises the busy turn path.
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    assert!(mgr.interrupt(&id).await, "interrupt finds the live agent");
+
+    // Drain the published events within a bounded window.
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"agent:stream:end"),
+        "interrupt emits the terminal stream:end (got {types:?})"
+    );
+    assert!(
+        !types.contains(&"agent:idle"),
+        "interrupt suppresses agent:idle (got {types:?})"
+    );
 }

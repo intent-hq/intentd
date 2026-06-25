@@ -15,7 +15,9 @@ use intent_acp::session::{
     self, ContentBlock, InitializeResponse, MappedUpdate, McpServer, StopReason,
 };
 use intent_acp::{Connection, IncomingNotification};
-use intent_core::events::{AGENT_STREAM_CHUNK, AGENT_STREAM_END, AGENT_TOOL_CALL};
+use intent_core::events::{
+    AGENT_FAILED, AGENT_IDLE, AGENT_STREAM_CHUNK, AGENT_STREAM_END, AGENT_TOOL_CALL,
+};
 use intent_core::{now_iso, ActorType, AgentId, Error, EventActor, Result, WorkspaceId};
 use intent_store::NewEvent;
 use serde_json::{json, Value};
@@ -54,6 +56,30 @@ impl Transcript {
     fn into_blocks(mut self) -> Vec<Value> {
         self.flush_text();
         self.blocks
+    }
+}
+
+/// Extract a `lastResponseSummary` for the `agent:idle` payload from the turn's
+/// assistant text blocks (mirrors the TS `emitAgentIdleEvent` `finalMessage`
+/// summary): join the text blocks and keep the trailing 500 characters — the
+/// tail is the meaningful completion, not the "I'll start by…" preamble.
+/// `None` when the turn produced no text.
+fn last_response_summary(blocks: &[Value]) -> Option<String> {
+    let text = blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() > 500 {
+        let tail: String = chars[chars.len() - 500..].iter().collect();
+        Some(format!("...{tail}"))
+    } else {
+        Some(text)
     }
 }
 
@@ -209,6 +235,7 @@ impl Services {
         }
         // Accumulate the assistant message (one per turn) into the append-only log.
         let blocks = transcript.into_blocks();
+        let last_response_summary = last_response_summary(&blocks);
         if !blocks.is_empty() {
             self.store
                 .append_agent_message(agent_id, "assistant", &Value::Array(blocks), &now_iso())
@@ -222,6 +249,37 @@ impl Services {
             json!({ "agentId": agent_id.0 }),
         )
         .await;
+        // Session-completion lifecycle signal, emitted AFTER the terminal
+        // stream:end (the auto-subscription wake keys off this). A normal
+        // turn-end goes idle (`agent:idle`); a turn error maps to `agent:failed`.
+        // The interrupt/resume path never reaches here — `interrupt()` aborts
+        // this worker before the turn resolves and emits only `stream:end` — so
+        // `agent:idle` is suppressed for interrupted agents (mirrors the TS
+        // `emitAgentIdleEvent` interrupt suppression).
+        match &result {
+            Ok(stop_reason) => {
+                let mut data = json!({
+                    "agentId": agent_id.0,
+                    "reason": "stream_complete",
+                    "finishReason": stop_reason,
+                    "status": "idle",
+                });
+                if let Some(summary) = last_response_summary {
+                    data["lastResponseSummary"] = Value::String(summary);
+                }
+                self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
+                    .await;
+            }
+            Err(e) => {
+                self.publish_agent_event(
+                    workspace_id,
+                    agent_id,
+                    AGENT_FAILED,
+                    json!({ "agentId": agent_id.0, "error": e.to_string() }),
+                )
+                .await;
+            }
+        }
         result.map_err(|e| Error::Internal(format!("session/prompt failed: {e}")))
     }
 
