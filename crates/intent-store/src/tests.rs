@@ -70,6 +70,9 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         active_pull_request: None,
         archived,
         archived_at: if archived { Some(now_iso()) } else { None },
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
     }
 }
 
@@ -81,11 +84,11 @@ async fn migration_status_reports_current_after_open() {
     assert!(status.is_current(), "fresh open must apply all migrations");
     assert_eq!(
         status.expected,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
     assert_eq!(
         status.applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
 }
 
@@ -724,6 +727,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         model: Some("opus".to_string()),
         provider: None,
         system_prompt: Some("be helpful".to_string()),
+        specialist: None,
         status: AgentStatus::Pending,
         is_active: false,
         messages: Vec::new(),
@@ -857,6 +861,61 @@ async fn agent_session_parent_agent_id_round_trips() {
             .expect("get")
             .parent_agent_id,
         None
+    );
+}
+
+#[tokio::test]
+async fn agent_session_specialist_round_trips() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+
+    // Default: no specialist persists as None.
+    let plain = AgentId::from("agent-cccccccc-cccc-cccc-cccc-cccccccccccc");
+    store
+        .insert_agent_session(&sample_agent_session(&plain, &ws))
+        .await
+        .expect("insert plain");
+    assert_eq!(
+        store
+            .get_agent_session(&plain)
+            .await
+            .expect("get")
+            .specialist,
+        None
+    );
+
+    // Inserted specialist round-trips on get and survives an update.
+    let spec_agent = AgentId::from("agent-dddddddd-dddd-dddd-dddd-dddddddddddd");
+    let mut session = sample_agent_session(&spec_agent, &ws);
+    session.specialist = Some("implementor".to_string());
+    store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert specialist");
+    assert_eq!(
+        store
+            .get_agent_session(&spec_agent)
+            .await
+            .expect("get")
+            .specialist,
+        Some("implementor".to_string())
+    );
+
+    let mut updated = store.get_agent_session(&spec_agent).await.expect("get");
+    updated.name = "Renamed".to_string();
+    store.update_agent_session(&updated).await.expect("update");
+    assert_eq!(
+        store
+            .get_agent_session(&spec_agent)
+            .await
+            .expect("get")
+            .specialist,
+        Some("implementor".to_string())
     );
 }
 

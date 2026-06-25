@@ -569,8 +569,9 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `agent.queueMessage`: explicitly enqueue a message; `{ success, queuedMessage }`
-    /// (PROTOCOL §5.5).
+    /// `agent.queueMessage`: explicitly enqueue a message; `{ success,
+    /// queuedMessage }` where `queuedMessage` is `{ id, content, queuedAt,
+    /// position, imageBlocks? }` (PROTOCOL §5.5).
     fn agent_queue_message(
         &self,
         agent_id: AgentId,
@@ -614,8 +615,8 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `agent.getQueue`: the agent's pending message queue; `{ queue: [...] }`
-    /// (PROTOCOL §5.5).
+    /// `agent.getQueue`: the agent's pending message queue; `{ success, queue:
+    /// [{ id, content, queuedAt, position, imageBlocks? }] }` (PROTOCOL §5.5).
     fn agent_get_queue(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = agent_id;
         Box::pin(async {

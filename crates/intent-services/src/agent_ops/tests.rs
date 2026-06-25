@@ -76,6 +76,9 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         active_pull_request: None,
         archived: false,
         archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
     }
 }
 
@@ -246,6 +249,7 @@ async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
             Some(name.to_string()),
             Some("auggie:sonnet4.5".into()),
             None,
+            None,
         )
         .await
         .expect("create");
@@ -266,6 +270,74 @@ async fn create_then_list_and_get_projects_agent_lite() {
     let got = svc.agent_get_op(id.clone()).await.expect("get");
     assert_eq!(got.id, id);
     assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
+}
+
+#[tokio::test]
+async fn agent_lite_carries_metadata_and_activity_fields() {
+    let (_t, svc, ws) = setup().await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Spec".into()),
+            None,
+            Some("implementor".into()),
+            None,
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let lite = svc.agent_get_op(id).await.expect("get");
+    let v = serde_json::to_value(&lite).unwrap();
+    // Nested metadata object (iOS `parseAgent` reads metadata.specialist /
+    // isBackground / createdByAgentId).
+    assert_eq!(v["metadata"]["specialist"], "implementor");
+    assert_eq!(v["metadata"]["isBackground"], false);
+    assert!(v["metadata"].get("createdByAgentId").is_none());
+    // Activity flags are present; the headless BE has no live stream so all false.
+    assert_eq!(v["isStreaming"], false);
+    assert_eq!(v["isProcessing"], false);
+    assert_eq!(v["isResponding"], false);
+    assert!(v["lastActivity"].is_string());
+}
+
+#[tokio::test]
+async fn agent_lite_metadata_created_by_agent_id_from_parent() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let lite = svc.agent_get_op(child).await.expect("get");
+    let v = serde_json::to_value(&lite).unwrap();
+    assert_eq!(v["metadata"]["createdByAgentId"], parent.0);
+    // No specialist supplied → omitted from metadata.
+    assert!(v["metadata"].get("specialist").is_none());
+}
+
+#[tokio::test]
+async fn agent_lite_derives_last_user_message() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Chatter").await;
+    let content = json!([{ "type": "text", "text": "please do the thing" }]);
+    svc.store()
+        .append_agent_message(&id, "user", &content, &now_iso())
+        .await
+        .expect("append");
+    let lite = svc.agent_get_op(id).await.expect("get");
+    assert_eq!(
+        lite.last_user_message.as_deref(),
+        Some("please do the thing")
+    );
 }
 
 #[tokio::test]
@@ -373,15 +445,26 @@ async fn queue_lifecycle_add_get_edit_remove() {
         .agent_queue_message_op(id.clone(), "hello".into(), None)
         .await
         .expect("queue");
+    assert_eq!(added["success"], true);
     let mid = added["queuedMessage"]["id"].as_str().unwrap().to_string();
+    // iOS-required wire shape: {id, content, queuedAt, position} (no createdAt/agentId).
+    assert_eq!(added["queuedMessage"]["position"], 0);
+    assert!(added["queuedMessage"]["queuedAt"].is_string());
+    assert!(added["queuedMessage"].get("createdAt").is_none());
+    assert!(added["queuedMessage"].get("agentId").is_none());
 
     let q = svc.agent_get_queue_op(id.clone()).await.expect("getQueue");
+    assert_eq!(q["success"], true);
     assert_eq!(q["queue"].as_array().unwrap().len(), 1);
     assert_eq!(q["queue"][0]["content"], "hello");
+    assert_eq!(q["queue"][0]["position"], 0);
+    assert!(q["queue"][0]["queuedAt"].is_string());
 
-    svc.agent_edit_queued_message_op(id.clone(), mid.clone(), "edited".into())
+    let edited = svc
+        .agent_edit_queued_message_op(id.clone(), mid.clone(), "edited".into())
         .await
         .expect("edit");
+    assert_eq!(edited["queuedMessage"]["position"], 0);
     let q = svc.agent_get_queue_op(id.clone()).await.expect("getQueue");
     assert_eq!(q["queue"][0]["content"], "edited");
 
@@ -509,7 +592,13 @@ async fn report_to_parent_delivers_for_delegated_caller() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let created = svc
-        .agent_create_op(ws.clone(), Some("Child".into()), None, Some(parent.clone()))
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+        )
         .await
         .expect("create delegated child");
     let child = AgentId::from(created["agent"]["id"].as_str().unwrap());

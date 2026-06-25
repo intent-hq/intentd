@@ -64,6 +64,9 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         active_pull_request: None,
         archived: false,
         archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
     }
 }
 
@@ -99,6 +102,117 @@ async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
         .expect("note");
     let services = Services::new(store);
     (tmp, services, ws, id)
+}
+
+/// `workspace.list` / `workspace.get` populate the iOS card aggregates
+/// (`taskStats` / `agentSummary` / `diffSummary`) computed from the workspace's
+/// real notes, agents, and git state, with the nested wire shape iOS decodes.
+#[tokio::test]
+async fn workspace_list_and_get_populate_card_aggregates() {
+    use intent_core::{AgentId, AgentSession, AgentStatus, TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+    // Spec note links four task notes (the cancelled one is excluded from
+    // `total`); a spec-linked filter is exercised since the spec body has links.
+    let spec = note(
+        &ws,
+        "spec",
+        "- [A](intent://local/task/task-a)\n- [B](intent://local/task/task-b)\n\
+         - [C](intent://local/task/task-c)\n- [D](intent://local/task/task-d)",
+    );
+    store.insert_note(&spec).await.expect("spec");
+
+    let mk_task = |id: &str, status: TaskStatus| {
+        let mut tn = note(&ws, id, "body");
+        tn.parent_id = Some(NoteId::from("spec"));
+        tn.task = Some(TaskMetadata {
+            status,
+            ..Default::default()
+        });
+        tn
+    };
+    store
+        .insert_note(&mk_task("task-a", TaskStatus::Complete))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("task-b", TaskStatus::InProgress))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("task-c", TaskStatus::ReviewRequired))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("task-d", TaskStatus::Cancelled))
+        .await
+        .unwrap();
+
+    let mk_agent = |id: &str, name: &str, specialist: Option<&str>| AgentSession {
+        id: AgentId::from(id),
+        workspace_id: ws.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: name.to_string(),
+        name_explicitly_set: true,
+        model: None,
+        provider: None,
+        system_prompt: None,
+        specialist: specialist.map(str::to_string),
+        status: AgentStatus::Active,
+        is_active: true,
+        messages: vec![],
+        stats: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store
+        .insert_agent_session(&mk_agent("agent-1", "Builder", Some("implementor")))
+        .await
+        .unwrap();
+    store
+        .insert_agent_session(&mk_agent("agent-2", "Verifier", None))
+        .await
+        .unwrap();
+
+    let svc = Services::new(store);
+
+    // workspace.get
+    let got = svc.get_workspace(ws.clone()).await.expect("get");
+    let stats = got.task_stats.expect("task_stats present");
+    assert_eq!(stats.total, 3); // cancelled excluded
+    assert_eq!(stats.completed, 1);
+    assert_eq!(stats.in_progress, 2); // in_progress + review_required
+    let summary = got.agent_summary.expect("agent_summary present");
+    assert_eq!(summary.count, 2);
+    assert!(summary.agents.iter().any(|a| a.name == "Builder"
+        && a.specialist.as_deref() == Some("implementor")
+        && !a.is_streaming
+        && !a.is_responding));
+    // `agentIds` mirrors the agents used to build `agents` (forward-compat).
+    let summary_ids: Vec<_> = summary.agent_ids.iter().map(|i| i.0.clone()).collect();
+    let agent_ids: Vec<_> = summary.agents.iter().map(|a| a.id.0.clone()).collect();
+    assert_eq!(summary_ids, agent_ids);
+    assert!(summary_ids.contains(&"agent-1".to_string()));
+    // No git worktree → diffSummary omitted.
+    assert!(got.diff_summary.is_none());
+
+    // workspace.list carries the same aggregates; assert the nested wire shape.
+    let list = svc.list_workspaces(false).await.expect("list");
+    let v = serde_json::to_value(&list[0]).unwrap();
+    assert_eq!(v["taskStats"]["total"], 3);
+    assert_eq!(v["taskStats"]["completed"], 1);
+    assert_eq!(v["taskStats"]["inProgress"], 2);
+    assert_eq!(v["agentSummary"]["count"], 2);
+    assert_eq!(v["agentSummary"]["agents"][0]["id"], "agent-1");
+    assert_eq!(v["agentSummary"]["agentIds"][0], "agent-1");
+    assert_eq!(v["agentSummary"]["agentIds"].as_array().unwrap().len(), 2);
+    assert!(v.get("diffSummary").is_none());
 }
 
 #[tokio::test]
@@ -2797,6 +2911,7 @@ mod search_adapters {
             model: None,
             provider: None,
             system_prompt: None,
+            specialist: None,
             status: AgentStatus::default(),
             is_active: false,
             messages: vec![],

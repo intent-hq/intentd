@@ -1347,12 +1347,11 @@ async fn dispatch(
             }
         }
         "specialist.list" => {
-            // Global (no workspaceId); optional workspacePath adds the project
-            // tier on top of user > bundled (PROTOCOL §5.11).
-            let workspace_path = opt_str(params, "workspacePath");
-            api.specialist_list(workspace_path)
-                .await
-                .map_err(domain_to_rpc)
+            // Matches the TS WSS `specialist.list` signature: no params; merges
+            // user > bundled tiers only (the project tier is not part of the live
+            // wire contract iOS calls). `specialist.get` still accepts an optional
+            // `workspacePath` for the project tier (PROTOCOL §5.11).
+            api.specialist_list(None).await.map_err(domain_to_rpc)
         }
         "specialist.get" => {
             let id = require_str_param(params, "id")?;

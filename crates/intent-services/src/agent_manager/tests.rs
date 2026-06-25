@@ -416,6 +416,9 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         active_pull_request: None,
         archived: false,
         archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
     };
     store.insert_workspace(&ws).await.unwrap();
 
@@ -581,6 +584,9 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         active_pull_request: None,
         archived: false,
         archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
     };
     let session = AgentSession {
         id: id.clone(),
@@ -593,6 +599,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         model: None,
         provider: None,
         system_prompt: None,
+        specialist: None,
         status: AgentStatus::Pending,
         is_active: true,
         messages: Vec::new(),

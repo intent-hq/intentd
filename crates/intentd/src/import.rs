@@ -160,7 +160,7 @@ async fn import_workspace(
     fill_defaults(
         &mut obj,
         &[
-            ("status", json!("active")),
+            ("status", json!("Active")),
             ("activity", json!("idle")),
             ("attention", json!("none")),
             ("tags", json!([])),
