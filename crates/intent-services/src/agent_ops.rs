@@ -381,11 +381,37 @@ impl Services {
 
     /// `agent.delete`: idempotent session delete (PROTOCOL §5.5).
     pub(crate) async fn agent_delete_op(&self, agent_id: AgentId) -> Result<Value> {
+        // Capture the workspace before deleting so the post-delete agent:deleted
+        // emit can be workspace-scoped. If the session is already gone, skip the
+        // emit gracefully rather than failing the idempotent delete.
+        let workspace_id = self
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .ok()
+            .map(|s| s.workspace_id);
         self.store.delete_agent_session(&agent_id).await?;
         self.agent_queues
             .lock()
             .expect("agent queue registry poisoned")
             .remove(&agent_id);
+        if let Some(workspace_id) = workspace_id {
+            crate::publish_event(
+                &self.event_bus,
+                intent_store::NewEvent {
+                    workspace_id,
+                    timestamp: now_iso(),
+                    event_type: intent_core::events::AGENT_DELETED.to_string(),
+                    actor: crate::system_actor(),
+                    session_id: Some(agent_id.0.clone()),
+                    correlation_id: None,
+                    parent_event_id: None,
+                    metadata: None,
+                    data: json!({ "agentId": agent_id.0 }),
+                },
+            )
+            .await;
+        }
         Ok(json!({ "success": true }))
     }
 

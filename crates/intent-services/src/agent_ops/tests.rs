@@ -10,8 +10,16 @@ use intent_core::{
     now_iso, AgentDelegateInput, AgentId, Error, Workspace, WorkspaceActivity, WorkspaceApi,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
+use std::time::Duration;
+
 use intent_store::Store;
 use serde_json::json;
+use tokio::time::timeout;
+
+use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE};
+use intent_core::{ActorType, Event, EventActor};
+
+use crate::{EventBus, SubscriptionFilter};
 
 use crate::agent_ops::{parse_model_list_output, static_models};
 use crate::Services;
@@ -78,6 +86,157 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let services = Services::new(store);
     (tmp, services, ws)
+}
+
+async fn setup_with_bus() -> (TempDb, Services, WorkspaceId, EventBus) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let services = Services::new(store);
+    let bus = EventBus::new(services.store().clone());
+    let services = services.with_event_bus(bus.clone());
+    (tmp, services, ws, bus)
+}
+
+fn completion_event(
+    workspace_id: &WorkspaceId,
+    event_type: &str,
+    child_id: &AgentId,
+    data: serde_json::Value,
+) -> Event {
+    Event {
+        id: uuid::Uuid::new_v4().to_string(),
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: event_type.to_string(),
+        actor: EventActor {
+            actor_type: ActorType::Agent,
+            id: Some(child_id.0.clone()),
+            ..Default::default()
+        },
+        session_id: Some(child_id.0.clone()),
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    }
+}
+
+#[tokio::test]
+async fn delete_emits_agent_deleted_scoped_to_workspace() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Doomed").await;
+
+    // Subscribe before the delete; no batching -> immediate single-event batch.
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_DELETED.to_string()],
+        ..Default::default()
+    });
+
+    let r = svc.agent_delete_op(id.clone()).await.expect("delete");
+    assert_eq!(r["success"], json!(true));
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].event_type, AGENT_DELETED);
+    assert_eq!(batch[0].workspace_id, ws);
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
+}
+
+#[tokio::test]
+async fn delete_skips_emit_when_session_already_gone() {
+    let (_t, svc, _ws, bus) = setup_with_bus().await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_DELETED.to_string()],
+        ..Default::default()
+    });
+
+    let missing = AgentId::from("agent-00000000-0000-0000-0000-00000missing0");
+    let r = svc
+        .agent_delete_op(missing)
+        .await
+        .expect("idempotent delete");
+    assert_eq!(r["success"], json!(true));
+
+    // Nothing was emitted: the subscription stays empty within the window.
+    let res = timeout(Duration::from_millis(300), sub.recv()).await;
+    assert!(
+        res.is_err(),
+        "expected no agent:deleted emit for a missing session"
+    );
+}
+
+#[tokio::test]
+async fn completion_delivery_wakes_oneshot_parent_and_removes_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let sub_id = svc.register_completion_watch(
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        true,
+        None,
+    );
+
+    let event = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "shipped it" }),
+    );
+    svc.handle_completion_event(&event).await;
+
+    // The parent received exactly one wake message via agent_send_message_op.
+    let parent_session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(parent_session.messages.len(), 1);
+
+    // The oneShot watch was removed after delivery.
+    assert!(svc.find_watches_for_child(&ws, &child).is_empty());
+    assert!(!svc.remove_watch(&ws, &sub_id));
+}
+
+#[tokio::test]
+async fn completion_delivery_leaves_group_watch_for_as4() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        true,
+        Some("group-1".into()),
+    );
+
+    let event = completion_event(
+        &ws,
+        AGENT_FAILED,
+        &child,
+        json!({ "agentId": child.0, "error": "boom" }),
+    );
+    svc.handle_completion_event(&event).await;
+
+    // No wake delivered and the group watch is left in place for AS-4.
+    let parent_session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert!(parent_session.messages.is_empty());
+    assert_eq!(svc.find_watches_for_child(&ws, &child).len(), 1);
 }
 
 async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
