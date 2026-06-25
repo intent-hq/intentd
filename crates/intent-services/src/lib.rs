@@ -19,18 +19,20 @@ use intent_core::events::{
 };
 use intent_core::{
     iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId, AgentLite,
-    AuthorType, BoxFuture, ClientId, Comment, CommentAddResult, CommentAnchor, CommentAnchorType,
-    CommentDeleteResult, CommentGetThreadResult, CommentListResult, CommentLocation,
-    CommentRespondResult, CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType,
-    CommentWire, ContentType, Draft, Event, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, FileActivity, Note, NoteAddInput, NoteAddResult, NoteCreate,
-    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteId, NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult,
-    NoteVisibility, ReadAssetResult, ScriptCreateParams, TaskAssignAgentResult,
-    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult,
-    TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult,
-    TaskUpdateResult, TaskUpdateStatusResult, Workspace, WorkspaceActivity, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    AgentSession, AuthorType, BoxFuture, ClientId, Comment, CommentAddResult, CommentAnchor,
+    CommentAnchorType, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
+    CommentLocation, CommentRespondResult, CommentRespondThread, CommentStatus,
+    CommentThreadSummary, CommentType, CommentWire, ContentType, Draft, Event, EventQueryParams,
+    EventSubscribeResult, EventUnsubscribeResult, FileActivity, Note, NoteAddInput, NoteAddResult,
+    NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
+    NoteEditResult, NoteId, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, ScriptCreateParams,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, Workspace,
+    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    WorkspaceCreate, WorkspaceDiffSummary, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
+    WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -239,6 +241,21 @@ impl Services {
             Some(count) if *count > 0 => WorkspaceActivity::AgentRunning,
             _ => WorkspaceActivity::Idle,
         }
+    }
+
+    /// Populate a workspace's card aggregates (`taskStats`/`agentSummary`/
+    /// `diffSummary`) for the `workspace.list` / `workspace.get` emit path (§9.1).
+    /// Each is computed from live state (notes / agents / git worktree) and
+    /// omitted when not computable; a read failure degrades to an absent
+    /// aggregate rather than failing the whole call.
+    pub(crate) async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
+        if let Ok(notes) = self.store.list_notes(&ws.id).await {
+            ws.task_stats = Some(compute_task_stats(&notes));
+        }
+        if let Ok(sessions) = self.store.list_agent_sessions(&ws.id).await {
+            ws.agent_summary = Some(build_agent_summary(&sessions));
+        }
+        ws.diff_summary = compute_diff_summary(ws);
     }
 
     /// Record an agent session entering flight for `workspace_id`. On the
@@ -542,6 +559,126 @@ async fn fetch_note_peer(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Extract the spec-linked task-note ids from a spec note's markdown body
+/// (`[text](intent://local/task/{id})`), mirroring the TS `extractSpecTaskIds`
+/// (`TASK_LINK_REGEX_FLEXIBLE`).
+fn extract_spec_task_ids(content: &str) -> HashSet<String> {
+    const MARKER: &str = "(intent://local/task/";
+    let mut ids = HashSet::new();
+    let mut rest = content;
+    while let Some(pos) = rest.find(MARKER) {
+        let after = &rest[pos + MARKER.len()..];
+        match after.find(')') {
+            Some(end) => {
+                let id = &after[..end];
+                if !id.is_empty() {
+                    ids.insert(id.to_string());
+                }
+                rest = &after[end + 1..];
+            }
+            None => break,
+        }
+    }
+    ids
+}
+
+/// Compute a workspace's `taskStats` card aggregate from its notes, porting the
+/// canonical `computeTaskStats` (`task-stats.ts`) over the spec-linked direct
+/// child task notes: `cancelled` is excluded from `total`, `complete` counts as
+/// `completed`, and `in_progress`/`review_required` count as `inProgress`. When
+/// the spec body has no task links, all direct children with task metadata count
+/// (TS backward-compat fallback).
+fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
+    let linked = notes
+        .iter()
+        .find(|n| n.id.as_str() == "spec")
+        .map(|n| extract_spec_task_ids(&n.content))
+        .unwrap_or_default();
+    let has_links = !linked.is_empty();
+
+    let mut seen = HashSet::new();
+    let mut stats = WorkspaceTaskStats::default();
+    for note in notes {
+        let Some(task) = &note.task else { continue };
+        let id = note.id.as_str();
+        if id == "spec" {
+            continue;
+        }
+        if note.parent_id.as_ref().map(|p| p.as_str()) != Some("spec") {
+            continue;
+        }
+        if has_links && !linked.contains(id) {
+            continue;
+        }
+        if !seen.insert(id.to_string()) {
+            continue;
+        }
+        match task.status {
+            TaskStatus::Cancelled => continue,
+            TaskStatus::Complete => {
+                stats.total += 1;
+                stats.completed += 1;
+            }
+            TaskStatus::InProgress | TaskStatus::ReviewRequired => {
+                stats.total += 1;
+                stats.in_progress += 1;
+            }
+            _ => stats.total += 1,
+        }
+    }
+    stats
+}
+
+/// Project a workspace's agent sessions into the `agentSummary` card aggregate
+/// (`{ count, agents, agentIds }`). `isStreaming`/`isResponding` are always
+/// `false` (the headless backend has no live stream state; `status` carries
+/// liveness). `agentIds` lists the same agents (forward-compat TS parity).
+fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
+    let agents: Vec<WorkspaceAgentInfo> = sessions
+        .iter()
+        .map(|s| WorkspaceAgentInfo {
+            id: s.id.clone(),
+            name: s.name.clone(),
+            status: s.status,
+            specialist: s.specialist.clone(),
+            last_activity: Some(s.updated_at.clone()),
+            is_streaming: false,
+            is_responding: false,
+        })
+        .collect();
+    let agent_ids: Vec<_> = sessions.iter().map(|s| s.id.clone()).collect();
+    WorkspaceAgentSummary {
+        count: agents.len(),
+        agents,
+        agent_ids,
+    }
+}
+
+/// Compute a workspace's `diffSummary` card aggregate from its git worktree,
+/// porting the on-demand `computeWorkspaceDiffSummary`. Returns `None` when the
+/// workspace has no worktree, the worktree is not a git repo, or there are no
+/// changes (matching the TS `undefined` fallback).
+fn compute_diff_summary(ws: &Workspace) -> Option<WorkspaceDiffSummary> {
+    let worktree = ws.worktree_path.as_deref().filter(|p| !p.is_empty())?;
+    let path = Path::new(worktree);
+    if !path.join(".git").exists() {
+        return None;
+    }
+    let (total_files, total_additions, total_deletions) =
+        intent_git::diff::head_diff_rollup(path).ok()?;
+    if total_files == 0 {
+        return None;
+    }
+    Some(WorkspaceDiffSummary {
+        schema_version: 1,
+        updated_at: now_iso(),
+        total_files,
+        total_additions,
+        total_deletions,
+        files: Vec::new(),
+    })
 }
 
 /// The seven valid task-note statuses, in the order the TS validator lists them.
@@ -1776,9 +1913,11 @@ impl WorkspaceApi for Services {
         let this = self.clone();
         Box::pin(async move {
             let mut list = store.list_workspaces(include_archived).await?;
-            // `activity` is derived from live agent state, never persisted (§9.9).
+            // `activity` is derived from live agent state, never persisted (§9.9);
+            // the card aggregates are computed fresh on the emit path (§9.1).
             for ws in &mut list {
                 ws.activity = this.workspace_activity(&ws.id);
+                this.enrich_workspace_aggregates(ws).await;
             }
             Ok(list)
         })
@@ -1789,8 +1928,10 @@ impl WorkspaceApi for Services {
         let this = self.clone();
         Box::pin(async move {
             let mut ws = store.get_workspace(&id).await?;
-            // `activity` is derived from live agent state, never persisted (§9.9).
+            // `activity` is derived from live agent state, never persisted (§9.9);
+            // the card aggregates are computed fresh on the emit path (§9.1).
             ws.activity = this.workspace_activity(&id);
+            this.enrich_workspace_aggregates(&mut ws).await;
             Ok(ws)
         })
     }
@@ -1833,6 +1974,10 @@ impl WorkspaceApi for Services {
                 active_pull_request: None,
                 archived: false,
                 archived_at: None,
+                // Card aggregates are computed on the list/get emit path only.
+                task_stats: None,
+                agent_summary: None,
+                diff_summary: None,
             };
             store.insert_workspace(&ws).await?;
             // Register the repo in the persistent registry so it survives
@@ -3712,11 +3857,11 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         name: Option<String>,
         model: Option<String>,
-        _specialist_id: Option<String>,
+        specialist_id: Option<String>,
         parent_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_create_op(workspace_id, name, model, parent_agent_id)
+            self.agent_create_op(workspace_id, name, model, specialist_id, parent_agent_id)
                 .await
         })
     }
