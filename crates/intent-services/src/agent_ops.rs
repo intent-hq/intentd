@@ -9,10 +9,17 @@
 
 use std::collections::HashSet;
 
+use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE};
 use intent_core::{
     now_iso, AgentId, AgentLite, AgentMessage, AgentSession, AgentStatus, Error, NoteId, Result,
     WorkspaceApi, WorkspaceId,
 };
+
+use crate::agent_subscriptions::CompletionWatch;
+
+/// `waitMode` value that defers the completion watch into an `after_all`
+/// delegation group (AS-4) rather than registering a standalone oneShot here.
+const WAIT_MODE_AFTER_ALL: &str = "after_all";
 use intent_providers::models::PROVIDER_MODEL_TIERS;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -395,11 +402,37 @@ impl Services {
 
     /// `agent.delete`: idempotent session delete (PROTOCOL §5.5).
     pub(crate) async fn agent_delete_op(&self, agent_id: AgentId) -> Result<Value> {
+        // Capture the workspace before deleting so the post-delete agent:deleted
+        // emit can be workspace-scoped. If the session is already gone, skip the
+        // emit gracefully rather than failing the idempotent delete.
+        let workspace_id = self
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .ok()
+            .map(|s| s.workspace_id);
         self.store.delete_agent_session(&agent_id).await?;
         self.agent_queues
             .lock()
             .expect("agent queue registry poisoned")
             .remove(&agent_id);
+        if let Some(workspace_id) = workspace_id {
+            crate::publish_event(
+                &self.event_bus,
+                intent_store::NewEvent {
+                    workspace_id,
+                    timestamp: now_iso(),
+                    event_type: intent_core::events::AGENT_DELETED.to_string(),
+                    actor: crate::system_actor(),
+                    session_id: Some(agent_id.0.clone()),
+                    correlation_id: None,
+                    parent_event_id: None,
+                    metadata: None,
+                    data: json!({ "agentId": agent_id.0 }),
+                },
+            )
+            .await;
+        }
         Ok(json!({ "success": true }))
     }
 
@@ -589,13 +622,14 @@ impl Services {
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
+        let wait_mode = input.wait_mode.clone();
         let created = self
             .agent_create_op(
                 workspace_id.clone(),
                 None,
                 input.model,
                 input.specialist,
-                parent_agent_id,
+                parent_agent_id.clone(),
             )
             .await?;
         let agent_id = created["agent"]["id"]
@@ -608,10 +642,149 @@ impl Services {
             .to_string();
         if let Some(task_note_id) = input.task_note_id.clone().or(input.note_id.clone()) {
             let _ = self
-                .assign_agent(workspace_id, task_note_id, agent_id.clone())
+                .assign_agent(workspace_id.clone(), task_note_id, agent_id.clone())
                 .await;
         }
+        // Auto-subscribe the delegating caller to the child's completion (AS-2).
+        // Only the MCP front door carries a caller (`parent_agent_id = Some`); the
+        // RPC front door (`None`) registers nothing. `after_all` defers to the
+        // delegation-group fan-in (AS-4); `immediate`/default registers a oneShot.
+        if let Some(parent) = parent_agent_id {
+            // Best-effort guard: skip if the parent agent is already deleted
+            // (TS `selectIsAgentDeleted`).
+            let parent_session = self.store.get_agent_session(&parent).await.ok();
+            let parent_deleted = parent_session
+                .as_ref()
+                .map(|s| s.status == AgentStatus::Deleted)
+                .unwrap_or(false);
+            if !parent_deleted {
+                let parent_name = parent_session.map(|s| s.name).unwrap_or_default();
+                let child = AgentId::from(agent_id.as_str());
+                if wait_mode.as_deref() == Some(WAIT_MODE_AFTER_ALL) {
+                    // Enroll the child in the parent's after_all delegation group
+                    // and register a group watch (group_id = Some, not oneShot) so
+                    // the delivery worker routes its completion into the group
+                    // fan-in instead of waking the parent immediately (AS-4).
+                    let gid = self.get_or_create_delegation_group(&workspace_id, &parent);
+                    self.enroll_child_in_group(&workspace_id, &gid, &child);
+                    self.register_completion_watch(
+                        &workspace_id,
+                        parent,
+                        parent_name,
+                        child,
+                        false,
+                        Some(gid),
+                    );
+                } else {
+                    self.register_completion_watch(
+                        &workspace_id,
+                        parent,
+                        parent_name,
+                        child,
+                        true,
+                        None,
+                    );
+                }
+            }
+        }
         Ok(json!({ "ok": true, "agentId": agent_id, "name": name }))
+    }
+
+    /// `agent.getSubscriptions`: live completion-watch payload for `agent_id`
+    /// from the AS-2/AS-4 registry, in the TS camelCase wire shape with the
+    /// `subscriptions`, `delegationGroups`, and `agentStatuses` fields.
+    /// `awaitMode` maps the registry's `after_all` to TS's `"all"`;
+    /// `agentStatuses` is best-effort, keyed off the persisted `AgentStatus` of
+    /// the agents present in the payload.
+    pub(crate) async fn agent_get_subscriptions_op(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> Result<Value> {
+        let watches = self.list_watches_for_parent(&workspace_id, &agent_id);
+        let groups = self.list_groups_for_parent(&workspace_id, &agent_id);
+
+        let event_types = [AGENT_IDLE, AGENT_FAILED, AGENT_DELETED];
+
+        let mut present: Vec<AgentId> = vec![agent_id.clone()];
+        let subscriptions: Vec<Value> = watches
+            .iter()
+            .map(|w| {
+                if !present.contains(&w.child_agent_id) {
+                    present.push(w.child_agent_id.clone());
+                }
+                let delegation_group = w.group_id.as_ref().and_then(|gid| {
+                    groups.iter().find(|g| &g.group_id == gid).map(|g| {
+                        json!({
+                            "groupId": g.group_id,
+                            "awaitMode": "all",
+                            "expectedAgentIds": g.expected_agent_ids,
+                        })
+                    })
+                });
+                let description = describe_subscription(w, &event_types, delegation_group.as_ref());
+                json!({
+                    "id": w.id,
+                    "agentId": w.parent_agent_id,
+                    "agentName": w.parent_agent_name,
+                    "workspaceId": workspace_id,
+                    "createdAt": w.created_at,
+                    "oneShot": w.one_shot,
+                    "actorIds": [w.child_agent_id],
+                    "eventTypes": event_types,
+                    "delegationGroup": delegation_group,
+                    "description": description,
+                })
+            })
+            .collect();
+
+        let delegation_groups: Vec<Value> = groups
+            .iter()
+            .map(|g| {
+                for id in &g.expected_agent_ids {
+                    if !present.contains(id) {
+                        present.push(id.clone());
+                    }
+                }
+                json!({
+                    "groupId": g.group_id,
+                    "parentAgentId": g.parent_agent_id,
+                    "awaitMode": "all",
+                    "expectedAgentIds": g.expected_agent_ids,
+                    "completedAgentIds": g.completed_agent_ids,
+                    "deletedAgentIds": g.deleted_agent_ids,
+                    "delivered": g.delivered,
+                })
+            })
+            .collect();
+
+        let mut agent_statuses = serde_json::Map::new();
+        for id in &present {
+            if let Ok(session) = self.store.get_agent_session(id).await {
+                if let Some(word) = agent_status_wire(session.status) {
+                    agent_statuses.insert(id.0.clone(), json!(word));
+                }
+            }
+        }
+
+        Ok(json!({
+            "subscriptions": subscriptions,
+            "delegationGroups": delegation_groups,
+            "agentStatuses": Value::Object(agent_statuses),
+        }))
+    }
+
+    /// `agent.cancelSubscriptions`: remove every completion watch registered by
+    /// `agent_id` and drop any delegation groups it parents. Idempotent — always
+    /// returns `{ "success": true }` (TS shape).
+    pub(crate) async fn agent_cancel_subscriptions_op(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> Result<Value> {
+        self.remove_all_for_parent(&workspace_id, &agent_id);
+        self.remove_groups_for_parent(&workspace_id, &agent_id);
+        Ok(json!({ "success": true }))
     }
 
     /// `agent.sendToTask`: deliver to the agent assigned to a task note (PROTOCOL §5.5).
@@ -757,6 +930,47 @@ fn last_assistant_text(messages: &[AgentMessage]) -> Option<String> {
         };
     }
     None
+}
+
+/// Map a persisted [`AgentStatus`] to the TS runtime status word used in the
+/// `agent.getSubscriptions` `agentStatuses` map. Best-effort: statuses without a
+/// runtime equivalent (e.g. `deleted`) are omitted so the caller drops the key.
+fn agent_status_wire(status: AgentStatus) -> Option<&'static str> {
+    match status {
+        AgentStatus::Pending | AgentStatus::Waiting => Some("waiting"),
+        AgentStatus::Active | AgentStatus::Processing => Some("responding"),
+        AgentStatus::RuntimeIdle | AgentStatus::Idle => Some("idle"),
+        AgentStatus::Completed => Some("completed"),
+        AgentStatus::Error => Some("failed"),
+        AgentStatus::Deleted => None,
+    }
+}
+
+/// Best-effort human description mirroring TS `describeAgentSubscription`:
+/// `"<parent>: <n event types>, from <child>[, delegation group <id> (await all,
+/// k expected)][, one-shot]"`. Exact wording is not asserted.
+fn describe_subscription(
+    watch: &CompletionWatch,
+    event_types: &[&str],
+    delegation_group: Option<&Value>,
+) -> String {
+    let mut desc = format!(
+        "{}: {} event types, from {}",
+        watch.parent_agent_name,
+        event_types.len(),
+        watch.child_agent_id.0
+    );
+    if let Some(group) = delegation_group {
+        let group_id = group["groupId"].as_str().unwrap_or_default();
+        let expected = group["expectedAgentIds"].as_array().map_or(0, Vec::len);
+        desc.push_str(&format!(
+            ", delegation group {group_id} (await all, {expected} expected)"
+        ));
+    }
+    if watch.one_shot {
+        desc.push_str(", one-shot");
+    }
+    desc
 }
 
 /// Count `tool_use` content blocks by tool name across all messages.

@@ -251,6 +251,10 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
     // polling. Safe when source control is unconfigured (each refresh logs and
     // swallows the missing-provider error). Aborted on clean shutdown.
     let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(60));
+    // Completion-delivery worker (AS-3): wake parents holding a oneShot
+    // completion watch when their delegated child finishes. No-op-safe without
+    // an event bus. Held for the process lifetime and aborted on clean shutdown.
+    let completion_delivery = services.spawn_completion_delivery_loop();
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group. Disabled entirely
     // when `agents.idleReapMinutes == 0`.
@@ -337,6 +341,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
         server.stop().await;
     }
     pr_refresh.abort();
+    completion_delivery.abort();
     if let Some(reap_task) = reap_task {
         reap_task.abort();
     }

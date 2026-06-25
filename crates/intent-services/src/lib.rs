@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use base64::Engine as _;
 use intent_core::events::{
-    CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED,
-    NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED,
-    TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
-    WORKSPACE_ATTENTION_CHANGED,
+    AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED,
+    COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED,
+    SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED,
+    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
 };
 use intent_core::{
     iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId, AgentLite,
@@ -41,6 +41,7 @@ pub use intent_core::{Error, Result, WorkspaceApi};
 mod agent_manager;
 mod agent_ops;
 mod agent_session;
+mod agent_subscriptions;
 mod drafts;
 mod event_ops;
 pub mod events;
@@ -89,6 +90,12 @@ pub struct Services {
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
     /// with the end-to-end orchestration flow; the queue surface itself is here.
     agent_queues: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Daemon-owned parent→child completion-watch registry (AS-2), keyed by
+    /// workspace. A oneShot watch is registered when an agent delegates with
+    /// `waitMode` `immediate` over the MCP front door; the delivery worker (AS-3)
+    /// and the `after_all` group fan-in (AS-4) consume it later. Shared across
+    /// clones like the other in-memory registries.
+    agent_subscriptions: Arc<Mutex<HashMap<WorkspaceId, agent_subscriptions::WorkspaceWatches>>>,
     /// Back-reference to the runtime [`AgentManager`] so the `agent.*` RPC
     /// handlers drive the real spawn/turn/MCP loop (§6.8). Held as a [`Weak`] to
     /// break the `AgentManager → Services` ownership cycle; the composition root
@@ -156,6 +163,7 @@ impl Services {
             event_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
+            agent_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
@@ -532,6 +540,127 @@ impl Services {
                 services.refresh_all_linked_prs().await;
             }
         })
+    }
+
+    /// Spawn the AS-3 completion-delivery worker: subscribe to the AGENT
+    /// completion event set (agent:idle / agent:failed / agent:deleted) across
+    /// every workspace and, on each child completion, wake every parent holding
+    /// a oneShot completion watch for that child (the same agent_send_message_op
+    /// path reportToParent uses), removing the oneShot watch after delivery.
+    /// after_all delegation-group watches (group_id = Some) are left in place for
+    /// AS-4. No-op-safe when no event bus is wired. Returns the task handle so the
+    /// composition root can hold it for the process lifetime.
+    pub fn spawn_completion_delivery_loop(&self) -> tokio::task::JoinHandle<()> {
+        let Some(bus) = self.event_bus.clone() else {
+            tracing::info!("completion delivery loop disabled: no event bus");
+            return tokio::spawn(async {});
+        };
+        let services = self.clone();
+        tokio::spawn(async move {
+            // Span every workspace (workspace_id = None) and deliver each matched
+            // event immediately (batch_window = None) so wakes are never coalesced.
+            let filter = SubscriptionFilter {
+                event_types: vec![
+                    AGENT_IDLE.to_string(),
+                    AGENT_FAILED.to_string(),
+                    AGENT_DELETED.to_string(),
+                ],
+                ..Default::default()
+            };
+            let mut sub = bus.subscribe(filter);
+            while let Some(events) = sub.recv().await {
+                for event in events {
+                    services.handle_completion_event(&event).await;
+                }
+            }
+        })
+    }
+
+    /// Resolve the completed child + workspace from a completion event and fan
+    /// the wake out to matching watches. A malformed event (no child id) is
+    /// logged and skipped so the worker loop never panics.
+    pub(crate) async fn handle_completion_event(&self, event: &Event) {
+        let Some(child_id) = completion_event_child_id(event) else {
+            tracing::warn!(
+                event_type = %event.event_type,
+                "completion event missing child agent id; skipping"
+            );
+            return;
+        };
+        let child = AgentId::from(child_id.as_str());
+        self.deliver_completion_to_watches(&event.workspace_id, &child, event)
+            .await;
+        // An agent going idle ends its delegating turn, so seal that parent's
+        // open after_all group (the expected set is now final) and try to fire it
+        // — covers the case where every child finished before the parent idled.
+        if event.event_type == AGENT_IDLE {
+            if let Some(gid) = self.seal_group_for_parent(&event.workspace_id, &child) {
+                self.try_fire_group(&event.workspace_id, &gid).await;
+            }
+        }
+    }
+
+    /// Wake every parent whose oneShot watch matches child_id, then drop that
+    /// watch. group_id = Some watches defer to the AS-4 delegation-group fan-in
+    /// and are left untouched. A single failed delivery is logged and skipped so
+    /// the remaining watches still fire.
+    pub(crate) async fn deliver_completion_to_watches(
+        &self,
+        workspace_id: &WorkspaceId,
+        child_id: &AgentId,
+        event: &Event,
+    ) {
+        for watch in self.find_watches_for_child(workspace_id, child_id) {
+            if let Some(gid) = watch.group_id.clone() {
+                // Route the child's completion into the parent's after_all
+                // delegation group instead of waking immediately. The group's own
+                // fire path removes these watches once it settles (AS-4).
+                let deleted = event.event_type == AGENT_DELETED;
+                let summary = format_group_child_line(child_id, event);
+                self.record_group_child_completion(workspace_id, &gid, child_id, deleted, summary);
+                self.try_fire_group(workspace_id, &gid).await;
+                continue;
+            }
+            let wake = format_completion_wake(child_id, event);
+            if let Err(e) = self
+                .agent_send_message_op(watch.parent_agent_id.clone(), wake, None)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    parent = %watch.parent_agent_id.0,
+                    "failed to deliver completion wake to parent"
+                );
+                continue;
+            }
+            if watch.one_shot {
+                self.remove_watch(workspace_id, &watch.id);
+            }
+        }
+    }
+
+    /// Fire a delegation group's single aggregated wake if it is ready (sealed,
+    /// complete, undelivered). `take_group_if_ready` flips `delivered` and removes
+    /// the group atomically, so this fires at most once even under concurrent
+    /// completions; on a send error we log and accept the dropped wake (mirroring
+    /// the immediate path's best-effort delivery).
+    pub(crate) async fn try_fire_group(&self, workspace_id: &WorkspaceId, group_id: &str) {
+        let Some(group) = self.take_group_if_ready(workspace_id, group_id) else {
+            return;
+        };
+        let wake = format_group_wake(&group);
+        if let Err(e) = self
+            .agent_send_message_op(group.parent_agent_id.clone(), wake, None)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                parent = %group.parent_agent_id.0,
+                group = %group_id,
+                "failed to deliver aggregated after_all wake to parent"
+            );
+        }
+        self.remove_group_watches(workspace_id, group_id);
     }
 }
 
@@ -1242,6 +1371,105 @@ pub(crate) async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
     if let Err(e) = bus.publish(&event).await {
         tracing::warn!(error = %e, "failed to publish change event");
     }
+}
+
+/// Extract the completed child agent id from a completion event: the canonical
+/// data.agentId, falling back to the event actor id when present.
+fn completion_event_child_id(event: &Event) -> Option<String> {
+    event
+        .data
+        .get("agentId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| event.actor.id.clone())
+}
+
+/// Build a concise, human-readable wake string describing a child agent's
+/// completion for its parent. A minimal port of the TS formatEventNotification
+/// intent: it names the child, the completion kind, and any lastResponseSummary
+/// or error carried on the event.
+fn format_completion_wake(child_id: &AgentId, event: &Event) -> String {
+    let kind = match event.event_type.as_str() {
+        AGENT_IDLE => "completed",
+        AGENT_FAILED => "failed",
+        AGENT_DELETED => "was deleted",
+        other => other,
+    };
+    let label = event
+        .data
+        .get("agentName")
+        .and_then(|v| v.as_str())
+        .or(event.actor.name.as_deref())
+        .map(|name| format!("{name} ({})", child_id.0))
+        .unwrap_or_else(|| child_id.0.clone());
+    let mut msg = format!("[WORKSPACE EVENTS] Child agent {label} {kind}.");
+    if let Some(summary) = event
+        .data
+        .get("lastResponseSummary")
+        .and_then(|v| v.as_str())
+    {
+        if !summary.is_empty() {
+            msg.push_str(&format!(" Summary: {summary}"));
+        }
+    }
+    if let Some(err) = event.data.get("error").and_then(|v| v.as_str()) {
+        if !err.is_empty() {
+            msg.push_str(&format!(" Error: {err}"));
+        }
+    }
+    msg
+}
+
+/// Build one per-child summary line for a delegation group's aggregated wake.
+/// A compact sibling of [`format_completion_wake`] without the standalone
+/// `[WORKSPACE EVENTS]` framing, since the group header carries that.
+fn format_group_child_line(child_id: &AgentId, event: &Event) -> String {
+    let kind = match event.event_type.as_str() {
+        AGENT_IDLE => "completed",
+        AGENT_FAILED => "failed",
+        AGENT_DELETED => "was deleted",
+        other => other,
+    };
+    let label = event
+        .data
+        .get("agentName")
+        .and_then(|v| v.as_str())
+        .or(event.actor.name.as_deref())
+        .map(|name| format!("{name} ({})", child_id.0))
+        .unwrap_or_else(|| child_id.0.clone());
+    let mut line = format!("- {label} {kind}.");
+    if let Some(summary) = event
+        .data
+        .get("lastResponseSummary")
+        .and_then(|v| v.as_str())
+    {
+        if !summary.is_empty() {
+            line.push_str(&format!(" Summary: {summary}"));
+        }
+    }
+    if let Some(err) = event.data.get("error").and_then(|v| v.as_str()) {
+        if !err.is_empty() {
+            line.push_str(&format!(" Error: {err}"));
+        }
+    }
+    line
+}
+
+/// Build the single aggregated wake for a settled after_all delegation group: a
+/// header with the child count and completionStatus (`partial` when any child was
+/// deleted, else `completed`) followed by the accumulated per-child lines.
+fn format_group_wake(group: &agent_subscriptions::DelegationGroup) -> String {
+    let total = group.expected_agent_ids.len();
+    let partial = !group.deleted_agent_ids.is_empty();
+    let status = if partial { "partial" } else { "completed" };
+    let mut msg = format!(
+        "[WORKSPACE EVENTS] All {total} delegated child agent(s) settled (completionStatus: {status})."
+    );
+    for line in &group.event_summaries {
+        msg.push('\n');
+        msg.push_str(line);
+    }
+    msg
 }
 
 impl Services {
@@ -4048,12 +4276,8 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            let _ = (workspace_id, agent_id);
-            Ok(serde_json::json!({
-                "subscriptions": [],
-                "delegationGroups": [],
-                "agentStatuses": {},
-            }))
+            self.agent_get_subscriptions_op(workspace_id, agent_id)
+                .await
         })
     }
 
@@ -4063,8 +4287,8 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            let _ = (workspace_id, agent_id);
-            Ok(serde_json::json!({ "success": true }))
+            self.agent_cancel_subscriptions_op(workspace_id, agent_id)
+                .await
         })
     }
 

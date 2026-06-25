@@ -10,8 +10,16 @@ use intent_core::{
     now_iso, AgentDelegateInput, AgentId, Error, Workspace, WorkspaceActivity, WorkspaceApi,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
-use intent_store::Store;
+use std::time::Duration;
+
+use intent_store::{NewEvent, Store};
 use serde_json::json;
+use tokio::time::timeout;
+
+use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE};
+use intent_core::{ActorType, Event, EventActor};
+
+use crate::{EventBus, SubscriptionFilter};
 
 use crate::agent_ops::{parse_model_list_output, static_models};
 use crate::Services;
@@ -81,6 +89,157 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let services = Services::new(store);
     (tmp, services, ws)
+}
+
+async fn setup_with_bus() -> (TempDb, Services, WorkspaceId, EventBus) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let services = Services::new(store);
+    let bus = EventBus::new(services.store().clone());
+    let services = services.with_event_bus(bus.clone());
+    (tmp, services, ws, bus)
+}
+
+fn completion_event(
+    workspace_id: &WorkspaceId,
+    event_type: &str,
+    child_id: &AgentId,
+    data: serde_json::Value,
+) -> Event {
+    Event {
+        id: uuid::Uuid::new_v4().to_string(),
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: event_type.to_string(),
+        actor: EventActor {
+            actor_type: ActorType::Agent,
+            id: Some(child_id.0.clone()),
+            ..Default::default()
+        },
+        session_id: Some(child_id.0.clone()),
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    }
+}
+
+#[tokio::test]
+async fn delete_emits_agent_deleted_scoped_to_workspace() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Doomed").await;
+
+    // Subscribe before the delete; no batching -> immediate single-event batch.
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_DELETED.to_string()],
+        ..Default::default()
+    });
+
+    let r = svc.agent_delete_op(id.clone()).await.expect("delete");
+    assert_eq!(r["success"], json!(true));
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].event_type, AGENT_DELETED);
+    assert_eq!(batch[0].workspace_id, ws);
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
+}
+
+#[tokio::test]
+async fn delete_skips_emit_when_session_already_gone() {
+    let (_t, svc, _ws, bus) = setup_with_bus().await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_DELETED.to_string()],
+        ..Default::default()
+    });
+
+    let missing = AgentId::from("agent-00000000-0000-0000-0000-00000missing0");
+    let r = svc
+        .agent_delete_op(missing)
+        .await
+        .expect("idempotent delete");
+    assert_eq!(r["success"], json!(true));
+
+    // Nothing was emitted: the subscription stays empty within the window.
+    let res = timeout(Duration::from_millis(300), sub.recv()).await;
+    assert!(
+        res.is_err(),
+        "expected no agent:deleted emit for a missing session"
+    );
+}
+
+#[tokio::test]
+async fn completion_delivery_wakes_oneshot_parent_and_removes_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let sub_id = svc.register_completion_watch(
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        true,
+        None,
+    );
+
+    let event = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "shipped it" }),
+    );
+    svc.handle_completion_event(&event).await;
+
+    // The parent received exactly one wake message via agent_send_message_op.
+    let parent_session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(parent_session.messages.len(), 1);
+
+    // The oneShot watch was removed after delivery.
+    assert!(svc.find_watches_for_child(&ws, &child).is_empty());
+    assert!(!svc.remove_watch(&ws, &sub_id));
+}
+
+#[tokio::test]
+async fn completion_delivery_leaves_group_watch_for_as4() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        true,
+        Some("group-1".into()),
+    );
+
+    let event = completion_event(
+        &ws,
+        AGENT_FAILED,
+        &child,
+        json!({ "agentId": child.0, "error": "boom" }),
+    );
+    svc.handle_completion_event(&event).await;
+
+    // No wake delivered and the group watch is left in place for AS-4.
+    let parent_session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert!(parent_session.messages.is_empty());
+    assert_eq!(svc.find_watches_for_child(&ws, &child).len(), 1);
 }
 
 async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
@@ -506,6 +665,101 @@ async fn get_subscriptions_has_stable_shape() {
     assert!(r["subscriptions"].is_array());
     assert!(r["delegationGroups"].is_array());
     assert!(r["agentStatuses"].is_object());
+    // A freshly created agent watches nobody, so both lists are empty.
+    assert!(r["subscriptions"].as_array().expect("array").is_empty());
+    assert!(r["delegationGroups"].as_array().expect("array").is_empty());
+}
+
+/// After an immediate (default) delegate, `getSubscriptions(parent)` lists the
+/// oneShot watch with `actorIds = [child]` and no delegation group.
+#[tokio::test]
+async fn get_subscriptions_lists_immediate_delegate_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput::default(),
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let r = svc
+        .agent_get_subscriptions(ws, parent.clone())
+        .await
+        .expect("subs");
+    let subs = r["subscriptions"].as_array().expect("array");
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0]["oneShot"], json!(true));
+    assert_eq!(subs[0]["agentId"], json!(parent.0));
+    assert_eq!(subs[0]["actorIds"], json!([child.0]));
+    assert_eq!(subs[0]["delegationGroup"], serde_json::Value::Null);
+    assert!(r["delegationGroups"].as_array().expect("array").is_empty());
+}
+
+/// After an `after_all` delegate, the watch is a non-oneShot group watch and one
+/// `delegationGroups` entry lists the child in `expectedAgentIds` with the wire
+/// `awaitMode` mapped from `after_all` to `"all"`.
+#[tokio::test]
+async fn get_subscriptions_lists_after_all_group() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = delegate_after_all(&svc, &ws, &parent).await;
+
+    let r = svc
+        .agent_get_subscriptions(ws, parent.clone())
+        .await
+        .expect("subs");
+    let subs = r["subscriptions"].as_array().expect("array");
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0]["oneShot"], json!(false));
+    assert_eq!(subs[0]["actorIds"], json!([child.0]));
+    assert_eq!(subs[0]["delegationGroup"]["awaitMode"], json!("all"));
+
+    let groups = r["delegationGroups"].as_array().expect("array");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["parentAgentId"], json!(parent.0));
+    assert_eq!(groups[0]["awaitMode"], json!("all"));
+    assert_eq!(groups[0]["expectedAgentIds"], json!([child.0]));
+}
+
+/// `cancelSubscriptions` drops the parent's watches and groups; a second cancel
+/// with nothing left still returns `{ success: true }`.
+#[tokio::test]
+async fn cancel_subscriptions_clears_watches_and_groups_idempotently() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let _c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let _c2 = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput::default(),
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+
+    let cancel = svc
+        .agent_cancel_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("cancel");
+    assert_eq!(cancel, json!({ "success": true }));
+
+    let r = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs");
+    assert!(r["subscriptions"].as_array().expect("array").is_empty());
+    assert!(r["delegationGroups"].as_array().expect("array").is_empty());
+
+    // Idempotent: cancelling again with nothing left still succeeds.
+    let again = svc
+        .agent_cancel_subscriptions(ws, parent)
+        .await
+        .expect("cancel again");
+    assert_eq!(again, json!({ "success": true }));
 }
 
 /// A delegate through the MCP front door (caller set) stamps the child's
@@ -656,4 +910,619 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
         .await
         .expect("error response");
     assert_eq!(err_resp["error"]["code"], json!(-32603));
+}
+
+// ===========================================================================
+// AS-2: completion-watch registry + auto-subscribe on delegate (immediate mode)
+// ===========================================================================
+
+/// The registry helpers register/find/list/remove parent→child watches.
+#[tokio::test]
+async fn completion_watch_registry_register_find_list_remove() {
+    let (_t, svc, ws) = setup().await;
+    let parent = AgentId::from("agent-00000000-0000-0000-0000-00000000paren");
+    let child_a = AgentId::from("agent-00000000-0000-0000-0000-0000000child");
+    let child_b = AgentId::from("agent-00000000-0000-0000-0000-000000childb");
+
+    let sub_a = svc.register_completion_watch(
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child_a.clone(),
+        true,
+        None,
+    );
+    let sub_b = svc.register_completion_watch(
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child_b.clone(),
+        true,
+        None,
+    );
+    assert_ne!(sub_a, sub_b);
+
+    let for_child_a = svc.find_watches_for_child(&ws, &child_a);
+    assert_eq!(for_child_a.len(), 1);
+    assert_eq!(for_child_a[0].id, sub_a);
+    assert!(for_child_a[0].one_shot);
+    assert_eq!(for_child_a[0].parent_agent_id, parent);
+    assert_eq!(for_child_a[0].child_agent_id, child_a);
+
+    assert_eq!(svc.list_watches_for_parent(&ws, &parent).len(), 2);
+
+    assert!(svc.remove_watch(&ws, &sub_a));
+    assert!(!svc.remove_watch(&ws, &sub_a));
+    assert!(svc.find_watches_for_child(&ws, &child_a).is_empty());
+    assert_eq!(svc.list_watches_for_parent(&ws, &parent).len(), 1);
+
+    assert_eq!(svc.remove_all_for_parent(&ws, &parent), 1);
+    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+}
+
+/// MCP front door (caller set), default wait mode: exactly one oneShot watch is
+/// registered linking the caller (parent) to the freshly created child.
+#[tokio::test]
+async fn delegate_immediate_registers_one_oneshot_watch_for_mcp_caller() {
+    let (_t, svc, ws) = setup().await;
+    let caller = AgentId::from("agent-00000000-0000-0000-0000-0000000caller");
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput::default(),
+            Some(caller.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1);
+    assert!(watches[0].one_shot);
+    assert_eq!(watches[0].child_agent_id, child);
+    assert_eq!(svc.find_watches_for_child(&ws, &child).len(), 1);
+}
+
+/// RPC front door (caller `None`): no watch is registered.
+#[tokio::test]
+async fn delegate_rpc_path_registers_no_watch() {
+    let (_t, svc, ws) = setup().await;
+    let resp = svc
+        .agent_delegate_op(ws.clone(), AgentDelegateInput::default(), None)
+        .await
+        .expect("rpc delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    assert!(svc.find_watches_for_child(&ws, &child).is_empty());
+}
+
+/// `wait_mode == "after_all"` (AS-4): the child is enrolled in the parent's
+/// delegation group and a non-oneShot group watch (group_id = Some) is registered
+/// instead of an immediate oneShot.
+#[tokio::test]
+async fn delegate_after_all_enrolls_group_and_registers_group_watch() {
+    let (_t, svc, ws) = setup().await;
+    let caller = AgentId::from("agent-00000000-0000-0000-0000-0000000caller");
+    let input = AgentDelegateInput {
+        wait_mode: Some("after_all".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, Some(caller.clone()))
+        .await
+        .expect("delegate after_all");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let group = svc
+        .delegation_group_for_parent(&ws, &caller)
+        .expect("group exists");
+    assert_eq!(group.expected_agent_ids, vec![child.clone()]);
+
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1);
+    assert!(!watches[0].one_shot);
+    assert_eq!(
+        watches[0].group_id.as_deref(),
+        Some(group.group_id.as_str())
+    );
+    assert_eq!(watches[0].child_agent_id, child);
+}
+
+/// The deleted-parent guard skips registration when the caller's session is
+/// flagged `deleted` (TS `selectIsAgentDeleted`).
+#[tokio::test]
+async fn delegate_skips_watch_when_parent_deleted() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    session.status = intent_core::AgentStatus::Deleted;
+    svc.store()
+        .update_agent_session(&session)
+        .await
+        .expect("flag deleted");
+
+    svc.agent_delegate_op(
+        ws.clone(),
+        AgentDelegateInput::default(),
+        Some(parent.clone()),
+    )
+    .await
+    .expect("delegate");
+    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+}
+
+/// End-to-end through the MCP front door: delegating with a caller registers
+/// exactly one oneShot watch for the child returned by the tool.
+#[tokio::test]
+async fn mcp_delegate_immediate_registers_oneshot_watch() {
+    let (_t, svc, ws) = setup().await;
+    let caller = AgentId::from("agent-00000000-0000-0000-0000-0000000caller");
+    let api: Arc<dyn WorkspaceApi> = Arc::new(svc.clone());
+    let server =
+        WorkspaceMcpServer::new(api, ws.clone()).with_caller_agent_id(Some(caller.clone()));
+    let resp = server
+        .handle_message(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "delegate_task_workspace-mcp",
+                "arguments": { "agentInstructions": "do work" }
+            }
+        }))
+        .await
+        .expect("mcp response");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    let parsed: serde_json::Value = serde_json::from_str(text).expect("tool json");
+    let child = AgentId::from(parsed["agentId"].as_str().expect("agentId"));
+
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].child_agent_id, child);
+    assert!(watches[0].one_shot);
+}
+
+// ===========================================================================
+// AS-4: after_all delegation groups (aggregate + single wake)
+// ===========================================================================
+
+async fn delegate_after_all(svc: &Services, ws: &WorkspaceId, parent: &AgentId) -> AgentId {
+    let input = AgentDelegateInput {
+        wait_mode: Some("after_all".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, Some(parent.clone()))
+        .await
+        .expect("delegate after_all");
+    AgentId::from(resp["agentId"].as_str().expect("agentId"))
+}
+
+async fn parent_message_count(svc: &Services, parent: &AgentId) -> usize {
+    svc.store()
+        .get_agent_session(parent)
+        .await
+        .expect("parent session")
+        .messages
+        .len()
+}
+
+async fn parent_messages_text(svc: &Services, parent: &AgentId) -> String {
+    let session = svc
+        .store()
+        .get_agent_session(parent)
+        .await
+        .expect("parent session");
+    serde_json::to_string(&session.messages).expect("serialize messages")
+}
+
+/// Two after_all delegates from one parent share a single group whose expected
+/// set has both children, with two non-oneShot group watches and zero oneShots.
+#[tokio::test]
+async fn two_after_all_delegates_share_one_group() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let c2 = delegate_after_all(&svc, &ws, &parent).await;
+
+    let group = svc
+        .delegation_group_for_parent(&ws, &parent)
+        .expect("group exists");
+    assert_eq!(group.expected_agent_ids.len(), 2);
+    assert!(group.expected_agent_ids.contains(&c1));
+    assert!(group.expected_agent_ids.contains(&c2));
+
+    let watches = svc.list_watches_for_parent(&ws, &parent);
+    assert_eq!(watches.len(), 2);
+    assert!(watches.iter().all(|w| !w.one_shot));
+    assert!(watches
+        .iter()
+        .all(|w| w.group_id.as_deref() == Some(group.group_id.as_str())));
+}
+
+/// child idle (no fire) -> parent idle (seal, still incomplete, no fire) ->
+/// second child idle -> exactly one aggregated wake; group + watches removed.
+#[tokio::test]
+async fn group_fires_once_after_parent_then_remaining_child() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let c2 = delegate_after_all(&svc, &ws, &parent).await;
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c1,
+        json!({ "agentId": c1.0, "lastResponseSummary": "one" }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c2,
+        json!({ "agentId": c2.0, "lastResponseSummary": "two" }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    assert!(svc.delegation_group_for_parent(&ws, &parent).is_none());
+    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+}
+
+/// Both children idle before the parent: no fire until the parent idles, then a
+/// single aggregated wake.
+#[tokio::test]
+async fn group_fires_on_parent_idle_when_children_already_done() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let c2 = delegate_after_all(&svc, &ws, &parent).await;
+
+    for c in [&c1, &c2] {
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            c,
+            json!({ "agentId": c.0 }),
+        ))
+        .await;
+    }
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    assert!(svc.delegation_group_for_parent(&ws, &parent).is_none());
+    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+}
+
+/// A deleted child counts toward completion as `partial`: after the parent
+/// seals, one deleted + one idle child yields a single partial aggregated wake.
+#[tokio::test]
+async fn group_partial_when_child_deleted() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let c2 = delegate_after_all(&svc, &ws, &parent).await;
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_DELETED,
+        &c1,
+        json!({ "agentId": c1.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c2,
+        json!({ "agentId": c2.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("partial"),
+        "wake should report partial status"
+    );
+}
+
+/// The group fires exactly once: a duplicate child completion and a second parent
+/// idle after delivery do not deliver a second aggregated wake.
+#[tokio::test]
+async fn group_no_double_fire() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let c2 = delegate_after_all(&svc, &ws, &parent).await;
+
+    for c in [&c1, &c2] {
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            c,
+            json!({ "agentId": c.0 }),
+        ))
+        .await;
+    }
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+
+    // Duplicate child completion: the group is already gone -> no-op.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c2,
+        json!({ "agentId": c2.0 }),
+    ))
+    .await;
+    // Second parent idle: no open group to seal -> no-op.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+}
+
+// ===========================================================================
+// AS-6: joined end-to-end integration over the real EventBus + delivery loop
+// ===========================================================================
+
+/// Poll until the completion-delivery worker's broadcast receiver is live so a
+/// published event never races ahead of the subscription.
+async fn wait_for_subscriber(bus: &EventBus) {
+    timeout(Duration::from_secs(2), async {
+        while bus.subscriber_count() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("delivery worker subscribed");
+}
+
+/// Publish an AGENT completion event (idle/failed/deleted) onto the bus in the
+/// shape the delivery worker filters on (agentId in data + agent actor).
+async fn publish_completion(
+    bus: &EventBus,
+    workspace_id: &WorkspaceId,
+    event_type: &str,
+    child_id: &AgentId,
+    data: serde_json::Value,
+) {
+    let ev = NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: event_type.to_string(),
+        actor: EventActor {
+            actor_type: ActorType::Agent,
+            id: Some(child_id.0.clone()),
+            ..Default::default()
+        },
+        session_id: Some(child_id.0.clone()),
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    };
+    bus.publish(&ev).await.expect("publish completion event");
+}
+
+/// Poll until the parent transcript reaches expected messages (the worker wakes
+/// the parent asynchronously through the spawned delivery task).
+async fn wait_for_message_count(svc: &Services, parent: &AgentId, expected: usize) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if parent_message_count(svc, parent).await >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("parent did not reach {expected} messages in time"));
+}
+
+/// Poll until the parent's open delegation group has recorded at least n child
+/// completions (completed + deleted), so the no-premature-fire assertion is
+/// deterministic rather than timing-dependent.
+async fn wait_for_group_children(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    parent: &AgentId,
+    n: usize,
+) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(g) = svc.delegation_group_for_parent(workspace_id, parent) {
+                if g.completed_agent_ids.len() + g.deleted_agent_ids.len() >= n {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("delegation group recorded child completions");
+}
+
+/// One joined service-level integration test that drives the full
+/// auto-subscription loop through the real spawn_completion_delivery_loop worker
+/// and the EventBus publish path (not handle_completion_event directly):
+///   (a) an immediate delegate registers a oneShot watch; the child's agent:idle
+///       published on the bus wakes the parent exactly once and the watch is
+///       cleared from the registry;
+///   (b) an after_all group of two children yields no wake until the parent
+///       seals on its own agent:idle and both children complete -- a deleted
+///       child still counts -- then exactly one aggregated partial wake;
+///   (c) agent.getSubscriptions / agent.cancelSubscriptions reflect the live
+///       registry across the loop (populated mid-flight, empty after the group
+///       settles and after an explicit cancel).
+/// Chosen over a node-gated UDS E2E so the whole loop runs deterministically
+/// with no external provider dependency, mirroring the AS-3/AS-4 worker tests.
+#[tokio::test]
+async fn as6_end_to_end_auto_subscription_over_bus() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let worker = svc.spawn_completion_delivery_loop();
+    wait_for_subscriber(&bus).await;
+
+    let parent = create_agent(&svc, &ws, "Parent").await;
+
+    // ---- (a) immediate delegate -> single oneShot wake + watch cleanup ----
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput::default(),
+            Some(parent.clone()),
+        )
+        .await
+        .expect("immediate delegate");
+    let child1 = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let subs = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs");
+    let list = subs["subscriptions"].as_array().expect("array");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["oneShot"], json!(true));
+    assert_eq!(list[0]["actorIds"], json!([child1.0]));
+
+    publish_completion(
+        &bus,
+        &ws,
+        AGENT_IDLE,
+        &child1,
+        json!({ "agentId": child1.0, "lastResponseSummary": "shipped" }),
+    )
+    .await;
+    wait_for_message_count(&svc, &parent, 1).await;
+
+    assert!(svc.find_watches_for_child(&ws, &child1).is_empty());
+    let subs = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs");
+    assert!(subs["subscriptions"].as_array().expect("array").is_empty());
+
+    // ---- (b) after_all two children -> single aggregated partial wake ----
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let c2 = delegate_after_all(&svc, &ws, &parent).await;
+
+    let subs = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs");
+    assert_eq!(subs["subscriptions"].as_array().expect("array").len(), 2);
+    let groups = subs["delegationGroups"].as_array().expect("array");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["awaitMode"], json!("all"));
+    assert_eq!(
+        groups[0]["expectedAgentIds"]
+            .as_array()
+            .expect("array")
+            .len(),
+        2
+    );
+
+    // c1 idle then c2 deleted: both recorded, but no wake while unsealed.
+    publish_completion(&bus, &ws, AGENT_IDLE, &c1, json!({ "agentId": c1.0 })).await;
+    publish_completion(&bus, &ws, AGENT_DELETED, &c2, json!({ "agentId": c2.0 })).await;
+    wait_for_group_children(&svc, &ws, &parent, 2).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+
+    // The parent's own idle seals the group; now complete -> ONE partial wake.
+    publish_completion(
+        &bus,
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    )
+    .await;
+    wait_for_message_count(&svc, &parent, 2).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 2);
+    assert!(
+        parent_messages_text(&svc, &parent)
+            .await
+            .contains("partial"),
+        "a deleted child should yield a partial aggregated wake"
+    );
+
+    assert!(svc.delegation_group_for_parent(&ws, &parent).is_none());
+    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+    let subs = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs");
+    assert!(subs["delegationGroups"]
+        .as_array()
+        .expect("array")
+        .is_empty());
+
+    // ---- (c) cancelSubscriptions clears a live mid-flight watch ----
+    svc.agent_delegate_op(
+        ws.clone(),
+        AgentDelegateInput::default(),
+        Some(parent.clone()),
+    )
+    .await
+    .expect("immediate delegate 3");
+    let subs = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs");
+    assert_eq!(subs["subscriptions"].as_array().expect("array").len(), 1);
+
+    let cancel = svc
+        .agent_cancel_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("cancel");
+    assert_eq!(cancel, json!({ "success": true }));
+    let subs = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs");
+    assert!(subs["subscriptions"].as_array().expect("array").is_empty());
+    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+
+    worker.abort();
 }

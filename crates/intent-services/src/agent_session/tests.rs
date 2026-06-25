@@ -247,7 +247,7 @@ async fn prompt_turn_streams_events_and_accumulates() {
 
     // Collect the published events (default filter → one event per batch).
     let mut events = Vec::new();
-    while events.len() < 4 {
+    while events.len() < 5 {
         let batch = timeout(Duration::from_secs(2), sub.recv())
             .await
             .expect("recv timed out")
@@ -262,8 +262,9 @@ async fn prompt_turn_streams_events_and_accumulates() {
             "agent:stream:chunk",
             "agent:tool:call",
             "agent:stream:end",
+            "agent:idle",
         ],
-        "events publish in order with a single terminal stream:end"
+        "a normal turn emits exactly one agent:idle after the terminal stream:end"
     );
     assert_eq!(
         events
@@ -272,6 +273,25 @@ async fn prompt_turn_streams_events_and_accumulates() {
             .count(),
         1
     );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.event_type == "agent:idle")
+            .count(),
+        1,
+        "exactly one agent:idle per normal turn"
+    );
+
+    // The agent:idle payload carries the session-completion signal.
+    let idle = events
+        .iter()
+        .find(|e| e.event_type == "agent:idle")
+        .unwrap();
+    assert_eq!(idle.data["agentId"], json!("agent-1"));
+    assert_eq!(idle.data["reason"], json!("stream_complete"));
+    assert_eq!(idle.data["finishReason"], json!("end_turn"));
+    assert_eq!(idle.data["status"], json!("idle"));
+    assert_eq!(idle.data["lastResponseSummary"], json!("Hello world"));
 
     let tool = events
         .iter()
@@ -380,7 +400,7 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
 
     let mut events = Vec::new();
-    while events.len() < 4 {
+    while events.len() < 5 {
         let batch = timeout(Duration::from_secs(2), sub.recv())
             .await
             .expect("recv timed out")
@@ -395,8 +415,9 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
             "agent:stream:chunk",
             "agent:tool:call",
             "agent:stream:end",
+            "agent:idle",
         ],
-        "the real turn streams its own updates after the replay was dropped"
+        "the real turn streams its own updates (then goes idle) after the replay was dropped"
     );
 
     let messages = bus
