@@ -9,10 +9,13 @@
 
 use std::collections::HashSet;
 
+use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE};
 use intent_core::{
     now_iso, AgentId, AgentLite, AgentMessage, AgentSession, AgentStatus, Error, NoteId, Result,
     WorkspaceApi, WorkspaceId,
 };
+
+use crate::agent_subscriptions::CompletionWatch;
 
 /// `waitMode` value that defers the completion watch into an `after_all`
 /// delegation group (AS-4) rather than registering a standalone oneShot here.
@@ -664,6 +667,103 @@ impl Services {
         Ok(json!({ "ok": true, "agentId": agent_id, "name": name }))
     }
 
+    /// `agent.getSubscriptions`: live completion-watch payload for `agent_id`
+    /// from the AS-2/AS-4 registry, in the TS camelCase wire shape with the
+    /// `subscriptions`, `delegationGroups`, and `agentStatuses` fields.
+    /// `awaitMode` maps the registry's `after_all` to TS's `"all"`;
+    /// `agentStatuses` is best-effort, keyed off the persisted `AgentStatus` of
+    /// the agents present in the payload.
+    pub(crate) async fn agent_get_subscriptions_op(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> Result<Value> {
+        let watches = self.list_watches_for_parent(&workspace_id, &agent_id);
+        let groups = self.list_groups_for_parent(&workspace_id, &agent_id);
+
+        let event_types = [AGENT_IDLE, AGENT_FAILED, AGENT_DELETED];
+
+        let mut present: Vec<AgentId> = vec![agent_id.clone()];
+        let subscriptions: Vec<Value> = watches
+            .iter()
+            .map(|w| {
+                if !present.contains(&w.child_agent_id) {
+                    present.push(w.child_agent_id.clone());
+                }
+                let delegation_group = w.group_id.as_ref().and_then(|gid| {
+                    groups.iter().find(|g| &g.group_id == gid).map(|g| {
+                        json!({
+                            "groupId": g.group_id,
+                            "awaitMode": "all",
+                            "expectedAgentIds": g.expected_agent_ids,
+                        })
+                    })
+                });
+                let description = describe_subscription(w, &event_types, delegation_group.as_ref());
+                json!({
+                    "id": w.id,
+                    "agentId": w.parent_agent_id,
+                    "agentName": w.parent_agent_name,
+                    "workspaceId": workspace_id,
+                    "createdAt": w.created_at,
+                    "oneShot": w.one_shot,
+                    "actorIds": [w.child_agent_id],
+                    "eventTypes": event_types,
+                    "delegationGroup": delegation_group,
+                    "description": description,
+                })
+            })
+            .collect();
+
+        let delegation_groups: Vec<Value> = groups
+            .iter()
+            .map(|g| {
+                for id in &g.expected_agent_ids {
+                    if !present.contains(id) {
+                        present.push(id.clone());
+                    }
+                }
+                json!({
+                    "groupId": g.group_id,
+                    "parentAgentId": g.parent_agent_id,
+                    "awaitMode": "all",
+                    "expectedAgentIds": g.expected_agent_ids,
+                    "completedAgentIds": g.completed_agent_ids,
+                    "deletedAgentIds": g.deleted_agent_ids,
+                    "delivered": g.delivered,
+                })
+            })
+            .collect();
+
+        let mut agent_statuses = serde_json::Map::new();
+        for id in &present {
+            if let Ok(session) = self.store.get_agent_session(id).await {
+                if let Some(word) = agent_status_wire(session.status) {
+                    agent_statuses.insert(id.0.clone(), json!(word));
+                }
+            }
+        }
+
+        Ok(json!({
+            "subscriptions": subscriptions,
+            "delegationGroups": delegation_groups,
+            "agentStatuses": Value::Object(agent_statuses),
+        }))
+    }
+
+    /// `agent.cancelSubscriptions`: remove every completion watch registered by
+    /// `agent_id` and drop any delegation groups it parents. Idempotent — always
+    /// returns `{ "success": true }` (TS shape).
+    pub(crate) async fn agent_cancel_subscriptions_op(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> Result<Value> {
+        self.remove_all_for_parent(&workspace_id, &agent_id);
+        self.remove_groups_for_parent(&workspace_id, &agent_id);
+        Ok(json!({ "success": true }))
+    }
+
     /// `agent.sendToTask`: deliver to the agent assigned to a task note (PROTOCOL §5.5).
     pub(crate) async fn agent_send_to_task_op(
         &self,
@@ -806,6 +906,47 @@ fn last_assistant_text(messages: &[AgentMessage]) -> Option<String> {
         };
     }
     None
+}
+
+/// Map a persisted [`AgentStatus`] to the TS runtime status word used in the
+/// `agent.getSubscriptions` `agentStatuses` map. Best-effort: statuses without a
+/// runtime equivalent (e.g. `deleted`) are omitted so the caller drops the key.
+fn agent_status_wire(status: AgentStatus) -> Option<&'static str> {
+    match status {
+        AgentStatus::Pending | AgentStatus::Waiting => Some("waiting"),
+        AgentStatus::Active | AgentStatus::Processing => Some("responding"),
+        AgentStatus::RuntimeIdle | AgentStatus::Idle => Some("idle"),
+        AgentStatus::Completed => Some("completed"),
+        AgentStatus::Error => Some("failed"),
+        AgentStatus::Deleted => None,
+    }
+}
+
+/// Best-effort human description mirroring TS `describeAgentSubscription`:
+/// `"<parent>: <n event types>, from <child>[, delegation group <id> (await all,
+/// k expected)][, one-shot]"`. Exact wording is not asserted.
+fn describe_subscription(
+    watch: &CompletionWatch,
+    event_types: &[&str],
+    delegation_group: Option<&Value>,
+) -> String {
+    let mut desc = format!(
+        "{}: {} event types, from {}",
+        watch.parent_agent_name,
+        event_types.len(),
+        watch.child_agent_id.0
+    );
+    if let Some(group) = delegation_group {
+        let group_id = group["groupId"].as_str().unwrap_or_default();
+        let expected = group["expectedAgentIds"].as_array().map_or(0, Vec::len);
+        desc.push_str(&format!(
+            ", delegation group {group_id} (await all, {expected} expected)"
+        ));
+    }
+    if watch.one_shot {
+        desc.push_str(", one-shot");
+    }
+    desc
 }
 
 /// Count `tool_use` content blocks by tool name across all messages.

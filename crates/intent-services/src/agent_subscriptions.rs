@@ -337,6 +337,48 @@ impl Services {
         before - w.subscriptions.len()
     }
 
+    /// All delegation groups parented by `parent_id` (read snapshot for
+    /// `agent.getSubscriptions`). Mirrors `delegation_group_for_parent` but
+    /// returns every group rather than the first match.
+    pub(crate) fn list_groups_for_parent(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_id: &AgentId,
+    ) -> Vec<DelegationGroup> {
+        self.agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .get(workspace_id)
+            .map(|w| {
+                w.delegation_groups
+                    .iter()
+                    .filter(|g| &g.parent_agent_id == parent_id)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Drop every delegation group parented by `parent_id`; returns the count
+    /// removed (the group side of `agent.cancelSubscriptions`).
+    pub(crate) fn remove_groups_for_parent(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_id: &AgentId,
+    ) -> usize {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let Some(w) = guard.get_mut(workspace_id) else {
+            return 0;
+        };
+        let before = w.delegation_groups.len();
+        w.delegation_groups
+            .retain(|g| &g.parent_agent_id != parent_id);
+        before - w.delegation_groups.len()
+    }
+
     /// Test-only snapshot of a parent's delegation group, if one exists.
     #[cfg(test)]
     pub(crate) fn delegation_group_for_parent(

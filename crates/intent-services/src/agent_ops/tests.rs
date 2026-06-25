@@ -576,6 +576,101 @@ async fn get_subscriptions_has_stable_shape() {
     assert!(r["subscriptions"].is_array());
     assert!(r["delegationGroups"].is_array());
     assert!(r["agentStatuses"].is_object());
+    // A freshly created agent watches nobody, so both lists are empty.
+    assert!(r["subscriptions"].as_array().expect("array").is_empty());
+    assert!(r["delegationGroups"].as_array().expect("array").is_empty());
+}
+
+/// After an immediate (default) delegate, `getSubscriptions(parent)` lists the
+/// oneShot watch with `actorIds = [child]` and no delegation group.
+#[tokio::test]
+async fn get_subscriptions_lists_immediate_delegate_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput::default(),
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let r = svc
+        .agent_get_subscriptions(ws, parent.clone())
+        .await
+        .expect("subs");
+    let subs = r["subscriptions"].as_array().expect("array");
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0]["oneShot"], json!(true));
+    assert_eq!(subs[0]["agentId"], json!(parent.0));
+    assert_eq!(subs[0]["actorIds"], json!([child.0]));
+    assert_eq!(subs[0]["delegationGroup"], serde_json::Value::Null);
+    assert!(r["delegationGroups"].as_array().expect("array").is_empty());
+}
+
+/// After an `after_all` delegate, the watch is a non-oneShot group watch and one
+/// `delegationGroups` entry lists the child in `expectedAgentIds` with the wire
+/// `awaitMode` mapped from `after_all` to `"all"`.
+#[tokio::test]
+async fn get_subscriptions_lists_after_all_group() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = delegate_after_all(&svc, &ws, &parent).await;
+
+    let r = svc
+        .agent_get_subscriptions(ws, parent.clone())
+        .await
+        .expect("subs");
+    let subs = r["subscriptions"].as_array().expect("array");
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0]["oneShot"], json!(false));
+    assert_eq!(subs[0]["actorIds"], json!([child.0]));
+    assert_eq!(subs[0]["delegationGroup"]["awaitMode"], json!("all"));
+
+    let groups = r["delegationGroups"].as_array().expect("array");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["parentAgentId"], json!(parent.0));
+    assert_eq!(groups[0]["awaitMode"], json!("all"));
+    assert_eq!(groups[0]["expectedAgentIds"], json!([child.0]));
+}
+
+/// `cancelSubscriptions` drops the parent's watches and groups; a second cancel
+/// with nothing left still returns `{ success: true }`.
+#[tokio::test]
+async fn cancel_subscriptions_clears_watches_and_groups_idempotently() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let _c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let _c2 = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput::default(),
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+
+    let cancel = svc
+        .agent_cancel_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("cancel");
+    assert_eq!(cancel, json!({ "success": true }));
+
+    let r = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs");
+    assert!(r["subscriptions"].as_array().expect("array").is_empty());
+    assert!(r["delegationGroups"].as_array().expect("array").is_empty());
+
+    // Idempotent: cancelling again with nothing left still succeeds.
+    let again = svc
+        .agent_cancel_subscriptions(ws, parent)
+        .await
+        .expect("cancel again");
+    assert_eq!(again, json!({ "success": true }));
 }
 
 /// A delegate through the MCP front door (caller set) stamps the child's

@@ -4131,12 +4131,8 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            let _ = (workspace_id, agent_id);
-            Ok(serde_json::json!({
-                "subscriptions": [],
-                "delegationGroups": [],
-                "agentStatuses": {},
-            }))
+            self.agent_get_subscriptions_op(workspace_id, agent_id)
+                .await
         })
     }
 
@@ -4146,8 +4142,8 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            let _ = (workspace_id, agent_id);
-            Ok(serde_json::json!({ "success": true }))
+            self.agent_cancel_subscriptions_op(workspace_id, agent_id)
+                .await
         })
     }
 
