@@ -12,7 +12,7 @@ use intent_core::{
 };
 use std::time::Duration;
 
-use intent_store::Store;
+use intent_store::{NewEvent, Store};
 use serde_json::json;
 use tokio::time::timeout;
 
@@ -1212,4 +1212,228 @@ async fn group_no_double_fire() {
     ))
     .await;
     assert_eq!(parent_message_count(&svc, &parent).await, 1);
+}
+
+// ===========================================================================
+// AS-6: joined end-to-end integration over the real EventBus + delivery loop
+// ===========================================================================
+
+/// Poll until the completion-delivery worker's broadcast receiver is live so a
+/// published event never races ahead of the subscription.
+async fn wait_for_subscriber(bus: &EventBus) {
+    timeout(Duration::from_secs(2), async {
+        while bus.subscriber_count() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("delivery worker subscribed");
+}
+
+/// Publish an AGENT completion event (idle/failed/deleted) onto the bus in the
+/// shape the delivery worker filters on (agentId in data + agent actor).
+async fn publish_completion(
+    bus: &EventBus,
+    workspace_id: &WorkspaceId,
+    event_type: &str,
+    child_id: &AgentId,
+    data: serde_json::Value,
+) {
+    let ev = NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: event_type.to_string(),
+        actor: EventActor {
+            actor_type: ActorType::Agent,
+            id: Some(child_id.0.clone()),
+            ..Default::default()
+        },
+        session_id: Some(child_id.0.clone()),
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    };
+    bus.publish(&ev).await.expect("publish completion event");
+}
+
+/// Poll until the parent transcript reaches expected messages (the worker wakes
+/// the parent asynchronously through the spawned delivery task).
+async fn wait_for_message_count(svc: &Services, parent: &AgentId, expected: usize) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if parent_message_count(svc, parent).await >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("parent did not reach {expected} messages in time"));
+}
+
+/// Poll until the parent's open delegation group has recorded at least n child
+/// completions (completed + deleted), so the no-premature-fire assertion is
+/// deterministic rather than timing-dependent.
+async fn wait_for_group_children(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    parent: &AgentId,
+    n: usize,
+) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(g) = svc.delegation_group_for_parent(workspace_id, parent) {
+                if g.completed_agent_ids.len() + g.deleted_agent_ids.len() >= n {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("delegation group recorded child completions");
+}
+
+/// One joined service-level integration test that drives the full
+/// auto-subscription loop through the real spawn_completion_delivery_loop worker
+/// and the EventBus publish path (not handle_completion_event directly):
+///   (a) an immediate delegate registers a oneShot watch; the child's agent:idle
+///       published on the bus wakes the parent exactly once and the watch is
+///       cleared from the registry;
+///   (b) an after_all group of two children yields no wake until the parent
+///       seals on its own agent:idle and both children complete -- a deleted
+///       child still counts -- then exactly one aggregated partial wake;
+///   (c) agent.getSubscriptions / agent.cancelSubscriptions reflect the live
+///       registry across the loop (populated mid-flight, empty after the group
+///       settles and after an explicit cancel).
+/// Chosen over a node-gated UDS E2E so the whole loop runs deterministically
+/// with no external provider dependency, mirroring the AS-3/AS-4 worker tests.
+#[tokio::test]
+async fn as6_end_to_end_auto_subscription_over_bus() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let worker = svc.spawn_completion_delivery_loop();
+    wait_for_subscriber(&bus).await;
+
+    let parent = create_agent(&svc, &ws, "Parent").await;
+
+    // ---- (a) immediate delegate -> single oneShot wake + watch cleanup ----
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput::default(),
+            Some(parent.clone()),
+        )
+        .await
+        .expect("immediate delegate");
+    let child1 = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let subs = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs");
+    let list = subs["subscriptions"].as_array().expect("array");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["oneShot"], json!(true));
+    assert_eq!(list[0]["actorIds"], json!([child1.0]));
+
+    publish_completion(
+        &bus,
+        &ws,
+        AGENT_IDLE,
+        &child1,
+        json!({ "agentId": child1.0, "lastResponseSummary": "shipped" }),
+    )
+    .await;
+    wait_for_message_count(&svc, &parent, 1).await;
+
+    assert!(svc.find_watches_for_child(&ws, &child1).is_empty());
+    let subs = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs");
+    assert!(subs["subscriptions"].as_array().expect("array").is_empty());
+
+    // ---- (b) after_all two children -> single aggregated partial wake ----
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let c2 = delegate_after_all(&svc, &ws, &parent).await;
+
+    let subs = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs");
+    assert_eq!(subs["subscriptions"].as_array().expect("array").len(), 2);
+    let groups = subs["delegationGroups"].as_array().expect("array");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["awaitMode"], json!("all"));
+    assert_eq!(
+        groups[0]["expectedAgentIds"]
+            .as_array()
+            .expect("array")
+            .len(),
+        2
+    );
+
+    // c1 idle then c2 deleted: both recorded, but no wake while unsealed.
+    publish_completion(&bus, &ws, AGENT_IDLE, &c1, json!({ "agentId": c1.0 })).await;
+    publish_completion(&bus, &ws, AGENT_DELETED, &c2, json!({ "agentId": c2.0 })).await;
+    wait_for_group_children(&svc, &ws, &parent, 2).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+
+    // The parent's own idle seals the group; now complete -> ONE partial wake.
+    publish_completion(
+        &bus,
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    )
+    .await;
+    wait_for_message_count(&svc, &parent, 2).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 2);
+    assert!(
+        parent_messages_text(&svc, &parent)
+            .await
+            .contains("partial"),
+        "a deleted child should yield a partial aggregated wake"
+    );
+
+    assert!(svc.delegation_group_for_parent(&ws, &parent).is_none());
+    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+    let subs = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs");
+    assert!(subs["delegationGroups"]
+        .as_array()
+        .expect("array")
+        .is_empty());
+
+    // ---- (c) cancelSubscriptions clears a live mid-flight watch ----
+    svc.agent_delegate_op(
+        ws.clone(),
+        AgentDelegateInput::default(),
+        Some(parent.clone()),
+    )
+    .await
+    .expect("immediate delegate 3");
+    let subs = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs");
+    assert_eq!(subs["subscriptions"].as_array().expect("array").len(), 1);
+
+    let cancel = svc
+        .agent_cancel_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("cancel");
+    assert_eq!(cancel, json!({ "success": true }));
+    let subs = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs");
+    assert!(subs["subscriptions"].as_array().expect("array").is_empty());
+    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+
+    worker.abort();
 }
