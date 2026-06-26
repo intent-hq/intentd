@@ -193,7 +193,7 @@ pub struct WorkspaceTaskStats {
 /// `specialist`/`lastActivity` as optional. `status` carries the same wire
 /// strings as `agent.list`; `isStreaming`/`isResponding` are always `false`
 /// (the headless backend has no live stream state — `status` carries liveness,
-/// matching the `AgentLite` Wave 1a decision).
+/// matching the `AgentLite` iOS wire-shape parity decision).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceAgentInfo {
