@@ -2486,6 +2486,63 @@ pub trait WorkspaceApi: Send + Sync {
             ))
         })
     }
+
+    // ------------------------------------------------------------------------
+    // crossWorkspace.* — read-only access to sibling workspaces that share the
+    // caller's `repositoryPath`. Sibling-scope and access-control failures
+    // mirror the TS builder messages ("Current workspace is not associated with
+    // a repository", "Access denied: ...", "Note not found: ...") and surface
+    // as `Error::Internal` (→ `-32603`), matching the TS handler which wraps the
+    // builder errors in `INTERNAL_ERROR` (PROTOCOL §5.x).
+    // ------------------------------------------------------------------------
+
+    /// `crossWorkspace.listSiblings`: workspaces sharing the caller's
+    /// `repositoryPath`, excluding self. Bare array of
+    /// `{ id, title, branch, status, createdAt, updatedAt }` (`title` defaults
+    /// to `"Untitled"`; `status` is the PascalCase `WorkspaceStatus`).
+    fn cross_workspace_list_siblings(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::cross_workspace_list_siblings not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `crossWorkspace.listNotes`: notes in a sibling workspace as a bare array
+    /// of `{ id, title, createdAt, updatedAt }`.
+    fn cross_workspace_list_notes(
+        &self,
+        workspace_id: WorkspaceId,
+        target_workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, target_workspace_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::cross_workspace_list_notes not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `crossWorkspace.readNote`: one note in a sibling workspace as
+    /// `{ id, title, content, numberedContent, sourceWorkspaceId,
+    /// sourceWorkspaceTitle, branch, lineCount }`.
+    fn cross_workspace_read_note(
+        &self,
+        workspace_id: WorkspaceId,
+        target_workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, target_workspace_id, note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::cross_workspace_read_note not implemented".to_string(),
+            ))
+        })
+    }
 }
 
 /// Whether a context engine is usable right now (§8.1). `Unavailable` is a

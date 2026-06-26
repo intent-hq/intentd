@@ -1354,6 +1354,27 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        "crossWorkspace.listSiblings" => {
+            let ws = require_ws_note(params)?;
+            api.cross_workspace_list_siblings(ws)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "crossWorkspace.readNote" => {
+            let ws = require_ws_note(params)?;
+            let target = require_str_param(params, "targetWorkspaceId").map(WorkspaceId::from)?;
+            let note_id = require_note_id(params)?;
+            api.cross_workspace_read_note(ws, target, note_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "crossWorkspace.listNotes" => {
+            let ws = require_ws_note(params)?;
+            let target = require_str_param(params, "targetWorkspaceId").map(WorkspaceId::from)?;
+            api.cross_workspace_list_notes(ws, target)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "script.list" => {
             let ws = require_ws_note(params)?;
             api.script_list(ws).await.map_err(domain_to_rpc)

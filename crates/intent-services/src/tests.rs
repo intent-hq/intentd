@@ -215,6 +215,149 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert!(v.get("diffSummary").is_none());
 }
 
+/// `crossWorkspace.listSiblings` returns only same-`repositoryPath` peers
+/// (self filtered out, other-repo filtered out) with the PascalCase status.
+#[tokio::test]
+async fn cross_workspace_list_siblings_scopes_to_repository() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let mk = |id: &WorkspaceId, title: &str, repo: Option<&str>| {
+        let mut w = workspace(id);
+        w.title = title.to_string();
+        w.repository_path = repo.map(str::to_string);
+        w
+    };
+
+    let caller = WorkspaceId::from("ws-caller");
+    let sibling = WorkspaceId::from("ws-sibling");
+    let other_repo = WorkspaceId::from("ws-other");
+    let no_repo = WorkspaceId::from("ws-norepo");
+    store
+        .insert_workspace(&mk(&caller, "Caller", Some("/repo/a")))
+        .await
+        .unwrap();
+    store
+        .insert_workspace(&mk(&sibling, "", Some("/repo/a")))
+        .await
+        .unwrap();
+    store
+        .insert_workspace(&mk(&other_repo, "Other", Some("/repo/b")))
+        .await
+        .unwrap();
+    store
+        .insert_workspace(&mk(&no_repo, "NoRepo", None))
+        .await
+        .unwrap();
+
+    let svc = Services::new(store);
+    let v = svc
+        .cross_workspace_list_siblings(caller.clone())
+        .await
+        .expect("siblings");
+    let arr = v.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"], "ws-sibling");
+    // Empty title falls back to "Untitled"; status is PascalCase.
+    assert_eq!(arr[0]["title"], "Untitled");
+    assert_eq!(arr[0]["status"], "Active");
+    assert!(arr[0]["createdAt"].is_string());
+}
+
+/// A caller with no `repositoryPath` cannot list siblings (mirrors the TS
+/// "not associated with a repository" error).
+#[tokio::test]
+async fn cross_workspace_list_siblings_requires_repository() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let caller = WorkspaceId::from("ws-norepo");
+    store.insert_workspace(&workspace(&caller)).await.unwrap();
+    let svc = Services::new(store);
+    let err = svc
+        .cross_workspace_list_siblings(caller)
+        .await
+        .expect_err("should error");
+    match err {
+        Error::Internal(m) => assert!(m.contains("not associated with a repository"), "{m}"),
+        other => panic!("expected Internal, got {other:?}"),
+    }
+}
+
+/// Cross-repo `readNote`/`listNotes` are access-denied; a same-repo sibling
+/// note reads back with numbered content and source metadata.
+#[tokio::test]
+async fn cross_workspace_read_note_enforces_access_and_shape() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let mk = |id: &WorkspaceId, repo: &str| {
+        let mut w = workspace(id);
+        w.repository_path = Some(repo.to_string());
+        w
+    };
+    let caller = WorkspaceId::from("ws-caller");
+    let sibling = WorkspaceId::from("ws-sibling");
+    let other = WorkspaceId::from("ws-other");
+    store
+        .insert_workspace(&mk(&caller, "/repo/a"))
+        .await
+        .unwrap();
+    store
+        .insert_workspace(&mk(&sibling, "/repo/a"))
+        .await
+        .unwrap();
+    store
+        .insert_workspace(&mk(&other, "/repo/b"))
+        .await
+        .unwrap();
+    store
+        .insert_note(&note(&sibling, "sib-note", "l1\nl2"))
+        .await
+        .unwrap();
+
+    let svc = Services::new(store);
+
+    // Same-repo sibling read: full shape with numbered content + line count.
+    let v = svc
+        .cross_workspace_read_note(caller.clone(), sibling.clone(), NoteId::from("sib-note"))
+        .await
+        .expect("read");
+    assert_eq!(v["id"], "sib-note");
+    assert_eq!(v["content"], "l1\nl2");
+    assert_eq!(v["numberedContent"], "   1 | l1\n   2 | l2");
+    assert_eq!(v["sourceWorkspaceId"], "ws-sibling");
+    assert_eq!(v["lineCount"], 2);
+
+    // listNotes for the sibling returns the bare-array shape.
+    let v = svc
+        .cross_workspace_list_notes(caller.clone(), sibling.clone())
+        .await
+        .expect("list");
+    let arr = v.as_array().expect("array");
+    assert_eq!(arr[0]["id"], "sib-note");
+    assert!(arr[0]["createdAt"].is_string());
+
+    // Cross-repo access is denied.
+    let err = svc
+        .cross_workspace_list_notes(caller.clone(), other.clone())
+        .await
+        .expect_err("denied");
+    match err {
+        Error::Internal(m) => assert!(m.contains("Access denied"), "{m}"),
+        other => panic!("expected Internal, got {other:?}"),
+    }
+
+    // A missing note in a valid sibling surfaces the "Note not found" message.
+    let err = svc
+        .cross_workspace_read_note(caller, sibling, NoteId::from("nope"))
+        .await
+        .expect_err("missing");
+    match err {
+        Error::Internal(m) => assert!(m.contains("Note not found"), "{m}"),
+        other => panic!("expected Internal, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn add_persists_and_reports_position() {
     let (_tmp, svc, ws, id) = setup("# A\nbody").await;

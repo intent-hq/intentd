@@ -1020,6 +1020,46 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn cross_workspace_list_siblings(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!([{
+                "id": "sib-1", "title": "Untitled", "branch": "b", "status": "Active",
+                "createdAt": "t0", "updatedAt": "t1", "caller": workspace_id.as_str(),
+            }]))
+        })
+    }
+
+    fn cross_workspace_list_notes(
+        &self,
+        _workspace_id: WorkspaceId,
+        target_workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!([{
+                "id": "n1", "title": "t", "createdAt": "t0", "updatedAt": "t1",
+                "target": target_workspace_id.as_str(),
+            }]))
+        })
+    }
+
+    fn cross_workspace_read_note(
+        &self,
+        _workspace_id: WorkspaceId,
+        target_workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "id": note_id.as_str(), "title": "t", "content": "c",
+                "numberedContent": "   1 | c", "sourceWorkspaceId": target_workspace_id.as_str(),
+                "sourceWorkspaceTitle": "T", "branch": "b", "lineCount": 1,
+            }))
+        })
+    }
+
     fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             Ok(serde_json::json!({ "scripts": [], "workspaceId": workspace_id.as_str() }))
@@ -2492,6 +2532,67 @@ async fn primitive_methods_require_params() {
     // addAgentAction missing goal → -32602.
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addAgentAction","params":{"workspaceId":"ws-1","noteId":"n1","agentId":"a","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn cross_workspace_methods_dispatch_and_pass_params() {
+    // listSiblings → bare array; the caller workspaceId flows to the service.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.listSiblings","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v["result"].is_array());
+    assert_eq!(v["result"][0]["caller"], serde_json::json!("ws-1"));
+    // status is the PascalCase WorkspaceStatus from the workspace model.
+    assert_eq!(v["result"][0]["status"], serde_json::json!("Active"));
+
+    // listNotes → bare array; targetWorkspaceId flows through.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.listNotes","params":{"workspaceId":"ws-1","targetWorkspaceId":"ws-2"}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v["result"].is_array());
+    assert_eq!(v["result"][0]["target"], serde_json::json!("ws-2"));
+
+    // readNote → object; target + noteId flow through.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.readNote","params":{"workspaceId":"ws-1","targetWorkspaceId":"ws-2","noteId":"n9"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["id"], serde_json::json!("n9"));
+    assert_eq!(v["result"]["sourceWorkspaceId"], serde_json::json!("ws-2"));
+    assert_eq!(
+        v["result"]["numberedContent"],
+        serde_json::json!("   1 | c")
+    );
+}
+
+#[tokio::test]
+async fn cross_workspace_methods_require_params() {
+    // Missing workspaceId → -32602.
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.listSiblings","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // listNotes missing targetWorkspaceId → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.listNotes","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // readNote missing noteId → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.readNote","params":{"workspaceId":"ws-1","targetWorkspaceId":"ws-2"}}"#,
     )
     .await
     .unwrap();
