@@ -163,9 +163,13 @@ async fn dispatch(
             Ok(json!({ "workspace": ws }))
         }
         "workspace.create" => {
+            let idempotency_key = opt_str(params, "idempotencyKey");
             let input: WorkspaceCreate = serde_json::from_value(Value::Object(params.clone()))
                 .map_err(|e| rpc(INVALID_PARAMS, format!("invalid params: {e}")))?;
-            let ws = api.create_workspace(input).await.map_err(workspace_err)?;
+            let ws = api
+                .create_workspace(input, idempotency_key)
+                .await
+                .map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
         }
         "workspace.update" => {
@@ -225,13 +229,17 @@ async fn dispatch(
         "note.create" => {
             let ws = require_ws_note(params)?;
             let title = require_str_param(params, "title")?;
+            let idempotency_key = opt_str(params, "idempotencyKey");
             let input = NoteCreate {
                 title,
                 content: opt_str(params, "content"),
                 tags: opt_tags(params, "tags"),
                 parent_id: opt_str(params, "parentId"),
             };
-            let note = api.create_note(ws, input).await.map_err(domain_to_rpc)?;
+            let note = api
+                .create_note(ws, input, idempotency_key)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(json!({ "note": note }))
         }
         "note.update" => {
@@ -625,9 +633,10 @@ async fn dispatch(
             let name = opt_str(params, "name");
             let model = opt_str(params, "model");
             let specialist_id = opt_str(params, "specialistId");
+            let idempotency_key = opt_str(params, "idempotencyKey");
             // FE/RPC front door: top-level creates stay parentless.
             let result = api
-                .agent_create(ws, name, model, specialist_id, None)
+                .agent_create(ws, name, model, specialist_id, None, idempotency_key)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -875,7 +884,11 @@ async fn dispatch(
         "git.commit" => {
             let ws = require_ws_note(params)?;
             let message = require_str_param(params, "message")?;
-            let r = api.git_commit(ws, message).await.map_err(domain_to_rpc)?;
+            let idempotency_key = opt_str(params, "idempotencyKey");
+            let r = api
+                .git_commit(ws, message, idempotency_key)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(json!({ "ok": true, "hash": r.hash, "files": r.files }))
         }
         "git.agentCommit" => {
@@ -950,8 +963,15 @@ async fn dispatch(
             let merge_method = opt_str(params, "mergeMethod");
             let commit_title = opt_str(params, "commitTitle");
             let commit_message = opt_str(params, "commitMessage");
+            let idempotency_key = opt_str(params, "idempotencyKey");
             let r = api
-                .pr_merge(ws, merge_method, commit_title, commit_message)
+                .pr_merge(
+                    ws,
+                    merge_method,
+                    commit_title,
+                    commit_message,
+                    idempotency_key,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

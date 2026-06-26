@@ -95,7 +95,11 @@ impl WorkspaceApi for FakeApi {
             Ok(ws_with(&id))
         })
     }
-    fn create_workspace(&self, input: WorkspaceCreate) -> BoxFuture<'_, Result<Workspace>> {
+    fn create_workspace(
+        &self,
+        input: WorkspaceCreate,
+        _idempotency_key: Option<String>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
         Box::pin(async move {
             let mut ws = sample_ws();
             if let Some(t) = input.title {
@@ -192,6 +196,7 @@ impl WorkspaceApi for FakeApi {
         &self,
         workspace_id: WorkspaceId,
         input: NoteCreate,
+        _idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<Note>> {
         Box::pin(async move {
             let mut note = sample_note(&workspace_id);
@@ -695,6 +700,7 @@ impl WorkspaceApi for FakeApi {
         &self,
         _workspace_id: WorkspaceId,
         message: String,
+        _idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<GitCommitResult>> {
         Box::pin(async move {
             if message == "boom" {

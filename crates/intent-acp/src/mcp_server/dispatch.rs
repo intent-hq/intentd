@@ -75,6 +75,7 @@ impl WorkspaceMcpServer {
                         tags: opt_vec_str(args, "tags"),
                         parent_id: None,
                     },
+                    opt_str(args, "idempotencyKey"),
                 )
                 .await),
             "add_to_note_workspace-mcp" => {
