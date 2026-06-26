@@ -1006,8 +1006,10 @@ async fn query_filters_and_defaults_limit_50() {
         )
         .await
         .expect("query");
+    let only_user = only_user.as_array().expect("bare array (non-paginated)");
     assert_eq!(only_user.len(), 1);
-    assert_eq!(only_user[0].actor.actor_type, ActorType::User);
+    let ev: intent_core::Event = serde_json::from_value(only_user[0].clone()).expect("event");
+    assert_eq!(ev.actor.actor_type, ActorType::User);
 
     // An unknown actorType matches nothing.
     let none = svc
@@ -1020,7 +1022,79 @@ async fn query_filters_and_defaults_limit_50() {
         )
         .await
         .expect("query");
-    assert!(none.is_empty());
+    assert!(none.as_array().expect("bare array").is_empty());
+}
+
+/// TA-2 / §5.5: `event.query` is opt-in paginated. Without `paginate`/`page_token`
+/// it returns the legacy bare array; with it, it returns the `{ items, nextToken }`
+/// envelope (newest→oldest, clamped limit) and an opaque token that walks
+/// backward to exhaustion.
+#[tokio::test]
+async fn query_opt_in_pagination_envelope_and_token() {
+    let (_tmp, svc, ws) = event_setup().await;
+    for i in 0..3 {
+        insert_file_event(
+            &svc,
+            &ws,
+            ActorType::Agent,
+            Some("a"),
+            &format!("2026-01-01T00:00:0{i}Z"),
+            &format!("f{i}.rs"),
+        )
+        .await;
+    }
+
+    // Page 1 (opt in via `paginate`): newest two, envelope shape, token present.
+    let p1 = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(2),
+                paginate: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("p1");
+    let items1 = p1["items"].as_array().expect("envelope items");
+    assert_eq!(items1.len(), 2);
+    // Newest→oldest: f2 then f1.
+    assert_eq!(items1[0]["data"]["path"], "f2.rs");
+    assert_eq!(items1[1]["data"]["path"], "f1.rs");
+    let token = p1["nextToken"].as_str().expect("nextToken").to_string();
+    assert!(token.parse::<u64>().is_err(), "token is opaque");
+
+    // Page 2 follows the token: the oldest event, then exhaustion.
+    let p2 = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(2),
+                page_token: Some(token),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("p2");
+    let items2 = p2["items"].as_array().unwrap();
+    assert_eq!(items2.len(), 1);
+    assert_eq!(items2[0]["data"]["path"], "f0.rs");
+    assert!(p2["nextToken"].is_null());
+
+    // An over-max limit clamps to 200; all three fit in one page, no token.
+    let clamped = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(10_000),
+                paginate: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("clamped");
+    assert_eq!(clamped["items"].as_array().unwrap().len(), 3);
+    assert!(clamped["nextToken"].is_null());
 }
 
 #[tokio::test]
@@ -2723,7 +2797,7 @@ mod file_tracking {
         let svc = Services::new(store);
 
         let result = svc
-            .file_tracking_load_commits(ws_id, Some(10))
+            .file_tracking_load_commits(ws_id, Some(10), None)
             .await
             .unwrap();
         let commits = result["commits"].as_array().unwrap();
@@ -3679,7 +3753,7 @@ mod terminal {
         // No output yet -> sentinel string.
         let empty = h
             .services
-            .terminal_read_output(h.ws.clone(), terminal_id.clone(), None)
+            .terminal_read_output(h.ws.clone(), terminal_id.clone(), None, None, None)
             .await
             .expect("readOutput empty");
         assert_eq!(empty, serde_json::json!("Terminal has no output yet."));
@@ -3692,7 +3766,7 @@ mod terminal {
 
         let out = h
             .services
-            .terminal_read_output(h.ws.clone(), terminal_id.clone(), Some(50))
+            .terminal_read_output(h.ws.clone(), terminal_id.clone(), Some(50), None, None)
             .await
             .expect("readOutput");
         let text = out.as_str().expect("readOutput is a bare string");
@@ -3706,14 +3780,14 @@ mod terminal {
         // Unknown id and cross-workspace access map to internal errors.
         let unknown = h
             .services
-            .terminal_read_output(h.ws.clone(), "pty-99999".into(), None)
+            .terminal_read_output(h.ws.clone(), "pty-99999".into(), None, None, None)
             .await
             .unwrap_err();
         assert!(matches!(unknown, intent_core::Error::Internal(_)));
         let other_ws = WorkspaceId::new();
         let wrong = h
             .services
-            .terminal_read_output(other_ws, terminal_id.clone(), None)
+            .terminal_read_output(other_ws, terminal_id.clone(), None, None, None)
             .await
             .unwrap_err();
         assert!(matches!(wrong, intent_core::Error::Internal(_)));
@@ -3916,7 +3990,7 @@ mod script {
 
         let out = h
             .services
-            .script_output(id.clone(), Some(10))
+            .script_output(id.clone(), Some(10), None, None)
             .await
             .expect("output");
         let text = out
@@ -3940,7 +4014,11 @@ mod script {
     async fn output_empty_buffer_returns_placeholder() {
         let h = harness().await;
         let id = create(&h, "idle", "echo never-started", ScriptMode::Command).await;
-        let out = h.services.script_output(id, None).await.expect("output");
+        let out = h
+            .services
+            .script_output(id, None, None, None)
+            .await
+            .expect("output");
         assert_eq!(out, Value::String("No output yet.".to_string()));
     }
 

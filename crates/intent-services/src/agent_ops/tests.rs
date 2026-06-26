@@ -384,7 +384,7 @@ async fn get_conversation_truncates_to_limit() {
             .expect("append");
     }
     let res = svc
-        .agent_get_conversation_op(id.clone(), Some(2))
+        .agent_get_conversation_op(id.clone(), Some(2), None)
         .await
         .expect("conv");
     assert_eq!(res["totalMessages"], 5);
@@ -395,6 +395,74 @@ async fn get_conversation_truncates_to_limit() {
     // (TS `AgentMessage`), never `content`.
     assert_eq!(messages[1]["contentBlocks"][0]["text"], "m4");
     assert!(messages[1].get("content").is_none());
+}
+
+/// TA-2 / §5.5: `agent.getConversation` exposes an additive opaque `nextToken`
+/// that walks backward to older pages; the page array stays oldest→newest and
+/// the token is `null` once the oldest message has been returned. An absent
+/// limit uses the default page (50) and clamps over-max requests to 200.
+#[tokio::test]
+async fn get_conversation_paginates_with_opaque_next_token() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Pager").await;
+    for i in 0..5 {
+        let c = json!([{ "type": "text", "text": format!("m{i}") }]);
+        svc.store()
+            .append_agent_message(&id, "assistant", &c, &now_iso())
+            .await
+            .expect("append");
+    }
+
+    // Page 1: newest two, oldest→newest within the page, nextToken present.
+    let p1 = svc
+        .agent_get_conversation_op(id.clone(), Some(2), None)
+        .await
+        .expect("p1");
+    assert_eq!(p1["totalMessages"], 5);
+    assert_eq!(p1["truncated"], true);
+    let m1 = p1["messages"].as_array().unwrap();
+    assert_eq!(m1.len(), 2);
+    assert_eq!(m1[0]["contentBlocks"][0]["text"], "m3");
+    assert_eq!(m1[1]["contentBlocks"][0]["text"], "m4");
+    let t1 = p1["nextToken"].as_str().expect("nextToken").to_string();
+    // Opaque: not a bare numeric offset.
+    assert!(t1.parse::<u64>().is_err());
+
+    // Page 2 follows the token to the next-older window.
+    let p2 = svc
+        .agent_get_conversation_op(id.clone(), Some(2), Some(t1))
+        .await
+        .expect("p2");
+    let m2 = p2["messages"].as_array().unwrap();
+    assert_eq!(m2[0]["contentBlocks"][0]["text"], "m1");
+    assert_eq!(m2[1]["contentBlocks"][0]["text"], "m2");
+    let t2 = p2["nextToken"].as_str().expect("nextToken2").to_string();
+
+    // Page 3 is the final page: oldest message, no further token.
+    let p3 = svc
+        .agent_get_conversation_op(id.clone(), Some(2), Some(t2))
+        .await
+        .expect("p3");
+    let m3 = p3["messages"].as_array().unwrap();
+    assert_eq!(m3.len(), 1);
+    assert_eq!(m3[0]["contentBlocks"][0]["text"], "m0");
+    assert!(p3["nextToken"].is_null());
+    assert_eq!(p3["truncated"], false);
+
+    // No limit → default page returns all five with no token; an over-max limit
+    // clamps to 200 and likewise fits all five in one page.
+    let all = svc
+        .agent_get_conversation_op(id.clone(), None, None)
+        .await
+        .expect("all");
+    assert_eq!(all["messages"].as_array().unwrap().len(), 5);
+    assert!(all["nextToken"].is_null());
+    let clamped = svc
+        .agent_get_conversation_op(id, Some(10_000), None)
+        .await
+        .expect("clamped");
+    assert_eq!(clamped["messages"].as_array().unwrap().len(), 5);
+    assert!(clamped["nextToken"].is_null());
 }
 
 #[tokio::test]
@@ -496,7 +564,10 @@ async fn send_message_delivers_when_agent_exists() {
         .expect("send");
     assert_eq!(r["queued"], false);
     assert_eq!(r["messageId"], "m1");
-    let conv = svc.agent_get_conversation_op(id, None).await.expect("conv");
+    let conv = svc
+        .agent_get_conversation_op(id, None, None)
+        .await
+        .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
     assert_eq!(conv["messages"][0]["role"], "user");
 }

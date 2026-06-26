@@ -549,9 +549,10 @@ async fn dispatch(
                 path: opt_str(params, "path"),
                 minutes_ago: opt_int(params, "minutesAgo"),
                 limit: opt_int(params, "limit"),
+                paginate: params.get("paginate").and_then(Value::as_bool),
+                page_token: opt_str(params, "nextToken"),
             };
-            let result = api.event_query(ws, query).await.map_err(domain_to_rpc)?;
-            to_result_value(&result)
+            api.event_query(ws, query).await.map_err(domain_to_rpc)
         }
         "event.subscribe" => {
             let ws = require_ws_note(params)?;
@@ -599,7 +600,11 @@ async fn dispatch(
             let agent_id = require_agent_id(params)?;
             let limit = opt_int(params, "limit");
             let ws = opt_workspace_id(params);
-            match api.agent_get_conversation(agent_id, limit, ws).await {
+            let page_token = opt_str(params, "nextToken");
+            match api
+                .agent_get_conversation(agent_id, limit, ws, page_token)
+                .await
+            {
                 Ok(v) => Ok(v),
                 Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
                 Err(e) => Err(domain_to_rpc(e)),
@@ -1027,8 +1032,9 @@ async fn dispatch(
         "file-tracking.loadCommits" => {
             let ws = require_ws_note(params)?;
             let limit = opt_int(params, "limit");
+            let page_token = opt_str(params, "nextToken");
             let r = api
-                .file_tracking_load_commits(ws, limit)
+                .file_tracking_load_commits(ws, limit, page_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -1294,7 +1300,9 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let terminal_id = require_str_param(params, "terminalId")?;
             let max_lines = opt_int(params, "maxLines");
-            api.terminal_read_output(ws, terminal_id, max_lines)
+            let paginate = params.get("paginate").and_then(Value::as_bool);
+            let page_token = opt_str(params, "nextToken");
+            api.terminal_read_output(ws, terminal_id, max_lines, paginate, page_token)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -1424,7 +1432,9 @@ async fn dispatch(
         "script.output" => {
             let script_id = require_str_param(params, "scriptId")?;
             let max_lines = opt_int(params, "maxLines");
-            api.script_output(script_id, max_lines)
+            let paginate = params.get("paginate").and_then(Value::as_bool);
+            let page_token = opt_str(params, "nextToken");
+            api.script_output(script_id, max_lines, paginate, page_token)
                 .await
                 .map_err(domain_to_rpc)
         }

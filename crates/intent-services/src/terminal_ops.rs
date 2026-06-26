@@ -154,6 +154,8 @@ pub(crate) fn read_output(
     workspace_id: &WorkspaceId,
     terminal_id: &str,
     max_lines: Option<i64>,
+    paginate: bool,
+    page_token: Option<String>,
 ) -> Result<Value> {
     let id = PtyId::parse(terminal_id)
         .ok_or_else(|| Error::Internal(format!("Terminal not found: {terminal_id}")))?;
@@ -168,6 +170,19 @@ pub(crate) fn read_output(
 
     let bytes = pty.scrollback(id)?;
     let raw = String::from_utf8_lossy(&bytes);
+
+    // TA-2 / §5.5 opt-in pagination: when engaged, return the historical
+    // scrollback as a `{ items, nextToken }` envelope of ANSI-stripped lines
+    // ordered newest→oldest, with an opaque append-stable continuation token.
+    // Absent the opt-in, preserve the legacy bare formatted string verbatim.
+    if paginate || page_token.is_some() {
+        return Ok(crate::pagination::paginate_text_lines(
+            &strip_ansi(&raw),
+            max_lines,
+            page_token.as_deref(),
+        ));
+    }
+
     if raw.trim().is_empty() {
         return Ok(Value::String("Terminal has no output yet.".to_string()));
     }

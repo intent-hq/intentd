@@ -158,7 +158,18 @@ impl ScriptManager {
     /// (mirrors `ws.script.output`, PROTOCOL §5.8). The trailing `max_lines`
     /// (default 100) are returned under a `[... lines]` header; an empty buffer
     /// yields `"No output yet."`.
-    pub(crate) fn output(&self, script_id: &str, max_lines: Option<i64>) -> Result<Value> {
+    ///
+    /// TA-2 / §5.5 opt-in pagination: when `paginate` (or a `page_token`) is set,
+    /// the historical scrollback is returned as a `{ items, nextToken }` envelope
+    /// of lines ordered newest→oldest with an opaque continuation token, instead
+    /// of the legacy bare string.
+    pub(crate) fn output(
+        &self,
+        script_id: &str,
+        max_lines: Option<i64>,
+        paginate: bool,
+        page_token: Option<String>,
+    ) -> Result<Value> {
         let pty_id = {
             let guard = self.scripts.lock().unwrap();
             let m = guard
@@ -173,6 +184,13 @@ impl ScriptManager {
             }
             None => String::new(),
         };
+        if paginate || page_token.is_some() {
+            return Ok(crate::pagination::paginate_text_lines(
+                &buffer,
+                max_lines,
+                page_token.as_deref(),
+            ));
+        }
         let line_count = clamp_line_count(max_lines, 100);
         let text = last_n_lines(&buffer, line_count);
         if text.trim().is_empty() {

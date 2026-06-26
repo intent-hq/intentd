@@ -33,9 +33,6 @@ use crate::Services;
 #[cfg(test)]
 mod tests;
 
-/// Default `agent.getConversation` cap (TS `MAX_WEBSOCKET_CONVERSATION_MESSAGES`).
-const MAX_CONVERSATION_MESSAGES: i64 = 200;
-
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
 #[derive(Debug, Clone)]
 pub(crate) struct QueuedMessage {
@@ -320,26 +317,28 @@ impl Services {
         Ok(project_lite(session))
     }
 
-    /// `agent.getConversation` (PROTOCOL §5.5).
+    /// `agent.getConversation` (PROTOCOL §5.5). Paginated per the TA-2 contract:
+    /// the limit clamps to `[1,200]` (default 50) and an opaque `nextToken`
+    /// walks backward to older pages. The `messages` array stays oldest→newest
+    /// within a page (wire parity with the TS handler); `nextToken` is additive
+    /// and is `null` once the oldest message has been returned.
     pub(crate) async fn agent_get_conversation_op(
         &self,
         agent_id: AgentId,
         limit: Option<i64>,
+        page_token: Option<String>,
     ) -> Result<Value> {
         let session = self.store.get_agent_session(&agent_id).await?;
-        let mut messages = session.messages;
-        let total = messages.len() as i64;
-        let limit = limit.unwrap_or(MAX_CONVERSATION_MESSAGES);
-        let truncated = limit >= 0 && total > limit;
-        if truncated {
-            let start = (total - limit) as usize;
-            messages = messages.split_off(start);
-        }
+        let messages = session.messages;
+        let total = messages.len();
+        let win = crate::pagination::page_window(total, limit, page_token.as_deref());
+        let page = &messages[win.start..win.end];
         Ok(json!({
             "agentId": agent_id,
-            "messages": messages,
-            "truncated": truncated,
+            "messages": page,
+            "truncated": win.next_token.is_some(),
             "totalMessages": total,
+            "nextToken": win.next_token,
         }))
     }
 

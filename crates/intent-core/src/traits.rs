@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId};
 use crate::model::{
     AgentDelegateInput, AgentLite, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
-    CommentListResult, CommentRespondResult, Draft, Event, EventQueryParams, EventSubscribeResult,
+    CommentListResult, CommentRespondResult, Draft, EventQueryParams, EventSubscribeResult,
     EventUnsubscribeResult, FileActivity, GitAgentCommitResult, GitBranches, GitCommitResult,
     GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
     NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteSetContentResult,
@@ -476,8 +476,9 @@ pub trait WorkspaceApi: Send + Sync {
         agent_id: AgentId,
         limit: Option<i64>,
         workspace_id: Option<WorkspaceId>,
+        page_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, limit, workspace_id);
+        let _ = (agent_id, limit, workspace_id, page_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_get_conversation not implemented".to_string(),
@@ -1005,11 +1006,14 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `event.query`: filtered event query over the append-only log (§5.10).
+    /// Returns the legacy bare array by default; when `params.paginate` (or a
+    /// `params.page_token`) is set it returns the `{ items, nextToken }`
+    /// pagination envelope (TA-2 / §5.5), newest→oldest with the limit clamped.
     fn event_query(
         &self,
         workspace_id: WorkspaceId,
         params: EventQueryParams,
-    ) -> BoxFuture<'_, Result<Vec<Event>>> {
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (workspace_id, params);
         Box::pin(async {
             Err(Error::Internal(
@@ -1397,8 +1401,9 @@ pub trait WorkspaceApi: Send + Sync {
         &self,
         workspace_id: WorkspaceId,
         limit: Option<i64>,
+        page_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, limit);
+        let _ = (workspace_id, limit, page_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_tracking_load_commits not implemented".to_string(),
@@ -2138,8 +2143,10 @@ pub trait WorkspaceApi: Send + Sync {
         workspace_id: WorkspaceId,
         terminal_id: String,
         max_lines: Option<i64>,
+        paginate: Option<bool>,
+        page_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, terminal_id, max_lines);
+        let _ = (workspace_id, terminal_id, max_lines, paginate, page_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::terminal_read_output not implemented".to_string(),
@@ -2228,8 +2235,10 @@ pub trait WorkspaceApi: Send + Sync {
         &self,
         script_id: String,
         max_lines: Option<i64>,
+        paginate: Option<bool>,
+        page_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (script_id, max_lines);
+        let _ = (script_id, max_lines, paginate, page_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_output not implemented".to_string(),
