@@ -564,8 +564,10 @@ async fn dispatch(
                     .collect::<Vec<_>>(),
                 _ => return Err(rpc(INVALID_PARAMS, "eventTypes must be an array")),
             };
+            let exclude_self = params.get("excludeSelf").and_then(Value::as_bool);
+            let batch_window = opt_int(params, "batchWindow");
             let result = api
-                .event_subscribe(ws, event_types)
+                .event_subscribe(ws, event_types, exclude_self, batch_window)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -784,6 +786,17 @@ async fn dispatch(
             let agent_id = require_agent_id(params)?;
             let result = api
                 .agent_cancel_subscriptions(ws, agent_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.diagnostics" => {
+            let ws = require_ws_note(params)?;
+            let agent_id = opt_str(params, "agentId").map(AgentId::from);
+            let task_note_id = opt_str(params, "taskNoteId").map(NoteId::from);
+            let stale_responding_after_ms = opt_int(params, "staleRespondingAfterMs");
+            let result = api
+                .agent_diagnostics(ws, agent_id, task_note_id, stale_responding_after_ms)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -1276,6 +1289,14 @@ async fn dispatch(
         "terminal.list" => {
             let ws = require_ws_note(params)?;
             api.terminal_list(ws).await.map_err(domain_to_rpc)
+        }
+        "terminal.readOutput" => {
+            let ws = require_ws_note(params)?;
+            let terminal_id = require_str_param(params, "terminalId")?;
+            let max_lines = opt_int(params, "maxLines");
+            api.terminal_read_output(ws, terminal_id, max_lines)
+                .await
+                .map_err(domain_to_rpc)
         }
         "file.read" => {
             let ws = require_ws_note(params)?;

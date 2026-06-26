@@ -721,6 +721,31 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.diagnostics`: a sanitized snapshot of agent statuses,
+    /// subscriptions, delegation groups, and stuck-risk signals as
+    /// `{ ok, diagnostics, text }` (PROTOCOL §5.5). Optional `agent_id` /
+    /// `task_note_id` focus the snapshot; `stale_responding_after_ms` tunes the
+    /// stale-responding threshold (default 600000).
+    fn agent_diagnostics(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        task_note_id: Option<NoteId>,
+        stale_responding_after_ms: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            agent_id,
+            task_note_id,
+            stale_responding_after_ms,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_diagnostics not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.reportToParent`: child→parent report; `-32603` when the caller is
     /// not a delegated agent (PROTOCOL §5.5).
     ///
@@ -995,12 +1020,15 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `event.subscribe` (deprecated alias): service-style subscription result;
     /// does NOT wire WS streaming (use `events.subscribe`) (PROTOCOL §5.10/§6).
+    /// `exclude_self`/`batch_window` mirror the TS shim's forwarded options.
     fn event_subscribe(
         &self,
         workspace_id: WorkspaceId,
         event_types: Vec<String>,
+        exclude_self: Option<bool>,
+        batch_window: Option<i64>,
     ) -> BoxFuture<'_, Result<EventSubscribeResult>> {
-        let _ = (workspace_id, event_types);
+        let _ = (workspace_id, event_types, exclude_self, batch_window);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::event_subscribe not implemented".to_string(),
@@ -2091,13 +2119,30 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `terminal.list`: the workspace's live terminals as `{ terminals: [...] }`
-    /// (PROTOCOL §5.9).
+    /// `terminal.list`: the workspace's live terminals as a bare array
+    /// `[{ id, name, cwd, isExecutingCommand }]` (PROTOCOL §5.9).
     fn terminal_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = workspace_id;
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::terminal_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `terminal.readOutput`: a formatted, ANSI-stripped string view of a
+    /// terminal's scrollback, keeping the trailing `max_lines` (default 200)
+    /// (PROTOCOL §5.13).
+    fn terminal_read_output(
+        &self,
+        workspace_id: WorkspaceId,
+        terminal_id: String,
+        max_lines: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, terminal_id, max_lines);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::terminal_read_output not implemented".to_string(),
             ))
         })
     }

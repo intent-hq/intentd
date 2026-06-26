@@ -146,8 +146,23 @@ struct Fanout {
     tx: broadcast::Sender<Arc<Vec<u8>>>,
 }
 
+/// A point-in-time view of a tracked PTY's metadata (`terminal.list` /
+/// `terminal.readOutput`). `cwd` is the working directory resolved at spawn;
+/// `alive` reflects whether the child has not yet exited.
+#[derive(Clone, Debug)]
+pub struct PtyInfo {
+    /// Lifetime scope the PTY was spawned under (workspace or session id).
+    pub scope: String,
+    /// Working directory resolved at spawn, if one could be determined.
+    pub cwd: Option<String>,
+    /// Whether the child process has not yet exited.
+    pub alive: bool,
+}
+
 struct PtySession {
     scope: String,
+    /// Working directory resolved at spawn (`spec.cwd`, else the daemon's cwd).
+    cwd: Option<String>,
     pid: Option<u32>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     writer: Mutex<Box<dyn Write + Send>>,
@@ -232,8 +247,19 @@ impl PtyHost {
         let reader_fanout = Arc::clone(&fanout);
         let handle = std::thread::spawn(move || read_loop(reader, reader_fanout));
 
+        let cwd = spec
+            .cwd
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            });
+
         let session = Arc::new(PtySession {
             scope: spec.scope,
+            cwd,
             pid,
             master: Mutex::new(Some(pair.master)),
             writer: Mutex::new(writer),
@@ -338,6 +364,19 @@ impl PtyHost {
             Some(session) => matches!(session.child.lock().unwrap().try_wait(), Ok(None)),
             None => false,
         }
+    }
+
+    /// Metadata for one tracked PTY (`terminal.list` / `terminal.readOutput`):
+    /// its `scope`, working directory, and whether its child is still running.
+    /// `None` when the id is unknown.
+    pub fn info(&self, id: PtyId) -> Option<PtyInfo> {
+        let session = self.sessions.lock().unwrap().get(&id).cloned()?;
+        let alive = matches!(session.child.lock().unwrap().try_wait(), Ok(None));
+        Some(PtyInfo {
+            scope: session.scope.clone(),
+            cwd: session.cwd.clone(),
+            alive,
+        })
     }
 
     /// Number of PTYs currently tracked.

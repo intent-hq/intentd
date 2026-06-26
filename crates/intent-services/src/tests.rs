@@ -1027,12 +1027,16 @@ async fn query_filters_and_defaults_limit_50() {
 async fn subscribe_resolves_star_and_unsubscribe_roundtrips() {
     let (_tmp, svc, ws) = event_setup().await;
     // Empty eventTypes → error (TS resolveSubscriptionEventTypes guard).
-    let err = svc.event_subscribe(ws.clone(), vec![]).await.unwrap_err();
+    let err = svc
+        .event_subscribe(ws.clone(), vec![], None, None)
+        .await
+        .unwrap_err();
     assert!(matches!(err, Error::Internal(m) if m.contains("eventTypes is required")));
 
-    // Bare `*` expands to the category wildcards.
+    // Bare `*` expands to the category wildcards; `excludeSelf`/`batchWindow`
+    // are accepted (TS shim forwards them) without changing the result shape.
     let sub = svc
-        .event_subscribe(ws.clone(), vec!["*".to_string()])
+        .event_subscribe(ws.clone(), vec!["*".to_string()], Some(true), Some(250))
         .await
         .expect("subscribe");
     assert!(sub.event_types.contains(&"agent:*".to_string()));
@@ -3642,16 +3646,77 @@ mod terminal {
             .expect("resize");
 
         let list = h.services.terminal_list(h.ws.clone()).await.expect("list");
-        let ids: Vec<&str> = list["terminals"]
-            .as_array()
-            .expect("terminals")
+        let terminals = list.as_array().expect("bare terminals array");
+        let entry = terminals
             .iter()
-            .filter_map(|t| t["id"].as_str())
-            .collect();
+            .find(|t| t["id"].as_str() == Some(terminal_id.as_str()))
+            .expect("list contains terminal");
+        // Bare-array shape: { id, name, cwd, isExecutingCommand }.
+        assert_eq!(entry["name"], "Terminal");
+        assert!(entry["cwd"].is_string(), "cwd is a string");
         assert!(
-            ids.contains(&terminal_id.as_str()),
-            "list contains terminal"
+            entry["isExecutingCommand"].is_boolean(),
+            "isExecutingCommand is a boolean"
         );
+
+        h.services.terminal_kill(terminal_id).await.expect("kill");
+    }
+
+    /// `terminal.readOutput` returns a formatted, ANSI-stripped string: a header
+    /// (`Terminal {id} (cwd: ...)`), a `─`×40 separator, then the trailing lines.
+    /// A freshly created terminal with no output returns the empty sentinel.
+    #[tokio::test]
+    async fn read_output_formats_scrollback_and_empty_sentinel() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let created = h
+            .services
+            .terminal_create(h.ws.clone(), 80, 24, None, Some("cat".into()))
+            .await
+            .expect("create");
+        let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+
+        // No output yet -> sentinel string.
+        let empty = h
+            .services
+            .terminal_read_output(h.ws.clone(), terminal_id.clone(), None)
+            .await
+            .expect("readOutput empty");
+        assert_eq!(empty, serde_json::json!("Terminal has no output yet."));
+
+        h.services
+            .terminal_write(terminal_id.clone(), b64("READOUT-MARK\n"))
+            .await
+            .expect("write");
+        drain_until(&mut sub, "terminal:data", Duration::from_secs(5)).await;
+
+        let out = h
+            .services
+            .terminal_read_output(h.ws.clone(), terminal_id.clone(), Some(50))
+            .await
+            .expect("readOutput");
+        let text = out.as_str().expect("readOutput is a bare string");
+        assert!(
+            text.starts_with(&format!("Terminal {terminal_id} (cwd: ")),
+            "header present: {text}"
+        );
+        assert!(text.contains(&"\u{2500}".repeat(40)), "separator present");
+        assert!(text.contains("READOUT-MARK"), "echoed output present");
+
+        // Unknown id and cross-workspace access map to internal errors.
+        let unknown = h
+            .services
+            .terminal_read_output(h.ws.clone(), "pty-99999".into(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(unknown, intent_core::Error::Internal(_)));
+        let other_ws = WorkspaceId::new();
+        let wrong = h
+            .services
+            .terminal_read_output(other_ws, terminal_id.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(wrong, intent_core::Error::Internal(_)));
 
         h.services.terminal_kill(terminal_id).await.expect("kill");
     }
@@ -3972,9 +4037,9 @@ mod script {
 
         // The script's PTY appears in the workspace's terminal list...
         let list = h.services.terminal_list(h.ws.clone()).await.expect("list");
-        let term_id = list["terminals"]
+        let term_id = list
             .as_array()
-            .expect("terminals")
+            .expect("bare terminals array")
             .iter()
             .filter_map(|t| t["id"].as_str())
             .next()

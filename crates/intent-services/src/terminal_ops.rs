@@ -113,15 +113,159 @@ pub(crate) fn get_buffer(
     Ok(json!({ "terminalId": terminal_id, "data": data }))
 }
 
-/// The workspace's live terminals (`{ terminals: [{ id, alive }] }`).
+/// The workspace's live terminals as a bare array
+/// `[{ id, name, cwd, isExecutingCommand }]` (TS `ws.terminal.list`). The daemon
+/// tracks no terminal title, so `name` is the constant `"Terminal"`; `cwd` is the
+/// working directory resolved at spawn; `isExecutingCommand` is the child's
+/// liveness (the spawned process is the running command).
 pub(crate) fn list(pty: &PtyHost, workspace_id: &WorkspaceId) -> Result<Value> {
-    let mut terminals: Vec<Value> = pty
+    let mut terminals: Vec<(String, Value)> = pty
         .list_scope(workspace_id.as_str())
         .into_iter()
-        .map(|id| json!({ "id": id.to_string(), "alive": pty.is_alive(id) }))
+        .map(|id| {
+            let id_str = id.to_string();
+            let info = pty.info(id);
+            let cwd = info
+                .as_ref()
+                .and_then(|i| i.cwd.clone())
+                .unwrap_or_default();
+            let is_executing = info.map(|i| i.alive).unwrap_or(false);
+            let value = json!({
+                "id": id_str,
+                "name": "Terminal",
+                "cwd": cwd,
+                "isExecutingCommand": is_executing,
+            });
+            (id_str, value)
+        })
         .collect();
-    terminals.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-    Ok(json!({ "terminals": terminals }))
+    terminals.sort_by(|a, b| a.0.cmp(&b.0));
+    let terminals: Vec<Value> = terminals.into_iter().map(|(_, v)| v).collect();
+    Ok(Value::Array(terminals))
+}
+
+/// `terminal.readOutput`: a formatted, ANSI-stripped view of a terminal's
+/// scrollback (TS `ws.terminal.readOutput`). Returns a bare string: a header
+/// (`Terminal {id} (cwd: ...)[ showing last N of M lines]`), a `─`×40 separator,
+/// then the trailing `max_lines` (default 200, clamped to 1..=10000) lines with
+/// trailing blank lines trimmed; or `"Terminal has no output yet."` when empty.
+pub(crate) fn read_output(
+    pty: &PtyHost,
+    workspace_id: &WorkspaceId,
+    terminal_id: &str,
+    max_lines: Option<i64>,
+) -> Result<Value> {
+    let id = PtyId::parse(terminal_id)
+        .ok_or_else(|| Error::Internal(format!("Terminal not found: {terminal_id}")))?;
+    let info = pty
+        .info(id)
+        .ok_or_else(|| Error::Internal(format!("Terminal not found: {terminal_id}")))?;
+    if info.scope != workspace_id.as_str() {
+        return Err(Error::Internal(
+            "Terminal does not belong to this workspace".to_string(),
+        ));
+    }
+
+    let bytes = pty.scrollback(id)?;
+    let raw = String::from_utf8_lossy(&bytes);
+    if raw.trim().is_empty() {
+        return Ok(Value::String("Terminal has no output yet.".to_string()));
+    }
+
+    let clean = strip_ansi(&raw);
+    let lines: Vec<&str> = clean.split('\n').collect();
+    let max_line_count = max_lines.unwrap_or(200).clamp(1, 10000) as usize;
+    let mut output_lines: Vec<&str> = if lines.len() > max_line_count {
+        lines[lines.len() - max_line_count..].to_vec()
+    } else {
+        lines.clone()
+    };
+    while output_lines
+        .last()
+        .map(|l| l.trim().is_empty())
+        .unwrap_or(false)
+    {
+        output_lines.pop();
+    }
+
+    let truncated = lines.len() > max_line_count;
+    let cwd = info.cwd.unwrap_or_default();
+    let header = if truncated {
+        format!(
+            "Terminal {terminal_id} (cwd: {cwd}) [showing last {max_line_count} of {} lines]",
+            lines.len()
+        )
+    } else {
+        format!("Terminal {terminal_id} (cwd: {cwd})")
+    };
+    let separator = "\u{2500}".repeat(40);
+    Ok(Value::String(format!(
+        "{header}\n{separator}\n{}",
+        output_lines.join("\n")
+    )))
+}
+
+/// Strip ANSI escape sequences from terminal output, mirroring the TS
+/// `readOutput` regex (`CSI`/`OSC`/private-mode sequences).
+fn strip_ansi(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            // ESC
+            match bytes.get(i + 1) {
+                // OSC: ESC ] ... BEL(0x07)
+                Some(b']') => {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != 0x07 {
+                        i += 1;
+                    }
+                    i += 1; // consume BEL
+                    continue;
+                }
+                // CSI: ESC [ (optional '?') params (0-9;) final letter
+                Some(b'[') => {
+                    i += 2;
+                    if i < bytes.len() && bytes[i] == b'?' {
+                        i += 1;
+                    }
+                    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b';') {
+                        i += 1;
+                    }
+                    if i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                        i += 1; // consume final byte
+                    }
+                    continue;
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        // Copy the next UTF-8 scalar intact.
+        let ch_len = utf8_len(bytes[i]);
+        let end = (i + ch_len).min(bytes.len());
+        out.push_str(&input[i..end]);
+        i = end;
+    }
+    out
+}
+
+/// Length in bytes of the UTF-8 scalar starting with `b`.
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
 }
 
 /// Attach to a freshly created PTY and fan its output onto the bus as

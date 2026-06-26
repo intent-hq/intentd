@@ -1526,3 +1526,106 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
 
     worker.abort();
 }
+
+/// `agent.diagnostics` answers `{ ok, diagnostics, text }` with the full
+/// snapshot shape: summary counts, a subscriptions view backed by completion
+/// watches, an agents view, zeroed deliveryStats, and a human-readable `text`.
+#[tokio::test]
+async fn diagnostics_snapshot_shape_and_subscriptions() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    svc.register_completion_watch(
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        true,
+        None,
+    );
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+
+    assert_eq!(result["ok"], json!(true));
+    let diag = &result["diagnostics"];
+    assert_eq!(diag["workspaceId"], json!(ws.0));
+    assert!(diag["generatedAt"].is_string());
+    assert_eq!(diag["summary"]["agents"], json!(2));
+    assert_eq!(diag["summary"]["subscriptions"], json!(1));
+    assert_eq!(diag["summary"]["queuedEvents"], json!(0));
+    assert!(diag["queues"].as_array().expect("queues").is_empty());
+    assert!(diag["recentEvents"]
+        .as_array()
+        .expect("recentEvents")
+        .is_empty());
+    // deliveryStats is the zeroed emptyDeliveryStats shape.
+    assert_eq!(diag["deliveryStats"]["droppedEvents"], json!(0));
+    assert!(diag["deliveryStats"]["lastFailureTime"].is_null());
+
+    let subs = diag["subscriptions"].as_array().expect("subscriptions");
+    assert_eq!(subs.len(), 1);
+    let sub = &subs[0];
+    assert_eq!(sub["agentId"], json!(parent.0));
+    assert_eq!(sub["agentName"], json!("Parent"));
+    assert_eq!(sub["actorIds"], json!([child.0]));
+    assert_eq!(sub["eventTypes"].as_array().expect("eventTypes").len(), 3);
+    assert_eq!(sub["priority"], json!("normal"));
+    assert_eq!(sub["oneShot"], json!(true));
+    assert_eq!(sub["orphaned"], json!(false));
+
+    assert!(result["text"]
+        .as_str()
+        .expect("text")
+        .contains("Agent diagnostics for workspace"));
+}
+
+/// `agent.diagnostics` `agentId` filter narrows the snapshot to the focused
+/// agent (and the subscription actors in its scope).
+#[tokio::test]
+async fn diagnostics_agent_filter_narrows_scope() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let _b = create_agent(&svc, &ws, "B").await;
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), Some(a.clone()), None, None)
+        .await
+        .expect("diagnostics");
+
+    let diag = &result["diagnostics"];
+    let agents = diag["agents"].as_array().expect("agents");
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["id"], json!(a.0));
+    assert_eq!(diag["filters"]["agentId"], json!(a.0));
+}
+
+/// A completion watch whose parent has no live session surfaces an
+/// `orphaned-subscription` stuck-risk signal.
+#[tokio::test]
+async fn diagnostics_flags_orphaned_subscription() {
+    let (_t, svc, ws) = setup().await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let ghost = AgentId::from("agent-ghost");
+    svc.register_completion_watch(
+        &ws,
+        ghost.clone(),
+        "Ghost".into(),
+        child.clone(),
+        true,
+        None,
+    );
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+
+    let diag = &result["diagnostics"];
+    let risks = diag["stuckRisks"].as_array().expect("stuckRisks");
+    assert!(risks
+        .iter()
+        .any(|r| r["type"] == json!("orphaned-subscription") && r["agentId"] == json!(ghost.0)));
+}

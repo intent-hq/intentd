@@ -2175,6 +2175,18 @@ impl WorkspaceApi for Services {
         Box::pin(async move { terminal_ops::list(&pty, &workspace_id) })
     }
 
+    fn terminal_read_output(
+        &self,
+        workspace_id: WorkspaceId,
+        terminal_id: String,
+        max_lines: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let pty = self.pty.clone();
+        Box::pin(
+            async move { terminal_ops::read_output(&pty, &workspace_id, &terminal_id, max_lines) },
+        )
+    }
+
     fn file_read(
         &self,
         workspace_id: WorkspaceId,
@@ -4155,6 +4167,8 @@ impl WorkspaceApi for Services {
         &self,
         _workspace_id: WorkspaceId,
         event_types: Vec<String>,
+        _exclude_self: Option<bool>,
+        _batch_window: Option<i64>,
     ) -> BoxFuture<'_, Result<EventSubscribeResult>> {
         let subs = self.event_subscriptions.clone();
         Box::pin(async move {
@@ -4670,6 +4684,24 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.agent_get_subscriptions_op(workspace_id, agent_id)
                 .await
+        })
+    }
+
+    fn agent_diagnostics(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        task_note_id: Option<NoteId>,
+        stale_responding_after_ms: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_diagnostics_op(
+                workspace_id,
+                agent_id,
+                task_note_id,
+                stale_responding_after_ms,
+            )
+            .await
         })
     }
 

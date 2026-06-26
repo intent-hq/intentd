@@ -558,6 +558,8 @@ impl WorkspaceApi for FakeApi {
         &self,
         _workspace_id: WorkspaceId,
         event_types: Vec<String>,
+        _exclude_self: Option<bool>,
+        _batch_window: Option<i64>,
     ) -> BoxFuture<'_, Result<EventSubscribeResult>> {
         Box::pin(async move {
             Ok(EventSubscribeResult {
