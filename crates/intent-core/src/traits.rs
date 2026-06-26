@@ -2399,6 +2399,93 @@ pub trait WorkspaceApi: Send + Sync {
             ))
         })
     }
+
+    // ------------------------------------------------------------------------
+    // primitive.* — append a fenced ```ws-block:<type>``` JSON primitive to a
+    // note. Each returns `{ ok: true, primitiveId, noteId, content }` where
+    // `content` is the full note text after the append, matching the TS
+    // `appendPrimitiveBlock` builder (PROTOCOL §5.x). Every primitive carries
+    // `version: 1` and `createdBy: "agent"`.
+    // ------------------------------------------------------------------------
+
+    /// `primitive.addReference`: append a `reference` primitive (`target.kind`
+    /// = `symbol` for `#symbol:` semantic ids, else `file_range`; optional code
+    /// `snapshot`).
+    fn primitive_add_reference(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        semantic_id: String,
+        description: String,
+        snapshot: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, note_id, semantic_id, description, snapshot);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::primitive_add_reference not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `primitive.addCli`: append a `cli` primitive (`cwd` defaults to `"./"`,
+    /// `display.showCommandPrefix` = `"$"`).
+    fn primitive_add_cli(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        command: String,
+        description: String,
+        working_directory: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            note_id,
+            command,
+            description,
+            working_directory,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::primitive_add_cli not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `primitive.addPatch`: append a `patch` primitive with a single-entry
+    /// `patches: [{ filePath, diff }]` array.
+    fn primitive_add_patch(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        file_path: String,
+        diff: String,
+        description: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, note_id, file_path, diff, description);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::primitive_add_patch not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `primitive.addAgentAction`: append an `agent_action` primitive with empty
+    /// `inputs`.
+    fn primitive_add_agent_action(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        agent_id: String,
+        goal: String,
+        description: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, note_id, agent_id, goal, description);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::primitive_add_agent_action not implemented".to_string(),
+            ))
+        })
+    }
 }
 
 /// Whether a context engine is usable right now (§8.1). `Unavailable` is a

@@ -956,6 +956,70 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn primitive_add_reference(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        semantic_id: String,
+        description: String,
+        snapshot: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true, "primitiveId": "p-ref", "noteId": note_id.as_str(),
+                "content": format!("{semantic_id}|{description}|{snapshot:?}"),
+            }))
+        })
+    }
+
+    fn primitive_add_cli(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        command: String,
+        description: String,
+        working_directory: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true, "primitiveId": "p-cli", "noteId": note_id.as_str(),
+                "content": format!("{command}|{description}|{working_directory:?}"),
+            }))
+        })
+    }
+
+    fn primitive_add_patch(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        file_path: String,
+        diff: String,
+        description: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true, "primitiveId": "p-patch", "noteId": note_id.as_str(),
+                "content": format!("{file_path}|{diff}|{description}"),
+            }))
+        })
+    }
+
+    fn primitive_add_agent_action(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        agent_id: String,
+        goal: String,
+        description: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true, "primitiveId": "p-action", "noteId": note_id.as_str(),
+                "content": format!("{agent_id}|{goal}|{description}"),
+            }))
+        })
+    }
+
     fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             Ok(serde_json::json!({ "scripts": [], "workspaceId": workspace_id.as_str() }))
@@ -2339,6 +2403,95 @@ async fn file_methods_require_params() {
     // file.rename missing newPath → -32602.
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"file.rename","params":{"workspaceId":"ws-1","oldPath":"a"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn primitive_methods_dispatch_and_pass_params() {
+    // addReference: required semanticId/description flow through; snapshot optional.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addReference","params":{"workspaceId":"ws-1","noteId":"n1","semanticId":"src/a.ts#L1","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["noteId"], serde_json::json!("n1"));
+    assert_eq!(v["result"]["primitiveId"], serde_json::json!("p-ref"));
+    assert_eq!(
+        v["result"]["content"],
+        serde_json::json!("src/a.ts#L1|d|None")
+    );
+
+    // addCli: workingDirectory optional, passed through as Some when present.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addCli","params":{"workspaceId":"ws-1","noteId":"n1","command":"ls","description":"d","workingDirectory":"sub"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["primitiveId"], serde_json::json!("p-cli"));
+    assert_eq!(
+        v["result"]["content"],
+        serde_json::json!("ls|d|Some(\"sub\")")
+    );
+
+    // addPatch and addAgentAction dispatch to their arms.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addPatch","params":{"workspaceId":"ws-1","noteId":"n1","filePath":"a.ts","diff":"@@","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["primitiveId"], serde_json::json!("p-patch"));
+    assert_eq!(v["result"]["content"], serde_json::json!("a.ts|@@|d"));
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addAgentAction","params":{"workspaceId":"ws-1","noteId":"n1","agentId":"agent-1","goal":"g","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["primitiveId"], serde_json::json!("p-action"));
+    assert_eq!(v["result"]["content"], serde_json::json!("agent-1|g|d"));
+}
+
+#[tokio::test]
+async fn primitive_methods_require_params() {
+    // Missing workspaceId → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addCli","params":{"noteId":"n1","command":"ls","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // Missing noteId → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addReference","params":{"workspaceId":"ws-1","semanticId":"x","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // addReference missing semanticId → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addReference","params":{"workspaceId":"ws-1","noteId":"n1","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // addPatch missing diff → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addPatch","params":{"workspaceId":"ws-1","noteId":"n1","filePath":"a","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // addAgentAction missing goal → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addAgentAction","params":{"workspaceId":"ws-1","noteId":"n1","agentId":"a","description":"d"}}"#,
     )
     .await
     .unwrap();

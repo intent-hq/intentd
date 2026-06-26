@@ -4219,3 +4219,115 @@ mod file_ops_service {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+mod primitive_ops_service {
+    use super::*;
+    use intent_core::WorkspaceApi;
+    use serde_json::{json, Value};
+
+    /// Parse the trailing fenced `ws-block:<type>` JSON block out of note content.
+    fn last_block(content: &str, block_type: &str) -> Value {
+        let fence = format!("```ws-block:{block_type}\n");
+        let body = content
+            .rsplit_once(&fence)
+            .expect("ws-block fence present")
+            .1
+            .rsplit_once("\n```\n")
+            .expect("closing fence")
+            .0;
+        serde_json::from_str(body).expect("block parses as JSON")
+    }
+
+    /// All four `primitive.*` methods append a parseable `ws-block:<type>` block
+    /// and return `{ ok, primitiveId, noteId, content }` with the TS field shapes.
+    #[tokio::test]
+    async fn primitive_methods_append_blocks_and_match_response_shape() {
+        let (_tmp, svc, ws, note_id) = setup("# Note").await;
+
+        let r = svc
+            .primitive_add_reference(
+                ws.clone(),
+                note_id.clone(),
+                "src/a.ts#symbol:Foo".to_string(),
+                "a ref".to_string(),
+                Some("fn foo() {}".to_string()),
+            )
+            .await
+            .expect("addReference");
+        assert_eq!(r["ok"], json!(true));
+        assert_eq!(r["noteId"], json!("n1"));
+        assert!(r["primitiveId"].is_string());
+        let block = last_block(r["content"].as_str().unwrap(), "reference");
+        assert_eq!(block["type"], "reference");
+        assert_eq!(block["version"], 1);
+        assert_eq!(block["createdBy"], "agent");
+        assert_eq!(block["target"]["kind"], "symbol");
+        assert_eq!(block["snapshot"]["filePath"], "src/a.ts");
+        assert_eq!(block["id"], r["primitiveId"]);
+
+        let c = svc
+            .primitive_add_cli(
+                ws.clone(),
+                note_id.clone(),
+                "cargo test".to_string(),
+                "run tests".to_string(),
+                None,
+            )
+            .await
+            .expect("addCli");
+        let cblock = last_block(c["content"].as_str().unwrap(), "cli");
+        assert_eq!(cblock["type"], "cli");
+        assert_eq!(cblock["cwd"], "./");
+        assert_eq!(cblock["display"]["showCommandPrefix"], "$");
+
+        let p = svc
+            .primitive_add_patch(
+                ws.clone(),
+                note_id.clone(),
+                "src/a.ts".to_string(),
+                "@@ -1 +1 @@".to_string(),
+                "fix".to_string(),
+            )
+            .await
+            .expect("addPatch");
+        let pblock = last_block(p["content"].as_str().unwrap(), "patch");
+        assert_eq!(pblock["type"], "patch");
+        assert_eq!(pblock["patches"][0]["filePath"], "src/a.ts");
+
+        let a = svc
+            .primitive_add_agent_action(
+                ws.clone(),
+                note_id.clone(),
+                "agent-1".to_string(),
+                "do it".to_string(),
+                "desc".to_string(),
+            )
+            .await
+            .expect("addAgentAction");
+        let ablock = last_block(a["content"].as_str().unwrap(), "agent_action");
+        assert_eq!(ablock["type"], "agent_action");
+        assert_eq!(ablock["agentId"], "agent-1");
+        assert_eq!(ablock["inputs"], json!([]));
+
+        // Blocks accumulate on the note (four appends, four fences).
+        let persisted = svc.get_note(ws, note_id).await.expect("get_note");
+        assert_eq!(persisted.content.matches("```ws-block:").count(), 4);
+    }
+
+    /// A missing note surfaces as `Error::Internal` (→ `-32603`), matching the TS
+    /// builder throwing `Note <id> not found`.
+    #[tokio::test]
+    async fn primitive_on_missing_note_is_internal_error() {
+        let (_tmp, svc, ws, _id) = setup("# Note").await;
+        let res = svc
+            .primitive_add_cli(
+                ws,
+                NoteId::from("missing"),
+                "ls".to_string(),
+                "d".to_string(),
+                None,
+            )
+            .await;
+        assert!(matches!(res, Err(Error::Internal(_))));
+    }
+}

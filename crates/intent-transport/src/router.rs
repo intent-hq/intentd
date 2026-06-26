@@ -1314,6 +1314,46 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        "primitive.addReference" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let semantic_id = require_str_param(params, "semanticId")?;
+            let description = require_str_param(params, "description")?;
+            let snapshot = opt_str(params, "snapshot");
+            api.primitive_add_reference(ws, note_id, semantic_id, description, snapshot)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "primitive.addCli" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let command = require_str_param(params, "command")?;
+            let description = require_str_param(params, "description")?;
+            let working_directory = opt_str(params, "workingDirectory");
+            api.primitive_add_cli(ws, note_id, command, description, working_directory)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "primitive.addPatch" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let file_path = require_str_param(params, "filePath")?;
+            let diff = require_str_param(params, "diff")?;
+            let description = require_str_param(params, "description")?;
+            api.primitive_add_patch(ws, note_id, file_path, diff, description)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "primitive.addAgentAction" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let agent_id = require_str_param(params, "agentId")?;
+            let goal = require_str_param(params, "goal")?;
+            let description = require_str_param(params, "description")?;
+            api.primitive_add_agent_action(ws, note_id, agent_id, goal, description)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "script.list" => {
             let ws = require_ws_note(params)?;
             api.script_list(ws).await.map_err(domain_to_rpc)

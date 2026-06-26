@@ -50,6 +50,7 @@ mod git_ops;
 mod history_xml;
 mod note_ops;
 mod pr_ops;
+mod primitive_ops;
 mod script_ops;
 mod search_ops;
 mod settings;
@@ -689,6 +690,49 @@ async fn fetch_note_peer(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Fresh v4 uuid string for an agent-authored primitive id (TS `uuidv4()`).
+fn new_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Shared `primitive.*` glue: append the fenced `ws-block:<block_type>` JSON of
+/// `primitive` to the note, persist it, emit `note:updated`, and return the TS
+/// `appendPrimitiveBlock` response `{ ok, primitiveId, noteId, content }`. A
+/// missing note surfaces as `Error::Internal` (→ `-32603`), matching the TS
+/// builder which throws `Note <id> not found`.
+async fn append_primitive(
+    store: &Store,
+    bus: &Option<EventBus>,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    primitive: &serde_json::Value,
+    block_type: &str,
+    primitive_id: &str,
+) -> Result<serde_json::Value> {
+    let mut note = fetch_note_peer(store, workspace_id, note_id).await?;
+    let new_content = primitive_ops::append_block(&note.content, primitive, block_type);
+    note.content = new_content.clone();
+    note.updated_at = now_iso();
+    store.update_note(&note).await?;
+    publish_event(
+        bus,
+        note_change_event(
+            &note.workspace_id,
+            &note.id,
+            &note.title,
+            NOTE_UPDATED,
+            "update",
+        ),
+    )
+    .await;
+    Ok(serde_json::json!({
+        "ok": true,
+        "primitiveId": primitive_id,
+        "noteId": note_id.as_str(),
+        "content": new_content,
+    }))
 }
 
 /// Extract the spec-linked task-note ids from a spec note's markdown body
@@ -2150,6 +2194,127 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let root = file_ops::resolve_root(&store, &workspace_id).await;
             file_ops::rename(&root, &old_path, &new_path)
+        })
+    }
+
+    fn primitive_add_reference(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        semantic_id: String,
+        description: String,
+        snapshot: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            let id = new_uuid();
+            let created_at = now_iso();
+            let primitive = primitive_ops::reference(
+                &id,
+                &created_at,
+                &semantic_id,
+                &description,
+                snapshot.as_deref(),
+            );
+            append_primitive(
+                &store,
+                &bus,
+                &workspace_id,
+                &note_id,
+                &primitive,
+                "reference",
+                &id,
+            )
+            .await
+        })
+    }
+
+    fn primitive_add_cli(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        command: String,
+        description: String,
+        working_directory: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            let id = new_uuid();
+            let created_at = now_iso();
+            let primitive = primitive_ops::cli(
+                &id,
+                &created_at,
+                &command,
+                &description,
+                working_directory.as_deref(),
+            );
+            append_primitive(
+                &store,
+                &bus,
+                &workspace_id,
+                &note_id,
+                &primitive,
+                "cli",
+                &id,
+            )
+            .await
+        })
+    }
+
+    fn primitive_add_patch(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        file_path: String,
+        diff: String,
+        description: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            let id = new_uuid();
+            let created_at = now_iso();
+            let primitive = primitive_ops::patch(&id, &created_at, &file_path, &diff, &description);
+            append_primitive(
+                &store,
+                &bus,
+                &workspace_id,
+                &note_id,
+                &primitive,
+                "patch",
+                &id,
+            )
+            .await
+        })
+    }
+
+    fn primitive_add_agent_action(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        agent_id: String,
+        goal: String,
+        description: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            let id = new_uuid();
+            let created_at = now_iso();
+            let primitive =
+                primitive_ops::agent_action(&id, &created_at, &agent_id, &goal, &description);
+            append_primitive(
+                &store,
+                &bus,
+                &workspace_id,
+                &note_id,
+                &primitive,
+                "agent_action",
+                &id,
+            )
+            .await
         })
     }
 
