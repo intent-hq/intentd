@@ -903,6 +903,163 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn file_read(&self, workspace_id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+        // Echo a bare string so the wire test can assert file.read is NOT
+        // wrapped in an object.
+        Box::pin(async move { Ok(Value::String(format!("{}:{path}", workspace_id.as_str()))) })
+    }
+
+    fn file_write(
+        &self,
+        _workspace_id: WorkspaceId,
+        path: String,
+        content: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(
+                serde_json::json!({ "ok": true, "path": path, "size": content.encode_utf16().count() }),
+            )
+        })
+    }
+
+    fn file_list(&self, _workspace_id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!([{ "name": path, "type": "file" }])) })
+    }
+
+    fn file_delete(
+        &self,
+        _workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(
+            async move { Ok(serde_json::json!({ "ok": true, "path": path, "deleted": true })) },
+        )
+    }
+
+    fn file_mkdir(&self, _workspace_id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(
+            async move { Ok(serde_json::json!({ "ok": true, "path": path, "created": true })) },
+        )
+    }
+
+    fn file_rename(
+        &self,
+        _workspace_id: WorkspaceId,
+        old_path: String,
+        new_path: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true, "oldPath": old_path, "newPath": new_path,
+                "renamed": true, "isDirectory": false
+            }))
+        })
+    }
+
+    fn primitive_add_reference(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        semantic_id: String,
+        description: String,
+        snapshot: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true, "primitiveId": "p-ref", "noteId": note_id.as_str(),
+                "content": format!("{semantic_id}|{description}|{snapshot:?}"),
+            }))
+        })
+    }
+
+    fn primitive_add_cli(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        command: String,
+        description: String,
+        working_directory: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true, "primitiveId": "p-cli", "noteId": note_id.as_str(),
+                "content": format!("{command}|{description}|{working_directory:?}"),
+            }))
+        })
+    }
+
+    fn primitive_add_patch(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        file_path: String,
+        diff: String,
+        description: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true, "primitiveId": "p-patch", "noteId": note_id.as_str(),
+                "content": format!("{file_path}|{diff}|{description}"),
+            }))
+        })
+    }
+
+    fn primitive_add_agent_action(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        agent_id: String,
+        goal: String,
+        description: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true, "primitiveId": "p-action", "noteId": note_id.as_str(),
+                "content": format!("{agent_id}|{goal}|{description}"),
+            }))
+        })
+    }
+
+    fn cross_workspace_list_siblings(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!([{
+                "id": "sib-1", "title": "Untitled", "branch": "b", "status": "Active",
+                "createdAt": "t0", "updatedAt": "t1", "caller": workspace_id.as_str(),
+            }]))
+        })
+    }
+
+    fn cross_workspace_list_notes(
+        &self,
+        _workspace_id: WorkspaceId,
+        target_workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!([{
+                "id": "n1", "title": "t", "createdAt": "t0", "updatedAt": "t1",
+                "target": target_workspace_id.as_str(),
+            }]))
+        })
+    }
+
+    fn cross_workspace_read_note(
+        &self,
+        _workspace_id: WorkspaceId,
+        target_workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "id": note_id.as_str(), "title": "t", "content": "c",
+                "numberedContent": "   1 | c", "sourceWorkspaceId": target_workspace_id.as_str(),
+                "sourceWorkspaceTitle": "T", "branch": "b", "lineCount": 1,
+            }))
+        })
+    }
+
     fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             Ok(serde_json::json!({ "scripts": [], "workspaceId": workspace_id.as_str() }))
@@ -2190,6 +2347,256 @@ async fn terminal_kill_and_list_dispatch() {
         v["result"]["terminals"][0]["alive"],
         serde_json::json!(true)
     );
+}
+
+#[tokio::test]
+async fn file_methods_dispatch_with_exact_wire_shapes() {
+    // file.read returns a BARE string, not an object (the key parity gotcha).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.read","params":{"workspaceId":"ws-1","path":"a.txt"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"], serde_json::json!("ws-1:a.txt"));
+    assert!(v["result"].is_string());
+
+    // file.write → { ok, path, size }.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.write","params":{"workspaceId":"ws-1","path":"a.txt","content":"hello"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "ok": true, "path": "a.txt", "size": 5 })
+    );
+
+    // file.list → bare array; `path` defaults to "." when omitted.
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"file.list","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert!(v["result"].is_array());
+    assert_eq!(v["result"][0]["name"], serde_json::json!("."));
+    assert_eq!(v["result"][0]["type"], serde_json::json!("file"));
+
+    // file.delete → { ok, path, deleted: true }.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.delete","params":{"workspaceId":"ws-1","path":"a.txt"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "ok": true, "path": "a.txt", "deleted": true })
+    );
+
+    // file.mkdir → { ok, path, created: true }.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.mkdir","params":{"workspaceId":"ws-1","path":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "ok": true, "path": "d", "created": true })
+    );
+
+    // file.rename → { ok, oldPath, newPath, renamed: true, isDirectory }.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.rename","params":{"workspaceId":"ws-1","oldPath":"a.txt","newPath":"b.txt"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({
+            "ok": true, "oldPath": "a.txt", "newPath": "b.txt",
+            "renamed": true, "isDirectory": false
+        })
+    );
+}
+
+#[tokio::test]
+async fn file_methods_require_params() {
+    // Missing workspaceId → -32602 "workspaceId is required".
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"file.read","params":{"path":"a"}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // Missing path → -32602 (router-level requireParam, outside the try block).
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"file.read","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // file.write missing content → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.write","params":{"workspaceId":"ws-1","path":"a"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // file.rename missing newPath → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.rename","params":{"workspaceId":"ws-1","oldPath":"a"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn primitive_methods_dispatch_and_pass_params() {
+    // addReference: required semanticId/description flow through; snapshot optional.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addReference","params":{"workspaceId":"ws-1","noteId":"n1","semanticId":"src/a.ts#L1","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["noteId"], serde_json::json!("n1"));
+    assert_eq!(v["result"]["primitiveId"], serde_json::json!("p-ref"));
+    assert_eq!(
+        v["result"]["content"],
+        serde_json::json!("src/a.ts#L1|d|None")
+    );
+
+    // addCli: workingDirectory optional, passed through as Some when present.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addCli","params":{"workspaceId":"ws-1","noteId":"n1","command":"ls","description":"d","workingDirectory":"sub"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["primitiveId"], serde_json::json!("p-cli"));
+    assert_eq!(
+        v["result"]["content"],
+        serde_json::json!("ls|d|Some(\"sub\")")
+    );
+
+    // addPatch and addAgentAction dispatch to their arms.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addPatch","params":{"workspaceId":"ws-1","noteId":"n1","filePath":"a.ts","diff":"@@","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["primitiveId"], serde_json::json!("p-patch"));
+    assert_eq!(v["result"]["content"], serde_json::json!("a.ts|@@|d"));
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addAgentAction","params":{"workspaceId":"ws-1","noteId":"n1","agentId":"agent-1","goal":"g","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["primitiveId"], serde_json::json!("p-action"));
+    assert_eq!(v["result"]["content"], serde_json::json!("agent-1|g|d"));
+}
+
+#[tokio::test]
+async fn primitive_methods_require_params() {
+    // Missing workspaceId → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addCli","params":{"noteId":"n1","command":"ls","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // Missing noteId → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addReference","params":{"workspaceId":"ws-1","semanticId":"x","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // addReference missing semanticId → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addReference","params":{"workspaceId":"ws-1","noteId":"n1","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // addPatch missing diff → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addPatch","params":{"workspaceId":"ws-1","noteId":"n1","filePath":"a","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // addAgentAction missing goal → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"primitive.addAgentAction","params":{"workspaceId":"ws-1","noteId":"n1","agentId":"a","description":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn cross_workspace_methods_dispatch_and_pass_params() {
+    // listSiblings → bare array; the caller workspaceId flows to the service.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.listSiblings","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v["result"].is_array());
+    assert_eq!(v["result"][0]["caller"], serde_json::json!("ws-1"));
+    // status is the PascalCase WorkspaceStatus from the workspace model.
+    assert_eq!(v["result"][0]["status"], serde_json::json!("Active"));
+
+    // listNotes → bare array; targetWorkspaceId flows through.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.listNotes","params":{"workspaceId":"ws-1","targetWorkspaceId":"ws-2"}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v["result"].is_array());
+    assert_eq!(v["result"][0]["target"], serde_json::json!("ws-2"));
+
+    // readNote → object; target + noteId flow through.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.readNote","params":{"workspaceId":"ws-1","targetWorkspaceId":"ws-2","noteId":"n9"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["id"], serde_json::json!("n9"));
+    assert_eq!(v["result"]["sourceWorkspaceId"], serde_json::json!("ws-2"));
+    assert_eq!(
+        v["result"]["numberedContent"],
+        serde_json::json!("   1 | c")
+    );
+}
+
+#[tokio::test]
+async fn cross_workspace_methods_require_params() {
+    // Missing workspaceId → -32602.
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.listSiblings","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // listNotes missing targetWorkspaceId → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.listNotes","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // readNote missing noteId → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.readNote","params":{"workspaceId":"ws-1","targetWorkspaceId":"ws-2"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
 }
 
 #[tokio::test]

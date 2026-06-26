@@ -45,10 +45,12 @@ mod agent_subscriptions;
 mod drafts;
 mod event_ops;
 pub mod events;
+mod file_ops;
 mod git_ops;
 mod history_xml;
 mod note_ops;
 mod pr_ops;
+mod primitive_ops;
 mod script_ops;
 mod search_ops;
 mod settings;
@@ -688,6 +690,101 @@ async fn fetch_note_peer(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Resolve a sibling workspace for the `crossWorkspace.*` reads, enforcing that
+/// the caller and target share the same `repositoryPath`. Mirrors the TS
+/// `getSiblingWorkspaceOrThrow` messages; all failures surface as
+/// [`Error::Internal`] (→ `-32603`) to match the TS handler.
+async fn sibling_workspace_or_throw(
+    store: &Store,
+    current_workspace_id: &WorkspaceId,
+    target_workspace_id: &WorkspaceId,
+) -> Result<Workspace> {
+    let current = match store.get_workspace(current_workspace_id).await {
+        Ok(w) => w,
+        Err(Error::NotFound(_)) => {
+            return Err(Error::Internal("Current workspace not found".to_string()));
+        }
+        Err(e) => return Err(e),
+    };
+    let repo_path = match current.repository_path.as_deref() {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => {
+            return Err(Error::Internal(
+                "Current workspace is not associated with a repository".to_string(),
+            ));
+        }
+    };
+    let target = match store.get_workspace(target_workspace_id).await {
+        Ok(w) => w,
+        Err(Error::NotFound(_)) => {
+            return Err(Error::Internal(format!(
+                "Target workspace not found: {target_workspace_id}"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    if target.repository_path.as_deref() != Some(repo_path.as_str()) {
+        return Err(Error::Internal(
+            "Access denied: Can only access workspaces in the same repository".to_string(),
+        ));
+    }
+    Ok(target)
+}
+
+/// Prefix each line with a right-aligned 1-based line number (`"   1 | text"`),
+/// matching the TS `numberLines` helper used by `crossWorkspace.readNote`.
+fn number_lines(content: &str) -> String {
+    content
+        .split('\n')
+        .enumerate()
+        .map(|(i, line)| format!("{:>4} | {line}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Fresh v4 uuid string for an agent-authored primitive id (TS `uuidv4()`).
+fn new_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Shared `primitive.*` glue: append the fenced `ws-block:<block_type>` JSON of
+/// `primitive` to the note, persist it, emit `note:updated`, and return the TS
+/// `appendPrimitiveBlock` response `{ ok, primitiveId, noteId, content }`. A
+/// missing note surfaces as `Error::Internal` (→ `-32603`), matching the TS
+/// builder which throws `Note <id> not found`.
+async fn append_primitive(
+    store: &Store,
+    bus: &Option<EventBus>,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    primitive: &serde_json::Value,
+    block_type: &str,
+    primitive_id: &str,
+) -> Result<serde_json::Value> {
+    let mut note = fetch_note_peer(store, workspace_id, note_id).await?;
+    let new_content = primitive_ops::append_block(&note.content, primitive, block_type);
+    note.content = new_content.clone();
+    note.updated_at = now_iso();
+    store.update_note(&note).await?;
+    publish_event(
+        bus,
+        note_change_event(
+            &note.workspace_id,
+            &note.id,
+            &note.title,
+            NOTE_UPDATED,
+            "update",
+        ),
+    )
+    .await;
+    Ok(serde_json::json!({
+        "ok": true,
+        "primitiveId": primitive_id,
+        "noteId": note_id.as_str(),
+        "content": new_content,
+    }))
 }
 
 /// Extract the spec-linked task-note ids from a spec note's markdown body
@@ -2076,6 +2173,301 @@ impl WorkspaceApi for Services {
     fn terminal_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         Box::pin(async move { terminal_ops::list(&pty, &workspace_id) })
+    }
+
+    fn file_read(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            file_ops::read(&root, &path)
+        })
+    }
+
+    fn file_write(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+        content: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            file_ops::write(&root, &path, &content)
+        })
+    }
+
+    fn file_list(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            file_ops::list(&root, &path)
+        })
+    }
+
+    fn file_delete(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            file_ops::delete(&root, &path)
+        })
+    }
+
+    fn file_mkdir(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            file_ops::mkdir(&root, &path)
+        })
+    }
+
+    fn file_rename(
+        &self,
+        workspace_id: WorkspaceId,
+        old_path: String,
+        new_path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            file_ops::rename(&root, &old_path, &new_path)
+        })
+    }
+
+    fn primitive_add_reference(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        semantic_id: String,
+        description: String,
+        snapshot: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            let id = new_uuid();
+            let created_at = now_iso();
+            let primitive = primitive_ops::reference(
+                &id,
+                &created_at,
+                &semantic_id,
+                &description,
+                snapshot.as_deref(),
+            );
+            append_primitive(
+                &store,
+                &bus,
+                &workspace_id,
+                &note_id,
+                &primitive,
+                "reference",
+                &id,
+            )
+            .await
+        })
+    }
+
+    fn primitive_add_cli(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        command: String,
+        description: String,
+        working_directory: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            let id = new_uuid();
+            let created_at = now_iso();
+            let primitive = primitive_ops::cli(
+                &id,
+                &created_at,
+                &command,
+                &description,
+                working_directory.as_deref(),
+            );
+            append_primitive(
+                &store,
+                &bus,
+                &workspace_id,
+                &note_id,
+                &primitive,
+                "cli",
+                &id,
+            )
+            .await
+        })
+    }
+
+    fn primitive_add_patch(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        file_path: String,
+        diff: String,
+        description: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            let id = new_uuid();
+            let created_at = now_iso();
+            let primitive = primitive_ops::patch(&id, &created_at, &file_path, &diff, &description);
+            append_primitive(
+                &store,
+                &bus,
+                &workspace_id,
+                &note_id,
+                &primitive,
+                "patch",
+                &id,
+            )
+            .await
+        })
+    }
+
+    fn primitive_add_agent_action(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        agent_id: String,
+        goal: String,
+        description: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            let id = new_uuid();
+            let created_at = now_iso();
+            let primitive =
+                primitive_ops::agent_action(&id, &created_at, &agent_id, &goal, &description);
+            append_primitive(
+                &store,
+                &bus,
+                &workspace_id,
+                &note_id,
+                &primitive,
+                "agent_action",
+                &id,
+            )
+            .await
+        })
+    }
+
+    fn cross_workspace_list_siblings(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let current = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(Error::NotFound(_)) => {
+                    return Err(Error::Internal("Current workspace not found".to_string()));
+                }
+                Err(e) => return Err(e),
+            };
+            let repo_path = match current.repository_path.as_deref() {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => {
+                    return Err(Error::Internal(
+                        "Current workspace is not associated with a repository".to_string(),
+                    ));
+                }
+            };
+            let all = store.list_workspaces(true).await?;
+            let siblings: Vec<serde_json::Value> = all
+                .into_iter()
+                .filter(|w| {
+                    w.id != workspace_id && w.repository_path.as_deref() == Some(repo_path.as_str())
+                })
+                .map(|w| {
+                    serde_json::json!({
+                        "id": w.id,
+                        "title": if w.title.is_empty() { "Untitled".to_string() } else { w.title },
+                        "branch": w.branch,
+                        "status": w.status,
+                        "createdAt": w.created_at,
+                        "updatedAt": w.updated_at,
+                    })
+                })
+                .collect();
+            Ok(serde_json::Value::Array(siblings))
+        })
+    }
+
+    fn cross_workspace_list_notes(
+        &self,
+        workspace_id: WorkspaceId,
+        target_workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            sibling_workspace_or_throw(&store, &workspace_id, &target_workspace_id).await?;
+            let notes = store.list_notes(&target_workspace_id).await?;
+            let out: Vec<serde_json::Value> = notes
+                .into_iter()
+                .map(|n| {
+                    serde_json::json!({
+                        "id": n.id,
+                        "title": n.title,
+                        "createdAt": n.created_at,
+                        "updatedAt": n.updated_at,
+                    })
+                })
+                .collect();
+            Ok(serde_json::Value::Array(out))
+        })
+    }
+
+    fn cross_workspace_read_note(
+        &self,
+        workspace_id: WorkspaceId,
+        target_workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let target =
+                sibling_workspace_or_throw(&store, &workspace_id, &target_workspace_id).await?;
+            let note = match store.get_note(&note_id).await {
+                Ok(n) if n.workspace_id == target_workspace_id => n,
+                Ok(_) | Err(Error::NotFound(_)) => {
+                    return Err(Error::Internal(format!(
+                        "Note not found: {note_id} in workspace {target_workspace_id}"
+                    )));
+                }
+                Err(e) => return Err(e),
+            };
+            let content = note.content;
+            let line_count = content.split('\n').count();
+            Ok(serde_json::json!({
+                "id": note.id,
+                "title": note.title,
+                "content": content,
+                "numberedContent": number_lines(&content),
+                "sourceWorkspaceId": target_workspace_id,
+                "sourceWorkspaceTitle": target.title,
+                "branch": target.branch,
+                "lineCount": line_count,
+            }))
+        })
     }
 
     fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {

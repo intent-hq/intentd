@@ -215,6 +215,149 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert!(v.get("diffSummary").is_none());
 }
 
+/// `crossWorkspace.listSiblings` returns only same-`repositoryPath` peers
+/// (self filtered out, other-repo filtered out) with the PascalCase status.
+#[tokio::test]
+async fn cross_workspace_list_siblings_scopes_to_repository() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let mk = |id: &WorkspaceId, title: &str, repo: Option<&str>| {
+        let mut w = workspace(id);
+        w.title = title.to_string();
+        w.repository_path = repo.map(str::to_string);
+        w
+    };
+
+    let caller = WorkspaceId::from("ws-caller");
+    let sibling = WorkspaceId::from("ws-sibling");
+    let other_repo = WorkspaceId::from("ws-other");
+    let no_repo = WorkspaceId::from("ws-norepo");
+    store
+        .insert_workspace(&mk(&caller, "Caller", Some("/repo/a")))
+        .await
+        .unwrap();
+    store
+        .insert_workspace(&mk(&sibling, "", Some("/repo/a")))
+        .await
+        .unwrap();
+    store
+        .insert_workspace(&mk(&other_repo, "Other", Some("/repo/b")))
+        .await
+        .unwrap();
+    store
+        .insert_workspace(&mk(&no_repo, "NoRepo", None))
+        .await
+        .unwrap();
+
+    let svc = Services::new(store);
+    let v = svc
+        .cross_workspace_list_siblings(caller.clone())
+        .await
+        .expect("siblings");
+    let arr = v.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"], "ws-sibling");
+    // Empty title falls back to "Untitled"; status is PascalCase.
+    assert_eq!(arr[0]["title"], "Untitled");
+    assert_eq!(arr[0]["status"], "Active");
+    assert!(arr[0]["createdAt"].is_string());
+}
+
+/// A caller with no `repositoryPath` cannot list siblings (mirrors the TS
+/// "not associated with a repository" error).
+#[tokio::test]
+async fn cross_workspace_list_siblings_requires_repository() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let caller = WorkspaceId::from("ws-norepo");
+    store.insert_workspace(&workspace(&caller)).await.unwrap();
+    let svc = Services::new(store);
+    let err = svc
+        .cross_workspace_list_siblings(caller)
+        .await
+        .expect_err("should error");
+    match err {
+        Error::Internal(m) => assert!(m.contains("not associated with a repository"), "{m}"),
+        other => panic!("expected Internal, got {other:?}"),
+    }
+}
+
+/// Cross-repo `readNote`/`listNotes` are access-denied; a same-repo sibling
+/// note reads back with numbered content and source metadata.
+#[tokio::test]
+async fn cross_workspace_read_note_enforces_access_and_shape() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let mk = |id: &WorkspaceId, repo: &str| {
+        let mut w = workspace(id);
+        w.repository_path = Some(repo.to_string());
+        w
+    };
+    let caller = WorkspaceId::from("ws-caller");
+    let sibling = WorkspaceId::from("ws-sibling");
+    let other = WorkspaceId::from("ws-other");
+    store
+        .insert_workspace(&mk(&caller, "/repo/a"))
+        .await
+        .unwrap();
+    store
+        .insert_workspace(&mk(&sibling, "/repo/a"))
+        .await
+        .unwrap();
+    store
+        .insert_workspace(&mk(&other, "/repo/b"))
+        .await
+        .unwrap();
+    store
+        .insert_note(&note(&sibling, "sib-note", "l1\nl2"))
+        .await
+        .unwrap();
+
+    let svc = Services::new(store);
+
+    // Same-repo sibling read: full shape with numbered content + line count.
+    let v = svc
+        .cross_workspace_read_note(caller.clone(), sibling.clone(), NoteId::from("sib-note"))
+        .await
+        .expect("read");
+    assert_eq!(v["id"], "sib-note");
+    assert_eq!(v["content"], "l1\nl2");
+    assert_eq!(v["numberedContent"], "   1 | l1\n   2 | l2");
+    assert_eq!(v["sourceWorkspaceId"], "ws-sibling");
+    assert_eq!(v["lineCount"], 2);
+
+    // listNotes for the sibling returns the bare-array shape.
+    let v = svc
+        .cross_workspace_list_notes(caller.clone(), sibling.clone())
+        .await
+        .expect("list");
+    let arr = v.as_array().expect("array");
+    assert_eq!(arr[0]["id"], "sib-note");
+    assert!(arr[0]["createdAt"].is_string());
+
+    // Cross-repo access is denied.
+    let err = svc
+        .cross_workspace_list_notes(caller.clone(), other.clone())
+        .await
+        .expect_err("denied");
+    match err {
+        Error::Internal(m) => assert!(m.contains("Access denied"), "{m}"),
+        other => panic!("expected Internal, got {other:?}"),
+    }
+
+    // A missing note in a valid sibling surfaces the "Note not found" message.
+    let err = svc
+        .cross_workspace_read_note(caller, sibling, NoteId::from("nope"))
+        .await
+        .expect_err("missing");
+    match err {
+        Error::Internal(m) => assert!(m.contains("Note not found"), "{m}"),
+        other => panic!("expected Internal, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn add_persists_and_reports_position() {
     let (_tmp, svc, ws, id) = setup("# A\nbody").await;
@@ -4166,5 +4309,168 @@ mod known_repo {
         assert_eq!(repos[0]["owner"], "cloudlands-ai");
         assert!(repos[0]["addedAt"].is_string());
         assert!(repos[0]["lastUsedAt"].is_string());
+    }
+}
+
+mod file_ops_service {
+    use super::*;
+
+    /// `file.*` wired through `WorkspaceApi`: the workspace root resolves from
+    /// `worktreePath`, writes/reads round-trip, and an out-of-workspace path
+    /// surfaces as `Error::Internal` (→ `-32603`).
+    #[tokio::test]
+    async fn file_methods_resolve_root_and_enforce_workspace() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+
+        let dir = std::env::temp_dir().join(format!("intentd-fileapi-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.expect("ws");
+        let svc = Services::new(store);
+
+        let written = svc
+            .file_write(ws.clone(), "notes/x.txt".to_string(), "hi".to_string())
+            .await
+            .expect("write");
+        assert_eq!(
+            written,
+            serde_json::json!({ "ok": true, "path": "notes/x.txt", "size": 2 })
+        );
+
+        let read = svc
+            .file_read(ws.clone(), "notes/x.txt".to_string())
+            .await
+            .expect("read");
+        assert_eq!(read, serde_json::Value::String("hi".to_string()));
+
+        let listed = svc
+            .file_list(ws.clone(), "notes".to_string())
+            .await
+            .expect("list");
+        assert_eq!(
+            listed,
+            serde_json::json!([{ "name": "x.txt", "type": "file" }])
+        );
+
+        let denied = svc.file_read(ws.clone(), "../escape".to_string()).await;
+        assert!(matches!(denied, Err(Error::Internal(_))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+mod primitive_ops_service {
+    use super::*;
+    use intent_core::WorkspaceApi;
+    use serde_json::{json, Value};
+
+    /// Parse the trailing fenced `ws-block:<type>` JSON block out of note content.
+    fn last_block(content: &str, block_type: &str) -> Value {
+        let fence = format!("```ws-block:{block_type}\n");
+        let body = content
+            .rsplit_once(&fence)
+            .expect("ws-block fence present")
+            .1
+            .rsplit_once("\n```\n")
+            .expect("closing fence")
+            .0;
+        serde_json::from_str(body).expect("block parses as JSON")
+    }
+
+    /// All four `primitive.*` methods append a parseable `ws-block:<type>` block
+    /// and return `{ ok, primitiveId, noteId, content }` with the TS field shapes.
+    #[tokio::test]
+    async fn primitive_methods_append_blocks_and_match_response_shape() {
+        let (_tmp, svc, ws, note_id) = setup("# Note").await;
+
+        let r = svc
+            .primitive_add_reference(
+                ws.clone(),
+                note_id.clone(),
+                "src/a.ts#symbol:Foo".to_string(),
+                "a ref".to_string(),
+                Some("fn foo() {}".to_string()),
+            )
+            .await
+            .expect("addReference");
+        assert_eq!(r["ok"], json!(true));
+        assert_eq!(r["noteId"], json!("n1"));
+        assert!(r["primitiveId"].is_string());
+        let block = last_block(r["content"].as_str().unwrap(), "reference");
+        assert_eq!(block["type"], "reference");
+        assert_eq!(block["version"], 1);
+        assert_eq!(block["createdBy"], "agent");
+        assert_eq!(block["target"]["kind"], "symbol");
+        assert_eq!(block["snapshot"]["filePath"], "src/a.ts");
+        assert_eq!(block["id"], r["primitiveId"]);
+
+        let c = svc
+            .primitive_add_cli(
+                ws.clone(),
+                note_id.clone(),
+                "cargo test".to_string(),
+                "run tests".to_string(),
+                None,
+            )
+            .await
+            .expect("addCli");
+        let cblock = last_block(c["content"].as_str().unwrap(), "cli");
+        assert_eq!(cblock["type"], "cli");
+        assert_eq!(cblock["cwd"], "./");
+        assert_eq!(cblock["display"]["showCommandPrefix"], "$");
+
+        let p = svc
+            .primitive_add_patch(
+                ws.clone(),
+                note_id.clone(),
+                "src/a.ts".to_string(),
+                "@@ -1 +1 @@".to_string(),
+                "fix".to_string(),
+            )
+            .await
+            .expect("addPatch");
+        let pblock = last_block(p["content"].as_str().unwrap(), "patch");
+        assert_eq!(pblock["type"], "patch");
+        assert_eq!(pblock["patches"][0]["filePath"], "src/a.ts");
+
+        let a = svc
+            .primitive_add_agent_action(
+                ws.clone(),
+                note_id.clone(),
+                "agent-1".to_string(),
+                "do it".to_string(),
+                "desc".to_string(),
+            )
+            .await
+            .expect("addAgentAction");
+        let ablock = last_block(a["content"].as_str().unwrap(), "agent_action");
+        assert_eq!(ablock["type"], "agent_action");
+        assert_eq!(ablock["agentId"], "agent-1");
+        assert_eq!(ablock["inputs"], json!([]));
+
+        // Blocks accumulate on the note (four appends, four fences).
+        let persisted = svc.get_note(ws, note_id).await.expect("get_note");
+        assert_eq!(persisted.content.matches("```ws-block:").count(), 4);
+    }
+
+    /// A missing note surfaces as `Error::Internal` (→ `-32603`), matching the TS
+    /// builder throwing `Note <id> not found`.
+    #[tokio::test]
+    async fn primitive_on_missing_note_is_internal_error() {
+        let (_tmp, svc, ws, _id) = setup("# Note").await;
+        let res = svc
+            .primitive_add_cli(
+                ws,
+                NoteId::from("missing"),
+                "ls".to_string(),
+                "d".to_string(),
+                None,
+            )
+            .await;
+        assert!(matches!(res, Err(Error::Internal(_))));
     }
 }

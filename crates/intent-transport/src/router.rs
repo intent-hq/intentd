@@ -1277,6 +1277,104 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             api.terminal_list(ws).await.map_err(domain_to_rpc)
         }
+        "file.read" => {
+            let ws = require_ws_note(params)?;
+            let path = require_str_param(params, "path")?;
+            api.file_read(ws, path).await.map_err(domain_to_rpc)
+        }
+        "file.write" => {
+            let ws = require_ws_note(params)?;
+            let path = require_str_param(params, "path")?;
+            let content = require_str_param(params, "content")?;
+            api.file_write(ws, path, content)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "file.list" => {
+            // `path` is optional, defaulting to "." (TS builder default).
+            let ws = require_ws_note(params)?;
+            let path = opt_str(params, "path").unwrap_or_else(|| ".".to_string());
+            api.file_list(ws, path).await.map_err(domain_to_rpc)
+        }
+        "file.delete" => {
+            let ws = require_ws_note(params)?;
+            let path = require_str_param(params, "path")?;
+            api.file_delete(ws, path).await.map_err(domain_to_rpc)
+        }
+        "file.mkdir" => {
+            let ws = require_ws_note(params)?;
+            let path = require_str_param(params, "path")?;
+            api.file_mkdir(ws, path).await.map_err(domain_to_rpc)
+        }
+        "file.rename" => {
+            let ws = require_ws_note(params)?;
+            let old_path = require_str_param(params, "oldPath")?;
+            let new_path = require_str_param(params, "newPath")?;
+            api.file_rename(ws, old_path, new_path)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "primitive.addReference" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let semantic_id = require_str_param(params, "semanticId")?;
+            let description = require_str_param(params, "description")?;
+            let snapshot = opt_str(params, "snapshot");
+            api.primitive_add_reference(ws, note_id, semantic_id, description, snapshot)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "primitive.addCli" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let command = require_str_param(params, "command")?;
+            let description = require_str_param(params, "description")?;
+            let working_directory = opt_str(params, "workingDirectory");
+            api.primitive_add_cli(ws, note_id, command, description, working_directory)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "primitive.addPatch" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let file_path = require_str_param(params, "filePath")?;
+            let diff = require_str_param(params, "diff")?;
+            let description = require_str_param(params, "description")?;
+            api.primitive_add_patch(ws, note_id, file_path, diff, description)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "primitive.addAgentAction" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let agent_id = require_str_param(params, "agentId")?;
+            let goal = require_str_param(params, "goal")?;
+            let description = require_str_param(params, "description")?;
+            api.primitive_add_agent_action(ws, note_id, agent_id, goal, description)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "crossWorkspace.listSiblings" => {
+            let ws = require_ws_note(params)?;
+            api.cross_workspace_list_siblings(ws)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "crossWorkspace.readNote" => {
+            let ws = require_ws_note(params)?;
+            let target = require_str_param(params, "targetWorkspaceId").map(WorkspaceId::from)?;
+            let note_id = require_note_id(params)?;
+            api.cross_workspace_read_note(ws, target, note_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "crossWorkspace.listNotes" => {
+            let ws = require_ws_note(params)?;
+            let target = require_str_param(params, "targetWorkspaceId").map(WorkspaceId::from)?;
+            api.cross_workspace_list_notes(ws, target)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "script.list" => {
             let ws = require_ws_note(params)?;
             api.script_list(ws).await.map_err(domain_to_rpc)

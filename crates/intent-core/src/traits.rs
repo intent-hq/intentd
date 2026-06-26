@@ -2296,6 +2296,253 @@ pub trait WorkspaceApi: Send + Sync {
             ))
         })
     }
+
+    // ------------------------------------------------------------------------
+    // file.* — workspace-scoped filesystem access (PROTOCOL §5.10). Every path
+    // is validated within the resolved workspace root; access-denied and other
+    // filesystem failures surface as `Error::Internal` (→ `-32603`), matching
+    // the TS handler which wraps the builder errors in `INTERNAL_ERROR`.
+    // ------------------------------------------------------------------------
+
+    /// `file.read`: the file's UTF-8 contents as a **bare JSON string** (not an
+    /// object), per the TS `ws.file.read` builder (PROTOCOL §5.10).
+    fn file_read(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_read not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.write`: create/overwrite a file (parent dirs created); returns
+    /// `{ ok: true, path, size }` where `size` is the content byte/char length
+    /// (PROTOCOL §5.10).
+    fn file_write(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+        content: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path, content);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_write not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.list`: directory entries as a **bare array** of
+    /// `{ name, type }` (`type` = `"file"`/`"directory"`); `path` defaults to
+    /// `"."` (PROTOCOL §5.10).
+    fn file_list(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.delete`: remove a single file (rejects directories); returns
+    /// `{ ok: true, path, deleted: true }` (PROTOCOL §5.10).
+    fn file_delete(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.mkdir`: create a directory (recursive); returns
+    /// `{ ok: true, path, created: true }`, or `{ ok: true, path, existed: true }`
+    /// when the directory already exists (PROTOCOL §5.10).
+    fn file_mkdir(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_mkdir not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.rename`: move a file/directory (destination must not exist);
+    /// returns `{ ok: true, oldPath, newPath, renamed: true, isDirectory }`
+    /// (PROTOCOL §5.10).
+    fn file_rename(
+        &self,
+        workspace_id: WorkspaceId,
+        old_path: String,
+        new_path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, old_path, new_path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_rename not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ------------------------------------------------------------------------
+    // primitive.* — append a fenced ```ws-block:<type>``` JSON primitive to a
+    // note. Each returns `{ ok: true, primitiveId, noteId, content }` where
+    // `content` is the full note text after the append, matching the TS
+    // `appendPrimitiveBlock` builder (PROTOCOL §5.x). Every primitive carries
+    // `version: 1` and `createdBy: "agent"`.
+    // ------------------------------------------------------------------------
+
+    /// `primitive.addReference`: append a `reference` primitive (`target.kind`
+    /// = `symbol` for `#symbol:` semantic ids, else `file_range`; optional code
+    /// `snapshot`).
+    fn primitive_add_reference(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        semantic_id: String,
+        description: String,
+        snapshot: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, note_id, semantic_id, description, snapshot);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::primitive_add_reference not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `primitive.addCli`: append a `cli` primitive (`cwd` defaults to `"./"`,
+    /// `display.showCommandPrefix` = `"$"`).
+    fn primitive_add_cli(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        command: String,
+        description: String,
+        working_directory: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            note_id,
+            command,
+            description,
+            working_directory,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::primitive_add_cli not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `primitive.addPatch`: append a `patch` primitive with a single-entry
+    /// `patches: [{ filePath, diff }]` array.
+    fn primitive_add_patch(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        file_path: String,
+        diff: String,
+        description: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, note_id, file_path, diff, description);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::primitive_add_patch not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `primitive.addAgentAction`: append an `agent_action` primitive with empty
+    /// `inputs`.
+    fn primitive_add_agent_action(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        agent_id: String,
+        goal: String,
+        description: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, note_id, agent_id, goal, description);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::primitive_add_agent_action not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ------------------------------------------------------------------------
+    // crossWorkspace.* — read-only access to sibling workspaces that share the
+    // caller's `repositoryPath`. Sibling-scope and access-control failures
+    // mirror the TS builder messages ("Current workspace is not associated with
+    // a repository", "Access denied: ...", "Note not found: ...") and surface
+    // as `Error::Internal` (→ `-32603`), matching the TS handler which wraps the
+    // builder errors in `INTERNAL_ERROR` (PROTOCOL §5.x).
+    // ------------------------------------------------------------------------
+
+    /// `crossWorkspace.listSiblings`: workspaces sharing the caller's
+    /// `repositoryPath`, excluding self. Bare array of
+    /// `{ id, title, branch, status, createdAt, updatedAt }` (`title` defaults
+    /// to `"Untitled"`; `status` is the PascalCase `WorkspaceStatus`).
+    fn cross_workspace_list_siblings(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::cross_workspace_list_siblings not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `crossWorkspace.listNotes`: notes in a sibling workspace as a bare array
+    /// of `{ id, title, createdAt, updatedAt }`.
+    fn cross_workspace_list_notes(
+        &self,
+        workspace_id: WorkspaceId,
+        target_workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, target_workspace_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::cross_workspace_list_notes not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `crossWorkspace.readNote`: one note in a sibling workspace as
+    /// `{ id, title, content, numberedContent, sourceWorkspaceId,
+    /// sourceWorkspaceTitle, branch, lineCount }`.
+    fn cross_workspace_read_note(
+        &self,
+        workspace_id: WorkspaceId,
+        target_workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, target_workspace_id, note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::cross_workspace_read_note not implemented".to_string(),
+            ))
+        })
+    }
 }
 
 /// Whether a context engine is usable right now (§8.1). `Unavailable` is a
