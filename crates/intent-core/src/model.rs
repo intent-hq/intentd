@@ -327,6 +327,9 @@ pub struct Note {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskMetadata>,
     pub created_at: String,
+    /// Monotonic version counter (§8.3). Bumped on every write; used as the
+    /// `expectedVersion` optimistic-concurrency token. Existing rows default `0`.
+    pub rev: i64,
     pub updated_at: String,
 }
 
@@ -691,6 +694,8 @@ pub struct TaskGetMyTaskResult {
     pub parent_id: Option<NoteId>,
     pub subtasks: Vec<TaskSubtask>,
     pub assigned_agents: Vec<AgentId>,
+    /// Monotonic version counter echoed from the backing note (§8.3/§8.4).
+    pub rev: i64,
 }
 
 /// Result of `task.markAsTask`.

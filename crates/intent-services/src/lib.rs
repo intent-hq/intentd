@@ -1598,6 +1598,7 @@ impl Services {
             visibility: NoteVisibility::Workspace,
             task: Some(fresh_task_metadata(status, &now, peer_order)),
             created_at: now.clone(),
+            rev: 0,
             updated_at: now,
         };
         self.store.insert_note(&note).await?;
@@ -2829,6 +2830,7 @@ impl WorkspaceApi for Services {
                 visibility: NoteVisibility::Workspace,
                 task: None,
                 created_at: now.clone(),
+                rev: 0,
                 updated_at: now,
             };
             store.insert_note(&note).await?;
@@ -3420,6 +3422,7 @@ impl WorkspaceApi for Services {
                 assigned_agents: task.assigned_agent_ids.clone(),
                 subtasks,
                 task_metadata: task,
+                rev: note.rev,
             })
         })
     }

@@ -86,6 +86,7 @@ fn note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
         visibility: NoteVisibility::Workspace,
         task: None,
         created_at: ts.clone(),
+        rev: 0,
         updated_at: ts,
     }
 }

@@ -71,6 +71,7 @@ fn sample_note(ws: &WorkspaceId) -> Note {
         visibility: NoteVisibility::Workspace,
         task: None,
         created_at: "t0".to_string(),
+        rev: 0,
         updated_at: "t0".to_string(),
     }
 }

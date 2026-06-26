@@ -84,11 +84,11 @@ async fn migration_status_reports_current_after_open() {
     assert!(status.is_current(), "fresh open must apply all migrations");
     assert_eq!(
         status.expected,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
     assert_eq!(
         status.applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
 }
 
@@ -217,6 +217,7 @@ async fn note_round_trip() {
             ..Default::default()
         }),
         created_at: ts.clone(),
+        rev: 0,
         updated_at: ts,
     };
     store.insert_note(&note).await.expect("insert note");
@@ -240,6 +241,56 @@ async fn note_round_trip() {
     assert_eq!(fetched.id, note.id);
 }
 
+#[tokio::test]
+async fn note_rev_increments_on_update() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let ts = now_iso();
+    let mut note = Note {
+        id: NoteId::new(),
+        workspace_id: ws_id.clone(),
+        title: "Spec".to_string(),
+        content: "# Hello".to_string(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        task: None,
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts,
+    };
+    store.insert_note(&note).await.expect("insert note");
+
+    // Fresh insert starts at rev 0.
+    let after_insert = store.get_note(&note.id).await.expect("get note");
+    assert_eq!(after_insert.rev, 0);
+
+    // First update bumps rev → 1 (the bump is store-owned, ignoring the stale
+    // in-memory `rev` carried by the passed-in note).
+    note.content = "# Hello v2".to_string();
+    store.update_note(&note).await.expect("update note");
+    let after_first = store.get_note(&note.id).await.expect("get note");
+    assert_eq!(after_first.rev, 1);
+    assert_eq!(after_first.content, "# Hello v2");
+
+    // A second update bumps again → 2 (monotonic).
+    note.content = "# Hello v3".to_string();
+    store.update_note(&note).await.expect("update note");
+    let after_second = store.get_note(&note.id).await.expect("get note");
+    assert_eq!(after_second.rev, 2);
+}
+
 fn task_note(ws_id: &WorkspaceId, title: &str, task: Option<TaskMetadata>) -> Note {
     let ts = now_iso();
     Note {
@@ -256,6 +307,7 @@ fn task_note(ws_id: &WorkspaceId, title: &str, task: Option<TaskMetadata>) -> No
         visibility: NoteVisibility::Workspace,
         task,
         created_at: ts.clone(),
+        rev: 0,
         updated_at: ts,
     }
 }

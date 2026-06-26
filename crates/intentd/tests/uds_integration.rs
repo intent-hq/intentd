@@ -70,6 +70,7 @@ fn seed_note(ws: &WorkspaceId) -> Note {
         visibility: NoteVisibility::Workspace,
         task: None,
         created_at: ts.clone(),
+        rev: 0,
         updated_at: ts,
     }
 }
@@ -285,6 +286,7 @@ async fn uds_slice_end_to_end() {
         "isArchived",
         "isDefault",
         "createdAt",
+        "rev",
         "updatedAt",
     ] {
         assert!(note.get(key).is_some(), "Note must carry camelCase `{key}`");

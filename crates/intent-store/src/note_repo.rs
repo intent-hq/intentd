@@ -7,7 +7,7 @@ use sqlx::Row;
 use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, Store};
 
 const NOTE_COLUMNS: &str = "id, workspace_id, title, content, content_type, tags, is_pinned, \
-    is_archived, is_default, parent_id, visibility, task_json, created_at, updated_at";
+    is_archived, is_default, parent_id, visibility, task_json, created_at, rev, updated_at";
 
 impl Store {
     /// Insert a note row. `task` is stored opaquely as `task_json` TEXT.
@@ -20,7 +20,8 @@ impl Store {
             ),
             None => None,
         };
-        let sql = format!("INSERT INTO note ({NOTE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        let sql =
+            format!("INSERT INTO note ({NOTE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         sqlx::query(&sql)
             .bind(&note.id.0)
             .bind(&note.workspace_id.0)
@@ -35,6 +36,7 @@ impl Store {
             .bind(enum_to_db(&note.visibility)?)
             .bind(task_json)
             .bind(&note.created_at)
+            .bind(note.rev)
             .bind(&note.updated_at)
             .execute(self.pool())
             .await
@@ -93,7 +95,7 @@ impl Store {
         let res = sqlx::query(
             "UPDATE note SET workspace_id=?, title=?, content=?, content_type=?, tags=?, \
              is_pinned=?, is_archived=?, is_default=?, parent_id=?, visibility=?, task_json=?, \
-             created_at=?, updated_at=? WHERE id=?",
+             created_at=?, updated_at=?, rev = rev + 1 WHERE id=?",
         )
         .bind(&note.workspace_id.0)
         .bind(&note.title)
@@ -179,6 +181,7 @@ fn map_note_row(row: &SqliteRow) -> Result<Note> {
         visibility: enum_from_db::<NoteVisibility>(&col::<String>(row, "visibility")?)?,
         task,
         created_at: col(row, "created_at")?,
+        rev: col::<i64>(row, "rev")?,
         updated_at: col(row, "updated_at")?,
     })
 }
