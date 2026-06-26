@@ -1294,6 +1294,7 @@ mod change_event_parity {
                     tags: None,
                     parent_id: None,
                 },
+                None,
             )
             .await
             .expect("create");
@@ -1302,6 +1303,81 @@ mod change_event_parity {
         assert_eq!(
             ev["data"],
             json!({ "noteId": created.id.0, "title": "Note", "action": "create" })
+        );
+    }
+
+    /// Idempotency replay (design note TB-0 §5.3): a second `note.create` with the
+    /// same `(workspaceId, idempotencyKey)` returns the ORIGINAL note without
+    /// re-executing — so no second `note:created` event is published.
+    #[tokio::test]
+    async fn idempotent_create_note_replay_returns_original_no_reexec() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let key = Some("idem-key-1".to_string());
+        let first = h
+            .services
+            .create_note(
+                h.ws.clone(),
+                NoteCreate {
+                    title: "Note".to_string(),
+                    content: None,
+                    tags: None,
+                    parent_id: None,
+                },
+                key.clone(),
+            )
+            .await
+            .expect("first create");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:created");
+
+        // Replay with the same key but different content still returns the
+        // original note id (the body is never re-executed).
+        let second = h
+            .services
+            .create_note(
+                h.ws.clone(),
+                NoteCreate {
+                    title: "Different".to_string(),
+                    content: Some("changed".to_string()),
+                    tags: None,
+                    parent_id: None,
+                },
+                key,
+            )
+            .await
+            .expect("replay create");
+        assert_eq!(second.id.0, first.id.0, "replay returns the original note");
+
+        // No second event is published (the replay short-circuits before mutate).
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(none.is_err(), "replay must not publish a second event");
+    }
+
+    /// Soft-launch (R5): a missing `idempotencyKey` is accepted (never rejected)
+    /// and each call executes normally, producing distinct notes.
+    #[tokio::test]
+    async fn missing_idempotency_key_executes_normally() {
+        let h = harness().await;
+        let mk = || NoteCreate {
+            title: "Note".to_string(),
+            content: None,
+            tags: None,
+            parent_id: None,
+        };
+        let a = h
+            .services
+            .create_note(h.ws.clone(), mk(), None)
+            .await
+            .expect("first create");
+        let b = h
+            .services
+            .create_note(h.ws.clone(), mk(), None)
+            .await
+            .expect("second create");
+        assert_ne!(
+            a.id.0, b.id.0,
+            "missing key must not dedupe — both creates run"
         );
     }
 
@@ -2160,7 +2236,7 @@ mod pr {
     async fn merge_returns_parity_shape() {
         let (_t, svc, ws) = setup(false, true).await;
         let v = svc
-            .pr_merge(ws, Some("squash".into()), None, None)
+            .pr_merge(ws, Some("squash".into()), None, None, None)
             .await
             .expect("merge");
         assert_eq!(v["merged"], true);
@@ -2173,7 +2249,7 @@ mod pr {
     async fn merge_rejects_invalid_method() {
         let (_t, svc, ws) = setup(false, true).await;
         let err = svc
-            .pr_merge(ws, Some("ff".into()), None, None)
+            .pr_merge(ws, Some("ff".into()), None, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m.contains("mergeMethod must be one of")));
@@ -2182,7 +2258,7 @@ mod pr {
     #[tokio::test]
     async fn merge_requires_active_pr() {
         let (_t, svc, ws) = setup(false, false).await;
-        let err = svc.pr_merge(ws, None, None, None).await.unwrap_err();
+        let err = svc.pr_merge(ws, None, None, None, None).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
     }
 
@@ -4516,12 +4592,15 @@ mod known_repo {
         let store = Store::open(&tmp.path).await.expect("open store");
         let svc = Services::new(store);
 
-        svc.create_workspace(WorkspaceCreate {
-            repository_path: Some("/src/intent".to_string()),
-            repository_name: Some("intent".to_string()),
-            repository_owner: Some("cloudlands-ai".to_string()),
-            ..Default::default()
-        })
+        svc.create_workspace(
+            WorkspaceCreate {
+                repository_path: Some("/src/intent".to_string()),
+                repository_name: Some("intent".to_string()),
+                repository_owner: Some("cloudlands-ai".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
         .await
         .expect("create");
 
