@@ -82,8 +82,24 @@ impl Store {
     }
 
     /// Update an existing note (full-row replace, except `id`), or `NotFound`.
-    /// `task` is stored opaquely as `task_json` TEXT.
+    /// Unconditional last-writer-wins bump of `rev`; `task` is stored opaquely
+    /// as `task_json` TEXT.
     pub async fn update_note(&self, note: &Note) -> Result<()> {
+        self.update_note_versioned(note, None).await
+    }
+
+    /// Update an existing note, optionally gating on `expected_version`
+    /// (optimistic concurrency, PROTOCOL §5.6). When `expected_version` is
+    /// `Some(rev)`, the write is a conditional `... WHERE id = ? AND rev = ?`
+    /// that only succeeds if the stored `rev` matches; on a 0-row result the row
+    /// is re-read to distinguish a [`Error::Conflict`] (row present, carrying the
+    /// current entity) from a [`Error::NotFound`] (row absent). When `None`, this
+    /// is the unconditional last-writer-wins bump. In all cases `rev` increments.
+    pub async fn update_note_versioned(
+        &self,
+        note: &Note,
+        expected_version: Option<i64>,
+    ) -> Result<()> {
         let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
         let task_json = match &note.task {
             Some(v) => Some(
@@ -92,30 +108,48 @@ impl Store {
             ),
             None => None,
         };
-        let res = sqlx::query(
+        let mut sql = String::from(
             "UPDATE note SET workspace_id=?, title=?, content=?, content_type=?, tags=?, \
              is_pinned=?, is_archived=?, is_default=?, parent_id=?, visibility=?, task_json=?, \
              created_at=?, updated_at=?, rev = rev + 1 WHERE id=?",
-        )
-        .bind(&note.workspace_id.0)
-        .bind(&note.title)
-        .bind(&note.content)
-        .bind(enum_to_db(&note.content_type)?)
-        .bind(tags_to_db(&note.tags)?)
-        .bind(note.is_pinned as i64)
-        .bind(note.is_archived as i64)
-        .bind(note.is_default as i64)
-        .bind(parent_id)
-        .bind(enum_to_db(&note.visibility)?)
-        .bind(task_json)
-        .bind(&note.created_at)
-        .bind(&note.updated_at)
-        .bind(&note.id.0)
-        .execute(self.pool())
-        .await
-        .map_err(|e| Error::Internal(format!("update note failed: {e}")))?;
+        );
+        if expected_version.is_some() {
+            sql.push_str(" AND rev=?");
+        }
+        let mut query = sqlx::query(&sql)
+            .bind(&note.workspace_id.0)
+            .bind(&note.title)
+            .bind(&note.content)
+            .bind(enum_to_db(&note.content_type)?)
+            .bind(tags_to_db(&note.tags)?)
+            .bind(note.is_pinned as i64)
+            .bind(note.is_archived as i64)
+            .bind(note.is_default as i64)
+            .bind(parent_id)
+            .bind(enum_to_db(&note.visibility)?)
+            .bind(task_json)
+            .bind(&note.created_at)
+            .bind(&note.updated_at)
+            .bind(&note.id.0);
+        if let Some(rev) = expected_version {
+            query = query.bind(rev);
+        }
+        let res = query
+            .execute(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("update note failed: {e}")))?;
         if res.rows_affected() == 0 {
-            return Err(Error::NotFound(format!("note {}", note.id)));
+            // Re-read by id: a present row means the `expected_version` gate
+            // failed (conflict); an absent row is a genuine not-found.
+            return match self.get_note(&note.id).await {
+                Ok(current) => {
+                    let current = serde_json::to_value(&current)
+                        .map_err(|e| Error::Internal(format!("encode current note failed: {e}")))?;
+                    Err(Error::Conflict { current })
+                }
+                Err(Error::NotFound(_)) => Err(Error::NotFound(format!("note {}", note.id))),
+                Err(e) => Err(e),
+            };
         }
         Ok(())
     }

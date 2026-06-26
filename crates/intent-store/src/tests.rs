@@ -291,6 +291,83 @@ async fn note_rev_increments_on_update() {
     assert_eq!(after_second.rev, 2);
 }
 
+#[tokio::test]
+async fn update_note_versioned_hit_miss_and_absent() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let ts = now_iso();
+    let mut note = Note {
+        id: NoteId::new(),
+        workspace_id: ws_id.clone(),
+        title: "Spec".to_string(),
+        content: "v0".to_string(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        task: None,
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts,
+    };
+    store.insert_note(&note).await.expect("insert note");
+
+    // HIT: expected_version matches the stored rev (0) → write + bump to 1.
+    note.content = "v1".to_string();
+    store
+        .update_note_versioned(&note, Some(0))
+        .await
+        .expect("versioned hit");
+    let after_hit = store.get_note(&note.id).await.expect("get note");
+    assert_eq!(after_hit.rev, 1);
+    assert_eq!(after_hit.content, "v1");
+
+    // MISS: stale expected_version (0, but stored rev is now 1) → Conflict
+    // carrying the current entity under `current` (rev 1, unchanged content).
+    note.content = "v2-should-not-persist".to_string();
+    let conflict = store.update_note_versioned(&note, Some(0)).await;
+    match conflict {
+        Err(intent_core::Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 1);
+            assert_eq!(current["content"], "v1");
+            assert_eq!(current["id"], note.id.0);
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    // The failed conditional write must not have persisted or bumped.
+    let after_miss = store.get_note(&note.id).await.expect("get note");
+    assert_eq!(after_miss.rev, 1);
+    assert_eq!(after_miss.content, "v1");
+
+    // ABSENT: no expected_version → last-writer-wins (unconditional bump → 2).
+    note.content = "v2".to_string();
+    store
+        .update_note_versioned(&note, None)
+        .await
+        .expect("absent degrades to last-writer-wins");
+    let after_absent = store.get_note(&note.id).await.expect("get note");
+    assert_eq!(after_absent.rev, 2);
+    assert_eq!(after_absent.content, "v2");
+
+    // A versioned write against a missing row is NotFound (not Conflict).
+    let mut ghost = note.clone();
+    ghost.id = NoteId::new();
+    match store.update_note_versioned(&ghost, Some(5)).await {
+        Err(intent_core::Error::NotFound(_)) => {}
+        other => panic!("expected NotFound for absent row, got {other:?}"),
+    }
+}
+
 fn task_note(ws_id: &WorkspaceId, title: &str, task: Option<TaskMetadata>) -> Note {
     let ts = now_iso();
     Note {
