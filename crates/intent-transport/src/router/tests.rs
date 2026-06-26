@@ -903,6 +903,59 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn file_read(&self, workspace_id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+        // Echo a bare string so the wire test can assert file.read is NOT
+        // wrapped in an object.
+        Box::pin(async move { Ok(Value::String(format!("{}:{path}", workspace_id.as_str()))) })
+    }
+
+    fn file_write(
+        &self,
+        _workspace_id: WorkspaceId,
+        path: String,
+        content: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(
+                serde_json::json!({ "ok": true, "path": path, "size": content.encode_utf16().count() }),
+            )
+        })
+    }
+
+    fn file_list(&self, _workspace_id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!([{ "name": path, "type": "file" }])) })
+    }
+
+    fn file_delete(
+        &self,
+        _workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(
+            async move { Ok(serde_json::json!({ "ok": true, "path": path, "deleted": true })) },
+        )
+    }
+
+    fn file_mkdir(&self, _workspace_id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(
+            async move { Ok(serde_json::json!({ "ok": true, "path": path, "created": true })) },
+        )
+    }
+
+    fn file_rename(
+        &self,
+        _workspace_id: WorkspaceId,
+        old_path: String,
+        new_path: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true, "oldPath": old_path, "newPath": new_path,
+                "renamed": true, "isDirectory": false
+            }))
+        })
+    }
+
     fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             Ok(serde_json::json!({ "scripts": [], "workspaceId": workspace_id.as_str() }))
@@ -2190,6 +2243,106 @@ async fn terminal_kill_and_list_dispatch() {
         v["result"]["terminals"][0]["alive"],
         serde_json::json!(true)
     );
+}
+
+#[tokio::test]
+async fn file_methods_dispatch_with_exact_wire_shapes() {
+    // file.read returns a BARE string, not an object (the key parity gotcha).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.read","params":{"workspaceId":"ws-1","path":"a.txt"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"], serde_json::json!("ws-1:a.txt"));
+    assert!(v["result"].is_string());
+
+    // file.write → { ok, path, size }.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.write","params":{"workspaceId":"ws-1","path":"a.txt","content":"hello"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "ok": true, "path": "a.txt", "size": 5 })
+    );
+
+    // file.list → bare array; `path` defaults to "." when omitted.
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"file.list","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert!(v["result"].is_array());
+    assert_eq!(v["result"][0]["name"], serde_json::json!("."));
+    assert_eq!(v["result"][0]["type"], serde_json::json!("file"));
+
+    // file.delete → { ok, path, deleted: true }.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.delete","params":{"workspaceId":"ws-1","path":"a.txt"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "ok": true, "path": "a.txt", "deleted": true })
+    );
+
+    // file.mkdir → { ok, path, created: true }.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.mkdir","params":{"workspaceId":"ws-1","path":"d"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "ok": true, "path": "d", "created": true })
+    );
+
+    // file.rename → { ok, oldPath, newPath, renamed: true, isDirectory }.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.rename","params":{"workspaceId":"ws-1","oldPath":"a.txt","newPath":"b.txt"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({
+            "ok": true, "oldPath": "a.txt", "newPath": "b.txt",
+            "renamed": true, "isDirectory": false
+        })
+    );
+}
+
+#[tokio::test]
+async fn file_methods_require_params() {
+    // Missing workspaceId → -32602 "workspaceId is required".
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"file.read","params":{"path":"a"}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // Missing path → -32602 (router-level requireParam, outside the try block).
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"file.read","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // file.write missing content → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.write","params":{"workspaceId":"ws-1","path":"a"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // file.rename missing newPath → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.rename","params":{"workspaceId":"ws-1","oldPath":"a"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
 }
 
 #[tokio::test]

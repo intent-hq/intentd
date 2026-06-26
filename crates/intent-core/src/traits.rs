@@ -2296,6 +2296,109 @@ pub trait WorkspaceApi: Send + Sync {
             ))
         })
     }
+
+    // ------------------------------------------------------------------------
+    // file.* — workspace-scoped filesystem access (PROTOCOL §5.10). Every path
+    // is validated within the resolved workspace root; access-denied and other
+    // filesystem failures surface as `Error::Internal` (→ `-32603`), matching
+    // the TS handler which wraps the builder errors in `INTERNAL_ERROR`.
+    // ------------------------------------------------------------------------
+
+    /// `file.read`: the file's UTF-8 contents as a **bare JSON string** (not an
+    /// object), per the TS `ws.file.read` builder (PROTOCOL §5.10).
+    fn file_read(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_read not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.write`: create/overwrite a file (parent dirs created); returns
+    /// `{ ok: true, path, size }` where `size` is the content byte/char length
+    /// (PROTOCOL §5.10).
+    fn file_write(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+        content: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path, content);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_write not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.list`: directory entries as a **bare array** of
+    /// `{ name, type }` (`type` = `"file"`/`"directory"`); `path` defaults to
+    /// `"."` (PROTOCOL §5.10).
+    fn file_list(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.delete`: remove a single file (rejects directories); returns
+    /// `{ ok: true, path, deleted: true }` (PROTOCOL §5.10).
+    fn file_delete(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.mkdir`: create a directory (recursive); returns
+    /// `{ ok: true, path, created: true }`, or `{ ok: true, path, existed: true }`
+    /// when the directory already exists (PROTOCOL §5.10).
+    fn file_mkdir(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_mkdir not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.rename`: move a file/directory (destination must not exist);
+    /// returns `{ ok: true, oldPath, newPath, renamed: true, isDirectory }`
+    /// (PROTOCOL §5.10).
+    fn file_rename(
+        &self,
+        workspace_id: WorkspaceId,
+        old_path: String,
+        new_path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, old_path, new_path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_rename not implemented".to_string(),
+            ))
+        })
+    }
 }
 
 /// Whether a context engine is usable right now (§8.1). `Unavailable` is a

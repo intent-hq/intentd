@@ -45,6 +45,7 @@ mod agent_subscriptions;
 mod drafts;
 mod event_ops;
 pub mod events;
+mod file_ops;
 mod git_ops;
 mod history_xml;
 mod note_ops;
@@ -2076,6 +2077,80 @@ impl WorkspaceApi for Services {
     fn terminal_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         Box::pin(async move { terminal_ops::list(&pty, &workspace_id) })
+    }
+
+    fn file_read(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            file_ops::read(&root, &path)
+        })
+    }
+
+    fn file_write(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+        content: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            file_ops::write(&root, &path, &content)
+        })
+    }
+
+    fn file_list(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            file_ops::list(&root, &path)
+        })
+    }
+
+    fn file_delete(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            file_ops::delete(&root, &path)
+        })
+    }
+
+    fn file_mkdir(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            file_ops::mkdir(&root, &path)
+        })
+    }
+
+    fn file_rename(
+        &self,
+        workspace_id: WorkspaceId,
+        old_path: String,
+        new_path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            file_ops::rename(&root, &old_path, &new_path)
+        })
     }
 
     fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {

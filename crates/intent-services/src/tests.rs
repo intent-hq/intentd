@@ -4168,3 +4168,54 @@ mod known_repo {
         assert!(repos[0]["lastUsedAt"].is_string());
     }
 }
+
+mod file_ops_service {
+    use super::*;
+
+    /// `file.*` wired through `WorkspaceApi`: the workspace root resolves from
+    /// `worktreePath`, writes/reads round-trip, and an out-of-workspace path
+    /// surfaces as `Error::Internal` (→ `-32603`).
+    #[tokio::test]
+    async fn file_methods_resolve_root_and_enforce_workspace() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+
+        let dir = std::env::temp_dir().join(format!("intentd-fileapi-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.expect("ws");
+        let svc = Services::new(store);
+
+        let written = svc
+            .file_write(ws.clone(), "notes/x.txt".to_string(), "hi".to_string())
+            .await
+            .expect("write");
+        assert_eq!(
+            written,
+            serde_json::json!({ "ok": true, "path": "notes/x.txt", "size": 2 })
+        );
+
+        let read = svc
+            .file_read(ws.clone(), "notes/x.txt".to_string())
+            .await
+            .expect("read");
+        assert_eq!(read, serde_json::Value::String("hi".to_string()));
+
+        let listed = svc
+            .file_list(ws.clone(), "notes".to_string())
+            .await
+            .expect("list");
+        assert_eq!(
+            listed,
+            serde_json::json!([{ "name": "x.txt", "type": "file" }])
+        );
+
+        let denied = svc.file_read(ws.clone(), "../escape".to_string()).await;
+        assert!(matches!(denied, Err(Error::Internal(_))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
