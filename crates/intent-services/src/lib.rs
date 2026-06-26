@@ -2858,6 +2858,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            let expected_version = input.expected_version;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             // content present → raw full set; otherwise title/tags metadata.
             if let Some(content) = input.content {
@@ -2871,7 +2872,7 @@ impl WorkspaceApi for Services {
                 }
             }
             note.updated_at = now_iso();
-            store.update_note(&note).await?;
+            store.update_note_versioned(&note, expected_version).await?;
             publish_event(
                 &bus,
                 note_change_event(
@@ -3032,6 +3033,7 @@ impl WorkspaceApi for Services {
         note_id: NoteId,
         content: String,
         confirm_replacement: bool,
+        expected_version: Option<i64>,
     ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -3056,7 +3058,7 @@ impl WorkspaceApi for Services {
             note.content = clean.clone();
             let now = now_iso();
             note.updated_at = now.clone();
-            store.update_note(&note).await?;
+            store.update_note_versioned(&note, expected_version).await?;
             publish_event(
                 &bus,
                 note_change_event(
@@ -3258,6 +3260,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         note_id: NoteId,
         status: String,
+        expected_version: Option<i64>,
     ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -3277,7 +3280,7 @@ impl WorkspaceApi for Services {
             apply_status_transition(&mut task, new_status, &now);
             note.task = Some(task);
             note.updated_at = now.clone();
-            store.update_note(&note).await?;
+            store.update_note_versioned(&note, expected_version).await?;
             // Mirror `notes.service.ts`: emit only when the status actually changed.
             if previous_status != new_status {
                 publish_event(

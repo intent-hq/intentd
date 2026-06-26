@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use intent_core::{
     now_iso, ContentType, Error, Note, NoteAddInput, NoteEditInput, NoteEditLinesInput, NoteId,
-    NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
 
@@ -420,14 +420,94 @@ async fn edit_lines_deletes_range() {
 async fn set_content_reduction_guard_requires_confirmation() {
     let (_tmp, svc, ws, id) = setup("0123456789ABCDEFGHIJ").await;
     let denied = svc
-        .set_note_content(ws.clone(), id.clone(), "x".into(), false)
+        .set_note_content(ws.clone(), id.clone(), "x".into(), false, None)
         .await;
     assert!(matches!(denied, Err(Error::Internal(_))));
     let ok = svc
-        .set_note_content(ws, id, "x".into(), true)
+        .set_note_content(ws, id, "x".into(), true, None)
         .await
         .expect("confirmed");
     assert_eq!(ok.new_content, "x");
+}
+
+#[tokio::test]
+async fn update_note_expected_version_gate_hit_miss_absent() {
+    let (_tmp, svc, ws, id) = setup("v0").await;
+
+    // HIT: the freshly-inserted note is at rev 0; the matching expectedVersion
+    // writes successfully. (The returned note mirrors the pre-write in-memory
+    // copy, matching the existing `update_note` contract; the persisted bump is
+    // asserted via the conflict re-read below.)
+    let hit = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("v1".into()),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("expectedVersion hit writes");
+    assert_eq!(hit.content, "v1");
+
+    // MISS: a stale expectedVersion (0) yields a Conflict carrying the current
+    // entity, which proves the HIT persisted and bumped rev → 1.
+    let miss = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("v2-should-not-persist".into()),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await;
+    match miss {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 1);
+            assert_eq!(current["content"], "v1");
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+
+    // ABSENT: no expectedVersion → last-writer-wins (unconditional write).
+    let absent = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("v2".into()),
+                expected_version: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("absent degrades to last-writer-wins");
+    assert_eq!(absent.content, "v2");
+
+    // The unconditional write also bumps rev → 2: a stale expectedVersion (1)
+    // now conflicts, carrying the current entity (rev 2, content "v2").
+    let stale = svc
+        .update_note(
+            ws,
+            id,
+            NoteUpdateInput {
+                content: Some("v3-should-not-persist".into()),
+                expected_version: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+    match stale {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 2);
+            assert_eq!(current["content"], "v2");
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -591,7 +671,7 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
 
     // updateNoteStatus → in_progress sets startedAt.
     let upd = svc
-        .task_update_note_status(ws.clone(), id.clone(), "in_progress".into())
+        .task_update_note_status(ws.clone(), id.clone(), "in_progress".into(), None)
         .await
         .expect("updateNoteStatus");
     assert_eq!(upd.status, intent_core::TaskStatus::InProgress);
@@ -599,7 +679,7 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
 
     // Invalid status string rejected with the TS-style message.
     assert!(svc
-        .task_update_note_status(ws.clone(), id.clone(), "bogus".into())
+        .task_update_note_status(ws.clone(), id.clone(), "bogus".into(), None)
         .await
         .is_err());
 
@@ -1238,7 +1318,7 @@ mod change_event_parity {
         h.store.insert_note(&tn).await.expect("insert task note");
         let mut sub = subscribe(&h);
         h.services
-            .task_update_note_status(h.ws.clone(), tn.id.clone(), "in_progress".to_string())
+            .task_update_note_status(h.ws.clone(), tn.id.clone(), "in_progress".to_string(), None)
             .await
             .expect("status");
         let ev = recv_one(&mut sub).await;
@@ -1274,7 +1354,7 @@ mod change_event_parity {
         // terminal (excluded), and the parent's only child is complete, so the
         // parent becomes the sole ready task.
         h.services
-            .task_update_note_status(h.ws.clone(), child.id.clone(), "complete".to_string())
+            .task_update_note_status(h.ws.clone(), child.id.clone(), "complete".to_string(), None)
             .await
             .expect("status");
 
