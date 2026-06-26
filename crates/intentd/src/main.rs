@@ -223,6 +223,9 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
     // Hold a store handle for the §10.2 retention sweep before the store is
     // moved into the services surface below.
     let retention_store = store.clone();
+    // Hold a store handle for the §5.4 idempotency reaper (same lifecycle root
+    // as the retention sweep) before the store is moved into the services below.
+    let idempotency_store = store.clone();
     // The services surface publishes CRUD change events onto the same bus that
     // transport subscriptions read, so a mutation on one connection streams to
     // subscribers on another (§10).
@@ -264,6 +267,9 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
     // family. Disabled entirely when `events.streamRetentionHours == 0`.
     let retention_task =
         spawn_stream_retention_loop(retention_store, config.stream_retention_hours);
+    // Idempotency-key reaper (§5.4): hourly sweep deleting dedupe rows older than
+    // 24h so the `idempotency_key` table stays bounded. Aborted on clean shutdown.
+    let idempotency_reap_task = spawn_idempotency_reap_loop(idempotency_store);
     // External MCP servers (§18.3): start every enabled, non-disabled server,
     // then run the health monitor (periodic ping + auto-restart pushing
     // `mcp.servers:status-changed`). The hub is reaped on shutdown so no orphan
@@ -348,6 +354,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
     if let Some(retention_task) = retention_task {
         retention_task.abort();
     }
+    idempotency_reap_task.abort();
     // Stop the MCP health monitor and reap every external MCP server's process
     // group so no orphan stdio servers survive the daemon (§18.3).
     mcp_monitor.abort();
@@ -644,6 +651,36 @@ fn spawn_stream_retention_loop(
             }
         }
     }))
+}
+
+/// Spawn the periodic idempotency-key reaper (design note TB-0 §5.4). Runs
+/// ~hourly: deletes `idempotency_key` rows whose `created_at` is older than 24h
+/// (via `idx_idempotency_created`), bounding the dedupe store. The first tick
+/// fires immediately so a long-lived daemon trims on startup; a failed sweep is
+/// logged and retried on the next tick (never aborts the loop).
+fn spawn_idempotency_reap_loop(store: Store) -> tokio::task::JoinHandle<()> {
+    const RETENTION_HOURS: i64 = 24;
+    let interval = Duration::from_secs(3600);
+    tracing::info!(
+        retention_hours = RETENTION_HOURS,
+        interval_secs = interval.as_secs(),
+        "idempotency reaper enabled"
+    );
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let cutoff = intent_core::iso_minutes_ago(RETENTION_HOURS * 60);
+            match store.reap_idempotent(&cutoff).await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(removed, cutoff, "idempotency reaper trimmed dedupe keys");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "idempotency reaper sweep failed"),
+            }
+        }
+    })
 }
 
 /// Start a [`FileWatcher`] for every non-archived workspace that exposes an
