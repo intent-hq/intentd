@@ -168,7 +168,11 @@ async fn agent_channel_snapshot_then_removed_delta() {
     let (mut sub_reader, _sub_write, sub_id, snap) =
         subscribe(&socket, "agent.subscribe", json!({ "workspaceId": ws_id })).await;
     assert!(sub_id.starts_with("ws-sub-"));
-    assert!(find(&snap, &agent_id).is_some(), "agent in snapshot");
+    let agent = find(&snap, &agent_id).expect("agent in snapshot");
+    assert!(
+        agent["rev"].is_null(),
+        "agent entities carry no rev (R3 scopes rev to Note/Task)"
+    );
 
     // agent.delete → AGENT_DELETED → removedIds delta (seq 1).
     rpc(
@@ -232,6 +236,10 @@ async fn task_channel_snapshot_then_updated_delta() {
         task["task"].is_object(),
         "task metadata present in snapshot"
     );
+    assert!(
+        task["rev"].is_number(),
+        "rev echoed on task snapshot entity"
+    );
 
     // task.updateNoteStatus → task:status-changed → updated delta (seq 1).
     rpc(
@@ -249,6 +257,10 @@ async fn task_channel_snapshot_then_updated_delta() {
     assert_eq!(
         d1["params"]["delta"]["updated"][0]["task"]["status"],
         "in_progress"
+    );
+    assert!(
+        d1["params"]["delta"]["updated"][0]["rev"].is_number(),
+        "rev echoed on task updated delta entity"
     );
 
     let _ = shutdown_tx.send(());
@@ -314,6 +326,10 @@ async fn comment_channel_snapshot_then_updated_delta() {
     let thread = &d1["params"]["delta"]["updated"][0];
     assert_eq!(thread["threadId"], comment_id.as_str());
     assert_eq!(thread["noteId"], note_id.as_str());
+    assert!(
+        thread["rev"].is_null(),
+        "comment entities carry no rev (R3 scopes rev to Note/Task)"
+    );
 
     let _ = shutdown_tx.send(());
     let _ = server.await;
@@ -341,7 +357,11 @@ async fn workspace_channel_snapshot_then_updated_delta() {
     // The workspace channel is global (no `workspaceId` param).
     let (mut sub_reader, _sub_write, _sub_id, snap) =
         subscribe(&socket, "workspace.subscribe", json!({})).await;
-    assert!(find(&snap, &ws_id).is_some(), "workspace in snapshot");
+    let ws_entry = find(&snap, &ws_id).expect("workspace in snapshot");
+    assert!(
+        ws_entry["rev"].is_null(),
+        "workspace entities carry no rev (R3 scopes rev to Note/Task)"
+    );
 
     // A workspace status event re-reads the workspace into an `updated` delta.
     bus.publish(&NewEvent {
