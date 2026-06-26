@@ -42,6 +42,13 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: "Internal error".to_string(),
             data: Some(Value::String(msg)),
         },
+        // Optimistic-concurrency conflict: -32005 carrying the current entity
+        // under `data.current` so the client can reconcile (PROTOCOL §4, §5.6).
+        Error::Conflict { current } => RpcErr {
+            code: -32005,
+            message: "Conflict".to_string(),
+            data: Some(json!({ "code": "conflict", "current": current })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),
@@ -234,6 +241,7 @@ async fn dispatch(
                 content: opt_str(params, "content"),
                 title: opt_str(params, "title"),
                 tags: opt_tags(params, "tags"),
+                expected_version: opt_int(params, "expectedVersion"),
             };
             let note = api
                 .update_note(ws, note_id, input)
@@ -294,8 +302,9 @@ async fn dispatch(
             let note_id = require_note_id(params)?;
             let content = require_str_param(params, "content")?;
             let confirm = parse_confirm(params);
+            let expected_version = opt_int(params, "expectedVersion");
             let result = api
-                .set_note_content(ws, note_id, content, confirm)
+                .set_note_content(ws, note_id, content, confirm, expected_version)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -348,8 +357,9 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
             let status = require_str_param(params, "status")?;
+            let expected_version = opt_int(params, "expectedVersion");
             let result = api
-                .task_update_note_status(ws, note_id, status)
+                .task_update_note_status(ws, note_id, status, expected_version)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
