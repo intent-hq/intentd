@@ -84,11 +84,11 @@ async fn migration_status_reports_current_after_open() {
     assert!(status.is_current(), "fresh open must apply all migrations");
     assert_eq!(
         status.expected,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     );
     assert_eq!(
         status.applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     );
 }
 
@@ -1352,4 +1352,78 @@ async fn known_repo_list_orders_by_last_used_desc() {
     let repos = store.list_known_repos().await.expect("list");
     let paths: Vec<&str> = repos.iter().map(|r| r.path.as_str()).collect();
     assert_eq!(paths, vec!["/src/a", "/src/c", "/src/b"]);
+}
+
+#[tokio::test]
+async fn idempotency_get_put_round_trips_and_dedupes() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    assert!(
+        store.get_idempotent("ws-1", "k1").await.unwrap().is_none(),
+        "missing key reads as None"
+    );
+    let inserted = store
+        .put_idempotent("ws-1", "k1", "note.create", "{\"id\":\"n1\"}")
+        .await
+        .unwrap();
+    assert!(inserted, "first put inserts the row");
+    assert_eq!(
+        store.get_idempotent("ws-1", "k1").await.unwrap().as_deref(),
+        Some("{\"id\":\"n1\"}")
+    );
+    // A second put under the same (ws,key) is an INSERT OR IGNORE no-op that
+    // keeps the original stored result.
+    let inserted_again = store
+        .put_idempotent("ws-1", "k1", "note.create", "{\"id\":\"n2\"}")
+        .await
+        .unwrap();
+    assert!(!inserted_again, "duplicate put is a no-op");
+    assert_eq!(
+        store.get_idempotent("ws-1", "k1").await.unwrap().as_deref(),
+        Some("{\"id\":\"n1\"}"),
+        "duplicate put must not overwrite the original result"
+    );
+    // The same key is independent across workspaces (and the "" global sentinel).
+    assert!(store.get_idempotent("ws-2", "k1").await.unwrap().is_none());
+    assert!(store.get_idempotent("", "k1").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn idempotency_reaper_deletes_only_rows_older_than_cutoff() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    // One row well in the past, one fresh row (put stamps created_at = now).
+    let old_ts = intent_core::iso_minutes_ago(48 * 60);
+    sqlx::query(
+        "INSERT INTO idempotency_key \
+         (workspace_id, idempotency_key, method, result_json, created_at) \
+         VALUES (?,?,?,?,?)",
+    )
+    .bind("ws-1")
+    .bind("old")
+    .bind("note.create")
+    .bind("{\"id\":\"old\"}")
+    .bind(&old_ts)
+    .execute(store.pool())
+    .await
+    .expect("seed old row");
+    store
+        .put_idempotent("ws-1", "fresh", "note.create", "{\"id\":\"fresh\"}")
+        .await
+        .unwrap();
+
+    let cutoff = intent_core::iso_minutes_ago(24 * 60);
+    let removed = store.reap_idempotent(&cutoff).await.expect("reap");
+    assert_eq!(removed, 1, "only the >24h row is reaped");
+    assert!(store.get_idempotent("ws-1", "old").await.unwrap().is_none());
+    assert!(store
+        .get_idempotent("ws-1", "fresh")
+        .await
+        .unwrap()
+        .is_some());
+
+    // Re-running the sweep removes nothing more (idempotent).
+    assert_eq!(store.reap_idempotent(&cutoff).await.expect("reap"), 0);
 }
