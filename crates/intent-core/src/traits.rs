@@ -222,14 +222,22 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `note.setContent`: full replace with the reduction guard (PROTOCOL §5.2).
+    /// `expected_version` gates the write on the current `rev` when `Some` (§5.6).
     fn set_note_content(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         content: String,
         confirm_replacement: bool,
+        expected_version: Option<i64>,
     ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
-        let _ = (workspace_id, note_id, content, confirm_replacement);
+        let _ = (
+            workspace_id,
+            note_id,
+            content,
+            confirm_replacement,
+            expected_version,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::set_note_content not implemented".to_string(),
@@ -312,13 +320,15 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.updateNoteStatus`: set task-note metadata status (PROTOCOL §5.4).
+    /// `expected_version` gates the write on the current `rev` when `Some` (§5.6).
     fn task_update_note_status(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         status: String,
+        expected_version: Option<i64>,
     ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
-        let _ = (workspace_id, note_id, status);
+        let _ = (workspace_id, note_id, status, expected_version);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::task_update_note_status not implemented".to_string(),

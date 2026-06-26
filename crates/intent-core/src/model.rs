@@ -493,6 +493,9 @@ pub struct NoteUpdateInput {
     pub content: Option<String>,
     pub title: Option<String>,
     pub tags: Option<Vec<String>>,
+    /// Optimistic-concurrency gate: when `Some`, the write only succeeds if the
+    /// note's current `rev` matches; absent → last-writer-wins (PROTOCOL §5.6).
+    pub expected_version: Option<i64>,
 }
 
 /// Wire input for `note.add` (PROTOCOL §5.2).

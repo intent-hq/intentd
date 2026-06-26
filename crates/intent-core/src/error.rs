@@ -19,6 +19,13 @@ pub enum Error {
     /// An unexpected internal failure (I/O, persistence, serialization).
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// A conditional write lost an optimistic-concurrency check: the entity's
+    /// current `rev` did not match the supplied `expectedVersion`. Carries the
+    /// current entity so the client can reconcile (PROTOCOL §4, §5.6 — surfaced
+    /// as `-32005` with `error.data.current`).
+    #[error("conflict: version mismatch")]
+    Conflict { current: serde_json::Value },
 }
 
 impl Error {
@@ -27,6 +34,7 @@ impl Error {
         match self {
             Error::InvalidParams(_) | Error::NotFound(_) => -32602,
             Error::Internal(_) => -32603,
+            Error::Conflict { .. } => -32005,
         }
     }
 }
