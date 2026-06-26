@@ -380,7 +380,7 @@ impl WsInner {
                         // surface (those are served over the local UDS); pass `None`.
                         // `host.status` IS answered here, with the resolved WSS
                         // locality (remote unless overridden, §5.14).
-                        if !conn::process_frame(&text, &*self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, None, &mut client_id, self.locality_is_local).await {
+                        if !conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, None, &mut client_id, self.locality_is_local).await {
                             break;
                         }
                     }
