@@ -71,6 +71,7 @@ fn sample_note(ws: &WorkspaceId) -> Note {
         visibility: NoteVisibility::Workspace,
         task: None,
         created_at: "t0".to_string(),
+        rev: 0,
         updated_at: "t0".to_string(),
     }
 }
@@ -94,7 +95,11 @@ impl WorkspaceApi for FakeApi {
             Ok(ws_with(&id))
         })
     }
-    fn create_workspace(&self, input: WorkspaceCreate) -> BoxFuture<'_, Result<Workspace>> {
+    fn create_workspace(
+        &self,
+        input: WorkspaceCreate,
+        _idempotency_key: Option<String>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
         Box::pin(async move {
             let mut ws = sample_ws();
             if let Some(t) = input.title {
@@ -191,6 +196,7 @@ impl WorkspaceApi for FakeApi {
         &self,
         workspace_id: WorkspaceId,
         input: NoteCreate,
+        _idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<Note>> {
         Box::pin(async move {
             let mut note = sample_note(&workspace_id);
@@ -209,6 +215,16 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async move {
             if note_id.as_str() == "missing" {
                 return Err(Error::NotFound("note".to_string()));
+            }
+            // Sentinel: a stale `expectedVersion` on this id surfaces the
+            // optimistic-concurrency conflict carrying the current entity.
+            if note_id.as_str() == "conflict" {
+                let mut current = sample_note(&workspace_id);
+                current.id = note_id;
+                current.rev = 7;
+                return Err(Error::Conflict {
+                    current: serde_json::to_value(&current).unwrap(),
+                });
             }
             let mut note = sample_note(&workspace_id);
             note.id = note_id;
@@ -289,6 +305,7 @@ impl WorkspaceApi for FakeApi {
         note_id: NoteId,
         content: String,
         _confirm_replacement: bool,
+        _expected_version: Option<i64>,
     ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
         Box::pin(async move {
             Ok(NoteSetContentResult {
@@ -683,6 +700,7 @@ impl WorkspaceApi for FakeApi {
         &self,
         _workspace_id: WorkspaceId,
         message: String,
+        _idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<GitCommitResult>> {
         Box::pin(async move {
             if message == "boom" {
@@ -1247,6 +1265,24 @@ async fn domain_not_found_maps_to_minus_32602() {
             .await
             .unwrap();
     assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn expected_version_conflict_maps_to_minus_32005_with_data_current() {
+    // A stale `expectedVersion` on `note.update` surfaces -32005 carrying the
+    // current entity under `error.data.current` (PROTOCOL §4, §5.6).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":9,"method":"note.update","params":{"workspaceId":"ws-1","noteId":"conflict","content":"x","expectedVersion":1}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32005);
+    assert_eq!(v["error"]["message"], serde_json::json!("Conflict"));
+    assert_eq!(v["error"]["data"]["code"], serde_json::json!("conflict"));
+    let current = &v["error"]["data"]["current"];
+    assert!(current.is_object(), "data.current must be the entity");
+    assert_eq!(current["id"], serde_json::json!("conflict"));
+    assert_eq!(current["rev"], serde_json::json!(7));
 }
 
 #[tokio::test]

@@ -8,7 +8,8 @@
 //! identical regardless of transport. The only difference is framing, which the
 //! transports handle by draining an outbound `mpsc::Sender<String>`.
 
-use intent_core::{ClientId, WorkspaceApi};
+use intent_core::events::{NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED};
+use intent_core::{ClientId, NoteId, WorkspaceApi, WorkspaceId};
 use intent_services::{EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -24,6 +25,7 @@ use crate::forward::{self, ForwardRegistry};
 use crate::host;
 use crate::reverse::ReverseChannel;
 use crate::router::handle_message;
+use crate::subscriptions::{self, Channel, SubFastPath};
 
 /// Capacity of the per-connection outbound frame queue (responses + pushed
 /// notifications are serialized through one writer so they never interleave).
@@ -93,7 +95,7 @@ impl ConnSubs {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_frame(
     raw: &str,
-    api: &dyn WorkspaceApi,
+    api: &Arc<dyn WorkspaceApi>,
     bus: &EventBus,
     out_tx: &mpsc::Sender<String>,
     subs: &mut ConnSubs,
@@ -131,22 +133,25 @@ pub(crate) async fn process_frame(
             };
         }
         if let Some(req) = client::classify(&value) {
-            return match client::handle(req, api, client_id, is_local).await {
+            return match client::handle(req, api.as_ref(), client_id, is_local).await {
                 Some(frame) => out_tx.send(frame).await.is_ok(),
                 None => true,
             };
         }
         if let Some(req) = drafts::classify(&value) {
-            return match drafts::handle(req, api, client_id).await {
+            return match drafts::handle(req, api.as_ref(), client_id).await {
                 Some(frame) => out_tx.send(frame).await.is_ok(),
                 None => true,
             };
+        }
+        if let Some(sub) = subscriptions::classify(&value) {
+            return handle_sub_fast_path(sub, api, bus, out_tx, subs).await;
         }
         if let Some(fast_path) = events::classify(&value) {
             return handle_fast_path(fast_path, bus, out_tx, subs).await;
         }
     }
-    match handle_message(api, raw).await {
+    match handle_message(api.as_ref(), raw).await {
         Some(response) => out_tx.send(response).await.is_ok(),
         None => true,
     }
@@ -243,6 +248,263 @@ async fn forward_subscription(
             let frame = events::build_event_notification(&subscription_id, &event);
             if out_tx.send(frame).await.is_err() {
                 return;
+            }
+        }
+    }
+}
+
+/// Handle a classified `note.subscribe` / `note.unsubscribe` request (TB-0 §1).
+/// Subscribe wires the bus subscription FIRST (so concurrent mutations are
+/// captured), enqueues the `{ subscriptionId }` response, then spawns the
+/// forwarder that emits the snapshot (seq 0) and tails deltas. Returns `false`
+/// when the outbound channel is closed.
+async fn handle_sub_fast_path(
+    sub: SubFastPath,
+    api: &Arc<dyn WorkspaceApi>,
+    bus: &EventBus,
+    out_tx: &mpsc::Sender<String>,
+    subs: &mut ConnSubs,
+) -> bool {
+    match sub {
+        SubFastPath::Subscribe {
+            id,
+            channel: Channel::Note,
+            params,
+        } => match subscriptions::parse_subscribe_params(&params) {
+            Ok(p) => {
+                let subscriptions::NoteSubscribeParams {
+                    workspace_id,
+                    replace_group,
+                } = p;
+                if let Some(group) = replace_group.as_deref() {
+                    subs.remove_group(group);
+                }
+                // Subscribe before the snapshot so a mutation racing the read is
+                // captured and re-emitted as a delta (idempotent over-delivery,
+                // §1.3). Each matched event is delivered individually (no
+                // coalescing) to keep `seq` strictly monotonic.
+                let subscription = bus.subscribe(SubscriptionFilter {
+                    event_types: vec![
+                        NOTE_CREATED.to_string(),
+                        NOTE_UPDATED.to_string(),
+                        NOTE_DELETED.to_string(),
+                    ],
+                    workspace_id: Some(workspace_id.clone()),
+                    batch_window: None,
+                    ..Default::default()
+                });
+                let subscription_id = events::next_subscription_id();
+                // Enqueue the response before spawning the forwarder so it can
+                // never be preceded by a `subscription.push` notification (§3.4).
+                if id.present {
+                    let frame = events::success_frame(
+                        id.echo,
+                        json!({ "subscriptionId": subscription_id }),
+                    );
+                    if out_tx.send(frame).await.is_err() {
+                        return false;
+                    }
+                }
+                let handle = tokio::spawn(forward_note_subscription(
+                    api.clone(),
+                    WorkspaceId::from(workspace_id),
+                    subscription,
+                    subscription_id.clone(),
+                    out_tx.clone(),
+                ));
+                subs.insert(subscription_id, handle, replace_group);
+                true
+            }
+            Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
+        },
+        // TB-5 channels (`task`/`agent`/`workspace`/`comment`) reuse the same
+        // subscribe-before-snapshot discipline as the note channel; only the
+        // param scope, bus filter, and snapshot/delta mapper differ.
+        SubFastPath::Subscribe {
+            id,
+            channel,
+            params,
+        } => {
+            let parsed = parse_channel_params(channel, &params);
+            match parsed {
+                Ok(ChannelParams {
+                    workspace_id,
+                    note_id,
+                    replace_group,
+                }) => {
+                    if let Some(group) = replace_group.as_deref() {
+                        subs.remove_group(group);
+                    }
+                    let filter_ws = if subscriptions::channel_is_global(channel) {
+                        None
+                    } else {
+                        workspace_id.clone()
+                    };
+                    let subscription = bus.subscribe(SubscriptionFilter {
+                        event_types: subscriptions::channel_event_types(channel),
+                        workspace_id: filter_ws,
+                        batch_window: None,
+                        ..Default::default()
+                    });
+                    let subscription_id = events::next_subscription_id();
+                    if id.present {
+                        let frame = events::success_frame(
+                            id.echo,
+                            json!({ "subscriptionId": subscription_id }),
+                        );
+                        if out_tx.send(frame).await.is_err() {
+                            return false;
+                        }
+                    }
+                    let handle = tokio::spawn(forward_channel_subscription(
+                        api.clone(),
+                        channel,
+                        workspace_id
+                            .map(WorkspaceId::from)
+                            .unwrap_or_else(|| WorkspaceId::from(String::new())),
+                        note_id.map(NoteId::from),
+                        subscription,
+                        subscription_id.clone(),
+                        out_tx.clone(),
+                    ));
+                    subs.insert(subscription_id, handle, replace_group);
+                    true
+                }
+                Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
+            }
+        }
+        SubFastPath::Unsubscribe { id, params } => match events::parse_unsubscribe_id(&params) {
+            Ok(subscription_id) => {
+                let success = subs.remove(&subscription_id);
+                if id.present {
+                    let frame = events::success_frame(id.echo, json!({ "success": success }));
+                    return out_tx.send(frame).await.is_ok();
+                }
+                true
+            }
+            Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
+        },
+    }
+}
+
+/// Per-subscription forwarder for the `note` collection channel. Materializes
+/// the snapshot (seq 0) from `list_notes`, then maps each `note:*` change event
+/// to a `{ added, updated, removedIds }` delta (re-reading the entity, §2.2) at
+/// the next seq. Owns `seq`, so strict monotonicity holds without shared state.
+/// Aborted by [`ConnSub`] on unsubscribe / disconnect.
+async fn forward_note_subscription(
+    api: Arc<dyn WorkspaceApi>,
+    workspace_id: WorkspaceId,
+    mut subscription: Subscription,
+    subscription_id: String,
+    out_tx: mpsc::Sender<String>,
+) {
+    let snapshot = match api.list_notes(&workspace_id).await {
+        Ok(notes) => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
+        Err(_) => Value::Array(Vec::new()),
+    };
+    let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
+    if out_tx.send(frame).await.is_err() {
+        return;
+    }
+    let mut seq: u64 = 1;
+    while let Some(batch) = subscription.recv().await {
+        for event in batch {
+            if let Some(delta) =
+                subscriptions::note_delta(api.as_ref(), &workspace_id, &event).await
+            {
+                let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
+                if out_tx.send(frame).await.is_err() {
+                    return;
+                }
+                seq += 1;
+            }
+        }
+    }
+}
+
+/// The resolved scope of a TB-5 channel subscribe: `workspace_id` is `None` only
+/// for the global `workspace` channel; `note_id` is `Some` only for the
+/// per-note `comment` channel.
+struct ChannelParams {
+    workspace_id: Option<String>,
+    note_id: Option<String>,
+    replace_group: Option<String>,
+}
+
+/// Parse a TB-5 channel's subscribe params into the common [`ChannelParams`]
+/// scope, validating the required fields per channel (§6.2).
+fn parse_channel_params(
+    channel: Channel,
+    params: &serde_json::Map<String, Value>,
+) -> Result<ChannelParams, String> {
+    match channel {
+        Channel::Workspace => {
+            let p = subscriptions::parse_workspace_subscribe_params(params)?;
+            Ok(ChannelParams {
+                workspace_id: None,
+                note_id: None,
+                replace_group: p.replace_group,
+            })
+        }
+        Channel::Comment => {
+            let p = subscriptions::parse_comment_subscribe_params(params)?;
+            Ok(ChannelParams {
+                workspace_id: Some(p.workspace_id),
+                note_id: Some(p.note_id),
+                replace_group: p.replace_group,
+            })
+        }
+        // `note`/`task`/`agent` are all workspace-scoped collections.
+        _ => {
+            let p = subscriptions::parse_subscribe_params(params)?;
+            Ok(ChannelParams {
+                workspace_id: Some(p.workspace_id),
+                note_id: None,
+                replace_group: p.replace_group,
+            })
+        }
+    }
+}
+
+/// Per-subscription forwarder for the TB-5 channels. Mirrors
+/// [`forward_note_subscription`] but dispatches snapshot + delta through the
+/// channel-generic [`subscriptions::channel_snapshot`] /
+/// [`subscriptions::channel_delta`]. Owns `seq` for strict monotonicity; aborted
+/// by [`ConnSub`] on unsubscribe / disconnect.
+async fn forward_channel_subscription(
+    api: Arc<dyn WorkspaceApi>,
+    channel: Channel,
+    workspace_id: WorkspaceId,
+    note_id: Option<NoteId>,
+    mut subscription: Subscription,
+    subscription_id: String,
+    out_tx: mpsc::Sender<String>,
+) {
+    let snapshot =
+        subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
+            .await;
+    let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
+    if out_tx.send(frame).await.is_err() {
+        return;
+    }
+    let mut seq: u64 = 1;
+    while let Some(batch) = subscription.recv().await {
+        for event in batch {
+            if let Some(delta) = subscriptions::channel_delta(
+                api.as_ref(),
+                channel,
+                &workspace_id,
+                note_id.as_ref(),
+                &event,
+            )
+            .await
+            {
+                let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
+                if out_tx.send(frame).await.is_err() {
+                    return;
+                }
+                seq += 1;
             }
         }
     }

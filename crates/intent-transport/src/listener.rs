@@ -143,7 +143,7 @@ async fn handle_connection(
         // UDS is the local control transport, so `is_local = true` (§12.3).
         if !process_frame(
             trimmed,
-            &*api,
+            &api,
             &bus,
             &out_tx,
             &mut subs,

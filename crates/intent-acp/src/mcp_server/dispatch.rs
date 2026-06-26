@@ -33,6 +33,10 @@ fn opt_bool(args: &Value, key: &str) -> Option<bool> {
     args.get(key).and_then(Value::as_bool)
 }
 
+fn opt_i64(args: &Value, key: &str) -> Option<i64> {
+    args.get(key).and_then(Value::as_i64)
+}
+
 fn opt_vec_str(args: &Value, key: &str) -> Option<Vec<String>> {
     args.get(key).and_then(Value::as_array).map(|a| {
         a.iter()
@@ -71,6 +75,7 @@ impl WorkspaceMcpServer {
                         tags: opt_vec_str(args, "tags"),
                         parent_id: None,
                     },
+                    opt_str(args, "idempotencyKey"),
                 )
                 .await),
             "add_to_note_workspace-mcp" => {
@@ -95,6 +100,7 @@ impl WorkspaceMcpServer {
                         id,
                         req_str(args, "content")?,
                         opt_bool(args, "confirmReplacement").unwrap_or(false),
+                        opt_i64(args, "expectedVersion"),
                     )
                     .await)
             }
@@ -157,7 +163,12 @@ impl WorkspaceMcpServer {
             "update_note_task_status_workspace-mcp" => {
                 let id = note_id(args, "noteId")?;
                 val(api
-                    .task_update_note_status(ws, id, req_str(args, "status")?)
+                    .task_update_note_status(
+                        ws,
+                        id,
+                        req_str(args, "status")?,
+                        opt_i64(args, "expectedVersion"),
+                    )
                     .await)
             }
             "update_task_workspace-mcp" => {

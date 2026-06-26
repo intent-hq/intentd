@@ -222,6 +222,7 @@ async fn import_notes(store: &Store, dir: &Path, summary: &mut ImportSummary) {
                 ("isArchived", json!(false)),
                 ("isDefault", json!(false)),
                 ("visibility", json!("workspace")),
+                ("rev", json!(0)),
             ],
         );
         match serde_json::from_value::<Note>(Value::Object(obj)) {

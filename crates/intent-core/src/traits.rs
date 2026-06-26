@@ -54,8 +54,16 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// Create a workspace from wire input, filling ids/defaults (PROTOCOL §5.1).
-    fn create_workspace(&self, input: WorkspaceCreate) -> BoxFuture<'_, Result<Workspace>> {
-        let _ = input;
+    ///
+    /// `idempotency_key` is the optional `params.idempotencyKey` (design note TB-0
+    /// §5): when present and previously recorded, the original result is returned
+    /// without re-executing; soft-launch when absent (warn + execute).
+    fn create_workspace(
+        &self,
+        input: WorkspaceCreate,
+        idempotency_key: Option<String>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        let _ = (input, idempotency_key);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::create_workspace not implemented".to_string(),
@@ -148,12 +156,17 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// Create a note from wire input (PROTOCOL §5.2).
+    ///
+    /// `idempotency_key` is the optional `params.idempotencyKey` (design note TB-0
+    /// §5): when present and previously recorded, the original result is returned
+    /// without re-executing; soft-launch when absent (warn + execute).
     fn create_note(
         &self,
         workspace_id: WorkspaceId,
         input: NoteCreate,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<Note>> {
-        let _ = (workspace_id, input);
+        let _ = (workspace_id, input, idempotency_key);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::create_note not implemented".to_string(),
@@ -222,14 +235,22 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `note.setContent`: full replace with the reduction guard (PROTOCOL §5.2).
+    /// `expected_version` gates the write on the current `rev` when `Some` (§5.6).
     fn set_note_content(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         content: String,
         confirm_replacement: bool,
+        expected_version: Option<i64>,
     ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
-        let _ = (workspace_id, note_id, content, confirm_replacement);
+        let _ = (
+            workspace_id,
+            note_id,
+            content,
+            confirm_replacement,
+            expected_version,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::set_note_content not implemented".to_string(),
@@ -312,13 +333,15 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.updateNoteStatus`: set task-note metadata status (PROTOCOL §5.4).
+    /// `expected_version` gates the write on the current `rev` when `Some` (§5.6).
     fn task_update_note_status(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         status: String,
+        expected_version: Option<i64>,
     ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
-        let _ = (workspace_id, note_id, status);
+        let _ = (workspace_id, note_id, status, expected_version);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::task_update_note_status not implemented".to_string(),
@@ -499,8 +522,16 @@ pub trait WorkspaceApi: Send + Sync {
         model: Option<String>,
         specialist_id: Option<String>,
         parent_agent_id: Option<AgentId>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, name, model, specialist_id, parent_agent_id);
+        let _ = (
+            workspace_id,
+            name,
+            model,
+            specialist_id,
+            parent_agent_id,
+            idempotency_key,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_create not implemented".to_string(),
@@ -1102,8 +1133,9 @@ pub trait WorkspaceApi: Send + Sync {
         &self,
         workspace_id: WorkspaceId,
         message: String,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<GitCommitResult>> {
-        let _ = (workspace_id, message);
+        let _ = (workspace_id, message, idempotency_key);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_commit not implemented".to_string(),
@@ -1236,8 +1268,15 @@ pub trait WorkspaceApi: Send + Sync {
         merge_method: Option<String>,
         commit_title: Option<String>,
         commit_message: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, merge_method, commit_title, commit_message);
+        let _ = (
+            workspace_id,
+            merge_method,
+            commit_title,
+            commit_message,
+            idempotency_key,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_merge not implemented".to_string(),

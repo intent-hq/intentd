@@ -84,11 +84,11 @@ async fn migration_status_reports_current_after_open() {
     assert!(status.is_current(), "fresh open must apply all migrations");
     assert_eq!(
         status.expected,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     );
     assert_eq!(
         status.applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     );
 }
 
@@ -217,6 +217,7 @@ async fn note_round_trip() {
             ..Default::default()
         }),
         created_at: ts.clone(),
+        rev: 0,
         updated_at: ts,
     };
     store.insert_note(&note).await.expect("insert note");
@@ -240,6 +241,133 @@ async fn note_round_trip() {
     assert_eq!(fetched.id, note.id);
 }
 
+#[tokio::test]
+async fn note_rev_increments_on_update() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let ts = now_iso();
+    let mut note = Note {
+        id: NoteId::new(),
+        workspace_id: ws_id.clone(),
+        title: "Spec".to_string(),
+        content: "# Hello".to_string(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        task: None,
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts,
+    };
+    store.insert_note(&note).await.expect("insert note");
+
+    // Fresh insert starts at rev 0.
+    let after_insert = store.get_note(&note.id).await.expect("get note");
+    assert_eq!(after_insert.rev, 0);
+
+    // First update bumps rev → 1 (the bump is store-owned, ignoring the stale
+    // in-memory `rev` carried by the passed-in note).
+    note.content = "# Hello v2".to_string();
+    store.update_note(&note).await.expect("update note");
+    let after_first = store.get_note(&note.id).await.expect("get note");
+    assert_eq!(after_first.rev, 1);
+    assert_eq!(after_first.content, "# Hello v2");
+
+    // A second update bumps again → 2 (monotonic).
+    note.content = "# Hello v3".to_string();
+    store.update_note(&note).await.expect("update note");
+    let after_second = store.get_note(&note.id).await.expect("get note");
+    assert_eq!(after_second.rev, 2);
+}
+
+#[tokio::test]
+async fn update_note_versioned_hit_miss_and_absent() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let ts = now_iso();
+    let mut note = Note {
+        id: NoteId::new(),
+        workspace_id: ws_id.clone(),
+        title: "Spec".to_string(),
+        content: "v0".to_string(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        task: None,
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts,
+    };
+    store.insert_note(&note).await.expect("insert note");
+
+    // HIT: expected_version matches the stored rev (0) → write + bump to 1.
+    note.content = "v1".to_string();
+    store
+        .update_note_versioned(&note, Some(0))
+        .await
+        .expect("versioned hit");
+    let after_hit = store.get_note(&note.id).await.expect("get note");
+    assert_eq!(after_hit.rev, 1);
+    assert_eq!(after_hit.content, "v1");
+
+    // MISS: stale expected_version (0, but stored rev is now 1) → Conflict
+    // carrying the current entity under `current` (rev 1, unchanged content).
+    note.content = "v2-should-not-persist".to_string();
+    let conflict = store.update_note_versioned(&note, Some(0)).await;
+    match conflict {
+        Err(intent_core::Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 1);
+            assert_eq!(current["content"], "v1");
+            assert_eq!(current["id"], note.id.0);
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    // The failed conditional write must not have persisted or bumped.
+    let after_miss = store.get_note(&note.id).await.expect("get note");
+    assert_eq!(after_miss.rev, 1);
+    assert_eq!(after_miss.content, "v1");
+
+    // ABSENT: no expected_version → last-writer-wins (unconditional bump → 2).
+    note.content = "v2".to_string();
+    store
+        .update_note_versioned(&note, None)
+        .await
+        .expect("absent degrades to last-writer-wins");
+    let after_absent = store.get_note(&note.id).await.expect("get note");
+    assert_eq!(after_absent.rev, 2);
+    assert_eq!(after_absent.content, "v2");
+
+    // A versioned write against a missing row is NotFound (not Conflict).
+    let mut ghost = note.clone();
+    ghost.id = NoteId::new();
+    match store.update_note_versioned(&ghost, Some(5)).await {
+        Err(intent_core::Error::NotFound(_)) => {}
+        other => panic!("expected NotFound for absent row, got {other:?}"),
+    }
+}
+
 fn task_note(ws_id: &WorkspaceId, title: &str, task: Option<TaskMetadata>) -> Note {
     let ts = now_iso();
     Note {
@@ -256,6 +384,7 @@ fn task_note(ws_id: &WorkspaceId, title: &str, task: Option<TaskMetadata>) -> No
         visibility: NoteVisibility::Workspace,
         task,
         created_at: ts.clone(),
+        rev: 0,
         updated_at: ts,
     }
 }
@@ -1223,4 +1352,78 @@ async fn known_repo_list_orders_by_last_used_desc() {
     let repos = store.list_known_repos().await.expect("list");
     let paths: Vec<&str> = repos.iter().map(|r| r.path.as_str()).collect();
     assert_eq!(paths, vec!["/src/a", "/src/c", "/src/b"]);
+}
+
+#[tokio::test]
+async fn idempotency_get_put_round_trips_and_dedupes() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    assert!(
+        store.get_idempotent("ws-1", "k1").await.unwrap().is_none(),
+        "missing key reads as None"
+    );
+    let inserted = store
+        .put_idempotent("ws-1", "k1", "note.create", "{\"id\":\"n1\"}")
+        .await
+        .unwrap();
+    assert!(inserted, "first put inserts the row");
+    assert_eq!(
+        store.get_idempotent("ws-1", "k1").await.unwrap().as_deref(),
+        Some("{\"id\":\"n1\"}")
+    );
+    // A second put under the same (ws,key) is an INSERT OR IGNORE no-op that
+    // keeps the original stored result.
+    let inserted_again = store
+        .put_idempotent("ws-1", "k1", "note.create", "{\"id\":\"n2\"}")
+        .await
+        .unwrap();
+    assert!(!inserted_again, "duplicate put is a no-op");
+    assert_eq!(
+        store.get_idempotent("ws-1", "k1").await.unwrap().as_deref(),
+        Some("{\"id\":\"n1\"}"),
+        "duplicate put must not overwrite the original result"
+    );
+    // The same key is independent across workspaces (and the "" global sentinel).
+    assert!(store.get_idempotent("ws-2", "k1").await.unwrap().is_none());
+    assert!(store.get_idempotent("", "k1").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn idempotency_reaper_deletes_only_rows_older_than_cutoff() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    // One row well in the past, one fresh row (put stamps created_at = now).
+    let old_ts = intent_core::iso_minutes_ago(48 * 60);
+    sqlx::query(
+        "INSERT INTO idempotency_key \
+         (workspace_id, idempotency_key, method, result_json, created_at) \
+         VALUES (?,?,?,?,?)",
+    )
+    .bind("ws-1")
+    .bind("old")
+    .bind("note.create")
+    .bind("{\"id\":\"old\"}")
+    .bind(&old_ts)
+    .execute(store.pool())
+    .await
+    .expect("seed old row");
+    store
+        .put_idempotent("ws-1", "fresh", "note.create", "{\"id\":\"fresh\"}")
+        .await
+        .unwrap();
+
+    let cutoff = intent_core::iso_minutes_ago(24 * 60);
+    let removed = store.reap_idempotent(&cutoff).await.expect("reap");
+    assert_eq!(removed, 1, "only the >24h row is reaped");
+    assert!(store.get_idempotent("ws-1", "old").await.unwrap().is_none());
+    assert!(store
+        .get_idempotent("ws-1", "fresh")
+        .await
+        .unwrap()
+        .is_some());
+
+    // Re-running the sweep removes nothing more (idempotent).
+    assert_eq!(store.reap_idempotent(&cutoff).await.expect("reap"), 0);
 }

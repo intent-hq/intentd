@@ -42,6 +42,13 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: "Internal error".to_string(),
             data: Some(Value::String(msg)),
         },
+        // Optimistic-concurrency conflict: -32005 carrying the current entity
+        // under `data.current` so the client can reconcile (PROTOCOL §4, §5.6).
+        Error::Conflict { current } => RpcErr {
+            code: -32005,
+            message: "Conflict".to_string(),
+            data: Some(json!({ "code": "conflict", "current": current })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),
@@ -156,9 +163,13 @@ async fn dispatch(
             Ok(json!({ "workspace": ws }))
         }
         "workspace.create" => {
+            let idempotency_key = opt_str(params, "idempotencyKey");
             let input: WorkspaceCreate = serde_json::from_value(Value::Object(params.clone()))
                 .map_err(|e| rpc(INVALID_PARAMS, format!("invalid params: {e}")))?;
-            let ws = api.create_workspace(input).await.map_err(workspace_err)?;
+            let ws = api
+                .create_workspace(input, idempotency_key)
+                .await
+                .map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
         }
         "workspace.update" => {
@@ -218,13 +229,17 @@ async fn dispatch(
         "note.create" => {
             let ws = require_ws_note(params)?;
             let title = require_str_param(params, "title")?;
+            let idempotency_key = opt_str(params, "idempotencyKey");
             let input = NoteCreate {
                 title,
                 content: opt_str(params, "content"),
                 tags: opt_tags(params, "tags"),
                 parent_id: opt_str(params, "parentId"),
             };
-            let note = api.create_note(ws, input).await.map_err(domain_to_rpc)?;
+            let note = api
+                .create_note(ws, input, idempotency_key)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(json!({ "note": note }))
         }
         "note.update" => {
@@ -234,6 +249,7 @@ async fn dispatch(
                 content: opt_str(params, "content"),
                 title: opt_str(params, "title"),
                 tags: opt_tags(params, "tags"),
+                expected_version: opt_int(params, "expectedVersion"),
             };
             let note = api
                 .update_note(ws, note_id, input)
@@ -294,8 +310,9 @@ async fn dispatch(
             let note_id = require_note_id(params)?;
             let content = require_str_param(params, "content")?;
             let confirm = parse_confirm(params);
+            let expected_version = opt_int(params, "expectedVersion");
             let result = api
-                .set_note_content(ws, note_id, content, confirm)
+                .set_note_content(ws, note_id, content, confirm, expected_version)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -348,8 +365,9 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
             let status = require_str_param(params, "status")?;
+            let expected_version = opt_int(params, "expectedVersion");
             let result = api
-                .task_update_note_status(ws, note_id, status)
+                .task_update_note_status(ws, note_id, status, expected_version)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -615,9 +633,10 @@ async fn dispatch(
             let name = opt_str(params, "name");
             let model = opt_str(params, "model");
             let specialist_id = opt_str(params, "specialistId");
+            let idempotency_key = opt_str(params, "idempotencyKey");
             // FE/RPC front door: top-level creates stay parentless.
             let result = api
-                .agent_create(ws, name, model, specialist_id, None)
+                .agent_create(ws, name, model, specialist_id, None, idempotency_key)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -865,7 +884,11 @@ async fn dispatch(
         "git.commit" => {
             let ws = require_ws_note(params)?;
             let message = require_str_param(params, "message")?;
-            let r = api.git_commit(ws, message).await.map_err(domain_to_rpc)?;
+            let idempotency_key = opt_str(params, "idempotencyKey");
+            let r = api
+                .git_commit(ws, message, idempotency_key)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(json!({ "ok": true, "hash": r.hash, "files": r.files }))
         }
         "git.agentCommit" => {
@@ -940,8 +963,15 @@ async fn dispatch(
             let merge_method = opt_str(params, "mergeMethod");
             let commit_title = opt_str(params, "commitTitle");
             let commit_message = opt_str(params, "commitMessage");
+            let idempotency_key = opt_str(params, "idempotencyKey");
             let r = api
-                .pr_merge(ws, merge_method, commit_title, commit_message)
+                .pr_merge(
+                    ws,
+                    merge_method,
+                    commit_title,
+                    commit_message,
+                    idempotency_key,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

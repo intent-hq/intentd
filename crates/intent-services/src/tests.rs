@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use intent_core::{
     now_iso, ContentType, Error, Note, NoteAddInput, NoteEditInput, NoteEditLinesInput, NoteId,
-    NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
 
@@ -86,6 +86,7 @@ fn note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
         visibility: NoteVisibility::Workspace,
         task: None,
         created_at: ts.clone(),
+        rev: 0,
         updated_at: ts,
     }
 }
@@ -419,14 +420,94 @@ async fn edit_lines_deletes_range() {
 async fn set_content_reduction_guard_requires_confirmation() {
     let (_tmp, svc, ws, id) = setup("0123456789ABCDEFGHIJ").await;
     let denied = svc
-        .set_note_content(ws.clone(), id.clone(), "x".into(), false)
+        .set_note_content(ws.clone(), id.clone(), "x".into(), false, None)
         .await;
     assert!(matches!(denied, Err(Error::Internal(_))));
     let ok = svc
-        .set_note_content(ws, id, "x".into(), true)
+        .set_note_content(ws, id, "x".into(), true, None)
         .await
         .expect("confirmed");
     assert_eq!(ok.new_content, "x");
+}
+
+#[tokio::test]
+async fn update_note_expected_version_gate_hit_miss_absent() {
+    let (_tmp, svc, ws, id) = setup("v0").await;
+
+    // HIT: the freshly-inserted note is at rev 0; the matching expectedVersion
+    // writes successfully. (The returned note mirrors the pre-write in-memory
+    // copy, matching the existing `update_note` contract; the persisted bump is
+    // asserted via the conflict re-read below.)
+    let hit = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("v1".into()),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("expectedVersion hit writes");
+    assert_eq!(hit.content, "v1");
+
+    // MISS: a stale expectedVersion (0) yields a Conflict carrying the current
+    // entity, which proves the HIT persisted and bumped rev → 1.
+    let miss = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("v2-should-not-persist".into()),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await;
+    match miss {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 1);
+            assert_eq!(current["content"], "v1");
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+
+    // ABSENT: no expectedVersion → last-writer-wins (unconditional write).
+    let absent = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("v2".into()),
+                expected_version: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("absent degrades to last-writer-wins");
+    assert_eq!(absent.content, "v2");
+
+    // The unconditional write also bumps rev → 2: a stale expectedVersion (1)
+    // now conflicts, carrying the current entity (rev 2, content "v2").
+    let stale = svc
+        .update_note(
+            ws,
+            id,
+            NoteUpdateInput {
+                content: Some("v3-should-not-persist".into()),
+                expected_version: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+    match stale {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 2);
+            assert_eq!(current["content"], "v2");
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -590,7 +671,7 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
 
     // updateNoteStatus → in_progress sets startedAt.
     let upd = svc
-        .task_update_note_status(ws.clone(), id.clone(), "in_progress".into())
+        .task_update_note_status(ws.clone(), id.clone(), "in_progress".into(), None)
         .await
         .expect("updateNoteStatus");
     assert_eq!(upd.status, intent_core::TaskStatus::InProgress);
@@ -598,7 +679,7 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
 
     // Invalid status string rejected with the TS-style message.
     assert!(svc
-        .task_update_note_status(ws.clone(), id.clone(), "bogus".into())
+        .task_update_note_status(ws.clone(), id.clone(), "bogus".into(), None)
         .await
         .is_err());
 
@@ -1213,6 +1294,7 @@ mod change_event_parity {
                     tags: None,
                     parent_id: None,
                 },
+                None,
             )
             .await
             .expect("create");
@@ -1221,6 +1303,81 @@ mod change_event_parity {
         assert_eq!(
             ev["data"],
             json!({ "noteId": created.id.0, "title": "Note", "action": "create" })
+        );
+    }
+
+    /// Idempotency replay (design note TB-0 §5.3): a second `note.create` with the
+    /// same `(workspaceId, idempotencyKey)` returns the ORIGINAL note without
+    /// re-executing — so no second `note:created` event is published.
+    #[tokio::test]
+    async fn idempotent_create_note_replay_returns_original_no_reexec() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let key = Some("idem-key-1".to_string());
+        let first = h
+            .services
+            .create_note(
+                h.ws.clone(),
+                NoteCreate {
+                    title: "Note".to_string(),
+                    content: None,
+                    tags: None,
+                    parent_id: None,
+                },
+                key.clone(),
+            )
+            .await
+            .expect("first create");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:created");
+
+        // Replay with the same key but different content still returns the
+        // original note id (the body is never re-executed).
+        let second = h
+            .services
+            .create_note(
+                h.ws.clone(),
+                NoteCreate {
+                    title: "Different".to_string(),
+                    content: Some("changed".to_string()),
+                    tags: None,
+                    parent_id: None,
+                },
+                key,
+            )
+            .await
+            .expect("replay create");
+        assert_eq!(second.id.0, first.id.0, "replay returns the original note");
+
+        // No second event is published (the replay short-circuits before mutate).
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(none.is_err(), "replay must not publish a second event");
+    }
+
+    /// Soft-launch (R5): a missing `idempotencyKey` is accepted (never rejected)
+    /// and each call executes normally, producing distinct notes.
+    #[tokio::test]
+    async fn missing_idempotency_key_executes_normally() {
+        let h = harness().await;
+        let mk = || NoteCreate {
+            title: "Note".to_string(),
+            content: None,
+            tags: None,
+            parent_id: None,
+        };
+        let a = h
+            .services
+            .create_note(h.ws.clone(), mk(), None)
+            .await
+            .expect("first create");
+        let b = h
+            .services
+            .create_note(h.ws.clone(), mk(), None)
+            .await
+            .expect("second create");
+        assert_ne!(
+            a.id.0, b.id.0,
+            "missing key must not dedupe — both creates run"
         );
     }
 
@@ -1237,7 +1394,7 @@ mod change_event_parity {
         h.store.insert_note(&tn).await.expect("insert task note");
         let mut sub = subscribe(&h);
         h.services
-            .task_update_note_status(h.ws.clone(), tn.id.clone(), "in_progress".to_string())
+            .task_update_note_status(h.ws.clone(), tn.id.clone(), "in_progress".to_string(), None)
             .await
             .expect("status");
         let ev = recv_one(&mut sub).await;
@@ -1273,7 +1430,7 @@ mod change_event_parity {
         // terminal (excluded), and the parent's only child is complete, so the
         // parent becomes the sole ready task.
         h.services
-            .task_update_note_status(h.ws.clone(), child.id.clone(), "complete".to_string())
+            .task_update_note_status(h.ws.clone(), child.id.clone(), "complete".to_string(), None)
             .await
             .expect("status");
 
@@ -2079,7 +2236,7 @@ mod pr {
     async fn merge_returns_parity_shape() {
         let (_t, svc, ws) = setup(false, true).await;
         let v = svc
-            .pr_merge(ws, Some("squash".into()), None, None)
+            .pr_merge(ws, Some("squash".into()), None, None, None)
             .await
             .expect("merge");
         assert_eq!(v["merged"], true);
@@ -2092,7 +2249,7 @@ mod pr {
     async fn merge_rejects_invalid_method() {
         let (_t, svc, ws) = setup(false, true).await;
         let err = svc
-            .pr_merge(ws, Some("ff".into()), None, None)
+            .pr_merge(ws, Some("ff".into()), None, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m.contains("mergeMethod must be one of")));
@@ -2101,7 +2258,7 @@ mod pr {
     #[tokio::test]
     async fn merge_requires_active_pr() {
         let (_t, svc, ws) = setup(false, false).await;
-        let err = svc.pr_merge(ws, None, None, None).await.unwrap_err();
+        let err = svc.pr_merge(ws, None, None, None, None).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
     }
 
@@ -4435,12 +4592,15 @@ mod known_repo {
         let store = Store::open(&tmp.path).await.expect("open store");
         let svc = Services::new(store);
 
-        svc.create_workspace(WorkspaceCreate {
-            repository_path: Some("/src/intent".to_string()),
-            repository_name: Some("intent".to_string()),
-            repository_owner: Some("cloudlands-ai".to_string()),
-            ..Default::default()
-        })
+        svc.create_workspace(
+            WorkspaceCreate {
+                repository_path: Some("/src/intent".to_string()),
+                repository_name: Some("intent".to_string()),
+                repository_owner: Some("cloudlands-ai".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
         .await
         .expect("create");
 
