@@ -9,7 +9,7 @@
 //! transports handle by draining an outbound `mpsc::Sender<String>`.
 
 use intent_core::events::{NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED};
-use intent_core::{ClientId, WorkspaceApi, WorkspaceId};
+use intent_core::{ClientId, NoteId, WorkspaceApi, WorkspaceId};
 use intent_services::{EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -317,6 +317,62 @@ async fn handle_sub_fast_path(
             }
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
         },
+        // TB-5 channels (`task`/`agent`/`workspace`/`comment`) reuse the same
+        // subscribe-before-snapshot discipline as the note channel; only the
+        // param scope, bus filter, and snapshot/delta mapper differ.
+        SubFastPath::Subscribe {
+            id,
+            channel,
+            params,
+        } => {
+            let parsed = parse_channel_params(channel, &params);
+            match parsed {
+                Ok(ChannelParams {
+                    workspace_id,
+                    note_id,
+                    replace_group,
+                }) => {
+                    if let Some(group) = replace_group.as_deref() {
+                        subs.remove_group(group);
+                    }
+                    let filter_ws = if subscriptions::channel_is_global(channel) {
+                        None
+                    } else {
+                        workspace_id.clone()
+                    };
+                    let subscription = bus.subscribe(SubscriptionFilter {
+                        event_types: subscriptions::channel_event_types(channel),
+                        workspace_id: filter_ws,
+                        batch_window: None,
+                        ..Default::default()
+                    });
+                    let subscription_id = events::next_subscription_id();
+                    if id.present {
+                        let frame = events::success_frame(
+                            id.echo,
+                            json!({ "subscriptionId": subscription_id }),
+                        );
+                        if out_tx.send(frame).await.is_err() {
+                            return false;
+                        }
+                    }
+                    let handle = tokio::spawn(forward_channel_subscription(
+                        api.clone(),
+                        channel,
+                        workspace_id
+                            .map(WorkspaceId::from)
+                            .unwrap_or_else(|| WorkspaceId::from(String::new())),
+                        note_id.map(NoteId::from),
+                        subscription,
+                        subscription_id.clone(),
+                        out_tx.clone(),
+                    ));
+                    subs.insert(subscription_id, handle, replace_group);
+                    true
+                }
+                Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
+            }
+        }
         SubFastPath::Unsubscribe { id, params } => match events::parse_unsubscribe_id(&params) {
             Ok(subscription_id) => {
                 let success = subs.remove(&subscription_id);
@@ -356,6 +412,93 @@ async fn forward_note_subscription(
         for event in batch {
             if let Some(delta) =
                 subscriptions::note_delta(api.as_ref(), &workspace_id, &event).await
+            {
+                let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
+                if out_tx.send(frame).await.is_err() {
+                    return;
+                }
+                seq += 1;
+            }
+        }
+    }
+}
+
+/// The resolved scope of a TB-5 channel subscribe: `workspace_id` is `None` only
+/// for the global `workspace` channel; `note_id` is `Some` only for the
+/// per-note `comment` channel.
+struct ChannelParams {
+    workspace_id: Option<String>,
+    note_id: Option<String>,
+    replace_group: Option<String>,
+}
+
+/// Parse a TB-5 channel's subscribe params into the common [`ChannelParams`]
+/// scope, validating the required fields per channel (§6.2).
+fn parse_channel_params(
+    channel: Channel,
+    params: &serde_json::Map<String, Value>,
+) -> Result<ChannelParams, String> {
+    match channel {
+        Channel::Workspace => {
+            let p = subscriptions::parse_workspace_subscribe_params(params)?;
+            Ok(ChannelParams {
+                workspace_id: None,
+                note_id: None,
+                replace_group: p.replace_group,
+            })
+        }
+        Channel::Comment => {
+            let p = subscriptions::parse_comment_subscribe_params(params)?;
+            Ok(ChannelParams {
+                workspace_id: Some(p.workspace_id),
+                note_id: Some(p.note_id),
+                replace_group: p.replace_group,
+            })
+        }
+        // `note`/`task`/`agent` are all workspace-scoped collections.
+        _ => {
+            let p = subscriptions::parse_subscribe_params(params)?;
+            Ok(ChannelParams {
+                workspace_id: Some(p.workspace_id),
+                note_id: None,
+                replace_group: p.replace_group,
+            })
+        }
+    }
+}
+
+/// Per-subscription forwarder for the TB-5 channels. Mirrors
+/// [`forward_note_subscription`] but dispatches snapshot + delta through the
+/// channel-generic [`subscriptions::channel_snapshot`] /
+/// [`subscriptions::channel_delta`]. Owns `seq` for strict monotonicity; aborted
+/// by [`ConnSub`] on unsubscribe / disconnect.
+async fn forward_channel_subscription(
+    api: Arc<dyn WorkspaceApi>,
+    channel: Channel,
+    workspace_id: WorkspaceId,
+    note_id: Option<NoteId>,
+    mut subscription: Subscription,
+    subscription_id: String,
+    out_tx: mpsc::Sender<String>,
+) {
+    let snapshot =
+        subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
+            .await;
+    let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
+    if out_tx.send(frame).await.is_err() {
+        return;
+    }
+    let mut seq: u64 = 1;
+    while let Some(batch) = subscription.recv().await {
+        for event in batch {
+            if let Some(delta) = subscriptions::channel_delta(
+                api.as_ref(),
+                channel,
+                &workspace_id,
+                note_id.as_ref(),
+                &event,
+            )
+            .await
             {
                 let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
                 if out_tx.send(frame).await.is_err() {

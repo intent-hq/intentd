@@ -29,6 +29,110 @@ fn classify_routes_note_subscribe_and_unsubscribe() {
 }
 
 #[test]
+fn classify_routes_tb5_channels() {
+    let cases = [
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"task.subscribe","params":{"workspaceId":"w"}}"#,
+            Channel::Task,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"workspace.subscribe","params":{}}"#,
+            Channel::Workspace,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"comment.subscribe","params":{"workspaceId":"w","noteId":"n"}}"#,
+            Channel::Comment,
+        ),
+    ];
+    for (frame, want) in cases {
+        match classify(&parse(frame)) {
+            Some(SubFastPath::Subscribe { channel, .. }) => assert_eq!(channel, want),
+            _ => panic!("expected Subscribe({want:?}) for {frame}"),
+        }
+    }
+    for method in [
+        "task.unsubscribe",
+        "workspace.unsubscribe",
+        "comment.unsubscribe",
+    ] {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"subscriptionId":"s"}}}}"#
+        );
+        assert!(matches!(
+            classify(&parse(&frame)),
+            Some(SubFastPath::Unsubscribe { .. })
+        ));
+    }
+}
+
+#[test]
+fn classify_disambiguates_agent_channel_from_deprecated_alias() {
+    // No `eventTypes` → the new collection channel fast-path.
+    match classify(&parse(
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.subscribe","params":{"workspaceId":"w"}}"#,
+    )) {
+        Some(SubFastPath::Subscribe {
+            channel: Channel::Agent,
+            ..
+        }) => {}
+        _ => panic!("expected Subscribe(Agent)"),
+    }
+    // `eventTypes` present → the deprecated service alias; fall through to router.
+    assert!(classify(&parse(
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.subscribe","params":{"workspaceId":"w","eventTypes":["agent:*"]}}"#
+    ))
+    .is_none());
+    // Bare `{ subscriptionId }` → our fast-path unsubscribe.
+    assert!(matches!(
+        classify(&parse(
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.unsubscribe","params":{"subscriptionId":"s"}}"#
+        )),
+        Some(SubFastPath::Unsubscribe { .. })
+    ));
+    // `workspaceId` present → the deprecated alias; fall through to router.
+    assert!(classify(&parse(
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.unsubscribe","params":{"workspaceId":"w","subscriptionId":"s"}}"#
+    ))
+    .is_none());
+}
+
+#[test]
+fn comment_params_require_workspace_and_note() {
+    let ok = parse(r#"{"workspaceId":"w","noteId":"n","replaceGroup":"comment:n"}"#);
+    let p = parse_comment_subscribe_params(ok.as_object().unwrap()).unwrap();
+    assert_eq!(p.workspace_id, "w");
+    assert_eq!(p.note_id, "n");
+    assert_eq!(p.replace_group.as_deref(), Some("comment:n"));
+
+    for bad in [r#"{}"#, r#"{"workspaceId":"w"}"#, r#"{"noteId":"n"}"#] {
+        let v = parse(bad);
+        assert!(parse_comment_subscribe_params(v.as_object().unwrap()).is_err());
+    }
+}
+
+#[test]
+fn workspace_params_are_global() {
+    let v = parse(r#"{"replaceGroup":"workspaces"}"#);
+    let p = parse_workspace_subscribe_params(v.as_object().unwrap()).unwrap();
+    assert_eq!(p.replace_group.as_deref(), Some("workspaces"));
+    // No workspaceId needed.
+    let empty = parse(r#"{}"#);
+    assert!(parse_workspace_subscribe_params(empty.as_object().unwrap()).is_ok());
+}
+
+#[test]
+fn channel_event_types_exclude_chat_stream() {
+    let agent = channel_event_types(Channel::Agent);
+    assert!(agent.iter().any(|t| t == "agent:deleted"));
+    assert!(
+        !agent.iter().any(|t| t.starts_with("agent:stream:")),
+        "chat-stream family must be excluded (design R7)"
+    );
+    assert!(channel_is_global(Channel::Workspace));
+    assert!(!channel_is_global(Channel::Task));
+}
+
+#[test]
 fn classify_falls_through_for_other_methods_and_bad_envelope() {
     // The legacy firehose method is NOT a subscription channel.
     assert!(classify(&parse(
