@@ -384,7 +384,7 @@ async fn get_conversation_truncates_to_limit() {
             .expect("append");
     }
     let res = svc
-        .agent_get_conversation_op(id.clone(), Some(2))
+        .agent_get_conversation_op(id.clone(), Some(2), None)
         .await
         .expect("conv");
     assert_eq!(res["totalMessages"], 5);
@@ -395,6 +395,74 @@ async fn get_conversation_truncates_to_limit() {
     // (TS `AgentMessage`), never `content`.
     assert_eq!(messages[1]["contentBlocks"][0]["text"], "m4");
     assert!(messages[1].get("content").is_none());
+}
+
+/// TA-2 / §5.5: `agent.getConversation` exposes an additive opaque `nextToken`
+/// that walks backward to older pages; the page array stays oldest→newest and
+/// the token is `null` once the oldest message has been returned. An absent
+/// limit uses the default page (50) and clamps over-max requests to 200.
+#[tokio::test]
+async fn get_conversation_paginates_with_opaque_next_token() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Pager").await;
+    for i in 0..5 {
+        let c = json!([{ "type": "text", "text": format!("m{i}") }]);
+        svc.store()
+            .append_agent_message(&id, "assistant", &c, &now_iso())
+            .await
+            .expect("append");
+    }
+
+    // Page 1: newest two, oldest→newest within the page, nextToken present.
+    let p1 = svc
+        .agent_get_conversation_op(id.clone(), Some(2), None)
+        .await
+        .expect("p1");
+    assert_eq!(p1["totalMessages"], 5);
+    assert_eq!(p1["truncated"], true);
+    let m1 = p1["messages"].as_array().unwrap();
+    assert_eq!(m1.len(), 2);
+    assert_eq!(m1[0]["contentBlocks"][0]["text"], "m3");
+    assert_eq!(m1[1]["contentBlocks"][0]["text"], "m4");
+    let t1 = p1["nextToken"].as_str().expect("nextToken").to_string();
+    // Opaque: not a bare numeric offset.
+    assert!(t1.parse::<u64>().is_err());
+
+    // Page 2 follows the token to the next-older window.
+    let p2 = svc
+        .agent_get_conversation_op(id.clone(), Some(2), Some(t1))
+        .await
+        .expect("p2");
+    let m2 = p2["messages"].as_array().unwrap();
+    assert_eq!(m2[0]["contentBlocks"][0]["text"], "m1");
+    assert_eq!(m2[1]["contentBlocks"][0]["text"], "m2");
+    let t2 = p2["nextToken"].as_str().expect("nextToken2").to_string();
+
+    // Page 3 is the final page: oldest message, no further token.
+    let p3 = svc
+        .agent_get_conversation_op(id.clone(), Some(2), Some(t2))
+        .await
+        .expect("p3");
+    let m3 = p3["messages"].as_array().unwrap();
+    assert_eq!(m3.len(), 1);
+    assert_eq!(m3[0]["contentBlocks"][0]["text"], "m0");
+    assert!(p3["nextToken"].is_null());
+    assert_eq!(p3["truncated"], false);
+
+    // No limit → default page returns all five with no token; an over-max limit
+    // clamps to 200 and likewise fits all five in one page.
+    let all = svc
+        .agent_get_conversation_op(id.clone(), None, None)
+        .await
+        .expect("all");
+    assert_eq!(all["messages"].as_array().unwrap().len(), 5);
+    assert!(all["nextToken"].is_null());
+    let clamped = svc
+        .agent_get_conversation_op(id, Some(10_000), None)
+        .await
+        .expect("clamped");
+    assert_eq!(clamped["messages"].as_array().unwrap().len(), 5);
+    assert!(clamped["nextToken"].is_null());
 }
 
 #[tokio::test]
@@ -496,7 +564,10 @@ async fn send_message_delivers_when_agent_exists() {
         .expect("send");
     assert_eq!(r["queued"], false);
     assert_eq!(r["messageId"], "m1");
-    let conv = svc.agent_get_conversation_op(id, None).await.expect("conv");
+    let conv = svc
+        .agent_get_conversation_op(id, None, None)
+        .await
+        .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
     assert_eq!(conv["messages"][0]["role"], "user");
 }
@@ -1525,4 +1596,107 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
     assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
 
     worker.abort();
+}
+
+/// `agent.diagnostics` answers `{ ok, diagnostics, text }` with the full
+/// snapshot shape: summary counts, a subscriptions view backed by completion
+/// watches, an agents view, zeroed deliveryStats, and a human-readable `text`.
+#[tokio::test]
+async fn diagnostics_snapshot_shape_and_subscriptions() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    svc.register_completion_watch(
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        true,
+        None,
+    );
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+
+    assert_eq!(result["ok"], json!(true));
+    let diag = &result["diagnostics"];
+    assert_eq!(diag["workspaceId"], json!(ws.0));
+    assert!(diag["generatedAt"].is_string());
+    assert_eq!(diag["summary"]["agents"], json!(2));
+    assert_eq!(diag["summary"]["subscriptions"], json!(1));
+    assert_eq!(diag["summary"]["queuedEvents"], json!(0));
+    assert!(diag["queues"].as_array().expect("queues").is_empty());
+    assert!(diag["recentEvents"]
+        .as_array()
+        .expect("recentEvents")
+        .is_empty());
+    // deliveryStats is the zeroed emptyDeliveryStats shape.
+    assert_eq!(diag["deliveryStats"]["droppedEvents"], json!(0));
+    assert!(diag["deliveryStats"]["lastFailureTime"].is_null());
+
+    let subs = diag["subscriptions"].as_array().expect("subscriptions");
+    assert_eq!(subs.len(), 1);
+    let sub = &subs[0];
+    assert_eq!(sub["agentId"], json!(parent.0));
+    assert_eq!(sub["agentName"], json!("Parent"));
+    assert_eq!(sub["actorIds"], json!([child.0]));
+    assert_eq!(sub["eventTypes"].as_array().expect("eventTypes").len(), 3);
+    assert_eq!(sub["priority"], json!("normal"));
+    assert_eq!(sub["oneShot"], json!(true));
+    assert_eq!(sub["orphaned"], json!(false));
+
+    assert!(result["text"]
+        .as_str()
+        .expect("text")
+        .contains("Agent diagnostics for workspace"));
+}
+
+/// `agent.diagnostics` `agentId` filter narrows the snapshot to the focused
+/// agent (and the subscription actors in its scope).
+#[tokio::test]
+async fn diagnostics_agent_filter_narrows_scope() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let _b = create_agent(&svc, &ws, "B").await;
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), Some(a.clone()), None, None)
+        .await
+        .expect("diagnostics");
+
+    let diag = &result["diagnostics"];
+    let agents = diag["agents"].as_array().expect("agents");
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["id"], json!(a.0));
+    assert_eq!(diag["filters"]["agentId"], json!(a.0));
+}
+
+/// A completion watch whose parent has no live session surfaces an
+/// `orphaned-subscription` stuck-risk signal.
+#[tokio::test]
+async fn diagnostics_flags_orphaned_subscription() {
+    let (_t, svc, ws) = setup().await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let ghost = AgentId::from("agent-ghost");
+    svc.register_completion_watch(
+        &ws,
+        ghost.clone(),
+        "Ghost".into(),
+        child.clone(),
+        true,
+        None,
+    );
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+
+    let diag = &result["diagnostics"];
+    let risks = diag["stuckRisks"].as_array().expect("stuckRisks");
+    assert!(risks
+        .iter()
+        .any(|r| r["type"] == json!("orphaned-subscription") && r["agentId"] == json!(ghost.0)));
 }

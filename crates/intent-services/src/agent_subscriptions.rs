@@ -359,6 +359,28 @@ impl Services {
             .unwrap_or_default()
     }
 
+    /// Every completion watch registered in the workspace (the `agent.diagnostics`
+    /// workspace-wide subscription view).
+    pub(crate) fn all_watches(&self, workspace_id: &WorkspaceId) -> Vec<CompletionWatch> {
+        self.agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .get(workspace_id)
+            .map(|w| w.subscriptions.clone())
+            .unwrap_or_default()
+    }
+
+    /// Every delegation group in the workspace (the `agent.diagnostics`
+    /// workspace-wide delegation-group view).
+    pub(crate) fn all_groups(&self, workspace_id: &WorkspaceId) -> Vec<DelegationGroup> {
+        self.agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .get(workspace_id)
+            .map(|w| w.delegation_groups.clone())
+            .unwrap_or_default()
+    }
+
     /// Drop every delegation group parented by `parent_id`; returns the count
     /// removed (the group side of `agent.cancelSubscriptions`).
     pub(crate) fn remove_groups_for_parent(

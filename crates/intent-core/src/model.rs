@@ -1046,6 +1046,13 @@ pub struct EventQueryParams {
     pub path: Option<String>,
     pub minutes_ago: Option<i64>,
     pub limit: Option<i64>,
+    /// Opt-in pagination (TA-2 / §5.5): when set true (or when `page_token` is
+    /// present), `event.query` returns the `{ items, nextToken }` envelope
+    /// (newest→oldest, limit clamped to [1,200] default 50) instead of the
+    /// legacy bare array. Absent/false preserves the legacy shape.
+    pub paginate: Option<bool>,
+    /// Opaque continuation token from a previous paginated `event.query`.
+    pub page_token: Option<String>,
 }
 
 /// Agent runtime status (§9.1; `AgentStatus` in `agent.types.ts`). The modern

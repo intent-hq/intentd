@@ -11,9 +11,13 @@ use std::collections::HashSet;
 
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE};
 use intent_core::{
-    now_iso, AgentId, AgentLite, AgentMessage, AgentSession, AgentStatus, Error, NoteId, Result,
-    WorkspaceApi, WorkspaceId,
+    now_iso, parse_iso, AgentId, AgentLite, AgentMessage, AgentSession, AgentStatus, Error, NoteId,
+    Result, WorkspaceApi, WorkspaceId,
 };
+
+/// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
+/// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
+const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
 
 use crate::agent_subscriptions::CompletionWatch;
 
@@ -28,9 +32,6 @@ use crate::Services;
 
 #[cfg(test)]
 mod tests;
-
-/// Default `agent.getConversation` cap (TS `MAX_WEBSOCKET_CONVERSATION_MESSAGES`).
-const MAX_CONVERSATION_MESSAGES: i64 = 200;
 
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
 #[derive(Debug, Clone)]
@@ -316,26 +317,28 @@ impl Services {
         Ok(project_lite(session))
     }
 
-    /// `agent.getConversation` (PROTOCOL §5.5).
+    /// `agent.getConversation` (PROTOCOL §5.5). Paginated per the TA-2 contract:
+    /// the limit clamps to `[1,200]` (default 50) and an opaque `nextToken`
+    /// walks backward to older pages. The `messages` array stays oldest→newest
+    /// within a page (wire parity with the TS handler); `nextToken` is additive
+    /// and is `null` once the oldest message has been returned.
     pub(crate) async fn agent_get_conversation_op(
         &self,
         agent_id: AgentId,
         limit: Option<i64>,
+        page_token: Option<String>,
     ) -> Result<Value> {
         let session = self.store.get_agent_session(&agent_id).await?;
-        let mut messages = session.messages;
-        let total = messages.len() as i64;
-        let limit = limit.unwrap_or(MAX_CONVERSATION_MESSAGES);
-        let truncated = limit >= 0 && total > limit;
-        if truncated {
-            let start = (total - limit) as usize;
-            messages = messages.split_off(start);
-        }
+        let messages = session.messages;
+        let total = messages.len();
+        let win = crate::pagination::page_window(total, limit, page_token.as_deref());
+        let page = &messages[win.start..win.end];
         Ok(json!({
             "agentId": agent_id,
-            "messages": messages,
-            "truncated": truncated,
+            "messages": page,
+            "truncated": win.next_token.is_some(),
             "totalMessages": total,
+            "nextToken": win.next_token,
         }))
     }
 
@@ -787,6 +790,367 @@ impl Services {
         Ok(json!({ "success": true }))
     }
 
+    /// `agent.diagnostics`: a sanitized snapshot of agent statuses,
+    /// subscriptions, delegation groups, and stuck-risk signals (PROTOCOL §5.5).
+    ///
+    /// Ports the TS `buildAgentDiagnosticsSnapshot` shape over the daemon's
+    /// (simpler) runtime: completion-watch records back the `subscriptions` view
+    /// and the delegation-group registry backs `delegationGroups`. The daemon
+    /// does not track per-agent event queues, deleted-agent references, or
+    /// delivery health, so `queues`, `deletedAgentReferences`, `recentEvents` are
+    /// empty and `deliveryStats` is zeroed — honestly reflecting what the runtime
+    /// knows about. Returns `{ ok, diagnostics, text }` (`buildToolResponse`).
+    pub(crate) async fn agent_diagnostics_op(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        task_note_id: Option<NoteId>,
+        stale_responding_after_ms: Option<i64>,
+    ) -> Result<Value> {
+        let stale_after_ms = stale_responding_after_ms.unwrap_or(DEFAULT_STALE_RESPONDING_AFTER_MS);
+        let now = now_iso();
+        let now_ms = iso_ms(&now);
+
+        let sessions = self.store.list_agent_sessions(&workspace_id).await?;
+        let watches = self.all_watches(&workspace_id);
+        let groups = self.all_groups(&workspace_id);
+
+        let agent_filter = agent_id.as_ref().map(|a| a.0.clone());
+        // Sessions carry no taskNoteId in the daemon model, so a taskNoteId
+        // filter matches nothing (mirrors `agent.metadata?.taskNoteId` undefined).
+        let task_filter = task_note_id.as_ref().map(|n| n.0.clone());
+        let has_filter = agent_filter.is_some() || task_filter.is_some();
+
+        let session_ids: HashSet<String> = sessions.iter().map(|s| s.id.0.clone()).collect();
+        let session_by_id: std::collections::HashMap<String, &AgentSession> =
+            sessions.iter().map(|s| (s.id.0.clone(), s)).collect();
+        let watch_ids: HashSet<String> = watches.iter().map(|w| w.id.clone()).collect();
+
+        let mut matching: HashSet<String> = HashSet::new();
+        for s in &sessions {
+            if let Some(aid) = &agent_filter {
+                if &s.id.0 != aid {
+                    continue;
+                }
+            }
+            if task_filter.is_some() {
+                continue;
+            }
+            matching.insert(s.id.0.clone());
+        }
+        if let Some(aid) = &agent_filter {
+            matching.insert(aid.clone());
+        }
+        let in_scope = |id: &str| !has_filter || matching.contains(id);
+        let intersects_scope =
+            |ids: &[String]| !has_filter || ids.iter().any(|id| matching.contains(id));
+
+        // Union of every agent id referenced anywhere in the snapshot.
+        let mut all_agent_ids: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let push_id = |id: &str, all: &mut Vec<String>, seen: &mut HashSet<String>| {
+            if seen.insert(id.to_string()) {
+                all.push(id.to_string());
+            }
+        };
+        for s in &sessions {
+            push_id(&s.id.0, &mut all_agent_ids, &mut seen);
+        }
+        for w in &watches {
+            push_id(&w.parent_agent_id.0, &mut all_agent_ids, &mut seen);
+            push_id(&w.child_agent_id.0, &mut all_agent_ids, &mut seen);
+        }
+        for g in &groups {
+            push_id(&g.parent_agent_id.0, &mut all_agent_ids, &mut seen);
+            for id in &g.expected_agent_ids {
+                push_id(&id.0, &mut all_agent_ids, &mut seen);
+            }
+            for id in &g.completed_agent_ids {
+                push_id(&id.0, &mut all_agent_ids, &mut seen);
+            }
+            for id in &g.deleted_agent_ids {
+                push_id(&id.0, &mut all_agent_ids, &mut seen);
+            }
+        }
+
+        let event_types = [AGENT_IDLE, AGENT_FAILED, AGENT_DELETED];
+
+        // subscriptions (completion watches), filtered to scope.
+        let subscriptions: Vec<Value> = watches
+            .iter()
+            .filter(|w| {
+                in_scope(&w.parent_agent_id.0)
+                    || intersects_scope(std::slice::from_ref(&w.child_agent_id.0))
+            })
+            .map(|w| {
+                json!({
+                    "id": w.id,
+                    "agentId": w.parent_agent_id,
+                    "agentName": w.parent_agent_name,
+                    "createdAt": w.created_at,
+                    "eventTypes": event_types,
+                    "actorIds": [w.child_agent_id.clone()],
+                    "priority": "normal",
+                    "oneShot": w.one_shot,
+                    "delegationGroupId": w.group_id,
+                    "orphaned": !session_ids.contains(&w.parent_agent_id.0),
+                })
+            })
+            .collect();
+
+        // delegationGroups, filtered to scope.
+        let delegation_groups: Vec<Value> = groups
+            .iter()
+            .filter(|g| {
+                let mut ids = vec![g.parent_agent_id.0.clone()];
+                ids.extend(g.expected_agent_ids.iter().map(|a| a.0.clone()));
+                ids.extend(g.completed_agent_ids.iter().map(|a| a.0.clone()));
+                ids.extend(g.deleted_agent_ids.iter().map(|a| a.0.clone()));
+                intersects_scope(&ids)
+            })
+            .map(|g| {
+                let done: HashSet<String> = g
+                    .completed_agent_ids
+                    .iter()
+                    .chain(g.deleted_agent_ids.iter())
+                    .map(|a| a.0.clone())
+                    .filter(|id| g.expected_agent_ids.iter().any(|e| &e.0 == id))
+                    .collect();
+                let pending: Vec<String> = g
+                    .expected_agent_ids
+                    .iter()
+                    .map(|a| a.0.clone())
+                    .filter(|id| !done.contains(id))
+                    .collect();
+                let complete = !g.expected_agent_ids.is_empty()
+                    && g.expected_agent_ids.iter().all(|id| {
+                        g.completed_agent_ids.contains(id) || g.deleted_agent_ids.contains(id)
+                    });
+                let subscription_missing = match &g.subscription_id {
+                    Some(sid) => !watch_ids.contains(sid),
+                    None => true,
+                };
+                json!({
+                    "groupId": g.group_id,
+                    "parentAgentId": g.parent_agent_id,
+                    "awaitMode": g.await_mode,
+                    "expectedAgentIds": g.expected_agent_ids,
+                    "completedAgentIds": g.completed_agent_ids,
+                    "deletedAgentIds": g.deleted_agent_ids,
+                    "pendingAgentIds": pending,
+                    "subscriptionId": g.subscription_id.clone().unwrap_or_default(),
+                    "subscriptionMissing": subscription_missing,
+                    "delivered": g.delivered,
+                    "complete": complete,
+                    "eventCount": g.event_summaries.len(),
+                })
+            })
+            .collect();
+
+        // agents rows.
+        all_agent_ids.sort();
+        let mut agent_rows: Vec<Value> = Vec::new();
+        for id in &all_agent_ids {
+            if !in_scope(id) {
+                continue;
+            }
+            let session = session_by_id.get(id).copied();
+            let status = session
+                .and_then(|s| agent_status_wire(s.status))
+                .unwrap_or("unknown");
+            let message_count = session.map(|s| s.messages.len() as u64);
+            let last_activity = session.map(|s| s.updated_at.clone());
+            let last_activity_age = last_activity.as_deref().map(|t| age_ms(now_ms, t));
+            let stale_responding = status == "responding"
+                && match last_activity_age {
+                    None => true,
+                    Some(age) => age > stale_after_ms,
+                };
+            let pending_initial_response = session.is_some()
+                && status.eq_ignore_ascii_case("idle")
+                && message_count == Some(1)
+                && !session
+                    .map(|s| has_assistant_message(&s.messages))
+                    .unwrap_or(false);
+            let subscription_count = watches
+                .iter()
+                .filter(|w| &w.parent_agent_id.0 == id)
+                .count();
+
+            let mut row = serde_json::Map::new();
+            row.insert("id".into(), json!(id));
+            if let Some(s) = session {
+                row.insert("name".into(), json!(s.name));
+                row.insert("sessionStatus".into(), json!(s.status));
+                row.insert("createdAt".into(), json!(s.created_at));
+            }
+            row.insert("status".into(), json!(status));
+            if let Some(mc) = message_count {
+                row.insert("messageCount".into(), json!(mc));
+            }
+            row.insert("subscriptionCount".into(), json!(subscription_count));
+            row.insert("queuedEventCount".into(), json!(0));
+            row.insert("staleResponding".into(), json!(stale_responding));
+            row.insert("deleted".into(), json!(false));
+            row.insert("presentInBackend".into(), json!(session.is_some()));
+            row.insert(
+                "pendingInitialResponse".into(),
+                json!(pending_initial_response),
+            );
+            if let Some(la) = &last_activity {
+                row.insert("lastActivity".into(), json!(la));
+            }
+            agent_rows.push(Value::Object(row));
+        }
+
+        // stuck-risk signals.
+        let mut stuck_risks: Vec<Value> = Vec::new();
+        for row in &agent_rows {
+            let aid = row["id"].as_str().unwrap_or_default();
+            if row["staleResponding"].as_bool() == Some(true) {
+                stuck_risks.push(json!({
+                    "type": "stale-responding-status",
+                    "severity": "warning",
+                    "message": format!("Agent {aid} is marked responding without recent activity"),
+                    "agentId": aid,
+                }));
+            }
+            if row["pendingInitialResponse"].as_bool() == Some(true) {
+                let present = row["presentInBackend"].as_bool() == Some(true);
+                let age = row["lastActivity"].as_str().map(|t| age_ms(now_ms, t));
+                let severity = match age {
+                    Some(a) if a <= stale_after_ms => "info",
+                    _ => "warning",
+                };
+                let message = if present {
+                    format!("Agent {aid} has an initial user message but no assistant response")
+                } else {
+                    format!("Agent {aid} has an initial user message but no active backend session or assistant response")
+                };
+                let mut risk = serde_json::Map::new();
+                risk.insert("type".into(), json!("initial-prompt-not-running"));
+                risk.insert("severity".into(), json!(severity));
+                risk.insert("message".into(), json!(message));
+                risk.insert("agentId".into(), json!(aid));
+                if let Some(a) = age {
+                    risk.insert("ageMs".into(), json!(a));
+                }
+                stuck_risks.push(Value::Object(risk));
+            }
+        }
+        for sub in &subscriptions {
+            if sub["orphaned"].as_bool() == Some(true) {
+                let sid = sub["id"].as_str().unwrap_or_default();
+                let aid = sub["agentId"].as_str().unwrap_or_default();
+                stuck_risks.push(json!({
+                    "type": "orphaned-subscription",
+                    "severity": "warning",
+                    "message": format!("Subscription {sid} targets missing or deleted owner {aid}"),
+                    "agentId": aid,
+                    "subscriptionId": sid,
+                }));
+            }
+        }
+        for g in &delegation_groups {
+            let complete = g["complete"].as_bool() == Some(true);
+            let delivered = g["delivered"].as_bool() == Some(true);
+            if !complete && !delivered {
+                let gid = g["groupId"].as_str().unwrap_or_default();
+                let pending = g["pendingAgentIds"].as_array().map_or(0, Vec::len);
+                let severity = if g["subscriptionMissing"].as_bool() == Some(true) {
+                    "critical"
+                } else {
+                    "warning"
+                };
+                stuck_risks.push(json!({
+                    "type": "incomplete-delegation-group",
+                    "severity": severity,
+                    "message": format!("Delegation group {gid} is waiting for {pending} agent(s)"),
+                    "groupId": gid,
+                    "count": pending,
+                }));
+            }
+        }
+
+        let mut filters = serde_json::Map::new();
+        if let Some(aid) = &agent_filter {
+            filters.insert("agentId".into(), json!(aid));
+        }
+        if let Some(tid) = &task_filter {
+            filters.insert("taskNoteId".into(), json!(tid));
+        }
+
+        let summary = json!({
+            "agents": agent_rows.len(),
+            "subscriptions": subscriptions.len(),
+            "queuedAgents": 0,
+            "queuedEvents": 0,
+            "delegationGroups": delegation_groups.len(),
+            "deletedAgents": 0,
+            "stuckRisks": stuck_risks.len(),
+        });
+
+        let delivery_stats = json!({
+            "totalDeliveries": 0,
+            "successfulDeliveries": 0,
+            "failedDeliveries": 0,
+            "timeoutDeliveries": 0,
+            "droppedEvents": 0,
+            "lastDeliveryTime": Value::Null,
+            "lastFailureTime": Value::Null,
+        });
+
+        let diagnostics = json!({
+            "workspaceId": workspace_id,
+            "generatedAt": now,
+            "filters": Value::Object(filters),
+            "summary": summary,
+            "agents": agent_rows,
+            "subscriptions": subscriptions,
+            "queues": [],
+            "delegationGroups": delegation_groups,
+            "deliveryStats": delivery_stats,
+            "deletedAgentReferences": [],
+            "recentEvents": [],
+            "stuckRisks": stuck_risks,
+        });
+
+        // Human-readable `text` (mirrors `GetAgentDiagnosticsTool`).
+        let mut lines = vec![
+            format!("Agent diagnostics for workspace {}", workspace_id.0),
+            format!("Agents: {}", diagnostics["summary"]["agents"]),
+            format!("Subscriptions: {}", diagnostics["summary"]["subscriptions"]),
+            format!("Queued events: {}", diagnostics["summary"]["queuedEvents"]),
+            format!(
+                "Delegation groups: {}",
+                diagnostics["summary"]["delegationGroups"]
+            ),
+            format!("Stuck risks: {}", diagnostics["summary"]["stuckRisks"]),
+        ];
+        if let Some(risks) = diagnostics["stuckRisks"].as_array() {
+            if !risks.is_empty() {
+                lines.push(String::new());
+                lines.push("Stuck-risk signals:".to_string());
+                for risk in risks.iter().take(10) {
+                    let target = risk["agentId"]
+                        .as_str()
+                        .or_else(|| risk["groupId"].as_str())
+                        .or_else(|| risk["subscriptionId"].as_str())
+                        .unwrap_or("workspace");
+                    let severity = risk["severity"].as_str().unwrap_or_default();
+                    let rtype = risk["type"].as_str().unwrap_or_default();
+                    lines.push(format!("- [{severity}] {rtype}: {target}"));
+                }
+            }
+        }
+
+        Ok(json!({
+            "ok": true,
+            "diagnostics": diagnostics,
+            "text": lines.join("\n"),
+        }))
+    }
+
     /// `agent.sendToTask`: deliver to the agent assigned to a task note (PROTOCOL §5.5).
     pub(crate) async fn agent_send_to_task_op(
         &self,
@@ -935,6 +1299,23 @@ fn last_assistant_text(messages: &[AgentMessage]) -> Option<String> {
 /// Map a persisted [`AgentStatus`] to the TS runtime status word used in the
 /// `agent.getSubscriptions` `agentStatuses` map. Best-effort: statuses without a
 /// runtime equivalent (e.g. `deleted`) are omitted so the caller drops the key.
+/// Parse an RFC-3339 timestamp into epoch milliseconds, or `0` when malformed.
+fn iso_ms(ts: &str) -> i64 {
+    parse_iso(ts)
+        .map(|dt| (dt.unix_timestamp_nanos() / 1_000_000) as i64)
+        .unwrap_or(0)
+}
+
+/// Non-negative age in milliseconds of `ts` relative to `now_ms`.
+fn age_ms(now_ms: i64, ts: &str) -> i64 {
+    (now_ms - iso_ms(ts)).max(0)
+}
+
+/// Whether any message in the transcript was authored by the assistant.
+fn has_assistant_message(messages: &[AgentMessage]) -> bool {
+    messages.iter().any(|m| m.role == "assistant")
+}
+
 fn agent_status_wire(status: AgentStatus) -> Option<&'static str> {
     match status {
         AgentStatus::Pending | AgentStatus::Waiting => Some("waiting"),

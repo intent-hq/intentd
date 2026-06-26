@@ -535,11 +535,12 @@ impl WorkspaceApi for FakeApi {
         &self,
         _workspace_id: WorkspaceId,
         params: EventQueryParams,
-    ) -> BoxFuture<'_, Result<Vec<Event>>> {
+    ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             // Echo the extracted eventType into a single event so the router
-            // wiring of `EventQueryParams` is observable.
-            Ok(vec![Event {
+            // wiring of `EventQueryParams` is observable. The non-paginated
+            // contract is a bare array (§5.10).
+            let event = Event {
                 id: "e1".to_string(),
                 workspace_id: WorkspaceId::from("ws-1"),
                 timestamp: "t0".to_string(),
@@ -550,7 +551,8 @@ impl WorkspaceApi for FakeApi {
                 parent_event_id: None,
                 metadata: None,
                 data: serde_json::json!({}),
-            }])
+            };
+            Ok(serde_json::to_value(vec![event]).unwrap())
         })
     }
 
@@ -558,6 +560,8 @@ impl WorkspaceApi for FakeApi {
         &self,
         _workspace_id: WorkspaceId,
         event_types: Vec<String>,
+        _exclude_self: Option<bool>,
+        _batch_window: Option<i64>,
     ) -> BoxFuture<'_, Result<EventSubscribeResult>> {
         Box::pin(async move {
             Ok(EventSubscribeResult {
@@ -1110,6 +1114,8 @@ impl WorkspaceApi for FakeApi {
         &self,
         script_id: String,
         max_lines: Option<i64>,
+        _paginate: Option<bool>,
+        _page_token: Option<String>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             // `script.output` returns plaintext buffer text (a bare string), not

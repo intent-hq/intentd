@@ -1,0 +1,151 @@
+//! Reusable pagination contract (PROTOCOL §5.5 / R2-10).
+//!
+//! A single helper backing the paginated reads (`agent.getConversation`,
+//! `event.query`, `file-tracking.loadCommits`, terminal/script historical
+//! scrollback). The contract is: reverse-chronological backward paging
+//! (newest page first, follow the token to older pages), a server-clamped
+//! `limit` in `[1, 200]` defaulting to 50, and an **opaque** base64
+//! continuation token (never a raw numeric offset on the wire).
+//!
+//! ## Append-stability
+//! The token encodes the *oldest-indexed* boundary of the next (older) page
+//! (`{"b": <index-from-oldest>}`). Because new items are always appended at the
+//! newest end, an item's index counted from the oldest end never shifts under
+//! appends, so following a token returns exactly the same older items
+//! regardless of how many items were appended in the meantime (Q13). This holds
+//! as long as items are not pruned from the oldest end between calls.
+//!
+//! The token's internal encoding is a private implementation detail: callers
+//! and clients MUST treat it as opaque.
+
+use base64::Engine as _;
+use serde_json::{json, Value};
+
+/// Default page size when the client omits `limit`.
+pub const DEFAULT_PAGE_LIMIT: usize = 50;
+/// Hard server-side cap on page size.
+pub const MAX_PAGE_LIMIT: usize = 200;
+
+/// Clamp a client-supplied `limit` into the contract range. `None` yields the
+/// default (50); zero/negative clamp up to 1; values over the cap clamp down to
+/// 200.
+pub fn clamp_limit(limit: Option<i64>) -> usize {
+    match limit {
+        None => DEFAULT_PAGE_LIMIT,
+        Some(l) => l.clamp(1, MAX_PAGE_LIMIT as i64) as usize,
+    }
+}
+
+/// Encode an opaque continuation token from its internal JSON cursor.
+fn encode_token(cursor: &Value) -> String {
+    base64::engine::general_purpose::STANDARD_NO_PAD
+        .encode(serde_json::to_vec(cursor).expect("cursor json is always serializable"))
+}
+
+/// Decode an opaque continuation token back into its JSON cursor. A malformed
+/// token decodes to `None`, which callers treat as "start from the newest page".
+fn decode_token(token: &str) -> Option<Value> {
+    let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(token)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The half-open `start..end` slice (in the source's oldest→newest order) that
+/// makes up the requested page, plus the token for the next (older) page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageWindow {
+    pub start: usize,
+    pub end: usize,
+    pub next_token: Option<String>,
+}
+
+/// Resolve the page window over a chronological (oldest→newest) collection of
+/// `len` items. The first page (no token) is the newest `limit` items; each
+/// `next_token` walks one `limit`-sized page older. Returns `next_token` only
+/// while older items remain.
+pub fn page_window(len: usize, limit: Option<i64>, token: Option<&str>) -> PageWindow {
+    let limit = clamp_limit(limit);
+    // `end` is the exclusive upper bound (oldest-indexed) of this page; absent a
+    // token we start at the newest end. Clamp to `len` so a stale token against
+    // a shrunk collection degrades gracefully rather than panicking.
+    let end = token
+        .and_then(decode_token)
+        .and_then(|v| v.get("b").and_then(Value::as_u64))
+        .map(|b| (b as usize).min(len))
+        .unwrap_or(len);
+    let start = end.saturating_sub(limit);
+    let next_token = if start > 0 {
+        Some(encode_token(&json!({ "b": start })))
+    } else {
+        None
+    };
+    PageWindow {
+        start,
+        end,
+        next_token,
+    }
+}
+
+/// A page of items plus the opaque token for the next (older) page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_token: Option<String>,
+}
+
+/// Paginate a chronological (oldest→newest) slice into a newest→oldest page.
+/// Items within the returned page are ordered newest-first; `next_token` follows
+/// the contract in [`page_window`].
+pub fn paginate_slice<T: Clone>(source: &[T], limit: Option<i64>, token: Option<&str>) -> Page<T> {
+    let win = page_window(source.len(), limit, token);
+    let items = source[win.start..win.end].iter().rev().cloned().collect();
+    Page {
+        items,
+        next_token: win.next_token,
+    }
+}
+
+/// Paginate a plaintext scrollback buffer into a newest→oldest page of lines,
+/// returning the `{ items, nextToken }` envelope used by the terminal/script
+/// historical-output reads. Trailing blank lines are trimmed (mirroring the
+/// legacy formatted reads) before paging; the per-page size follows the standard
+/// clamp (default 50, max 200) and the token is append-stable per [`page_window`].
+pub fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) -> Value {
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    while lines.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    let page = paginate_slice(&lines, limit, token);
+    json!({
+        "items": page.items,
+        "nextToken": page.next_token,
+    })
+}
+
+/// Encode an opaque continuation token for offset/skip-style backward paging
+/// (used by the store-backed `event.query` and git `file-tracking.loadCommits`
+/// reads, whose sources are already newest-first and expose a native
+/// `LIMIT`/`OFFSET`). The wire form is opaque base64; the internal
+/// `{ "o": <offset> }` is a private detail clients MUST NOT depend on.
+///
+/// Unlike [`page_window`], offset paging anchors on the *newest* end, so it is
+/// not append-stable against inserts at the newest end — appropriate for
+/// time-windowed event queries and immutable commit history, where the live
+/// tail is read separately (Q13).
+pub fn offset_token(next_offset: usize) -> String {
+    encode_token(&json!({ "o": next_offset }))
+}
+
+/// Decode an offset-style continuation token into its offset. A missing or
+/// malformed token starts from offset 0 (the newest page).
+pub fn parse_offset(token: Option<&str>) -> usize {
+    token
+        .and_then(decode_token)
+        .and_then(|v| v.get("o").and_then(Value::as_u64))
+        .map(|n| n as usize)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests;

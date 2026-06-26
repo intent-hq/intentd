@@ -49,6 +49,7 @@ mod file_ops;
 mod git_ops;
 mod history_xml;
 mod note_ops;
+mod pagination;
 mod pr_ops;
 mod primitive_ops;
 mod script_ops;
@@ -2175,6 +2176,27 @@ impl WorkspaceApi for Services {
         Box::pin(async move { terminal_ops::list(&pty, &workspace_id) })
     }
 
+    fn terminal_read_output(
+        &self,
+        workspace_id: WorkspaceId,
+        terminal_id: String,
+        max_lines: Option<i64>,
+        paginate: Option<bool>,
+        page_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let pty = self.pty.clone();
+        Box::pin(async move {
+            terminal_ops::read_output(
+                &pty,
+                &workspace_id,
+                &terminal_id,
+                max_lines,
+                paginate.unwrap_or(false),
+                page_token,
+            )
+        })
+    }
+
     fn file_read(
         &self,
         workspace_id: WorkspaceId,
@@ -2508,9 +2530,13 @@ impl WorkspaceApi for Services {
         &self,
         script_id: String,
         max_lines: Option<i64>,
+        paginate: Option<bool>,
+        page_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.output(&script_id, max_lines) })
+        Box::pin(
+            async move { mgr.output(&script_id, max_lines, paginate.unwrap_or(false), page_token) },
+        )
     }
 
     fn script_status(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -4118,14 +4144,19 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         params: EventQueryParams,
-    ) -> BoxFuture<'_, Result<Vec<Event>>> {
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            // Opt-in pagination (TA-2 / §5.5): the `{ items, nextToken }` envelope
+            // is returned only when the caller engages pagination (`paginate` or a
+            // `page_token`); otherwise the legacy bare array is preserved verbatim.
+            let paginate = params.paginate.unwrap_or(false) || params.page_token.is_some();
             // Mirror `buildQueryFilters`: each option is applied only when
             // truthy (empty strings / 0 are skipped); `limit || 50`.
+            let legacy_limit = params.limit.filter(|&l| l != 0).unwrap_or(50);
             let mut q = EventQuery {
                 workspace_id: Some(workspace_id),
-                limit: Some(params.limit.filter(|&l| l != 0).unwrap_or(50)),
+                limit: Some(legacy_limit),
                 ..Default::default()
             };
             if let Some(t) = params.event_type.filter(|s| !s.is_empty()) {
@@ -4135,7 +4166,13 @@ impl WorkspaceApi for Services {
                 // An unrecognized actorType matches nothing (TS equals filter).
                 match serde_json::from_value::<ActorType>(serde_json::Value::String(at)) {
                     Ok(parsed) => q.actor_type = Some(parsed),
-                    Err(_) => return Ok(Vec::new()),
+                    Err(_) => {
+                        return Ok(if paginate {
+                            serde_json::json!({ "items": [], "nextToken": serde_json::Value::Null })
+                        } else {
+                            serde_json::json!([])
+                        })
+                    }
                 }
             }
             if let Some(aid) = params.actor_id.filter(|s| !s.is_empty()) {
@@ -4147,7 +4184,35 @@ impl WorkspaceApi for Services {
             if let Some(m) = params.minutes_ago.filter(|&m| m != 0) {
                 q.since = Some(iso_minutes_ago(m));
             }
-            store.query_events(&q).await
+            if !paginate {
+                // Legacy bare array (store yields newest→oldest).
+                let events = store.query_events(&q).await?;
+                return serde_json::to_value(events)
+                    .map_err(|e| Error::Internal(format!("serialize events failed: {e}")));
+            }
+            // Paginated: clamp the page size, page backward via OFFSET, and fetch
+            // one extra row to decide whether an older page remains. The store
+            // already orders newest→oldest, so the page is in contract order.
+            let limit = pagination::clamp_limit(params.limit);
+            let offset = pagination::parse_offset(params.page_token.as_deref());
+            q.limit = Some((limit + 1) as i64);
+            q.offset = Some(offset as i64);
+            let mut events = store.query_events(&q).await?;
+            let has_more = events.len() > limit;
+            if has_more {
+                events.truncate(limit);
+            }
+            let next_token = if has_more {
+                serde_json::Value::String(pagination::offset_token(offset + limit))
+            } else {
+                serde_json::Value::Null
+            };
+            let items = serde_json::to_value(events)
+                .map_err(|e| Error::Internal(format!("serialize events failed: {e}")))?;
+            Ok(serde_json::json!({
+                "items": items,
+                "nextToken": next_token,
+            }))
         })
     }
 
@@ -4155,6 +4220,8 @@ impl WorkspaceApi for Services {
         &self,
         _workspace_id: WorkspaceId,
         event_types: Vec<String>,
+        _exclude_self: Option<bool>,
+        _batch_window: Option<i64>,
     ) -> BoxFuture<'_, Result<EventSubscribeResult>> {
         let subs = self.event_subscriptions.clone();
         Box::pin(async move {
@@ -4468,8 +4535,12 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         limit: Option<i64>,
         _workspace_id: Option<WorkspaceId>,
+        page_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_get_conversation_op(agent_id, limit).await })
+        Box::pin(async move {
+            self.agent_get_conversation_op(agent_id, limit, page_token)
+                .await
+        })
     }
 
     fn agent_create(
@@ -4670,6 +4741,24 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.agent_get_subscriptions_op(workspace_id, agent_id)
                 .await
+        })
+    }
+
+    fn agent_diagnostics(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        task_note_id: Option<NoteId>,
+        stale_responding_after_ms: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_diagnostics_op(
+                workspace_id,
+                agent_id,
+                task_note_id,
+                stale_responding_after_ms,
+            )
+            .await
         })
     }
 
@@ -5370,12 +5459,16 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         limit: Option<i64>,
+        page_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
-            // Default 50 (TS), clamp to the PROTOCOL §5.19 cap of 200.
-            let limit = limit.unwrap_or(50).clamp(0, 200) as usize;
-            let empty = serde_json::json!({ "commits": [] });
+            // TA-2 / §5.5: clamp the page size to [1,200] (default 50) and walk
+            // backward through the (newest-first) first-parent history via an
+            // opaque skip token. `nextToken` is additive to the existing object.
+            let limit = pagination::clamp_limit(limit);
+            let skip = pagination::parse_offset(page_token.as_deref());
+            let empty = serde_json::json!({ "commits": [], "nextToken": serde_json::Value::Null });
             let ws = match store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
                 Err(_) => return Ok(empty),
@@ -5389,12 +5482,21 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
-            let commits = intent_git::history::history(&worktree, limit)?;
+            // Fetch one past the page window to decide whether older commits remain.
+            let commits = intent_git::history::history(&worktree, skip + limit + 1)?;
+            let has_more = commits.len() > skip + limit;
             let values: Vec<serde_json::Value> = commits
                 .iter()
+                .skip(skip)
+                .take(limit)
                 .map(file_tracking_ops::commit_to_value)
                 .collect();
-            Ok(serde_json::json!({ "commits": values }))
+            let next_token = if has_more {
+                serde_json::Value::String(pagination::offset_token(skip + limit))
+            } else {
+                serde_json::Value::Null
+            };
+            Ok(serde_json::json!({ "commits": values, "nextToken": next_token }))
         })
     }
 
