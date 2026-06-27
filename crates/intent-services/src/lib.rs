@@ -229,6 +229,20 @@ impl Services {
         )
     }
 
+    /// Resolve the default `agent_type` declared by a specialist's `agentType`
+    /// frontmatter (§18.2 / SP-B). Used at spawn time to engage the matching
+    /// internal tool denylist (§18.4) — e.g. the `ralph` specialist →
+    /// `ralph-loop`. Returns `None` when the specialist is unknown or declares no
+    /// `agentType`, leaving the caller's default agent type intact.
+    pub(crate) fn specialist_agent_type(
+        &self,
+        specialist_id: &str,
+        workspace_path: Option<&Path>,
+    ) -> Option<String> {
+        self.specialists_service()
+            .resolve_agent_type(specialist_id, workspace_path)
+    }
+
     /// Build a [`SettingsService`](settings::SettingsService) view over the store
     /// and secret store for one `settings.*` call.
     fn settings_service(&self) -> settings::SettingsService<'_> {
