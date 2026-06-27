@@ -1170,11 +1170,15 @@ impl AgentManager {
         opts.model = resolved.model.as_deref();
         opts.extra_env = resolved.extra_env.clone();
         if !self.contains(agent_id) {
+            // Derive the agent type from the session's specialist `agentType`
+            // frontmatter (SP-B); falls back to the default interactive type so
+            // plain agents and specialists without `agentType` are unchanged.
+            let agent_type = derive_agent_type(&self.services, &session, workspace.as_ref());
             self.create_agent(
                 agent_id.clone(),
                 workspace_id.clone(),
                 session.name.clone(),
-                "interactive",
+                &agent_type,
                 resolved.cwd.clone(),
                 &opts,
             )
@@ -1285,6 +1289,36 @@ struct ResolvedSpawn {
 }
 
 /// Resolve the provider config, model, cwd, and extra env for spawning an
+/// The default agent type for an agent with no specialist-declared `agentType`
+/// (the foreground/interactive type, which has no internal tool denylist).
+const DEFAULT_AGENT_TYPE: &str = "interactive";
+
+/// Derive the spawn `agent_type` for a session (SP-B): when the session was
+/// created with a specialist that declares an `agentType` frontmatter scalar
+/// (e.g. `ralph` → `ralph-loop`), that value becomes the agent's type so the
+/// matching internal tool denylist (§18.4,
+/// [`get_tool_denylist_for_agent_type`](intent_acp::get_tool_denylist_for_agent_type))
+/// engages on spawn. Otherwise (no specialist, or a specialist without
+/// `agentType`) the existing [`DEFAULT_AGENT_TYPE`] is kept — no regression for
+/// plain agents. The specialist project tier resolves from the workspace path.
+fn derive_agent_type(
+    services: &Services,
+    session: &AgentSession,
+    workspace: Option<&intent_core::Workspace>,
+) -> String {
+    if let Some(specialist) = session.specialist.as_deref().filter(|s| !s.is_empty()) {
+        let workspace_path = workspace
+            .and_then(|w| w.path.clone().or_else(|| w.worktree_path.clone()))
+            .map(PathBuf::from);
+        if let Some(agent_type) =
+            services.specialist_agent_type(specialist, workspace_path.as_deref())
+        {
+            return agent_type;
+        }
+    }
+    DEFAULT_AGENT_TYPE.to_string()
+}
+
 /// agent's child from its persisted session + workspace. The provider id comes
 /// from the session's explicit `provider`, else the `provider:model` compound
 /// id, else the default provider. The `mock` provider (E2E) reads its script
