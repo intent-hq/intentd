@@ -134,11 +134,19 @@ impl WorkspaceMcpServer {
             "update_note_metadata_workspace-mcp" => {
                 let id = note_id(args, "noteId")?;
                 let r: Result<NoteUpdateMetadataResult> = api
-                    .update_note_metadata(ws, id, opt_str(args, "title"), opt_vec_str(args, "tags"))
+                    .update_note_metadata(
+                        ws,
+                        id,
+                        opt_str(args, "title"),
+                        opt_vec_str(args, "tags"),
+                        None,
+                    )
                     .await;
                 val(r)
             }
-            "delete_note_workspace-mcp" => val(api.delete_note(ws, note_id(args, "noteId")?).await),
+            "delete_note_workspace-mcp" => {
+                val(api.delete_note(ws, note_id(args, "noteId")?, None).await)
+            }
             other => self.dispatch_more(other, args).await,
         }
     }
