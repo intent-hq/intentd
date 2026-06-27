@@ -3,8 +3,13 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Serializes the `INTENTD_DATA_DIR` env-var set + `Config::resolve()` across the
+/// tests in this binary: the var is process-global, so concurrent setup would
+/// race and make both tests resolve the same db path (→ "database is locked").
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 use intent_core::{
     now_iso, Config, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
@@ -97,8 +102,11 @@ async fn uds_git_write_ops_round_trip() {
     let repo = base.join("repo");
     seed_repo(&repo);
 
-    std::env::set_var("INTENTD_DATA_DIR", &data_dir);
-    let config = Config::resolve().expect("resolve config");
+    let config = {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTENTD_DATA_DIR", &data_dir);
+        Config::resolve().expect("resolve config")
+    };
 
     let ws_id = WorkspaceId::from("ws-git");
     {
@@ -238,6 +246,123 @@ async fn uds_git_write_ops_round_trip() {
     .await;
     assert_eq!(resp["result"]["ok"], json!(true));
     assert_eq!(resp["result"]["paths"], json!(["seed.txt"]));
+
+    let _ = tx.send(());
+    let _ = server.await;
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Over-the-wire git read slice: `git.changes`, `git.diffs` (+ `git.diff`
+/// alias), and `git.commits` (+ `git.log` alias) populate the FE panels.
+#[tokio::test]
+async fn uds_git_read_ops_round_trip() {
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let base = Path::new("/tmp").join(format!("intentd-gitr-{}", &short[..8]));
+    let data_dir = base.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let repo = base.join("repo");
+    seed_repo(&repo);
+
+    let config = {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTENTD_DATA_DIR", &data_dir);
+        Config::resolve().expect("resolve config")
+    };
+
+    let ws_id = WorkspaceId::from("ws-gitr");
+    {
+        let store = Store::open(&config.db_path).await.expect("open store");
+        store
+            .insert_workspace(&seed_workspace(&ws_id, repo.to_str().unwrap()))
+            .await
+            .expect("seed ws");
+    }
+
+    let store = Store::open(&config.db_path).await.expect("reopen store");
+    let bus = EventBus::new(store.clone());
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let socket = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_uds(services, bus, &socket, None, async move {
+            let _ = rx.await;
+        })
+        .await
+        .expect("serve");
+    });
+    for _ in 0..50 {
+        if config.socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Modify a tracked file (unstaged) so changes/diffs are non-empty.
+    std::fs::write(repo.join("seed.txt"), "seed\nadded\n").unwrap();
+
+    // (a) git.changes → working-tree FileStatus[] with the modified file.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.changes","params":{"workspaceId":"ws-gitr"}}"#,
+    )
+    .await;
+    let changes = resp["result"].as_array().expect("changes array");
+    let seed = changes
+        .iter()
+        .find(|c| c["path"] == json!("seed.txt"))
+        .expect("seed.txt in changes");
+    assert_eq!(seed["status"], json!("M"));
+    assert_eq!(seed["staged"], json!(false));
+
+    // (b) git.diffs (unstaged) → [{ path, hunks }] with tagged DiffLines.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":2,"method":"git.diffs","params":{"workspaceId":"ws-gitr"}}"#,
+    )
+    .await;
+    let diffs = resp["result"].as_array().expect("diffs array");
+    let f = diffs
+        .iter()
+        .find(|d| d["path"] == json!("seed.txt"))
+        .expect("seed.txt diff");
+    let hunks = f["hunks"].as_array().expect("hunks");
+    assert!(!hunks.is_empty());
+    let lines = hunks[0]["lines"].as_array().expect("lines");
+    assert!(lines
+        .iter()
+        .any(|l| l["type"] == json!("Addition")
+            && l["content"].as_str().unwrap_or("").contains("added")));
+
+    // (b') git.diff alias resolves to the same handler.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":3,"method":"git.diff","params":{"workspaceId":"ws-gitr","path":"seed.txt"}}"#,
+    )
+    .await;
+    let arr = resp["result"].as_array().expect("diff alias array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["path"], json!("seed.txt"));
+
+    // (c) git.commits → §5.5 { items, nextToken } page of CommitInfo.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":4,"method":"git.commits","params":{"workspaceId":"ws-gitr","page":{"limit":10}}}"#,
+    )
+    .await;
+    let items = resp["result"]["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["message"].as_str().unwrap(), "seed");
+    assert_eq!(items[0]["files"], json!(["seed.txt"]));
+    assert_eq!(items[0]["email"], json!("test@example.com"));
+    assert_eq!(resp["result"]["nextToken"], Value::Null);
+
+    // (c') git.log alias resolves to the same handler (top-level limit form).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":5,"method":"git.log","params":{"workspaceId":"ws-gitr","limit":10}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["items"].as_array().expect("items").len(), 1);
 
     let _ = tx.send(());
     let _ = server.await;
