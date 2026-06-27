@@ -678,6 +678,32 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn git_unstage(
+        &self,
+        _workspace_id: WorkspaceId,
+        paths: Value,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        Box::pin(async move {
+            if let Value::String(s) = &paths {
+                if s == "." || s == "*" || s.contains("--all") {
+                    return Err(Error::Internal(
+                        "Staging all files is not allowed.".to_string(),
+                    ));
+                }
+            }
+            let list = match paths {
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+                Value::String(s) => s.split(',').map(|p| p.trim().to_string()).collect(),
+                _ => vec![],
+            };
+            Ok(list)
+        })
+    }
+
     fn git_get_branches(
         &self,
         repo_path: String,
@@ -1954,6 +1980,33 @@ async fn git_stage_all_is_rejected_with_minus_32603() {
     .await
     .unwrap();
     assert_eq!(err_code(&v), -32603);
+}
+
+#[tokio::test]
+async fn git_unstage_returns_ok_and_paths() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.unstage","params":{"workspaceId":"ws-1","paths":["src/a.ts","src/b.ts"]}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(
+        v["result"]["paths"],
+        serde_json::json!(["src/a.ts", "src/b.ts"])
+    );
+}
+
+#[tokio::test]
+async fn git_unstage_missing_paths_is_minus_32602() {
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"git.unstage","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: paths")
+    );
 }
 
 #[tokio::test]

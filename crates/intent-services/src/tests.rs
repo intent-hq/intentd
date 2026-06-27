@@ -3066,6 +3066,70 @@ mod file_tracking {
         );
         assert!(row["stats"]["additions"].as_i64().unwrap() >= 1);
     }
+
+    /// `git.stage` → `git.unstage` round-trip over the git.* RPC surface: a
+    /// staged modification is reflected in the index, then dropped back to an
+    /// unstaged modification, both calls echoing the validated path list.
+    #[tokio::test]
+    async fn git_unstage_round_trips_a_staged_modification() {
+        let repo = init_git_repo();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store);
+
+        std::fs::write(repo.dir.join("seed.txt"), "seed changed\n").unwrap();
+
+        let staged = svc
+            .git_stage(ws_id.clone(), serde_json::json!(["seed.txt"]))
+            .await
+            .unwrap();
+        assert_eq!(staged, vec!["seed.txt".to_string()]);
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        assert!(st.files.iter().any(|f| f.path == "seed.txt" && f.staged));
+
+        let unstaged = svc
+            .git_unstage(ws_id.clone(), serde_json::json!(["seed.txt"]))
+            .await
+            .unwrap();
+        assert_eq!(unstaged, vec!["seed.txt".to_string()]);
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        assert!(st.files.iter().any(|f| f.path == "seed.txt" && !f.staged));
+    }
+
+    /// `git.unstage` is idempotent: unstaging an already-unstaged path is a
+    /// no-op that returns the path list rather than erroring.
+    #[tokio::test]
+    async fn git_unstage_is_idempotent_on_already_unstaged_paths() {
+        let repo = init_git_repo();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store);
+
+        std::fs::write(repo.dir.join("seed.txt"), "seed changed\n").unwrap();
+
+        // Never staged → first unstage is already a no-op; a second confirms
+        // idempotency (no error either time).
+        let first = svc
+            .git_unstage(ws_id.clone(), serde_json::json!(["seed.txt"]))
+            .await
+            .unwrap();
+        assert_eq!(first, vec!["seed.txt".to_string()]);
+        let second = svc
+            .git_unstage(ws_id.clone(), serde_json::json!(["seed.txt"]))
+            .await
+            .unwrap();
+        assert_eq!(second, vec!["seed.txt".to_string()]);
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        assert!(st.files.iter().any(|f| f.path == "seed.txt" && !f.staged));
+    }
 }
 
 /// `metrics.*` aggregation (§17.5) over the M4.7 `tracked_changes` table: the
