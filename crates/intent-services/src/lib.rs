@@ -2322,6 +2322,18 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn file_tree(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            file_ops::tree(&root, &path)
+        })
+    }
+
     fn primitive_add_reference(
         &self,
         workspace_id: WorkspaceId,

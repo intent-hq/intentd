@@ -132,6 +132,36 @@ pub(crate) fn list(root: &str, path: &str) -> Result<Value> {
     Ok(Value::Array(entries))
 }
 
+/// Build the relative path of a child entry under the requested directory,
+/// dropping a leading `.`/`./`/empty base so root entries are bare names.
+fn join_rel(base: &str, name: &str) -> String {
+    let b = base.trim();
+    let b = b.strip_prefix("./").unwrap_or(b);
+    let b = b.trim_matches('/');
+    if b.is_empty() || b == "." {
+        name.to_string()
+    } else {
+        format!("{b}/{name}")
+    }
+}
+
+/// `file.tree` → bare array of `{ path, name, isDirectory }` for the entries
+/// directly under `path` (defaulting to the workspace root). The FE anchors the
+/// explorer here and lazy-lists children via `file.list`, so a shallow listing
+/// is sufficient. Shares the same within-workspace guard as the other file ops.
+pub(crate) fn tree(root: &str, path: &str) -> Result<Value> {
+    let full = resolve_within(root, path)?;
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&full).map_err(io_err)? {
+        let entry = entry.map_err(io_err)?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_directory = entry.file_type().map_err(io_err)?.is_dir();
+        let rel = join_rel(path, &name);
+        entries.push(json!({ "path": rel, "name": name, "isDirectory": is_directory }));
+    }
+    Ok(Value::Array(entries))
+}
+
 /// `file.delete` → `{ ok, path, deleted: true }` (rejects directories).
 pub(crate) fn delete(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
@@ -257,6 +287,47 @@ mod tests {
         write(&root, "only.txt", "x").unwrap();
         let items = list(&root, ".").unwrap();
         assert_eq!(items.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tree_returns_root_entries_with_three_fields() {
+        let t = TempRoot::new();
+        let root = t.root();
+        write(&root, "a.txt", "x").unwrap();
+        mkdir(&root, "d").unwrap();
+        let mut items = tree(&root, ".").unwrap().as_array().unwrap().clone();
+        items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        assert_eq!(
+            items,
+            vec![
+                json!({ "path": "a.txt", "name": "a.txt", "isDirectory": false }),
+                json!({ "path": "d", "name": "d", "isDirectory": true }),
+            ]
+        );
+    }
+
+    #[test]
+    fn tree_prefixes_subpath_in_path_field() {
+        let t = TempRoot::new();
+        let root = t.root();
+        write(&root, "sub/inner.txt", "x").unwrap();
+        let items = tree(&root, "sub").unwrap();
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0],
+            json!({ "path": "sub/inner.txt", "name": "inner.txt", "isDirectory": false })
+        );
+    }
+
+    #[test]
+    fn tree_rejects_path_traversal() {
+        let t = TempRoot::new();
+        let root = t.root();
+        match tree(&root, "..") {
+            Err(Error::Internal(m)) => assert_eq!(m, ACCESS_DENIED),
+            other => panic!("expected access denied, got {other:?}"),
+        }
     }
 
     #[test]

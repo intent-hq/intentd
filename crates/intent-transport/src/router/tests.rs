@@ -970,6 +970,12 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async move { Ok(serde_json::json!([{ "name": path, "type": "file" }])) })
     }
 
+    fn file_tree(&self, _workspace_id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!([{ "path": path, "name": path, "isDirectory": false }]))
+        })
+    }
+
     fn file_delete(
         &self,
         _workspace_id: WorkspaceId,
@@ -2481,6 +2487,16 @@ async fn file_methods_dispatch_with_exact_wire_shapes() {
     assert!(v["result"].is_array());
     assert_eq!(v["result"][0]["name"], serde_json::json!("."));
     assert_eq!(v["result"][0]["type"], serde_json::json!("file"));
+
+    // file.tree → bare array of { path, name, isDirectory }; `path` defaults to ".".
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"file.tree","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert!(v["result"].is_array());
+    assert_eq!(v["result"][0]["path"], serde_json::json!("."));
+    assert_eq!(v["result"][0]["name"], serde_json::json!("."));
+    assert_eq!(v["result"][0]["isDirectory"], serde_json::json!(false));
 
     // file.delete → { ok, path, deleted: true }.
     let v = call(

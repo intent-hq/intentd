@@ -2509,6 +2509,24 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `file.tree`: directory entries directly under `path` (defaulting to the
+    /// workspace root) as a **bare array** of `{ path, name, isDirectory }`
+    /// (camelCase on the wire). The FE anchors the explorer on the root and
+    /// lazy-lists children via `file.list`, so a shallow listing is sufficient.
+    /// Shares the same within-workspace guard as the other file ops.
+    fn file_tree(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tree not implemented".to_string(),
+            ))
+        })
+    }
+
     // ------------------------------------------------------------------------
     // primitive.* — append a fenced ```ws-block:<type>``` JSON primitive to a
     // note. Each returns `{ ok: true, primitiveId, noteId, content }` where

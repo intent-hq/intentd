@@ -1360,6 +1360,13 @@ async fn dispatch(
             let path = opt_str(params, "path").unwrap_or_else(|| ".".to_string());
             api.file_list(ws, path).await.map_err(domain_to_rpc)
         }
+        "file.tree" => {
+            // `path` is optional, defaulting to the workspace root ("."). The FE
+            // anchors the explorer here and lazy-lists children via `file.list`.
+            let ws = require_ws_note(params)?;
+            let path = opt_str(params, "path").unwrap_or_else(|| ".".to_string());
+            api.file_tree(ws, path).await.map_err(domain_to_rpc)
+        }
         "file.delete" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
