@@ -58,7 +58,7 @@ pub(crate) fn current_branch(repo: &Repository) -> String {
         Err(_) => repo
             .find_reference("HEAD")
             .ok()
-            .and_then(|r| r.symbolic_target().map(str::to_string))
+            .and_then(|r| r.symbolic_target().ok().flatten().map(str::to_string))
             .and_then(|t| t.strip_prefix("refs/heads/").map(str::to_string))
             .unwrap_or_default(),
     }
@@ -98,7 +98,7 @@ fn collect_files(repo: &Repository) -> Result<Vec<FileStatus>> {
     let statuses = repo.statuses(Some(&mut opts)).map_err(map_git_err)?;
     let mut files = Vec::new();
     for entry in statuses.iter() {
-        let Some(path) = entry.path() else { continue };
+        let Ok(path) = entry.path() else { continue };
         if path.ends_with('/') {
             continue;
         }
