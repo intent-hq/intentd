@@ -1015,3 +1015,221 @@ async fn chat_subscription_coexists_with_events_firehose() {
     let _ = shutdown_tx.send(());
     let _ = server.await;
 }
+
+/// CS-5 orphan self-heal: a turn where TEXT INTERLEAVES AFTER a tool call so the
+/// live mapper's optimistic block layout diverges from the durable transcript,
+/// forcing the terminal reconcile to emit a NON-EMPTY `removedIds`. Two distinct
+/// self-heal paths are exercised at once: (1) the mispredicted `tool_result`
+/// index — the live mapper appends the result right after the `tool_use`
+/// (`{mid}:2`), but the persisted transcript flushed the interleaved text into
+/// `{mid}:2` and placed the real `tool_result` at `{mid}:3`, so `{mid}:2` heals
+/// from `tool_result` back to `text` via an `updated` entity; and (2) a trailing
+/// partial text block (`{mid}:4`) the model streamed live but the durable turn
+/// dropped — it exists in no persisted block, so reconcile lists it in
+/// `removedIds`. The assertion is the reconciliation invariant: the seq-0
+/// snapshot reduced with every delta (HONORING `removedIds`) equals a fresh
+/// `agent.getConversation` snapshot, and the terminal `removedIds` is non-empty.
+#[tokio::test]
+async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
+    let (socket, server, shutdown_tx, _tmp, bus, _services) = setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A1" }),
+    )
+    .await;
+    let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+
+    // A persisted user message anchors a non-trivial seq-0 snapshot.
+    let store = bus.store();
+    let user_id = Uuid::now_v7().to_string();
+    store
+        .append_agent_message_with_id(
+            &AgentId::from(agent_id.as_str()),
+            &user_id,
+            "user",
+            &json!([{ "type": "text", "id": format!("{user_id}:0"), "text": "Run the tests" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append user message");
+
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
+            "params": { "agentId": agent_id }
+        }))
+        .unwrap(),
+    )
+    .await;
+    let resp = read_json(&mut sub_reader).await;
+    assert_eq!(resp["id"], 1);
+    let snap = read_json(&mut sub_reader).await;
+    assert_eq!(snap["params"]["kind"], "snapshot");
+    assert_eq!(snap["params"]["seq"], 0);
+    let mut reconstructed: Vec<Value> = snap["params"]["snapshot"]["messages"]
+        .as_array()
+        .cloned()
+        .expect("snapshot messages");
+    assert_eq!(reconstructed.len(), 1, "snapshot holds the user message");
+
+    let mid = Uuid::now_v7().to_string();
+    let chunk = |idx: u64, text: &str| {
+        json!({
+            "agentId": agent_id, "content": text, "messageId": mid,
+            "blockIndex": idx, "blockId": format!("{mid}:{idx}"), "blockType": "text",
+        })
+    };
+    // 1) Opening text → {mid}:0.
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_STREAM_CHUNK,
+        chunk(0, "I'll run the tests. "),
+    )
+    .await;
+    // 2) Tool starts → tool_use {mid}:1.
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_TOOL_CALL,
+        json!({
+            "agentId": agent_id, "toolName": "run_tests", "toolKind": "terminal",
+            "toolCallId": "call_abc", "input": { "path": "." }, "status": "started",
+            "messageId": mid, "blockIndex": 1, "blockId": format!("{mid}:1"),
+        }),
+    )
+    .await;
+    // 3) TEXT INTERLEAVES AFTER the tool call → live text {mid}:2.
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_STREAM_CHUNK,
+        chunk(2, "Checking output. "),
+    )
+    .await;
+    // 4) Tool completes WITH output: the mapper appends the predicted tool_result
+    //    right after the tool_use ({mid}:2), MISPREDICTING the index (it overwrites
+    //    the interleaved text block at {mid}:2 live).
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_TOOL_CALL,
+        json!({
+            "agentId": agent_id, "toolName": "run_tests", "toolKind": "terminal",
+            "toolCallId": "call_abc", "input": { "path": "." }, "status": "completed",
+            "output": "12 passed", "messageId": mid, "blockIndex": 1,
+            "blockId": format!("{mid}:1"),
+        }),
+    )
+    .await;
+    // 5) A trailing partial the model streamed but the durable turn drops → {mid}:4.
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_STREAM_CHUNK,
+        chunk(4, "Let me also "),
+    )
+    .await;
+
+    // The DURABLE transcript (what run_prompt_turn persists): the interleaved text
+    // landed at {mid}:2 and the real tool_result at {mid}:3; the trailing partial
+    // {mid}:4 is NOT committed. {mid}:4 therefore orphans the live state.
+    store
+        .append_agent_message_with_id(
+            &AgentId::from(agent_id.as_str()),
+            &mid,
+            "assistant",
+            &json!([
+                { "type": "text", "id": format!("{mid}:0"), "text": "I'll run the tests. " },
+                { "type": "tool_use", "id": format!("{mid}:1"), "name": "run_tests",
+                  "input": { "path": "." }, "toolCallId": "call_abc",
+                  "metadata": { "toolKind": "terminal", "status": "completed" } },
+                { "type": "text", "id": format!("{mid}:2"), "text": "Checking output. " },
+                { "type": "tool_result", "id": format!("{mid}:3"), "tool_use_id": "call_abc",
+                  "output": "12 passed", "is_error": false },
+            ]),
+            &now_iso(),
+        )
+        .await
+        .expect("append assistant message");
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_STREAM_END,
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+
+    // Reduce every delta; capture the terminal frame's removedIds.
+    let mut terminal_removed: Vec<String> = Vec::new();
+    loop {
+        let frame = read_json(&mut sub_reader).await;
+        assert_eq!(frame["params"]["kind"], "delta");
+        let delta = frame["params"]["delta"].clone();
+        let terminal = is_terminal_delta(&delta);
+        if terminal {
+            terminal_removed = delta["removedIds"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+        }
+        apply_delta(&mut reconstructed, &delta);
+        if terminal {
+            break;
+        }
+    }
+
+    // The orphaned trailing partial drives a NON-EMPTY removedIds (the prior tests
+    // only ever saw empty removedIds).
+    assert!(
+        !terminal_removed.is_empty(),
+        "terminal reconcile emits a non-empty removedIds for the orphaned block"
+    );
+    assert!(
+        terminal_removed.contains(&format!("{mid}:4")),
+        "the orphaned trailing partial {{mid}}:4 is in removedIds, got {terminal_removed:?}"
+    );
+
+    // Honoring removedIds, the reduced state equals a fresh snapshot exactly.
+    let want = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        12,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        Value::Array(reconstructed),
+        want["messages"],
+        "snapshot + deltas (honoring removedIds) reconcile to the fresh conversation snapshot"
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
