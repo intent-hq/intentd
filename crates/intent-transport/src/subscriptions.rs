@@ -12,10 +12,10 @@
 
 use intent_core::events::{
     AGENT_COMPLETED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RENAMED,
-    AGENT_RESTORED, AGENT_STARTED, AGENT_STATUS_CHANGED, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED,
-    NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED,
-    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
-    WORKSPACE_UPDATED,
+    AGENT_RESTORED, AGENT_STARTED, AGENT_STATUS_CHANGED, AGENT_STREAM_CHUNK, AGENT_STREAM_END,
+    AGENT_TOOL_CALL, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED,
+    PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_UPDATED,
 };
 use intent_core::{AgentId, Event, NoteId, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Map, Value};
@@ -32,6 +32,10 @@ pub(crate) enum Channel {
     Agent,
     Workspace,
     Comment,
+    /// Per-agent chat stream (CS-0). Scoped by `agentId`; tails the
+    /// `agent:stream:*` family for one agent (snapshot = newest conversation
+    /// page; live deltas land in CS-3).
+    Chat,
 }
 
 /// A classified subscription fast-path request awaiting handling by the
@@ -70,6 +74,15 @@ pub(crate) struct WorkspaceSubscribeParams {
 pub(crate) struct CommentSubscribeParams {
     pub workspace_id: String,
     pub note_id: String,
+    pub replace_group: Option<String>,
+}
+
+/// Parsed `chat.subscribe` params (CS-0). The chat channel is per-resource,
+/// scoped by `agentId` (like the comment channel's `noteId`, NOT `workspaceId`);
+/// `replaceGroup` is optional.
+#[derive(Debug)]
+pub(crate) struct ChatSubscribeParams {
+    pub agent_id: String,
     pub replace_group: Option<String>,
 }
 
@@ -118,6 +131,13 @@ pub(crate) fn classify(value: &Value) -> Option<SubFastPath> {
             channel: Channel::Comment,
             params,
         }),
+        // `chat.*` is a new, distinct method name (no alias/deprecated path
+        // collides with it), so it routes cleanly to the per-agent chat channel.
+        "chat.subscribe" => Some(SubFastPath::Subscribe {
+            id,
+            channel: Channel::Chat,
+            params,
+        }),
         // The collection `agent` channel shares the `agent.subscribe` method
         // name with the pre-existing deprecated service-style alias (router,
         // §5.5). Disambiguate by params: the alias always carries `eventTypes`,
@@ -133,7 +153,8 @@ pub(crate) fn classify(value: &Value) -> Option<SubFastPath> {
         "note.unsubscribe"
         | "task.unsubscribe"
         | "workspace.unsubscribe"
-        | "comment.unsubscribe" => Some(SubFastPath::Unsubscribe { id, params }),
+        | "comment.unsubscribe"
+        | "chat.unsubscribe" => Some(SubFastPath::Unsubscribe { id, params }),
         "agent.unsubscribe" if !params.contains_key("workspaceId") => {
             Some(SubFastPath::Unsubscribe { id, params })
         }
@@ -182,6 +203,21 @@ pub(crate) fn parse_comment_subscribe_params(
     Ok(CommentSubscribeParams {
         workspace_id,
         note_id,
+        replace_group: replace_group(params),
+    })
+}
+
+/// Validate `chat.subscribe` params. A missing/empty `agentId` is a `-32602`
+/// error (the chat channel is per-agent, CS-0).
+pub(crate) fn parse_chat_subscribe_params(
+    params: &Map<String, Value>,
+) -> Result<ChatSubscribeParams, String> {
+    let agent_id = match params.get("agentId").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return Err("agentId is required".to_string()),
+    };
+    Ok(ChatSubscribeParams {
+        agent_id,
         replace_group: replace_group(params),
     })
 }
@@ -295,6 +331,10 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             PR_UNLINKED,
         ],
         Channel::Comment => &[COMMENT_ADDED],
+        // The chat channel is the one consumer of the `agent:stream:*` family
+        // (CS-0); the forwarder additionally filters these to one agent by
+        // `sessionId == agentId`.
+        Channel::Chat => &[AGENT_STREAM_CHUNK, AGENT_TOOL_CALL, AGENT_STREAM_END],
     };
     types.iter().map(|s| s.to_string()).collect()
 }
@@ -346,6 +386,32 @@ pub(crate) async fn channel_snapshot(
             },
             None => empty(),
         },
+        // The chat channel uses the dedicated `chat_snapshot` /
+        // `forward_chat_subscription` path (a per-agent `messages[]` object
+        // snapshot, CS-0 D3), so this generic arm is unreachable.
+        Channel::Chat => empty(),
+    }
+}
+
+/// Materialize the chat channel's seq-0 snapshot: the newest page of
+/// `agent.getConversation` as the `{ agentId, messages, truncated,
+/// totalMessages, nextToken }` OBJECT (CS-0 D3), reused verbatim from the
+/// existing paginated read. On a read error the snapshot degrades to an empty
+/// messages page rather than failing the subscription (matching
+/// [`channel_snapshot`]'s degrade-to-empty pattern).
+pub(crate) async fn chat_snapshot(api: &dyn WorkspaceApi, agent_id: &AgentId) -> Value {
+    match api
+        .agent_get_conversation(agent_id.clone(), None, None, None)
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => json!({
+            "agentId": agent_id.as_str(),
+            "messages": [],
+            "truncated": false,
+            "totalMessages": 0,
+            "nextToken": Value::Null,
+        }),
     }
 }
 
@@ -365,6 +431,10 @@ pub(crate) async fn channel_delta(
         Channel::Agent => agent_delta(api, event).await,
         Channel::Workspace => workspace_delta(api, event).await,
         Channel::Comment => comment_delta(api, workspace_id, note_id?, event).await,
+        // TODO(CS-3): map `agent:stream:*` events to chat block deltas. The chat
+        // channel uses the dedicated `forward_chat_subscription` path, so this
+        // generic arm is unreachable in CS-2.
+        Channel::Chat => None,
     }
 }
 

@@ -97,6 +97,55 @@ fn classify_disambiguates_agent_channel_from_deprecated_alias() {
 }
 
 #[test]
+fn classify_routes_chat_channel() {
+    // `chat.subscribe` is a distinct method name; it routes to the chat channel
+    // without colliding with the `agent.*` alias/deprecated paths.
+    match classify(&parse(
+        r#"{"jsonrpc":"2.0","id":1,"method":"chat.subscribe","params":{"agentId":"agent-1"}}"#,
+    )) {
+        Some(SubFastPath::Subscribe {
+            channel: Channel::Chat,
+            ..
+        }) => {}
+        _ => panic!("expected Subscribe(Chat)"),
+    }
+    assert!(matches!(
+        classify(&parse(
+            r#"{"jsonrpc":"2.0","id":2,"method":"chat.unsubscribe","params":{"subscriptionId":"ws-sub-1"}}"#
+        )),
+        Some(SubFastPath::Unsubscribe { .. })
+    ));
+}
+
+#[test]
+fn chat_params_require_agent_id() {
+    let ok = parse(r#"{"agentId":"agent-1","replaceGroup":"chat:agent-1"}"#);
+    let p = parse_chat_subscribe_params(ok.as_object().unwrap()).unwrap();
+    assert_eq!(p.agent_id, "agent-1");
+    assert_eq!(p.replace_group.as_deref(), Some("chat:agent-1"));
+
+    for bad in [r#"{}"#, r#"{"agentId":""}"#, r#"{"agentId":5}"#] {
+        let v = parse(bad);
+        let err = parse_chat_subscribe_params(v.as_object().unwrap()).unwrap_err();
+        assert!(err.contains("agentId is required"));
+    }
+}
+
+#[test]
+fn chat_channel_tails_only_stream_family() {
+    let chat = channel_event_types(Channel::Chat);
+    assert_eq!(
+        chat,
+        vec![
+            "agent:stream:chunk".to_string(),
+            "agent:tool:call".to_string(),
+            "agent:stream:end".to_string(),
+        ]
+    );
+    assert!(!channel_is_global(Channel::Chat));
+}
+
+#[test]
 fn comment_params_require_workspace_and_note() {
     let ok = parse(r#"{"workspaceId":"w","noteId":"n","replaceGroup":"comment:n"}"#);
     let p = parse_comment_subscribe_params(ok.as_object().unwrap()).unwrap();
