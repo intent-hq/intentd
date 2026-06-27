@@ -210,6 +210,11 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
     let locality_override = parse_locality_mode(mode)?;
     let config = resolve_config()?;
     std::fs::create_dir_all(&config.data_dir)?;
+    // OS-level single-instance backstop (§5.6): hold an exclusive advisory lock
+    // on `data_dir/intentd.lock` for the whole process. Acquired before the
+    // socket/pidfile guard so the strongest, configuration-independent guard
+    // fires first; released automatically when the held fd closes on drop.
+    let _datadir_lock = acquire_data_dir_lock(&config)?;
     // Single-instance guard (§5.6): refuse to start if a live daemon owns the
     // UDS or a live pid holds the pidfile; clean a stale socket/pidfile whose
     // owner is gone. The returned guard removes our pidfile on shutdown.
@@ -558,6 +563,50 @@ async fn acquire_single_instance(
     Ok(PidFile {
         path: config.pid_path.clone(),
     })
+}
+
+/// RAII exclusive `flock` on `data_dir/intentd.lock`, held for the daemon's
+/// lifetime as an OS-level single-instance backstop (§5.6) independent of the
+/// socket/pidfile. The kernel releases the advisory lock when the held file
+/// descriptor closes on drop. The lockfile itself is intentionally NOT removed
+/// on shutdown: a stale lockfile is harmless (only a live holder's lock blocks a
+/// second instance), and removing it would race a concurrent acquirer.
+#[cfg(unix)]
+struct DataDirLock {
+    _lock: nix::fcntl::Flock<std::fs::File>,
+}
+
+#[cfg(not(unix))]
+struct DataDirLock;
+
+/// Acquire the data-dir lock (§5.6): open/create `data_dir/intentd.lock` and take
+/// a non-blocking exclusive advisory `flock`. On contention another live instance
+/// already holds the lock, so refuse to start.
+#[cfg(unix)]
+fn acquire_data_dir_lock(config: &Config) -> anyhow::Result<DataDirLock> {
+    use nix::fcntl::{Flock, FlockArg};
+    let lock_path = config.data_dir.join("intentd.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| anyhow::anyhow!("open data-dir lockfile {}: {e}", lock_path.display()))?;
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => Ok(DataDirLock { _lock: lock }),
+        Err((_, errno)) => anyhow::bail!(
+            "intentd data dir {} is locked by another running instance ({errno}) — refusing to start a second instance",
+            config.data_dir.display()
+        ),
+    }
+}
+
+/// Non-unix has no `flock`; the lock is a no-op success (the socket/pidfile
+/// guards remain the single-instance enforcement on those platforms).
+#[cfg(not(unix))]
+fn acquire_data_dir_lock(_config: &Config) -> anyhow::Result<DataDirLock> {
+    Ok(DataDirLock)
 }
 
 /// Spawn the periodic idle-reap sweep (§5.6/§6.7), or `None` when disabled
@@ -1307,6 +1356,31 @@ mod tests {
         assert!(result.is_err(), "a live UDS owner must refuse startup");
         drop(listener);
         std::fs::remove_file(&config.socket_path).ok();
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_lock_refuses_second_acquire_while_held() {
+        let config = temp_config();
+        let guard = acquire_data_dir_lock(&config).expect("first lock acquires");
+        let second = acquire_data_dir_lock(&config);
+        assert!(
+            second.is_err(),
+            "a held data-dir lock must refuse a second acquire"
+        );
+        drop(guard);
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_lock_reacquires_after_drop() {
+        let config = temp_config();
+        let guard = acquire_data_dir_lock(&config).expect("first lock acquires");
+        drop(guard);
+        let _again =
+            acquire_data_dir_lock(&config).expect("re-acquire succeeds after the guard is dropped");
         std::fs::remove_dir_all(&config.data_dir).ok();
     }
 
