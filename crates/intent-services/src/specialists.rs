@@ -152,10 +152,25 @@ fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
     (fm, body_lines.join("\n").trim().to_string())
 }
 
+/// Optional frontmatter scalar keys carried through `build_def`/`render_file`
+/// verbatim so parse→write→parse round-trips losslessly (port of
+/// `SpecialistFileFrontmatter`'s optional fields: `codingAgent`, `model`,
+/// `modelTier`, `roleReminder`, `agentType`).
+const OPTIONAL_FRONTMATTER_KEYS: &[&str] = &[
+    "codingAgent",
+    "model",
+    "modelTier",
+    "roleReminder",
+    "agentType",
+];
+
 /// Build a wire `SpecialistDef` from one file's `content`. `source` is the
 /// winning tier; `path` is the resolved file (omitted for `bundled`,
-/// PROTOCOL §5.11). `prompt` is the markdown body; `modelTier` is carried
-/// through from frontmatter when present so it round-trips losslessly.
+/// PROTOCOL §5.11). `prompt` is the markdown body; the optional frontmatter
+/// scalars ([`OPTIONAL_FRONTMATTER_KEYS`]) are carried through when present so
+/// they round-trip losslessly. `behaviorPrompt` mirrors `prompt` and
+/// `isCustomized` is `true` for any non-`bundled` source (port of
+/// `serializeSpecialist`).
 fn build_def(id: &str, content: &str, source: &str, path: &Path) -> Value {
     let (fm, body) = parse_frontmatter(content);
     let name = fm
@@ -173,13 +188,20 @@ fn build_def(id: &str, content: &str, source: &str, path: &Path) -> Value {
     def.insert("id".into(), json!(id));
     def.insert("name".into(), json!(name));
     def.insert("description".into(), json!(description));
-    if let Some(tier) = fm.get("modelTier").and_then(Value::as_str) {
-        if !tier.is_empty() {
-            def.insert("modelTier".into(), json!(tier));
+    for &key in OPTIONAL_FRONTMATTER_KEYS {
+        if let Some(v) = fm.get(key).and_then(Value::as_str) {
+            if !v.is_empty() {
+                def.insert(key.into(), json!(v));
+            }
         }
     }
     def.insert("prompt".into(), json!(body));
+    // `behaviorPrompt` is the wire alias for the body (port of
+    // `serializeSpecialist`: both `prompt` and `behaviorPrompt` carry it).
+    def.insert("behaviorPrompt".into(), json!(body));
     def.insert("source".into(), json!(source));
+    // Any non-bundled (user/project) definition is a customization.
+    def.insert("isCustomized".into(), json!(source != "bundled"));
     // `bundled` is read-only and exposes no editable path (PROTOCOL §5.11).
     if source != "bundled" {
         def.insert("path".into(), json!(path.to_string_lossy()));
@@ -188,9 +210,11 @@ fn build_def(id: &str, content: &str, source: &str, path: &Path) -> Value {
 }
 
 /// Serialize a wire `spec` into markdown-with-frontmatter (port of
-/// `writeSpecialistFile`): quoted `name`/`description`/`modelTier` scalars then
-/// the `prompt` body. Only documented fields are written so parse→write→parse
-/// round-trips losslessly.
+/// `writeSpecialistFile`): quoted `name`/`description` scalars, then any
+/// supplied optional scalars ([`OPTIONAL_FRONTMATTER_KEYS`]) in declaration
+/// order, then the prompt body. The body is taken from `prompt`, falling back
+/// to the `behaviorPrompt` alias (mirroring `SpecialistProposalPayload`). Only
+/// documented fields are written so parse→write→parse round-trips losslessly.
 fn render_file(id: &str, spec: &Value) -> String {
     let name = spec.get("name").and_then(Value::as_str).unwrap_or(id);
     let description = spec
@@ -201,12 +225,18 @@ fn render_file(id: &str, spec: &Value) -> String {
         format!("name: \"{}\"", escape_yaml(name)),
         format!("description: \"{}\"", escape_yaml(description)),
     ];
-    if let Some(tier) = spec.get("modelTier").and_then(Value::as_str) {
-        if !tier.is_empty() {
-            fm.push(format!("modelTier: \"{}\"", escape_yaml(tier)));
+    for &key in OPTIONAL_FRONTMATTER_KEYS {
+        if let Some(v) = spec.get(key).and_then(Value::as_str) {
+            if !v.is_empty() {
+                fm.push(format!("{key}: \"{}\"", escape_yaml(v)));
+            }
         }
     }
-    let prompt = spec.get("prompt").and_then(Value::as_str).unwrap_or("");
+    let prompt = spec
+        .get("prompt")
+        .and_then(Value::as_str)
+        .or_else(|| spec.get("behaviorPrompt").and_then(Value::as_str))
+        .unwrap_or("");
     format!("---\n{}\n---\n\n{}", fm.join("\n"), prompt)
 }
 
@@ -407,5 +437,88 @@ impl SpecialistsService {
         std::fs::remove_file(&path)
             .map_err(|e| Error::Internal(format!("delete specialist file failed: {e}")))?;
         Ok(json!({ "success": true }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_frontmatter_captures_optional_scalars() {
+        let content = "---\nname: \"Ralph\"\ndescription: \"Loops\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"ralph-loop\"\n---\n\nYou loop.";
+        let (fm, body) = parse_frontmatter(content);
+        assert_eq!(fm.get("codingAgent").unwrap(), "claude");
+        assert_eq!(fm.get("model").unwrap(), "opus4.5");
+        assert_eq!(fm.get("modelTier").unwrap(), "smart");
+        assert_eq!(fm.get("roleReminder").unwrap(), "Never stop early");
+        assert_eq!(fm.get("agentType").unwrap(), "ralph-loop");
+        assert_eq!(body, "You loop.");
+    }
+
+    #[test]
+    fn build_def_emits_wire_fields() {
+        let content = "---\nname: \"Ralph\"\ndescription: \"Loops\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"ralph-loop\"\n---\n\nYou loop.";
+        let def = build_def("ralph", content, "user", Path::new("/tmp/ralph.md"));
+        assert_eq!(def["id"], "ralph");
+        assert_eq!(def["name"], "Ralph");
+        assert_eq!(def["description"], "Loops");
+        assert_eq!(def["codingAgent"], "claude");
+        assert_eq!(def["model"], "opus4.5");
+        assert_eq!(def["modelTier"], "smart");
+        assert_eq!(def["roleReminder"], "Never stop early");
+        assert_eq!(def["agentType"], "ralph-loop");
+        assert_eq!(def["prompt"], "You loop.");
+        assert_eq!(def["behaviorPrompt"], "You loop.");
+        assert_eq!(def["source"], "user");
+        assert_eq!(def["isCustomized"], true);
+        assert_eq!(def["path"], "/tmp/ralph.md");
+    }
+
+    #[test]
+    fn build_def_bundled_is_not_customized_and_omits_path() {
+        let content = "---\nname: \"Impl\"\ndescription: \"d\"\n---\n\nbody";
+        let def = build_def("impl", content, "bundled", Path::new("/tmp/impl.md"));
+        assert_eq!(def["isCustomized"], false);
+        assert!(def.get("path").is_none());
+        // Absent optional scalars are not emitted.
+        assert!(def.get("codingAgent").is_none());
+        assert!(def.get("agentType").is_none());
+    }
+
+    #[test]
+    fn render_file_round_trips_losslessly() {
+        let spec = json!({
+            "id": "ralph",
+            "name": "Ralph",
+            "description": "Loops",
+            "codingAgent": "claude",
+            "model": "opus4.5",
+            "modelTier": "smart",
+            "roleReminder": "Never stop early",
+            "agentType": "ralph-loop",
+            "prompt": "You loop.\nForever."
+        });
+        let rendered = render_file("ralph", &spec);
+        let def = build_def("ralph", &rendered, "user", Path::new("/tmp/ralph.md"));
+        assert_eq!(def["codingAgent"], "claude");
+        assert_eq!(def["model"], "opus4.5");
+        assert_eq!(def["modelTier"], "smart");
+        assert_eq!(def["roleReminder"], "Never stop early");
+        assert_eq!(def["agentType"], "ralph-loop");
+        assert_eq!(def["prompt"], "You loop.\nForever.");
+        assert_eq!(def["behaviorPrompt"], "You loop.\nForever.");
+    }
+
+    #[test]
+    fn render_file_accepts_behavior_prompt_alias() {
+        let spec = json!({
+            "name": "Ralph",
+            "description": "Loops",
+            "behaviorPrompt": "body via alias"
+        });
+        let rendered = render_file("ralph", &spec);
+        let def = build_def("ralph", &rendered, "user", Path::new("/tmp/ralph.md"));
+        assert_eq!(def["prompt"], "body via alias");
     }
 }
