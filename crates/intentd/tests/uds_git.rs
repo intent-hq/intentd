@@ -187,6 +187,58 @@ async fn uds_git_write_ops_round_trip() {
     assert_eq!(resp["result"]["targetBranch"], json!(branch));
     assert_eq!(resp["result"]["currentBranch"], json!(branch));
 
+    // (f) git.stage → git.unstage round-trip mirrors the git.stage shape.
+    std::fs::write(repo.join("seed.txt"), "seed changed again\n").unwrap();
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":6,"method":"git.stage","params":{"workspaceId":"ws-git","paths":["seed.txt"]}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["paths"], json!(["seed.txt"]));
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":7,"method":"git.status","params":{"workspaceId":"ws-git"}}"#,
+    )
+    .await;
+    let staged = resp["result"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == json!("seed.txt"))
+        .expect("seed.txt status");
+    assert_eq!(staged["staged"], json!(true));
+
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":8,"method":"git.unstage","params":{"workspaceId":"ws-git","paths":["seed.txt"]}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["paths"], json!(["seed.txt"]));
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":9,"method":"git.status","params":{"workspaceId":"ws-git"}}"#,
+    )
+    .await;
+    let unstaged = resp["result"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == json!("seed.txt"))
+        .expect("seed.txt status");
+    assert_eq!(unstaged["staged"], json!(false));
+
+    // (g) git.unstage is idempotent — a second call on the already-unstaged
+    // path returns ok without erroring.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":10,"method":"git.unstage","params":{"workspaceId":"ws-git","paths":["seed.txt"]}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["paths"], json!(["seed.txt"]));
+
     let _ = tx.send(());
     let _ = server.await;
     std::fs::remove_dir_all(&base).ok();

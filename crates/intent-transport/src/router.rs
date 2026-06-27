@@ -870,6 +870,13 @@ async fn dispatch(
             let staged = api.git_stage(ws, paths).await.map_err(domain_to_rpc)?;
             Ok(json!({ "ok": true, "paths": staged }))
         }
+        "git.unstage" => {
+            let ws = require_ws_note(params)?;
+            require_present(params, "paths")?;
+            let paths = params.get("paths").cloned().unwrap_or(Value::Null);
+            let unstaged = api.git_unstage(ws, paths).await.map_err(domain_to_rpc)?;
+            Ok(json!({ "ok": true, "paths": unstaged }))
+        }
         "git.getBranches" => {
             let repo_path = require_str_param(params, "repoPath")?;
             let include_remote = parse_bool(params, "includeRemote");

@@ -1127,6 +1127,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `git.unstage`: unstage `paths` (CSV string or array), the inverse of
+    /// `git.stage`. `.`/`*`/`--all` are rejected (`-32603`); idempotent on
+    /// already-unstaged paths. Returns the validated path list (PROTOCOL §5.6).
+    fn git_unstage(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: serde_json::Value,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        let _ = (workspace_id, paths);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_unstage not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `git.getBranches`: branches for a known `repo_path`; an unknown repo path
     /// is `-32602` (PROTOCOL §5.6).
     fn git_get_branches(
