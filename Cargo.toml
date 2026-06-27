@@ -20,6 +20,7 @@ base64 = "0.22"
 agent-client-protocol = "0.14"
 agent-client-protocol-tokio = "0.11"
 octocrab = "0.53"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 git2 = { version = "0.21", features = ["https", "ssh"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate", "chrono"] }
 tracing = "0.1"
