@@ -3169,6 +3169,7 @@ impl WorkspaceApi for Services {
         note_id: NoteId,
         title: Option<String>,
         tags: Option<Vec<String>>,
+        expected_version: Option<i64>,
     ) -> BoxFuture<'_, Result<NoteUpdateMetadataResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -3205,7 +3206,7 @@ impl WorkspaceApi for Services {
             }
             let now = now_iso();
             note.updated_at = now.clone();
-            store.update_note(&note).await?;
+            store.update_note_versioned(&note, expected_version).await?;
             publish_event(
                 &bus,
                 note_change_event(
@@ -3233,13 +3234,16 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
+        expected_version: Option<i64>,
     ) -> BoxFuture<'_, Result<NoteDeleteResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
             // Scope-check first so a foreign/absent note yields the peer message.
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            store.delete_note(&note_id).await?;
+            store
+                .delete_note_versioned(&note_id, expected_version)
+                .await?;
             publish_event(
                 &bus,
                 note_change_event(&workspace_id, &note_id, &note.title, NOTE_DELETED, "delete"),

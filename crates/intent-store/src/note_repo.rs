@@ -154,15 +154,49 @@ impl Store {
         Ok(())
     }
 
-    /// Delete a note by id, or `NotFound`.
+    /// Delete a note by id (unconditional), or `NotFound`.
     pub async fn delete_note(&self, id: &NoteId) -> Result<()> {
-        let res = sqlx::query("DELETE FROM note WHERE id = ?")
-            .bind(&id.0)
-            .execute(self.pool())
-            .await
-            .map_err(|e| Error::Internal(format!("delete note failed: {e}")))?;
+        self.delete_note_versioned(id, None).await
+    }
+
+    /// Delete a note, optionally gating on `expected_version` (optimistic
+    /// concurrency, PROTOCOL §5.6). When `expected_version` is `Some(rev)`, the
+    /// delete is conditional (`... WHERE id = ? AND rev = ?`); on a 0-row result
+    /// the row is re-read to distinguish a [`Error::Conflict`] (row present,
+    /// carrying the current entity snapshot prior to deletion) from a
+    /// [`Error::NotFound`] (row absent). When `None`, this is the unconditional
+    /// delete.
+    pub async fn delete_note_versioned(
+        &self,
+        id: &NoteId,
+        expected_version: Option<i64>,
+    ) -> Result<()> {
+        let res = match expected_version {
+            Some(rev) => sqlx::query("DELETE FROM note WHERE id = ? AND rev = ?")
+                .bind(&id.0)
+                .bind(rev)
+                .execute(self.pool())
+                .await
+                .map_err(|e| Error::Internal(format!("delete note failed: {e}")))?,
+            None => sqlx::query("DELETE FROM note WHERE id = ?")
+                .bind(&id.0)
+                .execute(self.pool())
+                .await
+                .map_err(|e| Error::Internal(format!("delete note failed: {e}")))?,
+        };
         if res.rows_affected() == 0 {
-            return Err(Error::NotFound(format!("note {id}")));
+            // Re-read by id: a present row means the `expected_version` gate
+            // failed (conflict, carrying the current snapshot); an absent row is
+            // a genuine not-found.
+            return match self.get_note(id).await {
+                Ok(current) => {
+                    let current = serde_json::to_value(&current)
+                        .map_err(|e| Error::Internal(format!("encode current note failed: {e}")))?;
+                    Err(Error::Conflict { current })
+                }
+                Err(Error::NotFound(_)) => Err(Error::NotFound(format!("note {id}"))),
+                Err(e) => Err(e),
+            };
         }
         Ok(())
     }

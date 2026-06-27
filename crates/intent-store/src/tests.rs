@@ -368,6 +368,84 @@ async fn update_note_versioned_hit_miss_and_absent() {
     }
 }
 
+#[tokio::test]
+async fn delete_note_versioned_hit_miss_and_absent() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let ts = now_iso();
+    let note = Note {
+        id: NoteId::new(),
+        workspace_id: ws_id.clone(),
+        title: "Spec".to_string(),
+        content: "v0".to_string(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        task: None,
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts,
+    };
+    store.insert_note(&note).await.expect("insert note");
+
+    // MISS: stale expected_version (5, but stored rev is 0) → Conflict carrying
+    // the current entity snapshot prior to deletion; the row survives.
+    let conflict = store.delete_note_versioned(&note.id, Some(5)).await;
+    match conflict {
+        Err(intent_core::Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 0);
+            assert_eq!(current["id"], note.id.0);
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    assert!(store.get_note(&note.id).await.is_ok());
+
+    // HIT: expected_version matches the stored rev (0) → row deleted.
+    store
+        .delete_note_versioned(&note.id, Some(0))
+        .await
+        .expect("versioned delete hit");
+    match store.get_note(&note.id).await {
+        Err(intent_core::Error::NotFound(_)) => {}
+        other => panic!("expected NotFound after delete, got {other:?}"),
+    }
+
+    // A versioned delete against a missing row is NotFound (not Conflict).
+    match store.delete_note_versioned(&note.id, Some(0)).await {
+        Err(intent_core::Error::NotFound(_)) => {}
+        other => panic!("expected NotFound for absent row, got {other:?}"),
+    }
+
+    // ABSENT: a fresh row with no expected_version → unconditional delete.
+    let ts2 = now_iso();
+    let other = Note {
+        id: NoteId::new(),
+        created_at: ts2.clone(),
+        updated_at: ts2,
+        ..note.clone()
+    };
+    store.insert_note(&other).await.expect("insert note 2");
+    store
+        .delete_note_versioned(&other.id, None)
+        .await
+        .expect("unconditional delete");
+    match store.get_note(&other.id).await {
+        Err(intent_core::Error::NotFound(_)) => {}
+        other => panic!("expected NotFound after unconditional delete, got {other:?}"),
+    }
+}
+
 fn task_note(ws_id: &WorkspaceId, title: &str, task: Option<TaskMetadata>) -> Note {
     let ts = now_iso();
     Note {

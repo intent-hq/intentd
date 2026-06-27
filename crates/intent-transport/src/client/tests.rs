@@ -56,6 +56,11 @@ async fn mints_client_id_when_omitted() {
         "osArch is os/arch"
     );
     assert!(server.get("hasDisplay").is_some());
+    assert_eq!(
+        server["capabilities"]["liveState"],
+        json!(true),
+        "server advertises the liveState capability (§5.17)"
+    );
 }
 
 #[tokio::test]

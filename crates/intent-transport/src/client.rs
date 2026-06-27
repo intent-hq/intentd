@@ -66,7 +66,9 @@ pub(crate) fn classify(value: &Value) -> Option<ClientRequest> {
 }
 
 /// Build the `server` capability block (§5.17): `{ locality, hasDisplay, osArch,
-/// version }`. `osArch` is the daemon host's `os/arch` (e.g. `darwin/arm64`).
+/// version, capabilities }`. `osArch` is the daemon host's `os/arch` (e.g.
+/// `darwin/arm64`). `capabilities.liveState` advertises the live-state push
+/// surface (D+E) so the FE can feature-detect it without version-sniffing.
 /// Pure (inputs injected) so it is unit-testable.
 pub(crate) fn server_json(
     has_display: bool,
@@ -80,6 +82,7 @@ pub(crate) fn server_json(
         "hasDisplay": has_display,
         "osArch": format!("{os}/{arch}"),
         "version": version,
+        "capabilities": { "liveState": true },
     })
 }
 

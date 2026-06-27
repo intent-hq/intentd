@@ -322,8 +322,9 @@ async fn dispatch(
             let note_id = require_note_id(params)?;
             let title = opt_str(params, "title");
             let tags = opt_tags(params, "tags");
+            let expected_version = opt_int(params, "expectedVersion");
             let result = api
-                .update_note_metadata(ws, note_id, title, tags)
+                .update_note_metadata(ws, note_id, title, tags, expected_version)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -331,7 +332,11 @@ async fn dispatch(
         "note.delete" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
-            let result = api.delete_note(ws, note_id).await.map_err(domain_to_rpc)?;
+            let expected_version = opt_int(params, "expectedVersion");
+            let result = api
+                .delete_note(ws, note_id, expected_version)
+                .await
+                .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
         "note.listTasks" => {

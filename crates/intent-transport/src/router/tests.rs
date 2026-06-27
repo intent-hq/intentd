@@ -324,12 +324,23 @@ impl WorkspaceApi for FakeApi {
 
     fn update_note_metadata(
         &self,
-        _workspace_id: WorkspaceId,
+        workspace_id: WorkspaceId,
         note_id: NoteId,
         title: Option<String>,
         tags: Option<Vec<String>>,
+        _expected_version: Option<i64>,
     ) -> BoxFuture<'_, Result<NoteUpdateMetadataResult>> {
         Box::pin(async move {
+            // Sentinel: a stale `expectedVersion` on this id surfaces the
+            // optimistic-concurrency conflict carrying the current entity.
+            if note_id.as_str() == "conflict" {
+                let mut current = sample_note(&workspace_id);
+                current.id = note_id;
+                current.rev = 7;
+                return Err(Error::Conflict {
+                    current: serde_json::to_value(&current).unwrap(),
+                });
+            }
             Ok(NoteUpdateMetadataResult {
                 ok: true,
                 note_id,
@@ -344,10 +355,21 @@ impl WorkspaceApi for FakeApi {
 
     fn delete_note(
         &self,
-        _workspace_id: WorkspaceId,
+        workspace_id: WorkspaceId,
         note_id: NoteId,
+        _expected_version: Option<i64>,
     ) -> BoxFuture<'_, Result<NoteDeleteResult>> {
         Box::pin(async move {
+            // Sentinel: a stale `expectedVersion` on this id surfaces the
+            // optimistic-concurrency conflict carrying the current snapshot.
+            if note_id.as_str() == "conflict" {
+                let mut current = sample_note(&workspace_id);
+                current.id = note_id;
+                current.rev = 7;
+                return Err(Error::Conflict {
+                    current: serde_json::to_value(&current).unwrap(),
+                });
+            }
             Ok(NoteDeleteResult {
                 ok: true,
                 note_id,
@@ -1283,6 +1305,44 @@ async fn expected_version_conflict_maps_to_minus_32005_with_data_current() {
     assert!(current.is_object(), "data.current must be the entity");
     assert_eq!(current["id"], serde_json::json!("conflict"));
     assert_eq!(current["rev"], serde_json::json!(7));
+}
+
+#[tokio::test]
+async fn update_metadata_expected_version_conflict_maps_to_minus_32005() {
+    // A stale `expectedVersion` on `note.updateMetadata` surfaces -32005 carrying
+    // the current entity under `error.data.current` (PROTOCOL §4, §5.6).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.updateMetadata","params":{"workspaceId":"ws-1","noteId":"conflict","title":"x","expectedVersion":1}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32005);
+    assert_eq!(v["error"]["message"], serde_json::json!("Conflict"));
+    assert_eq!(v["error"]["data"]["code"], serde_json::json!("conflict"));
+    assert_eq!(
+        v["error"]["data"]["current"]["id"],
+        serde_json::json!("conflict")
+    );
+    assert_eq!(v["error"]["data"]["current"]["rev"], serde_json::json!(7));
+}
+
+#[tokio::test]
+async fn delete_expected_version_conflict_maps_to_minus_32005() {
+    // A stale `expectedVersion` on `note.delete` surfaces -32005 carrying the
+    // current entity snapshot under `error.data.current` (PROTOCOL §4, §5.6).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.delete","params":{"workspaceId":"ws-1","noteId":"conflict","expectedVersion":1}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32005);
+    assert_eq!(v["error"]["message"], serde_json::json!("Conflict"));
+    assert_eq!(v["error"]["data"]["code"], serde_json::json!("conflict"));
+    assert_eq!(
+        v["error"]["data"]["current"]["id"],
+        serde_json::json!("conflict")
+    );
+    assert_eq!(v["error"]["data"]["current"]["rev"], serde_json::json!(7));
 }
 
 #[tokio::test]

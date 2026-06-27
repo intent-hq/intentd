@@ -525,7 +525,7 @@ async fn update_metadata_skips_spec_title_but_applies_tags() {
 
     // Title-only on spec → skipped, title unchanged.
     let skipped = svc
-        .update_note_metadata(ws.clone(), spec.clone(), Some("New".into()), None)
+        .update_note_metadata(ws.clone(), spec.clone(), Some("New".into()), None, None)
         .await
         .expect("meta");
     assert_eq!(skipped.skipped, Some(true));
@@ -541,6 +541,7 @@ async fn update_metadata_skips_spec_title_but_applies_tags() {
             spec.clone(),
             Some("New".into()),
             Some(vec!["a".into()]),
+            None,
         )
         .await
         .expect("meta2");
@@ -566,13 +567,80 @@ async fn list_tasks_and_delete_and_scoping() {
     ));
 
     let del = svc
-        .delete_note(ws.clone(), id.clone())
+        .delete_note(ws.clone(), id.clone(), None)
         .await
         .expect("delete");
     assert!(del.deleted);
     assert!(matches!(
         svc.get_note(ws, id).await,
         Err(Error::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn update_metadata_expected_version_gate_hit_and_miss() {
+    let (_tmp, svc, ws, id) = setup("body").await;
+
+    // HIT: the freshly-inserted note is at rev 0; a matching expectedVersion
+    // applies the title and bumps rev → 1.
+    let hit = svc
+        .update_note_metadata(
+            ws.clone(),
+            id.clone(),
+            Some("Renamed".into()),
+            None,
+            Some(0),
+        )
+        .await
+        .expect("expectedVersion hit writes");
+    assert_eq!(hit.title, Some("Renamed".to_string()));
+
+    // MISS: a stale expectedVersion (0) now conflicts, carrying the current
+    // entity (rev 1, title "Renamed") and leaving the note unchanged.
+    let miss = svc
+        .update_note_metadata(ws.clone(), id.clone(), Some("Nope".into()), None, Some(0))
+        .await;
+    match miss {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 1);
+            assert_eq!(current["title"], "Renamed");
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    assert_eq!(svc.get_note(ws, id).await.unwrap().title, "Renamed");
+}
+
+#[tokio::test]
+async fn delete_expected_version_gate_miss_then_hit_and_absent() {
+    let (_tmp, svc, ws, id) = setup("body").await;
+
+    // MISS: a stale expectedVersion (5, but stored rev is 0) → Conflict carrying
+    // the current entity snapshot; the note is NOT deleted.
+    let miss = svc.delete_note(ws.clone(), id.clone(), Some(5)).await;
+    match miss {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 0);
+            assert_eq!(current["id"], id.0);
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    assert!(svc.get_note(ws.clone(), id.clone()).await.is_ok());
+
+    // HIT: a matching expectedVersion (0) deletes the note.
+    let del = svc
+        .delete_note(ws.clone(), id.clone(), Some(0))
+        .await
+        .expect("expectedVersion hit deletes");
+    assert!(del.deleted);
+    assert!(matches!(
+        svc.get_note(ws.clone(), id.clone()).await,
+        Err(Error::NotFound(_))
+    ));
+
+    // ABSENT: deleting an already-absent note (no expectedVersion) is NotFound.
+    assert!(matches!(
+        svc.delete_note(ws, id, None).await,
+        Err(Error::NotFound(_) | Error::Internal(_))
     ));
 }
 

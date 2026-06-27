@@ -259,14 +259,16 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `note.updateMetadata`: title/tags (spec title is skipped) (PROTOCOL §5.2).
+    /// `expected_version` gates the write on the current `rev` when `Some` (§5.6).
     fn update_note_metadata(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         title: Option<String>,
         tags: Option<Vec<String>>,
+        expected_version: Option<i64>,
     ) -> BoxFuture<'_, Result<NoteUpdateMetadataResult>> {
-        let _ = (workspace_id, note_id, title, tags);
+        let _ = (workspace_id, note_id, title, tags, expected_version);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::update_note_metadata not implemented".to_string(),
@@ -274,13 +276,16 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `note.delete`: remove a note (PROTOCOL §5.2).
+    /// `note.delete`: remove a note (PROTOCOL §5.2). `expected_version` gates the
+    /// delete on the current `rev` when `Some` (§5.6); on a stale value the
+    /// conflict carries the current entity snapshot prior to deletion.
     fn delete_note(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
+        expected_version: Option<i64>,
     ) -> BoxFuture<'_, Result<NoteDeleteResult>> {
-        let _ = (workspace_id, note_id);
+        let _ = (workspace_id, note_id, expected_version);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::delete_note not implemented".to_string(),
