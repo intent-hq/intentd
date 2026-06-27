@@ -9,10 +9,11 @@
 //! `agent:stream:end` is emitted per turn — `complete` and `error` both map to it
 //! (PROTOCOL §7).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use intent_acp::session::{
-    self, ContentBlock, InitializeResponse, MappedUpdate, McpServer, StopReason,
+    self, ContentBlock, InitializeResponse, MappedToolCall, MappedUpdate, McpServer, StopReason,
 };
 use intent_acp::{Connection, IncomingNotification};
 use intent_core::events::{
@@ -22,6 +23,7 @@ use intent_core::{now_iso, ActorType, AgentId, Error, EventActor, Result, Worksp
 use intent_store::NewEvent;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use crate::Services;
 
@@ -29,28 +31,132 @@ use crate::Services;
 mod tests;
 
 /// Accumulates streamed assistant content into one transcript message per turn,
-/// coalescing consecutive text chunks into a single text block.
-#[derive(Default)]
+/// coalescing consecutive text chunks into a single text block and pushing
+/// `tool_use`/`tool_result` blocks for tool calls (CS-0 D6). Every block is
+/// stamped with a stable id `{messageId}:{blockIndex}` (CS-0 D1), where
+/// `messageId` is the assistant `AgentMessage` id minted at turn start; blocks
+/// are append-only so a block's index (and thus id) is fixed once assigned.
 struct Transcript {
+    /// Assistant `AgentMessage` id minted at turn start (the block-id prefix).
+    message_id: String,
     blocks: Vec<Value>,
     text: String,
+    /// `toolCallId` → index of its `tool_use` block (for status patching).
+    tool_use_index: HashMap<String, usize>,
+    /// `toolCallId` → index of its `tool_result` block (append-once, then patch).
+    tool_result_index: HashMap<String, usize>,
 }
 
 impl Transcript {
+    fn new(message_id: String) -> Self {
+        Self {
+            message_id,
+            blocks: Vec::new(),
+            text: String::new(),
+            tool_use_index: HashMap::new(),
+            tool_result_index: HashMap::new(),
+        }
+    }
+
+    /// The stable block id for a 0-based block index (`{messageId}:{index}`).
+    fn block_id(&self, index: usize) -> String {
+        format!("{}:{index}", self.message_id)
+    }
+
+    /// Index the currently pending (or next) coalesced text block will occupy
+    /// once flushed — the same value for every consecutive text chunk, so they
+    /// share one block id.
+    fn current_text_index(&self) -> usize {
+        self.blocks.len()
+    }
+
     fn push_text(&mut self, t: &str) {
         self.text.push_str(t);
     }
 
-    fn push_block(&mut self, block: Value) {
+    /// Push a non-text passthrough content block, stamping its id; returns its
+    /// index.
+    fn push_block(&mut self, mut block: Value) -> usize {
         self.flush_text();
+        let index = self.blocks.len();
+        if let Some(obj) = block.as_object_mut() {
+            obj.insert("id".to_string(), Value::String(self.block_id(index)));
+        }
         self.blocks.push(block);
+        index
     }
 
     fn flush_text(&mut self) {
         if !self.text.is_empty() {
+            let index = self.blocks.len();
+            let id = self.block_id(index);
             self.blocks
-                .push(json!({ "type": "text", "text": std::mem::take(&mut self.text) }));
+                .push(json!({ "type": "text", "id": id, "text": std::mem::take(&mut self.text) }));
         }
+    }
+
+    /// Record a tool call into the transcript (CS-0 D6). On first sight of a
+    /// `toolCallId`, flush any open text and push a `tool_use` block; on repeats,
+    /// patch its `metadata.status`. When the tool reaches `completed`/`error`
+    /// WITH output, append (then patch) a matching `tool_result` block. Returns
+    /// the index of the `tool_use` block (the block the `agent:tool:call` event
+    /// is enriched against).
+    fn record_tool(&mut self, tc: &MappedToolCall) -> usize {
+        let use_index = match self.tool_use_index.get(&tc.tool_call_id) {
+            Some(&i) => {
+                if let Some(meta) = self.blocks[i]
+                    .get_mut("metadata")
+                    .and_then(Value::as_object_mut)
+                {
+                    meta.insert("status".to_string(), Value::String(tc.status.to_string()));
+                }
+                i
+            }
+            None => {
+                self.flush_text();
+                let index = self.blocks.len();
+                let id = self.block_id(index);
+                self.blocks.push(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": tc.tool_name,
+                    "input": tc.input,
+                    "toolCallId": tc.tool_call_id,
+                    "metadata": { "toolKind": tc.tool_kind, "status": tc.status },
+                }));
+                self.tool_use_index.insert(tc.tool_call_id.clone(), index);
+                index
+            }
+        };
+        let completed = tc.status == "completed" || tc.status == "error";
+        if completed {
+            if let Some(output) = &tc.output {
+                let is_error = tc.status == "error";
+                match self.tool_result_index.get(&tc.tool_call_id) {
+                    Some(&ri) => {
+                        if let Some(obj) = self.blocks[ri].as_object_mut() {
+                            obj.insert("output".to_string(), output.clone());
+                            obj.insert("is_error".to_string(), Value::Bool(is_error));
+                        }
+                    }
+                    None => {
+                        self.flush_text();
+                        let rindex = self.blocks.len();
+                        let rid = self.block_id(rindex);
+                        self.blocks.push(json!({
+                            "type": "tool_result",
+                            "id": rid,
+                            "tool_use_id": tc.tool_call_id,
+                            "output": output,
+                            "is_error": is_error,
+                        }));
+                        self.tool_result_index
+                            .insert(tc.tool_call_id.clone(), rindex);
+                    }
+                }
+            }
+        }
+        use_index
     }
 
     fn into_blocks(mut self) -> Vec<Value> {
@@ -212,7 +318,10 @@ impl Services {
         acp_session_id: &str,
         prompt: Vec<ContentBlock>,
     ) -> Result<StopReason> {
-        let mut transcript = Transcript::default();
+        // Mint the assistant message id at turn START (CS-0 D1) so streaming
+        // block ids `{messageId}:{index}` match the blocks ultimately persisted.
+        let message_id = Uuid::now_v7().to_string();
+        let mut transcript = Transcript::new(message_id.clone());
         let prompt_fut = session::prompt(conn, acp_session_id, prompt);
         tokio::pin!(prompt_fut);
         let mut closed = false;
@@ -238,7 +347,13 @@ impl Services {
         let last_response_summary = last_response_summary(&blocks);
         if !blocks.is_empty() {
             self.store
-                .append_agent_message(agent_id, "assistant", &Value::Array(blocks), &now_iso())
+                .append_agent_message_with_id(
+                    agent_id,
+                    &message_id,
+                    "assistant",
+                    &Value::Array(blocks),
+                    &now_iso(),
+                )
                 .await?;
         }
         // Exactly ONE terminal stream:end — complete and error both map here (§7).
@@ -294,26 +409,59 @@ impl Services {
         let Some(mapped) = session::map_notification(note) else {
             return;
         };
+        let message_id = transcript.message_id.clone();
         match mapped {
             MappedUpdate::Chunk { content, text } => {
-                match text {
-                    Some(t) => transcript.push_text(&t),
-                    None => transcript.push_block(content.clone()),
-                }
+                // Accumulate into the transcript and compute the block index this
+                // chunk lands at; consecutive text chunks coalesce onto one index
+                // (and thus one stable block id), a non-text block starts a new one.
+                let (block_index, block_type) = match &text {
+                    Some(t) => {
+                        let index = transcript.current_text_index();
+                        transcript.push_text(t);
+                        (index, "text".to_string())
+                    }
+                    None => {
+                        let block_type = content
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string();
+                        (transcript.push_block(content.clone()), block_type)
+                    }
+                };
+                // D4: enrich additively — keep `content`, add block identity.
                 self.publish_agent_event(
                     workspace_id,
                     agent_id,
                     AGENT_STREAM_CHUNK,
-                    json!({ "agentId": agent_id.0, "content": content }),
+                    json!({
+                        "agentId": agent_id.0,
+                        "content": content,
+                        "messageId": message_id,
+                        "blockIndex": block_index,
+                        "blockId": transcript.block_id(block_index),
+                        "blockType": block_type,
+                    }),
                 )
                 .await;
             }
             MappedUpdate::ToolCall(tc) => {
+                // D6: accumulate tool_use/tool_result blocks into the transcript
+                // so they persist (and reach `agent.getConversation`).
+                let block_index = transcript.record_tool(&tc);
+                // D4: enrich additively — keep the existing fields, add agentId,
+                // the (previously dropped) toolCallId, and the block identity.
                 let mut data = json!({
+                    "agentId": agent_id.0,
                     "toolName": tc.tool_name,
                     "toolKind": tc.tool_kind,
+                    "toolCallId": tc.tool_call_id,
                     "input": tc.input,
                     "status": tc.status,
+                    "messageId": message_id,
+                    "blockIndex": block_index,
+                    "blockId": transcript.block_id(block_index),
                 });
                 if let Some(output) = tc.output {
                     data["output"] = output;
