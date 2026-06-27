@@ -478,11 +478,13 @@ async fn forward_note_subscription(
 /// `messages[]` object (CS-0 D3) — then tails the `agent:stream:*` family
 /// FILTERED to this agent (`sessionId == agentId`, cross-agent isolation).
 ///
-/// CS-2 owns the filtered-subscription lifecycle (aborted by [`ConnSub`] on
-/// unsubscribe / disconnect) and the snapshot; it does NOT yet translate stream
-/// events into block deltas — that live delta mapper (and the monotonic delta
-/// `seq` starting at 1) lands in CS-3. Matched events are drained and ignored
-/// here so the in-flight turn does not back up the bus.
+/// The forwarder owns the filtered-subscription lifecycle (aborted by
+/// [`ConnSub`] on unsubscribe / disconnect), the seq-0 snapshot, AND the
+/// monotonic per-subscription delta `seq` (1, 2, …). Each tailed `agent:stream:*`
+/// event is translated by the stateful [`subscriptions::ChatDeltaState`] mapper
+/// into a `{ added, updated, removedIds }` block delta (CS-0 D2/D4/D6) pushed in
+/// strict seq order; `stream:end` reconciles against the persisted message so the
+/// snapshot + deltas equal a fresh `getConversation` snapshot (CS-3).
 async fn forward_chat_subscription(
     api: Arc<dyn WorkspaceApi>,
     agent_id: AgentId,
@@ -495,6 +497,8 @@ async fn forward_chat_subscription(
     if out_tx.send(frame).await.is_err() {
         return;
     }
+    let mut state = subscriptions::ChatDeltaState::new(&agent_id);
+    let mut seq: u64 = 1;
     while let Some(batch) = subscription.recv().await {
         for event in batch {
             // Cross-agent isolation: only this agent's stream events belong to
@@ -502,9 +506,13 @@ async fn forward_chat_subscription(
             if event.session_id.as_deref() != Some(agent_id.as_str()) {
                 continue;
             }
-            // TODO(CS-3): map this `agent:stream:*` event to a chat block delta
-            // (`{ added, updated, removedIds }` by `blockId`, CS-0 D2/D4) and
-            // push it via `build_delta_push` at the next monotonic `seq`.
+            if let Some(delta) = state.delta(api.as_ref(), &event).await {
+                let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
+                seq += 1;
+                if out_tx.send(frame).await.is_err() {
+                    return;
+                }
+            }
         }
     }
 }

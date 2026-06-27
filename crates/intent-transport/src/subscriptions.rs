@@ -19,6 +19,7 @@ use intent_core::events::{
 };
 use intent_core::{AgentId, Event, NoteId, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
 
 use crate::events::IdInfo;
 
@@ -415,6 +416,257 @@ pub(crate) async fn chat_snapshot(api: &dyn WorkspaceApi, agent_id: &AgentId) ->
     }
 }
 
+/// Stateful, event-payload-driven delta mapper for the per-agent chat channel
+/// (CS-0 D2/D4/D6). Unlike the re-read channels, in-flight chat content is not
+/// persisted until `stream:end`, so the forwarder builds block deltas straight
+/// from the enriched `agent:stream:*` payloads (D4) and accumulates the per-block
+/// state needed to emit the FULL current block on every change (D2). A turn's
+/// blocks are keyed by their stable `{messageId}:{index}` id (D1): a text block's
+/// first chunk arrives as `added`, each subsequent growth as `updated`; a tool
+/// call synthesizes a `tool_use` block (then a `tool_result` block on completion,
+/// D6). On `stream:end` it reconciles against the now-persisted message so the
+/// client's accumulated state (seq-0 snapshot + deltas) equals a fresh
+/// `agent.getConversation` snapshot (the CS-3 reconciliation invariant).
+pub(crate) struct ChatDeltaState {
+    agent_id: String,
+    /// `blockId` → accumulated text for `text` blocks (deltas carry full text, D2).
+    text_acc: HashMap<String, String>,
+    /// `blockId`s emitted at least once this turn (added vs updated discriminator).
+    seen_ids: HashSet<String>,
+    /// `blockId`s emitted live this turn (to compute orphan `removedIds` at end).
+    emitted_ids: HashSet<String>,
+    /// The in-flight assistant message id (block-id prefix), learned from events.
+    message_id: Option<String>,
+}
+
+impl ChatDeltaState {
+    /// A fresh mapper for one chat subscription (one agent). The same instance is
+    /// reused across turns; `finalize` resets the per-turn accumulation.
+    pub(crate) fn new(agent_id: &AgentId) -> Self {
+        Self {
+            agent_id: agent_id.as_str().to_string(),
+            text_acc: HashMap::new(),
+            seen_ids: HashSet::new(),
+            emitted_ids: HashSet::new(),
+            message_id: None,
+        }
+    }
+
+    /// Map one tailed `agent:stream:*` event to a chat block delta (or `None` for
+    /// an unrelated/malformed event). `chunk`/`tool:call` build live block upserts
+    /// from the payload; `stream:end` reconciles against the persisted message and
+    /// resets the per-turn state.
+    pub(crate) async fn delta(&mut self, api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
+        match event.event_type.as_str() {
+            AGENT_STREAM_CHUNK => self.chunk_delta(event),
+            AGENT_TOOL_CALL => self.tool_delta(event),
+            AGENT_STREAM_END => self.finalize(api).await,
+            _ => None,
+        }
+    }
+
+    /// Map an `agent:stream:chunk`: accumulate the chunk and emit the full block
+    /// (D2/D4). Text chunks coalesce onto one `blockId` (`updated` on growth);
+    /// non-text chunks pass through as the full block (`added`), stamped with the
+    /// same id the persisted block carries.
+    fn chunk_delta(&mut self, event: &Event) -> Option<Value> {
+        let d = &event.data;
+        let block_id = d.get("blockId").and_then(Value::as_str)?.to_string();
+        let message_id = d.get("messageId").and_then(Value::as_str)?.to_string();
+        self.message_id = Some(message_id.clone());
+        let block_type = d.get("blockType").and_then(Value::as_str).unwrap_or("text");
+        let content = d.get("content")?;
+        let block = if block_type == "text" {
+            let chunk = content.as_str().unwrap_or_default();
+            let acc = self.text_acc.entry(block_id.clone()).or_default();
+            acc.push_str(chunk);
+            json!({ "type": "text", "id": block_id, "text": acc.clone() })
+        } else {
+            let mut obj = content.as_object()?.clone();
+            obj.insert("id".to_string(), Value::String(block_id.clone()));
+            Value::Object(obj)
+        };
+        let added = self.note_block(&block_id);
+        let entity = self.entity(&message_id, block, None, None, false);
+        Some(single_delta(added, entity))
+    }
+
+    /// Map an `agent:tool:call`: synthesize a `tool_use` block (and, once the call
+    /// completes WITH output, a `tool_result` block) matching the persisted
+    /// `record_tool` shape (D6). The `tool_result` block id is the `tool_use`
+    /// index + 1 (it is appended right after); a mispredicted id self-heals at the
+    /// terminal reconcile via `removedIds`.
+    fn tool_delta(&mut self, event: &Event) -> Option<Value> {
+        let d = &event.data;
+        let block_id = d.get("blockId").and_then(Value::as_str)?.to_string();
+        let message_id = d.get("messageId").and_then(Value::as_str)?.to_string();
+        self.message_id = Some(message_id.clone());
+        let tool_call_id = d.get("toolCallId").and_then(Value::as_str)?.to_string();
+        let status = d.get("status").and_then(Value::as_str).unwrap_or("started");
+        let use_block = json!({
+            "type": "tool_use",
+            "id": block_id,
+            "name": d.get("toolName").cloned().unwrap_or(Value::Null),
+            "input": d.get("input").cloned().unwrap_or(Value::Null),
+            "toolCallId": tool_call_id,
+            "metadata": {
+                "toolKind": d.get("toolKind").cloned().unwrap_or(Value::Null),
+                "status": status,
+            },
+        });
+        let use_added = self.note_block(&block_id);
+        let mut added = Vec::new();
+        let mut updated = Vec::new();
+        push_entity(
+            &mut added,
+            &mut updated,
+            use_added,
+            self.entity(&message_id, use_block, None, None, false),
+        );
+        let completed = status == "completed" || status == "error";
+        if completed {
+            if let (Some(output), Some(result_id)) = (d.get("output"), next_block_id(&block_id)) {
+                let result_block = json!({
+                    "type": "tool_result",
+                    "id": result_id,
+                    "tool_use_id": tool_call_id,
+                    "output": output,
+                    "is_error": status == "error",
+                });
+                let res_added = self.note_block(&result_id);
+                push_entity(
+                    &mut added,
+                    &mut updated,
+                    res_added,
+                    self.entity(&message_id, result_block, None, None, false),
+                );
+            }
+        }
+        Some(json!({ "added": added, "updated": updated, "removedIds": [] }))
+    }
+
+    /// Finalize the turn on `agent:stream:end`: reconcile against the persisted
+    /// message, then reset the per-turn accumulation so the next turn on this
+    /// subscription starts clean.
+    async fn finalize(&mut self, api: &dyn WorkspaceApi) -> Option<Value> {
+        let delta = self.reconcile(api).await;
+        self.text_acc.clear();
+        self.seen_ids.clear();
+        self.emitted_ids.clear();
+        self.message_id = None;
+        delta
+    }
+
+    /// Re-read the now-persisted assistant message and emit a terminal delta that
+    /// drives the client's accumulated state to exactly the fresh snapshot: every
+    /// persisted block as `updated` (or `added` if never emitted live) carrying
+    /// the authoritative `messageSeq`/`timestamp` and `streamingComplete:true`,
+    /// plus `removedIds` for any block emitted live that the persisted message
+    /// does not contain (e.g. a mispredicted `tool_result` index).
+    async fn reconcile(&self, api: &dyn WorkspaceApi) -> Option<Value> {
+        let message_id = self.message_id.clone()?;
+        let conv = api
+            .agent_get_conversation(AgentId::from(self.agent_id.as_str()), None, None, None)
+            .await
+            .ok()?;
+        let messages = conv.get("messages").and_then(Value::as_array)?;
+        let mut added = Vec::new();
+        let mut updated = Vec::new();
+        let mut persisted_ids: HashSet<String> = HashSet::new();
+        if let Some(msg) = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_str) == Some(message_id.as_str()))
+        {
+            let seq = msg.get("seq").and_then(Value::as_u64);
+            let ts = msg.get("timestamp").and_then(Value::as_str);
+            if let Some(blocks) = msg.get("contentBlocks").and_then(Value::as_array) {
+                for block in blocks {
+                    let Some(bid) = block.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    persisted_ids.insert(bid.to_string());
+                    let is_added = !self.seen_ids.contains(bid);
+                    let entity = self.entity(&message_id, block.clone(), seq, ts, true);
+                    push_entity(&mut added, &mut updated, is_added, entity);
+                }
+            }
+        }
+        let mut removed: Vec<String> = self
+            .emitted_ids
+            .iter()
+            .filter(|id| !persisted_ids.contains(*id))
+            .cloned()
+            .collect();
+        removed.sort();
+        Some(json!({ "added": added, "updated": updated, "removedIds": removed }))
+    }
+
+    /// Wrap one upserted block as a delta entity: the message pointer plus the
+    /// FULL block (D2). `messageSeq`/`timestamp`/`streamingComplete` are carried
+    /// only on the authoritative terminal frame (mid-turn they are not yet known).
+    fn entity(
+        &self,
+        message_id: &str,
+        block: Value,
+        seq: Option<u64>,
+        timestamp: Option<&str>,
+        streaming_complete: bool,
+    ) -> Value {
+        let mut e = Map::new();
+        e.insert("agentId".to_string(), Value::String(self.agent_id.clone()));
+        e.insert(
+            "messageId".to_string(),
+            Value::String(message_id.to_string()),
+        );
+        e.insert("role".to_string(), Value::String("assistant".to_string()));
+        if let Some(seq) = seq {
+            e.insert("messageSeq".to_string(), json!(seq));
+        }
+        if let Some(ts) = timestamp {
+            e.insert("timestamp".to_string(), Value::String(ts.to_string()));
+        }
+        if streaming_complete {
+            e.insert("streamingComplete".to_string(), Value::Bool(true));
+        }
+        e.insert("block".to_string(), block);
+        Value::Object(e)
+    }
+
+    /// Record a freshly built block id as seen + emitted; returns `true` when it
+    /// is the block's FIRST sighting this turn (→ `added`, else `updated`).
+    fn note_block(&mut self, block_id: &str) -> bool {
+        self.emitted_ids.insert(block_id.to_string());
+        self.seen_ids.insert(block_id.to_string())
+    }
+}
+
+/// Build a single-entity delta envelope, routing the entity to `added` (first
+/// sighting) or `updated` (a known block grown/changed).
+fn single_delta(added: bool, entity: Value) -> Value {
+    if added {
+        json!({ "added": [entity], "updated": [], "removedIds": [] })
+    } else {
+        json!({ "added": [], "updated": [entity], "removedIds": [] })
+    }
+}
+
+/// Route an entity into the `added` or `updated` bucket by first-sighting flag.
+fn push_entity(added: &mut Vec<Value>, updated: &mut Vec<Value>, is_added: bool, entity: Value) {
+    if is_added {
+        added.push(entity);
+    } else {
+        updated.push(entity);
+    }
+}
+
+/// `{prefix}:{n}` → `{prefix}:{n+1}` — the `tool_result` block id follows its
+/// `tool_use` block by one index in the persisted transcript (`record_tool`).
+fn next_block_id(block_id: &str) -> Option<String> {
+    let (prefix, idx) = block_id.rsplit_once(':')?;
+    let n: usize = idx.parse().ok()?;
+    Some(format!("{prefix}:{}", n + 1))
+}
+
 /// Map one bus change event to a channel delta via the re-read strategy (TB-0
 /// §2.2 option B). Dispatches to the per-channel mapper; returns `None` for an
 /// event that does not translate (unrelated type, missing id, or re-read miss).
@@ -431,9 +683,10 @@ pub(crate) async fn channel_delta(
         Channel::Agent => agent_delta(api, event).await,
         Channel::Workspace => workspace_delta(api, event).await,
         Channel::Comment => comment_delta(api, workspace_id, note_id?, event).await,
-        // TODO(CS-3): map `agent:stream:*` events to chat block deltas. The chat
-        // channel uses the dedicated `forward_chat_subscription` path, so this
-        // generic arm is unreachable in CS-2.
+        // The chat channel uses the dedicated, stateful [`ChatDeltaState`] mapper
+        // on the `forward_chat_subscription` path (CS-3) — its deltas are
+        // event-payload-driven, not re-read — so this generic re-read arm is
+        // unreachable for `Chat`.
         Channel::Chat => None,
     }
 }
