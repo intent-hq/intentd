@@ -46,4 +46,4 @@ sha2 = "0.10"
 mdns-sd = "0.11"
 
 [target."cfg(unix)".dependencies]
-nix = { workspace = true, features = ["signal", "process"] }
+nix = { workspace = true, features = ["signal", "process", "fs"] }
