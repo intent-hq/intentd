@@ -145,6 +145,61 @@ pub(crate) fn map_issue(value: Value) -> Result<Issue> {
     })
 }
 
+pub(crate) fn map_repo(value: Value) -> Result<Repo> {
+    let r: dto::Repo = serde_json::from_value(value)?;
+    Ok(Repo {
+        owner: r.owner.and_then(|o| o.login).unwrap_or_default(),
+        name: r.name.unwrap_or_default(),
+        url: r.html_url,
+        default_branch: r.default_branch,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+    })
+}
+
+pub(crate) fn map_branch(value: Value) -> Result<Branch> {
+    let b: dto::Branch = serde_json::from_value(value)?;
+    Ok(Branch {
+        name: b.name.unwrap_or_default(),
+        commit_sha: b.commit.and_then(|c| c.sha),
+        protected: b.protected,
+    })
+}
+
+pub(crate) fn map_user_identity(value: Value) -> Result<UserIdentity> {
+    let u: dto::UserFull = serde_json::from_value(value)?;
+    Ok(UserIdentity {
+        login: u.login.unwrap_or_default(),
+        id: u.id,
+        name: u.name,
+        avatar_url: u.avatar_url,
+        html_url: u.html_url,
+    })
+}
+
+/// Rewrite raw repo-search input into GitHub `/search/repositories` syntax
+/// (parity with the FE `buildRepoSearchQuery`): `owner/name` → `name
+/// user:owner`, `owner/` → `user:owner`, `/name` → `name`, bare → unchanged.
+pub(crate) fn build_repo_search_query(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match trimmed.find('/') {
+        None => trimmed.to_string(),
+        Some(idx) => {
+            let owner = trimmed[..idx].trim();
+            let name = trimmed[idx + 1..].trim();
+            match (owner.is_empty(), name.is_empty()) {
+                (false, false) => format!("{name} user:{owner}"),
+                (false, true) => format!("user:{owner}"),
+                (true, false) => name.to_string(),
+                (true, true) => String::new(),
+            }
+        }
+    }
+}
+
 pub(crate) fn map_review(value: Value) -> Result<Review> {
     let r: dto::Review = serde_json::from_value(value)?;
     Ok(Review {
@@ -259,6 +314,43 @@ mod dto {
     #[derive(Deserialize)]
     pub(super) struct User {
         pub login: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct UserFull {
+        pub login: Option<String>,
+        pub id: Option<u64>,
+        pub name: Option<String>,
+        pub avatar_url: Option<String>,
+        pub html_url: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct RepoOwner {
+        pub login: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Repo {
+        pub name: Option<String>,
+        pub owner: Option<RepoOwner>,
+        pub html_url: Option<String>,
+        pub default_branch: Option<String>,
+        pub created_at: Option<String>,
+        pub updated_at: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct BranchCommit {
+        pub sha: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Branch {
+        pub name: Option<String>,
+        pub commit: Option<BranchCommit>,
+        #[serde(default)]
+        pub protected: bool,
     }
 
     #[derive(Deserialize)]
@@ -405,6 +497,82 @@ impl SourceControl for GitHubSourceControl {
         }
     }
 
+    async fn get_user(&self) -> Result<UserIdentity> {
+        let v: Value = self.client.get("/user", None::<&()>).await?;
+        map_user_identity(v)
+    }
+
+    async fn list_repos(&self) -> Result<Vec<Repo>> {
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: u64 = 10;
+        let mut repos = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let params: Vec<(&str, String)> = vec![
+                ("per_page", PER_PAGE.to_string()),
+                ("page", page.to_string()),
+                ("sort", "updated".to_string()),
+            ];
+            let v: Value = self.client.get("/user/repos", Some(&params)).await?;
+            let items: Vec<Value> = serde_json::from_value(v)?;
+            let count = items.len();
+            for item in items {
+                repos.push(map_repo(item)?);
+            }
+            if count < PER_PAGE {
+                break;
+            }
+        }
+        Ok(repos)
+    }
+
+    async fn search_repos(&self, query: &str) -> Result<Vec<Repo>> {
+        let search_query = build_repo_search_query(query);
+        if search_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let params: Vec<(&str, String)> = vec![
+            ("q", search_query),
+            ("sort", "stars".to_string()),
+            ("order", "desc".to_string()),
+            ("per_page", "20".to_string()),
+        ];
+        let v: Value = self
+            .client
+            .get("/search/repositories", Some(&params))
+            .await?;
+        let items = v
+            .get("items")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        map_list(items, map_repo)
+    }
+
+    async fn get_repo(&self, owner: &str, name: &str) -> Result<Repo> {
+        let route = format!("/repos/{owner}/{name}");
+        let v: Value = self.client.get(&route, None::<&()>).await?;
+        map_repo(v)
+    }
+
+    async fn list_remote_branches(&self, owner: &str, name: &str) -> Result<RemoteBranches> {
+        const PER_PAGE: usize = 100;
+        let route = format!("/repos/{owner}/{name}/branches");
+        let params: Vec<(&str, String)> = vec![
+            ("per_page", PER_PAGE.to_string()),
+            ("page", "1".to_string()),
+        ];
+        let v: Value = self.client.get(&route, Some(&params)).await?;
+        let items: Vec<Value> = serde_json::from_value(v)?;
+        let has_next_page = items.len() == PER_PAGE;
+        let branches = items
+            .into_iter()
+            .map(map_branch)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(RemoteBranches {
+            branches,
+            has_next_page,
+        })
+    }
+
     async fn create_pr(&self, repo: &RepoRef, input: NewPullRequest) -> Result<PullRequest> {
         let body = json!({
             "title": input.title,
@@ -425,6 +593,38 @@ impl SourceControl for GitHubSourceControl {
     }
 
     async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> Result<Vec<PullRequest>> {
+        if let Some(involvement) = query.involvement {
+            // GitHub's `/pulls` listing cannot express assignee/review-requested/
+            // involves @me, so route involvement queries through `/search/issues`
+            // (parity with the FE `searchGitHubPullRequests`).
+            let state = match query.state {
+                Some(PrState::Closed) => "closed",
+                Some(PrState::Merged) => "merged",
+                _ => "open",
+            };
+            let involve = match involvement {
+                PrInvolvement::Created => "author:@me",
+                PrInvolvement::Assigned => "assignee:@me",
+                PrInvolvement::ReviewRequested => "review-requested:@me",
+                PrInvolvement::Involves => "involves:@me",
+            };
+            let q = format!(
+                "is:pr repo:{}/{} is:{state} {involve}",
+                repo.owner, repo.name
+            );
+            let params: Vec<(&str, String)> = vec![
+                ("q", q),
+                ("sort", "updated".to_string()),
+                ("order", "desc".to_string()),
+                ("per_page", query.limit.unwrap_or(30).to_string()),
+            ];
+            let v: Value = self.client.get("/search/issues", Some(&params)).await?;
+            let items = v
+                .get("items")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            return map_list(items, map_pull);
+        }
         let mut params: Vec<(&str, String)> = vec![(
             "state",
             match query.state {
@@ -898,5 +1098,148 @@ mod tests {
         assert_eq!(c.id, "99");
         assert_eq!(c.author, "u");
         assert!(c.path.is_none());
+    }
+
+    #[test]
+    fn maps_repo_fixture_and_camel_case_shape() {
+        let repo = map_repo(json!({
+            "name": "react",
+            "owner": { "login": "facebook" },
+            "html_url": "https://github.com/facebook/react",
+            "default_branch": "main",
+            "created_at": "2013-05-24T16:15:54Z",
+            "updated_at": "2026-01-02T03:04:05Z"
+        }))
+        .unwrap();
+        assert_eq!(repo.owner, "facebook");
+        assert_eq!(repo.name, "react");
+        assert_eq!(
+            repo.url.as_deref(),
+            Some("https://github.com/facebook/react")
+        );
+        assert_eq!(repo.default_branch.as_deref(), Some("main"));
+        let wire = serde_json::to_value(&repo).unwrap();
+        assert_eq!(wire["url"], "https://github.com/facebook/react");
+        assert_eq!(wire["defaultBranch"], "main");
+        assert_eq!(wire["createdAt"], "2013-05-24T16:15:54Z");
+        assert_eq!(wire["updatedAt"], "2026-01-02T03:04:05Z");
+    }
+
+    #[test]
+    fn map_repo_omits_absent_optionals() {
+        let repo = map_repo(json!({ "name": "r", "owner": { "login": "o" } })).unwrap();
+        let wire = serde_json::to_value(&repo).unwrap();
+        assert_eq!(wire["owner"], "o");
+        assert_eq!(wire["name"], "r");
+        assert!(wire.get("url").is_none());
+        assert!(wire.get("defaultBranch").is_none());
+        assert!(wire.get("createdAt").is_none());
+        assert!(wire.get("updatedAt").is_none());
+    }
+
+    #[test]
+    fn maps_branch_fixture() {
+        let b = map_branch(json!({
+            "name": "main",
+            "commit": { "sha": "deadbeef" },
+            "protected": true
+        }))
+        .unwrap();
+        assert_eq!(b.name, "main");
+        assert_eq!(b.commit_sha.as_deref(), Some("deadbeef"));
+        assert!(b.protected);
+        let wire = serde_json::to_value(&b).unwrap();
+        assert_eq!(wire["commitSha"], "deadbeef");
+        assert_eq!(wire["protected"], true);
+    }
+
+    #[test]
+    fn branch_defaults_protected_and_omits_sha() {
+        let b = map_branch(json!({ "name": "dev" })).unwrap();
+        assert_eq!(b.name, "dev");
+        assert!(!b.protected);
+        let wire = serde_json::to_value(&b).unwrap();
+        assert!(wire.get("commitSha").is_none());
+        assert_eq!(wire["protected"], false);
+    }
+
+    #[test]
+    fn remote_branches_has_next_page_shape() {
+        let page = RemoteBranches {
+            branches: vec![Branch {
+                name: "main".into(),
+                commit_sha: None,
+                protected: false,
+            }],
+            has_next_page: true,
+        };
+        let wire = serde_json::to_value(&page).unwrap();
+        assert_eq!(wire["hasNextPage"], true);
+        assert_eq!(wire["branches"][0]["name"], "main");
+    }
+
+    #[test]
+    fn maps_user_identity_and_omits_credentials() {
+        let u = map_user_identity(json!({
+            "login": "octocat",
+            "id": 583231,
+            "name": "The Octocat",
+            "avatar_url": "https://avatars.githubusercontent.com/u/583231",
+            "html_url": "https://github.com/octocat"
+        }))
+        .unwrap();
+        assert_eq!(u.login, "octocat");
+        assert_eq!(u.id, Some(583231));
+        let wire = serde_json::to_value(&u).unwrap();
+        assert_eq!(wire["login"], "octocat");
+        assert_eq!(
+            wire["avatarUrl"],
+            "https://avatars.githubusercontent.com/u/583231"
+        );
+        assert_eq!(wire["htmlUrl"], "https://github.com/octocat");
+    }
+
+    #[test]
+    fn user_identity_minimal_shape() {
+        let u = map_user_identity(json!({ "login": "u" })).unwrap();
+        let wire = serde_json::to_value(&u).unwrap();
+        assert_eq!(wire["login"], "u");
+        assert!(wire.get("id").is_none());
+        assert!(wire.get("name").is_none());
+        assert!(wire.get("avatarUrl").is_none());
+        assert!(wire.get("htmlUrl").is_none());
+    }
+
+    #[test]
+    fn rewrites_repo_search_query() {
+        assert_eq!(
+            build_repo_search_query("facebook/react"),
+            "react user:facebook"
+        );
+        assert_eq!(build_repo_search_query("facebook/"), "user:facebook");
+        assert_eq!(build_repo_search_query("/react"), "react");
+        assert_eq!(build_repo_search_query("react"), "react");
+        assert_eq!(
+            build_repo_search_query("  vercel/next.js  "),
+            "next.js user:vercel"
+        );
+        assert_eq!(build_repo_search_query("   "), "");
+        assert_eq!(build_repo_search_query(""), "");
+    }
+
+    #[test]
+    fn pr_involvement_serializes_kebab_case() {
+        assert_eq!(
+            serde_json::to_value(PrInvolvement::ReviewRequested).unwrap(),
+            json!("review-requested")
+        );
+        assert_eq!(
+            serde_json::to_value(PrInvolvement::Created).unwrap(),
+            json!("created")
+        );
+        assert_eq!(
+            serde_json::from_value::<PrInvolvement>(json!("involves")).unwrap(),
+            PrInvolvement::Involves
+        );
     }
 }

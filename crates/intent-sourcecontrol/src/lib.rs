@@ -21,10 +21,10 @@ use async_trait::async_trait;
 pub use error::{Error, Result};
 pub use github::GitHubSourceControl;
 pub use model::{
-    AuthStatus, CheckRun, CheckState, Comment, CommentAnchor, Issue, IssueQuery, MergeMethod,
-    MergeOptions, MergeOutcome, Mergeability, NewPullRequest, PrPatch, PrQuery, PrState,
-    PullRequest, RepoRef, Review, ReviewComment, ReviewThread, ReviewThreadComment, ReviewVerdict,
-    ScCapabilities,
+    AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor, Issue, IssueQuery,
+    MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, PrInvolvement, PrPatch,
+    PrQuery, PrState, PullRequest, RemoteBranches, Repo, RepoRef, Review, ReviewComment,
+    ReviewThread, ReviewThreadComment, ReviewVerdict, ScCapabilities, UserIdentity,
 };
 pub use registry::{GithubSettings, SourceControlRegistry, SourceControlSettings};
 pub use token::TokenSource;
@@ -46,6 +46,28 @@ pub trait SourceControl: Send + Sync {
 
     /// Auth / connectivity probe (used by `settings`/`doctor`).
     async fn check_auth(&self) -> Result<AuthStatus>;
+
+    /// Authenticated user identity (`GET /user`). Backs `github.getUser`.
+    async fn get_user(&self) -> Result<UserIdentity>;
+
+    // --- Repositories ---
+
+    /// List repositories the authenticated user has access to (paginated,
+    /// bounded; parity with the FE `listGitHubRepos` fetch-all). Backs
+    /// `github.repos.list`.
+    async fn list_repos(&self) -> Result<Vec<Repo>>;
+
+    /// Search repositories (`GET /search/repositories?sort=stars`); the raw
+    /// query is rewritten so `owner/name` → `name user:owner`. Backs
+    /// `github.repos.search`.
+    async fn search_repos(&self, query: &str) -> Result<Vec<Repo>>;
+
+    /// Fetch a single repository's metadata. Backs `github.repos.get`.
+    async fn get_repo(&self, owner: &str, name: &str) -> Result<Repo>;
+
+    /// List a repository's remote branches with a forward-pagination flag.
+    /// Backs `github.branches.list`.
+    async fn list_remote_branches(&self, owner: &str, name: &str) -> Result<RemoteBranches>;
 
     // --- Pull/merge requests ---
 
