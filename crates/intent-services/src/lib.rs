@@ -243,6 +243,27 @@ impl Services {
             .resolve_agent_type(specialist_id, workspace_path)
     }
 
+    /// Resolve the `[Role Reminder: You are a {name}. {reminder}]` prefix to
+    /// prepend to a specialist agent's next turn, or `None` when the agent has no
+    /// specialist or its specialist yields no reminder (port of acp-provider.ts
+    /// role-reminder injection). Rebuilt every turn (interval = 1); the reminder
+    /// is added to the outbound provider prompt only and never persisted.
+    pub(crate) async fn agent_role_reminder(&self, agent_id: &AgentId) -> Option<String> {
+        let session = self.store.get_agent_session(agent_id).await.ok()?;
+        let specialist_id = session.specialist.as_deref()?;
+        let workspace_path = self
+            .store
+            .get_workspace(&session.workspace_id)
+            .await
+            .ok()
+            .and_then(|w| w.path.or(w.worktree_path))
+            .map(PathBuf::from);
+        let (name, reminder) = self
+            .specialists_service()
+            .resolve_role_reminder(specialist_id, workspace_path.as_deref())?;
+        Some(format!("[Role Reminder: You are a {name}. {reminder}]"))
+    }
+
     /// Build a [`SettingsService`](settings::SettingsService) view over the store
     /// and secret store for one `settings.*` call.
     fn settings_service(&self) -> settings::SettingsService<'_> {

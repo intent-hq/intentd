@@ -875,8 +875,28 @@ impl AgentManager {
     /// `sessionWasRecreated` → `formatHistoryAsXml`). The just-persisted current
     /// user message is excluded from the rendered history.
     async fn build_turn_prompt(&self, agent_id: &AgentId, content: &str) -> Vec<ContentBlock> {
+        // Role reminder is rebuilt every turn (interval = 1, port of
+        // acp-provider.ts) and prepended to the outbound prompt for specialist
+        // agents; absent for non-specialist agents. Because it fires every turn
+        // it also covers the session-recreated case handled by `build_turn_body`.
+        let reminder = self.services.agent_role_reminder(agent_id).await;
+        let body = self.build_turn_body(agent_id, content).await;
+        let prompt_text = match reminder {
+            Some(r) => format!("{r}\n\n{body}"),
+            None => body,
+        };
+        text_prompt(&prompt_text)
+    }
+
+    /// Build the user-turn body: normally just `content`, but when the ACP
+    /// session was recreated (the resume-impossible fallback), prepend the prior
+    /// conversation history as `<supervisor>` XML so the fresh session has
+    /// context, then clear the flag (parity: TS `sessionWasRecreated` →
+    /// `formatHistoryAsXml`). The just-persisted current user message is excluded
+    /// from the rendered history.
+    async fn build_turn_body(&self, agent_id: &AgentId, content: &str) -> String {
         if !self.take_recreated(agent_id) {
-            return text_prompt(content);
+            return content.to_string();
         }
         let messages = self
             .services
@@ -887,11 +907,11 @@ impl AgentManager {
         // The current user message was already appended → render all but the last.
         let prior = messages.split_last().map(|(_, rest)| rest).unwrap_or(&[]);
         if prior.is_empty() {
-            return text_prompt(content);
+            return content.to_string();
         }
         let history_xml =
             crate::history_xml::format_history_as_xml(prior, crate::history_xml::MAX_HISTORY_CHARS);
-        text_prompt(&format!("{history_xml}\n\n{content}"))
+        format!("{history_xml}\n\n{content}")
     }
 
     /// Drive one `session/prompt` turn for `agent_id`, marking it active for the
@@ -1456,5 +1476,171 @@ async fn persist_user(mgr: &AgentManager, agent_id: &AgentId, content: &str) {
         .await
     {
         tracing::warn!(agent = %agent_id, error = %e, "failed to persist queued user message");
+    }
+}
+
+#[cfg(test)]
+mod role_reminder_tests {
+    //! Role-reminder injection cadence over [`AgentManager::build_turn_prompt`]
+    //! (port of acp-provider.ts): every user turn (interval = 1) and also after a
+    //! session recreate for specialist agents; never for non-specialist agents.
+
+    use super::*;
+    use crate::events::EventBus;
+    use intent_core::{AgentStatus, Workspace, WorkspaceActivity, WorkspaceStatus};
+    use intent_store::Store;
+
+    /// Seed a hermetic specialists dir under temp with one `<id>.md`.
+    fn write_specialist(id: &str, content: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("intentd-spc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{id}.md")), content).unwrap();
+        dir
+    }
+
+    fn workspace(id: &WorkspaceId) -> Workspace {
+        let ts = now_iso();
+        Workspace {
+            id: id.clone(),
+            title: "WS".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+        }
+    }
+
+    fn session(
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        specialist: Option<&str>,
+    ) -> AgentSession {
+        let ts = now_iso();
+        AgentSession {
+            id: agent_id.clone(),
+            workspace_id: workspace_id.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Builder".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: specialist.map(str::to_string),
+            status: AgentStatus::Pending,
+            is_active: true,
+            messages: Vec::new(),
+            stats: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    }
+
+    /// Build a manager over a temp store seeded with a workspace + agent session.
+    async fn manager_with(
+        specialist: Option<&str>,
+        specialists_dir: Option<PathBuf>,
+    ) -> (AgentManager, AgentId) {
+        let path = std::env::temp_dir().join(format!("intentd-rr-{}.db", uuid::Uuid::new_v4()));
+        let store = Store::open(&path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_specialist_dirs(
+                specialists_dir,
+                Some(std::env::temp_dir().join("nonexistent-bundled")),
+            );
+        let workspace_id = WorkspaceId::from("ws-1");
+        let agent_id = AgentId::from("agent-1");
+        store
+            .insert_workspace(&workspace(&workspace_id))
+            .await
+            .unwrap();
+        store
+            .insert_agent_session(&session(&agent_id, &workspace_id, specialist))
+            .await
+            .unwrap();
+        let sink = Arc::new(BusEventSink::new(bus));
+        (AgentManager::new(services, sink, 4), agent_id)
+    }
+
+    /// First text block's text from a built prompt.
+    fn prompt_text(prompt: &[ContentBlock]) -> String {
+        serde_json::to_value(prompt).unwrap()[0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn injects_reminder_every_turn_for_specialist() {
+        let dir = write_specialist(
+            "implementor",
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
+        );
+        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        // Interval = 1 → every turn carries the prefix.
+        for _ in 0..2 {
+            let prompt = mgr.build_turn_prompt(&agent_id, "do the thing").await;
+            let text = prompt_text(&prompt);
+            assert!(
+                text.starts_with("[Role Reminder: You are a Implementor. Stay in scope.]\n\n"),
+                "missing reminder prefix: {text:?}"
+            );
+            assert!(text.ends_with("do the thing"));
+        }
+    }
+
+    #[tokio::test]
+    async fn injects_reminder_on_session_recreate() {
+        let dir = write_specialist(
+            "implementor",
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
+        );
+        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        // Flag the agent's session as recreated; the reminder must still prepend.
+        mgr.recreated.lock().unwrap().insert(agent_id.clone());
+        let prompt = mgr.build_turn_prompt(&agent_id, "resume work").await;
+        let text = prompt_text(&prompt);
+        assert!(
+            text.starts_with("[Role Reminder: You are a Implementor. Stay in scope.]\n\n"),
+            "missing reminder prefix on recreate: {text:?}"
+        );
+        // Flag consumed by the turn.
+        assert!(!mgr.recreated.lock().unwrap().contains(&agent_id));
+    }
+
+    #[tokio::test]
+    async fn no_injection_without_specialist() {
+        let (mgr, agent_id) = manager_with(None, None).await;
+        let prompt = mgr.build_turn_prompt(&agent_id, "plain message").await;
+        assert_eq!(prompt_text(&prompt), "plain message");
     }
 }
