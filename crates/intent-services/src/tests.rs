@@ -2005,8 +2005,9 @@ mod pr {
     use intent_sourcecontrol::{
         AuthStatus, CheckRun, CheckState, Comment, CommentAnchor, Error as ScError, Issue,
         IssueQuery, MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, PrPatch,
-        PrQuery, PrState, PullRequest, RepoRef, Result as ScResult, Review, ReviewComment,
-        ReviewThread, ReviewThreadComment, ReviewVerdict, ScCapabilities, SourceControl,
+        PrQuery, PrState, PullRequest, RemoteBranches, Repo, RepoRef, Result as ScResult, Review,
+        ReviewComment, ReviewThread, ReviewThreadComment, ReviewVerdict, ScCapabilities,
+        SourceControl, UserIdentity,
     };
     use intent_store::Store;
     use serde_json::json;
@@ -2071,6 +2072,21 @@ mod pr {
                 login: Some("octocat".into()),
                 scopes: vec![],
             })
+        }
+        async fn get_user(&self) -> ScResult<UserIdentity> {
+            unimplemented!()
+        }
+        async fn list_repos(&self) -> ScResult<Vec<Repo>> {
+            unimplemented!()
+        }
+        async fn search_repos(&self, _: &str) -> ScResult<Vec<Repo>> {
+            unimplemented!()
+        }
+        async fn get_repo(&self, _: &str, _: &str) -> ScResult<Repo> {
+            unimplemented!()
+        }
+        async fn list_remote_branches(&self, _: &str, _: &str) -> ScResult<RemoteBranches> {
+            unimplemented!()
         }
         async fn create_pr(&self, _: &RepoRef, input: NewPullRequest) -> ScResult<PullRequest> {
             Ok(PullRequest {

@@ -24,6 +24,44 @@ impl RepoRef {
     }
 }
 
+/// Repository metadata (parity with the FE `GithubRepo`). Backs the
+/// `github.repos.list/search/get` browse surface. `url` carries GitHub's
+/// `html_url`; absent optionals are omitted from the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Repo {
+    pub owner: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// A remote branch (`GET /repos/{owner}/{name}/branches` item).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Branch {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub protected: bool,
+}
+
+/// A page of remote branches with a forward-pagination flag (parity with the
+/// FE `listGitHubBranches` → `{ branches, hasNextPage }`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteBranches {
+    pub branches: Vec<Branch>,
+    pub has_next_page: bool,
+}
+
 /// Normalized pull/merge/change-request state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -110,7 +148,28 @@ pub struct PrPatch {
     pub state: Option<PrState>,
 }
 
+/// Involvement of the authenticated user (`@me`) for PR search. Parity with the
+/// FE `searchGitHubPullRequests` `filter` values; the FE `all` filter carries no
+/// involvement constraint and maps to `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrInvolvement {
+    /// `author:@me`.
+    Created,
+    /// `assignee:@me`.
+    Assigned,
+    /// `review-requested:@me`.
+    ReviewRequested,
+    /// `involves:@me`.
+    Involves,
+}
+
 /// Filter for listing pull requests.
+///
+/// When `involvement` is set, listing routes through `GET /search/issues`
+/// (`is:pr repo:o/r is:<state> <filter>:@me`) so callers can express
+/// author/assignee/review-requested/involves @me; otherwise the plain
+/// `GET /repos/{o}/{r}/pulls` path is used with client-side `author` filtering.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrQuery {
@@ -118,6 +177,7 @@ pub struct PrQuery {
     pub base: Option<String>,
     pub head: Option<String>,
     pub author: Option<String>,
+    pub involvement: Option<PrInvolvement>,
     pub limit: Option<u8>,
 }
 
@@ -244,6 +304,23 @@ pub struct IssueQuery {
     pub state: Option<String>,
     pub labels: Option<String>,
     pub limit: Option<u8>,
+}
+
+/// Authenticated GitHub identity (`GET /user`). Only non-sensitive identity
+/// fields are surfaced — the credential/token is never included. `avatarUrl` /
+/// `htmlUrl` mirror GitHub's `avatar_url` / `html_url`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserIdentity {
+    pub login: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
 }
 
 /// Auth / connectivity probe result (`settings`/`doctor`).
