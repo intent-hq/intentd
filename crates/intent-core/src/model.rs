@@ -701,6 +701,19 @@ pub struct TaskGetMyTaskResult {
     pub rev: i64,
 }
 
+/// Canonical task facts for a workspace (TS `WorkspaceTask`, `shared/types.ts`).
+/// Returned by `task.list`/`task.get` so the FE can drop its `note.list`
+/// metadata derivation of the workspace task set. The renderer selectors derive
+/// counts/progress/groupings from this `{ id, title, status, updatedAt }` shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceTask {
+    pub id: NoteId,
+    pub title: String,
+    pub status: TaskStatus,
+    pub updated_at: String,
+}
+
 /// Result of `task.markAsTask`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

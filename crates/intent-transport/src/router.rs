@@ -446,6 +446,21 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        "task.list" => {
+            let ws = require_ws_note(params)?;
+            let status = opt_str(params, "status");
+            let tasks = api.task_list(ws, status).await.map_err(domain_to_rpc)?;
+            Ok(json!({ "tasks": tasks }))
+        }
+        "task.get" => {
+            let ws = require_ws_note(params)?;
+            let task_note_id = require_str_param(params, "taskNoteId").map(NoteId::from)?;
+            match api.task_get(ws, task_note_id).await {
+                Ok(task) => Ok(json!({ "task": task })),
+                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Task not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "comment.add" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;

@@ -36,7 +36,7 @@ pub use model::{
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TopChangedFile,
     Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceDiffSummary, WorkspaceDiffSummaryFile, WorkspaceEventSummary,
-    WorkspaceStatus, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 pub use traits::{
     BoxFuture, ContextEngine, ContextError, EngineAvailability, RetrieveRequest, RetrieveResult,
