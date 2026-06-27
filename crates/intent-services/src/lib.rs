@@ -13,20 +13,21 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use base64::Engine as _;
 use intent_core::events::{
     AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED,
-    COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED,
-    SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED,
-    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
+    COMMENT_ADDED, COMMENT_RESOLVED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED,
+    PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED,
+    TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED,
 };
 use intent_core::{
     iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId, AgentLite,
     AgentSession, AuthorType, BoxFuture, ClientId, Comment, CommentAddResult, CommentAnchor,
     CommentAnchorType, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
-    CommentLocation, CommentRespondResult, CommentRespondThread, CommentStatus,
-    CommentThreadSummary, CommentType, CommentWire, ContentType, Draft, Event, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, FileActivity, Note, NoteAddInput, NoteAddResult,
-    NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
-    NoteEditResult, NoteId, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, ScriptCreateParams,
+    CommentLocation, CommentResolveThreadResult, CommentRespondResult, CommentRespondThread,
+    CommentStatus, CommentThreadSummary, CommentType, CommentWire, ContentType, Draft, Event,
+    EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, Note,
+    NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
+    NoteEditLinesResult, NoteEditResult, NoteId, NoteSetContentResult, NoteTaskRow,
+    NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, ScriptCreateParams,
     TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
     TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask,
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, Workspace,
@@ -1332,6 +1333,30 @@ fn comment_added_event(workspace_id: &WorkspaceId, note_id: &NoteId, comment_id:
         data: serde_json::json!({
             "noteId": note_id.as_str(),
             "commentId": comment_id,
+        }),
+    }
+}
+
+/// Build a `comment:resolved` event for a thread that was (un)resolved.
+fn comment_resolved_event(
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    thread_id: &str,
+    resolved: bool,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: COMMENT_RESOLVED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "noteId": note_id.as_str(),
+            "threadId": thread_id,
+            "resolved": resolved,
         }),
     }
 }
@@ -4173,6 +4198,62 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => Err(e),
             }
+        })
+    }
+
+    fn comment_resolve_thread(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        thread_id: Option<String>,
+        comment_id: Option<String>,
+        resolved: bool,
+    ) -> BoxFuture<'_, Result<CommentResolveThreadResult>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            if thread_id.is_none() && comment_id.is_none() {
+                return Err(Error::Internal(
+                    "Either threadId or commentId must be provided".to_string(),
+                ));
+            }
+            fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let all = store.list_comments(&note_id).await?;
+            let target = match thread_id {
+                Some(t) => t,
+                None => {
+                    let cid = comment_id.unwrap();
+                    match all.iter().find(|c| c.id == cid) {
+                        Some(c) => c.thread_id.clone(),
+                        None => return Err(Error::Internal(format!("Comment not found: {cid}"))),
+                    }
+                }
+            };
+            let count = all.iter().filter(|c| c.thread_id == target).count();
+            if count == 0 {
+                return Err(Error::Internal(format!("Thread not found: {target}")));
+            }
+            let new_status = if resolved {
+                CommentStatus::Resolved
+            } else {
+                CommentStatus::Open
+            };
+            store
+                .set_thread_status(&target, new_status, &now_iso())
+                .await?;
+            publish_event(
+                &bus,
+                comment_resolved_event(&workspace_id, &note_id, &target, resolved),
+            )
+            .await;
+            Ok(CommentResolveThreadResult {
+                success: true,
+                thread_id: target,
+                note_id,
+                resolved,
+                status: if resolved { "resolved" } else { "open" }.to_string(),
+                comment_count: count,
+            })
         })
     }
 

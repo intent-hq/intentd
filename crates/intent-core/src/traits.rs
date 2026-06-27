@@ -10,14 +10,15 @@ use crate::error::{Error, Result};
 use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId};
 use crate::model::{
     AgentDelegateInput, AgentLite, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
-    CommentListResult, CommentRespondResult, Draft, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, FileActivity, GitAgentCommitResult, GitBranches, GitCommitResult,
-    GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
-    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteSetContentResult,
-    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, ReadAssetResult, ScriptCreateParams,
-    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskUpdateNoteStatusResult, TaskUpdateResult,
-    TaskUpdateStatusResult, Workspace, WorkspaceCreate, WorkspaceEventSummary, WorkspaceUpdate,
+    CommentListResult, CommentResolveThreadResult, CommentRespondResult, Draft, EventQueryParams,
+    EventSubscribeResult, EventUnsubscribeResult, FileActivity, GitAgentCommitResult, GitBranches,
+    GitCommitResult, GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, ReadAssetResult,
+    ScriptCreateParams, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskMarkAsTaskResult,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, Workspace,
+    WorkspaceCreate, WorkspaceEventSummary, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -988,6 +989,24 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::comment_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `comment.resolveThread`: mark every comment in a thread resolved (or
+    /// `resolved = false` to reopen), identified by `threadId` or `commentId`.
+    fn comment_resolve_thread(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        thread_id: Option<String>,
+        comment_id: Option<String>,
+        resolved: bool,
+    ) -> BoxFuture<'_, Result<CommentResolveThreadResult>> {
+        let _ = (workspace_id, note_id, thread_id, comment_id, resolved);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::comment_resolve_thread not implemented".to_string(),
             ))
         })
     }

@@ -187,6 +187,24 @@ impl Store {
         rows.iter().map(map_comment_row).collect()
     }
 
+    /// Set the `status` of every comment in a thread, refreshing `updated_at`.
+    /// Returns the number of rows updated (0 when the thread does not exist).
+    pub async fn set_thread_status(
+        &self,
+        thread_id: &str,
+        status: CommentStatus,
+        updated_at: &str,
+    ) -> Result<u64> {
+        let res = sqlx::query("UPDATE comment SET status=?, updated_at=? WHERE thread_id=?")
+            .bind(enum_to_db(&status)?)
+            .bind(updated_at)
+            .bind(thread_id)
+            .execute(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("set thread status failed: {e}")))?;
+        Ok(res.rows_affected())
+    }
+
     /// Assemble a [`CommentThread`] (the comments sharing `thread_id`).
     pub async fn get_thread(&self, thread_id: &str) -> Result<CommentThread> {
         let comments = self.list_thread_comments(thread_id).await?;

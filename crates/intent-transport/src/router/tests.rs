@@ -2,10 +2,10 @@
 
 use intent_core::{
     AuthorType, BoxFuture, Comment, CommentAddResult, CommentAnchor, CommentAnchorType,
-    CommentLocation, CommentRespondResult, CommentRespondThread, CommentStatus, CommentType,
-    CommentWire, ContentType, Error, Event, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult, GitBranches,
-    GitCommitResult, GitFileStatus, GitMergeConflicts, GitStatus, Note, NoteAddInput,
+    CommentLocation, CommentResolveThreadResult, CommentRespondResult, CommentRespondThread,
+    CommentStatus, CommentType, CommentWire, ContentType, Error, Event, EventQueryParams,
+    EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
+    GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitStatus, Note, NoteAddInput,
     NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
     NoteEditLinesResult, NoteEditResult, NoteId, NoteSetContentResult, NoteTaskRow,
     NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, Result,
@@ -503,6 +503,27 @@ impl WorkspaceApi for FakeApi {
                     thread_id: "c1".to_string(),
                     total_comments: 2,
                 },
+            })
+        })
+    }
+
+    fn comment_resolve_thread(
+        &self,
+        _workspace_id: WorkspaceId,
+        note_id: NoteId,
+        thread_id: Option<String>,
+        comment_id: Option<String>,
+        resolved: bool,
+    ) -> BoxFuture<'_, Result<CommentResolveThreadResult>> {
+        Box::pin(async move {
+            let target = thread_id.or(comment_id).unwrap_or_default();
+            Ok(CommentResolveThreadResult {
+                success: true,
+                thread_id: target,
+                note_id,
+                resolved,
+                status: if resolved { "resolved" } else { "open" }.to_string(),
+                comment_count: 1,
             })
         })
     }
@@ -1695,6 +1716,30 @@ async fn comment_respond_nests_suggestion_diff_on_wire() {
 }
 
 #[tokio::test]
+async fn comment_resolve_thread_defaults_resolved_and_passes_params() {
+    // Default resolved=true when the param is omitted.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"comment.resolveThread","params":{"workspaceId":"ws-1","noteId":"n1","threadId":"c1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["success"], serde_json::json!(true));
+    assert_eq!(v["result"]["threadId"], serde_json::json!("c1"));
+    assert_eq!(v["result"]["resolved"], serde_json::json!(true));
+    assert_eq!(v["result"]["status"], serde_json::json!("resolved"));
+
+    // resolved=false routes through for unresolve symmetry.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"comment.resolveThread","params":{"workspaceId":"ws-1","noteId":"n1","commentId":"x9","resolved":false}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["threadId"], serde_json::json!("x9"));
+    assert_eq!(v["result"]["resolved"], serde_json::json!(false));
+    assert_eq!(v["result"]["status"], serde_json::json!("open"));
+}
+
+#[tokio::test]
 async fn task_comment_methods_missing_note_id_is_minus_32602() {
     for method in [
         "task.updateStatus",
@@ -1708,6 +1753,7 @@ async fn task_comment_methods_missing_note_id_is_minus_32602() {
         "comment.getThread",
         "comment.respond",
         "comment.delete",
+        "comment.resolveThread",
     ] {
         let msg = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"workspaceId":"ws-1"}}}}"#
