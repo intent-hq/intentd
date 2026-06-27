@@ -913,6 +913,18 @@ pub struct CommentDeleteResult {
     pub message: String,
 }
 
+/// Result of `comment.resolveThread`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentResolveThreadResult {
+    pub success: bool,
+    pub thread_id: String,
+    pub note_id: NoteId,
+    pub resolved: bool,
+    pub status: String,
+    pub comment_count: usize,
+}
+
 /// Event actor kind (§9.1, `events/types.ts` `ActorType`). Serializes to its
 /// lowercase string form, matching the TS wire values used by the iOS client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

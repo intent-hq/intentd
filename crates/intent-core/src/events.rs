@@ -153,6 +153,10 @@ pub const GOAL_UPDATED: &str = "goal:updated";
 
 // Comment events.
 pub const COMMENT_ADDED: &str = "comment:added";
+// Emitted by `comment.resolveThread` when a thread is (un)resolved. The
+// self-sufficient payload `{ noteId, threadId, resolved }` lets a client flip
+// the thread's resolved state without a follow-up read.
+pub const COMMENT_RESOLVED: &str = "comment:resolved";
 
 // Code-changes-review events (new in intentd; PROTOCOL §5.18–§5.20, §6.5). The
 // BE records attribution internally (there is no `file-tracking.trackChange`
@@ -271,6 +275,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SPEC_UPDATED,
     GOAL_UPDATED,
     COMMENT_ADDED,
+    COMMENT_RESOLVED,
     CHANGES_TRACKED,
     CHANGES_GIT_STATUS,
     CHANGES_METRICS_CHANGED,
