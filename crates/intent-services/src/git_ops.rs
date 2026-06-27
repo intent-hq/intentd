@@ -5,11 +5,11 @@
 //! `git.getBranches` "known repo" authorization check. The actual git operations
 //! live in `intent-git`; this module owns only the parity-critical wire policy.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use intent_core::{Error, Result, Workspace};
 use intent_store::Store;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 
 /// TS `ws.git.stage` message when an agent tries to stage everything.
 const STAGE_ALL_MSG: &str = "Staging all files is not allowed. Please specify individual file paths to stage. Use git_status to see which files you have modified, then stage only those specific files.";
@@ -84,6 +84,102 @@ pub(crate) fn is_known_repo(workspaces: &[Workspace], repo_path: &str) -> bool {
     workspaces.iter().any(|ws| {
         ws.path.as_deref() == Some(repo_path) || ws.worktree_path.as_deref() == Some(repo_path)
     })
+}
+
+/// Build the wire `CommitInfo` (§8.9) for a history record: `files` is the list
+/// of changed paths, `sha` the short hash, and the optional agent/note linkage
+/// is included only when present.
+pub(crate) fn commit_to_commit_info(c: &intent_git::history::CommitRecord) -> Value {
+    let mut obj = Map::new();
+    obj.insert("hash".to_string(), json!(c.hash));
+    obj.insert(
+        "sha".to_string(),
+        json!(c.hash.chars().take(7).collect::<String>()),
+    );
+    obj.insert("author".to_string(), json!(c.author));
+    obj.insert("email".to_string(), json!(c.author_email));
+    obj.insert("date".to_string(), json!(c.date));
+    obj.insert("message".to_string(), json!(c.message));
+    obj.insert("files".to_string(), json!(c.files));
+    if let Some(agent_id) = &c.agent_id {
+        obj.insert("agentId".to_string(), json!(agent_id));
+    }
+    if let Some(note_id) = &c.linked_note_id {
+        obj.insert("linkedNoteId".to_string(), json!(note_id));
+    }
+    Value::Object(obj)
+}
+
+/// Build the `git.diffs` wire result (`[{ path, hunks }]`) for a worktree.
+/// `staged` selects the HEAD→index diff (else index→workdir); `path` filters to
+/// a single file. Hunks for staged changes are hydrated from the recorded blob
+/// SHAs; unstaged changes read workdir content directly. Binary files yield an
+/// empty `hunks` array.
+pub(crate) fn build_diffs(worktree: &Path, path: Option<&str>, staged: bool) -> Result<Value> {
+    let files = if staged {
+        intent_git::diff::diff_head_to_index(worktree)?
+    } else {
+        intent_git::diff::diff_index_to_workdir(worktree)?
+    };
+    let mut out = Vec::new();
+    for fd in &files {
+        if let Some(p) = path {
+            if fd.path != p {
+                continue;
+            }
+        }
+        let hunks = if fd.is_binary {
+            Vec::new()
+        } else if staged {
+            intent_git::diff::hunks_between(
+                worktree,
+                fd.old_blob.as_deref(),
+                fd.new_blob.as_deref(),
+            )?
+        } else {
+            intent_git::diff::hunks_index_to_workdir(worktree, &fd.path)?
+        };
+        out.push(json!({ "path": fd.path, "hunks": hunks_to_value(&hunks) }));
+    }
+    Ok(Value::Array(out))
+}
+
+/// Convert the internal hunk list to the wire shape consumed by the FE diff
+/// viewer: `{ oldStart, oldLines, newStart, newLines, lines }`.
+fn hunks_to_value(hunks: &[intent_git::diff::DiffHunk]) -> Value {
+    Value::Array(hunks.iter().map(hunk_to_value).collect())
+}
+
+fn hunk_to_value(h: &intent_git::diff::DiffHunk) -> Value {
+    json!({
+        "oldStart": h.old_start,
+        "oldLines": h.old_lines,
+        "newStart": h.new_start,
+        "newLines": h.new_lines,
+        "lines": h.lines.iter().map(line_to_value).collect::<Vec<_>>(),
+    })
+}
+
+/// Convert one diff line to the wire `DiffLine` (`type`/`content` plus optional
+/// 1-based `oldNumber`/`newNumber`), matching `LineType`
+/// (Context/Addition/Deletion) from the shared types.
+fn line_to_value(l: &intent_git::diff::DiffLine) -> Value {
+    use intent_git::diff::DiffLineKind;
+    let kind = match l.kind {
+        DiffLineKind::Context => "Context",
+        DiffLineKind::Addition => "Addition",
+        DiffLineKind::Deletion => "Deletion",
+    };
+    let mut obj = Map::new();
+    obj.insert("type".to_string(), json!(kind));
+    obj.insert("content".to_string(), json!(l.content));
+    if let Some(n) = l.old_lineno {
+        obj.insert("oldNumber".to_string(), json!(n));
+    }
+    if let Some(n) = l.new_lineno {
+        obj.insert("newNumber".to_string(), json!(n));
+    }
+    Value::Object(obj)
 }
 
 #[cfg(test)]

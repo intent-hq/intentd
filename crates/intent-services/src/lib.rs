@@ -4858,6 +4858,103 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn git_changes(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Same empty fallbacks as `git_status` (unknown/remote/non-repo →
+            // empty list), but projecting only the working-tree file list.
+            let empty = serde_json::json!([]);
+            let ws = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(Error::NotFound(_)) => return Ok(empty),
+                Err(e) => return Err(e),
+            };
+            if ws.is_remote {
+                return Ok(empty);
+            }
+            let Some(path) = git_ops::worktree_path(&ws) else {
+                return Ok(empty);
+            };
+            if !path.join(".git").exists() {
+                return Ok(empty);
+            }
+            let status = intent_git::status::status(&path)?;
+            Ok(serde_json::to_value(&status.files).unwrap_or(empty))
+        })
+    }
+
+    fn git_diffs(
+        &self,
+        workspace_id: WorkspaceId,
+        path: Option<String>,
+        staged: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let empty = serde_json::json!([]);
+            let ws = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(Error::NotFound(_)) => return Ok(empty),
+                Err(e) => return Err(e),
+            };
+            if ws.is_remote {
+                return Ok(empty);
+            }
+            let Some(worktree) = git_ops::worktree_path(&ws) else {
+                return Ok(empty);
+            };
+            if !worktree.join(".git").exists() {
+                return Ok(empty);
+            }
+            git_ops::build_diffs(&worktree, path.as_deref(), staged)
+        })
+    }
+
+    fn git_commits(
+        &self,
+        workspace_id: WorkspaceId,
+        limit: Option<i64>,
+        page_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // §5.5 paginated read: clamp the page size to [1,200] (default 50)
+            // and walk backward through the (newest-first) first-parent history
+            // via an opaque skip token; the envelope is `{ items, nextToken }`.
+            let limit = pagination::clamp_limit(limit);
+            let skip = pagination::parse_offset(page_token.as_deref());
+            let empty = serde_json::json!({ "items": [], "nextToken": serde_json::Value::Null });
+            let ws = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(_) => return Ok(empty),
+            };
+            if ws.is_remote {
+                return Ok(empty);
+            }
+            let Some(worktree) = git_ops::worktree_path(&ws) else {
+                return Ok(empty);
+            };
+            if !worktree.join(".git").exists() {
+                return Ok(empty);
+            }
+            // Fetch one past the page window to decide whether older commits remain.
+            let commits = intent_git::history::history(&worktree, skip + limit + 1)?;
+            let has_more = commits.len() > skip + limit;
+            let items: Vec<serde_json::Value> = commits
+                .iter()
+                .skip(skip)
+                .take(limit)
+                .map(git_ops::commit_to_commit_info)
+                .collect();
+            let next_token = if has_more {
+                serde_json::Value::String(pagination::offset_token(skip + limit))
+            } else {
+                serde_json::Value::Null
+            };
+            Ok(serde_json::json!({ "items": items, "nextToken": next_token }))
+        })
+    }
+
     // ========================================================================
     // agent.* surface (PROTOCOL §5.5). Store/in-memory-backed; the live-runtime
     // coupling (spawning a turn from sendMessage, flipping `queued` mid-stream)

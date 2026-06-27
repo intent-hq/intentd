@@ -1260,6 +1260,54 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `git.changes`: the working-tree file list (`FileStatus[]`) for a
+    /// workspace — the same `files` array as `git.status`. Remote workspaces and
+    /// non-repositories return an empty array (wire §7.7).
+    fn git_changes(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_changes not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.diffs`: per-file diff hunks for the working tree. `staged` selects
+    /// the HEAD→index diff (`true`) or the index→workdir diff (`false`,
+    /// default); `path` restricts the result to a single file. Returns
+    /// `[{ path, hunks }]`; remote/non-repo workspaces return an empty array
+    /// (wire §7.7).
+    fn git_diffs(
+        &self,
+        workspace_id: WorkspaceId,
+        path: Option<String>,
+        staged: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path, staged);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_diffs not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.commits`: paginated reverse-chronological commit history as the
+    /// canonical §5.5 page envelope `{ items: CommitInfo[], nextToken }`. Remote
+    /// workspaces and non-repositories return an empty page (wire §7.7).
+    fn git_commits(
+        &self,
+        workspace_id: WorkspaceId,
+        limit: Option<i64>,
+        page_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, limit, page_token);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_commits not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `repo.list`: the persistent known-repository registry, most-recently-used
     /// first, as `{ repos: KnownRepo[] }` (PROTOCOL §5.6). Populates the iOS
     /// Create-Workspace picker; the first invocation also lazily syncs repos from
