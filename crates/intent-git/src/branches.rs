@@ -51,7 +51,7 @@ fn local_branches(repo: &Repository) -> Result<Vec<String>> {
 /// when it exists locally, else `main` (matching the TS fallback chain).
 fn default_branch(repo: &Repository, local: &[String]) -> String {
     if let Ok(reference) = repo.find_reference("refs/remotes/origin/HEAD") {
-        if let Some(target) = reference.symbolic_target() {
+        if let Ok(Some(target)) = reference.symbolic_target() {
             if let Some(name) = target.strip_prefix("refs/remotes/origin/") {
                 return name.to_string();
             }

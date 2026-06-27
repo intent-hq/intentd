@@ -77,13 +77,13 @@ pub fn history_since(
         }
         let hash = oid.to_string();
         let is_pushed = has_upstream && !unpushed.contains(&hash);
-        let (agent_id, linked_note_id) = parse_trailers(commit.body().unwrap_or(""));
+        let (agent_id, linked_note_id) = parse_trailers(commit.body().ok().flatten().unwrap_or(""));
         let files = changed_files(&repo, &commit)?;
         let files_changed = files.len();
         let author = commit.author();
         out.push(CommitRecord {
             hash,
-            message: commit.summary().unwrap_or("").to_string(),
+            message: commit.summary().ok().flatten().unwrap_or("").to_string(),
             author: author.name().unwrap_or("").to_string(),
             author_email: author.email().unwrap_or("").to_string(),
             date: iso_from_unix_secs(commit.time().seconds()),

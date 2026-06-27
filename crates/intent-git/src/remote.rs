@@ -59,7 +59,7 @@ pub fn ls_remote_has_branch(
 pub fn origin_url(worktree_path: &Path) -> Result<Option<String>> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let url = match repo.find_remote("origin") {
-        Ok(remote) => remote.url().map(str::to_string),
+        Ok(remote) => remote.url().ok().map(str::to_string),
         Err(_) => None,
     };
     Ok(url)
