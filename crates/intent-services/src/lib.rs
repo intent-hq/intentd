@@ -48,6 +48,7 @@ mod event_ops;
 pub mod events;
 mod file_ops;
 mod git_ops;
+mod github_ops;
 mod history_xml;
 mod note_ops;
 mod pagination;
@@ -5815,6 +5816,370 @@ impl WorkspaceApi for Services {
                      Watched mode: {watch}\nPolls performed: {iterations}"
                 ),
             }))
+        })
+    }
+
+    // ------------------------------------------------------------------------
+    // `github.*` explicit-addressing surface (PROTOCOL §5.27). Every method
+    // takes `(owner, repo[, number])` directly (no workspace/active-PR
+    // resolution) and reuses the `intent-sourcecontrol` engine that backs
+    // `pr.*`; the source-control handle and forge-error mapping are shared with
+    // `pr_ops`, while the GitHub-shaped wire DTOs are rendered by `github_ops`.
+    // ------------------------------------------------------------------------
+
+    fn github_pulls_create(
+        &self,
+        owner: String,
+        repo: String,
+        title: String,
+        body: String,
+        head: String,
+        base: String,
+        draft: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            // `head` is forwarded VERBATIM (no `owner:branch` login prefix) —
+            // the engine sends `input.source_branch` as the raw `head`,
+            // preserving the FE's same-repo-branch bypass (§5.27).
+            let pr = sc
+                .create_pr(
+                    &repo_ref,
+                    intent_sourcecontrol::NewPullRequest {
+                        title,
+                        body: Some(body),
+                        source_branch: head,
+                        target_branch: base,
+                        draft,
+                    },
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({ "pull": github_ops::pull_to_json(&pr) }))
+        })
+    }
+
+    fn github_pulls_get(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let pr = sc
+                .get_pr(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({ "pull": github_ops::pull_to_json(&pr) }))
+        })
+    }
+
+    fn github_pulls_list(
+        &self,
+        owner: String,
+        repo: String,
+        state: Option<String>,
+        head: Option<String>,
+        base: Option<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let state = github_ops::parse_pr_state(state.as_deref())?;
+            let limit = github_ops::clamp_limit(limit);
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let prs = sc
+                .list_prs(
+                    &repo_ref,
+                    intent_sourcecontrol::PrQuery {
+                        state,
+                        base,
+                        head,
+                        author: None,
+                        involvement: None,
+                        limit: Some(limit),
+                    },
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let pulls: Vec<_> = prs.iter().map(github_ops::pull_to_json).collect();
+            Ok(serde_json::json!({ "pulls": pulls, "nextToken": serde_json::Value::Null }))
+        })
+    }
+
+    fn github_pulls_search(
+        &self,
+        owner: String,
+        repo: String,
+        filter: Option<String>,
+        state: Option<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let involvement = github_ops::parse_pr_involvement(filter.as_deref())?;
+            // Search defaults to open PRs (FE `searchGitHubPullRequests`); a
+            // `filter:"all"` carries no involvement constraint and so degrades
+            // to the plain `github.pulls.list` listing the engine performs.
+            let state = match state {
+                Some(s) => github_ops::parse_pr_state(Some(s.as_str()))?,
+                None => Some(intent_sourcecontrol::PrState::Open),
+            };
+            let limit = github_ops::clamp_limit(limit);
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let prs = sc
+                .list_prs(
+                    &repo_ref,
+                    intent_sourcecontrol::PrQuery {
+                        state,
+                        base: None,
+                        head: None,
+                        author: None,
+                        involvement,
+                        limit: Some(limit),
+                    },
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let pulls: Vec<_> = prs.iter().map(github_ops::pull_to_json).collect();
+            Ok(serde_json::json!({ "pulls": pulls, "nextToken": serde_json::Value::Null }))
+        })
+    }
+
+    fn github_pulls_merge(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        merge_method: Option<String>,
+        commit_title: Option<String>,
+        commit_message: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let method = pr_ops::validate_merge_method(merge_method)?;
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let outcome = sc
+                .merge_pr(
+                    &repo_ref,
+                    number,
+                    method,
+                    intent_sourcecontrol::MergeOptions {
+                        commit_title,
+                        commit_message,
+                    },
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({
+                "merged": outcome.merged,
+                "message": outcome.message,
+                "sha": outcome.sha,
+            }))
+        })
+    }
+
+    fn github_pulls_update_branch(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        expected_head_sha: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            // `expectedHeadSha` is accepted for FE shape parity; the engine
+            // `update_branch` does not take a race guard, so it is unused.
+            let _ = expected_head_sha;
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            sc.update_branch(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({
+                "message": "PR branch updated from the base branch.",
+                "url": serde_json::Value::Null,
+            }))
+        })
+    }
+
+    fn github_issues_list(
+        &self,
+        owner: String,
+        repo: String,
+        state: Option<String>,
+        labels: Option<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let state = github_ops::parse_issue_state(state.as_deref())?;
+            let limit = github_ops::clamp_limit(limit);
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let issues = sc
+                .list_issues(
+                    &repo_ref,
+                    intent_sourcecontrol::IssueQuery {
+                        state: Some(state),
+                        labels,
+                        limit: Some(limit),
+                    },
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let items: Vec<_> = issues
+                .iter()
+                .map(|i| github_ops::issue_to_json(i, &repo_ref.owner, &repo_ref.name))
+                .collect();
+            Ok(serde_json::json!({ "issues": items, "nextToken": serde_json::Value::Null }))
+        })
+    }
+
+    fn github_issues_search(
+        &self,
+        owner: String,
+        repo: String,
+        filter: Option<String>,
+        state: Option<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            // Validate `filter` against the FE value set. The host-agnostic
+            // engine has no `/search/issues` capability for issues, so `@me`
+            // involvement cannot be expressed; the search degrades to the
+            // engine's repo-issue listing filtered by state (v1 limitation —
+            // full involvement search needs an engine `search_issues` method).
+            let _ = github_ops::parse_pr_involvement(filter.as_deref())?;
+            let state = match state {
+                Some(s) => github_ops::parse_issue_state(Some(s.as_str()))?,
+                None => "open".to_string(),
+            };
+            let limit = github_ops::clamp_limit(limit);
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let issues = sc
+                .list_issues(
+                    &repo_ref,
+                    intent_sourcecontrol::IssueQuery {
+                        state: Some(state),
+                        labels: None,
+                        limit: Some(limit),
+                    },
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let items: Vec<_> = issues
+                .iter()
+                .map(|i| github_ops::issue_to_json(i, &repo_ref.owner, &repo_ref.name))
+                .collect();
+            Ok(serde_json::json!({ "issues": items, "nextToken": serde_json::Value::Null }))
+        })
+    }
+
+    fn github_list_review_comments(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let limit = github_ops::clamp_limit(limit) as usize;
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let comments = sc
+                .list_review_comments(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let items: Vec<_> = comments
+                .iter()
+                .take(limit)
+                .map(github_ops::review_comment_to_json)
+                .collect();
+            Ok(serde_json::json!({ "comments": items, "nextToken": serde_json::Value::Null }))
+        })
+    }
+
+    fn github_reply_review_comment(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        comment_id: u64,
+        body: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let rc = sc
+                .reply_to_review_comment(&repo_ref, number, comment_id, &body)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({ "comment": github_ops::review_comment_to_json(&rc) }))
+        })
+    }
+
+    fn github_get_review_threads(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let limit = github_ops::clamp_limit(limit) as usize;
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let threads = sc
+                .get_review_threads(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let items: Vec<_> = threads
+                .iter()
+                .take(limit)
+                .map(github_ops::review_thread_to_json)
+                .collect();
+            Ok(serde_json::json!({ "threads": items, "nextToken": serde_json::Value::Null }))
+        })
+    }
+
+    fn github_resolve_thread(&self, thread_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let is_resolved = sc
+                .resolve_thread(&thread_id)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({ "isResolved": is_resolved }))
+        })
+    }
+
+    fn github_unresolve_thread(
+        &self,
+        thread_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let is_resolved = sc
+                .unresolve_thread(&thread_id)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({ "isResolved": is_resolved }))
         })
     }
 

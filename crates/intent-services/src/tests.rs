@@ -2398,7 +2398,13 @@ mod pr {
             unimplemented!()
         }
         async fn list_issues(&self, _: &RepoRef, _: IssueQuery) -> ScResult<Vec<Issue>> {
-            unimplemented!()
+            Ok(vec![Issue {
+                number: 11,
+                title: "Bug report".into(),
+                body: Some("something broke".into()),
+                state: "open".into(),
+                url: "https://github.com/o/r/issues/11".into(),
+            }])
         }
     }
 
@@ -3007,6 +3013,163 @@ mod pr {
             .accept_changes_add_remote(WorkspaceId::new(), "not-a-url".into())
             .await;
         assert!(bad.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // `github.*` explicit-addressing surface (§5.27): owner/repo are passed
+    // directly, so no workspace/PR linkage is needed (`setup_with(.., false)`).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn github_pulls_create_preserves_head_verbatim_and_shapes_dto() {
+        let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
+        let v = svc
+            .github_pulls_create(
+                "octocat".into(),
+                "hello".into(),
+                "Add feature".into(),
+                "desc".into(),
+                "feature/x".into(),
+                "main".into(),
+                false,
+            )
+            .await
+            .expect("create");
+        let pull = &v["pull"];
+        assert_eq!(pull["number"], 7);
+        assert_eq!(pull["state"], "open");
+        assert_eq!(pull["merged"], false);
+        // `head` flows onto the PR head ref unmodified — no `owner:branch` prefix.
+        assert_eq!(pull["headRef"], "feature/x");
+        assert_eq!(pull["baseRef"], "main");
+        assert_eq!(pull["user"]["login"], "octocat");
+    }
+
+    #[tokio::test]
+    async fn github_pulls_get_list_search_shapes() {
+        let (_t, svc, _ws) = setup_with(
+            StubForge {
+                discover: true,
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        let g = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .unwrap();
+        assert_eq!(g["pull"]["number"], 42);
+
+        let l = svc
+            .github_pulls_list(
+                "o".into(),
+                "r".into(),
+                Some("open".into()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(l["pulls"][0]["number"], 42);
+        assert!(l["nextToken"].is_null());
+
+        let s = svc
+            .github_pulls_search(
+                "o".into(),
+                "r".into(),
+                Some("created".into()),
+                Some("open".into()),
+                Some(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(s["pulls"][0]["number"], 42);
+
+        assert!(svc
+            .github_pulls_search("o".into(), "r".into(), Some("nope".into()), None, None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn github_pulls_merge_and_update_branch() {
+        let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
+        let m = svc
+            .github_pulls_merge(
+                "o".into(),
+                "r".into(),
+                42,
+                Some("squash".into()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(m["merged"], true);
+        assert_eq!(m["sha"], "mergedsha");
+
+        let u = svc
+            .github_pulls_update_branch("o".into(), "r".into(), 42, None)
+            .await
+            .unwrap();
+        assert!(u["message"].is_string());
+        assert!(u["url"].is_null());
+    }
+
+    #[tokio::test]
+    async fn github_issues_list_and_search_shapes() {
+        let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
+        let l = svc
+            .github_issues_list("o".into(), "r".into(), Some("open".into()), None, None)
+            .await
+            .unwrap();
+        assert_eq!(l["issues"][0]["number"], 11);
+        assert_eq!(l["issues"][0]["owner"], "o");
+        assert_eq!(l["issues"][0]["repo"], "r");
+        assert!(l["nextToken"].is_null());
+
+        let s = svc
+            .github_issues_search(
+                "o".into(),
+                "r".into(),
+                Some("assigned".into()),
+                Some("open".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(s["issues"][0]["number"], 11);
+    }
+
+    #[tokio::test]
+    async fn github_review_comments_threads_and_resolution() {
+        let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
+        let c = svc
+            .github_list_review_comments("o".into(), "r".into(), 42, None)
+            .await
+            .unwrap();
+        assert_eq!(c["comments"][0]["id"], 5);
+        assert_eq!(c["comments"][0]["user"]["login"], "rev");
+
+        let reply = svc
+            .github_reply_review_comment("o".into(), "r".into(), 42, 5, "thanks".into())
+            .await
+            .unwrap();
+        assert_eq!(reply["comment"]["inReplyToId"], 5);
+
+        let t = svc
+            .github_get_review_threads("o".into(), "r".into(), 42, None)
+            .await
+            .unwrap();
+        assert_eq!(t["threads"][0]["id"], "RT1");
+        assert_eq!(t["threads"][0]["comments"][0]["author"]["login"], "rev");
+
+        let r = svc.github_resolve_thread("RT1".into()).await.unwrap();
+        assert_eq!(r["isResolved"], true);
+        let ur = svc.github_unresolve_thread("RT1".into()).await.unwrap();
+        assert_eq!(ur["isResolved"], false);
     }
 }
 

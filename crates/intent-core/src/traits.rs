@@ -1508,6 +1508,240 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    // ------------------------------------------------------------------------
+    // `github.*` explicit-addressing surface (PROTOCOL §5.27). Unlike `pr.*`
+    // (workspace/active-PR scoped), every data method takes `(owner, repo[,
+    // number])` directly. Backed by the same `intent-sourcecontrol` engine.
+    // ------------------------------------------------------------------------
+
+    /// `github.pulls.create`: open a PR with `head` sent **verbatim** (no
+    /// `owner:branch` login prefix) — `{ pull }` (PROTOCOL §5.27).
+    #[allow(clippy::too_many_arguments)]
+    fn github_pulls_create(
+        &self,
+        owner: String,
+        repo: String,
+        title: String,
+        body: String,
+        head: String,
+        base: String,
+        draft: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, title, body, head, base, draft);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_pulls_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.pulls.get`: `GET /repos/{owner}/{repo}/pulls/{number}` → `{ pull }`.
+    fn github_pulls_get(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_pulls_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.pulls.list`: `GET /repos/{owner}/{repo}/pulls` → `{ pulls, nextToken }`.
+    fn github_pulls_list(
+        &self,
+        owner: String,
+        repo: String,
+        state: Option<String>,
+        head: Option<String>,
+        base: Option<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, state, head, base, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_pulls_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.pulls.search`: `GET /search/issues` (`is:pr` + `@me`
+    /// involvement) → `{ pulls, nextToken }`.
+    fn github_pulls_search(
+        &self,
+        owner: String,
+        repo: String,
+        filter: Option<String>,
+        state: Option<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, filter, state, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_pulls_search not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.pulls.merge`: `PUT /repos/{owner}/{repo}/pulls/{number}/merge`
+    /// → `{ merged, message, sha? }`.
+    #[allow(clippy::too_many_arguments)]
+    fn github_pulls_merge(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        merge_method: Option<String>,
+        commit_title: Option<String>,
+        commit_message: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            owner,
+            repo,
+            number,
+            merge_method,
+            commit_title,
+            commit_message,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_pulls_merge not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.pulls.updateBranch`:
+    /// `PUT /repos/{owner}/{repo}/pulls/{number}/update-branch` → `{ message, url? }`.
+    fn github_pulls_update_branch(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        expected_head_sha: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number, expected_head_sha);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_pulls_update_branch not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.issues.list`: `GET /repos/{owner}/{repo}/issues` (PRs filtered
+    /// out) → `{ issues, nextToken }`.
+    fn github_issues_list(
+        &self,
+        owner: String,
+        repo: String,
+        state: Option<String>,
+        labels: Option<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, state, labels, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_issues_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.issues.search`: `GET /search/issues` (`is:issue`) →
+    /// `{ issues, nextToken }`.
+    fn github_issues_search(
+        &self,
+        owner: String,
+        repo: String,
+        filter: Option<String>,
+        state: Option<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, filter, state, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_issues_search not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.listReviewComments`:
+    /// `GET /repos/{owner}/{repo}/pulls/{number}/comments` → `{ comments, nextToken }`.
+    fn github_list_review_comments(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_list_review_comments not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.replyReviewComment`: reply to a review comment
+    /// (`inReplyToId = commentId`) → `{ comment }`.
+    fn github_reply_review_comment(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        comment_id: u64,
+        body: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number, comment_id, body);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_reply_review_comment not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.getReviewThreads`: GraphQL `pullRequest.reviewThreads` →
+    /// `{ threads, nextToken }`.
+    fn github_get_review_threads(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_get_review_threads not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.resolveThread`: GraphQL `resolveReviewThread` → `{ isResolved: true }`.
+    fn github_resolve_thread(&self, thread_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = thread_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_resolve_thread not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.unresolveThread`: GraphQL `unresolveReviewThread` →
+    /// `{ isResolved: false }`.
+    fn github_unresolve_thread(
+        &self,
+        thread_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = thread_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_unresolve_thread not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `file-tracking.init`: initialize/attach the tracker for a workspace
     /// (`{ ok: true }`) (PROTOCOL §5.19).
     fn file_tracking_init(

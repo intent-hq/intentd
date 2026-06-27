@@ -1099,6 +1099,163 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        // `github.*` explicit-addressing surface (PROTOCOL §5.27): every data
+        // method takes `(owner, repo[, number])` rather than resolving from the
+        // workspace. `limit` falls back to the FE's `perPage` spelling.
+        "github.pulls.create" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let title = require_str_param(params, "title")?;
+            let body = require_str_param(params, "body")?;
+            let head = require_str_param(params, "head")?;
+            let base = require_str_param(params, "base")?;
+            let draft = parse_bool(params, "draft");
+            let r = api
+                .github_pulls_create(owner, repo, title, body, head, base, draft)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.pulls.get" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let number = require_u64(params, "number")?;
+            let r = api
+                .github_pulls_get(owner, repo, number)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.pulls.list" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let state = opt_str(params, "state");
+            let head = opt_str(params, "head");
+            let base = opt_str(params, "base");
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let r = api
+                .github_pulls_list(owner, repo, state, head, base, limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.pulls.search" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let filter = opt_str(params, "filter");
+            let state = opt_str(params, "state");
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let r = api
+                .github_pulls_search(owner, repo, filter, state, limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.pulls.merge" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let number = require_u64(params, "number")?;
+            let merge_method = opt_str(params, "mergeMethod");
+            let commit_title = opt_str(params, "commitTitle");
+            let commit_message = opt_str(params, "commitMessage");
+            let r = api
+                .github_pulls_merge(
+                    owner,
+                    repo,
+                    number,
+                    merge_method,
+                    commit_title,
+                    commit_message,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.pulls.updateBranch" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let number = require_u64(params, "number")?;
+            let expected_head_sha = opt_str(params, "expectedHeadSha");
+            let r = api
+                .github_pulls_update_branch(owner, repo, number, expected_head_sha)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.issues.list" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let state = opt_str(params, "state");
+            let labels = opt_str(params, "labels");
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let r = api
+                .github_issues_list(owner, repo, state, labels, limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.issues.search" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let filter = opt_str(params, "filter");
+            let state = opt_str(params, "state");
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let r = api
+                .github_issues_search(owner, repo, filter, state, limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.listReviewComments" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let number = require_u64(params, "number")?;
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let r = api
+                .github_list_review_comments(owner, repo, number, limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.replyReviewComment" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let number = require_u64(params, "number")?;
+            let comment_id = require_u64(params, "commentId")?;
+            let body = require_str_param(params, "body")?;
+            let r = api
+                .github_reply_review_comment(owner, repo, number, comment_id, body)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.getReviewThreads" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let number = require_u64(params, "number")?;
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let r = api
+                .github_get_review_threads(owner, repo, number, limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.resolveThread" => {
+            let thread_id = require_str_param(params, "threadId")?;
+            let r = api
+                .github_resolve_thread(thread_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.unresolveThread" => {
+            let thread_id = require_str_param(params, "threadId")?;
+            let r = api
+                .github_unresolve_thread(thread_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "file-tracking.init" => {
             let ws = require_ws_note(params)?;
             let r = api.file_tracking_init(ws).await.map_err(domain_to_rpc)?;
@@ -1758,6 +1915,17 @@ fn require_str_param(params: &Map<String, Value>, name: &str) -> Result<String, 
             format!("Missing required parameter: {name}"),
         )),
     }
+}
+
+/// Require a `u64` param (used for the explicit `github.*` `number` /
+/// `commentId`); absent/non-numeric → `-32602`.
+fn require_u64(params: &Map<String, Value>, name: &str) -> Result<u64, RpcErr> {
+    params.get(name).and_then(Value::as_u64).ok_or_else(|| {
+        rpc(
+            INVALID_PARAMS,
+            format!("Missing required parameter: {name}"),
+        )
+    })
 }
 
 /// Require a param be present and non-null (used for numeric `start`/`end`).
