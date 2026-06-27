@@ -42,9 +42,9 @@ impl Drop for TempDb {
 
 const ACP_SID: &str = "acp-session-1";
 
-/// Mock agent: answers the lifecycle methods; `session/prompt` streams two text
-/// chunks and one tool call, then resolves with `end_turn`.
-fn spawn_mock_agent<R, W>(read: R, write: W) -> JoinHandle<()>
+/// Mock agent that answers the lifecycle methods; `session/prompt` streams the
+/// caller-supplied `session/update` burst, then resolves with `end_turn`.
+fn spawn_mock_agent_with<R, W>(read: R, write: W, updates: Vec<String>) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -63,7 +63,7 @@ where
                 continue;
             };
             if method == "session/prompt" {
-                for note in prompt_updates() {
+                for note in &updates {
                     write
                         .write_all(format!("{note}\n").as_bytes())
                         .await
@@ -117,6 +117,44 @@ fn prompt_updates() -> Vec<String> {
     vec![chunk("Hello "), chunk("world"), tool]
 }
 
+/// A prompt turn that streams one text chunk, a `tool_call` (started), then a
+/// `tool_call_update` that completes it with output — exercises tool_use +
+/// tool_result block accumulation (CS-0 D6).
+fn prompt_updates_with_tool_result() -> Vec<String> {
+    let chunk = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "Working " } }
+        }
+    })
+    .to_string();
+    let tool_call = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": "Run tests", "kind": "execute", "status": "in_progress",
+                "rawInput": { "path": "." } }
+        }
+    })
+    .to_string();
+    let tool_done = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "completed", "rawOutput": { "summary": "12 passed" } }
+        }
+    })
+    .to_string();
+    vec![chunk, tool_call, tool_done]
+}
+
 /// Wire a `Connection` to a fresh mock agent, returning the connection, its
 /// notification receiver, and the agent task handle.
 fn connect() -> (
@@ -124,9 +162,20 @@ fn connect() -> (
     mpsc::UnboundedReceiver<IncomingNotification>,
     JoinHandle<()>,
 ) {
+    connect_with(prompt_updates())
+}
+
+/// [`connect`] with a caller-supplied prompt-update burst.
+fn connect_with(
+    updates: Vec<String>,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+) {
     let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
     let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
-    let agent = spawn_mock_agent(c2a_agent, a2c_agent);
+    let agent = spawn_mock_agent_with(c2a_agent, a2c_agent, updates);
     let (note_tx, note_rx) = mpsc::unbounded_channel();
     let hooks = ConnectionHooks {
         notifications: Some(note_tx),
@@ -301,7 +350,7 @@ async fn prompt_turn_streams_events_and_accumulates() {
     assert_eq!(tool.data["status"], json!("started"));
     assert_eq!(tool.data["input"], json!({ "path": "src/lib.rs" }));
 
-    // Chunks accumulate into one assistant message (coalesced text).
+    // Chunks accumulate into one assistant message (coalesced text + tool block).
     let messages = bus
         .store()
         .get_agent_messages(&agent_id, None)
@@ -309,10 +358,34 @@ async fn prompt_turn_streams_events_and_accumulates() {
         .expect("read messages");
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].role, "assistant");
+    let mid = &messages[0].id;
+    // The coalesced text block is block 0; the tool_use block is block 1, each
+    // carrying the stable id `{messageId}:{index}` (CS-0 D1/D6).
     assert_eq!(
         messages[0].content,
-        json!([{ "type": "text", "text": "Hello world" }])
+        json!([
+            { "type": "text", "id": format!("{mid}:0"), "text": "Hello world" },
+            { "type": "tool_use", "id": format!("{mid}:1"), "name": "Edit src/lib.rs",
+              "input": { "path": "src/lib.rs" }, "toolCallId": "t1",
+              "metadata": { "toolKind": "file", "status": "started" } },
+        ])
     );
+
+    // The streaming chunk events carry the SAME stable block id across both
+    // text chunks; the persisted message id is the block-id prefix (D1/D4).
+    let chunks: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:chunk")
+        .collect();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].data["blockId"], json!(format!("{mid}:0")));
+    assert_eq!(chunks[1].data["blockId"], json!(format!("{mid}:0")));
+    assert_eq!(chunks[0].data["blockIndex"], json!(0));
+    assert_eq!(chunks[1].data["blockIndex"], json!(0));
+    // The tool block gets its own (next) id, and the tool event carries it.
+    assert_eq!(tool.data["blockId"], json!(format!("{mid}:1")));
+    assert_eq!(tool.data["blockIndex"], json!(1));
+    assert_eq!(tool.data["messageId"], json!(mid));
 }
 
 /// A `session/update` notification shaped like the prior-conversation replay
@@ -426,9 +499,87 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
         .await
         .expect("read messages");
     assert_eq!(messages.len(), 1, "only the real turn is accumulated");
+    let mid = &messages[0].id;
     assert_eq!(
         messages[0].content,
-        json!([{ "type": "text", "text": "Hello world" }])
+        json!([
+            { "type": "text", "id": format!("{mid}:0"), "text": "Hello world" },
+            { "type": "tool_use", "id": format!("{mid}:1"), "name": "Edit src/lib.rs",
+              "input": { "path": "src/lib.rs" }, "toolCallId": "t1",
+              "metadata": { "toolKind": "file", "status": "started" } },
+        ])
+    );
+}
+
+/// A tool that streams `tool_call` (started) then `tool_call_update` (completed
+/// with output) persists BOTH a `tool_use` and a `tool_result` block, each with
+/// a stable id, and the second event carries the matching block identity while
+/// preserving the legacy fields additively (CS-0 D4/D6).
+#[tokio::test]
+async fn tool_call_then_update_persists_use_and_result_blocks() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates_with_tool_result());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("go")],
+        )
+        .await
+        .expect("turn completes");
+
+    // chunk, tool_call, tool_call_update, stream:end, idle.
+    let mut events = Vec::new();
+    while events.len() < 5 {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    let mid = &messages[0].id;
+    // text(0) → tool_use(1) patched to completed → tool_result(2) with output.
+    assert_eq!(
+        messages[0].content,
+        json!([
+            { "type": "text", "id": format!("{mid}:0"), "text": "Working " },
+            { "type": "tool_use", "id": format!("{mid}:1"), "name": "Run tests",
+              "input": { "path": "." }, "toolCallId": "t1",
+              "metadata": { "toolKind": "terminal", "status": "completed" } },
+            { "type": "tool_result", "id": format!("{mid}:2"), "tool_use_id": "t1",
+              "output": { "summary": "12 passed" }, "is_error": false },
+        ])
+    );
+
+    // Both tool events target the SAME tool_use block id (the result update
+    // patches the existing block in place rather than re-indexing).
+    let tool_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:tool:call")
+        .collect();
+    assert_eq!(tool_events.len(), 2);
+    for e in &tool_events {
+        assert_eq!(e.data["blockId"], json!(format!("{mid}:1")));
+        assert_eq!(e.data["blockIndex"], json!(1));
+        assert_eq!(e.data["toolCallId"], json!("t1"));
+    }
+    // The completing update carries status + output additively.
+    assert_eq!(tool_events[1].data["status"], json!("completed"));
+    assert_eq!(
+        tool_events[1].data["output"],
+        json!({ "summary": "12 passed" })
     );
 }
 

@@ -237,6 +237,23 @@ impl Store {
         content: &serde_json::Value,
         created_at: &str,
     ) -> Result<AgentMessage> {
+        let id = Uuid::now_v7().to_string();
+        self.append_agent_message_with_id(agent_id, &id, role, content, created_at)
+            .await
+    }
+
+    /// Append a message with a caller-supplied id (the assistant turn mints its
+    /// `messageId` at turn start so streaming block ids `{messageId}:{index}`
+    /// match the persisted blocks — CS-0 D1), allocating the next monotonic
+    /// `seq` and returning the persisted [`AgentMessage`].
+    pub async fn append_agent_message_with_id(
+        &self,
+        agent_id: &AgentId,
+        id: &str,
+        role: &str,
+        content: &serde_json::Value,
+        created_at: &str,
+    ) -> Result<AgentMessage> {
         let seq: i64 = sqlx::query(
             "SELECT COALESCE(MAX(seq), -1) + 1 AS next FROM agent_message WHERE agent_id = ?",
         )
@@ -245,12 +262,11 @@ impl Store {
         .await
         .map_err(|e| Error::Internal(format!("next agent message seq failed: {e}")))?
         .get::<i64, _>("next");
-        let id = Uuid::now_v7().to_string();
         let content_json = serde_json::to_string(content)
             .map_err(|e| Error::Internal(format!("encode message content failed: {e}")))?;
         let sql = format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?)");
         sqlx::query(&sql)
-            .bind(&id)
+            .bind(id)
             .bind(&agent_id.0)
             .bind(seq)
             .bind(role)
@@ -260,7 +276,7 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
         Ok(AgentMessage {
-            id,
+            id: id.to_string(),
             agent_id: agent_id.clone(),
             seq,
             role: role.to_string(),

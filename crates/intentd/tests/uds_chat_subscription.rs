@@ -1,0 +1,1235 @@
+//! Integration tests for the per-agent `chat` subscription channel (CS-0) over
+//! UDS: `chat.subscribe {agentId}` returns `{ subscriptionId }`, then a
+//! `subscription.push` snapshot (seq 0) equal to the agent's newest
+//! `agent.getConversation` page (the `messages[]` OBJECT shape, CS-0 D3).
+//! `chat.unsubscribe` cleans up; a missing `agentId` is `-32602`; snapshots are
+//! isolated per agent. CS-3 adds the live delta mapper: a mock streaming turn
+//! (text chunks + a tool call + `stream:end`) is driven over the bus and the
+//! emitted `subscription.push` deltas are reduced on top of the seq-0 snapshot
+//! and asserted to equal a fresh `agent.getConversation` snapshot (the
+//! reconciliation invariant).
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use intent_core::events::{AGENT_STREAM_CHUNK, AGENT_STREAM_END, AGENT_TOOL_CALL};
+use intent_core::{now_iso, ActorType, AgentId, EventActor, WorkspaceId};
+use intent_services::{EventBus, Services};
+use intent_store::{NewEvent, Store};
+use intent_transport::serve_uds;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedReadHalf;
+use tokio::net::UnixStream;
+use tokio::sync::oneshot;
+use tokio::time::timeout;
+use uuid::Uuid;
+
+struct TempDb {
+    path: PathBuf,
+}
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
+        }
+    }
+}
+
+async fn connect_retry(socket: &PathBuf) -> UnixStream {
+    for _ in 0..100 {
+        if let Ok(s) = UnixStream::connect(socket).await {
+            return s;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("could not connect to {}", socket.display());
+}
+
+async fn send(write_half: &mut (impl AsyncWriteExt + Unpin), frame: &str) {
+    write_half.write_all(frame.as_bytes()).await.unwrap();
+    write_half.write_all(b"\n").await.unwrap();
+    write_half.flush().await.unwrap();
+}
+
+async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
+    let mut line = String::new();
+    let n = timeout(Duration::from_secs(2), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for a frame")
+        .expect("read failed");
+    assert!(n > 0, "connection closed unexpectedly");
+    serde_json::from_str(line.trim_end()).expect("invalid JSON frame")
+}
+
+async fn rpc(
+    write_half: &mut (impl AsyncWriteExt + Unpin),
+    reader: &mut BufReader<OwnedReadHalf>,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> Value {
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    send(write_half, &serde_json::to_string(&frame).unwrap()).await;
+    let resp = read_json(reader).await;
+    assert_eq!(resp["id"], id, "response id mismatch for {method}");
+    assert!(resp.get("error").is_none(), "rpc {method} errored: {resp}");
+    resp["result"].clone()
+}
+
+async fn boot(
+    bus: &EventBus,
+) -> (
+    PathBuf,
+    tokio::task::JoinHandle<()>,
+    oneshot::Sender<()>,
+    Arc<Services>,
+) {
+    let socket = std::env::temp_dir().join(format!("intentd-uds-{}.sock", Uuid::new_v4()));
+    // Keep a typed handle so tests can drive the live-turn slot directly (the
+    // server is handed the same handle coerced to `Arc<dyn WorkspaceApi>`).
+    let services = Arc::new(Services::new(bus.store().clone()).with_event_bus(bus.clone()));
+    let api: Arc<dyn intent_core::WorkspaceApi> = services.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let bus = bus.clone();
+        let socket = socket.clone();
+        async move {
+            let _ = serve_uds(api, bus, &socket, None, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        }
+    });
+    (socket, server, shutdown_tx, services)
+}
+
+/// Create a workspace + agent on a fresh control connection; return `(socket,
+/// server, shutdown_tx, ws_id, agent_id)` plus the live rpc connection halves.
+async fn setup() -> (
+    PathBuf,
+    tokio::task::JoinHandle<()>,
+    oneshot::Sender<()>,
+    TempDb,
+    Arc<Services>,
+) {
+    let tmp = TempDb {
+        path: std::env::temp_dir().join(format!("intentd-uds-{}.db", Uuid::new_v4())),
+    };
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let (socket, server, shutdown_tx, services) = boot(&bus).await;
+    (socket, server, shutdown_tx, tmp, services)
+}
+
+/// Like [`setup`] but also returns the live [`EventBus`] so a test can persist
+/// messages and publish `agent:stream:*` events that drive the chat forwarder.
+async fn setup_with_bus() -> (
+    PathBuf,
+    tokio::task::JoinHandle<()>,
+    oneshot::Sender<()>,
+    TempDb,
+    EventBus,
+    Arc<Services>,
+) {
+    let tmp = TempDb {
+        path: std::env::temp_dir().join(format!("intentd-uds-{}.db", Uuid::new_v4())),
+    };
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let (socket, server, shutdown_tx, services) = boot(&bus).await;
+    (socket, server, shutdown_tx, tmp, bus, services)
+}
+
+/// Publish one `agent:stream:*` event scoped to `agent_id` (the chat forwarder
+/// filters on `sessionId == agentId`), mirroring `publish_agent_event`.
+async fn publish_stream(
+    bus: &EventBus,
+    ws_id: &str,
+    agent_id: &str,
+    event_type: &str,
+    data: Value,
+) {
+    let ev = NewEvent {
+        workspace_id: WorkspaceId::from(ws_id),
+        timestamp: now_iso(),
+        event_type: event_type.to_string(),
+        actor: EventActor {
+            actor_type: ActorType::Agent,
+            id: Some(agent_id.to_string()),
+            ..Default::default()
+        },
+        session_id: Some(agent_id.to_string()),
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    };
+    bus.publish(&ev).await.expect("publish stream event");
+}
+
+/// Apply one delta entity (`{ messageId, role, messageSeq?, timestamp?, block }`)
+/// onto a reconstructed `messages[]`: find-or-create the message envelope, refresh
+/// any authoritative fields, then upsert the block by id (preserving order).
+fn apply_entity(messages: &mut Vec<Value>, entity: &Value) {
+    let message_id = entity["messageId"].as_str().expect("messageId").to_string();
+    let idx = messages
+        .iter()
+        .position(|m| m["id"].as_str() == Some(message_id.as_str()))
+        .unwrap_or_else(|| {
+            messages.push(json!({
+                "id": message_id,
+                "agentId": Value::Null,
+                "seq": Value::Null,
+                "role": Value::Null,
+                "contentBlocks": [],
+                "timestamp": Value::Null,
+            }));
+            messages.len() - 1
+        });
+    let msg = &mut messages[idx];
+    if let Some(v) = entity.get("agentId") {
+        msg["agentId"] = v.clone();
+    }
+    if let Some(v) = entity.get("role") {
+        msg["role"] = v.clone();
+    }
+    if let Some(v) = entity.get("messageSeq") {
+        msg["seq"] = v.clone();
+    }
+    if let Some(v) = entity.get("timestamp") {
+        msg["timestamp"] = v.clone();
+    }
+    // The terminal reconcile (`streamingComplete: true`) flips an in-flight
+    // message to its durable form: a client drops the transient `isStreaming`
+    // render hint the mid-turn snapshot carried so it converges to the persisted
+    // (non-streaming) message.
+    if entity.get("streamingComplete") == Some(&Value::Bool(true)) {
+        if let Some(obj) = msg.as_object_mut() {
+            obj.remove("isStreaming");
+        }
+    }
+    let block = entity["block"].clone();
+    let block_id = block["id"].as_str().expect("block id").to_string();
+    let blocks = msg["contentBlocks"].as_array_mut().expect("contentBlocks");
+    match blocks
+        .iter()
+        .position(|b| b["id"].as_str() == Some(block_id.as_str()))
+    {
+        Some(bi) => blocks[bi] = block,
+        None => blocks.push(block),
+    }
+}
+
+/// Reduce one `{ added, updated, removedIds }` delta onto `messages` (added then
+/// updated upserts, then `removedIds` block removals).
+fn apply_delta(messages: &mut Vec<Value>, delta: &Value) {
+    for key in ["added", "updated"] {
+        for entity in delta[key].as_array().into_iter().flatten() {
+            apply_entity(messages, entity);
+        }
+    }
+    for removed in delta["removedIds"].as_array().into_iter().flatten() {
+        let Some(id) = removed.as_str() else { continue };
+        for msg in messages.iter_mut() {
+            if let Some(blocks) = msg["contentBlocks"].as_array_mut() {
+                blocks.retain(|b| b["id"].as_str() != Some(id));
+            }
+        }
+    }
+}
+
+/// Whether a delta is the terminal (`stream:end`) reconcile frame — its entities
+/// carry `streamingComplete: true`.
+fn is_terminal_delta(delta: &Value) -> bool {
+    ["added", "updated"].iter().any(|key| {
+        delta[*key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|e| e.get("streamingComplete") == Some(&Value::Bool(true)))
+    })
+}
+
+#[tokio::test]
+async fn chat_subscribe_snapshot_matches_conversation_then_unsubscribe() {
+    let (socket, server, shutdown_tx, _tmp, _services) = setup().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A1" }),
+    )
+    .await;
+    let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+    // The expected newest page is exactly what `agent.getConversation` returns.
+    let want = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        12,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe", "params": { "agentId": agent_id } }),
+        )
+        .unwrap(),
+    )
+    .await;
+    let resp = read_json(&mut sub_reader).await;
+    assert_eq!(resp["id"], 1);
+    assert!(resp["result"]["subscriptionId"].as_str().is_some());
+
+    let snap = read_json(&mut sub_reader).await;
+    assert_eq!(snap["params"]["kind"], "snapshot");
+    assert_eq!(snap["params"]["seq"], 0);
+    // seq-0 snapshot equals the agent's newest conversation page (object shape).
+    assert_eq!(snap["params"]["snapshot"], want);
+    assert_eq!(snap["params"]["snapshot"]["agentId"], agent_id.as_str());
+
+    // chat.unsubscribe cleans up the subscription.
+    let ok = rpc(
+        &mut sub_write,
+        &mut sub_reader,
+        2,
+        "chat.unsubscribe",
+        json!({ "subscriptionId": resp["result"]["subscriptionId"] }),
+    )
+    .await;
+    assert_eq!(ok["success"], true);
+    let again = rpc(
+        &mut sub_write,
+        &mut sub_reader,
+        3,
+        "chat.unsubscribe",
+        json!({ "subscriptionId": resp["result"]["subscriptionId"] }),
+    )
+    .await;
+    assert_eq!(again["success"], false, "second unsubscribe is a no-op");
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn chat_subscribe_missing_agent_id_is_invalid_params() {
+    let (socket, server, shutdown_tx, _tmp, _services) = setup().await;
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe", "params": {} }),
+        )
+        .unwrap(),
+    )
+    .await;
+    let resp = read_json(&mut sub_reader).await;
+    assert_eq!(resp["id"], 1);
+    assert_eq!(resp["error"]["code"], -32602);
+    assert!(resp["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("agentId is required"));
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn chat_subscribe_isolates_snapshot_per_agent() {
+    let (socket, server, shutdown_tx, _tmp, _services) = setup().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A" }),
+    )
+    .await;
+    let b = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        12,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "B" }),
+    )
+    .await;
+    let a_id = a["agent"]["id"].as_str().unwrap().to_string();
+    let b_id = b["agent"]["id"].as_str().unwrap().to_string();
+    assert_ne!(a_id, b_id);
+
+    for agent_id in [&a_id, &b_id] {
+        let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+        let mut sub_reader = tokio::io::BufReader::new(sub_read);
+        send(
+            &mut sub_write,
+            &serde_json::to_string(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
+                "params": { "agentId": agent_id }
+            }))
+            .unwrap(),
+        )
+        .await;
+        let _resp = read_json(&mut sub_reader).await;
+        let snap = read_json(&mut sub_reader).await;
+        // Each subscription's snapshot is scoped to its own agent.
+        assert_eq!(snap["params"]["snapshot"]["agentId"], agent_id.as_str());
+    }
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// CS-3 reconciliation invariant: the seq-0 snapshot reduced with the live
+/// `stream:chunk`/`tool:call`/`stream:end` deltas equals a fresh
+/// `agent.getConversation` snapshot. Drives a mock turn — two text chunks that
+/// coalesce onto one block (added → updated), a tool call (tool_use → tool_use
+/// updated + tool_result added), then trailing text — persists the assistant
+/// message exactly as `run_prompt_turn` would, and finally emits `stream:end`.
+#[tokio::test]
+async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
+    let (socket, server, shutdown_tx, _tmp, bus, _services) = setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A1" }),
+    )
+    .await;
+    let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+
+    // A persisted user message makes the seq-0 snapshot non-trivial; it must be
+    // preserved untouched through reconciliation.
+    let store = bus.store();
+    let user_id = Uuid::now_v7().to_string();
+    store
+        .append_agent_message_with_id(
+            &AgentId::from(agent_id.as_str()),
+            &user_id,
+            "user",
+            &json!([{ "type": "text", "id": format!("{user_id}:0"), "text": "Run the tests" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append user message");
+
+    // Subscribe AFTER the user message exists so it lands in the seq-0 snapshot.
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
+            "params": { "agentId": agent_id }
+        }))
+        .unwrap(),
+    )
+    .await;
+    let resp = read_json(&mut sub_reader).await;
+    assert_eq!(resp["id"], 1);
+    let snap = read_json(&mut sub_reader).await;
+    assert_eq!(snap["params"]["kind"], "snapshot");
+    assert_eq!(snap["params"]["seq"], 0);
+    let mut reconstructed: Vec<Value> = snap["params"]["snapshot"]["messages"]
+        .as_array()
+        .cloned()
+        .expect("snapshot messages");
+    assert_eq!(reconstructed.len(), 1, "snapshot holds the user message");
+
+    // Drive the assistant turn over the bus (enriched payloads per CS-1 D4).
+    let mid = Uuid::now_v7().to_string();
+    let chunk = |idx: u64, text: &str| {
+        json!({
+            "agentId": agent_id, "content": text, "messageId": mid,
+            "blockIndex": idx, "blockId": format!("{mid}:{idx}"), "blockType": "text",
+        })
+    };
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_STREAM_CHUNK,
+        chunk(0, "I'll run "),
+    )
+    .await;
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_STREAM_CHUNK,
+        chunk(0, "the tests."),
+    )
+    .await;
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_TOOL_CALL,
+        json!({
+            "agentId": agent_id, "toolName": "run_tests", "toolKind": "terminal",
+            "toolCallId": "call_abc", "input": { "path": "." }, "status": "started",
+            "messageId": mid, "blockIndex": 1, "blockId": format!("{mid}:1"),
+        }),
+    )
+    .await;
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_TOOL_CALL,
+        json!({
+            "agentId": agent_id, "toolName": "run_tests", "toolKind": "terminal",
+            "toolCallId": "call_abc", "input": { "path": "." }, "status": "completed",
+            "output": "12 passed", "messageId": mid, "blockIndex": 1,
+            "blockId": format!("{mid}:1"),
+        }),
+    )
+    .await;
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_STREAM_CHUNK,
+        chunk(3, "Done."),
+    )
+    .await;
+
+    // Persist the assistant message BEFORE stream:end (as run_prompt_turn does),
+    // so the terminal reconcile re-reads the now-durable transcript.
+    store
+        .append_agent_message_with_id(
+            &AgentId::from(agent_id.as_str()),
+            &mid,
+            "assistant",
+            &json!([
+                { "type": "text", "id": format!("{mid}:0"), "text": "I'll run the tests." },
+                { "type": "tool_use", "id": format!("{mid}:1"), "name": "run_tests",
+                  "input": { "path": "." }, "toolCallId": "call_abc",
+                  "metadata": { "toolKind": "terminal", "status": "completed" } },
+                { "type": "tool_result", "id": format!("{mid}:2"), "tool_use_id": "call_abc",
+                  "output": "12 passed", "is_error": false },
+                { "type": "text", "id": format!("{mid}:3"), "text": "Done." },
+            ]),
+            &now_iso(),
+        )
+        .await
+        .expect("append assistant message");
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_STREAM_END,
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+
+    // Reduce every delta onto the snapshot until the terminal frame arrives.
+    let mut expected_seq = 1u64;
+    let mut saw_tool_result = false;
+    let mut saw_text_growth = false;
+    loop {
+        let frame = read_json(&mut sub_reader).await;
+        assert_eq!(frame["params"]["kind"], "delta");
+        assert_eq!(
+            frame["params"]["seq"].as_u64().unwrap(),
+            expected_seq,
+            "delta seq is monotonic from 1"
+        );
+        expected_seq += 1;
+        let delta = frame["params"]["delta"].clone();
+        if delta["updated"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|e| e["block"]["id"].as_str() == Some(format!("{mid}:0").as_str()))
+        {
+            saw_text_growth = true;
+        }
+        if delta["added"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|e| e["block"]["type"].as_str() == Some("tool_result"))
+        {
+            saw_tool_result = true;
+        }
+        apply_delta(&mut reconstructed, &delta);
+        if is_terminal_delta(&delta) {
+            break;
+        }
+    }
+    assert!(saw_text_growth, "a text block grew via an updated delta");
+    assert!(saw_tool_result, "a tool_result block was added");
+
+    // The reduced state must equal a fresh getConversation snapshot exactly.
+    let want = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        12,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        Value::Array(reconstructed),
+        want["messages"],
+        "snapshot + deltas reconcile to the fresh conversation snapshot"
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// CS-4 mid-turn resume (CS-0 D5): a `chat.subscribe` arriving WHILE a turn is
+/// streaming receives a coherent snapshot — the persisted messages PLUS the
+/// in-flight partial assistant message (`isStreaming: true`) reconstructed from
+/// the live-turn slot. Its first continuing chunk carries the FULL accumulated
+/// text (proving the delta state was seeded from the snapshot), and the
+/// snapshot + deltas reconcile to a fresh `agent.getConversation` snapshot.
+#[tokio::test]
+async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
+    let (socket, server, shutdown_tx, _tmp, bus, services) = setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A1" }),
+    )
+    .await;
+    let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    // A persisted user message (seq 0): the durable part of the snapshot.
+    let store = bus.store();
+    let user_id = Uuid::now_v7().to_string();
+    store
+        .append_agent_message_with_id(
+            &agent,
+            &user_id,
+            "user",
+            &json!([{ "type": "text", "id": format!("{user_id}:0"), "text": "Run the tests" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append user message");
+
+    // Simulate a turn ALREADY mid-flight: the assistant has streamed "I'll run "
+    // into block {mid}:0 but nothing is persisted yet (run_prompt_turn drives this
+    // slot via begin_live_turn/update_live_turn).
+    let mid = Uuid::now_v7().to_string();
+    services.set_live_turn(
+        &agent,
+        &mid,
+        vec![json!({ "type": "text", "id": format!("{mid}:0"), "text": "I'll run " })],
+    );
+
+    // Subscribe mid-turn: the snapshot must merge the in-flight message.
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
+            "params": { "agentId": agent_id }
+        }))
+        .unwrap(),
+    )
+    .await;
+    let resp = read_json(&mut sub_reader).await;
+    assert_eq!(resp["id"], 1);
+    let snap = read_json(&mut sub_reader).await;
+    assert_eq!(snap["params"]["kind"], "snapshot");
+    assert_eq!(snap["params"]["snapshot"]["totalMessages"], 2);
+    let mut reconstructed: Vec<Value> = snap["params"]["snapshot"]["messages"]
+        .as_array()
+        .cloned()
+        .expect("snapshot messages");
+    assert_eq!(
+        reconstructed.len(),
+        2,
+        "snapshot merges user + in-flight assistant message"
+    );
+    let inflight = &reconstructed[1];
+    assert_eq!(inflight["id"], mid.as_str());
+    assert_eq!(inflight["isStreaming"], true);
+    assert_eq!(
+        inflight["seq"], 1,
+        "in-flight seq is the next monotonic value"
+    );
+    assert_eq!(inflight["role"], "assistant");
+    assert_eq!(inflight["contentBlocks"][0]["text"], "I'll run ");
+
+    // Continue the turn over the bus.
+    let chunk = |idx: u64, text: &str| {
+        json!({
+            "agentId": agent_id, "content": text, "messageId": mid,
+            "blockIndex": idx, "blockId": format!("{mid}:{idx}"), "blockType": "text",
+        })
+    };
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_STREAM_CHUNK,
+        chunk(0, "the tests."),
+    )
+    .await;
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_TOOL_CALL,
+        json!({
+            "agentId": agent_id, "toolName": "run_tests", "toolKind": "terminal",
+            "toolCallId": "call_abc", "input": { "path": "." }, "status": "started",
+            "messageId": mid, "blockIndex": 1, "blockId": format!("{mid}:1"),
+        }),
+    )
+    .await;
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_TOOL_CALL,
+        json!({
+            "agentId": agent_id, "toolName": "run_tests", "toolKind": "terminal",
+            "toolCallId": "call_abc", "input": { "path": "." }, "status": "completed",
+            "output": "12 passed", "messageId": mid, "blockIndex": 1,
+            "blockId": format!("{mid}:1"),
+        }),
+    )
+    .await;
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_STREAM_CHUNK,
+        chunk(3, "Done."),
+    )
+    .await;
+
+    // Persist the full assistant message + clear the slot (as run_prompt_turn
+    // does), then emit the terminal stream:end.
+    store
+        .append_agent_message_with_id(
+            &agent,
+            &mid,
+            "assistant",
+            &json!([
+                { "type": "text", "id": format!("{mid}:0"), "text": "I'll run the tests." },
+                { "type": "tool_use", "id": format!("{mid}:1"), "name": "run_tests",
+                  "input": { "path": "." }, "toolCallId": "call_abc",
+                  "metadata": { "toolKind": "terminal", "status": "completed" } },
+                { "type": "tool_result", "id": format!("{mid}:2"), "tool_use_id": "call_abc",
+                  "output": "12 passed", "is_error": false },
+                { "type": "text", "id": format!("{mid}:3"), "text": "Done." },
+            ]),
+            &now_iso(),
+        )
+        .await
+        .expect("append assistant message");
+    services.clear_live_turn(&agent);
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_STREAM_END,
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+
+    // Reduce deltas; the resumed text block's delta must carry the FULL text.
+    let mut resumed_full_text = false;
+    loop {
+        let frame = read_json(&mut sub_reader).await;
+        assert_eq!(frame["params"]["kind"], "delta");
+        let delta = frame["params"]["delta"].clone();
+        for e in delta["updated"].as_array().into_iter().flatten() {
+            if e["block"]["id"].as_str() == Some(format!("{mid}:0").as_str())
+                && e["block"]["text"].as_str() == Some("I'll run the tests.")
+            {
+                resumed_full_text = true;
+            }
+        }
+        apply_delta(&mut reconstructed, &delta);
+        if is_terminal_delta(&delta) {
+            break;
+        }
+    }
+    assert!(
+        resumed_full_text,
+        "the resumed text delta carried the full accumulated text, not just the new fragment"
+    );
+
+    let want = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        12,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        Value::Array(reconstructed),
+        want["messages"],
+        "mid-turn snapshot + deltas reconcile to the fresh conversation snapshot"
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// CS-4 cross-agent isolation: a `chat.subscribe` for agent A must NOT receive
+/// agent B's `agent:stream:*` events — the forwarder filters on
+/// `sessionId == agentId`. B's chunk is published first (and dropped); the next
+/// (and only) delta A's subscription sees is A's own chunk.
+#[tokio::test]
+async fn chat_subscription_isolates_stream_across_agents() {
+    let (socket, server, shutdown_tx, _tmp, bus, _services) = setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A" }),
+    )
+    .await;
+    let b = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        12,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "B" }),
+    )
+    .await;
+    let a_id = a["agent"]["id"].as_str().unwrap().to_string();
+    let b_id = b["agent"]["id"].as_str().unwrap().to_string();
+    assert_ne!(a_id, b_id);
+
+    // Subscribe chat to agent A only.
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
+            "params": { "agentId": a_id }
+        }))
+        .unwrap(),
+    )
+    .await;
+    let _resp = read_json(&mut sub_reader).await;
+    let _snap = read_json(&mut sub_reader).await;
+
+    // Publish a chunk for B FIRST (it must be filtered out), then one for A.
+    let b_mid = Uuid::now_v7().to_string();
+    publish_stream(
+        &bus,
+        &ws_id,
+        &b_id,
+        AGENT_STREAM_CHUNK,
+        json!({
+            "agentId": b_id, "content": "secret from B", "messageId": b_mid,
+            "blockIndex": 0, "blockId": format!("{b_mid}:0"), "blockType": "text",
+        }),
+    )
+    .await;
+    let a_mid = Uuid::now_v7().to_string();
+    publish_stream(
+        &bus,
+        &ws_id,
+        &a_id,
+        AGENT_STREAM_CHUNK,
+        json!({
+            "agentId": a_id, "content": "hello A", "messageId": a_mid,
+            "blockIndex": 0, "blockId": format!("{a_mid}:0"), "blockType": "text",
+        }),
+    )
+    .await;
+
+    // The next delta A receives is A's own — B's (published first) was filtered.
+    let frame = read_json(&mut sub_reader).await;
+    assert_eq!(frame["params"]["kind"], "delta");
+    let entity = &frame["params"]["delta"]["added"][0];
+    assert_eq!(entity["agentId"], a_id.as_str());
+    assert_eq!(entity["messageId"], a_mid.as_str());
+    assert_eq!(entity["block"]["text"], "hello A");
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// CS-4 firehose coexistence (Risk R1): the legacy `events.subscribe` firehose
+/// keeps emitting `agent:stream:*` events unchanged WHILE a `chat.subscribe`
+/// receives its block deltas for the SAME turn — both fire for one chunk.
+#[tokio::test]
+async fn chat_subscription_coexists_with_events_firehose() {
+    let (socket, server, shutdown_tx, _tmp, bus, _services) = setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A" }),
+    )
+    .await;
+    let a_id = a["agent"]["id"].as_str().unwrap().to_string();
+
+    // The legacy firehose still works: a separate connection subscribes to the
+    // agent event family via events.subscribe.
+    let (fh_read, mut fh_write) = connect_retry(&socket).await.into_split();
+    let mut fh_reader = tokio::io::BufReader::new(fh_read);
+    send(
+        &mut fh_write,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"events.subscribe","params":{{"eventTypes":["agent:*"],"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let _ = read_json(&mut fh_reader).await; // subscribe ack
+
+    // A chat subscription for the same agent.
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
+            "params": { "agentId": a_id }
+        }))
+        .unwrap(),
+    )
+    .await;
+    let _resp = read_json(&mut sub_reader).await;
+    let _snap = read_json(&mut sub_reader).await;
+
+    // Publish a single chunk for A.
+    let mid = Uuid::now_v7().to_string();
+    publish_stream(
+        &bus,
+        &ws_id,
+        &a_id,
+        AGENT_STREAM_CHUNK,
+        json!({
+            "agentId": a_id, "content": "hello", "messageId": mid,
+            "blockIndex": 0, "blockId": format!("{mid}:0"), "blockType": "text",
+        }),
+    )
+    .await;
+
+    // The firehose sees the raw event unchanged (events.event, full payload).
+    let fh = read_json(&mut fh_reader).await;
+    assert_eq!(fh["method"], "events.event");
+    assert_eq!(fh["params"]["event"]["type"], "agent:stream:chunk");
+    assert_eq!(fh["params"]["event"]["data"]["content"], "hello");
+
+    // The chat subscription sees the mapped block delta for the same chunk.
+    let delta = read_json(&mut sub_reader).await;
+    assert_eq!(delta["params"]["kind"], "delta");
+    assert_eq!(
+        delta["params"]["delta"]["added"][0]["block"]["text"],
+        "hello"
+    );
+    assert_eq!(
+        delta["params"]["delta"]["added"][0]["block"]["id"],
+        format!("{mid}:0")
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// CS-5 orphan self-heal: a turn where TEXT INTERLEAVES AFTER a tool call so the
+/// live mapper's optimistic block layout diverges from the durable transcript,
+/// forcing the terminal reconcile to emit a NON-EMPTY `removedIds`. Two distinct
+/// self-heal paths are exercised at once: (1) the mispredicted `tool_result`
+/// index — the live mapper appends the result right after the `tool_use`
+/// (`{mid}:2`), but the persisted transcript flushed the interleaved text into
+/// `{mid}:2` and placed the real `tool_result` at `{mid}:3`, so `{mid}:2` heals
+/// from `tool_result` back to `text` via an `updated` entity; and (2) a trailing
+/// partial text block (`{mid}:4`) the model streamed live but the durable turn
+/// dropped — it exists in no persisted block, so reconcile lists it in
+/// `removedIds`. The assertion is the reconciliation invariant: the seq-0
+/// snapshot reduced with every delta (HONORING `removedIds`) equals a fresh
+/// `agent.getConversation` snapshot, and the terminal `removedIds` is non-empty.
+#[tokio::test]
+async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
+    let (socket, server, shutdown_tx, _tmp, bus, _services) = setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A1" }),
+    )
+    .await;
+    let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+
+    // A persisted user message anchors a non-trivial seq-0 snapshot.
+    let store = bus.store();
+    let user_id = Uuid::now_v7().to_string();
+    store
+        .append_agent_message_with_id(
+            &AgentId::from(agent_id.as_str()),
+            &user_id,
+            "user",
+            &json!([{ "type": "text", "id": format!("{user_id}:0"), "text": "Run the tests" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append user message");
+
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
+            "params": { "agentId": agent_id }
+        }))
+        .unwrap(),
+    )
+    .await;
+    let resp = read_json(&mut sub_reader).await;
+    assert_eq!(resp["id"], 1);
+    let snap = read_json(&mut sub_reader).await;
+    assert_eq!(snap["params"]["kind"], "snapshot");
+    assert_eq!(snap["params"]["seq"], 0);
+    let mut reconstructed: Vec<Value> = snap["params"]["snapshot"]["messages"]
+        .as_array()
+        .cloned()
+        .expect("snapshot messages");
+    assert_eq!(reconstructed.len(), 1, "snapshot holds the user message");
+
+    let mid = Uuid::now_v7().to_string();
+    let chunk = |idx: u64, text: &str| {
+        json!({
+            "agentId": agent_id, "content": text, "messageId": mid,
+            "blockIndex": idx, "blockId": format!("{mid}:{idx}"), "blockType": "text",
+        })
+    };
+    // 1) Opening text → {mid}:0.
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_STREAM_CHUNK,
+        chunk(0, "I'll run the tests. "),
+    )
+    .await;
+    // 2) Tool starts → tool_use {mid}:1.
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_TOOL_CALL,
+        json!({
+            "agentId": agent_id, "toolName": "run_tests", "toolKind": "terminal",
+            "toolCallId": "call_abc", "input": { "path": "." }, "status": "started",
+            "messageId": mid, "blockIndex": 1, "blockId": format!("{mid}:1"),
+        }),
+    )
+    .await;
+    // 3) TEXT INTERLEAVES AFTER the tool call → live text {mid}:2.
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_STREAM_CHUNK,
+        chunk(2, "Checking output. "),
+    )
+    .await;
+    // 4) Tool completes WITH output: the mapper appends the predicted tool_result
+    //    right after the tool_use ({mid}:2), MISPREDICTING the index (it overwrites
+    //    the interleaved text block at {mid}:2 live).
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_TOOL_CALL,
+        json!({
+            "agentId": agent_id, "toolName": "run_tests", "toolKind": "terminal",
+            "toolCallId": "call_abc", "input": { "path": "." }, "status": "completed",
+            "output": "12 passed", "messageId": mid, "blockIndex": 1,
+            "blockId": format!("{mid}:1"),
+        }),
+    )
+    .await;
+    // 5) A trailing partial the model streamed but the durable turn drops → {mid}:4.
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_STREAM_CHUNK,
+        chunk(4, "Let me also "),
+    )
+    .await;
+
+    // The DURABLE transcript (what run_prompt_turn persists): the interleaved text
+    // landed at {mid}:2 and the real tool_result at {mid}:3; the trailing partial
+    // {mid}:4 is NOT committed. {mid}:4 therefore orphans the live state.
+    store
+        .append_agent_message_with_id(
+            &AgentId::from(agent_id.as_str()),
+            &mid,
+            "assistant",
+            &json!([
+                { "type": "text", "id": format!("{mid}:0"), "text": "I'll run the tests. " },
+                { "type": "tool_use", "id": format!("{mid}:1"), "name": "run_tests",
+                  "input": { "path": "." }, "toolCallId": "call_abc",
+                  "metadata": { "toolKind": "terminal", "status": "completed" } },
+                { "type": "text", "id": format!("{mid}:2"), "text": "Checking output. " },
+                { "type": "tool_result", "id": format!("{mid}:3"), "tool_use_id": "call_abc",
+                  "output": "12 passed", "is_error": false },
+            ]),
+            &now_iso(),
+        )
+        .await
+        .expect("append assistant message");
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        AGENT_STREAM_END,
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+
+    // Reduce every delta; capture the terminal frame's removedIds.
+    let mut terminal_removed: Vec<String> = Vec::new();
+    loop {
+        let frame = read_json(&mut sub_reader).await;
+        assert_eq!(frame["params"]["kind"], "delta");
+        let delta = frame["params"]["delta"].clone();
+        let terminal = is_terminal_delta(&delta);
+        if terminal {
+            terminal_removed = delta["removedIds"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+        }
+        apply_delta(&mut reconstructed, &delta);
+        if terminal {
+            break;
+        }
+    }
+
+    // The orphaned trailing partial drives a NON-EMPTY removedIds (the prior tests
+    // only ever saw empty removedIds).
+    assert!(
+        !terminal_removed.is_empty(),
+        "terminal reconcile emits a non-empty removedIds for the orphaned block"
+    );
+    assert!(
+        terminal_removed.contains(&format!("{mid}:4")),
+        "the orphaned trailing partial {{mid}}:4 is in removedIds, got {terminal_removed:?}"
+    );
+
+    // Honoring removedIds, the reduced state equals a fresh snapshot exactly.
+    let want = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        12,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        Value::Array(reconstructed),
+        want["messages"],
+        "snapshot + deltas (honoring removedIds) reconcile to the fresh conversation snapshot"
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}

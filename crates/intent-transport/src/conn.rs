@@ -9,7 +9,7 @@
 //! transports handle by draining an outbound `mpsc::Sender<String>`.
 
 use intent_core::events::{NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED};
-use intent_core::{ClientId, NoteId, WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, ClientId, NoteId, WorkspaceApi, WorkspaceId};
 use intent_services::{EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -317,6 +317,56 @@ async fn handle_sub_fast_path(
             }
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
         },
+        // The per-agent `chat` channel (CS-0) reuses the same
+        // subscribe-before-snapshot discipline as the note channel, but is
+        // scoped by `agentId` (not `workspaceId`) and emits a `messages[]`
+        // object snapshot from `agent.getConversation`. The bus subscription
+        // tails the `agent:stream:*` family; the forwarder isolates it to one
+        // agent by `sessionId == agentId`.
+        SubFastPath::Subscribe {
+            id,
+            channel: Channel::Chat,
+            params,
+        } => match subscriptions::parse_chat_subscribe_params(&params) {
+            Ok(p) => {
+                let subscriptions::ChatSubscribeParams {
+                    agent_id,
+                    replace_group,
+                } = p;
+                if let Some(group) = replace_group.as_deref() {
+                    subs.remove_group(group);
+                }
+                // The chat channel is per-agent, not workspace-scoped, so the
+                // bus filter carries no `workspaceId`; the forwarder narrows the
+                // stream family to this agent (cross-agent isolation).
+                let subscription = bus.subscribe(SubscriptionFilter {
+                    event_types: subscriptions::channel_event_types(Channel::Chat),
+                    workspace_id: None,
+                    batch_window: None,
+                    ..Default::default()
+                });
+                let subscription_id = events::next_subscription_id();
+                if id.present {
+                    let frame = events::success_frame(
+                        id.echo,
+                        json!({ "subscriptionId": subscription_id }),
+                    );
+                    if out_tx.send(frame).await.is_err() {
+                        return false;
+                    }
+                }
+                let handle = tokio::spawn(forward_chat_subscription(
+                    api.clone(),
+                    AgentId::from(agent_id),
+                    subscription,
+                    subscription_id.clone(),
+                    out_tx.clone(),
+                ));
+                subs.insert(subscription_id, handle, replace_group);
+                true
+            }
+            Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
+        },
         // TB-5 channels (`task`/`agent`/`workspace`/`comment`) reuse the same
         // subscribe-before-snapshot discipline as the note channel; only the
         // param scope, bus filter, and snapshot/delta mapper differ.
@@ -418,6 +468,54 @@ async fn forward_note_subscription(
                     return;
                 }
                 seq += 1;
+            }
+        }
+    }
+}
+
+/// Per-subscription forwarder for the per-agent `chat` channel (CS-0). Pushes
+/// the seq-0 snapshot — the newest `agent.getConversation` page as the
+/// `messages[]` object (CS-0 D3) — then tails the `agent:stream:*` family
+/// FILTERED to this agent (`sessionId == agentId`, cross-agent isolation).
+///
+/// The forwarder owns the filtered-subscription lifecycle (aborted by
+/// [`ConnSub`] on unsubscribe / disconnect), the seq-0 snapshot, AND the
+/// monotonic per-subscription delta `seq` (1, 2, …). Each tailed `agent:stream:*`
+/// event is translated by the stateful [`subscriptions::ChatDeltaState`] mapper
+/// into a `{ added, updated, removedIds }` block delta (CS-0 D2/D4/D6) pushed in
+/// strict seq order; `stream:end` reconciles against the persisted message so the
+/// snapshot + deltas equal a fresh `getConversation` snapshot (CS-3).
+async fn forward_chat_subscription(
+    api: Arc<dyn WorkspaceApi>,
+    agent_id: AgentId,
+    mut subscription: Subscription,
+    subscription_id: String,
+    out_tx: mpsc::Sender<String>,
+) {
+    let snapshot = subscriptions::chat_snapshot(api.as_ref(), &agent_id).await;
+    let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
+    if out_tx.send(frame).await.is_err() {
+        return;
+    }
+    let mut state = subscriptions::ChatDeltaState::new(&agent_id);
+    // Mid-turn resume (CS-0 D5): if the snapshot carried an in-flight message,
+    // seed the delta state from it so the next chunk continues the streamed text
+    // (full-text deltas) instead of restarting from empty.
+    state.seed_from_snapshot(&snapshot);
+    let mut seq: u64 = 1;
+    while let Some(batch) = subscription.recv().await {
+        for event in batch {
+            // Cross-agent isolation: only this agent's stream events belong to
+            // this subscription.
+            if event.session_id.as_deref() != Some(agent_id.as_str()) {
+                continue;
+            }
+            if let Some(delta) = state.delta(api.as_ref(), &event).await {
+                let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
+                seq += 1;
+                if out_tx.send(frame).await.is_err() {
+                    return;
+                }
             }
         }
     }

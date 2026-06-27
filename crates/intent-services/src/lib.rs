@@ -155,6 +155,12 @@ pub struct Services {
     /// `auggie`-backed engine; `search.codebase` falls back to the ripgrep/symbol
     /// path when the engine is `Unavailable` (§8.3). Shared across clones.
     context_engine: Arc<dyn intent_context::ContextEngine>,
+    /// Per-agent in-flight ("live") turn slots (CS-0 D5): the partial assistant
+    /// message for an agent currently mid-`run_prompt_turn`, so a `chat.subscribe`
+    /// arriving mid-turn can merge it into the seq-0 snapshot. Shared across
+    /// clones so the [`AgentManager`]'s turn writer and the `WorkspaceApi` chat
+    /// read door observe the same state; populated only while a turn streams.
+    live_turns: agent_session::LiveTurns,
 }
 
 impl Services {
@@ -179,6 +185,7 @@ impl Services {
             specialists_bundled_dir: None,
             mcp_hub: Arc::new(McpHub::new()),
             context_engine: Arc::new(intent_context::AuggieContextEngine::new()),
+            live_turns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -4632,6 +4639,19 @@ impl WorkspaceApi for Services {
             self.agent_get_conversation_op(agent_id, limit, page_token)
                 .await
         })
+    }
+
+    fn agent_live_turn(&self, agent_id: AgentId) -> Option<serde_json::Value> {
+        let live = self.live_turn(&agent_id)?;
+        // An empty (just-begun) turn has nothing to reconstruct yet; surfacing it
+        // would leave an empty in-flight message envelope in the snapshot.
+        if live.blocks.is_empty() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "messageId": live.message_id,
+            "contentBlocks": live.blocks,
+        }))
     }
 
     fn agent_create(
