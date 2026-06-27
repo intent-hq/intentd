@@ -949,6 +949,99 @@ async fn comment_respond_suggestion_nests_diff_and_threads() {
     assert!(del.success);
 }
 
+#[tokio::test]
+async fn comment_resolve_thread_marks_and_reopens() {
+    let (_tmp, svc, ws, id) = setup("alpha resolve-target omega").await;
+    let added = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "alpha resolve-target omega".into(),
+            "resolve-target".into(),
+            "root".into(),
+            None,
+            None,
+        )
+        .await
+        .expect("add");
+    // A reply ensures the whole thread (not just the root) flips status.
+    svc.comment_respond(
+        ws.clone(),
+        id.clone(),
+        Some(added.comment_id.clone()),
+        None,
+        "a reply".into(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("respond");
+
+    // Resolve (default-style explicit true) marks the thread resolved.
+    let res = svc
+        .comment_resolve_thread(
+            ws.clone(),
+            id.clone(),
+            Some(added.comment_id.clone()),
+            None,
+            true,
+        )
+        .await
+        .expect("resolve");
+    assert!(res.success);
+    assert!(res.resolved);
+    assert_eq!(res.status, "resolved");
+    assert_eq!(res.comment_count, 2);
+
+    // getThread + list reflect the resolved state.
+    let thread = svc
+        .comment_get_thread(ws.clone(), id.clone(), Some(added.comment_id.clone()), None)
+        .await
+        .expect("getThread");
+    assert_eq!(thread.status, "resolved");
+    let list = svc
+        .comment_list(ws.clone(), id.clone(), None, None, None, false)
+        .await
+        .expect("list");
+    assert_eq!(list.threads[0].status, "resolved");
+
+    // Unresolve via commentId reopens the thread.
+    let res = svc
+        .comment_resolve_thread(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some(added.comment_id.clone()),
+            false,
+        )
+        .await
+        .expect("unresolve");
+    assert!(!res.resolved);
+    assert_eq!(res.status, "open");
+    let thread = svc
+        .comment_get_thread(ws.clone(), id.clone(), Some(added.comment_id.clone()), None)
+        .await
+        .expect("getThread2");
+    assert_eq!(thread.status, "open");
+    let list = svc
+        .comment_list(ws, id, None, None, None, false)
+        .await
+        .expect("list2");
+    assert_eq!(list.threads[0].status, "open");
+}
+
+#[tokio::test]
+async fn comment_resolve_thread_requires_thread_or_comment_id() {
+    let (_tmp, svc, ws, id) = setup("nothing here").await;
+    let err = svc
+        .comment_resolve_thread(ws, id, None, None, true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Internal(ref m) if m.contains("Either threadId or commentId")));
+}
+
 // ---- event.* query/aggregation methods (M2.4) ----
 
 use intent_core::{ActorType, EventActor};
@@ -1541,6 +1634,44 @@ mod change_event_parity {
         assert_eq!(
             ev["data"],
             json!({ "noteId": "n-1", "commentId": added.comment_id })
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_resolved_payload() {
+        let h = harness().await;
+        let tn = note(&h.ws, "n-1", "hello world");
+        h.store.insert_note(&tn).await.expect("insert note");
+        let added = h
+            .services
+            .comment_add(
+                h.ws.clone(),
+                tn.id.clone(),
+                "hello world".to_string(),
+                "hello".to_string(),
+                "nice".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("comment");
+        // Subscribe after the add so only the resolve event is observed.
+        let mut sub = subscribe(&h);
+        h.services
+            .comment_resolve_thread(
+                h.ws.clone(),
+                tn.id.clone(),
+                Some(added.comment_id.clone()),
+                None,
+                true,
+            )
+            .await
+            .expect("resolve");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "comment:resolved");
+        assert_eq!(
+            ev["data"],
+            json!({ "noteId": "n-1", "threadId": added.comment_id, "resolved": true })
         );
     }
 

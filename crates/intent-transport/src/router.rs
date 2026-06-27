@@ -528,6 +528,18 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        "comment.resolveThread" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let thread_id = opt_str(params, "threadId");
+            let comment_id = opt_str(params, "commentId");
+            let resolved = opt_bool(params, "resolved").unwrap_or(true);
+            let result = api
+                .comment_resolve_thread(ws, note_id, thread_id, comment_id, resolved)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
         "event.recentFiles" => {
             let ws = require_ws_note(params)?;
             let result = api
