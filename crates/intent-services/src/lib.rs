@@ -33,7 +33,7 @@ use intent_core::{
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, Workspace,
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceDiffSummary, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
-    WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -899,6 +899,72 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
         }
     }
     stats
+}
+
+/// Project a workspace's notes into the canonical `WorkspaceTask` list, porting
+/// `getWorkspaceTasks` (`workspace-summaries.ts`) over the `getSpecTaskNotes`
+/// (`task-stats.ts`) filter: spec-linked direct child task notes, **including
+/// cancelled** (renderer selectors derive counts/groupings). When the spec body
+/// has no task links, all direct children with task metadata count (TS
+/// backward-compat fallback). Order follows the stored note order; the title
+/// falls back to `Untitled task` to match the TS `note.title || 'Untitled task'`.
+fn workspace_task_list(notes: &[Note]) -> Vec<WorkspaceTask> {
+    let linked = notes
+        .iter()
+        .find(|n| n.id.as_str() == "spec")
+        .map(|n| extract_spec_task_ids(&n.content))
+        .unwrap_or_default();
+    let has_links = !linked.is_empty();
+
+    let mut seen = HashSet::new();
+    let mut tasks = Vec::new();
+    for note in notes {
+        let Some(task) = &note.task else { continue };
+        let id = note.id.as_str();
+        if id == "spec" {
+            continue;
+        }
+        if note.parent_id.as_ref().map(|p| p.as_str()) != Some("spec") {
+            continue;
+        }
+        if has_links && !linked.contains(id) {
+            continue;
+        }
+        if !seen.insert(id.to_string()) {
+            continue;
+        }
+        tasks.push(WorkspaceTask {
+            id: note.id.clone(),
+            title: if note.title.is_empty() {
+                "Untitled task".to_string()
+            } else {
+                note.title.clone()
+            },
+            status: task.status,
+            updated_at: note.updated_at.clone(),
+        });
+    }
+    tasks
+}
+
+/// Project a single note into a [`WorkspaceTask`], applying the TS
+/// `Untitled task` title fallback. Returns `Internal` when the note is not a
+/// task (mirrors `task.getMyTask`'s "Note is not a task" guard).
+fn note_to_workspace_task(note: &Note) -> Result<WorkspaceTask> {
+    let task = match &note.task {
+        Some(t) => t,
+        None => return Err(Error::Internal("Note is not a task".to_string())),
+    };
+    Ok(WorkspaceTask {
+        id: note.id.clone(),
+        title: if note.title.is_empty() {
+            "Untitled task".to_string()
+        } else {
+            note.title.clone()
+        },
+        status: task.status,
+        updated_at: note.updated_at.clone(),
+    })
 }
 
 /// Project a workspace's agent sessions into the `agentSummary` card aggregate
@@ -3535,6 +3601,44 @@ impl WorkspaceApi for Services {
                 new_text: update.new_text,
                 status: update.status_word,
             })
+        })
+    }
+
+    fn task_list(
+        &self,
+        workspace_id: WorkspaceId,
+        status: Option<String>,
+    ) -> BoxFuture<'_, Result<Vec<WorkspaceTask>>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let filter = match status.as_deref() {
+                Some(s) => Some(parse_task_status_strict(s)?),
+                None => None,
+            };
+            let notes = store.list_notes(&workspace_id).await?;
+            let mut tasks = workspace_task_list(&notes);
+            if let Some(f) = filter {
+                tasks.retain(|t| t.status == f);
+            }
+            Ok(tasks)
+        })
+    }
+
+    fn task_get(
+        &self,
+        workspace_id: WorkspaceId,
+        task_note_id: NoteId,
+    ) -> BoxFuture<'_, Result<WorkspaceTask>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let note = match store.get_note(&task_note_id).await {
+                Ok(n) if n.workspace_id == workspace_id => n,
+                Ok(_) | Err(Error::NotFound(_)) => {
+                    return Err(Error::NotFound(format!("task note {task_note_id}")))
+                }
+                Err(e) => return Err(e),
+            };
+            note_to_workspace_task(&note)
         })
     }
 

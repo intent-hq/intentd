@@ -774,6 +774,105 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
     assert_eq!(mine.subtasks[0].status, "not_started");
 }
 
+/// `task.list` returns the workspace's spec-linked task notes projected into the
+/// `WorkspaceTask` shape (`{ id, title, status, updatedAt }`), including
+/// cancelled, and excluding the spec, non-task notes, non-children, and
+/// non-spec-linked task notes. `task.get` returns a single task note in the same
+/// shape; unknown / cross-workspace ids surface `NotFound` and non-task notes
+/// surface an `Internal` error.
+#[tokio::test]
+async fn task_list_and_get_project_workspace_tasks() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+    // Spec links three task notes; a fourth task note is unlinked (excluded).
+    let spec = note(
+        &ws,
+        "spec",
+        "- [A](intent://local/task/task-a)\n- [B](intent://local/task/task-b)\n\
+         - [C](intent://local/task/task-c)",
+    );
+    store.insert_note(&spec).await.expect("spec");
+
+    let mk_task = |id: &str, title: &str, status: TaskStatus| {
+        let mut tn = note(&ws, id, "body");
+        tn.title = title.to_string();
+        tn.parent_id = Some(NoteId::from("spec"));
+        tn.task = Some(TaskMetadata {
+            status,
+            ..Default::default()
+        });
+        tn
+    };
+    store
+        .insert_note(&mk_task("task-a", "Alpha", TaskStatus::InProgress))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("task-b", "Beta", TaskStatus::Complete))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("task-c", "Gamma", TaskStatus::Cancelled))
+        .await
+        .unwrap();
+    // Unlinked task note (spec has links, so excluded).
+    store
+        .insert_note(&mk_task("task-x", "Orphan", TaskStatus::NotStarted))
+        .await
+        .unwrap();
+    // Non-task child of spec (excluded — no task metadata).
+    let mut plain = note(&ws, "plain", "body");
+    plain.parent_id = Some(NoteId::from("spec"));
+    store.insert_note(&plain).await.unwrap();
+
+    let svc = Services::new(store);
+
+    // task.list returns the three spec-linked task notes (cancelled included).
+    let tasks = svc.task_list(ws.clone(), None).await.expect("task.list");
+    assert_eq!(tasks.len(), 3);
+    let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, vec!["task-a", "task-b", "task-c"]);
+    let alpha = &tasks[0];
+    assert_eq!(alpha.title, "Alpha");
+    assert_eq!(alpha.status, TaskStatus::InProgress);
+    assert!(!alpha.updated_at.is_empty());
+
+    // Status filter narrows to the matching task notes.
+    let done = svc
+        .task_list(ws.clone(), Some("complete".into()))
+        .await
+        .expect("task.list filtered");
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].id.as_str(), "task-b");
+
+    // Invalid status string is rejected.
+    assert!(svc
+        .task_list(ws.clone(), Some("bogus".into()))
+        .await
+        .is_err());
+
+    // task.get returns a single task note in the WorkspaceTask shape.
+    let got = svc
+        .task_get(ws.clone(), NoteId::from("task-a"))
+        .await
+        .expect("task.get");
+    assert_eq!(got.id.as_str(), "task-a");
+    assert_eq!(got.title, "Alpha");
+    assert_eq!(got.status, TaskStatus::InProgress);
+
+    // Unknown id → NotFound; non-task note → Internal "Note is not a task".
+    assert!(matches!(
+        svc.task_get(ws.clone(), NoteId::from("missing")).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(svc.task_get(ws, NoteId::from("plain")).await.is_err());
+}
+
 #[tokio::test]
 async fn assign_agent_validates_and_starts_task() {
     let (_tmp, svc, ws, id) = setup("# Task").await;

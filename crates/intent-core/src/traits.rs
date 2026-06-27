@@ -18,7 +18,7 @@ use crate::model::{
     ScriptCreateParams, TaskAssignAgentResult, TaskConvertBlocksResult,
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskMarkAsTaskResult,
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, Workspace,
-    WorkspaceCreate, WorkspaceEventSummary, WorkspaceUpdate,
+    WorkspaceCreate, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -383,6 +383,39 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::get_my_task not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `task.list`: project a workspace's spec-linked task notes into the
+    /// canonical `WorkspaceTask` list (PROTOCOL §5.4). `status` optionally filters
+    /// to a single task status. Mirrors the FE `getWorkspaceTasks` set so the FE
+    /// can drop its `note.list`-metadata derivation.
+    fn task_list(
+        &self,
+        workspace_id: WorkspaceId,
+        status: Option<String>,
+    ) -> BoxFuture<'_, Result<Vec<WorkspaceTask>>> {
+        let _ = (workspace_id, status);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::task_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `task.get`: project a single task note into a `WorkspaceTask` (PROTOCOL
+    /// §5.4). Errors with `NotFound` when the note is absent/cross-workspace and
+    /// `Internal` when the note carries no task metadata.
+    fn task_get(
+        &self,
+        workspace_id: WorkspaceId,
+        task_note_id: NoteId,
+    ) -> BoxFuture<'_, Result<WorkspaceTask>> {
+        let _ = (workspace_id, task_note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::task_get not implemented".to_string(),
             ))
         })
     }
