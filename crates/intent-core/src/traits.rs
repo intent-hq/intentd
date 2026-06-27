@@ -509,6 +509,17 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// The agent's in-flight ("live") turn, if a `session/prompt` is currently
+    /// streaming (CS-0 D5): the partial assistant message as `{ messageId,
+    /// contentBlocks }` so `chat.subscribe` can merge it into the seq-0 snapshot
+    /// and a client arriving mid-turn sees a coherent in-flight message. A
+    /// synchronous in-memory read (no I/O). The default returns `None` (no live
+    /// turn surfaced) so non-agent `WorkspaceApi` impls need not implement it.
+    fn agent_live_turn(&self, agent_id: AgentId) -> Option<serde_json::Value> {
+        let _ = agent_id;
+        None
+    }
+
     /// `agent.create`: persist a new agent session; returns `{ agent: { id, name } }`
     /// (the process spawns lazily on first turn) (PROTOCOL §5.5).
     ///

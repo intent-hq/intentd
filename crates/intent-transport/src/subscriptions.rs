@@ -17,7 +17,7 @@ use intent_core::events::{
     PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_UPDATED,
 };
-use intent_core::{AgentId, Event, NoteId, WorkspaceApi, WorkspaceId};
+use intent_core::{now_iso, AgentId, Event, NoteId, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -397,11 +397,14 @@ pub(crate) async fn channel_snapshot(
 /// Materialize the chat channel's seq-0 snapshot: the newest page of
 /// `agent.getConversation` as the `{ agentId, messages, truncated,
 /// totalMessages, nextToken }` OBJECT (CS-0 D3), reused verbatim from the
-/// existing paginated read. On a read error the snapshot degrades to an empty
-/// messages page rather than failing the subscription (matching
-/// [`channel_snapshot`]'s degrade-to-empty pattern).
+/// existing paginated read, then — when a turn is currently streaming —
+/// the in-flight partial assistant message merged in (CS-0 D5) so a
+/// `chat.subscribe` arriving mid-turn reconstructs a coherent in-flight message.
+/// On a read error the snapshot degrades to an empty messages page rather than
+/// failing the subscription (matching [`channel_snapshot`]'s degrade-to-empty
+/// pattern).
 pub(crate) async fn chat_snapshot(api: &dyn WorkspaceApi, agent_id: &AgentId) -> Value {
-    match api
+    let mut snapshot = match api
         .agent_get_conversation(agent_id.clone(), None, None, None)
         .await
     {
@@ -413,7 +416,54 @@ pub(crate) async fn chat_snapshot(api: &dyn WorkspaceApi, agent_id: &AgentId) ->
             "totalMessages": 0,
             "nextToken": Value::Null,
         }),
+    };
+    if let Some(live) = api.agent_live_turn(agent_id.clone()) {
+        merge_live_turn(&mut snapshot, agent_id, &live);
     }
+    snapshot
+}
+
+/// Append the in-flight assistant message to a chat snapshot's `messages` page
+/// (CS-0 D5). Its `seq` is the next monotonic value (`totalMessages`, since seq
+/// is contiguous from 0) and it carries `isStreaming: true` as a render hint the
+/// terminal reconcile clears via `streamingComplete`. Idempotent: if the turn's
+/// message already persisted (id present in the page) it is left untouched, so a
+/// snapshot taken in the window between persist and slot-clear never duplicates.
+fn merge_live_turn(snapshot: &mut Value, agent_id: &AgentId, live: &Value) {
+    let Some(message_id) = live.get("messageId").and_then(Value::as_str) else {
+        return;
+    };
+    let blocks = live
+        .get("contentBlocks")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let Some(obj) = snapshot.as_object_mut() else {
+        return;
+    };
+    let total = obj
+        .get("totalMessages")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let messages = obj.entry("messages").or_insert_with(|| json!([]));
+    let Some(arr) = messages.as_array_mut() else {
+        return;
+    };
+    if arr
+        .iter()
+        .any(|m| m.get("id").and_then(Value::as_str) == Some(message_id))
+    {
+        return;
+    }
+    arr.push(json!({
+        "id": message_id,
+        "agentId": agent_id.as_str(),
+        "seq": total,
+        "role": "assistant",
+        "contentBlocks": blocks,
+        "timestamp": now_iso(),
+        "isStreaming": true,
+    }));
+    obj.insert("totalMessages".to_string(), json!(total + 1));
 }
 
 /// Stateful, event-payload-driven delta mapper for the per-agent chat channel
@@ -449,6 +499,45 @@ impl ChatDeltaState {
             seen_ids: HashSet::new(),
             emitted_ids: HashSet::new(),
             message_id: None,
+        }
+    }
+
+    /// Seed the per-turn accumulation from a seq-0 snapshot that carries an
+    /// in-flight assistant message (CS-0 D5): the message arriving mid-turn has
+    /// already streamed some blocks, so prime `message_id`, mark each block id as
+    /// already seen+emitted (subsequent chunks arrive as `updated`, not `added`),
+    /// and pre-load each `text` block's accumulated text so the NEXT chunk delta
+    /// carries the FULL text (D2), not just the new fragment. Without this, a
+    /// resuming subscriber's first chunk would restart the text from empty until
+    /// the terminal reconcile. No-op when the snapshot has no in-flight message.
+    pub(crate) fn seed_from_snapshot(&mut self, snapshot: &Value) {
+        let Some(messages) = snapshot.get("messages").and_then(Value::as_array) else {
+            return;
+        };
+        let Some(msg) = messages
+            .iter()
+            .find(|m| m.get("isStreaming") == Some(&Value::Bool(true)))
+        else {
+            return;
+        };
+        let Some(message_id) = msg.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        self.message_id = Some(message_id.to_string());
+        let Some(blocks) = msg.get("contentBlocks").and_then(Value::as_array) else {
+            return;
+        };
+        for block in blocks {
+            let Some(bid) = block.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            self.seen_ids.insert(bid.to_string());
+            self.emitted_ids.insert(bid.to_string());
+            if block.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    self.text_acc.insert(bid.to_string(), text.to_string());
+                }
+            }
         }
     }
 

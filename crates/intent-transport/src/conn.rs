@@ -498,6 +498,10 @@ async fn forward_chat_subscription(
         return;
     }
     let mut state = subscriptions::ChatDeltaState::new(&agent_id);
+    // Mid-turn resume (CS-0 D5): if the snapshot carried an in-flight message,
+    // seed the delta state from it so the next chunk continues the streamed text
+    // (full-text deltas) instead of restarting from empty.
+    state.seed_from_snapshot(&snapshot);
     let mut seq: u64 = 1;
     while let Some(batch) = subscription.recv().await {
         for event in batch {

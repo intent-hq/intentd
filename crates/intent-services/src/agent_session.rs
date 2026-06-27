@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use intent_acp::session::{
     self, ContentBlock, InitializeResponse, MappedToolCall, MappedUpdate, McpServer, StopReason,
@@ -163,6 +164,58 @@ impl Transcript {
         self.flush_text();
         self.blocks
     }
+
+    /// A non-consuming snapshot of the coalesced blocks AS THEY STAND mid-turn
+    /// (CS-0 D5): the pushed blocks plus, when text is pending, the synthetic
+    /// `text` block it will flush into (same index/id it would ultimately take).
+    /// Used to publish the in-flight partial into the per-agent live-turn slot so
+    /// a `chat.subscribe` arriving mid-turn can reconstruct it.
+    fn snapshot_blocks(&self) -> Vec<Value> {
+        let mut blocks = self.blocks.clone();
+        if !self.text.is_empty() {
+            let index = blocks.len();
+            blocks.push(json!({
+                "type": "text",
+                "id": self.block_id(index),
+                "text": self.text.clone(),
+            }));
+        }
+        blocks
+    }
+}
+
+/// The per-agent in-flight ("live") turn slot (CS-0 D5): the assistant message
+/// id minted at turn start plus a non-consuming [`Transcript::snapshot_blocks`]
+/// of the partial assistant content AS IT STANDS. Published while a
+/// `session/prompt` turn streams so a `chat.subscribe` arriving mid-turn can
+/// reconstruct the in-flight message; cleared (by [`LiveTurnGuard`] and on the
+/// happy path before `stream:end`) once the turn's message is persisted.
+#[derive(Clone)]
+pub(crate) struct LiveTurn {
+    pub(crate) message_id: String,
+    pub(crate) blocks: Vec<Value>,
+}
+
+/// Per-agent map of live turn slots, shared across [`Services`] clones so the
+/// `chat.subscribe` read door and the [`run_prompt_turn`](Services::run_prompt_turn)
+/// writer observe the same state.
+pub(crate) type LiveTurns = Arc<Mutex<HashMap<AgentId, LiveTurn>>>;
+
+/// RAII guard that clears an agent's live-turn slot when a turn ends — including
+/// the interrupt/abort path, where the worker future is dropped before
+/// `stream:end` is reached. Without it an aborted turn would leave a stale
+/// in-flight message in the snapshot forever.
+pub(crate) struct LiveTurnGuard<'a> {
+    live_turns: &'a LiveTurns,
+    agent_id: AgentId,
+}
+
+impl Drop for LiveTurnGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut slots) = self.live_turns.lock() {
+            slots.remove(&self.agent_id);
+        }
+    }
 }
 
 /// Extract a `lastResponseSummary` for the `agent:idle` payload from the turn's
@@ -199,6 +252,60 @@ fn agent_actor(agent_id: &AgentId) -> EventActor {
 }
 
 impl Services {
+    /// Begin a live-turn slot for `agent_id` (CS-0 D5): seed it with the freshly
+    /// minted assistant `message_id` and no blocks yet, returning a
+    /// [`LiveTurnGuard`] that clears the slot on drop (abort-safe). The slot is
+    /// refreshed by [`update_live_turn`](Self::update_live_turn) as content streams.
+    pub(crate) fn begin_live_turn(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> LiveTurnGuard<'_> {
+        self.set_live_turn(agent_id, message_id, Vec::new());
+        LiveTurnGuard {
+            live_turns: &self.live_turns,
+            agent_id: agent_id.clone(),
+        }
+    }
+
+    /// Set/replace an agent's live-turn slot. The streaming path drives this via
+    /// [`update_live_turn`](Self::update_live_turn); it is also a test seam for
+    /// simulating a mid-turn snapshot without spinning up a real ACP turn.
+    pub fn set_live_turn(&self, agent_id: &AgentId, message_id: &str, blocks: Vec<Value>) {
+        if let Ok(mut slots) = self.live_turns.lock() {
+            slots.insert(
+                agent_id.clone(),
+                LiveTurn {
+                    message_id: message_id.to_string(),
+                    blocks,
+                },
+            );
+        }
+    }
+
+    /// Refresh the agent's live-turn blocks from the current [`Transcript`] (a
+    /// non-consuming [`Transcript::snapshot_blocks`]). No-op if no slot is open.
+    fn update_live_turn(&self, agent_id: &AgentId, transcript: &Transcript) {
+        if let Ok(mut slots) = self.live_turns.lock() {
+            if let Some(slot) = slots.get_mut(agent_id) {
+                slot.blocks = transcript.snapshot_blocks();
+            }
+        }
+    }
+
+    /// Clear an agent's live-turn slot (happy-path turn end + test seam). The
+    /// [`LiveTurnGuard`] also clears on drop for the interrupt/abort path.
+    pub fn clear_live_turn(&self, agent_id: &AgentId) {
+        if let Ok(mut slots) = self.live_turns.lock() {
+            slots.remove(agent_id);
+        }
+    }
+
+    /// Read an agent's in-flight turn slot, if a turn is currently streaming.
+    pub(crate) fn live_turn(&self, agent_id: &AgentId) -> Option<LiveTurn> {
+        self.live_turns.lock().ok()?.get(agent_id).cloned()
+    }
+
     /// Open a new ACP session and persist its id as `AgentSession.acpSessionId`
     /// (write-once, for later resume) (§6.5).
     pub async fn open_acp_session(
@@ -322,6 +429,11 @@ impl Services {
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
         let message_id = Uuid::now_v7().to_string();
         let mut transcript = Transcript::new(message_id.clone());
+        // Publish the in-flight turn so a `chat.subscribe` arriving mid-turn can
+        // reconstruct the partial message (CS-0 D5). The guard clears the slot on
+        // ANY exit — including the interrupt/abort path that drops this worker
+        // before `stream:end` — so subscribers never see a stale in-flight turn.
+        let _live_guard = self.begin_live_turn(agent_id, &message_id);
         let prompt_fut = session::prompt(conn, acp_session_id, prompt);
         tokio::pin!(prompt_fut);
         let mut closed = false;
@@ -356,6 +468,11 @@ impl Services {
                 )
                 .await?;
         }
+        // The turn's message is now durable: clear the live-turn slot so the next
+        // `chat.subscribe` snapshot reflects the persisted message (not a stale
+        // in-flight copy) BEFORE the terminal `stream:end` is observed. The guard
+        // remains as the abort-path fallback.
+        self.clear_live_turn(agent_id);
         // Exactly ONE terminal stream:end — complete and error both map here (§7).
         self.publish_agent_event(
             workspace_id,
@@ -470,6 +587,9 @@ impl Services {
                     .await;
             }
         }
+        // Refresh the live-turn slot with the partial transcript so a mid-turn
+        // `chat.subscribe` snapshot reflects content streamed so far (CS-0 D5).
+        self.update_live_turn(agent_id, transcript);
     }
 
     /// Build and publish an agent streaming event onto the bus (§6.6/§10).
