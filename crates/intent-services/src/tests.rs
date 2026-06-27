@@ -3360,6 +3360,148 @@ mod file_tracking {
         let st = intent_git::status::status(&repo.dir).unwrap();
         assert!(st.files.iter().any(|f| f.path == "seed.txt" && !f.staged));
     }
+
+    /// Build a workspace whose worktree points at `repo`, returning the service.
+    async fn svc_with_repo(repo: &GitRepo) -> (TempDb, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        (tmp, Services::new(store), ws_id)
+    }
+
+    /// `git.commits` returns the §5.5 `{ items, nextToken }` envelope of
+    /// `CommitInfo` (§8.9), walking older pages via the opaque continuation
+    /// token; attribution trailers populate `agentId`/`linkedNoteId`.
+    #[tokio::test]
+    async fn git_commits_returns_commit_info_page() {
+        let repo = init_git_repo();
+        commit_file(
+            &repo.dir,
+            "feature.txt",
+            "feature\n",
+            "add feature\n\nAgent-Id: agent-7\nLinked-Note-Id: note-2\n",
+        );
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        // Page size 1 → newest commit only, with a token for the older page.
+        let page1 = svc.git_commits(ws_id.clone(), Some(1), None).await.unwrap();
+        let items = page1["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        let head = &items[0];
+        assert_eq!(head["agentId"], serde_json::json!("agent-7"));
+        assert_eq!(head["linkedNoteId"], serde_json::json!("note-2"));
+        assert_eq!(head["author"], serde_json::json!("Test"));
+        assert_eq!(head["email"], serde_json::json!("test@example.com"));
+        assert_eq!(head["files"], serde_json::json!(["feature.txt"]));
+        let hash = head["hash"].as_str().unwrap();
+        assert_eq!(head["sha"], serde_json::json!(hash[..7].to_string()));
+        assert!(head["message"].as_str().unwrap().starts_with("add feature"));
+        let token = page1["nextToken"].as_str().expect("token for older page");
+
+        // Following the token yields the older (seed) commit, then no more.
+        let page2 = svc
+            .git_commits(ws_id, Some(1), Some(token.to_string()))
+            .await
+            .unwrap();
+        let items2 = page2["items"].as_array().unwrap();
+        assert_eq!(items2.len(), 1);
+        assert!(items2[0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("seed commit"));
+        assert_eq!(page2["nextToken"], serde_json::Value::Null);
+    }
+
+    /// `git.changes` returns the working-tree `FileStatus[]` (`path`/`status`/
+    /// `staged`), including untracked files.
+    #[tokio::test]
+    async fn git_changes_returns_working_tree_files() {
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nmore\n").unwrap();
+        std::fs::write(repo.dir.join("new.txt"), "hi\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let changes = svc.git_changes(ws_id).await.unwrap();
+        let arr = changes.as_array().unwrap();
+        let seed = arr.iter().find(|c| c["path"] == "seed.txt").unwrap();
+        assert_eq!(seed["status"], serde_json::json!("M"));
+        assert_eq!(seed["staged"], serde_json::json!(false));
+        let new = arr.iter().find(|c| c["path"] == "new.txt").unwrap();
+        assert_eq!(new["status"], serde_json::json!("?"));
+    }
+
+    /// `git.diffs` (unstaged) returns `[{ path, hunks }]` with the FE hunk shape
+    /// (`oldStart`/`oldLines`/`newStart`/`newLines`/`lines`) and `DiffLine`s
+    /// tagged `Context`/`Addition`/`Deletion` with 1-based line numbers.
+    #[tokio::test]
+    async fn git_diffs_unstaged_returns_path_and_hunks() {
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let diffs = svc.git_diffs(ws_id, None, false).await.unwrap();
+        let arr = diffs.as_array().unwrap();
+        let f = arr.iter().find(|d| d["path"] == "seed.txt").unwrap();
+        let hunks = f["hunks"].as_array().unwrap();
+        assert!(!hunks.is_empty());
+        let h = &hunks[0];
+        assert!(h["newStart"].as_u64().is_some());
+        assert!(h["oldStart"].as_u64().is_some());
+        let lines = h["lines"].as_array().unwrap();
+        let add = lines
+            .iter()
+            .find(|l| l["type"] == "Addition")
+            .expect("an addition line");
+        assert!(add["content"].as_str().unwrap().contains("added"));
+        assert!(add["newNumber"].as_u64().is_some());
+    }
+
+    /// `git.diffs` (staged) hydrates hunks from blob SHAs and honors the `path`
+    /// filter, returning only the requested file.
+    #[tokio::test]
+    async fn git_diffs_staged_filters_to_path() {
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nstaged change\n").unwrap();
+        std::fs::write(repo.dir.join("other.txt"), "other\n").unwrap();
+        {
+            let r = Repository::open(&repo.dir).unwrap();
+            let mut idx = r.index().unwrap();
+            idx.add_path(std::path::Path::new("seed.txt")).unwrap();
+            idx.add_path(std::path::Path::new("other.txt")).unwrap();
+            idx.write().unwrap();
+        }
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let diffs = svc
+            .git_diffs(ws_id, Some("seed.txt".to_string()), true)
+            .await
+            .unwrap();
+        let arr = diffs.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["path"], serde_json::json!("seed.txt"));
+        assert!(!arr[0]["hunks"].as_array().unwrap().is_empty());
+    }
+
+    /// The git reads degrade to empty results for a workspace with no worktree
+    /// (mirrors the `git.status` empty fallbacks).
+    #[tokio::test]
+    async fn git_reads_empty_for_non_repo_workspace() {
+        let (_t, svc, ws) = ft_setup().await;
+        assert_eq!(
+            svc.git_changes(ws.clone()).await.unwrap(),
+            serde_json::json!([])
+        );
+        assert_eq!(
+            svc.git_diffs(ws.clone(), None, false).await.unwrap(),
+            serde_json::json!([])
+        );
+        let commits = svc.git_commits(ws, None, None).await.unwrap();
+        assert_eq!(commits["items"], serde_json::json!([]));
+        assert_eq!(commits["nextToken"], serde_json::Value::Null);
+    }
 }
 
 /// `metrics.*` aggregation (§17.5) over the M4.7 `tracked_changes` table: the

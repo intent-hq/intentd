@@ -955,6 +955,35 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&r)
         }
+        "git.changes" => {
+            let ws = require_ws_note(params)?;
+            let r = api.git_changes(ws).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `git.diff` is accepted as an alias for the wire-canonical `git.diffs`.
+        "git.diffs" | "git.diff" => {
+            let ws = require_ws_note(params)?;
+            let path = opt_str(params, "path");
+            let staged = parse_bool(params, "staged");
+            let r = api
+                .git_diffs(ws, path, staged)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `git.log` is accepted as an alias for the wire-canonical `git.commits`.
+        "git.commits" | "git.log" => {
+            let ws = require_ws_note(params)?;
+            // §5.5 page params arrive nested under `page` ({ continuationToken,
+            // limit }); fall back to top-level `limit`/`nextToken` for parity
+            // with the other paginated reads.
+            let (limit, page_token) = parse_page_params(params);
+            let r = api
+                .git_commits(ws, limit, page_token)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "pr.status" => {
             let ws = require_ws_note(params)?;
             let r = api.pr_status(ws).await.map_err(domain_to_rpc)?;
@@ -1852,6 +1881,24 @@ fn parse_confirm(params: &Map<String, Value>) -> bool {
         Some(Value::String(s)) => s == "true",
         _ => false,
     }
+}
+
+/// Parse the §5.5 paginated-read page params into `(limit, continuation_token)`.
+/// The canonical form nests them under `page` ({ continuationToken, limit });
+/// for parity with the other paginated reads we fall back to top-level `limit`
+/// and `nextToken` when no `page` object is present.
+fn parse_page_params(params: &Map<String, Value>) -> (Option<i64>, Option<String>) {
+    if let Some(Value::Object(page)) = params.get("page") {
+        let limit = page
+            .get("limit")
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
+        let token = page
+            .get("continuationToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        return (limit, token);
+    }
+    (opt_int(params, "limit"), opt_str(params, "nextToken"))
 }
 
 /// Parse a boolean flag param: a real bool, or the string `"true"`.
