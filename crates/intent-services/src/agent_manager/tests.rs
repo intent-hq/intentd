@@ -19,7 +19,8 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use super::{
-    compute_process_cap, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry,
+    compute_process_cap, derive_agent_type, AgentHandle, AgentManager, BusEventSink, KillFn,
+    ProcessRegistry, DEFAULT_AGENT_TYPE,
 };
 use crate::events::{EventBus, SubscriptionFilter};
 use crate::Services;
@@ -769,4 +770,117 @@ async fn interrupt_emits_terminal_stream_end_but_no_idle() {
         !types.contains(&"agent:idle"),
         "interrupt suppresses agent:idle (got {types:?})"
     );
+}
+
+// --- SP-B: spawn `agent_type` derived from the specialist's `agentType` -------
+
+/// Self-cleaning temp directory for hermetic specialist-file fixtures.
+struct TempSpecialistsDir(PathBuf);
+
+impl TempSpecialistsDir {
+    fn new() -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("intentd-spb-specialists-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create specialists dir");
+        Self(dir)
+    }
+
+    /// Write `<id>.md` with the given raw markdown-with-frontmatter content.
+    fn write(&self, id: &str, content: &str) {
+        std::fs::write(self.0.join(format!("{id}.md")), content).expect("write specialist file");
+    }
+}
+
+impl Drop for TempSpecialistsDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Build a `Services` whose user specialists tier is `dir` (bundled tier left to
+/// the env default, which is irrelevant for these ids).
+async fn services_with_specialists(dir: &TempSpecialistsDir) -> (TempDb, Services) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let services = Services::new(store).with_specialist_dirs(Some(dir.0.clone()), None);
+    (tmp, services)
+}
+
+/// An otherwise-empty session carrying just the `specialist` under test.
+fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
+    AgentSession {
+        id: AgentId::from("agent-spb"),
+        workspace_id: WorkspaceId::from("ws-spb"),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "SpB".to_string(),
+        name_explicitly_set: false,
+        model: None,
+        provider: None,
+        system_prompt: None,
+        specialist: specialist.map(str::to_string),
+        status: AgentStatus::Pending,
+        is_active: false,
+        messages: Vec::new(),
+        stats: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    }
+}
+
+#[tokio::test]
+async fn derive_agent_type_uses_specialist_agent_type_and_engages_denylist() {
+    use intent_acp::{get_tool_denylist_for_agent_type, SUBAGENT_TOOLS};
+
+    let dir = TempSpecialistsDir::new();
+    dir.write(
+        "ralph",
+        "---\nname: \"Ralph\"\ndescription: \"Loops\"\nagentType: \"ralph-loop\"\n---\n\nYou loop.",
+    );
+    let (_tmp, services) = services_with_specialists(&dir).await;
+
+    let session = session_with_specialist(Some("ralph"));
+    let agent_type = derive_agent_type(&services, &session, None);
+    assert_eq!(agent_type, "ralph-loop");
+
+    // The derived type drives the §18.4 denylist: ralph-loop denies the
+    // sub-agent orchestration tools (but not the full text-only denylist).
+    let denylist = get_tool_denylist_for_agent_type(&agent_type);
+    assert!(!denylist.is_empty(), "ralph-loop engages a denylist");
+    for tool in SUBAGENT_TOOLS {
+        assert!(
+            denylist.contains(tool),
+            "ralph-loop denylist removes {tool}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn derive_agent_type_falls_back_to_default_without_agent_type() {
+    use intent_acp::get_tool_denylist_for_agent_type;
+
+    let dir = TempSpecialistsDir::new();
+    // A specialist that declares no `agentType` frontmatter.
+    dir.write(
+        "plain",
+        "---\nname: \"Plain\"\ndescription: \"No agentType\"\n---\n\nbody",
+    );
+    let (_tmp, services) = services_with_specialists(&dir).await;
+
+    let with_specialist = session_with_specialist(Some("plain"));
+    assert_eq!(
+        derive_agent_type(&services, &with_specialist, None),
+        DEFAULT_AGENT_TYPE,
+    );
+
+    // A plain agent with no specialist at all keeps the default too.
+    let no_specialist = session_with_specialist(None);
+    assert_eq!(
+        derive_agent_type(&services, &no_specialist, None),
+        DEFAULT_AGENT_TYPE,
+    );
+
+    // The default (interactive) type is unrestricted — no regression.
+    assert!(get_tool_denylist_for_agent_type(DEFAULT_AGENT_TYPE).is_empty());
 }
