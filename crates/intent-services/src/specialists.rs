@@ -240,6 +240,79 @@ fn render_file(id: &str, spec: &Value) -> String {
     format!("---\n{}\n---\n\n{}", fm.join("\n"), prompt)
 }
 
+/// Extract the first numbered bold rule (`N. **text**`) under a `## Hard Rules`
+/// heading, if any (port of the `getRoleReminder` Hard-Rules regex). Scans from
+/// the heading until the next `##` heading and returns the first non-empty inner
+/// `**…**` (rejecting any inner `*`, mirroring the TS `[^*]+`).
+fn first_hard_rule(behavior_prompt: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in behavior_prompt.split('\n') {
+        let trimmed = line.trim();
+        if !in_section {
+            if let Some(rest) = trimmed.strip_prefix("##") {
+                if rest.trim().to_lowercase().starts_with("hard rules") {
+                    in_section = true;
+                }
+            }
+            continue;
+        }
+        if trimmed.starts_with("##") {
+            break;
+        }
+        // Match a leading `N.` then a `**…**` span.
+        let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 || trimmed.as_bytes().get(digits) != Some(&b'.') {
+            continue;
+        }
+        let after_num = trimmed[digits + 1..].trim_start();
+        let Some(after_open) = after_num.strip_prefix("**") else {
+            continue;
+        };
+        let Some(end) = after_open.find("**") else {
+            continue;
+        };
+        let inner = &after_open[..end];
+        if inner.is_empty() || inner.contains('*') {
+            continue;
+        }
+        return Some(inner.trim().to_string());
+    }
+    None
+}
+
+/// Auto-generate a role reminder from a behavior prompt (port of
+/// `autoGenerateRoleReminder`): the first meaningful (non-header, non-bold-only)
+/// line, suffixed with the first numbered rule under a `## Hard Rules` section
+/// when present.
+fn auto_generate_role_reminder(behavior_prompt: &str) -> String {
+    if behavior_prompt.is_empty() {
+        return String::new();
+    }
+    let mut first_meaningful = String::new();
+    for line in behavior_prompt.split('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with("**") && trimmed.ends_with("**") {
+            continue;
+        }
+        // Strip a leading and/or trailing `**` marker (port of the
+        // `replace(/^\*\*|\*\*$/g, '')` core-role normalization).
+        let stripped = trimmed.strip_prefix("**").unwrap_or(trimmed);
+        let stripped = stripped.strip_suffix("**").unwrap_or(stripped);
+        first_meaningful = stripped.trim().to_string();
+        break;
+    }
+    if let Some(rule) = first_hard_rule(behavior_prompt) {
+        if !first_meaningful.is_empty() {
+            return format!("{first_meaningful} {rule}.");
+        }
+        return rule;
+    }
+    first_meaningful
+}
+
 /// Stateless executor for the file-backed `specialist.*` namespace. Construct
 /// one per call from the long-lived `Services`; it carries the resolved user and
 /// bundled directory roots (project comes from each call's `workspacePath`).
@@ -350,6 +423,41 @@ impl SpecialistsService {
             Some(def) => Ok(json!({ "specialist": def })),
             None => Err(Error::NotFound(format!("specialist not found: {id}"))),
         }
+    }
+
+    /// Resolve `(name, roleReminder)` for an agent's specialist id, or `None`
+    /// when the specialist is unknown or yields no usable reminder (port of
+    /// `resolveSpecialistForAgent` + `getRoleReminder`). The reminder is the
+    /// explicit `roleReminder` frontmatter scalar when present, else
+    /// auto-generated from the behavior prompt.
+    pub(crate) fn resolve_role_reminder(
+        &self,
+        id: &str,
+        workspace_path: Option<&Path>,
+    ) -> Option<(String, String)> {
+        let def = self.resolve(id, workspace_path)?;
+        let name = def
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(id)
+            .to_string();
+        let reminder = def
+            .get("roleReminder")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                let body = def
+                    .get("behaviorPrompt")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                auto_generate_role_reminder(body)
+            });
+        if reminder.is_empty() {
+            return None;
+        }
+        Some((name, reminder))
     }
 
     /// Resolve the writable directory for `scope`, creating it; `project`
@@ -538,5 +646,98 @@ mod tests {
         let rendered = render_file("ralph", &spec);
         let def = build_def("ralph", &rendered, "user", Path::new("/tmp/ralph.md"));
         assert_eq!(def["prompt"], "body via alias");
+    }
+
+    #[test]
+    fn auto_generate_role_reminder_combines_first_line_and_hard_rule() {
+        let body = "# Implementor\n\nImplement your assigned task — nothing more.\n\n## Hard Rules\n1. **No scope creep** — only what the task note asks\n2. **No refactors** — ask first\n";
+        assert_eq!(
+            auto_generate_role_reminder(body),
+            "Implement your assigned task — nothing more. No scope creep."
+        );
+    }
+
+    #[test]
+    fn auto_generate_role_reminder_first_line_only_without_hard_rules() {
+        let body = "# Verifier\n\nVerify the work thoroughly.\n";
+        assert_eq!(
+            auto_generate_role_reminder(body),
+            "Verify the work thoroughly."
+        );
+    }
+
+    #[test]
+    fn auto_generate_role_reminder_empty_is_empty() {
+        assert_eq!(auto_generate_role_reminder(""), "");
+        assert_eq!(auto_generate_role_reminder("# Only A Header\n"), "");
+    }
+
+    /// A temp dir holding seeded `<id>.md` specialist files for hermetic
+    /// resolver tests; removed on drop.
+    struct TempSpecialistsDir {
+        path: PathBuf,
+    }
+
+    impl TempSpecialistsDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("intentd-specialists-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn write(&self, id: &str, content: &str) {
+            std::fs::write(self.path.join(format!("{id}.md")), content).unwrap();
+        }
+    }
+
+    impl Drop for TempSpecialistsDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn service_over(dir: &TempSpecialistsDir) -> SpecialistsService {
+        SpecialistsService::new(Some(dir.path.clone()), Some(dir.path.clone()))
+    }
+
+    #[test]
+    fn resolve_role_reminder_uses_explicit_reminder() {
+        let dir = TempSpecialistsDir::new();
+        dir.write(
+            "implementor",
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope. No refactors.\"\n---\n\nbody",
+        );
+        let svc = service_over(&dir);
+        let (name, reminder) = svc.resolve_role_reminder("implementor", None).unwrap();
+        assert_eq!(name, "Implementor");
+        assert_eq!(reminder, "Stay in scope. No refactors.");
+    }
+
+    #[test]
+    fn resolve_role_reminder_auto_generates_when_absent() {
+        let dir = TempSpecialistsDir::new();
+        dir.write(
+            "implementor",
+            "---\nname: \"Implementor\"\ndescription: \"d\"\n---\n\nImplement your assigned task.\n\n## Hard Rules\n1. **No scope creep** — only the task\n",
+        );
+        let svc = service_over(&dir);
+        let (name, reminder) = svc.resolve_role_reminder("implementor", None).unwrap();
+        assert_eq!(name, "Implementor");
+        assert_eq!(reminder, "Implement your assigned task. No scope creep.");
+    }
+
+    #[test]
+    fn resolve_role_reminder_none_for_unknown_or_empty() {
+        let dir = TempSpecialistsDir::new();
+        // No file → unknown specialist.
+        let svc = service_over(&dir);
+        assert!(svc.resolve_role_reminder("missing", None).is_none());
+        // Present but no reminder and an unparseable body → None.
+        dir.write(
+            "blank",
+            "---\nname: \"Blank\"\ndescription: \"d\"\n---\n\n# Only Headers\n",
+        );
+        assert!(svc.resolve_role_reminder("blank", None).is_none());
     }
 }
