@@ -310,6 +310,88 @@ async fn specialist_full_crud_and_three_tier_resolution() {
 }
 
 #[tokio::test]
+async fn specialist_full_frontmatter_wire_parity() {
+    let h = start().await;
+    // Seed a bundled specialist whose frontmatter carries every optional scalar.
+    let body = "---\nname: \"Ralph\"\ndescription: \"Loops forever\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"ralph-loop\"\n---\n\nYou loop.";
+    std::fs::write(h.bundled_dir.join("ralph.md"), body).unwrap();
+
+    let (read, mut w) = connect_retry(&h.socket).await.into_split();
+    let mut r = BufReader::new(read);
+
+    // get — bundled tier surfaces the full wire shape.
+    let got = ok(
+        &mut w,
+        &mut r,
+        1,
+        "specialist.get",
+        json!({ "id": "ralph" }),
+    )
+    .await;
+    let s = &got["specialist"];
+    assert_eq!(s["codingAgent"], "claude");
+    assert_eq!(s["model"], "opus4.5");
+    assert_eq!(s["modelTier"], "smart");
+    assert_eq!(s["roleReminder"], "Never stop early");
+    assert_eq!(s["agentType"], "ralph-loop");
+    assert_eq!(s["prompt"], "You loop.");
+    assert_eq!(
+        s["behaviorPrompt"], "You loop.",
+        "behaviorPrompt aliases prompt"
+    );
+    assert_eq!(s["isCustomized"], false, "bundled is not customized");
+
+    // list — same fields visible in the list projection.
+    let list = ok(&mut w, &mut r, 2, "specialist.list", json!({})).await;
+    let specs = list["specialists"].as_array().unwrap();
+    let ralph = specs.iter().find(|s| s["id"] == "ralph").unwrap();
+    assert_eq!(ralph["agentType"], "ralph-loop");
+    assert_eq!(ralph["roleReminder"], "Never stop early");
+    assert_eq!(ralph["isCustomized"], false);
+
+    // create→get round-trip: a user specialist persists every field losslessly,
+    // and the body may be supplied via the `behaviorPrompt` alias.
+    let created = ok(
+        &mut w,
+        &mut r,
+        3,
+        "specialist.create",
+        json!({ "id": "ralph2", "spec": {
+            "id": "ralph2", "name": "Ralph II",
+            "description": "Loops again", "codingAgent": "claude",
+            "model": "opus4.5", "modelTier": "smart",
+            "roleReminder": "Keep going", "agentType": "ralph-loop",
+            "behaviorPrompt": "Loop body." } }),
+    )
+    .await;
+    assert_eq!(created["specialist"]["agentType"], "ralph-loop");
+    assert_eq!(created["specialist"]["isCustomized"], true);
+    assert_eq!(created["specialist"]["prompt"], "Loop body.");
+    assert_eq!(created["specialist"]["behaviorPrompt"], "Loop body.");
+
+    let got = ok(
+        &mut w,
+        &mut r,
+        4,
+        "specialist.get",
+        json!({ "id": "ralph2" }),
+    )
+    .await;
+    let s = &got["specialist"];
+    assert_eq!(s["source"], "user");
+    assert_eq!(s["codingAgent"], "claude");
+    assert_eq!(s["model"], "opus4.5");
+    assert_eq!(s["modelTier"], "smart");
+    assert_eq!(s["roleReminder"], "Keep going");
+    assert_eq!(s["agentType"], "ralph-loop");
+    assert_eq!(s["prompt"], "Loop body.");
+    assert_eq!(s["behaviorPrompt"], "Loop body.");
+    assert_eq!(s["isCustomized"], true);
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
 async fn specialist_bundled_read_only_and_invalid_params() {
     let h = start().await;
     write_specialist(
