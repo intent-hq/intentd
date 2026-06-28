@@ -1568,6 +1568,30 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    // ========================================================================
+    // github.* browse / auth / identity (PROTOCOL §5.27)
+    //
+    // Repo-addressed GitHub operations backed by the `SourceControl` engine,
+    // distinct from the workspace/active-PR `pr.*` surface. The PAT comes from
+    // the environment and is NEVER logged, echoed, or returned over the wire —
+    // only derived identity / connection state crosses it.
+    // ========================================================================
+
+    /// `github.repos.list`: the authenticated user's repositories
+    /// (`GET /user/repos`) → `{ repos: GithubRepo[], nextToken }`.
+    fn github_repos_list(
+        &self,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (limit, next_token);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_repos_list not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `github.pulls.search`: `GET /search/issues` (`is:pr` + `@me`
     /// involvement) → `{ pulls, nextToken }`.
     fn github_pulls_search(
@@ -1582,6 +1606,22 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_pulls_search not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.repos.search`: search repositories (`GET /search/repositories`)
+    /// → `{ repos: GithubRepo[], nextToken }`.
+    fn github_repos_search(
+        &self,
+        query: String,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (query, limit, next_token);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_repos_search not implemented".to_string(),
             ))
         })
     }
@@ -1609,6 +1649,21 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_pulls_merge not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.repos.get`: a single repository's metadata
+    /// (`GET /repos/{owner}/{repo}`) → `{ repo: GithubRepo | null }`.
+    fn github_repos_get(
+        &self,
+        owner: String,
+        repo: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_repos_get not implemented".to_string(),
             ))
         })
     }
@@ -1648,6 +1703,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `github.branches.list`: a repository's remote branch names
+    /// (`GET /repos/{owner}/{repo}/branches`) → `{ branches: string[], nextToken }`.
+    fn github_branches_list(
+        &self,
+        owner: String,
+        repo: String,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, limit, next_token);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_branches_list not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `github.issues.search`: `GET /search/issues` (`is:issue`) →
     /// `{ issues, nextToken }`.
     fn github_issues_search(
@@ -1662,6 +1734,16 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_issues_search not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.authStatus`: validate the resolved env PAT via `GET /user` and
+    /// report connection state. Never returns the token.
+    fn github_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_auth_status not implemented".to_string(),
             ))
         })
     }
@@ -1683,6 +1765,15 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `github.connect`: no-op / guidance in the PAT-from-env model (no OAuth).
+    fn github_connect(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_connect not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `github.replyReviewComment`: reply to a review comment
     /// (`inReplyToId = commentId`) → `{ comment }`.
     fn github_reply_review_comment(
@@ -1697,6 +1788,15 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_reply_review_comment not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.revoke`: no-op / guidance; the token is environment-owned.
+    fn github_revoke(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_revoke not implemented".to_string(),
             ))
         })
     }
@@ -1738,6 +1838,16 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_unresolve_thread not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.getUser`: GitHub-derived identity (`GET /user`) →
+    /// `{ user: GithubUser | null }`. Never includes the PAT.
+    fn github_get_user(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_get_user not implemented".to_string(),
             ))
         })
     }

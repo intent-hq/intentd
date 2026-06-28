@@ -765,6 +765,80 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn github_repos_list(
+        &self,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "repos": [],
+                "nextToken": Value::Null,
+                "echoLimit": limit,
+                "echoToken": next_token,
+            }))
+        })
+    }
+
+    fn github_repos_search(
+        &self,
+        query: String,
+        limit: Option<i64>,
+        _next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "repos": [],
+                "nextToken": Value::Null,
+                "echoQuery": query,
+                "echoLimit": limit,
+            }))
+        })
+    }
+
+    fn github_repos_get(&self, owner: String, repo: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!({ "repo": { "owner": owner, "name": repo } })) })
+    }
+
+    fn github_branches_list(
+        &self,
+        owner: String,
+        repo: String,
+        _limit: Option<i64>,
+        _next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({ "branches": [owner, repo], "nextToken": Value::Null }))
+        })
+    }
+
+    fn github_auth_status(&self) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async {
+            Ok(serde_json::json!({
+                "isConfigured": true,
+                "oauthUrl": "",
+                "configuredButNeedsUpdate": false,
+                "updatedScopes": "",
+            }))
+        })
+    }
+
+    fn github_connect(&self) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async { Ok(serde_json::json!({ "ok": false, "guidance": "set GITHUB_TOKEN" })) })
+    }
+
+    fn github_revoke(&self) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async { Ok(serde_json::json!({ "ok": false, "guidance": "nothing to revoke" })) })
+    }
+
+    fn github_get_user(&self) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async {
+            Ok(serde_json::json!({
+                "user": { "login": "octocat", "avatarUrl": "a", "htmlUrl": "h" }
+            }))
+        })
+    }
+
     fn git_commit(
         &self,
         _workspace_id: WorkspaceId,
@@ -2111,6 +2185,99 @@ async fn repo_list_returns_repos_with_camelcase_keys() {
     assert_eq!(repo["owner"], serde_json::json!("cloudlands-ai"));
     assert_eq!(repo["addedAt"], serde_json::json!("t0"));
     assert_eq!(repo["lastUsedAt"], serde_json::json!("t1"));
+}
+
+// ---- github.* browse / auth / identity routing (PROTOCOL §5.27) --------
+
+#[tokio::test]
+async fn github_repos_list_routes_with_optional_pagination() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.repos.list","params":{"limit":25,"nextToken":"c"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["echoLimit"], serde_json::json!(25));
+    assert_eq!(v["result"]["echoToken"], serde_json::json!("c"));
+    assert_eq!(v["result"]["nextToken"], Value::Null);
+}
+
+#[tokio::test]
+async fn github_repos_search_requires_query() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.repos.search","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn github_repos_search_routes_query() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.repos.search","params":{"query":"react"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["echoQuery"], serde_json::json!("react"));
+}
+
+#[tokio::test]
+async fn github_repos_get_requires_owner_and_repo() {
+    let missing_repo =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"github.repos.get","params":{"owner":"o"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&missing_repo), -32602);
+
+    let ok = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.repos.get","params":{"owner":"o","repo":"r"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok["result"]["repo"]["owner"], serde_json::json!("o"));
+    assert_eq!(ok["result"]["repo"]["name"], serde_json::json!("r"));
+}
+
+#[tokio::test]
+async fn github_branches_list_requires_owner_and_repo() {
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"github.branches.list","params":{"owner":"o"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    let ok = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.branches.list","params":{"owner":"o","repo":"r"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok["result"]["branches"], serde_json::json!(["o", "r"]));
+    assert_eq!(ok["result"]["nextToken"], Value::Null);
+}
+
+#[tokio::test]
+async fn github_auth_status_connect_revoke_get_user_route_without_params() {
+    let auth = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.authStatus","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(auth["result"]["isConfigured"], serde_json::json!(true));
+
+    let connect = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.connect","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(connect["result"]["ok"], serde_json::json!(false));
+
+    let revoke = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.revoke","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(revoke["result"]["ok"], serde_json::json!(false));
+
+    let user = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.getUser","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        user["result"]["user"]["login"],
+        serde_json::json!("octocat")
+    );
+    assert!(user["result"]["user"].get("id").is_none());
 }
 
 #[tokio::test]

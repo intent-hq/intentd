@@ -577,6 +577,44 @@ async fn uds_slice_end_to_end() {
     );
     assert_eq!(sess[4]["result"], Value::Null, "the draft was cleared");
 
+    // (y) github.* browse / auth / identity (PROTOCOL §5.27), token-absent path.
+    //     `connect` / `revoke` are no-ops (no engine, no network) and must return
+    //     guidance; `authStatus` validates the env PAT and degrades gracefully to
+    //     a well-formed `{ isConfigured: bool, ... }` (the single `GET /user`
+    //     probe is swallowed on failure, so this never asserts on live network).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":40,"method":"github.connect","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(false));
+    assert!(resp["result"]["guidance"]
+        .as_str()
+        .expect("guidance string")
+        .contains("GITHUB_TOKEN"));
+
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":41,"method":"github.revoke","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(false));
+    assert!(resp["result"]["guidance"].is_string());
+
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":42,"method":"github.authStatus","params":{}}"#,
+    )
+    .await;
+    assert!(resp["result"].is_object(), "authStatus result is an object");
+    assert!(
+        resp["result"]["isConfigured"].is_boolean(),
+        "isConfigured is a boolean"
+    );
+    assert_eq!(resp["result"]["oauthUrl"], json!(""));
+    // 🔒 The PAT is never echoed over the wire.
+    assert!(resp["result"].get("token").is_none());
+
     let _ = tx.send(());
     let _ = server.await;
     let _ = std::fs::remove_dir_all(&dir);
