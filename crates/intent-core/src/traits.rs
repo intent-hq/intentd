@@ -1852,6 +1852,49 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `linear.authStatus`: validate the resolved Linear API key via the GraphQL
+    /// `viewer` probe and report `{ authenticated, login?, scopes }`. The key is
+    /// never returned. A missing/invalid key surfaces as `Internal` (PROTOCOL
+    /// §5.28).
+    fn linear_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::linear_auth_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `linear.listIssues`: the viewer's issues for the typed `filter`
+    /// (`assigned`|`created`|`subscribed`|`team`|`all`, default `assigned`),
+    /// returned as a bare `LinearIssueResult[]` (PROTOCOL §5.28).
+    fn linear_list_issues(
+        &self,
+        filter: Option<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (filter, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::linear_list_issues not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `linear.searchIssues`: full-text issue search by `query`, returned as a
+    /// bare `LinearIssueResult[]` (PROTOCOL §5.28).
+    fn linear_search_issues(
+        &self,
+        query: String,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (query, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::linear_search_issues not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `file-tracking.init`: initialize/attach the tracker for a workspace
     /// (`{ ok: true }`) (PROTOCOL §5.19).
     fn file_tracking_init(
