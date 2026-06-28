@@ -295,6 +295,110 @@ async fn uds_slice_end_to_end() {
     assert_eq!(resp["error"]["code"], json!(-32602));
     assert_eq!(resp["error"]["message"], json!("Workspace not found"));
 
+    // (f4) workspace.getSetupScript on the seeded workspace returns the default
+    //      (empty `script`, `updatedAt: 0`, no `projectType`/`generatedBy`) record
+    //      before any save (§5.25).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":130,"method":"workspace.getSetupScript","params":{"workspaceId":"ws-seed"}}"#,
+    )
+    .await;
+    let s = &resp["result"]["setupScript"];
+    assert!(s.is_object(), "setupScript must be an object");
+    assert_eq!(s["script"], json!(""));
+    assert_eq!(s["updatedAt"], json!(0));
+    assert_eq!(s.get("projectType"), None);
+    assert_eq!(s.get("generatedBy"), None);
+
+    // (f5) saveSetupScript persists the body, stamps `generatedBy:"user"` + a
+    //      fresh `updatedAt`, and returns the stored record (§5.25).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":131,"method":"workspace.saveSetupScript","params":{"workspaceId":"ws-seed","script":"echo hello"}}"#,
+    )
+    .await;
+    let s = &resp["result"]["setupScript"];
+    assert_eq!(s["script"], json!("echo hello"));
+    assert_eq!(s["generatedBy"], json!("user"));
+    assert!(s["updatedAt"].as_u64().expect("updatedAt") > 0);
+
+    // (f6) getSetupScript now round-trips the saved body (durable persistence).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":132,"method":"workspace.getSetupScript","params":{"workspaceId":"ws-seed"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["setupScript"]["script"], json!("echo hello"));
+    assert_eq!(resp["result"]["setupScript"]["generatedBy"], json!("user"));
+
+    // (f7) saveSetupScript with a missing `script` param → -32602.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":133,"method":"workspace.saveSetupScript","params":{"workspaceId":"ws-seed"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+
+    // (f8) detectProjectType on a workspace whose worktree holds a Cargo.toml →
+    //      "rust"; generateSetupScript drafts a `cargo fetch` script stamped
+    //      `generatedBy:"agent"` with the detected `projectType` (§5.25).
+    let manifest_dir = dir.join("rust-ws");
+    std::fs::create_dir_all(&manifest_dir).unwrap();
+    std::fs::write(manifest_dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+    let wt = manifest_dir.to_string_lossy().to_string();
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":134,"method":"workspace.create","params":{{"title":"Rust WS","worktreePath":"{wt}"}}}}"#
+        ),
+    )
+    .await;
+    let rust_id = resp["result"]["workspace"]["id"]
+        .as_str()
+        .expect("rust ws id")
+        .to_string();
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":135,"method":"workspace.detectProjectType","params":{{"workspaceId":"{rust_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["projectType"], json!("rust"));
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":136,"method":"workspace.generateSetupScript","params":{{"workspaceId":"{rust_id}"}}}}"#
+        ),
+    )
+    .await;
+    let s = &resp["result"]["setupScript"];
+    assert_eq!(s["projectType"], json!("rust"));
+    assert_eq!(s["generatedBy"], json!("agent"));
+    assert!(s["script"]
+        .as_str()
+        .expect("script")
+        .contains("cargo fetch"));
+
+    // (f9) detectProjectType on a workspace with no worktree manifest → null.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":137,"method":"workspace.detectProjectType","params":{"workspaceId":"ws-seed"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["projectType"], Value::Null);
+
+    // (f10) getSetupScript on the deleted workspace → -32602 "Workspace not found".
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":138,"method":"workspace.getSetupScript","params":{{"workspaceId":"{new_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(resp["error"]["message"], json!("Workspace not found"));
+
     // (g) note.create on the seeded workspace, with a checkbox line so the
     //     task.* lifecycle has something to edit. Asserts the camelCase Note
     //     wire shape the iOS client expects (PROTOCOL §5.2).
