@@ -1,8 +1,8 @@
 //! Workspace repository: insert + list, mapping rows ↔ [`Workspace`] (§9.2).
 
 use intent_core::{
-    Error, PullRequestInfo, Result, TokenUsage, Workspace, WorkspaceActivity, WorkspaceAttention,
-    WorkspaceId, WorkspaceStatus,
+    Error, PullRequestInfo, Result, SetupScript, TokenUsage, Workspace, WorkspaceActivity,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -13,14 +13,14 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     status_message, attention, path, repository_path, repository_owner, repository_name, \
     worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, pr_status, \
     active_pull_request, archived, archived_at, tags, created_at, updated_at, last_activity, \
-    token_usage";
+    token_usage, setup_script";
 
 impl Store {
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
     pub async fn insert_workspace(&self, ws: &Workspace) -> Result<()> {
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -51,6 +51,7 @@ impl Store {
             .bind(&ws.updated_at)
             .bind(&ws.last_activity)
             .bind(token_usage_to_db(ws)?)
+            .bind(setup_script_to_db(ws)?)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
@@ -80,7 +81,7 @@ impl Store {
              repository_name=?, worktree_path=?, scope=?, skip_worktree=?, is_remote=?, \
              default_model=?, pr_number=?, pr_url=?, pr_status=?, active_pull_request=?, \
              archived=?, archived_at=?, tags=?, created_at=?, updated_at=?, last_activity=?, \
-             token_usage=? \
+             token_usage=?, setup_script=? \
              WHERE id=?",
         )
         .bind(&ws.title)
@@ -110,6 +111,7 @@ impl Store {
         .bind(&ws.updated_at)
         .bind(&ws.last_activity)
         .bind(token_usage_to_db(ws)?)
+        .bind(setup_script_to_db(ws)?)
         .bind(&ws.id.0)
         .execute(self.pool())
         .await
@@ -203,6 +205,26 @@ fn token_usage_from_db(s: Option<String>) -> Result<Option<TokenUsage>> {
     .transpose()
 }
 
+/// Encode the optional `setup_script` record to a JSON TEXT column (§5.25).
+fn setup_script_to_db(ws: &Workspace) -> Result<Option<String>> {
+    ws.setup_script
+        .as_ref()
+        .map(|s| {
+            serde_json::to_string(s)
+                .map_err(|e| Error::Internal(format!("encode setup_script failed: {e}")))
+        })
+        .transpose()
+}
+
+/// Decode the optional `setup_script` JSON TEXT column (§5.25).
+fn setup_script_from_db(s: Option<String>) -> Result<Option<SetupScript>> {
+    s.map(|json| {
+        serde_json::from_str::<SetupScript>(&json)
+            .map_err(|e| Error::Internal(format!("decode setup_script failed: {e}")))
+    })
+    .transpose()
+}
+
 fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
     let pr_number: Option<i64> = col(row, "pr_number")?;
     let pr_status = col::<Option<String>>(row, "pr_status")?
@@ -211,6 +233,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
     let active_pull_request =
         active_pr_from_db(col::<Option<String>>(row, "active_pull_request")?)?;
     let token_usage = token_usage_from_db(col::<Option<String>>(row, "token_usage")?)?;
+    let setup_script = setup_script_from_db(col::<Option<String>>(row, "setup_script")?)?;
     Ok(Workspace {
         id: WorkspaceId(col(row, "id")?),
         title: col(row, "title")?,
@@ -233,8 +256,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         worktree_path: col(row, "worktree_path")?,
         scope: col(row, "scope")?,
         skip_worktree: col::<i64>(row, "skip_worktree")? != 0,
-        // Not persisted in this slice.
-        setup_script: None,
+        setup_script,
         is_remote: col::<i64>(row, "is_remote")? != 0,
         default_model: col(row, "default_model")?,
         pr_number: pr_number.map(|n| n as u64),
