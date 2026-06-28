@@ -1579,6 +1579,7 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `github.pulls.list`: `GET /repos/{owner}/{repo}/pulls` → `{ pulls, nextToken }`.
+    #[allow(clippy::too_many_arguments)]
     fn github_pulls_list(
         &self,
         owner: String,
@@ -1587,8 +1588,9 @@ pub trait WorkspaceApi: Send + Sync {
         head: Option<String>,
         base: Option<String>,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (owner, repo, state, head, base, limit);
+        let _ = (owner, repo, state, head, base, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_pulls_list not implemented".to_string(),
@@ -1629,8 +1631,9 @@ pub trait WorkspaceApi: Send + Sync {
         filter: Option<String>,
         state: Option<String>,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (owner, repo, filter, state, limit);
+        let _ = (owner, repo, filter, state, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_pulls_search not implemented".to_string(),
@@ -1715,6 +1718,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.issues.list`: `GET /repos/{owner}/{repo}/issues` (PRs filtered
     /// out) → `{ issues, nextToken }`.
+    #[allow(clippy::too_many_arguments)]
     fn github_issues_list(
         &self,
         owner: String,
@@ -1722,8 +1726,9 @@ pub trait WorkspaceApi: Send + Sync {
         state: Option<String>,
         labels: Option<String>,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (owner, repo, state, labels, limit);
+        let _ = (owner, repo, state, labels, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_issues_list not implemented".to_string(),
@@ -1757,8 +1762,9 @@ pub trait WorkspaceApi: Send + Sync {
         filter: Option<String>,
         state: Option<String>,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (owner, repo, filter, state, limit);
+        let _ = (owner, repo, filter, state, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_issues_search not implemented".to_string(),
@@ -1784,8 +1790,9 @@ pub trait WorkspaceApi: Send + Sync {
         repo: String,
         number: u64,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (owner, repo, number, limit);
+        let _ = (owner, repo, number, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_list_review_comments not implemented".to_string(),
@@ -1837,8 +1844,9 @@ pub trait WorkspaceApi: Send + Sync {
         repo: String,
         number: u64,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (owner, repo, number, limit);
+        let _ = (owner, repo, number, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_get_review_threads not implemented".to_string(),

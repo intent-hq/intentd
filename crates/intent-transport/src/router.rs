@@ -1190,8 +1190,9 @@ async fn dispatch(
             let head = opt_str(params, "head");
             let base = opt_str(params, "base");
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_pulls_list(owner, repo, state, head, base, limit)
+                .github_pulls_list(owner, repo, state, head, base, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -1202,8 +1203,9 @@ async fn dispatch(
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_pulls_search(owner, repo, filter, state, limit)
+                .github_pulls_search(owner, repo, filter, state, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -1245,8 +1247,9 @@ async fn dispatch(
             let state = opt_str(params, "state");
             let labels = opt_str(params, "labels");
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_issues_list(owner, repo, state, labels, limit)
+                .github_issues_list(owner, repo, state, labels, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -1257,8 +1260,9 @@ async fn dispatch(
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_issues_search(owner, repo, filter, state, limit)
+                .github_issues_search(owner, repo, filter, state, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -1268,8 +1272,9 @@ async fn dispatch(
             let repo = require_str_param(params, "repo")?;
             let number = require_u64(params, "number")?;
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_list_review_comments(owner, repo, number, limit)
+                .github_list_review_comments(owner, repo, number, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -1291,8 +1296,9 @@ async fn dispatch(
             let repo = require_str_param(params, "repo")?;
             let number = require_u64(params, "number")?;
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_get_review_threads(owner, repo, number, limit)
+                .github_get_review_threads(owner, repo, number, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
