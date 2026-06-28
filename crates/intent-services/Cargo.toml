@@ -12,6 +12,7 @@ intent-store = { path = "../intent-store" }
 intent-git = { path = "../intent-git" }
 intent-sourcecontrol = { path = "../intent-sourcecontrol" }
 intent-linear = { path = "../intent-linear" }
+intent-sentry = { path = "../intent-sentry" }
 intent-acp = { path = "../intent-acp" }
 intent-context = { path = "../intent-context" }
 intent-providers = { path = "../intent-providers" }

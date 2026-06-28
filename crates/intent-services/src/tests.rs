@@ -5898,3 +5898,144 @@ mod linear {
         }
     }
 }
+
+/// `sentry.*` P0 read handlers over an injected stub engine: not-configured
+/// failures map to `Internal` (→ `-32603`) and successes serialize as a bare
+/// array / a bare object (no `{ items, nextToken }` envelope).
+mod sentry {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use intent_core::WorkspaceApi;
+    use intent_sentry::{
+        Error as SentryError, FetchIssuesRequest, Result as SentryResult, SentryAuthState,
+        SentryEngine, SentryIssueLevel, SentryIssueResult, SentryIssueStatus,
+    };
+
+    use super::*;
+
+    /// Injectable stub: when `fail` it reports `NotConfigured` for every call;
+    /// otherwise it returns canned values for shape assertions.
+    struct StubSentry {
+        fail: bool,
+    }
+
+    impl StubSentry {
+        fn not_configured<T>() -> SentryResult<T> {
+            Err(SentryError::NotConfigured("no creds".into()))
+        }
+
+        fn issue() -> SentryIssueResult {
+            SentryIssueResult {
+                id: "1".into(),
+                short_id: "PROJ-1".into(),
+                title: "boom".into(),
+                culprit: None,
+                status: SentryIssueStatus::Unresolved,
+                level: SentryIssueLevel::Error,
+                count: "1".into(),
+                user_count: 0,
+                first_seen: "2026-01-01T00:00:00Z".into(),
+                last_seen: "2026-01-02T00:00:00Z".into(),
+                project_name: "Web".into(),
+                project_slug: "web".into(),
+                url: None,
+                r#type: None,
+                value: None,
+                filename: None,
+                function: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SentryEngine for StubSentry {
+        async fn auth_status(&self) -> SentryResult<SentryAuthState> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(SentryAuthState {
+                authenticated: true,
+                organization: Some("acme".into()),
+                error: None,
+            })
+        }
+
+        async fn list_issues(
+            &self,
+            _request: FetchIssuesRequest,
+        ) -> SentryResult<Vec<SentryIssueResult>> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(vec![Self::issue()])
+        }
+
+        async fn search_issues(
+            &self,
+            _query: &str,
+            _project: Option<&str>,
+            _limit: Option<u32>,
+        ) -> SentryResult<Vec<SentryIssueResult>> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(vec![Self::issue()])
+        }
+    }
+
+    async fn svc(fail: bool) -> (TempDb, Services) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let services = Services::new(store).with_sentry_engine(Arc::new(StubSentry { fail }));
+        (tmp, services)
+    }
+
+    #[tokio::test]
+    async fn not_configured_maps_to_internal() {
+        let (_tmp, s) = svc(true).await;
+        assert!(matches!(
+            s.sentry_auth_status().await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            s.sentry_list_issues(None, None, None, None).await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            s.sentry_search_issues("boom".into(), None, None).await,
+            Err(Error::Internal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_status_is_invalid_params() {
+        let (_tmp, s) = svc(false).await;
+        assert!(matches!(
+            s.sentry_list_issues(None, Some("bogus".into()), None, None)
+                .await,
+            Err(Error::InvalidParams(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn success_serializes_as_bare_object_and_arrays() {
+        let (_tmp, s) = svc(false).await;
+
+        let status = s.sentry_auth_status().await.unwrap();
+        assert!(status.is_object());
+        assert_eq!(status["authenticated"], true);
+        assert_eq!(status["organization"], "acme");
+
+        for arr in [
+            s.sentry_list_issues(None, None, None, None).await.unwrap(),
+            s.sentry_search_issues("boom".into(), None, None)
+                .await
+                .unwrap(),
+        ] {
+            assert!(arr.is_array(), "expected bare array, got {arr}");
+            assert!(arr.get("items").is_none(), "no envelope");
+            assert_eq!(arr[0]["shortId"], "PROJ-1");
+        }
+    }
+}

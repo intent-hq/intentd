@@ -2083,6 +2083,53 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `sentry.authStatus`: probe the resolved Sentry credentials via
+    /// `GET /organizations/{org}/` and report `{ authenticated, organization?,
+    /// error? }`. The token is never returned. A missing pair surfaces as
+    /// `Internal` (PROTOCOL §5.29).
+    fn sentry_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sentry_auth_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sentry.listIssues`: issues matching the typed `status` filter
+    /// (`unresolved`|`resolved`|`ignored`|`all`, default `unresolved`),
+    /// optional `project` slug, optional free-text `query`, returned as a bare
+    /// `SentryIssueResult[]` (PROTOCOL §5.29).
+    fn sentry_list_issues(
+        &self,
+        project: Option<String>,
+        status: Option<String>,
+        query: Option<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (project, status, query, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sentry_list_issues not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sentry.searchIssues`: full-text issue search by `query`, optional
+    /// `project` slug, returned as a bare `SentryIssueResult[]` (PROTOCOL §5.29).
+    fn sentry_search_issues(
+        &self,
+        query: String,
+        project: Option<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (query, project, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sentry_search_issues not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `file-tracking.init`: initialize/attach the tracker for a workspace
     /// (`{ ok: true }`) (PROTOCOL §5.19).
     fn file_tracking_init(
