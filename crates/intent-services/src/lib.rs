@@ -16,7 +16,7 @@ use intent_core::events::{
     COMMENT_ADDED, COMMENT_RESOLVED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED,
     PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED,
     TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
-    WORKSPACE_ATTENTION_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_TOKEN_USAGE_CHANGED,
 };
 use intent_core::{
     iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId, AgentLite,
@@ -30,7 +30,7 @@ use intent_core::{
     NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, ScriptCreateParams,
     SessionStats, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
     TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, Workspace,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceDiffSummary, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
     WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
@@ -614,6 +614,87 @@ impl Services {
             loop {
                 ticker.tick().await;
                 services.refresh_all_linked_prs().await;
+            }
+        })
+    }
+
+    /// Recompute one workspace's durable `tokenUsage` by tallying its agent
+    /// sessions per agent and per model (§5.23 / §19.1), persisting the snapshot
+    /// and emitting `workspace:tokenUsage-changed` only when the materialized
+    /// tally (ignoring `lastScanAt`) actually changed. Daemon-internal — there is
+    /// no scan RPC. Returns whether a change was written. `NotFound` if the
+    /// workspace is absent.
+    pub async fn scan_workspace_token_usage(&self, workspace_id: &WorkspaceId) -> Result<bool> {
+        let sessions = self.store.list_agent_sessions(workspace_id).await?;
+        let tallies: Vec<token_usage::AgentTokenTally> = sessions
+            .iter()
+            .map(token_usage::session_token_tally)
+            .collect();
+        let mut usage = token_usage::aggregate_token_usage(&tallies);
+        usage.last_scan_at = Some(now_iso());
+
+        let mut ws = self.store.get_workspace(workspace_id).await?;
+        let changed = match &ws.token_usage {
+            Some(prev) => {
+                prev.by_agent_id != usage.by_agent_id
+                    || prev.by_model != usage.by_model
+                    || prev.totals != usage.totals
+            }
+            None => true,
+        };
+        if !changed {
+            return Ok(false);
+        }
+        ws.token_usage = Some(usage.clone());
+        ws.updated_at = now_iso();
+        self.store.update_workspace(&ws).await?;
+        publish_event(
+            &self.event_bus,
+            token_usage_changed_event(workspace_id, &usage),
+        )
+        .await;
+        Ok(true)
+    }
+
+    /// Re-scan token usage for every non-archived workspace. Errors are logged
+    /// per workspace and never abort the sweep.
+    async fn scan_all_token_usage(&self) {
+        let workspaces = match self.store.list_workspaces(false).await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(error = %e, "token usage scan: listing workspaces failed");
+                return;
+            }
+        };
+        for ws in workspaces {
+            if let Err(e) = self.scan_workspace_token_usage(&ws.id).await {
+                tracing::warn!(
+                    workspace = %ws.id.as_str(),
+                    error = %e,
+                    "token usage scan: workspace scan failed"
+                );
+            }
+        }
+    }
+
+    /// Spawn the daemon-internal periodic token-usage scan loop (§5.23 / §19.1):
+    /// every `interval` it re-tallies each workspace's usage, persisting deltas
+    /// and pushing `workspace:tokenUsage-changed`. The first sweep runs after one
+    /// `interval`; missed ticks are skipped (no pile-up). Returns the task handle
+    /// so the composition root can hold/abort it.
+    pub fn spawn_token_usage_scan_loop(
+        &self,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let services = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Consume the immediate first tick so the loop waits one interval.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                services.scan_all_token_usage().await;
             }
         })
     }
@@ -1514,6 +1595,26 @@ fn pr_unlinked_event(workspace_id: &WorkspaceId) -> NewEvent {
         parent_event_id: None,
         metadata: None,
         data: serde_json::json!({ "workspaceId": workspace_id.as_str() }),
+    }
+}
+
+/// Build a `workspace:tokenUsage-changed` event carrying the recomputed
+/// `TokenUsage` snapshot (§5.23 / §6.5). Self-sufficient payload
+/// `{ workspaceId, tokenUsage }` so the FE re-renders without a follow-up read.
+fn token_usage_changed_event(workspace_id: &WorkspaceId, usage: &TokenUsage) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_TOKEN_USAGE_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "tokenUsage": usage,
+        }),
     }
 }
 
@@ -2856,6 +2957,7 @@ impl WorkspaceApi for Services {
                         task_stats: None,
                         agent_summary: None,
                         diff_summary: None,
+                        token_usage: None,
                     };
                     store.insert_workspace(&ws).await?;
                     // Register the repo in the persistent registry so it survives
@@ -3027,6 +3129,17 @@ impl WorkspaceApi for Services {
                 publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
             }
             Ok(ws)
+        })
+    }
+
+    fn get_token_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<TokenUsage>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // The scan job is daemon-internal; this is the wire read. Surface a
+            // default (empty, `lastScanAt: null`) snapshot before the first scan;
+            // `NotFound` propagates so the router maps it to `-32602` (§5.23).
+            let ws = store.get_workspace(&id).await?;
+            Ok(ws.token_usage.unwrap_or_default())
         })
     }
 
@@ -8303,6 +8416,6 @@ mod file_tracking_ops;
 pub mod metrics;
 
 // Integrations & Ops modules (§19).
-pub mod token_usage {}
+pub mod token_usage;
 pub mod session_stats {}
 pub mod setup_scripts {}

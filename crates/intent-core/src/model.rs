@@ -172,6 +172,36 @@ pub struct Workspace {
     pub agent_summary: Option<WorkspaceAgentSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_summary: Option<WorkspaceDiffSummary>,
+    /// Durable token/credit usage accounting (§5.23 / §19.1), materialized by the
+    /// daemon-internal periodic scan job and surfaced by `workspace.getTokenUsage`.
+    /// Omitted (not `null`) until the first scan writes a snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<TokenUsage>,
+}
+
+/// The four consumption counters of a token tally (PROTOCOL §5.23 / §19.1).
+/// Reused for the per-agent, per-model, and workspace-wide rollups.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageTotals {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+}
+
+/// Durable token-usage snapshot returned by `workspace.getTokenUsage` and pushed
+/// via `workspace:tokenUsage-changed` (PROTOCOL §5.23 / §6.5). `byAgentId` keys
+/// are `agent-{uuid}`; `byModel` keys are the effective model name (`"unknown"`
+/// fallback); `lastScanAt` is the RFC-3339 timestamp of the last internal scan
+/// (`null` before the first scan).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsage {
+    pub by_agent_id: BTreeMap<String, TokenUsageTotals>,
+    pub totals: TokenUsageTotals,
+    pub by_model: BTreeMap<String, TokenUsageTotals>,
+    pub last_scan_at: Option<String>,
 }
 
 /// `Workspace.taskStats` card aggregate (§9.1; TS `WorkspaceTaskStats`). Ports
@@ -1908,6 +1938,7 @@ mod tests {
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
+            token_usage: None,
         };
         let v = serde_json::to_value(&ws).unwrap();
         assert_eq!(v["status"], "Active");
@@ -2003,6 +2034,40 @@ mod tests {
         assert_eq!(v["action"], "modify");
         assert_eq!(v["additions"], 3);
         assert_eq!(v["deletions"], 1);
+    }
+
+    /// `TokenUsage`/`TokenUsageTotals` serialize with the camelCase counter names
+    /// and `agent-{uuid}`/model keys the protocol specifies (§5.23); `lastScanAt`
+    /// is `null` (not omitted) before the first scan and round-trips.
+    #[test]
+    fn token_usage_wire_shape() {
+        let mut by_agent_id = BTreeMap::new();
+        by_agent_id.insert(
+            "agent-123".to_string(),
+            TokenUsageTotals {
+                input_tokens: 12000,
+                output_tokens: 3400,
+                cache_read_tokens: 8000,
+                cache_creation_tokens: 1200,
+            },
+        );
+        let mut by_model = BTreeMap::new();
+        by_model.insert("opus-4.8".to_string(), by_agent_id["agent-123"].clone());
+        let usage = TokenUsage {
+            by_agent_id,
+            totals: by_model["opus-4.8"].clone(),
+            by_model,
+            last_scan_at: None,
+        };
+        let v = serde_json::to_value(&usage).unwrap();
+        assert_eq!(v["byAgentId"]["agent-123"]["inputTokens"], 12000);
+        assert_eq!(v["byAgentId"]["agent-123"]["cacheReadTokens"], 8000);
+        assert_eq!(v["byAgentId"]["agent-123"]["cacheCreationTokens"], 1200);
+        assert_eq!(v["byModel"]["opus-4.8"]["outputTokens"], 3400);
+        assert_eq!(v["totals"]["inputTokens"], 12000);
+        assert_eq!(v["lastScanAt"], serde_json::Value::Null);
+        let back: TokenUsage = serde_json::from_value(v).unwrap();
+        assert_eq!(back, usage);
     }
 
     /// `WorkspaceAgentInfo` omits the optional `specialist`/`lastActivity` keys

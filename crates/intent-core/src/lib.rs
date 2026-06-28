@@ -33,10 +33,11 @@ pub use model::{
     Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState, ScriptStatus, SessionStats,
     SuggestionDiff, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
     TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TopChangedFile,
-    Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceDiffSummary, WorkspaceDiffSummaryFile, WorkspaceEventSummary,
-    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
+    TokenUsageTotals, TopChangedFile, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
+    WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceDiffSummary,
+    WorkspaceDiffSummaryFile, WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask,
+    WorkspaceTaskStats, WorkspaceUpdate,
 };
 pub use traits::{
     BoxFuture, ContextEngine, ContextError, EngineAvailability, RetrieveRequest, RetrieveResult,

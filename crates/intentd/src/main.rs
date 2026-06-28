@@ -259,6 +259,11 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
     // polling. Safe when source control is unconfigured (each refresh logs and
     // swallows the missing-provider error). Aborted on clean shutdown.
     let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(60));
+    // Daemon-internal token-usage scan (§5.23/§19.1): periodically re-tally each
+    // workspace's per-agent/per-model token usage, persist the durable
+    // `tokenUsage` field, and emit `workspace:tokenUsage-changed` on deltas.
+    // There is no scan RPC. Aborted on clean shutdown.
+    let token_usage_scan = services.spawn_token_usage_scan_loop(std::time::Duration::from_secs(60));
     // Completion-delivery worker (AS-3): wake parents holding a oneShot
     // completion watch when their delegated child finishes. No-op-safe without
     // an event bus. Held for the process lifetime and aborted on clean shutdown.
@@ -352,6 +357,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
         server.stop().await;
     }
     pr_refresh.abort();
+    token_usage_scan.abort();
     completion_delivery.abort();
     if let Some(reap_task) = reap_task {
         reap_task.abort();

@@ -209,6 +209,11 @@ async fn dispatch(
             let ws = api.mark_seen(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
         }
+        "workspace.getTokenUsage" => {
+            let id = require_workspace_id(params)?;
+            let token_usage = api.get_token_usage(id).await.map_err(workspace_err)?;
+            Ok(json!({ "tokenUsage": token_usage }))
+        }
         "note.list" => {
             let ws_id = match params.get("workspaceId").and_then(Value::as_str) {
                 Some(s) if !s.is_empty() => WorkspaceId::from(s),

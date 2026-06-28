@@ -17,7 +17,7 @@ use crate::model::{
     NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, ReadAssetResult,
     ScriptCreateParams, TaskAssignAgentResult, TaskConvertBlocksResult,
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskMarkAsTaskResult,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, Workspace,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
     WorkspaceCreate, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
@@ -132,6 +132,19 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::mark_seen not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Read the durable token/credit usage snapshot for a workspace (§5.23). The
+    /// scan job itself is daemon-internal (no RPC); this is the wire **read** and
+    /// returns a default (empty, `lastScanAt: null`) snapshot before the first
+    /// scan. `NotFound` if the workspace is absent (router maps it to `-32602`).
+    fn get_token_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<TokenUsage>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::get_token_usage not implemented".to_string(),
             ))
         })
     }

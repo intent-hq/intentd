@@ -420,6 +420,7 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
+        token_usage: None,
     };
     store.insert_workspace(&ws).await.unwrap();
 
@@ -588,6 +589,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
+        token_usage: None,
     };
     let session = AgentSession {
         id: id.clone(),

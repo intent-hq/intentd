@@ -1,8 +1,8 @@
 //! Workspace repository: insert + list, mapping rows ↔ [`Workspace`] (§9.2).
 
 use intent_core::{
-    Error, PullRequestInfo, Result, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    Error, PullRequestInfo, Result, TokenUsage, Workspace, WorkspaceActivity, WorkspaceAttention,
+    WorkspaceId, WorkspaceStatus,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -12,14 +12,15 @@ use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, Store};
 const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, status, \
     status_message, attention, path, repository_path, repository_owner, repository_name, \
     worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, pr_status, \
-    active_pull_request, archived, archived_at, tags, created_at, updated_at, last_activity";
+    active_pull_request, archived, archived_at, tags, created_at, updated_at, last_activity, \
+    token_usage";
 
 impl Store {
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
     pub async fn insert_workspace(&self, ws: &Workspace) -> Result<()> {
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -49,6 +50,7 @@ impl Store {
             .bind(&ws.created_at)
             .bind(&ws.updated_at)
             .bind(&ws.last_activity)
+            .bind(token_usage_to_db(ws)?)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
@@ -77,7 +79,8 @@ impl Store {
              status_message=?, attention=?, path=?, repository_path=?, repository_owner=?, \
              repository_name=?, worktree_path=?, scope=?, skip_worktree=?, is_remote=?, \
              default_model=?, pr_number=?, pr_url=?, pr_status=?, active_pull_request=?, \
-             archived=?, archived_at=?, tags=?, created_at=?, updated_at=?, last_activity=? \
+             archived=?, archived_at=?, tags=?, created_at=?, updated_at=?, last_activity=?, \
+             token_usage=? \
              WHERE id=?",
         )
         .bind(&ws.title)
@@ -106,6 +109,7 @@ impl Store {
         .bind(&ws.created_at)
         .bind(&ws.updated_at)
         .bind(&ws.last_activity)
+        .bind(token_usage_to_db(ws)?)
         .bind(&ws.id.0)
         .execute(self.pool())
         .await
@@ -179,6 +183,26 @@ fn active_pr_from_db(s: Option<String>) -> Result<Option<PullRequestInfo>> {
     .transpose()
 }
 
+/// Encode the optional `token_usage` snapshot to a JSON TEXT column (§5.23).
+fn token_usage_to_db(ws: &Workspace) -> Result<Option<String>> {
+    ws.token_usage
+        .as_ref()
+        .map(|tu| {
+            serde_json::to_string(tu)
+                .map_err(|e| Error::Internal(format!("encode token_usage failed: {e}")))
+        })
+        .transpose()
+}
+
+/// Decode the optional `token_usage` JSON TEXT column (§5.23).
+fn token_usage_from_db(s: Option<String>) -> Result<Option<TokenUsage>> {
+    s.map(|json| {
+        serde_json::from_str::<TokenUsage>(&json)
+            .map_err(|e| Error::Internal(format!("decode token_usage failed: {e}")))
+    })
+    .transpose()
+}
+
 fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
     let pr_number: Option<i64> = col(row, "pr_number")?;
     let pr_status = col::<Option<String>>(row, "pr_status")?
@@ -186,6 +210,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         .transpose()?;
     let active_pull_request =
         active_pr_from_db(col::<Option<String>>(row, "active_pull_request")?)?;
+    let token_usage = token_usage_from_db(col::<Option<String>>(row, "token_usage")?)?;
     Ok(Workspace {
         id: WorkspaceId(col(row, "id")?),
         title: col(row, "title")?,
@@ -223,5 +248,6 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
+        token_usage,
     })
 }

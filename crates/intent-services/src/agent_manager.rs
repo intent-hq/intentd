@@ -1533,6 +1533,7 @@ mod role_reminder_tests {
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
+            token_usage: None,
         }
     }
 

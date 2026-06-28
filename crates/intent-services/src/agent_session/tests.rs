@@ -238,6 +238,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
+        token_usage: None,
     }
 }
 
