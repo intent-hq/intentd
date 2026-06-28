@@ -2013,6 +2013,76 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `linear.getIssue`: a single flattened `LinearIssueResult` looked up by
+    /// UUID `id` or `ENG-123` `identifier` (PROTOCOL §5.28).
+    fn linear_get_issue(
+        &self,
+        id_or_identifier: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = id_or_identifier;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::linear_get_issue not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `linear.viewer`: the authenticated user as a bare `LinearUser`
+    /// (PROTOCOL §5.28).
+    fn linear_viewer(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::linear_viewer not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `linear.listTeams`: teams as a bare `LinearTeam[]` (PROTOCOL §5.28).
+    fn linear_list_teams(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = limit;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::linear_list_teams not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `linear.listWorkflowStates`: workflow states as a bare
+    /// `LinearWorkflowState[]` (PROTOCOL §5.28).
+    fn linear_list_workflow_states(
+        &self,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = limit;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::linear_list_workflow_states not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `linear.listProjects`: projects as a bare `LinearProject[]`
+    /// (PROTOCOL §5.28).
+    fn linear_list_projects(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = limit;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::linear_list_projects not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `linear.listLabels`: issue labels as a bare `LinearLabel[]`
+    /// (PROTOCOL §5.28).
+    fn linear_list_labels(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = limit;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::linear_list_labels not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `file-tracking.init`: initialize/attach the tracker for a workspace
     /// (`{ ok: true }`) (PROTOCOL §5.19).
     fn file_tracking_init(

@@ -13,7 +13,8 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 use async_trait::async_trait;
 use intent_core::{Config, WorkspaceApi};
 use intent_linear::{
-    AuthStatus, Error as LinearError, IssueFilter, LinearEngine, LinearIssueResult,
+    AuthStatus, Error as LinearError, IssueFilter, LinearEngine, LinearIssueResult, LinearLabel,
+    LinearProject, LinearTeam, LinearUser, LinearWorkflowState,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -50,6 +51,7 @@ struct StubEngine {
     fail: bool,
     seen_filter: Arc<Mutex<Option<IssueFilter>>>,
     seen_query: Arc<Mutex<Option<String>>>,
+    seen_id: Arc<Mutex<Option<String>>>,
 }
 
 #[async_trait]
@@ -87,6 +89,83 @@ impl LinearEngine for StubEngine {
         }
         *self.seen_query.lock().unwrap() = Some(query.to_string());
         Ok(vec![issue("ENG-2")])
+    }
+
+    async fn get_issue(&self, id_or_identifier: &str) -> intent_linear::Result<LinearIssueResult> {
+        if self.fail {
+            return Err(LinearError::NotConfigured("no key".into()));
+        }
+        *self.seen_id.lock().unwrap() = Some(id_or_identifier.to_string());
+        Ok(issue("ENG-3"))
+    }
+
+    async fn viewer(&self) -> intent_linear::Result<LinearUser> {
+        if self.fail {
+            return Err(LinearError::NotConfigured("no key".into()));
+        }
+        Ok(LinearUser {
+            id: "u1".into(),
+            name: "Ada Lovelace".into(),
+            display_name: None,
+            email: None,
+            avatar_url: None,
+        })
+    }
+
+    async fn list_teams(&self, _limit: Option<u32>) -> intent_linear::Result<Vec<LinearTeam>> {
+        if self.fail {
+            return Err(LinearError::NotConfigured("no key".into()));
+        }
+        Ok(vec![LinearTeam {
+            id: "t1".into(),
+            key: "ENG".into(),
+            name: "Engineering".into(),
+            description: None,
+        }])
+    }
+
+    async fn list_workflow_states(
+        &self,
+        _limit: Option<u32>,
+    ) -> intent_linear::Result<Vec<LinearWorkflowState>> {
+        if self.fail {
+            return Err(LinearError::NotConfigured("no key".into()));
+        }
+        Ok(vec![LinearWorkflowState {
+            id: "s1".into(),
+            name: "Todo".into(),
+            r#type: "unstarted".into(),
+            description: None,
+            color: None,
+        }])
+    }
+
+    async fn list_projects(
+        &self,
+        _limit: Option<u32>,
+    ) -> intent_linear::Result<Vec<LinearProject>> {
+        if self.fail {
+            return Err(LinearError::NotConfigured("no key".into()));
+        }
+        Ok(vec![LinearProject {
+            id: "p1".into(),
+            name: "Apollo".into(),
+            description: None,
+            state: "started".into(),
+            url: None,
+        }])
+    }
+
+    async fn list_labels(&self, _limit: Option<u32>) -> intent_linear::Result<Vec<LinearLabel>> {
+        if self.fail {
+            return Err(LinearError::NotConfigured("no key".into()));
+        }
+        Ok(vec![LinearLabel {
+            id: "l1".into(),
+            name: "bug".into(),
+            description: None,
+            color: None,
+        }])
     }
 }
 
@@ -143,10 +222,12 @@ async fn start(
 async fn uds_linear_read_surface_round_trip() {
     let seen_filter = Arc::new(Mutex::new(None));
     let seen_query = Arc::new(Mutex::new(None));
+    let seen_id = Arc::new(Mutex::new(None));
     let engine = Arc::new(StubEngine {
         fail: false,
         seen_filter: seen_filter.clone(),
         seen_query: seen_query.clone(),
+        seen_id: seen_id.clone(),
     });
     let (socket, _tx) = start(engine, "ok").await;
 
@@ -205,6 +286,60 @@ async fn uds_linear_read_surface_round_trip() {
     )
     .await;
     assert_eq!(resp["error"]["code"], json!(-32602));
+
+    // (g) getIssue forwards `id` (or `identifier`) and returns a bare object.
+    let resp = send(
+        &socket,
+        r#"{"jsonrpc":"2.0","id":7,"method":"linear.getIssue","params":{"id":"uuid-ENG-3"}}"#,
+    )
+    .await;
+    assert!(resp["result"].is_object());
+    assert_eq!(resp["result"]["identifier"], json!("ENG-3"));
+    assert_eq!(*seen_id.lock().unwrap(), Some("uuid-ENG-3".to_string()));
+    let resp = send(
+        &socket,
+        r#"{"jsonrpc":"2.0","id":8,"method":"linear.getIssue","params":{"identifier":"ENG-9"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["identifier"], json!("ENG-3"));
+    assert_eq!(*seen_id.lock().unwrap(), Some("ENG-9".to_string()));
+
+    // (h) getIssue with neither `id` nor `identifier` is -32602.
+    let resp = send(
+        &socket,
+        r#"{"jsonrpc":"2.0","id":9,"method":"linear.getIssue","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+
+    // (i) viewer returns a bare object (never the key).
+    let resp = send(
+        &socket,
+        r#"{"jsonrpc":"2.0","id":10,"method":"linear.viewer","params":{}}"#,
+    )
+    .await;
+    assert!(resp["result"].is_object());
+    assert_eq!(resp["result"]["name"], json!("Ada Lovelace"));
+
+    // (j) the list reads each return a bare array.
+    for (id, method, key) in [
+        (11, "linear.listTeams", "ENG"),
+        (12, "linear.listWorkflowStates", "Todo"),
+        (13, "linear.listProjects", "Apollo"),
+        (14, "linear.listLabels", "bug"),
+    ] {
+        let frame = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{}}}}"#);
+        let resp = send(&socket, &frame).await;
+        let arr = resp["result"].as_array().expect("bare array");
+        assert_eq!(arr.len(), 1, "{method}");
+        let names: Vec<&str> = arr[0]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(names.contains(&key), "{method} missing {key}");
+    }
 }
 
 #[tokio::test]
@@ -213,14 +348,43 @@ async fn uds_linear_not_configured_is_internal() {
         fail: true,
         seen_filter: Arc::new(Mutex::new(None)),
         seen_query: Arc::new(Mutex::new(None)),
+        seen_id: Arc::new(Mutex::new(None)),
     });
     let (socket, _tx) = start(engine, "unconfigured").await;
 
-    // A key that is absent / fails the viewer probe surfaces as -32603.
-    let resp = send(
-        &socket,
-        r#"{"jsonrpc":"2.0","id":1,"method":"linear.authStatus","params":{}}"#,
-    )
-    .await;
-    assert_eq!(resp["error"]["code"], json!(-32603));
+    // A key that is absent / fails the viewer probe surfaces as -32603. The P1
+    // reads share the same not-configured mapping once param validation passes.
+    for (id, frame) in [
+        (
+            1,
+            r#"{"jsonrpc":"2.0","id":1,"method":"linear.authStatus","params":{}}"#,
+        ),
+        (
+            2,
+            r#"{"jsonrpc":"2.0","id":2,"method":"linear.getIssue","params":{"id":"uuid-1"}}"#,
+        ),
+        (
+            3,
+            r#"{"jsonrpc":"2.0","id":3,"method":"linear.viewer","params":{}}"#,
+        ),
+        (
+            4,
+            r#"{"jsonrpc":"2.0","id":4,"method":"linear.listTeams","params":{}}"#,
+        ),
+        (
+            5,
+            r#"{"jsonrpc":"2.0","id":5,"method":"linear.listWorkflowStates","params":{}}"#,
+        ),
+        (
+            6,
+            r#"{"jsonrpc":"2.0","id":6,"method":"linear.listProjects","params":{}}"#,
+        ),
+        (
+            7,
+            r#"{"jsonrpc":"2.0","id":7,"method":"linear.listLabels","params":{}}"#,
+        ),
+    ] {
+        let resp = send(&socket, frame).await;
+        assert_eq!(resp["error"]["code"], json!(-32603), "frame id {id}");
+    }
 }

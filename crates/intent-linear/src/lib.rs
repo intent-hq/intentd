@@ -24,6 +24,9 @@ pub mod token;
 pub use client::{LinearClient, LINEAR_API_URL};
 pub use engine::{LinearEngine, LinearEngineImpl};
 pub use error::{Error, Result};
-pub use model::{AuthStatus, IssueFilter, LinearIssueResult};
+pub use model::{
+    AuthStatus, IssueFilter, LinearIssueResult, LinearLabel, LinearProject, LinearTeam, LinearUser,
+    LinearWorkflowState,
+};
 pub use registry::{LinearRegistry, LinearSettings};
 pub use token::TokenSource;

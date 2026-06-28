@@ -1409,6 +1409,43 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "linear.getIssue" => {
+            let id = opt_str(params, "id")
+                .or_else(|| opt_str(params, "identifier"))
+                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: id"))?;
+            let r = api.linear_get_issue(id).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "linear.viewer" => {
+            let r = api.linear_viewer().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "linear.listTeams" => {
+            let limit = opt_int(params, "limit");
+            let r = api.linear_list_teams(limit).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "linear.listWorkflowStates" => {
+            let limit = opt_int(params, "limit");
+            let r = api
+                .linear_list_workflow_states(limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "linear.listProjects" => {
+            let limit = opt_int(params, "limit");
+            let r = api
+                .linear_list_projects(limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "linear.listLabels" => {
+            let limit = opt_int(params, "limit");
+            let r = api.linear_list_labels(limit).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "file-tracking.init" => {
             let ws = require_ws_note(params)?;
             let r = api.file_tracking_init(ws).await.map_err(domain_to_rpc)?;

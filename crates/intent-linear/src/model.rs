@@ -78,6 +78,83 @@ pub struct LinearIssueResult {
     pub updated_at: Option<String>,
 }
 
+/// A Linear user (`linear.viewer`).
+///
+/// Mirrors the FE `LinearUser` (`linear-auth/types.ts`) field-for-field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinearUser {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+}
+
+/// A Linear team (`linear.listTeams`).
+///
+/// Mirrors the FE `LinearTeam` (`linear-auth/types.ts`) field-for-field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinearTeam {
+    pub id: String,
+    /// Team key like "ENG".
+    pub key: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// A Linear workflow state (`linear.listWorkflowStates`).
+///
+/// Mirrors the FE `LinearWorkflowState` (`linear-auth/types.ts`) field-for-field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinearWorkflowState {
+    pub id: String,
+    pub name: String,
+    /// "backlog", "unstarted", "started", "completed", "canceled".
+    #[serde(rename = "type")]
+    pub r#type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+/// A Linear project (`linear.listProjects`).
+///
+/// Mirrors the FE `LinearProject` (`linear-auth/types.ts`) field-for-field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinearProject {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// "backlog", "planned", "started", "paused", "completed", "canceled".
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// A Linear label (`linear.listLabels`).
+///
+/// Mirrors the FE `LinearLabel` (`linear-auth/types.ts`) field-for-field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinearLabel {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +208,79 @@ mod tests {
         assert_eq!(v["authenticated"], true);
         assert_eq!(v["login"], "Ada Lovelace");
         assert!(v["scopes"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn user_serializes_camel_case_and_omits_none() {
+        let u = LinearUser {
+            id: "u1".into(),
+            name: "Ada".into(),
+            display_name: Some("ada".into()),
+            email: None,
+            avatar_url: Some("https://x/a.png".into()),
+        };
+        let v = serde_json::to_value(&u).unwrap();
+        assert_eq!(v["id"], "u1");
+        assert_eq!(v["displayName"], "ada");
+        assert_eq!(v["avatarUrl"], "https://x/a.png");
+        assert!(v.get("email").is_none());
+    }
+
+    #[test]
+    fn team_serializes_camel_case_and_omits_none() {
+        let t = LinearTeam {
+            id: "t1".into(),
+            key: "ENG".into(),
+            name: "Engineering".into(),
+            description: None,
+        };
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["key"], "ENG");
+        assert_eq!(v["name"], "Engineering");
+        assert!(v.get("description").is_none());
+    }
+
+    #[test]
+    fn workflow_state_serializes_type_field_and_omits_none() {
+        let s = LinearWorkflowState {
+            id: "s1".into(),
+            name: "In Progress".into(),
+            r#type: "started".into(),
+            description: None,
+            color: Some("#abc".into()),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["type"], "started");
+        assert_eq!(v["color"], "#abc");
+        assert!(v.get("description").is_none());
+    }
+
+    #[test]
+    fn project_serializes_camel_case_and_omits_none() {
+        let p = LinearProject {
+            id: "p1".into(),
+            name: "Apollo".into(),
+            description: None,
+            state: "started".into(),
+            url: Some("https://linear.app/x/project/apollo".into()),
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["state"], "started");
+        assert_eq!(v["url"], "https://linear.app/x/project/apollo");
+        assert!(v.get("description").is_none());
+    }
+
+    #[test]
+    fn label_serializes_camel_case_and_omits_none() {
+        let l = LinearLabel {
+            id: "l1".into(),
+            name: "bug".into(),
+            description: Some("a bug".into()),
+            color: None,
+        };
+        let v = serde_json::to_value(&l).unwrap();
+        assert_eq!(v["name"], "bug");
+        assert_eq!(v["description"], "a bug");
+        assert!(v.get("color").is_none());
     }
 }
