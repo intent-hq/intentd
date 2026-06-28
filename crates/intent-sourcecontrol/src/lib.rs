@@ -22,8 +22,8 @@ pub use error::{Error, Result};
 pub use github::GitHubSourceControl;
 pub use model::{
     AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor, Issue, IssueQuery,
-    MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, PrInvolvement, PrPatch,
-    PrQuery, PrState, PullRequest, RemoteBranches, Repo, RepoRef, Review, ReviewComment,
+    MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page, PageParams,
+    PrInvolvement, PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Review, ReviewComment,
     ReviewThread, ReviewThreadComment, ReviewVerdict, ScCapabilities, UserIdentity,
 };
 pub use registry::{GithubSettings, SourceControlRegistry, SourceControlSettings};
@@ -52,22 +52,26 @@ pub trait SourceControl: Send + Sync {
 
     // --- Repositories ---
 
-    /// List repositories the authenticated user has access to (paginated,
-    /// bounded; parity with the FE `listGitHubRepos` fetch-all). Backs
-    /// `github.repos.list`.
-    async fn list_repos(&self) -> Result<Vec<Repo>>;
+    /// List repositories the authenticated user has access to, one §5.5 page at
+    /// a time (`GET /user/repos`). Backs `github.repos.list`.
+    async fn list_repos(&self, page: PageParams) -> Result<Page<Repo>>;
 
-    /// Search repositories (`GET /search/repositories?sort=stars`); the raw
-    /// query is rewritten so `owner/name` → `name user:owner`. Backs
-    /// `github.repos.search`.
-    async fn search_repos(&self, query: &str) -> Result<Vec<Repo>>;
+    /// Search repositories (`GET /search/repositories?sort=stars`), one §5.5
+    /// page at a time; the raw query is rewritten so `owner/name` →
+    /// `name user:owner`. Backs `github.repos.search`.
+    async fn search_repos(&self, query: &str, page: PageParams) -> Result<Page<Repo>>;
 
     /// Fetch a single repository's metadata. Backs `github.repos.get`.
     async fn get_repo(&self, owner: &str, name: &str) -> Result<Repo>;
 
-    /// List a repository's remote branches with a forward-pagination flag.
-    /// Backs `github.branches.list`.
-    async fn list_remote_branches(&self, owner: &str, name: &str) -> Result<RemoteBranches>;
+    /// List a repository's remote branches, one §5.5 page at a time. Backs
+    /// `github.branches.list`.
+    async fn list_remote_branches(
+        &self,
+        owner: &str,
+        name: &str,
+        page: PageParams,
+    ) -> Result<Page<Branch>>;
 
     // --- Pull/merge requests ---
 
@@ -77,8 +81,9 @@ pub trait SourceControl: Send + Sync {
     /// Fetch a single pull request by number.
     async fn get_pr(&self, repo: &RepoRef, number: u64) -> Result<PullRequest>;
 
-    /// List pull requests matching `query`.
-    async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> Result<Vec<PullRequest>>;
+    /// List pull requests matching `query`, one §5.5 page at a time (the page
+    /// cursor / size travel in `query`). Backs `github.pulls.list/search`.
+    async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> Result<Page<PullRequest>>;
 
     /// Apply a partial update to a pull request.
     async fn update_pr(&self, repo: &RepoRef, number: u64, patch: PrPatch) -> Result<PullRequest>;
@@ -125,9 +130,14 @@ pub trait SourceControl: Send + Sync {
         anchor: Option<CommentAnchor>,
     ) -> Result<Comment>;
 
-    /// List line-anchored review comments on a pull request.
-    async fn list_review_comments(&self, repo: &RepoRef, number: u64)
-        -> Result<Vec<ReviewComment>>;
+    /// List line-anchored review comments on a pull request, one §5.5 page at a
+    /// time. Backs `github.listReviewComments`.
+    async fn list_review_comments(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        page: PageParams,
+    ) -> Result<Page<ReviewComment>>;
 
     /// Reply to an existing review comment.
     async fn reply_to_review_comment(
@@ -138,8 +148,14 @@ pub trait SourceControl: Send + Sync {
         body: &str,
     ) -> Result<ReviewComment>;
 
-    /// Fetch review threads (GraphQL on GitHub).
-    async fn get_review_threads(&self, repo: &RepoRef, number: u64) -> Result<Vec<ReviewThread>>;
+    /// Fetch review threads (GraphQL on GitHub), one §5.5 page at a time. Backs
+    /// `github.getReviewThreads`.
+    async fn get_review_threads(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        page: PageParams,
+    ) -> Result<Page<ReviewThread>>;
 
     /// Resolve a review thread; returns the resulting resolved state.
     async fn resolve_thread(&self, thread_id: &str) -> Result<bool>;
@@ -160,6 +176,7 @@ pub trait SourceControl: Send + Sync {
     /// Fetch a single issue by number.
     async fn get_issue(&self, repo: &RepoRef, number: u64) -> Result<Issue>;
 
-    /// List issues matching `query` (PRs excluded).
-    async fn list_issues(&self, repo: &RepoRef, query: IssueQuery) -> Result<Vec<Issue>>;
+    /// List issues matching `query` (PRs excluded), one §5.5 page at a time (the
+    /// page cursor / size travel in `query`). Backs `github.issues.list/search`.
+    async fn list_issues(&self, repo: &RepoRef, query: IssueQuery) -> Result<Page<Issue>>;
 }

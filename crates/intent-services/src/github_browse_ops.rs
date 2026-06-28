@@ -7,7 +7,7 @@
 //! 🔒 The PAT is never read or echoed here — only derived, non-sensitive
 //! identity / connection fields cross the wire.
 
-use intent_sourcecontrol::{RemoteBranches, Repo, UserIdentity};
+use intent_sourcecontrol::{Branch, Repo, UserIdentity};
 use serde_json::{json, Map, Value};
 
 /// Guidance returned by the no-op `github.connect` / `github.revoke` methods in
@@ -44,12 +44,11 @@ pub(crate) fn repos_to_wire(repos: &[Repo]) -> Value {
     Value::Array(repos.iter().map(repo_to_wire).collect())
 }
 
-/// Project engine [`RemoteBranches`] to the wire branch-name list (§5.27):
-/// `branches: string[]`. `nextToken` is always `null` — the engine fetches a
-/// single bounded page and exposes no continuation cursor, so no honorable
-/// opaque token (§5.5) can be issued (see the module note / task learnings).
-pub(crate) fn branch_names(page: &RemoteBranches) -> Vec<String> {
-    page.branches.iter().map(|b| b.name.clone()).collect()
+/// Project a page of engine [`Branch`]es to the wire branch-name list (§5.27):
+/// `branches: string[]`. The §5.5 `nextToken` is derived separately from the
+/// engine page's continuation cursor by the handler.
+pub(crate) fn branch_names(branches: &[Branch]) -> Vec<String> {
+    branches.iter().map(|b| b.name.clone()).collect()
 }
 
 /// Project an engine [`UserIdentity`] to the wire `GithubUser` (§5.27): only
@@ -79,7 +78,6 @@ pub(crate) fn auth_status_to_wire(is_configured: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use intent_sourcecontrol::Branch;
 
     fn sample_repo() -> Repo {
         Repo {
@@ -105,22 +103,19 @@ mod tests {
 
     #[test]
     fn branch_names_extracts_names_only() {
-        let page = RemoteBranches {
-            branches: vec![
-                Branch {
-                    name: "main".into(),
-                    commit_sha: Some("abc".into()),
-                    protected: true,
-                },
-                Branch {
-                    name: "dev".into(),
-                    commit_sha: None,
-                    protected: false,
-                },
-            ],
-            has_next_page: true,
-        };
-        assert_eq!(branch_names(&page), vec!["main", "dev"]);
+        let branches = vec![
+            Branch {
+                name: "main".into(),
+                commit_sha: Some("abc".into()),
+                protected: true,
+            },
+            Branch {
+                name: "dev".into(),
+                commit_sha: None,
+                protected: false,
+            },
+        ];
+        assert_eq!(branch_names(&branches), vec!["main", "dev"]);
     }
 
     #[test]

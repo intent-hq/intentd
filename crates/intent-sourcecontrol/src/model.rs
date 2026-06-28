@@ -53,13 +53,35 @@ pub struct Branch {
     pub protected: bool,
 }
 
-/// A page of remote branches with a forward-pagination flag (parity with the
-/// FE `listGitHubBranches` → `{ branches, hasNextPage }`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoteBranches {
-    pub branches: Vec<Branch>,
-    pub has_next_page: bool,
+/// Pagination input for the forge list reads (§5.5 uniform pagination).
+///
+/// `limit` is the server-clamped page size (`1..=200`; the default is applied by
+/// the services layer). `cursor` is an **engine-native** continuation token — a
+/// REST page number (`"2"`) or a GraphQL end-cursor — not the opaque base64
+/// `nextToken` exposed on the wire; the services layer wraps/unwraps that.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageParams {
+    pub limit: u8,
+    pub cursor: Option<String>,
+}
+
+impl PageParams {
+    /// A first-page request of `limit` items (no continuation cursor).
+    pub fn first(limit: u8) -> Self {
+        Self {
+            limit,
+            cursor: None,
+        }
+    }
+}
+
+/// A page of forge items plus the engine-native cursor for the next page
+/// (`None` on the last page). The services layer projects `items` onto the wire
+/// DTOs and wraps `next_cursor` into the opaque base64 `nextToken`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
 }
 
 /// Normalized pull/merge/change-request state.
@@ -179,6 +201,9 @@ pub struct PrQuery {
     pub author: Option<String>,
     pub involvement: Option<PrInvolvement>,
     pub limit: Option<u8>,
+    /// Engine-native continuation cursor (a REST page number); `None` is the
+    /// first page. The opaque wire `nextToken` is owned by the services layer.
+    pub cursor: Option<String>,
 }
 
 /// Options carried by a merge request.
@@ -304,6 +329,9 @@ pub struct IssueQuery {
     pub state: Option<String>,
     pub labels: Option<String>,
     pub limit: Option<u8>,
+    /// Engine-native continuation cursor (a REST page number); `None` is the
+    /// first page. The opaque wire `nextToken` is owned by the services layer.
+    pub cursor: Option<String>,
 }
 
 /// Authenticated GitHub identity (`GET /user`). Only non-sensitive identity

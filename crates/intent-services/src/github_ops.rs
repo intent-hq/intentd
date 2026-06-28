@@ -13,6 +13,7 @@
 //! are emitted with shape-preserving defaults so the wire keys match
 //! `shared/types.ts` field-for-field even when the value is not available.
 
+use base64::Engine as _;
 use intent_core::{Error, Result};
 use intent_sourcecontrol::{
     Issue, PrInvolvement, PrState, PullRequest, ReviewComment, ReviewThread,
@@ -27,6 +28,34 @@ const MAX_LIMIT: i64 = 200;
 /// (default 50) and cast to the engine's `u8` query width.
 pub(crate) fn clamp_limit(limit: Option<i64>) -> u8 {
     limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as u8
+}
+
+/// Wrap an engine-native cursor (a REST page number or a GraphQL end-cursor)
+/// into the opaque base64 `nextToken` exposed on the wire (§5.5). The internal
+/// `{"c": <cursor>}` JSON is a private detail clients MUST treat as opaque.
+pub(crate) fn encode_next_token(cursor: &str) -> String {
+    base64::engine::general_purpose::STANDARD_NO_PAD
+        .encode(serde_json::to_vec(&json!({ "c": cursor })).expect("cursor json is serializable"))
+}
+
+/// Decode an incoming opaque `nextToken` back into the engine-native cursor. An
+/// absent or malformed token yields `None` (start from the first page).
+pub(crate) fn decode_next_token(token: Option<&str>) -> Option<String> {
+    let token = token?;
+    let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(token)
+        .ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("c").and_then(Value::as_str).map(String::from)
+}
+
+/// Render an engine `next_cursor` as the wire `nextToken` value: an opaque
+/// base64 string when more pages remain, or JSON `null` on the last page.
+pub(crate) fn next_token_value(next_cursor: Option<&str>) -> Value {
+    match next_cursor {
+        Some(c) => Value::String(encode_next_token(c)),
+        None => Value::Null,
+    }
 }
 
 /// Parse the `github.pulls.list` / `github.pulls.search` `state` onto a
@@ -298,5 +327,31 @@ mod tests {
         assert_eq!(clamp_limit(Some(0)), 1);
         assert_eq!(clamp_limit(Some(9000)), 200);
         assert_eq!(clamp_limit(Some(30)), 30);
+    }
+
+    #[test]
+    fn next_token_round_trips_opaque_cursor() {
+        // A REST page cursor survives an encode → decode round-trip.
+        let tok = encode_next_token("2");
+        assert_ne!(tok, "2", "wire token must be opaque, not the raw cursor");
+        assert_eq!(decode_next_token(Some(&tok)).as_deref(), Some("2"));
+
+        // A GraphQL end-cursor round-trips identically.
+        let gql = encode_next_token("Y3Vyc29yOnYyOpK5");
+        assert_eq!(
+            decode_next_token(Some(&gql)).as_deref(),
+            Some("Y3Vyc29yOnYyOpK5")
+        );
+
+        // Absent / malformed tokens decode to "start from the first page".
+        assert_eq!(decode_next_token(None), None);
+        assert_eq!(decode_next_token(Some("!!not-base64!!")), None);
+
+        // `next_token_value` is the opaque string when paging continues, JSON
+        // null on the last page.
+        assert_eq!(next_token_value(None), Value::Null);
+        let wire = next_token_value(Some("3"));
+        assert!(wire.is_string());
+        assert_eq!(decode_next_token(wire.as_str()).as_deref(), Some("3"));
     }
 }

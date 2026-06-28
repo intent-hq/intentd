@@ -2104,9 +2104,9 @@ mod pr {
     use intent_core::{now_iso, Error, WorkspaceApi, WorkspaceId};
     use intent_sourcecontrol::{
         AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor, Error as ScError, Issue,
-        IssueQuery, MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, PrPatch,
-        PrQuery, PrState, PullRequest, RemoteBranches, Repo, RepoRef, Result as ScResult, Review,
-        ReviewComment, ReviewThread, ReviewThreadComment, ReviewVerdict, ScCapabilities,
+        IssueQuery, MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page,
+        PageParams, PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Result as ScResult,
+        Review, ReviewComment, ReviewThread, ReviewThreadComment, ReviewVerdict, ScCapabilities,
         SourceControl, UserIdentity,
     };
     use intent_store::Store;
@@ -2124,6 +2124,9 @@ mod pr {
         /// When set, `list_prs` returns the sample PR so PR-refresh discovery can
         /// link an unlinked workspace by head ref.
         discover: bool,
+        /// When set, `list_repos` emits a two-page sequence driven by the opaque
+        /// cursor, exercising the §5.5 multi-page round-trip end to end.
+        paginate: bool,
         head_seq: AtomicU64,
         /// Notified on the first `get_pr` call — the point at which
         /// `pr.waitForChanges` has finished its one SQLite read and is past it.
@@ -2182,18 +2185,47 @@ mod pr {
                 html_url: Some("https://github.com/octocat".into()),
             })
         }
-        async fn list_repos(&self) -> ScResult<Vec<Repo>> {
-            Ok(vec![Repo {
-                owner: "octocat".into(),
-                name: "hello".into(),
-                url: Some("https://github.com/octocat/hello".into()),
-                default_branch: Some("main".into()),
-                created_at: None,
-                updated_at: None,
-            }])
+        async fn list_repos(&self, page: PageParams) -> ScResult<Page<Repo>> {
+            if self.paginate {
+                // A two-page sequence driven by the opaque cursor that the
+                // services layer round-trips through `nextToken`.
+                let p = page
+                    .cursor
+                    .as_deref()
+                    .and_then(|c| c.parse::<u64>().ok())
+                    .unwrap_or(1);
+                let repo = Repo {
+                    owner: "octocat".into(),
+                    name: format!("repo{p}"),
+                    url: Some(format!("https://github.com/octocat/repo{p}")),
+                    default_branch: Some("main".into()),
+                    created_at: None,
+                    updated_at: None,
+                };
+                let next_cursor = if p < 2 {
+                    Some((p + 1).to_string())
+                } else {
+                    None
+                };
+                return Ok(Page {
+                    items: vec![repo],
+                    next_cursor,
+                });
+            }
+            Ok(Page {
+                items: vec![Repo {
+                    owner: "octocat".into(),
+                    name: "hello".into(),
+                    url: Some("https://github.com/octocat/hello".into()),
+                    default_branch: Some("main".into()),
+                    created_at: None,
+                    updated_at: None,
+                }],
+                next_cursor: None,
+            })
         }
-        async fn search_repos(&self, _: &str) -> ScResult<Vec<Repo>> {
-            self.list_repos().await
+        async fn search_repos(&self, _: &str, page: PageParams) -> ScResult<Page<Repo>> {
+            self.list_repos(page).await
         }
         async fn get_repo(&self, owner: &str, name: &str) -> ScResult<Repo> {
             if owner == "ghost" {
@@ -2208,9 +2240,14 @@ mod pr {
                 updated_at: None,
             })
         }
-        async fn list_remote_branches(&self, _: &str, _: &str) -> ScResult<RemoteBranches> {
-            Ok(RemoteBranches {
-                branches: vec![
+        async fn list_remote_branches(
+            &self,
+            _: &str,
+            _: &str,
+            _: PageParams,
+        ) -> ScResult<Page<Branch>> {
+            Ok(Page {
+                items: vec![
                     Branch {
                         name: "main".into(),
                         commit_sha: None,
@@ -2222,7 +2259,7 @@ mod pr {
                         protected: false,
                     },
                 ],
-                has_next_page: false,
+                next_cursor: None,
             })
         }
         async fn create_pr(&self, _: &RepoRef, input: NewPullRequest) -> ScResult<PullRequest> {
@@ -2254,12 +2291,16 @@ mod pr {
             }
             Ok(pr)
         }
-        async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Vec<PullRequest>> {
-            if self.discover {
-                Ok(vec![sample_pr()])
+        async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Page<PullRequest>> {
+            let items = if self.discover {
+                vec![sample_pr()]
             } else {
-                Ok(vec![])
-            }
+                vec![]
+            };
+            Ok(Page {
+                items,
+                next_cursor: None,
+            })
         }
         async fn update_pr(&self, _: &RepoRef, _: u64, _: PrPatch) -> ScResult<PullRequest> {
             unimplemented!()
@@ -2341,18 +2382,26 @@ mod pr {
                 url: Some("https://github.com/o/r/pull/42#issuecomment-777".into()),
             })
         }
-        async fn list_review_comments(&self, _: &RepoRef, _: u64) -> ScResult<Vec<ReviewComment>> {
-            Ok(vec![ReviewComment {
-                id: 5,
-                body: "nit".into(),
-                path: "a.rs".into(),
-                line: Some(1),
-                author: "rev".into(),
-                created_at: "2026".into(),
-                updated_at: "2026".into(),
-                in_reply_to_id: None,
-                url: "url".into(),
-            }])
+        async fn list_review_comments(
+            &self,
+            _: &RepoRef,
+            _: u64,
+            _: PageParams,
+        ) -> ScResult<Page<ReviewComment>> {
+            Ok(Page {
+                items: vec![ReviewComment {
+                    id: 5,
+                    body: "nit".into(),
+                    path: "a.rs".into(),
+                    line: Some(1),
+                    author: "rev".into(),
+                    created_at: "2026".into(),
+                    updated_at: "2026".into(),
+                    in_reply_to_id: None,
+                    url: "url".into(),
+                }],
+                next_cursor: None,
+            })
         }
         async fn reply_to_review_comment(
             &self,
@@ -2373,36 +2422,44 @@ mod pr {
                 url: "https://github.com/o/r/pull/42#discussion_r999".into(),
             })
         }
-        async fn get_review_threads(&self, _: &RepoRef, _: u64) -> ScResult<Vec<ReviewThread>> {
+        async fn get_review_threads(
+            &self,
+            _: &RepoRef,
+            _: u64,
+            _: PageParams,
+        ) -> ScResult<Page<ReviewThread>> {
             if self.fail_threads {
                 return Err(ScError::Api("graphql down".into()));
             }
-            Ok(vec![
-                ReviewThread {
-                    id: "RT1".into(),
-                    is_resolved: false,
-                    comments: vec![ReviewThreadComment {
-                        id: "c1".into(),
-                        body: "x".into(),
-                        author: "rev".into(),
-                        path: "a.rs".into(),
-                        line: Some(1),
-                        created_at: "2026".into(),
-                    }],
-                },
-                ReviewThread {
-                    id: "RT2".into(),
-                    is_resolved: true,
-                    comments: vec![ReviewThreadComment {
-                        id: "c2".into(),
-                        body: "y".into(),
-                        author: "rev".into(),
-                        path: "b.rs".into(),
-                        line: Some(2),
-                        created_at: "2026".into(),
-                    }],
-                },
-            ])
+            Ok(Page {
+                items: vec![
+                    ReviewThread {
+                        id: "RT1".into(),
+                        is_resolved: false,
+                        comments: vec![ReviewThreadComment {
+                            id: "c1".into(),
+                            body: "x".into(),
+                            author: "rev".into(),
+                            path: "a.rs".into(),
+                            line: Some(1),
+                            created_at: "2026".into(),
+                        }],
+                    },
+                    ReviewThread {
+                        id: "RT2".into(),
+                        is_resolved: true,
+                        comments: vec![ReviewThreadComment {
+                            id: "c2".into(),
+                            body: "y".into(),
+                            author: "rev".into(),
+                            path: "b.rs".into(),
+                            line: Some(2),
+                            created_at: "2026".into(),
+                        }],
+                    },
+                ],
+                next_cursor: None,
+            })
         }
         async fn resolve_thread(&self, _: &str) -> ScResult<bool> {
             Ok(true)
@@ -2435,14 +2492,17 @@ mod pr {
         async fn get_issue(&self, _: &RepoRef, _: u64) -> ScResult<Issue> {
             unimplemented!()
         }
-        async fn list_issues(&self, _: &RepoRef, _: IssueQuery) -> ScResult<Vec<Issue>> {
-            Ok(vec![Issue {
-                number: 11,
-                title: "Bug report".into(),
-                body: Some("something broke".into()),
-                state: "open".into(),
-                url: "https://github.com/o/r/issues/11".into(),
-            }])
+        async fn list_issues(&self, _: &RepoRef, _: IssueQuery) -> ScResult<Page<Issue>> {
+            Ok(Page {
+                items: vec![Issue {
+                    number: 11,
+                    title: "Bug report".into(),
+                    body: Some("something broke".into()),
+                    state: "open".into(),
+                    url: "https://github.com/o/r/issues/11".into(),
+                }],
+                next_cursor: None,
+            })
         }
     }
 
@@ -2503,6 +2563,36 @@ mod pr {
             .expect("search");
         assert_eq!(v["repos"][0]["htmlUrl"], "https://github.com/octocat/hello");
         assert_eq!(v["nextToken"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn github_repos_list_paginates_via_opaque_next_token() {
+        // §5.5: the first page returns a non-null opaque `nextToken`; echoing it
+        // back fetches the next (last) page, which ends with a null `nextToken`.
+        let (_t, svc, _ws) = setup_with(
+            StubForge {
+                paginate: true,
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+
+        let page1 = svc.github_repos_list(None, None).await.expect("page 1");
+        assert_eq!(page1["repos"][0]["name"], "repo1");
+        let token = page1["nextToken"]
+            .as_str()
+            .expect("page 1 has a next token");
+        assert!(!token.is_empty());
+        // The wire token is opaque — never the raw engine cursor ("2").
+        assert_ne!(token, "2");
+
+        let page2 = svc
+            .github_repos_list(None, Some(token.to_string()))
+            .await
+            .expect("page 2");
+        assert_eq!(page2["repos"][0]["name"], "repo2");
+        assert_eq!(page2["nextToken"], serde_json::Value::Null);
     }
 
     #[tokio::test]
@@ -3200,6 +3290,7 @@ mod pr {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -3213,13 +3304,21 @@ mod pr {
                 Some("created".into()),
                 Some("open".into()),
                 Some(10),
+                None,
             )
             .await
             .unwrap();
         assert_eq!(s["pulls"][0]["number"], 42);
 
         assert!(svc
-            .github_pulls_search("o".into(), "r".into(), Some("nope".into()), None, None)
+            .github_pulls_search(
+                "o".into(),
+                "r".into(),
+                Some("nope".into()),
+                None,
+                None,
+                None
+            )
             .await
             .is_err());
     }
@@ -3253,7 +3352,14 @@ mod pr {
     async fn github_issues_list_and_search_shapes() {
         let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
         let l = svc
-            .github_issues_list("o".into(), "r".into(), Some("open".into()), None, None)
+            .github_issues_list(
+                "o".into(),
+                "r".into(),
+                Some("open".into()),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(l["issues"][0]["number"], 11);
@@ -3268,6 +3374,7 @@ mod pr {
                 Some("assigned".into()),
                 Some("open".into()),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -3278,7 +3385,7 @@ mod pr {
     async fn github_review_comments_threads_and_resolution() {
         let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
         let c = svc
-            .github_list_review_comments("o".into(), "r".into(), 42, None)
+            .github_list_review_comments("o".into(), "r".into(), 42, None, None)
             .await
             .unwrap();
         assert_eq!(c["comments"][0]["id"], 5);
@@ -3291,7 +3398,7 @@ mod pr {
         assert_eq!(reply["comment"]["inReplyToId"], 5);
 
         let t = svc
-            .github_get_review_threads("o".into(), "r".into(), 42, None)
+            .github_get_review_threads("o".into(), "r".into(), 42, None, None)
             .await
             .unwrap();
         assert_eq!(t["threads"][0]["id"], "RT1");

@@ -549,7 +549,8 @@ impl Services {
                 let prs = sc
                     .list_prs(&repo_ref, query)
                     .await
-                    .map_err(pr_ops::map_sc_err)?;
+                    .map_err(pr_ops::map_sc_err)?
+                    .items;
                 match prs
                     .into_iter()
                     .find(|p| pr_ops::pr_matches_branch(p, &ws.branch))
@@ -5520,8 +5521,16 @@ impl WorkspaceApi for Services {
             let number = pr_ops::active_pr_number(&ws)?;
             let sc = pr_ops::resolve_source_control(injected)?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            match sc.get_review_threads(&repo_ref, number).await {
-                Ok(mut threads) => {
+            match sc
+                .get_review_threads(
+                    &repo_ref,
+                    number,
+                    intent_sourcecontrol::PageParams::first(100),
+                )
+                .await
+            {
+                Ok(page) => {
+                    let mut threads = page.items;
                     let total = threads.len() as i64;
                     if status == "resolved" {
                         threads.retain(|t| t.is_resolved);
@@ -5543,9 +5552,14 @@ impl WorkspaceApi for Services {
                 }
                 Err(_) => {
                     let comments = sc
-                        .list_review_comments(&repo_ref, number)
+                        .list_review_comments(
+                            &repo_ref,
+                            number,
+                            intent_sourcecontrol::PageParams::first(100),
+                        )
                         .await
-                        .map_err(pr_ops::map_sc_err)?;
+                        .map_err(pr_ops::map_sc_err)?
+                        .items;
                     let total_fetched = comments.len() as i64;
                     let mut threads = pr_ops::fallback_threads(comments);
                     if let Some(p) = &path {
@@ -6028,6 +6042,7 @@ impl WorkspaceApi for Services {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn github_pulls_list(
         &self,
         owner: String,
@@ -6036,14 +6051,16 @@ impl WorkspaceApi for Services {
         head: Option<String>,
         base: Option<String>,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
             let state = github_ops::parse_pr_state(state.as_deref())?;
             let limit = github_ops::clamp_limit(limit);
+            let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected)?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let prs = sc
+            let page = sc
                 .list_prs(
                     &repo_ref,
                     intent_sourcecontrol::PrQuery {
@@ -6053,12 +6070,16 @@ impl WorkspaceApi for Services {
                         author: None,
                         involvement: None,
                         limit: Some(limit),
+                        cursor,
                     },
                 )
                 .await
                 .map_err(pr_ops::map_sc_err)?;
-            let pulls: Vec<_> = prs.iter().map(github_ops::pull_to_json).collect();
-            Ok(serde_json::json!({ "pulls": pulls, "nextToken": serde_json::Value::Null }))
+            let pulls: Vec<_> = page.items.iter().map(github_ops::pull_to_json).collect();
+            Ok(serde_json::json!({
+                "pulls": pulls,
+                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
+            }))
         })
     }
 
@@ -6069,6 +6090,7 @@ impl WorkspaceApi for Services {
         filter: Option<String>,
         state: Option<String>,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
@@ -6081,9 +6103,10 @@ impl WorkspaceApi for Services {
                 None => Some(intent_sourcecontrol::PrState::Open),
             };
             let limit = github_ops::clamp_limit(limit);
+            let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected)?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let prs = sc
+            let page = sc
                 .list_prs(
                     &repo_ref,
                     intent_sourcecontrol::PrQuery {
@@ -6093,12 +6116,16 @@ impl WorkspaceApi for Services {
                         author: None,
                         involvement,
                         limit: Some(limit),
+                        cursor,
                     },
                 )
                 .await
                 .map_err(pr_ops::map_sc_err)?;
-            let pulls: Vec<_> = prs.iter().map(github_ops::pull_to_json).collect();
-            Ok(serde_json::json!({ "pulls": pulls, "nextToken": serde_json::Value::Null }))
+            let pulls: Vec<_> = page.items.iter().map(github_ops::pull_to_json).collect();
+            Ok(serde_json::json!({
+                "pulls": pulls,
+                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
+            }))
         })
     }
 
@@ -6152,17 +6179,16 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
-            // The engine fetches a bounded fetch-all set (FE `fetchAll`) and
-            // exposes no continuation cursor, so `limit` / `nextToken` are
-            // accepted for §5.5 shape parity but not threaded; `nextToken` is
-            // always `null` (an unhonorable token would violate §5.5).
-            let _ = (limit, next_token);
+            let limit = github_ops::clamp_limit(limit);
+            let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected)?;
-            let repos = sc.list_repos().await.map_err(pr_ops::map_sc_err)?;
+            let page = sc
+                .list_repos(intent_sourcecontrol::PageParams { limit, cursor })
+                .await
+                .map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({
-                "repos": github_browse_ops::repos_to_wire(&repos),
-                "nextToken": serde_json::Value::Null,
-
+                "repos": github_browse_ops::repos_to_wire(&page.items),
+                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
             }))
         })
     }
@@ -6199,17 +6225,21 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let _ = (limit, next_token);
+            let limit = github_ops::clamp_limit(limit);
+            let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected)?;
-            let repos = sc.search_repos(&query).await.map_err(pr_ops::map_sc_err)?;
+            let page = sc
+                .search_repos(&query, intent_sourcecontrol::PageParams { limit, cursor })
+                .await
+                .map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({
-                "repos": github_browse_ops::repos_to_wire(&repos),
-                "nextToken": serde_json::Value::Null,
-
+                "repos": github_browse_ops::repos_to_wire(&page.items),
+                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
             }))
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn github_issues_list(
         &self,
         owner: String,
@@ -6217,32 +6247,40 @@ impl WorkspaceApi for Services {
         state: Option<String>,
         labels: Option<String>,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
             let state = github_ops::parse_issue_state(state.as_deref())?;
             let limit = github_ops::clamp_limit(limit);
+            let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected)?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let issues = sc
+            let page = sc
                 .list_issues(
                     &repo_ref,
                     intent_sourcecontrol::IssueQuery {
                         state: Some(state),
                         labels,
                         limit: Some(limit),
+                        cursor,
                     },
                 )
                 .await
                 .map_err(pr_ops::map_sc_err)?;
-            let items: Vec<_> = issues
+            let items: Vec<_> = page
+                .items
                 .iter()
                 .map(|i| github_ops::issue_to_json(i, &repo_ref.owner, &repo_ref.name))
                 .collect();
-            Ok(serde_json::json!({ "issues": items, "nextToken": serde_json::Value::Null }))
+            Ok(serde_json::json!({
+                "issues": items,
+                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
+            }))
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn github_issues_search(
         &self,
         owner: String,
@@ -6250,6 +6288,7 @@ impl WorkspaceApi for Services {
         filter: Option<String>,
         state: Option<String>,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
@@ -6264,24 +6303,30 @@ impl WorkspaceApi for Services {
                 None => "open".to_string(),
             };
             let limit = github_ops::clamp_limit(limit);
+            let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected)?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let issues = sc
+            let page = sc
                 .list_issues(
                     &repo_ref,
                     intent_sourcecontrol::IssueQuery {
                         state: Some(state),
                         labels: None,
                         limit: Some(limit),
+                        cursor,
                     },
                 )
                 .await
                 .map_err(pr_ops::map_sc_err)?;
-            let items: Vec<_> = issues
+            let items: Vec<_> = page
+                .items
                 .iter()
                 .map(|i| github_ops::issue_to_json(i, &repo_ref.owner, &repo_ref.name))
                 .collect();
-            Ok(serde_json::json!({ "issues": items, "nextToken": serde_json::Value::Null }))
+            Ok(serde_json::json!({
+                "issues": items,
+                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
+            }))
         })
     }
 
@@ -6291,22 +6336,31 @@ impl WorkspaceApi for Services {
         repo: String,
         number: u64,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let limit = github_ops::clamp_limit(limit) as usize;
+            let limit = github_ops::clamp_limit(limit);
+            let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected)?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let comments = sc
-                .list_review_comments(&repo_ref, number)
+            let page = sc
+                .list_review_comments(
+                    &repo_ref,
+                    number,
+                    intent_sourcecontrol::PageParams { limit, cursor },
+                )
                 .await
                 .map_err(pr_ops::map_sc_err)?;
-            let items: Vec<_> = comments
+            let items: Vec<_> = page
+                .items
                 .iter()
-                .take(limit)
                 .map(github_ops::review_comment_to_json)
                 .collect();
-            Ok(serde_json::json!({ "comments": items, "nextToken": serde_json::Value::Null }))
+            Ok(serde_json::json!({
+                "comments": items,
+                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
+            }))
         })
     }
 
@@ -6336,22 +6390,31 @@ impl WorkspaceApi for Services {
         repo: String,
         number: u64,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let limit = github_ops::clamp_limit(limit) as usize;
+            let limit = github_ops::clamp_limit(limit);
+            let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected)?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let threads = sc
-                .get_review_threads(&repo_ref, number)
+            let page = sc
+                .get_review_threads(
+                    &repo_ref,
+                    number,
+                    intent_sourcecontrol::PageParams { limit, cursor },
+                )
                 .await
                 .map_err(pr_ops::map_sc_err)?;
-            let items: Vec<_> = threads
+            let items: Vec<_> = page
+                .items
                 .iter()
-                .take(limit)
                 .map(github_ops::review_thread_to_json)
                 .collect();
-            Ok(serde_json::json!({ "threads": items, "nextToken": serde_json::Value::Null }))
+            Ok(serde_json::json!({
+                "threads": items,
+                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
+            }))
         })
     }
 
@@ -6411,17 +6474,20 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
-            // `nextToken` is always `null`: the engine fetches a single bounded
-            // page of branches and exposes no continuation cursor (§5.5).
-            let _ = (limit, next_token);
+            let limit = github_ops::clamp_limit(limit);
+            let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected)?;
             let page = sc
-                .list_remote_branches(&owner, &repo)
+                .list_remote_branches(
+                    &owner,
+                    &repo,
+                    intent_sourcecontrol::PageParams { limit, cursor },
+                )
                 .await
                 .map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({
-                "branches": github_browse_ops::branch_names(&page),
-                "nextToken": serde_json::Value::Null,
+                "branches": github_browse_ops::branch_names(&page.items),
+                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
             }))
         })
     }
