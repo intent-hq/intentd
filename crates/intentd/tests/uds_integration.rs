@@ -484,6 +484,29 @@ async fn uds_slice_end_to_end() {
     assert!(message.get("content").is_none());
     assert!(message.get("createdAt").is_none());
 
+    // (s2) agent.getSessionStats → `{ stats: SessionStats }`. With auggie
+    // unavailable in CI the counts derive from the transcript (one persisted
+    // user message), and `creditsUsed` is omitted (null) rather than fabricated.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":261,"method":"agent.getSessionStats","params":{{"sessionId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    let stats = &resp["result"]["stats"];
+    assert!(stats["messageCount"].is_number());
+    assert!(stats["toolCount"].is_number());
+
+    // (s3) agent.getSessionStats unknown → -32602 "Session not found".
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":262,"method":"agent.getSessionStats","params":{"sessionId":"agent-00000000-0000-0000-0000-000000000000"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(resp["error"]["message"], json!("Session not found"));
+
     // (t) agent.get unknown → -32602 "Agent not found".
     let resp = send(
         &config.socket_path,

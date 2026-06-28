@@ -28,7 +28,7 @@ use intent_core::{
     NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
     NoteEditLinesResult, NoteEditResult, NoteId, NoteSetContentResult, NoteTaskRow,
     NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, ScriptCreateParams,
-    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    SessionStats, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
     TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask,
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, Workspace,
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
@@ -100,6 +100,11 @@ pub struct Services {
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
     /// with the end-to-end orchestration flow; the queue surface itself is here.
     agent_queues: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Last per-session stats snapshot observed by `agent.getSessionStats`
+    /// (PROTOCOL §5.24). The `stats` field on `AgentSession` is derived/not
+    /// persisted, so this in-memory cache lets a refresh detect a change and push
+    /// `agent:session-stats-changed` only when the rollup actually moved (§6.5).
+    session_stats_cache: Arc<Mutex<HashMap<AgentId, SessionStats>>>,
     /// Daemon-owned parent→child completion-watch registry (AS-2), keyed by
     /// workspace. A oneShot watch is registered when an agent delegates with
     /// `waitMode` `immediate` over the MCP front door; the delivery worker (AS-3)
@@ -185,6 +190,7 @@ impl Services {
             event_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
+            session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             agent_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
@@ -5214,6 +5220,13 @@ impl WorkspaceApi for Services {
             self.agent_wake_or_create_op(workspace_id, task_note_id, context_message, model)
                 .await
         })
+    }
+
+    fn agent_get_session_stats(
+        &self,
+        session_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_get_session_stats_op(session_id).await })
     }
 
     fn agent_summary(
