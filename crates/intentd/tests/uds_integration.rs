@@ -51,6 +51,7 @@ fn seed_workspace(id: &WorkspaceId) -> Workspace {
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
+        token_usage: None,
     }
 }
 
@@ -260,6 +261,34 @@ async fn uds_slice_end_to_end() {
         &config.socket_path,
         &format!(
             r#"{{"jsonrpc":"2.0","id":12,"method":"workspace.get","params":{{"workspaceId":"{new_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(resp["error"]["message"], json!("Workspace not found"));
+
+    // (f2) workspace.getTokenUsage on the seeded workspace returns the default
+    //      (empty, lastScanAt: null) snapshot before any scan has run (§5.23).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":120,"method":"workspace.getTokenUsage","params":{"workspaceId":"ws-seed"}}"#,
+    )
+    .await;
+    let tu = &resp["result"]["tokenUsage"];
+    assert!(tu.is_object(), "tokenUsage must be an object");
+    assert_eq!(tu["byAgentId"], json!({}));
+    assert_eq!(tu["byModel"], json!({}));
+    assert_eq!(
+        tu["totals"],
+        json!({ "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0 })
+    );
+    assert_eq!(tu["lastScanAt"], Value::Null);
+
+    // (f3) getTokenUsage on the deleted workspace → -32602 "Workspace not found".
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":121,"method":"workspace.getTokenUsage","params":{{"workspaceId":"{new_id}"}}}}"#
         ),
     )
     .await;

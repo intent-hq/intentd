@@ -152,6 +152,10 @@ pub const WORKSPACE_ACTIVITY: &str = "workspace:activity";
 // `attention-changed` is emitted by `workspace.dismissAttention`/`markSeen` (§9.9).
 pub const WORKSPACE_ACTIVITY_CHANGED: &str = "workspace:activity-changed";
 pub const WORKSPACE_ATTENTION_CHANGED: &str = "workspace:attention-changed";
+// Token/credit usage recomputed by the daemon-internal scan job (§5.23 / §19.1).
+// The self-sufficient payload `{ workspaceId, tokenUsage: TokenUsage }` carries
+// the new snapshot so the FE re-renders without a follow-up `getTokenUsage`.
+pub const WORKSPACE_TOKEN_USAGE_CHANGED: &str = "workspace:tokenUsage-changed";
 
 // Spec / goal events.
 pub const SPEC_UPDATED: &str = "spec:updated";
@@ -278,6 +282,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     WORKSPACE_ACTIVITY,
     WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED,
+    WORKSPACE_TOKEN_USAGE_CHANGED,
     SPEC_UPDATED,
     GOAL_UPDATED,
     COMMENT_ADDED,
