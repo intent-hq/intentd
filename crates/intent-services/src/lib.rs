@@ -27,13 +27,13 @@ use intent_core::{
     EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, Note,
     NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
     NoteEditLinesResult, NoteEditResult, NoteId, NoteSetContentResult, NoteTaskRow,
-    NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, ScriptCreateParams,
-    SessionStats, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
-    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceDiffSummary, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
-    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ProjectType, ReadAssetResult,
+    ScriptCreateParams, SessionStats, SetupScript, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata,
+    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary,
+    WorkspaceAttention, WorkspaceCreate, WorkspaceDiffSummary, WorkspaceEventSummary, WorkspaceId,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -2945,7 +2945,7 @@ impl WorkspaceApi for Services {
                         worktree_path: input.worktree_path,
                         scope: input.scope,
                         skip_worktree: input.skip_worktree.unwrap_or(false),
-                        setup_script: input.setup_script,
+                        setup_script: input.setup_script.map(setup_scripts::user_script),
                         is_remote: input.is_remote.unwrap_or(false),
                         default_model: input.default_model,
                         pr_number: None,
@@ -3038,7 +3038,7 @@ impl WorkspaceApi for Services {
                 ws.skip_worktree = v;
             }
             if let Some(v) = update.setup_script {
-                ws.setup_script = Some(v);
+                ws.setup_script = Some(setup_scripts::user_script(v));
             }
             if let Some(v) = update.is_remote {
                 ws.is_remote = v;
@@ -3141,6 +3141,58 @@ impl WorkspaceApi for Services {
             // `NotFound` propagates so the router maps it to `-32602` (§5.23).
             let ws = store.get_workspace(&id).await?;
             Ok(ws.token_usage.unwrap_or_default())
+        })
+    }
+
+    fn get_setup_script(&self, id: WorkspaceId) -> BoxFuture<'_, Result<SetupScript>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Surface a default (empty `script`, `updatedAt: 0`) record before the
+            // first save; `NotFound` propagates so the router maps it to `-32602`.
+            let ws = store.get_workspace(&id).await?;
+            Ok(ws.setup_script.unwrap_or_else(|| SetupScript {
+                script: String::new(),
+                project_type: None,
+                updated_at: 0,
+                generated_by: None,
+            }))
+        })
+    }
+
+    fn save_setup_script(
+        &self,
+        id: WorkspaceId,
+        script: String,
+    ) -> BoxFuture<'_, Result<SetupScript>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let mut ws = store.get_workspace(&id).await?;
+            let record = setup_scripts::user_script(script);
+            ws.setup_script = Some(record.clone());
+            ws.updated_at = now_iso();
+            store.update_workspace(&ws).await?;
+            Ok(record)
+        })
+    }
+
+    fn detect_project_type(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Option<ProjectType>>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let ws = store.get_workspace(&id).await?;
+            Ok(git_ops::worktree_path(&ws).and_then(|p| setup_scripts::detect(&p)))
+        })
+    }
+
+    fn generate_setup_script(&self, id: WorkspaceId) -> BoxFuture<'_, Result<SetupScript>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // AI-assisted draft: the provider/agent path is not wired into this
+            // service, so generation falls back to the deterministic per-project
+            // template generator. Returned (not persisted) with `generatedBy:
+            // "agent"`; the client persists via `saveSetupScript` (§5.25).
+            let ws = store.get_workspace(&id).await?;
+            let project_type = git_ops::worktree_path(&ws).and_then(|p| setup_scripts::detect(&p));
+            Ok(setup_scripts::generate(project_type))
         })
     }
 
@@ -8484,4 +8536,151 @@ pub mod metrics;
 // Integrations & Ops modules (§19).
 pub mod token_usage;
 pub mod session_stats {}
-pub mod setup_scripts {}
+
+/// Worktree setup-script detection and template generation (PROTOCOL §5.25).
+/// Ports the reference `setup-scripts.ipc.ts` detection + template logic, with
+/// the package-manager-specific `ProjectType` collapsed to the coarse protocol
+/// enum (`node`/`python`/`go`/`rust`/`ruby`).
+pub mod setup_scripts {
+    use std::path::Path;
+
+    use intent_core::{now_epoch_ms, ProjectType, SetupScript, SetupScriptGeneratedBy};
+
+    /// Wrap a hand-authored script body into a `SetupScript` stamped
+    /// `generatedBy: "user"` with a fresh `updatedAt` (used by create/update and
+    /// `saveSetupScript`).
+    pub fn user_script(script: String) -> SetupScript {
+        SetupScript {
+            script,
+            project_type: None,
+            updated_at: now_epoch_ms(),
+            generated_by: Some(SetupScriptGeneratedBy::User),
+        }
+    }
+
+    /// Classify the project rooted at `dir` from its manifest files (§5.25),
+    /// mirroring the reference detection precedence (Node → Python → Go → Rust →
+    /// Ruby, later checks win). Returns `None` when no known manifest is present.
+    pub fn detect(dir: &Path) -> Option<ProjectType> {
+        let has = |name: &str| dir.join(name).exists();
+        let mut detected = None;
+        if has("package.json") {
+            detected = Some(ProjectType::Node);
+        }
+        if has("requirements.txt") || has("pyproject.toml") {
+            detected = Some(ProjectType::Python);
+        }
+        if has("go.mod") {
+            detected = Some(ProjectType::Go);
+        }
+        if has("Cargo.toml") {
+            detected = Some(ProjectType::Rust);
+        }
+        if has("Gemfile") {
+            detected = Some(ProjectType::Ruby);
+        }
+        detected
+    }
+
+    /// Render the deterministic template body for a (possibly absent) project
+    /// type, mirroring the reference per-type templates (env-file copy from
+    /// `$MAIN_CHECKOUT` + dependency install). The generic fallback copies common
+    /// config files only.
+    pub fn template_for(project_type: Option<ProjectType>) -> String {
+        const HEADER: &str = "#!/usr/bin/env bash\nset -euo pipefail\n# Available variables: \
+            $MAIN_CHECKOUT, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH\n\n";
+        const COPY_ENV: &str = "# Copy environment files from the main checkout\n\
+            for envfile in .env .env.local .env.development .env.development.local; do\n  \
+            if [ -f \"$MAIN_CHECKOUT/$envfile\" ]; then\n    \
+            cp \"$MAIN_CHECKOUT/$envfile\" \"./$envfile\"\n    echo \"Copied $envfile\"\n  fi\ndone\n\n";
+        let install = match project_type {
+            Some(ProjectType::Node) => "echo \"Installing dependencies...\"\nnpm install\n",
+            Some(ProjectType::Python) => {
+                "echo \"Creating virtual environment...\"\npython3 -m venv venv\n\
+                 source venv/bin/activate\nif [ -f requirements.txt ]; then\n  \
+                 pip install -r requirements.txt\nfi\n"
+            }
+            Some(ProjectType::Go) => "echo \"Downloading Go modules...\"\ngo mod download\n",
+            Some(ProjectType::Rust) => "echo \"Fetching Cargo dependencies...\"\ncargo fetch\n",
+            Some(ProjectType::Ruby) => "echo \"Installing gems...\"\nbundle install\n",
+            None => "echo \"Config files copied\"\n",
+        };
+        format!("{HEADER}{COPY_ENV}{install}")
+    }
+
+    /// Build the AI-assisted draft `SetupScript` for `project_type`, stamped
+    /// `generatedBy: "agent"` (returned, not persisted — §5.25).
+    pub fn generate(project_type: Option<ProjectType>) -> SetupScript {
+        SetupScript {
+            script: template_for(project_type),
+            project_type,
+            updated_at: now_epoch_ms(),
+            generated_by: Some(SetupScriptGeneratedBy::Agent),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::fs;
+
+        fn tmp() -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("setup-script-{}-{n}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn detect_returns_none_without_manifest() {
+            let dir = tmp();
+            assert_eq!(detect(&dir), None);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn detect_classifies_each_manifest() {
+            for (file, expected) in [
+                ("package.json", ProjectType::Node),
+                ("requirements.txt", ProjectType::Python),
+                ("pyproject.toml", ProjectType::Python),
+                ("go.mod", ProjectType::Go),
+                ("Cargo.toml", ProjectType::Rust),
+                ("Gemfile", ProjectType::Ruby),
+            ] {
+                let dir = tmp();
+                fs::write(dir.join(file), "x").unwrap();
+                assert_eq!(detect(&dir), Some(expected), "{file}");
+                fs::remove_dir_all(&dir).ok();
+            }
+        }
+
+        #[test]
+        fn detect_precedence_rust_over_node() {
+            let dir = tmp();
+            fs::write(dir.join("package.json"), "{}").unwrap();
+            fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
+            assert_eq!(detect(&dir), Some(ProjectType::Rust));
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn generate_stamps_agent_and_uses_template() {
+            let s = generate(Some(ProjectType::Rust));
+            assert_eq!(s.project_type, Some(ProjectType::Rust));
+            assert_eq!(s.generated_by, Some(SetupScriptGeneratedBy::Agent));
+            assert!(s.script.contains("cargo fetch"));
+            assert!(s.script.starts_with("#!/usr/bin/env bash"));
+        }
+
+        #[test]
+        fn user_script_stamps_user() {
+            let s = user_script("echo hi".to_string());
+            assert_eq!(s.generated_by, Some(SetupScriptGeneratedBy::User));
+            assert_eq!(s.project_type, None);
+            assert_eq!(s.script, "echo hi");
+        }
+    }
+}

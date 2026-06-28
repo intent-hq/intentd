@@ -14,6 +14,17 @@ pub fn now_iso() -> String {
         .unwrap_or_default()
 }
 
+/// Current UTC time as whole milliseconds since the Unix epoch. Backs the
+/// `SetupScript.updatedAt` epoch-ms field (§5.25), mirroring TS `Date.now()`.
+pub fn now_epoch_ms() -> u64 {
+    let ns = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    if ns <= 0 {
+        0
+    } else {
+        (ns / 1_000_000) as u64
+    }
+}
+
 /// Parse an RFC-3339 / ISO-8601 timestamp, returning `None` when malformed.
 /// Used by `comment.list` `since` filtering (the TS `new Date(since)` guard).
 pub fn parse_iso(s: &str) -> Option<OffsetDateTime> {

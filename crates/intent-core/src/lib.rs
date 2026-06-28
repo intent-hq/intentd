@@ -13,7 +13,7 @@ pub mod ids;
 pub mod model;
 pub mod traits;
 
-pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_iso, parse_iso};
+pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso};
 pub use config::Config;
 pub use error::{Error, Result};
 pub use events::is_known_event_type;
@@ -29,15 +29,15 @@ pub use model::{
     GitCommitResult, GitFileStatus, GitMergeConflicts, GitStatus, KnownRepo, Memory, Note,
     NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
     NoteEditLinesResult, NoteEditResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVisibility, PullRequestInfo, PullRequestStatus, ReadAssetResult,
-    Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState, ScriptStatus, SessionStats,
-    SuggestionDiff, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
-    TokenUsageTotals, TopChangedFile, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
-    WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceDiffSummary,
-    WorkspaceDiffSummaryFile, WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask,
-    WorkspaceTaskStats, WorkspaceUpdate,
+    NoteUpdateMetadataResult, NoteVisibility, ProjectType, PullRequestInfo, PullRequestStatus,
+    ReadAssetResult, Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState, ScriptStatus,
+    SessionStats, SetupScript, SetupScriptGeneratedBy, SuggestionDiff, TaskAssignAgentResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult,
+    TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, TokenUsageTotals, TopChangedFile,
+    Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    WorkspaceCreate, WorkspaceDiffSummary, WorkspaceDiffSummaryFile, WorkspaceEventSummary,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 pub use traits::{
     BoxFuture, ContextEngine, ContextError, EngineAvailability, RetrieveRequest, RetrieveResult,
