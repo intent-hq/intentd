@@ -48,7 +48,11 @@ mod event_ops;
 pub mod events;
 mod file_ops;
 mod git_ops;
+
 mod github_ops;
+
+mod github_browse_ops;
+
 mod history_xml;
 mod note_ops;
 mod pagination;
@@ -5987,6 +5991,37 @@ impl WorkspaceApi for Services {
         })
     }
 
+    // ========================================================================
+    // github.* browse / auth / identity (PROTOCOL §5.27)
+    //
+    // These reuse the same `SourceControl` engine as `pr.*` (via
+    // `pr_ops::resolve_source_control` / `map_sc_err`) but address GitHub
+    // directly by params, with no workspace/active-PR scoping. The PAT is read
+    // once by the engine at build time and is NEVER logged or returned here.
+    // ========================================================================
+
+    fn github_repos_list(
+        &self,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            // The engine fetches a bounded fetch-all set (FE `fetchAll`) and
+            // exposes no continuation cursor, so `limit` / `nextToken` are
+            // accepted for §5.5 shape parity but not threaded; `nextToken` is
+            // always `null` (an unhonorable token would violate §5.5).
+            let _ = (limit, next_token);
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repos = sc.list_repos().await.map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({
+                "repos": github_browse_ops::repos_to_wire(&repos),
+                "nextToken": serde_json::Value::Null,
+
+            }))
+        })
+    }
+
     fn github_pulls_update_branch(
         &self,
         owner: String,
@@ -6007,6 +6042,25 @@ impl WorkspaceApi for Services {
             Ok(serde_json::json!({
                 "message": "PR branch updated from the base branch.",
                 "url": serde_json::Value::Null,
+            }))
+        })
+    }
+
+    fn github_repos_search(
+        &self,
+        query: String,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let _ = (limit, next_token);
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let repos = sc.search_repos(&query).await.map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({
+                "repos": github_browse_ops::repos_to_wire(&repos),
+                "nextToken": serde_json::Value::Null,
+
             }))
         })
     }
@@ -6180,6 +6234,97 @@ impl WorkspaceApi for Services {
                 .await
                 .map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({ "isResolved": is_resolved }))
+        })
+    }
+
+    fn github_repos_get(
+        &self,
+        owner: String,
+        repo: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let sc = pr_ops::resolve_source_control(injected)?;
+            match sc.get_repo(&owner, &repo).await {
+                Ok(r) => Ok(serde_json::json!({ "repo": github_browse_ops::repo_to_wire(&r) })),
+                // FE `getGitHubRepo` returns `GithubRepo | null`; a missing repo
+                // surfaces as `{ repo: null }` rather than an error (§5.27).
+                Err(intent_sourcecontrol::Error::NotFound(_)) => {
+                    Ok(serde_json::json!({ "repo": serde_json::Value::Null }))
+                }
+                Err(e) => Err(pr_ops::map_sc_err(e)),
+            }
+        })
+    }
+
+    fn github_branches_list(
+        &self,
+        owner: String,
+        repo: String,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            // `nextToken` is always `null`: the engine fetches a single bounded
+            // page of branches and exposes no continuation cursor (§5.5).
+            let _ = (limit, next_token);
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let page = sc
+                .list_remote_branches(&owner, &repo)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({
+                "branches": github_browse_ops::branch_names(&page),
+                "nextToken": serde_json::Value::Null,
+            }))
+        })
+    }
+
+    fn github_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            // A missing/invalid token is the graceful "not configured" state,
+            // NOT an error: report `isConfigured: false` instead of throwing.
+            let is_configured = match pr_ops::resolve_source_control(injected) {
+                Ok(sc) => sc
+                    .check_auth()
+                    .await
+                    .map(|s| s.authenticated)
+                    .unwrap_or(false),
+                Err(_) => false,
+            };
+            Ok(github_browse_ops::auth_status_to_wire(is_configured))
+        })
+    }
+
+    fn github_connect(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // No-op in the PAT-from-env model: nothing to connect (no OAuth/device
+        // flow). Return guidance so the FE button can explain the setup.
+        Box::pin(async {
+            Ok(serde_json::json!({
+                "ok": false,
+                "guidance": github_browse_ops::CONNECT_GUIDANCE,
+            }))
+        })
+    }
+
+    fn github_revoke(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // No-op: the token is environment-owned, so there is nothing to revoke.
+        Box::pin(async {
+            Ok(serde_json::json!({
+                "ok": false,
+                "guidance": github_browse_ops::REVOKE_GUIDANCE,
+            }))
+        })
+    }
+
+    fn github_get_user(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let sc = pr_ops::resolve_source_control(injected)?;
+            let user = sc.get_user().await.map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({ "user": github_browse_ops::user_to_wire(&user) }))
         })
     }
 

@@ -1116,12 +1116,55 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        // github.* browse / auth / identity (PROTOCOL §5.27). Repo-addressed
+        // GitHub ops backed by the SourceControl engine; the PAT comes from the
+        // environment and is never logged or returned. Pagination follows §5.5
+        // (`limit` / `nextToken`); `nextToken` is currently always `null`.
+        "github.repos.list" => {
+            let limit = opt_int(params, "limit");
+            let next_token = opt_str(params, "nextToken");
+            let r = api
+                .github_repos_list(limit, next_token)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.repos.search" => {
+            let query = require_str_param(params, "query")?;
+            let limit = opt_int(params, "limit");
+            let next_token = opt_str(params, "nextToken");
+            let r = api
+                .github_repos_search(query, limit, next_token)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.repos.get" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let r = api
+                .github_repos_get(owner, repo)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "github.pulls.get" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;
             let number = require_u64(params, "number")?;
             let r = api
                 .github_pulls_get(owner, repo, number)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.branches.list" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let limit = opt_int(params, "limit");
+            let next_token = opt_str(params, "nextToken");
+            let r = api
+                .github_branches_list(owner, repo, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -1254,6 +1297,22 @@ async fn dispatch(
                 .github_unresolve_thread(thread_id)
                 .await
                 .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.authStatus" => {
+            let r = api.github_auth_status().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.connect" => {
+            let r = api.github_connect().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.revoke" => {
+            let r = api.github_revoke().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.getUser" => {
+            let r = api.github_get_user().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
         "file-tracking.init" => {

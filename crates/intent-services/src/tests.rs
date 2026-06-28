@@ -2102,7 +2102,7 @@ mod pr {
     use async_trait::async_trait;
     use intent_core::{now_iso, Error, WorkspaceApi, WorkspaceId};
     use intent_sourcecontrol::{
-        AuthStatus, CheckRun, CheckState, Comment, CommentAnchor, Error as ScError, Issue,
+        AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor, Error as ScError, Issue,
         IssueQuery, MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, PrPatch,
         PrQuery, PrState, PullRequest, RemoteBranches, Repo, RepoRef, Result as ScResult, Review,
         ReviewComment, ReviewThread, ReviewThreadComment, ReviewVerdict, ScCapabilities,
@@ -2173,19 +2173,56 @@ mod pr {
             })
         }
         async fn get_user(&self) -> ScResult<UserIdentity> {
-            unimplemented!()
+            Ok(UserIdentity {
+                login: "octocat".into(),
+                id: Some(583231),
+                name: Some("The Octocat".into()),
+                avatar_url: Some("https://avatars.example/u/1".into()),
+                html_url: Some("https://github.com/octocat".into()),
+            })
         }
         async fn list_repos(&self) -> ScResult<Vec<Repo>> {
-            unimplemented!()
+            Ok(vec![Repo {
+                owner: "octocat".into(),
+                name: "hello".into(),
+                url: Some("https://github.com/octocat/hello".into()),
+                default_branch: Some("main".into()),
+                created_at: None,
+                updated_at: None,
+            }])
         }
         async fn search_repos(&self, _: &str) -> ScResult<Vec<Repo>> {
-            unimplemented!()
+            self.list_repos().await
         }
-        async fn get_repo(&self, _: &str, _: &str) -> ScResult<Repo> {
-            unimplemented!()
+        async fn get_repo(&self, owner: &str, name: &str) -> ScResult<Repo> {
+            if owner == "ghost" {
+                return Err(ScError::NotFound("no such repo".into()));
+            }
+            Ok(Repo {
+                owner: owner.into(),
+                name: name.into(),
+                url: Some(format!("https://github.com/{owner}/{name}")),
+                default_branch: Some("main".into()),
+                created_at: None,
+                updated_at: None,
+            })
         }
         async fn list_remote_branches(&self, _: &str, _: &str) -> ScResult<RemoteBranches> {
-            unimplemented!()
+            Ok(RemoteBranches {
+                branches: vec![
+                    Branch {
+                        name: "main".into(),
+                        commit_sha: None,
+                        protected: false,
+                    },
+                    Branch {
+                        name: "dev".into(),
+                        commit_sha: None,
+                        protected: false,
+                    },
+                ],
+                has_next_page: false,
+            })
         }
         async fn create_pr(&self, _: &RepoRef, input: NewPullRequest) -> ScResult<PullRequest> {
             Ok(PullRequest {
@@ -2433,6 +2470,99 @@ mod pr {
         store.insert_workspace(&ws).await.expect("ws");
         let services = Services::new(store).with_source_control(Arc::new(forge));
         (tmp, services, ws_id)
+    }
+
+    // ---- github.* browse / auth / identity (PROTOCOL §5.27) -------------
+
+    async fn github_svc() -> (TempDb, Services) {
+        let (tmp, svc, _ws) = setup_with(StubForge::default(), false).await;
+        (tmp, svc)
+    }
+
+    #[tokio::test]
+    async fn github_repos_list_projects_html_url_and_null_next_token() {
+        let (_t, svc) = github_svc().await;
+        let v = svc.github_repos_list(None, None).await.expect("list");
+        assert_eq!(v["nextToken"], serde_json::Value::Null);
+        let repo = &v["repos"][0];
+        assert_eq!(repo["owner"], "octocat");
+        assert_eq!(repo["name"], "hello");
+        assert_eq!(repo["htmlUrl"], "https://github.com/octocat/hello");
+        assert_eq!(repo["defaultBranch"], "main");
+        // engine `url` is projected, never echoed verbatim.
+        assert!(repo.get("url").is_none());
+    }
+
+    #[tokio::test]
+    async fn github_repos_search_shapes_like_list() {
+        let (_t, svc) = github_svc().await;
+        let v = svc
+            .github_repos_search("hello".into(), None, None)
+            .await
+            .expect("search");
+        assert_eq!(v["repos"][0]["htmlUrl"], "https://github.com/octocat/hello");
+        assert_eq!(v["nextToken"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn github_repos_get_returns_repo_or_null_when_missing() {
+        let (_t, svc) = github_svc().await;
+        let found = svc
+            .github_repos_get("octocat".into(), "hello".into())
+            .await
+            .expect("get");
+        assert_eq!(found["repo"]["htmlUrl"], "https://github.com/octocat/hello");
+
+        // A NotFound from the engine surfaces as `{ repo: null }` (FE parity).
+        let missing = svc
+            .github_repos_get("ghost".into(), "nope".into())
+            .await
+            .expect("get missing");
+        assert_eq!(missing["repo"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn github_branches_list_returns_names_and_null_next_token() {
+        let (_t, svc) = github_svc().await;
+        let v = svc
+            .github_branches_list("octocat".into(), "hello".into(), None, None)
+            .await
+            .expect("branches");
+        assert_eq!(v["branches"], serde_json::json!(["main", "dev"]));
+        assert_eq!(v["nextToken"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn github_get_user_drops_id_name_and_never_leaks_token() {
+        let (_t, svc) = github_svc().await;
+        let v = svc.github_get_user().await.expect("user");
+        let user = &v["user"];
+        assert_eq!(user["login"], "octocat");
+        assert_eq!(user["avatarUrl"], "https://avatars.example/u/1");
+        assert_eq!(user["htmlUrl"], "https://github.com/octocat");
+        assert!(user.get("id").is_none());
+        assert!(user.get("name").is_none());
+    }
+
+    #[tokio::test]
+    async fn github_auth_status_reports_configured_with_valid_token() {
+        let (_t, svc) = github_svc().await;
+        let v = svc.github_auth_status().await.expect("auth");
+        assert_eq!(v["isConfigured"], true);
+        assert_eq!(v["oauthUrl"], "");
+        assert_eq!(v["configuredButNeedsUpdate"], false);
+        assert_eq!(v["updatedScopes"], "");
+    }
+
+    #[tokio::test]
+    async fn github_connect_and_revoke_are_noops_with_guidance() {
+        let (_t, svc) = github_svc().await;
+        let c = svc.github_connect().await.expect("connect");
+        assert_eq!(c["ok"], false);
+        assert!(c["guidance"].as_str().unwrap().contains("GITHUB_TOKEN"));
+        let r = svc.github_revoke().await.expect("revoke");
+        assert_eq!(r["ok"], false);
+        assert!(!r["guidance"].as_str().unwrap().is_empty());
     }
 
     /// Drive `pr_wait_for_changes` deterministically under a paused clock.
