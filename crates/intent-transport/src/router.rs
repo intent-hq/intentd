@@ -214,6 +214,30 @@ async fn dispatch(
             let token_usage = api.get_token_usage(id).await.map_err(workspace_err)?;
             Ok(json!({ "tokenUsage": token_usage }))
         }
+        "workspace.getSetupScript" => {
+            let id = require_workspace_id(params)?;
+            let setup_script = api.get_setup_script(id).await.map_err(workspace_err)?;
+            Ok(json!({ "setupScript": setup_script }))
+        }
+        "workspace.saveSetupScript" => {
+            let id = require_workspace_id(params)?;
+            let script = require_str_param(params, "script")?;
+            let setup_script = api
+                .save_setup_script(id, script)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "setupScript": setup_script }))
+        }
+        "workspace.detectProjectType" => {
+            let id = require_workspace_id(params)?;
+            let project_type = api.detect_project_type(id).await.map_err(workspace_err)?;
+            Ok(json!({ "projectType": project_type }))
+        }
+        "workspace.generateSetupScript" => {
+            let id = require_workspace_id(params)?;
+            let setup_script = api.generate_setup_script(id).await.map_err(workspace_err)?;
+            Ok(json!({ "setupScript": setup_script }))
+        }
         "note.list" => {
             let ws_id = match params.get("workspaceId").and_then(Value::as_str) {
                 Some(s) if !s.is_empty() => WorkspaceId::from(s),
