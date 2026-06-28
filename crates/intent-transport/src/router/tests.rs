@@ -2939,3 +2939,50 @@ async fn rules_methods_route_and_validate_params() {
     .unwrap();
     assert_eq!(err_code(&v), -32603);
 }
+
+// `github.*` explicit-addressing arms (§5.27). `FakeApi` uses the default
+// trait impls (→ -32603 "not implemented"), so a fully-parametrized call
+// proving the arm routes (not -32601) lands on -32603, while missing required
+// params short-circuit to -32602 in the router before the trait is reached.
+
+#[tokio::test]
+async fn github_methods_are_routed_not_unknown() {
+    for msg in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.pulls.create","params":{"owner":"o","repo":"r","title":"t","body":"b","head":"h","base":"main"}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"github.pulls.get","params":{"owner":"o","repo":"r","number":1}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"github.pulls.list","params":{"owner":"o","repo":"r"}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"github.pulls.search","params":{"owner":"o","repo":"r"}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"github.pulls.merge","params":{"owner":"o","repo":"r","number":1}}"#,
+        r#"{"jsonrpc":"2.0","id":6,"method":"github.pulls.updateBranch","params":{"owner":"o","repo":"r","number":1}}"#,
+        r#"{"jsonrpc":"2.0","id":7,"method":"github.issues.list","params":{"owner":"o","repo":"r"}}"#,
+        r#"{"jsonrpc":"2.0","id":8,"method":"github.issues.search","params":{"owner":"o","repo":"r"}}"#,
+        r#"{"jsonrpc":"2.0","id":9,"method":"github.listReviewComments","params":{"owner":"o","repo":"r","number":1}}"#,
+        r#"{"jsonrpc":"2.0","id":10,"method":"github.replyReviewComment","params":{"owner":"o","repo":"r","number":1,"commentId":2,"body":"b"}}"#,
+        r#"{"jsonrpc":"2.0","id":11,"method":"github.getReviewThreads","params":{"owner":"o","repo":"r","number":1}}"#,
+        r#"{"jsonrpc":"2.0","id":12,"method":"github.resolveThread","params":{"threadId":"RT1"}}"#,
+        r#"{"jsonrpc":"2.0","id":13,"method":"github.unresolveThread","params":{"threadId":"RT1"}}"#,
+    ] {
+        let v = call(msg).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "msg={msg}");
+    }
+}
+
+#[tokio::test]
+async fn github_missing_required_params_are_minus_32602() {
+    for msg in [
+        // missing owner/repo
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.pulls.list","params":{"repo":"r"}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"github.pulls.get","params":{"owner":"o","repo":"r"}}"#,
+        // missing number
+        r#"{"jsonrpc":"2.0","id":3,"method":"github.pulls.merge","params":{"owner":"o","repo":"r"}}"#,
+        // missing required create fields
+        r#"{"jsonrpc":"2.0","id":4,"method":"github.pulls.create","params":{"owner":"o","repo":"r","title":"t"}}"#,
+        // missing commentId / body
+        r#"{"jsonrpc":"2.0","id":5,"method":"github.replyReviewComment","params":{"owner":"o","repo":"r","number":1}}"#,
+        // missing threadId
+        r#"{"jsonrpc":"2.0","id":6,"method":"github.resolveThread","params":{}}"#,
+    ] {
+        let v = call(msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "msg={msg}");
+    }
+}
