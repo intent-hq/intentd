@@ -48,6 +48,39 @@ pub(crate) const GITHUB_CAPABILITIES: ScCapabilities = ScCapabilities {
     issues: true,
 };
 
+// --- REST pagination helpers (§5.5) ---
+
+/// GitHub honors at most 100 items per REST page regardless of the requested
+/// `limit`, so the page size sent upstream is clamped here and the
+/// next-page heuristic is measured against the clamped size.
+const REST_MAX_PER_PAGE: u8 = 100;
+
+/// Parse an engine REST cursor (a 1-based `"<page>"` string) into a page
+/// number; an absent or malformed cursor starts at page 1.
+fn rest_page(cursor: Option<&str>) -> u64 {
+    cursor
+        .and_then(|c| c.parse::<u64>().ok())
+        .filter(|p| *p >= 1)
+        .unwrap_or(1)
+}
+
+/// Per-page size sent to GitHub for a requested `limit` (`1..=100`).
+fn rest_per_page(limit: u8) -> u64 {
+    limit.clamp(1, REST_MAX_PER_PAGE) as u64
+}
+
+/// The next REST cursor when the fetched page filled the per-page window — the
+/// same count heuristic the prior single-page branch listing used (a final
+/// exactly-full page costs one extra empty fetch; GitHub's `Link` header is not
+/// surfaced by octocrab's generic `get`).
+fn rest_next_cursor(page: u64, fetched: usize, per_page: u64) -> Option<String> {
+    if per_page > 0 && fetched as u64 == per_page {
+        Some((page + 1).to_string())
+    } else {
+        None
+    }
+}
+
 // --- JSON → model mapping (pure; unit-tested with fixtures) ---
 
 fn login_of(user: &Option<dto::User>) -> String {
@@ -455,10 +488,11 @@ mod dto {
 }
 
 const REVIEW_THREADS_QUERY: &str = r#"
-query GetReviewThreads($owner: String!, $repo: String!, $prNumber: Int!) {
+query GetReviewThreads($owner: String!, $repo: String!, $prNumber: Int!, $first: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $prNumber) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: $first, after: $after) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           id
           isResolved
@@ -502,49 +536,62 @@ impl SourceControl for GitHubSourceControl {
         map_user_identity(v)
     }
 
-    async fn list_repos(&self) -> Result<Vec<Repo>> {
-        const PER_PAGE: usize = 100;
-        const MAX_PAGES: u64 = 10;
-        let mut repos = Vec::new();
-        for page in 1..=MAX_PAGES {
-            let params: Vec<(&str, String)> = vec![
-                ("per_page", PER_PAGE.to_string()),
-                ("page", page.to_string()),
-                ("sort", "updated".to_string()),
-            ];
-            let v: Value = self.client.get("/user/repos", Some(&params)).await?;
-            let items: Vec<Value> = serde_json::from_value(v)?;
-            let count = items.len();
-            for item in items {
-                repos.push(map_repo(item)?);
-            }
-            if count < PER_PAGE {
-                break;
-            }
-        }
-        Ok(repos)
+    async fn list_repos(&self, page: PageParams) -> Result<Page<Repo>> {
+        let per_page = rest_per_page(page.limit);
+        let page_no = rest_page(page.cursor.as_deref());
+        let params: Vec<(&str, String)> = vec![
+            ("per_page", per_page.to_string()),
+            ("page", page_no.to_string()),
+            ("sort", "updated".to_string()),
+        ];
+        let v: Value = self.client.get("/user/repos", Some(&params)).await?;
+        let items: Vec<Value> = serde_json::from_value(v)?;
+        let fetched = items.len();
+        let repos = items
+            .into_iter()
+            .map(map_repo)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Page {
+            items: repos,
+            next_cursor: rest_next_cursor(page_no, fetched, per_page),
+        })
     }
 
-    async fn search_repos(&self, query: &str) -> Result<Vec<Repo>> {
+    async fn search_repos(&self, query: &str, page: PageParams) -> Result<Page<Repo>> {
         let search_query = build_repo_search_query(query);
         if search_query.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Page {
+                items: Vec::new(),
+                next_cursor: None,
+            });
         }
+        let per_page = rest_per_page(page.limit);
+        let page_no = rest_page(page.cursor.as_deref());
         let params: Vec<(&str, String)> = vec![
             ("q", search_query),
             ("sort", "stars".to_string()),
             ("order", "desc".to_string()),
-            ("per_page", "20".to_string()),
+            ("per_page", per_page.to_string()),
+            ("page", page_no.to_string()),
         ];
         let v: Value = self
             .client
             .get("/search/repositories", Some(&params))
             .await?;
-        let items = v
-            .get("items")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new()));
-        map_list(items, map_repo)
+        let items: Vec<Value> = serde_json::from_value(
+            v.get("items")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new())),
+        )?;
+        let fetched = items.len();
+        let repos = items
+            .into_iter()
+            .map(map_repo)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Page {
+            items: repos,
+            next_cursor: rest_next_cursor(page_no, fetched, per_page),
+        })
     }
 
     async fn get_repo(&self, owner: &str, name: &str) -> Result<Repo> {
@@ -553,23 +600,29 @@ impl SourceControl for GitHubSourceControl {
         map_repo(v)
     }
 
-    async fn list_remote_branches(&self, owner: &str, name: &str) -> Result<RemoteBranches> {
-        const PER_PAGE: usize = 100;
+    async fn list_remote_branches(
+        &self,
+        owner: &str,
+        name: &str,
+        page: PageParams,
+    ) -> Result<Page<Branch>> {
+        let per_page = rest_per_page(page.limit);
+        let page_no = rest_page(page.cursor.as_deref());
         let route = format!("/repos/{owner}/{name}/branches");
         let params: Vec<(&str, String)> = vec![
-            ("per_page", PER_PAGE.to_string()),
-            ("page", "1".to_string()),
+            ("per_page", per_page.to_string()),
+            ("page", page_no.to_string()),
         ];
         let v: Value = self.client.get(&route, Some(&params)).await?;
         let items: Vec<Value> = serde_json::from_value(v)?;
-        let has_next_page = items.len() == PER_PAGE;
+        let fetched = items.len();
         let branches = items
             .into_iter()
             .map(map_branch)
             .collect::<Result<Vec<_>>>()?;
-        Ok(RemoteBranches {
-            branches,
-            has_next_page,
+        Ok(Page {
+            items: branches,
+            next_cursor: rest_next_cursor(page_no, fetched, per_page),
         })
     }
 
@@ -592,7 +645,9 @@ impl SourceControl for GitHubSourceControl {
         map_pull(v)
     }
 
-    async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> Result<Vec<PullRequest>> {
+    async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> Result<Page<PullRequest>> {
+        let per_page = rest_per_page(query.limit.unwrap_or(30));
+        let page_no = rest_page(query.cursor.as_deref());
         if let Some(involvement) = query.involvement {
             // GitHub's `/pulls` listing cannot express assignee/review-requested/
             // involves @me, so route involvement queries through `/search/issues`
@@ -616,14 +671,24 @@ impl SourceControl for GitHubSourceControl {
                 ("q", q),
                 ("sort", "updated".to_string()),
                 ("order", "desc".to_string()),
-                ("per_page", query.limit.unwrap_or(30).to_string()),
+                ("per_page", per_page.to_string()),
+                ("page", page_no.to_string()),
             ];
             let v: Value = self.client.get("/search/issues", Some(&params)).await?;
-            let items = v
-                .get("items")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new()));
-            return map_list(items, map_pull);
+            let items: Vec<Value> = serde_json::from_value(
+                v.get("items")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new())),
+            )?;
+            let fetched = items.len();
+            let prs = items
+                .into_iter()
+                .map(map_pull)
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Page {
+                items: prs,
+                next_cursor: rest_next_cursor(page_no, fetched, per_page),
+            });
         }
         let mut params: Vec<(&str, String)> = vec![(
             "state",
@@ -640,14 +705,20 @@ impl SourceControl for GitHubSourceControl {
         if let Some(head) = &query.head {
             params.push(("head", head.clone()));
         }
-        params.push(("per_page", query.limit.unwrap_or(30).to_string()));
+        params.push(("per_page", per_page.to_string()));
+        params.push(("page", page_no.to_string()));
         let route = Self::repo_path(repo, "/pulls");
         let v: Value = self.client.get(&route, Some(&params)).await?;
-        let prs = map_list(v, map_pull)?;
-        Ok(match &query.author {
+        let raw: Vec<Value> = serde_json::from_value(v)?;
+        // Paging is measured on the raw GitHub page; the optional client-side
+        // `author` filter only narrows what this page returns.
+        let next_cursor = rest_next_cursor(page_no, raw.len(), per_page);
+        let prs = raw.into_iter().map(map_pull).collect::<Result<Vec<_>>>()?;
+        let items = match &query.author {
             Some(author) => prs.into_iter().filter(|p| &p.author == author).collect(),
             None => prs,
-        })
+        };
+        Ok(Page { items, next_cursor })
     }
 
     async fn update_pr(&self, repo: &RepoRef, number: u64, patch: PrPatch) -> Result<PullRequest> {
@@ -795,13 +866,28 @@ impl SourceControl for GitHubSourceControl {
         &self,
         repo: &RepoRef,
         number: u64,
-    ) -> Result<Vec<ReviewComment>> {
-        let route = Self::repo_path(
-            repo,
-            &format!("/pulls/{number}/comments?per_page=100&sort=created&direction=desc"),
-        );
-        let v: Value = self.client.get(&route, None::<&()>).await?;
-        map_list(v, map_review_comment)
+        page: PageParams,
+    ) -> Result<Page<ReviewComment>> {
+        let per_page = rest_per_page(page.limit);
+        let page_no = rest_page(page.cursor.as_deref());
+        let route = Self::repo_path(repo, &format!("/pulls/{number}/comments"));
+        let params: Vec<(&str, String)> = vec![
+            ("per_page", per_page.to_string()),
+            ("page", page_no.to_string()),
+            ("sort", "created".to_string()),
+            ("direction", "desc".to_string()),
+        ];
+        let v: Value = self.client.get(&route, Some(&params)).await?;
+        let items: Vec<Value> = serde_json::from_value(v)?;
+        let fetched = items.len();
+        let comments = items
+            .into_iter()
+            .map(map_review_comment)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Page {
+            items: comments,
+            next_cursor: rest_next_cursor(page_no, fetched, per_page),
+        })
     }
 
     async fn reply_to_review_comment(
@@ -817,18 +903,45 @@ impl SourceControl for GitHubSourceControl {
         map_review_comment(v)
     }
 
-    async fn get_review_threads(&self, repo: &RepoRef, number: u64) -> Result<Vec<ReviewThread>> {
+    async fn get_review_threads(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        page: PageParams,
+    ) -> Result<Page<ReviewThread>> {
+        // GraphQL caps `first` at 100; the cursor is the native `endCursor`.
+        let first = page.limit.clamp(1, 100) as i64;
+        let after = page.cursor.clone();
         let payload = json!({
             "query": REVIEW_THREADS_QUERY,
-            "variables": { "owner": repo.owner, "repo": repo.name, "prNumber": number },
+            "variables": {
+                "owner": repo.owner,
+                "repo": repo.name,
+                "prNumber": number,
+                "first": first,
+                "after": after,
+            },
         });
         let resp: Value = self.client.graphql(&payload).await?;
         let data = graphql_data(resp)?;
-        let nodes = data
-            .pointer("/repository/pullRequest/reviewThreads/nodes")
+        let threads = data.pointer("/repository/pullRequest/reviewThreads");
+        let nodes = threads
+            .and_then(|t| t.get("nodes"))
             .cloned()
             .unwrap_or_else(|| Value::Array(Vec::new()));
-        map_list(nodes, map_review_thread)
+        let has_next = threads
+            .and_then(|t| t.pointer("/pageInfo/hasNextPage"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let end_cursor = threads
+            .and_then(|t| t.pointer("/pageInfo/endCursor"))
+            .and_then(Value::as_str)
+            .map(String::from);
+        let items = map_list(nodes, map_review_thread)?;
+        Ok(Page {
+            items,
+            next_cursor: if has_next { end_cursor } else { None },
+        })
     }
 
     async fn resolve_thread(&self, thread_id: &str) -> Result<bool> {
@@ -869,7 +982,9 @@ impl SourceControl for GitHubSourceControl {
         map_issue(v)
     }
 
-    async fn list_issues(&self, repo: &RepoRef, query: IssueQuery) -> Result<Vec<Issue>> {
+    async fn list_issues(&self, repo: &RepoRef, query: IssueQuery) -> Result<Page<Issue>> {
+        let per_page = rest_per_page(query.limit.unwrap_or(30));
+        let page_no = rest_page(query.cursor.as_deref());
         let mut params: Vec<(&str, String)> = vec![(
             "state",
             query.state.clone().unwrap_or_else(|| "open".into()),
@@ -877,15 +992,21 @@ impl SourceControl for GitHubSourceControl {
         if let Some(labels) = &query.labels {
             params.push(("labels", labels.clone()));
         }
-        params.push(("per_page", query.limit.unwrap_or(30).to_string()));
+        params.push(("per_page", per_page.to_string()));
+        params.push(("page", page_no.to_string()));
         let route = Self::repo_path(repo, "/issues");
         let v: Value = self.client.get(&route, Some(&params)).await?;
-        let items: Vec<Value> = serde_json::from_value(v)?;
-        items
+        let raw: Vec<Value> = serde_json::from_value(v)?;
+        // Paging is measured on the raw GitHub page; the `pull_request` filter
+        // only narrows what this page returns (parity with the `author` filter
+        // on `list_prs`).
+        let next_cursor = rest_next_cursor(page_no, raw.len(), per_page);
+        let items = raw
             .into_iter()
             .filter(|i| i.get("pull_request").is_none())
             .map(map_issue)
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Page { items, next_cursor })
     }
 }
 
@@ -1164,18 +1285,20 @@ mod tests {
     }
 
     #[test]
-    fn remote_branches_has_next_page_shape() {
-        let page = RemoteBranches {
-            branches: vec![Branch {
-                name: "main".into(),
-                commit_sha: None,
-                protected: false,
-            }],
-            has_next_page: true,
-        };
-        let wire = serde_json::to_value(&page).unwrap();
-        assert_eq!(wire["hasNextPage"], true);
-        assert_eq!(wire["branches"][0]["name"], "main");
+    fn rest_pagination_helpers() {
+        // Cursor parsing: absent / garbage / sub-1 all start at page 1.
+        assert_eq!(rest_page(None), 1);
+        assert_eq!(rest_page(Some("bad")), 1);
+        assert_eq!(rest_page(Some("0")), 1);
+        assert_eq!(rest_page(Some("3")), 3);
+        // Per-page is clamped into `1..=100` regardless of the requested limit.
+        assert_eq!(rest_per_page(0), 1);
+        assert_eq!(rest_per_page(50), 50);
+        assert_eq!(rest_per_page(200), 100);
+        // A full page yields the next cursor; a short (final) page does not.
+        assert_eq!(rest_next_cursor(1, 100, 100).as_deref(), Some("2"));
+        assert_eq!(rest_next_cursor(2, 40, 100), None);
+        assert_eq!(rest_next_cursor(1, 0, 100), None);
     }
 
     #[test]
