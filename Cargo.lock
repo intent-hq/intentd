@@ -1872,6 +1872,7 @@ dependencies = [
  "intent-context",
  "intent-core",
  "intent-git",
+ "intent-linear",
  "intent-providers",
  "intent-pty",
  "intent-search",
@@ -1950,12 +1951,14 @@ name = "intentd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "futures-util",
  "intent-acp",
  "intent-context",
  "intent-core",
  "intent-git",
+ "intent-linear",
  "intent-providers",
  "intent-pty",
  "intent-search",

@@ -54,6 +54,7 @@ mod github_ops;
 mod github_browse_ops;
 
 mod history_xml;
+mod linear_ops;
 mod note_ops;
 mod pagination;
 mod pr_ops;
@@ -115,6 +116,12 @@ pub struct Services {
     /// composition root or a test; when unset, the `pr.*` handlers build the
     /// provider from default settings (token from env / `gh` / keychain).
     source_control: Option<Arc<dyn intent_sourcecontrol::SourceControl>>,
+    /// Active Linear engine for the `linear.*` methods (§5.28). `None` until
+    /// wired by the composition root or a test; when unset, the `linear.*`
+    /// handlers build the engine from default settings (key from
+    /// `LINEAR_API_KEY` / keychain), surfacing a graceful "not configured"
+    /// `Internal` error when no key is available.
+    linear_engine: Option<Arc<dyn intent_linear::LinearEngine>>,
     /// Per-worktree async locks (`withGitWorktreeLock` parity, §9.5) so the
     /// `accept-changes.execute` commit/push path never races concurrent agents
     /// or operations on the same worktree.
@@ -181,6 +188,7 @@ impl Services {
             agent_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
+            linear_engine: None,
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
             search_cancels: intent_search::CancelRegistry::new(),
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
@@ -396,6 +404,17 @@ impl Services {
         source_control: Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Self {
         self.source_control = Some(source_control);
+        self
+    }
+
+    /// Wire the active Linear engine used by the `linear.*` methods (§5.28).
+    /// The composition root builds it from settings; tests inject a stub so the
+    /// `linear.*` handlers never touch the network.
+    pub fn with_linear_engine(
+        mut self,
+        linear_engine: Arc<dyn intent_linear::LinearEngine>,
+    ) -> Self {
+        self.linear_engine = Some(linear_engine);
         self
     }
 
@@ -6325,6 +6344,62 @@ impl WorkspaceApi for Services {
             let sc = pr_ops::resolve_source_control(injected)?;
             let user = sc.get_user().await.map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({ "user": github_browse_ops::user_to_wire(&user) }))
+        })
+    }
+
+    // ========================================================================
+    // linear.* read surface (PROTOCOL §5.28). Maps onto the `LinearEngine`
+    // trait; the engine resolves the API key (`LINEAR_API_KEY` / keychain) and
+    // talks to Linear's GraphQL API. A missing/invalid key → `Internal`
+    // ("not configured", graceful). Validation/resolution glue lives in
+    // `linear_ops`. The API key is never logged or returned over the wire.
+    // ========================================================================
+
+    fn linear_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.linear_engine.clone();
+        Box::pin(async move {
+            let engine = linear_ops::resolve_engine(injected)?;
+            let status = engine
+                .auth_status()
+                .await
+                .map_err(linear_ops::map_linear_err)?;
+            serde_json::to_value(status)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    fn linear_list_issues(
+        &self,
+        filter: Option<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.linear_engine.clone();
+        Box::pin(async move {
+            let filter = linear_ops::parse_filter(filter)?;
+            let engine = linear_ops::resolve_engine(injected)?;
+            let issues = engine
+                .list_issues(filter, linear_ops::wire_limit(limit))
+                .await
+                .map_err(linear_ops::map_linear_err)?;
+            serde_json::to_value(issues)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    fn linear_search_issues(
+        &self,
+        query: String,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.linear_engine.clone();
+        Box::pin(async move {
+            let engine = linear_ops::resolve_engine(injected)?;
+            let issues = engine
+                .search_issues(&query, linear_ops::wire_limit(limit))
+                .await
+                .map_err(linear_ops::map_linear_err)?;
+            serde_json::to_value(issues)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
     }
 

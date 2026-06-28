@@ -33,6 +33,10 @@ intent-acp = { path = "../intent-acp" }
 intent-providers = { path = "../intent-providers" }
 intent-core = { path = "../intent-core" }
 intent-store = { path = "../intent-store" }
+# `uds_linear.rs` injects a stub `LinearEngine` so the `linear.*` e2e slice
+# never touches the network (no `LINEAR_API_KEY`, no GraphQL call).
+intent-linear = { path = "../intent-linear" }
+async-trait = "0.1"
 tokio = { workspace = true }
 serde_json = { workspace = true }
 tokio-tungstenite = { workspace = true }

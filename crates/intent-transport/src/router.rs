@@ -1315,6 +1315,32 @@ async fn dispatch(
             let r = api.github_get_user().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        // `linear.*` (§5.28) is daemon-owned and global: no `workspaceId`. A key
+        // that is absent or fails the `viewer` probe ("not configured") and any
+        // other Linear failure surface as `-32603`; an invalid `filter` is
+        // `-32602` with the descriptive message verbatim.
+        "linear.authStatus" => {
+            let r = api.linear_auth_status().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "linear.listIssues" => {
+            let filter = opt_str(params, "filter");
+            let limit = opt_int(params, "limit");
+            match api.linear_list_issues(filter, limit).await {
+                Ok(issues) => Ok(issues),
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "linear.searchIssues" => {
+            let query = require_str_param(params, "query")?;
+            let limit = opt_int(params, "limit");
+            let r = api
+                .linear_search_issues(query, limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "file-tracking.init" => {
             let ws = require_ws_note(params)?;
             let r = api.file_tracking_init(ws).await.map_err(domain_to_rpc)?;
