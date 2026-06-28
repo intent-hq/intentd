@@ -1862,6 +1862,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "intent-sentry"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "keyring",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "intent-services"
 version = "0.1.0"
 dependencies = [
