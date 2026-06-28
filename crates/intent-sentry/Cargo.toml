@@ -1,0 +1,25 @@
+[package]
+name = "intent-sentry"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "SentryEngine + DTOs for the sentry.* surface (REST over reqwest)"
+
+[dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+keyring = { version = "3", default-features = false, features = [
+    "apple-native",
+    "windows-native",
+    "linux-native",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
