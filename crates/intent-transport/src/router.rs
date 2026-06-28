@@ -660,6 +660,15 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "agent.getSessionStats" => {
+            let session_id =
+                require_str_param(params, "sessionId").map(|s| AgentId::from(s.as_str()))?;
+            match api.agent_get_session_stats(session_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Session not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "agent.create" => {
             let ws = require_ws_note(params)?;
             let name = opt_str(params, "name");

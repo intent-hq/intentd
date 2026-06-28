@@ -16,12 +16,12 @@ use intent_store::{NewEvent, Store};
 use serde_json::json;
 use tokio::time::timeout;
 
-use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE};
-use intent_core::{ActorType, Event, EventActor};
+use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_SESSION_STATS_CHANGED};
+use intent_core::{ActorType, Event, EventActor, SessionStats};
 
 use crate::{EventBus, SubscriptionFilter};
 
-use crate::agent_ops::{parse_model_list_output, static_models};
+use crate::agent_ops::{parse_model_list_output, parse_session_stats_output, static_models};
 use crate::Services;
 
 struct TempDb {
@@ -1699,4 +1699,93 @@ async fn diagnostics_flags_orphaned_subscription() {
     assert!(risks
         .iter()
         .any(|r| r["type"] == json!("orphaned-subscription") && r["agentId"] == json!(ghost.0)));
+}
+
+/// The auggie `session stats --json` parser maps the camelCase CLI shape onto
+/// [`SessionStats`]: `creditsUsed` flows through, counts default to 0 when
+/// absent, and a non-object payload degrades to `None` (PROTOCOL §5.24).
+#[test]
+fn parse_session_stats_output_maps_cli_shape() {
+    let full = parse_session_stats_output(r#"{"creditsUsed":12.5,"messageCount":7,"toolCount":3}"#)
+        .expect("full object parses");
+    assert_eq!(full.credits_used, Some(12.5));
+    assert_eq!(full.message_count, 7);
+    assert_eq!(full.tool_count, 3);
+
+    // Missing credits + counts: creditsUsed -> None, counts -> 0.
+    let partial = parse_session_stats_output(r#"{"messageCount":2}"#).expect("partial parses");
+    assert_eq!(partial.credits_used, None);
+    assert_eq!(partial.message_count, 2);
+    assert_eq!(partial.tool_count, 0);
+
+    // Non-object / unavailable-CLI plain text -> None (graceful degrade).
+    assert!(parse_session_stats_output("auggie: session stats unavailable").is_none());
+    assert!(parse_session_stats_output("").is_none());
+}
+
+/// `cache_and_emit_session_stats` pushes a self-sufficient
+/// `agent:session-stats-changed` event the first time it observes a snapshot and
+/// stays silent on an identical re-observation, then re-emits when the rollup
+/// moves (PROTOCOL §5.24 / §6.5 change-detection).
+#[tokio::test]
+async fn session_stats_emits_only_on_change() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Stats").await;
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_SESSION_STATS_CHANGED.to_string()],
+        ..Default::default()
+    });
+
+    let stats = SessionStats {
+        credits_used: Some(4.0),
+        message_count: 5,
+        tool_count: 2,
+    };
+    svc.cache_and_emit_session_stats(&session, &stats).await;
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].event_type, AGENT_SESSION_STATS_CHANGED);
+    assert_eq!(batch[0].workspace_id, ws);
+    assert_eq!(batch[0].data["sessionId"].as_str(), Some(id.0.as_str()));
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
+    assert_eq!(batch[0].data["stats"]["messageCount"], json!(5));
+    assert_eq!(batch[0].data["stats"]["toolCount"], json!(2));
+    assert_eq!(batch[0].data["stats"]["creditsUsed"], json!(4.0));
+
+    // Identical snapshot -> no second emit within the window.
+    svc.cache_and_emit_session_stats(&session, &stats).await;
+    let res = timeout(Duration::from_millis(300), sub.recv()).await;
+    assert!(res.is_err(), "identical stats must not re-emit");
+
+    // A moved rollup -> a fresh emit.
+    let moved = SessionStats {
+        credits_used: Some(9.0),
+        message_count: 6,
+        tool_count: 2,
+    };
+    svc.cache_and_emit_session_stats(&session, &moved).await;
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].data["stats"]["messageCount"], json!(6));
+}
+
+/// `agent.getSessionStats` for an unknown session surfaces `NotFound`, which the
+/// router maps to JSON-RPC `-32602` (PROTOCOL §5.24).
+#[tokio::test]
+async fn get_session_stats_unknown_session_is_not_found() {
+    let (_t, svc, _ws) = setup().await;
+    let err = svc
+        .agent_get_session_stats_op(AgentId::from("agent-00000000-0000-0000-0000-00000missing0"))
+        .await
+        .expect_err("unknown session");
+    assert!(matches!(err, Error::NotFound(_)));
 }

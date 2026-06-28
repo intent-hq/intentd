@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE};
 use intent_core::{
     now_iso, parse_iso, AgentId, AgentLite, AgentMessage, AgentSession, AgentStatus, Error, NoteId,
-    Result, WorkspaceApi, WorkspaceId,
+    Result, SessionStats, WorkspaceApi, WorkspaceId,
 };
 
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
@@ -282,6 +282,57 @@ pub(crate) async fn fetch_auggie_models() -> Result<Option<Vec<Value>>> {
         })
         .collect();
     Ok(Some(models))
+}
+
+/// Parse the JSON emitted by `auggie session stats <sessionId> --json` into a
+/// [`SessionStats`] (PROTOCOL §5.24). Tolerant of the CLI's richer shape:
+/// `creditsUsed` is nullable (absent/non-numeric → `None`, i.e. not yet
+/// computed), and the message/tool counts default to 0 when absent. Returns
+/// `None` when the payload is not a JSON object (e.g. the plain-text line the
+/// CLI prints when the command is unavailable), so the caller degrades
+/// gracefully rather than failing.
+pub(crate) fn parse_session_stats_output(stdout: &str) -> Option<SessionStats> {
+    let value: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let obj = value.as_object()?;
+    Some(SessionStats {
+        credits_used: obj.get("creditsUsed").and_then(Value::as_f64),
+        message_count: obj.get("messageCount").and_then(Value::as_u64).unwrap_or(0),
+        tool_count: obj.get("toolCount").and_then(Value::as_u64).unwrap_or(0),
+    })
+}
+
+/// Best-effort `agent.getSessionStats` CLI refresh: run
+/// `auggie session stats <sessionId> --json` and parse stdout (then stderr).
+/// Returns `None` when the CLI is unavailable or emits nothing parseable, so the
+/// caller can fall back to transcript-derived counts with `creditsUsed = null`.
+pub(crate) async fn fetch_session_stats(session_id: &AgentId) -> Option<SessionStats> {
+    let output = tokio::process::Command::new("auggie")
+        .args(["session", "stats", session_id.0.as_str(), "--json"])
+        .output()
+        .await
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_session_stats_output(&stdout).or_else(|| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        parse_session_stats_output(&stderr)
+    })
+}
+
+/// Transcript-derived `(messageCount, toolCount)` fallback used when the auggie
+/// CLI is unavailable: every logged message counts, and every `tool_use` content
+/// block counts as one tool call.
+fn transcript_counts(messages: &[AgentMessage]) -> (u64, u64) {
+    let mut tool_count = 0u64;
+    for msg in messages {
+        if let Some(blocks) = msg.content.as_array() {
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    tool_count += 1;
+                }
+            }
+        }
+    }
+    (messages.len() as u64, tool_count)
 }
 
 /// Mint a stable user-message id (`user-msg-{uuid}`), mirroring the TS
@@ -574,6 +625,71 @@ impl Services {
             out["lastResponse"] = Value::String(text);
         }
         Ok(out)
+    }
+
+    /// `agent.getSessionStats`: the per-session credit/message/tool rollup as
+    /// `{ stats: SessionStats }` (PROTOCOL §5.24). `NotFound` is surfaced to the
+    /// router which maps it to `-32602`. Stats are sourced from the auggie CLI
+    /// (`session stats <sessionId> --json`); when the CLI is unavailable the
+    /// counts fall back to the transcript and `creditsUsed` stays `null`
+    /// (graceful degrade — never panics). A refreshed rollup that differs from
+    /// the cached snapshot pushes `agent:session-stats-changed` (§6.5).
+    pub(crate) async fn agent_get_session_stats_op(&self, session_id: AgentId) -> Result<Value> {
+        let session = self.store.get_agent_session(&session_id).await?;
+        let stats = match fetch_session_stats(&session_id).await {
+            Some(cli) => cli,
+            None => {
+                let (message_count, tool_count) = transcript_counts(&session.messages);
+                SessionStats {
+                    credits_used: None,
+                    message_count,
+                    tool_count,
+                }
+            }
+        };
+        self.cache_and_emit_session_stats(&session, &stats).await;
+        Ok(json!({ "stats": stats }))
+    }
+
+    /// Cache the latest session-stats snapshot and, when it differs from the
+    /// previously observed one, push the self-sufficient
+    /// `agent:session-stats-changed` event (PROTOCOL §5.24 / §6.5). In this model
+    /// a session id is the agent id, so the payload carries both.
+    async fn cache_and_emit_session_stats(&self, session: &AgentSession, stats: &SessionStats) {
+        let changed = {
+            let mut cache = self
+                .session_stats_cache
+                .lock()
+                .expect("session stats cache poisoned");
+            if cache.get(&session.id) == Some(stats) {
+                false
+            } else {
+                cache.insert(session.id.clone(), stats.clone());
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+        crate::publish_event(
+            &self.event_bus,
+            intent_store::NewEvent {
+                workspace_id: session.workspace_id.clone(),
+                timestamp: now_iso(),
+                event_type: intent_core::events::AGENT_SESSION_STATS_CHANGED.to_string(),
+                actor: crate::system_actor(),
+                session_id: Some(session.id.0.clone()),
+                correlation_id: None,
+                parent_event_id: None,
+                metadata: None,
+                data: json!({
+                    "sessionId": session.id.0,
+                    "agentId": session.id.0,
+                    "stats": stats,
+                }),
+            },
+        )
+        .await;
     }
 
     /// `agent.reportToParent`: a delegated child reports back to its parent

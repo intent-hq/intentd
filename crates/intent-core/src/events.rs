@@ -74,6 +74,12 @@ pub const AGENT_USER_MESSAGE_SENT: &str = "agent:user-message:sent";
 pub const AGENT_PERMISSION_REQUEST: &str = "agent:permission:request";
 pub const AGENT_PERMISSION_RESOLVED: &str = "agent:permission:resolved";
 
+// Agent session-stats event (new in intentd; PROTOCOL §5.24 / §6.5). Pushed when
+// a session's per-session credit/message/tool rollup changes. Self-sufficient
+// payload `{ sessionId, agentId?, stats: SessionStats }` (§6.7) so an agent card
+// re-renders without a follow-up `agent.getSessionStats`.
+pub const AGENT_SESSION_STATS_CHANGED: &str = "agent:session-stats-changed";
+
 // Pull-request events (new in intentd; §7.6). The TS reference broadcasts PR
 // refresh deltas over Electron IPC (`workspace:background-enrichment-complete`,
 // renderer-only); a wire backend instead emits `pr:*` WorkspaceEvents so the

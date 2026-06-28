@@ -803,6 +803,21 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.getSessionStats`: the per-session credit/message/tool rollup as
+    /// `{ stats: SessionStats }` (PROTOCOL §5.24). `sessionId` is required; an
+    /// unknown session surfaces `NotFound` which the router maps to `-32602`.
+    fn agent_get_session_stats(
+        &self,
+        session_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = session_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_get_session_stats not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.diagnostics`: a sanitized snapshot of agent statuses,
     /// subscriptions, delegation groups, and stuck-risk signals as
     /// `{ ok, diagnostics, text }` (PROTOCOL §5.5). Optional `agent_id` /
