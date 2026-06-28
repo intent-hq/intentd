@@ -143,8 +143,11 @@ pub struct Workspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
     pub skip_worktree: bool,
+    /// Durable worktree setup script (§5.25): the persisted `SetupScript` record
+    /// read/written via `workspace.getSetupScript`/`saveSetupScript`. Omitted (not
+    /// `null`) until a script has been saved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub setup_script: Option<String>,
+    pub setup_script: Option<SetupScript>,
     pub is_remote: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
@@ -202,6 +205,44 @@ pub struct TokenUsage {
     pub totals: TokenUsageTotals,
     pub by_model: BTreeMap<String, TokenUsageTotals>,
     pub last_scan_at: Option<String>,
+}
+
+/// Coarse project classification for worktree setup (PROTOCOL §5.25), detected
+/// from a manifest file. The source detector additionally distinguishes package
+/// managers (npm/yarn/pnpm, pip/poetry); the BE collapses to this coarse enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectType {
+    Node,
+    Python,
+    Go,
+    Rust,
+    Ruby,
+}
+
+/// Who authored a [`SetupScript`] body (PROTOCOL §5.25): `user` for a hand-saved
+/// script (`saveSetupScript`) or `agent` for an AI-assisted draft
+/// (`generateSetupScript`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SetupScriptGeneratedBy {
+    User,
+    Agent,
+}
+
+/// Durable per-workspace worktree setup script (PROTOCOL §5.25). Persisted on the
+/// `setupScript` field of the `Workspace`; returned by `workspace.getSetupScript`,
+/// `saveSetupScript`, and `generateSetupScript`. `updatedAt` is the last-write
+/// epoch-ms; `generatedBy` records whether the body was hand-written or drafted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupScript {
+    pub script: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_type: Option<ProjectType>,
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_by: Option<SetupScriptGeneratedBy>,
 }
 
 /// `Workspace.taskStats` card aggregate (§9.1; TS `WorkspaceTaskStats`). Ports
@@ -2068,6 +2109,40 @@ mod tests {
         assert_eq!(v["lastScanAt"], serde_json::Value::Null);
         let back: TokenUsage = serde_json::from_value(v).unwrap();
         assert_eq!(back, usage);
+    }
+
+    /// `SetupScript` serializes with the camelCase `updatedAt`/`generatedBy` keys
+    /// and lowercase `projectType`/`generatedBy` enum values the protocol
+    /// specifies (§5.25); optional fields round-trip and are omitted when absent.
+    #[test]
+    fn setup_script_wire_shape() {
+        let s = SetupScript {
+            script: "#!/usr/bin/env bash\ncargo fetch\n".to_string(),
+            project_type: Some(ProjectType::Rust),
+            updated_at: 1_750_000_000_000,
+            generated_by: Some(SetupScriptGeneratedBy::Agent),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["script"], "#!/usr/bin/env bash\ncargo fetch\n");
+        assert_eq!(v["projectType"], "rust");
+        assert_eq!(v["updatedAt"], 1_750_000_000_000u64);
+        assert_eq!(v["generatedBy"], "agent");
+        let back: SetupScript = serde_json::from_value(v).unwrap();
+        assert_eq!(back, s);
+
+        // Optional fields omitted (not null) when absent.
+        let bare = SetupScript {
+            script: String::new(),
+            project_type: None,
+            updated_at: 0,
+            generated_by: None,
+        };
+        let v = serde_json::to_value(&bare).unwrap();
+        assert_eq!(v.get("projectType"), None);
+        assert_eq!(v.get("generatedBy"), None);
+        assert_eq!(v["updatedAt"], 0);
+        let back: SetupScript = serde_json::from_value(v).unwrap();
+        assert_eq!(back, bare);
     }
 
     /// `WorkspaceAgentInfo` omits the optional `specialist`/`lastActivity` keys

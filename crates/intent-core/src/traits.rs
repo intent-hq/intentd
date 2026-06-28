@@ -14,11 +14,11 @@ use crate::model::{
     EventSubscribeResult, EventUnsubscribeResult, FileActivity, GitAgentCommitResult, GitBranches,
     GitCommitResult, GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate,
     NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, ReadAssetResult,
-    ScriptCreateParams, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskMarkAsTaskResult,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
-    WorkspaceCreate, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, ProjectType,
+    ReadAssetResult, ScriptCreateParams, SetupScript, TaskAssignAgentResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult,
+    TaskMarkAsTaskResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, Workspace, WorkspaceCreate, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -145,6 +145,56 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::get_token_usage not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Read the durable worktree setup script for a workspace (§5.25). Returns a
+    /// default (empty `script`, `updatedAt: 0`) record before the first save.
+    /// `NotFound` if the workspace is absent (router maps it to `-32602`).
+    fn get_setup_script(&self, id: WorkspaceId) -> BoxFuture<'_, Result<SetupScript>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::get_setup_script not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Persist a hand-written setup-script body and return the stored record with
+    /// `generatedBy: "user"` and a fresh `updatedAt` (§5.25). `NotFound` if the
+    /// workspace is absent.
+    fn save_setup_script(
+        &self,
+        id: WorkspaceId,
+        script: String,
+    ) -> BoxFuture<'_, Result<SetupScript>> {
+        let _ = (id, script);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::save_setup_script not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Classify the workspace's project from manifest files (§5.25); `None` when
+    /// no known manifest is found. `NotFound` if the workspace is absent.
+    fn detect_project_type(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Option<ProjectType>>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::detect_project_type not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Produce an AI-assisted draft setup script (§5.25), returned (not persisted)
+    /// with `generatedBy: "agent"`. `NotFound` if the workspace is absent.
+    fn generate_setup_script(&self, id: WorkspaceId) -> BoxFuture<'_, Result<SetupScript>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::generate_setup_script not implemented".to_string(),
             ))
         })
     }
