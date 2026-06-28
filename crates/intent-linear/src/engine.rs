@@ -8,8 +8,11 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::client::LinearClient;
-use crate::error::Result;
-use crate::model::{AuthStatus, IssueFilter, LinearIssueResult};
+use crate::error::{Error, Result};
+use crate::model::{
+    AuthStatus, IssueFilter, LinearIssueResult, LinearLabel, LinearProject, LinearTeam, LinearUser,
+    LinearWorkflowState,
+};
 
 /// Default page size when the caller does not specify one.
 const DEFAULT_LIMIT: u32 = 50;
@@ -53,6 +56,24 @@ pub trait LinearEngine: Send + Sync {
         query: &str,
         limit: Option<u32>,
     ) -> Result<Vec<LinearIssueResult>>;
+
+    /// Fetch a single issue by UUID `id` or `ENG-123` `identifier`.
+    async fn get_issue(&self, id_or_identifier: &str) -> Result<LinearIssueResult>;
+
+    /// The authenticated user (`viewer`).
+    async fn viewer(&self) -> Result<LinearUser>;
+
+    /// List teams.
+    async fn list_teams(&self, limit: Option<u32>) -> Result<Vec<LinearTeam>>;
+
+    /// List workflow states.
+    async fn list_workflow_states(&self, limit: Option<u32>) -> Result<Vec<LinearWorkflowState>>;
+
+    /// List projects.
+    async fn list_projects(&self, limit: Option<u32>) -> Result<Vec<LinearProject>>;
+
+    /// List issue labels.
+    async fn list_labels(&self, limit: Option<u32>) -> Result<Vec<LinearLabel>>;
 }
 
 /// GraphQL-backed [`LinearEngine`] over [`LinearClient`].
@@ -114,6 +135,82 @@ impl LinearEngine for LinearEngineImpl {
         let variables = json!({ "term": query, "first": clamp_limit(limit) });
         let data = self.client.graphql(&gql, variables).await?;
         Ok(map_issue_nodes(data.pointer("/searchIssues/nodes")))
+    }
+
+    async fn get_issue(&self, id_or_identifier: &str) -> Result<LinearIssueResult> {
+        if let Some((key, number)) = parse_identifier(id_or_identifier) {
+            let query = format!(
+                "query IssueByKey($key: String!, $number: Float!) {{ \
+                    issues(first: 1, filter: {{ team: {{ key: {{ eq: $key }} }}, number: {{ eq: $number }} }}) \
+                    {{ nodes {{ {ISSUE_FIELDS} }} }} \
+                }}"
+            );
+            let variables = json!({ "key": key, "number": number });
+            let data = self.client.graphql(&query, variables).await?;
+            let node = data
+                .pointer("/issues/nodes/0")
+                .ok_or_else(|| Error::NotFound(format!("issue {id_or_identifier} not found")))?;
+            Ok(map_issue(node))
+        } else {
+            let query =
+                format!("query Issue($id: String!) {{ issue(id: $id) {{ {ISSUE_FIELDS} }} }}");
+            let variables = json!({ "id": id_or_identifier });
+            let data = self.client.graphql(&query, variables).await?;
+            let node = data
+                .get("issue")
+                .filter(|v| !v.is_null())
+                .ok_or_else(|| Error::NotFound(format!("issue {id_or_identifier} not found")))?;
+            Ok(map_issue(node))
+        }
+    }
+
+    async fn viewer(&self) -> Result<LinearUser> {
+        let query = "query { viewer { id name displayName email avatarUrl } }";
+        let data = self.client.graphql(query, json!({})).await?;
+        let node = data
+            .get("viewer")
+            .filter(|v| !v.is_null())
+            .ok_or_else(|| Error::NotFound("viewer not found".to_string()))?;
+        Ok(map_user(node))
+    }
+
+    async fn list_teams(&self, limit: Option<u32>) -> Result<Vec<LinearTeam>> {
+        let query = "query Teams($first: Int) { \
+            teams(first: $first) { nodes { id key name description } } \
+        }";
+        let variables = json!({ "first": clamp_limit(limit) });
+        let data = self.client.graphql(query, variables).await?;
+        Ok(map_nodes(data.pointer("/teams/nodes"), map_team))
+    }
+
+    async fn list_workflow_states(&self, limit: Option<u32>) -> Result<Vec<LinearWorkflowState>> {
+        let query = "query WorkflowStates($first: Int) { \
+            workflowStates(first: $first) { nodes { id name type description color } } \
+        }";
+        let variables = json!({ "first": clamp_limit(limit) });
+        let data = self.client.graphql(query, variables).await?;
+        Ok(map_nodes(
+            data.pointer("/workflowStates/nodes"),
+            map_workflow_state,
+        ))
+    }
+
+    async fn list_projects(&self, limit: Option<u32>) -> Result<Vec<LinearProject>> {
+        let query = "query Projects($first: Int) { \
+            projects(first: $first) { nodes { id name description state url } } \
+        }";
+        let variables = json!({ "first": clamp_limit(limit) });
+        let data = self.client.graphql(query, variables).await?;
+        Ok(map_nodes(data.pointer("/projects/nodes"), map_project))
+    }
+
+    async fn list_labels(&self, limit: Option<u32>) -> Result<Vec<LinearLabel>> {
+        let query = "query Labels($first: Int) { \
+            issueLabels(first: $first) { nodes { id name description color } } \
+        }";
+        let variables = json!({ "first": clamp_limit(limit) });
+        let data = self.client.graphql(query, variables).await?;
+        Ok(map_nodes(data.pointer("/issueLabels/nodes"), map_label))
     }
 }
 
@@ -182,6 +279,85 @@ pub(crate) fn map_issue(node: &Value) -> LinearIssueResult {
         created_at: str_field(node, "createdAt"),
         updated_at: str_field(node, "updatedAt"),
     }
+}
+
+/// Map a `nodes` array (if present) using `f`, defaulting to empty.
+fn map_nodes<T>(nodes: Option<&Value>, f: impl Fn(&Value) -> T) -> Vec<T> {
+    nodes
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().map(f).collect())
+        .unwrap_or_default()
+}
+
+/// Map a `viewer`/user node into a [`LinearUser`].
+pub(crate) fn map_user(node: &Value) -> LinearUser {
+    LinearUser {
+        id: str_field(node, "id").unwrap_or_default(),
+        name: str_field(node, "name").unwrap_or_default(),
+        display_name: str_field(node, "displayName"),
+        email: str_field(node, "email"),
+        avatar_url: str_field(node, "avatarUrl"),
+    }
+}
+
+/// Map a team node into a [`LinearTeam`].
+pub(crate) fn map_team(node: &Value) -> LinearTeam {
+    LinearTeam {
+        id: str_field(node, "id").unwrap_or_default(),
+        key: str_field(node, "key").unwrap_or_default(),
+        name: str_field(node, "name").unwrap_or_default(),
+        description: str_field(node, "description"),
+    }
+}
+
+/// Map a workflow-state node into a [`LinearWorkflowState`].
+pub(crate) fn map_workflow_state(node: &Value) -> LinearWorkflowState {
+    LinearWorkflowState {
+        id: str_field(node, "id").unwrap_or_default(),
+        name: str_field(node, "name").unwrap_or_default(),
+        r#type: str_field(node, "type").unwrap_or_default(),
+        description: str_field(node, "description"),
+        color: str_field(node, "color"),
+    }
+}
+
+/// Map a project node into a [`LinearProject`].
+pub(crate) fn map_project(node: &Value) -> LinearProject {
+    LinearProject {
+        id: str_field(node, "id").unwrap_or_default(),
+        name: str_field(node, "name").unwrap_or_default(),
+        description: str_field(node, "description"),
+        state: str_field(node, "state").unwrap_or_default(),
+        url: str_field(node, "url"),
+    }
+}
+
+/// Map a label node into a [`LinearLabel`].
+pub(crate) fn map_label(node: &Value) -> LinearLabel {
+    LinearLabel {
+        id: str_field(node, "id").unwrap_or_default(),
+        name: str_field(node, "name").unwrap_or_default(),
+        description: str_field(node, "description"),
+        color: str_field(node, "color"),
+    }
+}
+
+/// Detect an `ENG-123`-shaped identifier and split it into `(team_key, number)`.
+/// Matches `^[A-Z0-9]+-[0-9]+$`; anything else (e.g. a UUID) returns `None` and
+/// routes through the `issue(id:)` path instead.
+pub(crate) fn parse_identifier(s: &str) -> Option<(String, u64)> {
+    let (key, num) = s.rsplit_once('-')?;
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        return None;
+    }
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    num.parse().ok().map(|n| (key.to_string(), n))
 }
 
 /// Read a non-null string field as an owned `String`.
@@ -277,5 +453,102 @@ mod tests {
         ));
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].labels, None);
+    }
+
+    #[test]
+    fn maps_user_node() {
+        let u = map_user(&json!({
+            "id": "u1", "name": "Ada", "displayName": "ada",
+            "email": "a@x.io", "avatarUrl": "https://x/a.png"
+        }));
+        assert_eq!(u.id, "u1");
+        assert_eq!(u.name, "Ada");
+        assert_eq!(u.display_name.as_deref(), Some("ada"));
+        assert_eq!(u.email.as_deref(), Some("a@x.io"));
+        assert_eq!(u.avatar_url.as_deref(), Some("https://x/a.png"));
+
+        let bare = map_user(&json!({ "id": "u2", "name": "Bob" }));
+        assert!(bare.display_name.is_none());
+        assert!(bare.email.is_none());
+        assert!(bare.avatar_url.is_none());
+    }
+
+    #[test]
+    fn maps_team_node() {
+        let t = map_team(&json!({
+            "id": "t1", "key": "ENG", "name": "Engineering", "description": "core"
+        }));
+        assert_eq!(t.key, "ENG");
+        assert_eq!(t.name, "Engineering");
+        assert_eq!(t.description.as_deref(), Some("core"));
+        assert!(
+            map_team(&json!({ "id": "t2", "key": "OPS", "name": "Ops" }))
+                .description
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn maps_workflow_state_node() {
+        let s = map_workflow_state(&json!({
+            "id": "s1", "name": "In Progress", "type": "started",
+            "description": "d", "color": "#abc"
+        }));
+        assert_eq!(s.name, "In Progress");
+        assert_eq!(s.r#type, "started");
+        assert_eq!(s.color.as_deref(), Some("#abc"));
+        let bare = map_workflow_state(&json!({ "id": "s2", "name": "Todo", "type": "unstarted" }));
+        assert!(bare.description.is_none());
+        assert!(bare.color.is_none());
+    }
+
+    #[test]
+    fn maps_project_node() {
+        let p = map_project(&json!({
+            "id": "p1", "name": "Apollo", "state": "started",
+            "url": "https://linear.app/x/project/apollo"
+        }));
+        assert_eq!(p.name, "Apollo");
+        assert_eq!(p.state, "started");
+        assert_eq!(
+            p.url.as_deref(),
+            Some("https://linear.app/x/project/apollo")
+        );
+        assert!(p.description.is_none());
+    }
+
+    #[test]
+    fn maps_label_node() {
+        let l = map_label(&json!({ "id": "l1", "name": "bug", "color": "#f00" }));
+        assert_eq!(l.name, "bug");
+        assert_eq!(l.color.as_deref(), Some("#f00"));
+        assert!(l.description.is_none());
+    }
+
+    #[test]
+    fn maps_nodes_empty_and_missing() {
+        assert!(map_nodes(None, map_team).is_empty());
+        assert!(map_nodes(Some(&json!(null)), map_team).is_empty());
+        let teams = map_nodes(
+            Some(&json!([{ "id": "t", "key": "K", "name": "N" }])),
+            map_team,
+        );
+        assert_eq!(teams.len(), 1);
+    }
+
+    #[test]
+    fn parses_identifier_shape() {
+        assert_eq!(parse_identifier("ENG-123"), Some(("ENG".to_string(), 123)));
+        assert_eq!(parse_identifier("X1-7"), Some(("X1".to_string(), 7)));
+        // UUIDs and other shapes are not identifiers.
+        assert_eq!(
+            parse_identifier("3d1b0f7a-8f3a-4b2a-9c1a-2b6a0c4b9a11"),
+            None
+        );
+        assert_eq!(parse_identifier("eng-123"), None);
+        assert_eq!(parse_identifier("ENG-"), None);
+        assert_eq!(parse_identifier("-123"), None);
+        assert_eq!(parse_identifier("ENG123"), None);
+        assert_eq!(parse_identifier("ENG-12a"), None);
     }
 }

@@ -6695,6 +6695,87 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn linear_get_issue(
+        &self,
+        id_or_identifier: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.linear_engine.clone();
+        Box::pin(async move {
+            let engine = linear_ops::resolve_engine(injected)?;
+            let issue = engine
+                .get_issue(&id_or_identifier)
+                .await
+                .map_err(linear_ops::map_linear_err)?;
+            serde_json::to_value(issue)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    fn linear_viewer(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.linear_engine.clone();
+        Box::pin(async move {
+            let engine = linear_ops::resolve_engine(injected)?;
+            let user = engine.viewer().await.map_err(linear_ops::map_linear_err)?;
+            serde_json::to_value(user)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    fn linear_list_teams(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.linear_engine.clone();
+        Box::pin(async move {
+            let engine = linear_ops::resolve_engine(injected)?;
+            let teams = engine
+                .list_teams(linear_ops::wire_limit(limit))
+                .await
+                .map_err(linear_ops::map_linear_err)?;
+            serde_json::to_value(teams)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    fn linear_list_workflow_states(
+        &self,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.linear_engine.clone();
+        Box::pin(async move {
+            let engine = linear_ops::resolve_engine(injected)?;
+            let states = engine
+                .list_workflow_states(linear_ops::wire_limit(limit))
+                .await
+                .map_err(linear_ops::map_linear_err)?;
+            serde_json::to_value(states)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    fn linear_list_projects(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.linear_engine.clone();
+        Box::pin(async move {
+            let engine = linear_ops::resolve_engine(injected)?;
+            let projects = engine
+                .list_projects(linear_ops::wire_limit(limit))
+                .await
+                .map_err(linear_ops::map_linear_err)?;
+            serde_json::to_value(projects)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    fn linear_list_labels(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.linear_engine.clone();
+        Box::pin(async move {
+            let engine = linear_ops::resolve_engine(injected)?;
+            let labels = engine
+                .list_labels(linear_ops::wire_limit(limit))
+                .await
+                .map_err(linear_ops::map_linear_err)?;
+            serde_json::to_value(labels)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
     fn file_tracking_init(
         &self,
         workspace_id: WorkspaceId,

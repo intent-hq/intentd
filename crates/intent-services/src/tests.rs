@@ -5698,3 +5698,203 @@ mod primitive_ops_service {
         assert!(matches!(res, Err(Error::Internal(_))));
     }
 }
+
+/// `linear.*` P1 read handlers over an injected stub engine: not-configured
+/// failures map to `Internal` (→ `-32603`) and successes serialize as bare
+/// arrays / a bare object (no `{ items, nextToken }` envelope).
+mod linear {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use intent_core::WorkspaceApi;
+    use intent_linear::{
+        Error as LinearError, IssueFilter, LinearEngine, LinearIssueResult, LinearLabel,
+        LinearProject, LinearTeam, LinearUser, LinearWorkflowState, Result as LinearResult,
+    };
+
+    use super::*;
+
+    /// Injectable stub: when `fail` it reports `NotConfigured` for every call;
+    /// otherwise it returns canned values for shape assertions.
+    struct StubLinear {
+        fail: bool,
+    }
+
+    impl StubLinear {
+        fn not_configured<T>() -> LinearResult<T> {
+            Err(LinearError::NotConfigured("no key".into()))
+        }
+
+        fn issue() -> LinearIssueResult {
+            LinearIssueResult {
+                id: "uuid-1".into(),
+                identifier: "ENG-1".into(),
+                title: "t".into(),
+                description: None,
+                url: None,
+                team_name: None,
+                team_key: None,
+                state: None,
+                priority: None,
+                assignee: None,
+                labels: None,
+                project: None,
+                creator: None,
+                created_at: None,
+                updated_at: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LinearEngine for StubLinear {
+        async fn auth_status(&self) -> LinearResult<intent_linear::AuthStatus> {
+            Self::not_configured()
+        }
+
+        async fn list_issues(
+            &self,
+            _filter: IssueFilter,
+            _limit: Option<u32>,
+        ) -> LinearResult<Vec<LinearIssueResult>> {
+            Self::not_configured()
+        }
+
+        async fn search_issues(
+            &self,
+            _query: &str,
+            _limit: Option<u32>,
+        ) -> LinearResult<Vec<LinearIssueResult>> {
+            Self::not_configured()
+        }
+
+        async fn get_issue(&self, _id_or_identifier: &str) -> LinearResult<LinearIssueResult> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(Self::issue())
+        }
+
+        async fn viewer(&self) -> LinearResult<LinearUser> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(LinearUser {
+                id: "u1".into(),
+                name: "Ada".into(),
+                display_name: None,
+                email: None,
+                avatar_url: None,
+            })
+        }
+
+        async fn list_teams(&self, _limit: Option<u32>) -> LinearResult<Vec<LinearTeam>> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(vec![LinearTeam {
+                id: "t1".into(),
+                key: "ENG".into(),
+                name: "Engineering".into(),
+                description: None,
+            }])
+        }
+
+        async fn list_workflow_states(
+            &self,
+            _limit: Option<u32>,
+        ) -> LinearResult<Vec<LinearWorkflowState>> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(vec![LinearWorkflowState {
+                id: "s1".into(),
+                name: "Todo".into(),
+                r#type: "unstarted".into(),
+                description: None,
+                color: None,
+            }])
+        }
+
+        async fn list_projects(&self, _limit: Option<u32>) -> LinearResult<Vec<LinearProject>> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(vec![LinearProject {
+                id: "p1".into(),
+                name: "Apollo".into(),
+                description: None,
+                state: "started".into(),
+                url: None,
+            }])
+        }
+
+        async fn list_labels(&self, _limit: Option<u32>) -> LinearResult<Vec<LinearLabel>> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(vec![LinearLabel {
+                id: "l1".into(),
+                name: "bug".into(),
+                description: None,
+                color: None,
+            }])
+        }
+    }
+
+    async fn svc(fail: bool) -> (TempDb, Services) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let services = Services::new(store).with_linear_engine(Arc::new(StubLinear { fail }));
+        (tmp, services)
+    }
+
+    #[tokio::test]
+    async fn not_configured_maps_to_internal() {
+        let (_tmp, s) = svc(true).await;
+        assert!(matches!(
+            s.linear_get_issue("ENG-1".into()).await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(s.linear_viewer().await, Err(Error::Internal(_))));
+        assert!(matches!(
+            s.linear_list_teams(None).await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            s.linear_list_workflow_states(None).await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            s.linear_list_projects(None).await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            s.linear_list_labels(None).await,
+            Err(Error::Internal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn success_serializes_as_bare_object_and_arrays() {
+        let (_tmp, s) = svc(false).await;
+
+        let issue = s.linear_get_issue("ENG-1".into()).await.unwrap();
+        assert!(issue.is_object());
+        assert_eq!(issue["identifier"], "ENG-1");
+
+        let viewer = s.linear_viewer().await.unwrap();
+        assert!(viewer.is_object());
+        assert_eq!(viewer["name"], "Ada");
+
+        for arr in [
+            s.linear_list_teams(None).await.unwrap(),
+            s.linear_list_workflow_states(None).await.unwrap(),
+            s.linear_list_projects(None).await.unwrap(),
+            s.linear_list_labels(None).await.unwrap(),
+        ] {
+            assert!(arr.is_array(), "expected bare array, got {arr}");
+            assert!(arr.get("items").is_none(), "no envelope");
+        }
+    }
+}

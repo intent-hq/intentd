@@ -1323,6 +1323,47 @@ async fn call(msg: &str) -> Option<Value> {
         .map(|s| serde_json::from_str(&s).expect("valid json response"))
 }
 
+#[tokio::test]
+async fn linear_get_issue_missing_id_and_identifier_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"linear.getIssue","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: id")
+    );
+}
+
+#[tokio::test]
+async fn linear_get_issue_routes_with_id_or_identifier() {
+    // The `FakeApi` uses the trait default (`Internal` → `-32603`), so a present
+    // `id`/`identifier` means the arm routed past param validation.
+    for params in [r#"{"id":"uuid-1"}"#, r#"{"identifier":"ENG-1"}"#] {
+        let msg =
+            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"linear.getIssue","params":{params}}}"#);
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "params={params}");
+    }
+}
+
+#[tokio::test]
+async fn linear_p1_read_arms_route() {
+    // Each arm reaches the trait default (`-32603`), i.e. it is dispatched
+    // rather than reported as unknown method (`-32601`).
+    for method in [
+        "linear.viewer",
+        "linear.listTeams",
+        "linear.listWorkflowStates",
+        "linear.listProjects",
+        "linear.listLabels",
+    ] {
+        let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{}}}}"#);
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "{method}");
+    }
+}
+
 fn err_code(v: &Value) -> i64 {
     v["error"]["code"].as_i64().expect("error code")
 }
