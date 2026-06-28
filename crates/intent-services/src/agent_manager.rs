@@ -22,8 +22,8 @@ use intent_acp::{
     build_baseline_mcp_env_from_process, handshake, serve_workspace_mcp_tcp, spawn_provider,
     to_auggie_mcp_config, ClientRequestHandler, Connection, ConnectionHooks, EventSink,
     FileService, IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer,
-    NormalizedMcpServers, PermissionPolicy, PermissionRegistry, SinkEvent, SpawnOptions,
-    WorkspaceMcpServer,
+    NormalizedMcpServers, PermissionOutcome, PermissionPolicy, PermissionRegistry,
+    PermissionRequestData, SinkEvent, SpawnOptions, WorkspaceMcpServer,
 };
 use intent_core::{
     now_iso, ActorType, AgentId, AgentSession, BoxFuture, Error, Result, WorkspaceApi,
@@ -551,7 +551,11 @@ impl AgentManager {
             handles: Arc::new(Mutex::new(HashMap::new())),
             sink,
             permissions: Arc::new(PermissionRegistry::new()),
-            policy: PermissionPolicy::default(),
+            // Headless default (§6.7/M3.5): auto-allow low-risk reads, auto-deny
+            // medium/high-risk prompts. An FE-attached deployment selects
+            // `Interactive` via `with_policy()` (wired from `INTENTD_PERMISSION_POLICY`)
+            // to drive the `agent.respondPermission`/`agent.pendingPermissions` RPCs.
+            policy: PermissionPolicy::AutoByRisk,
             mcp_bridge_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("intentd")),
             busy: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
@@ -566,6 +570,11 @@ impl AgentManager {
         self
     }
 
+    /// The active permission policy (headless `AutoByRisk` unless overridden).
+    pub fn policy(&self) -> PermissionPolicy {
+        self.policy
+    }
+
     /// Override the executable used as the generated `--mcp-config` bridge
     /// command (defaults to the current `intentd` binary). Tests point this at
     /// `CARGO_BIN_EXE_intentd` so a spawned child reaches the in-process server.
@@ -577,6 +586,19 @@ impl AgentManager {
     /// Borrow the process registry (lifecycle / diagnostics).
     pub fn registry(&self) -> &ProcessRegistry {
         &self.registry
+    }
+
+    /// Resolve an outstanding interactive permission prompt (`agent.respondPermission`,
+    /// PROTOCOL §8): deliver `outcome` to the blocked client handler. Returns
+    /// `false` when no such prompt is outstanding (already answered or timed out).
+    pub fn respond_permission(&self, request_id: &str, outcome: PermissionOutcome) -> bool {
+        self.permissions.resolve(request_id, outcome)
+    }
+
+    /// Snapshot every outstanding permission prompt (`agent.pendingPermissions`,
+    /// PROTOCOL §8), for a (re)connecting client to recover what awaits an answer.
+    pub fn pending_permissions(&self) -> Vec<PermissionRequestData> {
+        self.permissions.pending()
     }
 
     /// Number of tracked agents.

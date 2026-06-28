@@ -74,7 +74,10 @@ pub use terminal_ops::PtyTerminalHost;
 pub use agent_manager::{
     compute_process_cap, default_process_cap, AgentManager, BusEventSink, ProcessRegistry,
 };
+// Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
+// and the transport router (`agent.respondPermission` outcome parsing) need.
 pub use events::{EventBus, FileWatcher, Subscription, SubscriptionFilter};
+pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
 
 /// Aggregate service handle wired by the binary composition root. It implements
@@ -5357,6 +5360,51 @@ impl WorkspaceApi for Services {
 
     fn agent_get_models(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.agent_get_models_op().await })
+    }
+
+    fn agent_respond_permission(
+        &self,
+        request_id: String,
+        outcome: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            // Parse the §8 wire `outcome` shape before touching the registry so a
+            // malformed body is rejected as invalid params, not silently dropped.
+            let parsed = PermissionOutcome::from_wire(&outcome).ok_or_else(|| {
+                Error::InvalidParams(
+                    "agent.respondPermission: malformed `outcome` (expected \
+                     { outcome: \"selected\", optionId } or { outcome: \"cancelled\" })"
+                        .to_string(),
+                )
+            })?;
+            // Without a runtime manager there is no registry to answer against, so
+            // every request id is unresolved.
+            let resolved = match self.agent_manager() {
+                Some(manager) => manager.respond_permission(&request_id, parsed),
+                None => false,
+            };
+            Ok(serde_json::json!({ "resolved": resolved }))
+        })
+    }
+
+    fn agent_pending_permissions(
+        &self,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            // No manager ⇒ no outstanding prompts. Otherwise snapshot the registry
+            // and, when an `agentId` filter is given, keep only that session's
+            // prompts (`session_id` == intentd `agentId`, PROTOCOL §8).
+            let mut requests = match self.agent_manager() {
+                Some(manager) => manager.pending_permissions(),
+                None => Vec::new(),
+            };
+            if let Some(agent_id) = agent_id {
+                let filter = agent_id.as_str();
+                requests.retain(|r| r.session_id == filter);
+            }
+            Ok(serde_json::json!({ "requests": requests }))
+        })
     }
 
     fn agent_rename(

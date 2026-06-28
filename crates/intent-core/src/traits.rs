@@ -807,6 +807,38 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.respondPermission`: resolve an outstanding interactive permission
+    /// prompt by `requestId`, unblocking the agent with the §8 `outcome`
+    /// (`{ outcome: "selected", optionId }` / `{ outcome: "cancelled" }`).
+    /// `{ resolved: bool }` (`false` when no such pending prompt) (PROTOCOL §8).
+    fn agent_respond_permission(
+        &self,
+        request_id: String,
+        outcome: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (request_id, outcome);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_respond_permission not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.pendingPermissions`: the outstanding interactive permission prompts
+    /// as `{ requests: [PermissionRequestData…] }`, optionally filtered to one
+    /// agent by `agentId` (= `sessionId`) (PROTOCOL §8).
+    fn agent_pending_permissions(
+        &self,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = agent_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_pending_permissions not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.rename`: rename an agent; `{ success: true, name }` (PROTOCOL §5.5).
     fn agent_rename(
         &self,

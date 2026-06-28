@@ -11,7 +11,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use intent_core::{Config, WorkspaceApi};
 use intent_services::{
-    default_process_cap, AgentManager, BusEventSink, EventBus, FileWatcher, Services,
+    default_process_cap, AgentManager, BusEventSink, EventBus, FileWatcher, PermissionPolicy,
+    Services,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -241,11 +242,21 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming
     // router (M3.4); a global process cap + LRU registry bound concurrency.
-    let manager = Arc::new(AgentManager::new(
-        services.clone(),
-        Arc::new(BusEventSink::new(bus.clone())),
-        default_process_cap(),
-    ));
+    // Headless deployments default to `AutoByRisk` (auto-allow reads, auto-deny
+    // destructive prompts). An FE-attached deployment sets
+    // `INTENTD_PERMISSION_POLICY=interactive` to surface every prompt over
+    // `agent.pendingPermissions` and resolve it via `agent.respondPermission`;
+    // `allow`/`deny` force a uniform headless decision (§6.7/M3.5).
+    let permission_policy = resolve_permission_policy();
+    tracing::info!(?permission_policy, "agent permission policy");
+    let manager = Arc::new(
+        AgentManager::new(
+            services.clone(),
+            Arc::new(BusEventSink::new(bus.clone())),
+            default_process_cap(),
+        )
+        .with_policy(permission_policy),
+    );
     // Attach the manager to the services surface so the `agent.*` RPC handlers
     // drive the live spawn/turn/MCP loop at runtime (the shared `OnceLock` is
     // visible to every clone, including the api handed to the transport below).
@@ -481,6 +492,25 @@ fn env_flag(name: &str) -> bool {
             .as_deref(),
         Some("1") | Some("true") | Some("yes")
     )
+}
+
+/// Map the `INTENTD_PERMISSION_POLICY` value to a [`PermissionPolicy`]
+/// (`interactive`|`auto`|`allow`|`deny`, case-insensitive). Absent/blank or an
+/// unrecognized value falls back to the headless `AutoByRisk` default.
+fn parse_permission_policy(raw: Option<&str>) -> PermissionPolicy {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("interactive") => PermissionPolicy::Interactive,
+        Some("auto") => PermissionPolicy::AutoByRisk,
+        Some("allow") => PermissionPolicy::AllowAll,
+        Some("deny") => PermissionPolicy::DenyAll,
+        _ => PermissionPolicy::AutoByRisk,
+    }
+}
+
+/// Resolve the permission policy from `INTENTD_PERMISSION_POLICY`, defaulting to
+/// the headless `AutoByRisk` when unset or unrecognized.
+fn resolve_permission_policy() -> PermissionPolicy {
+    parse_permission_policy(std::env::var("INTENTD_PERMISSION_POLICY").ok().as_deref())
 }
 
 /// RAII single-instance pidfile: removes the file on drop, but only if it still
@@ -1497,5 +1527,40 @@ mod tests {
         assert_eq!(outcome, StopOutcome::Failed);
         assert!(sig.inner.lock().unwrap().term_called);
         assert!(sig.inner.lock().unwrap().kill_called);
+    }
+
+    #[test]
+    fn permission_policy_parses_each_keyword_case_insensitively() {
+        assert_eq!(
+            parse_permission_policy(Some("interactive")),
+            PermissionPolicy::Interactive
+        );
+        assert_eq!(
+            parse_permission_policy(Some("  AUTO ")),
+            PermissionPolicy::AutoByRisk
+        );
+        assert_eq!(
+            parse_permission_policy(Some("Allow")),
+            PermissionPolicy::AllowAll
+        );
+        assert_eq!(
+            parse_permission_policy(Some("deny")),
+            PermissionPolicy::DenyAll
+        );
+    }
+
+    #[test]
+    fn permission_policy_defaults_to_auto_by_risk() {
+        // Absent, blank, and unrecognized values all fall back to the headless
+        // default rather than failing startup.
+        assert_eq!(parse_permission_policy(None), PermissionPolicy::AutoByRisk);
+        assert_eq!(
+            parse_permission_policy(Some("   ")),
+            PermissionPolicy::AutoByRisk
+        );
+        assert_eq!(
+            parse_permission_policy(Some("bogus")),
+            PermissionPolicy::AutoByRisk
+        );
     }
 }

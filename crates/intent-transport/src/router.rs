@@ -813,6 +813,29 @@ async fn dispatch(
             let result = api.agent_get_models().await.map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.respondPermission" => {
+            // Resolve an outstanding interactive prompt (PROTOCOL §8). `requestId`
+            // is required; the §8 `outcome` object is validated in the handler so
+            // a malformed shape surfaces as -32602.
+            let request_id = require_str_param(params, "requestId")?;
+            require_present(params, "outcome")?;
+            let outcome = params.get("outcome").cloned().unwrap_or(Value::Null);
+            let result = api
+                .agent_respond_permission(request_id, outcome)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.pendingPermissions" => {
+            // Snapshot outstanding prompts (PROTOCOL §8), optionally filtered to a
+            // single agent by `agentId` (= `sessionId`).
+            let agent_id = opt_str(params, "agentId").map(|s| AgentId::from(s.as_str()));
+            let result = api
+                .agent_pending_permissions(agent_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.rename" => {
             let agent_id = require_agent_id(params)?;
             let name = require_str_param(params, "name")?;
