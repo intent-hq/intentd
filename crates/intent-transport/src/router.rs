@@ -1157,9 +1157,10 @@ async fn dispatch(
         // github.* browse / auth / identity (PROTOCOL §5.27). Repo-addressed
         // GitHub ops backed by the SourceControl engine; the PAT comes from the
         // environment and is never logged or returned. Pagination follows §5.5
-        // (`limit` / `nextToken`); `nextToken` is currently always `null`.
+        // (`limit` / `nextToken`): reads return a real opaque base64 `nextToken`
+        // cursor, which is `null` only on the last page.
         "github.repos.list" => {
-            let limit = opt_int(params, "limit");
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
             let r = api
                 .github_repos_list(limit, next_token)
@@ -1199,7 +1200,7 @@ async fn dispatch(
         "github.branches.list" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;
-            let limit = opt_int(params, "limit");
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
             let r = api
                 .github_branches_list(owner, repo, limit, next_token)

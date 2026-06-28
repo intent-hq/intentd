@@ -1196,7 +1196,7 @@ pub enum AgentStatus {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStats {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub credits_used: Option<f64>,
     pub message_count: u64,
     pub tool_count: u64,

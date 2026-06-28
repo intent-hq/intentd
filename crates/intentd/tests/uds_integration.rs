@@ -619,7 +619,8 @@ async fn uds_slice_end_to_end() {
 
     // (s2) agent.getSessionStats → `{ stats: SessionStats }`. With auggie
     // unavailable in CI the counts derive from the transcript (one persisted
-    // user message), and `creditsUsed` is omitted (null) rather than fabricated.
+    // user message), and `creditsUsed` serializes as explicit `null` (§5.24
+    // `number|null`) rather than being fabricated or omitted.
     let resp = send(
         &config.socket_path,
         &format!(
@@ -630,6 +631,7 @@ async fn uds_slice_end_to_end() {
     let stats = &resp["result"]["stats"];
     assert!(stats["messageCount"].is_number());
     assert!(stats["toolCount"].is_number());
+    assert!(stats["creditsUsed"].is_null());
 
     // (s3) agent.getSessionStats unknown → -32602 "Session not found".
     let resp = send(
