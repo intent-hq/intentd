@@ -36,6 +36,9 @@ intent-store = { path = "../intent-store" }
 # `uds_linear.rs` injects a stub `LinearEngine` so the `linear.*` e2e slice
 # never touches the network (no `LINEAR_API_KEY`, no GraphQL call).
 intent-linear = { path = "../intent-linear" }
+# `uds_sentry.rs` injects a stub `SentryEngine` so the `sentry.*` e2e slice
+# never touches the network (no token, no REST call).
+intent-sentry = { path = "../intent-sentry" }
 async-trait = "0.1"
 tokio = { workspace = true }
 serde_json = { workspace = true }

@@ -61,6 +61,7 @@ mod pr_ops;
 mod primitive_ops;
 mod script_ops;
 mod search_ops;
+mod sentry_ops;
 mod settings;
 mod terminal_ops;
 
@@ -130,6 +131,12 @@ pub struct Services {
     /// `LINEAR_API_KEY` / keychain), surfacing a graceful "not configured"
     /// `Internal` error when no key is available.
     linear_engine: Option<Arc<dyn intent_linear::LinearEngine>>,
+    /// Active Sentry engine for the `sentry.*` methods (§5.29). `None` until
+    /// wired by the composition root or a test; when unset, the `sentry.*`
+    /// handlers build the engine from default settings (org/token from
+    /// `SENTRY_ORG` / `SENTRY_API_TOKEN` / keychain), surfacing a graceful
+    /// "not configured" `Internal` error when no pair is available.
+    sentry_engine: Option<Arc<dyn intent_sentry::SentryEngine>>,
     /// Per-worktree async locks (`withGitWorktreeLock` parity, §9.5) so the
     /// `accept-changes.execute` commit/push path never races concurrent agents
     /// or operations on the same worktree.
@@ -198,6 +205,7 @@ impl Services {
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
             linear_engine: None,
+            sentry_engine: None,
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
             search_cancels: intent_search::CancelRegistry::new(),
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
@@ -424,6 +432,17 @@ impl Services {
         linear_engine: Arc<dyn intent_linear::LinearEngine>,
     ) -> Self {
         self.linear_engine = Some(linear_engine);
+        self
+    }
+
+    /// Wire the active Sentry engine used by the `sentry.*` methods (§5.29).
+    /// The composition root builds it from settings; tests inject a stub so the
+    /// `sentry.*` handlers never touch the network.
+    pub fn with_sentry_engine(
+        mut self,
+        sentry_engine: Arc<dyn intent_sentry::SentryEngine>,
+    ) -> Self {
+        self.sentry_engine = Some(sentry_engine);
         self
     }
 
@@ -6772,6 +6791,72 @@ impl WorkspaceApi for Services {
                 .await
                 .map_err(linear_ops::map_linear_err)?;
             serde_json::to_value(labels)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    // ========================================================================
+    // sentry.* read surface (PROTOCOL §5.29). Maps onto the `SentryEngine`
+    // trait; the engine resolves the credential pair (org + token from
+    // `SENTRY_ORG` / `SENTRY_API_TOKEN` / keychain) and talks to Sentry's REST
+    // API. A missing/invalid pair → `Internal` ("not configured", graceful).
+    // Validation/resolution glue lives in `sentry_ops`. The token is never
+    // logged or returned over the wire.
+    // ========================================================================
+
+    fn sentry_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.sentry_engine.clone();
+        Box::pin(async move {
+            let engine = sentry_ops::resolve_engine(injected)?;
+            let status = engine
+                .auth_status()
+                .await
+                .map_err(sentry_ops::map_sentry_err)?;
+            serde_json::to_value(status)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    fn sentry_list_issues(
+        &self,
+        project: Option<String>,
+        status: Option<String>,
+        query: Option<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.sentry_engine.clone();
+        Box::pin(async move {
+            let status = sentry_ops::parse_status(status)?;
+            let engine = sentry_ops::resolve_engine(injected)?;
+            let request = intent_sentry::FetchIssuesRequest {
+                project,
+                status,
+                query,
+                limit: sentry_ops::wire_limit(limit),
+            };
+            let issues = engine
+                .list_issues(request)
+                .await
+                .map_err(sentry_ops::map_sentry_err)?;
+            serde_json::to_value(issues)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    fn sentry_search_issues(
+        &self,
+        query: String,
+        project: Option<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.sentry_engine.clone();
+        Box::pin(async move {
+            let engine = sentry_ops::resolve_engine(injected)?;
+            let issues = engine
+                .search_issues(&query, project.as_deref(), sentry_ops::wire_limit(limit))
+                .await
+                .map_err(sentry_ops::map_sentry_err)?;
+            serde_json::to_value(issues)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
     }

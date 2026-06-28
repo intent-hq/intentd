@@ -1446,6 +1446,35 @@ async fn dispatch(
             let r = api.linear_list_labels(limit).await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        // `sentry.*` (§5.29) is daemon-owned and global: no `workspaceId`. A
+        // credential pair that is absent or fails the org probe ("not
+        // configured") and any other Sentry failure surface as `-32603`; an
+        // invalid `status` is `-32602` with the descriptive message verbatim.
+        "sentry.authStatus" => {
+            let r = api.sentry_auth_status().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sentry.listIssues" => {
+            let project = opt_str(params, "project");
+            let status = opt_str(params, "status");
+            let query = opt_str(params, "query");
+            let limit = opt_int(params, "limit");
+            match api.sentry_list_issues(project, status, query, limit).await {
+                Ok(issues) => Ok(issues),
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "sentry.searchIssues" => {
+            let query = require_str_param(params, "query")?;
+            let project = opt_str(params, "project");
+            let limit = opt_int(params, "limit");
+            let r = api
+                .sentry_search_issues(query, project, limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "file-tracking.init" => {
             let ws = require_ws_note(params)?;
             let r = api.file_tracking_init(ws).await.map_err(domain_to_rpc)?;
