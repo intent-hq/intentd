@@ -124,6 +124,25 @@ impl PermissionOutcome {
             PermissionOutcome::Cancelled => json!({ "outcome": "cancelled" }),
         }
     }
+
+    /// Parse the §8 wire `outcome` object (`{ outcome: "selected", optionId }`
+    /// or `{ outcome: "cancelled" }`) into a [`PermissionOutcome`]; the inverse
+    /// of [`to_event_value`](Self::to_event_value). Returns `None` for a
+    /// malformed shape (missing/non-string `outcome`, an unknown discriminant,
+    /// or `selected` without a string `optionId`) so the resolving RPC can
+    /// reject it as invalid params.
+    pub fn from_wire(value: &Value) -> Option<PermissionOutcome> {
+        match value.get("outcome").and_then(Value::as_str)? {
+            "selected" => {
+                let option_id = value.get("optionId").and_then(Value::as_str)?;
+                Some(PermissionOutcome::Selected {
+                    option_id: option_id.to_string(),
+                })
+            }
+            "cancelled" => Some(PermissionOutcome::Cancelled),
+            _ => None,
+        }
+    }
 }
 
 /// How the backend resolves prompts when no interactive client mediates them.
@@ -328,4 +347,56 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_wire_parses_selected_and_cancelled() {
+        assert_eq!(
+            PermissionOutcome::from_wire(
+                &json!({ "outcome": "selected", "optionId": "allow_once" })
+            ),
+            Some(PermissionOutcome::Selected {
+                option_id: "allow_once".to_string()
+            })
+        );
+        assert_eq!(
+            PermissionOutcome::from_wire(&json!({ "outcome": "cancelled" })),
+            Some(PermissionOutcome::Cancelled)
+        );
+    }
+
+    #[test]
+    fn from_wire_rejects_malformed_shapes() {
+        // `selected` without an `optionId`, an unknown discriminant, a missing
+        // `outcome`, and a non-object value all parse to `None`.
+        assert_eq!(
+            PermissionOutcome::from_wire(&json!({ "outcome": "selected" })),
+            None
+        );
+        assert_eq!(
+            PermissionOutcome::from_wire(&json!({ "outcome": "approved" })),
+            None
+        );
+        assert_eq!(PermissionOutcome::from_wire(&json!({})), None);
+        assert_eq!(PermissionOutcome::from_wire(&json!("cancelled")), None);
+    }
+
+    #[test]
+    fn from_wire_round_trips_to_event_value() {
+        for outcome in [
+            PermissionOutcome::Selected {
+                option_id: "reject_once".to_string(),
+            },
+            PermissionOutcome::Cancelled,
+        ] {
+            assert_eq!(
+                PermissionOutcome::from_wire(&outcome.to_event_value()),
+                Some(outcome)
+            );
+        }
+    }
 }

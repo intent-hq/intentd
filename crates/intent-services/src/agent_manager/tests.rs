@@ -6,10 +6,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use intent_acp::{Connection, ConnectionHooks, EventSink, IncomingNotification};
+use intent_acp::permission::{PermissionOptionView, RiskLevel};
+use intent_acp::{
+    Connection, ConnectionHooks, EventSink, IncomingNotification, PermissionOutcome,
+    PermissionPolicy, PermissionRequestData,
+};
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-    WorkspaceId, WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, Error, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
 use serde_json::{json, Value};
@@ -885,4 +889,148 @@ async fn derive_agent_type_falls_back_to_default_without_agent_type() {
 
     // The default (interactive) type is unrestricted — no regression.
     assert!(get_tool_denylist_for_agent_type(DEFAULT_AGENT_TYPE).is_empty());
+}
+
+/// Build a normalized prompt for `session_id` keyed by `request_id`.
+fn prompt(request_id: &str, session_id: &str) -> PermissionRequestData {
+    PermissionRequestData {
+        request_id: request_id.to_string(),
+        session_id: session_id.to_string(),
+        title: "Write file".to_string(),
+        description: None,
+        options: vec![PermissionOptionView {
+            id: "allow_once".to_string(),
+            label: "Allow".to_string(),
+            description: None,
+            destructive: false,
+        }],
+        agent_name: "auggie".to_string(),
+        risk_level: RiskLevel::High,
+        timestamp: 0,
+    }
+}
+
+#[tokio::test]
+async fn default_policy_is_auto_by_risk_and_overridable() {
+    let (_tmp, mgr) = manager().await;
+    // Headless default per §6.7/M3.5.
+    assert_eq!(mgr.policy(), PermissionPolicy::AutoByRisk);
+    // `with_policy` selects an FE-driven interactive deployment.
+    let (_tmp2, mgr2, _bus) = manager_with_bus().await;
+    let mgr2 = mgr2.with_policy(PermissionPolicy::Interactive);
+    assert_eq!(mgr2.policy(), PermissionPolicy::Interactive);
+}
+
+#[tokio::test]
+async fn pending_permissions_snapshots_and_respond_unblocks() {
+    let (_tmp, mgr) = manager().await;
+    // Register two outstanding prompts directly in the registry the way a
+    // surfaced (interactive) prompt would.
+    let mut rx = mgr.permissions.register(prompt("perm_1", "agent-a"));
+    let _rx2 = mgr.permissions.register(prompt("perm_2", "agent-b"));
+
+    let pending = mgr.pending_permissions();
+    assert_eq!(pending.len(), 2);
+    assert!(pending.iter().any(|p| p.request_id == "perm_1"));
+    assert!(pending.iter().any(|p| p.request_id == "perm_2"));
+
+    // Resolving delivers the outcome to the blocked waiter and drops the prompt.
+    assert!(mgr.respond_permission(
+        "perm_1",
+        PermissionOutcome::Selected {
+            option_id: "allow_once".to_string()
+        }
+    ));
+    assert_eq!(
+        rx.try_recv().expect("waiter receives the resolved outcome"),
+        PermissionOutcome::Selected {
+            option_id: "allow_once".to_string()
+        }
+    );
+    assert_eq!(mgr.pending_permissions().len(), 1);
+
+    // A second resolve (or an unknown id) finds nothing outstanding.
+    assert!(!mgr.respond_permission("perm_1", PermissionOutcome::Cancelled));
+    assert!(!mgr.respond_permission("nope", PermissionOutcome::Cancelled));
+}
+
+#[tokio::test]
+async fn services_pending_and_respond_rpcs_drive_the_registry() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let manager = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&manager);
+
+    let mut rx = manager.permissions.register(prompt("perm_1", "agent-a"));
+    let _rx2 = manager.permissions.register(prompt("perm_2", "agent-b"));
+
+    // Unfiltered snapshot returns both prompts as `{ requests: [...] }`.
+    let all = services
+        .agent_pending_permissions(None)
+        .await
+        .expect("pending");
+    assert_eq!(all["requests"].as_array().unwrap().len(), 2);
+
+    // Filtering by agentId (= sessionId) keeps only that session's prompt.
+    let filtered = services
+        .agent_pending_permissions(Some(AgentId::from("agent-a")))
+        .await
+        .expect("pending filtered");
+    let reqs = filtered["requests"].as_array().unwrap();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0]["requestId"], json!("perm_1"));
+    assert_eq!(reqs[0]["sessionId"], json!("agent-a"));
+
+    // Resolving over the RPC unblocks the waiter and reports `{ resolved: true }`.
+    let resolved = services
+        .agent_respond_permission(
+            "perm_1".to_string(),
+            json!({ "outcome": "selected", "optionId": "allow_once" }),
+        )
+        .await
+        .expect("respond");
+    assert_eq!(resolved, json!({ "resolved": true }));
+    assert_eq!(
+        rx.try_recv().expect("waiter unblocked"),
+        PermissionOutcome::Selected {
+            option_id: "allow_once".to_string()
+        }
+    );
+
+    // An unknown request id is `{ resolved: false }`, not an error.
+    let missing = services
+        .agent_respond_permission("perm_1".to_string(), json!({ "outcome": "cancelled" }))
+        .await
+        .expect("respond missing");
+    assert_eq!(missing, json!({ "resolved": false }));
+
+    // A malformed `outcome` shape is rejected as invalid params.
+    let err = services
+        .agent_respond_permission("perm_2".to_string(), json!({ "outcome": "approved" }))
+        .await
+        .expect_err("malformed outcome rejected");
+    assert!(matches!(err, Error::InvalidParams(_)));
+}
+
+#[tokio::test]
+async fn services_permission_rpcs_are_inert_without_a_manager() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    // No AgentManager attached → no registry to consult.
+    let services = Services::new(store);
+
+    let pending = services
+        .agent_pending_permissions(None)
+        .await
+        .expect("pending");
+    assert_eq!(pending["requests"].as_array().unwrap().len(), 0);
+
+    let resolved = services
+        .agent_respond_permission("perm_1".to_string(), json!({ "outcome": "cancelled" }))
+        .await
+        .expect("respond");
+    assert_eq!(resolved, json!({ "resolved": false }));
 }

@@ -2016,6 +2016,30 @@ async fn agent_methods_validate_required_params() {
         v["error"]["message"],
         serde_json::json!("eventTypes must be an array")
     );
+
+    // agent.respondPermission without requestId.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":6,"method":"agent.respondPermission","params":{"outcome":{"outcome":"cancelled"}}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: requestId")
+    );
+
+    // agent.respondPermission without outcome.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":7,"method":"agent.respondPermission","params":{"requestId":"perm_1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: outcome")
+    );
 }
 
 #[tokio::test]
@@ -2032,6 +2056,21 @@ async fn agent_methods_are_routed_not_method_not_found() {
     let v = call(r#"{"jsonrpc":"2.0","id":2,"method":"agent.getModels"}"#)
         .await
         .unwrap();
+    assert_eq!(err_code(&v), -32603);
+
+    // agent.pendingPermissions takes an optional agentId and must route.
+    let v = call(r#"{"jsonrpc":"2.0","id":3,"method":"agent.pendingPermissions","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32603);
+
+    // agent.respondPermission with valid params routes past dispatch (the
+    // default impl yields -32603, never -32601).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":4,"method":"agent.respondPermission","params":{"requestId":"perm_1","outcome":{"outcome":"cancelled"}}}"#,
+    )
+    .await
+    .unwrap();
     assert_eq!(err_code(&v), -32603);
 }
 
