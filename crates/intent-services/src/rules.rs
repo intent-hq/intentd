@@ -175,10 +175,55 @@ fn enabled_override(overrides: &Map<String, Value>, rule_type: &str) -> Option<S
     }
 }
 
+/// Resolve the specialization rules for `agent_type` with the reference's 3-tier
+/// fallback (port of `InstructionService.getSpecializationRules`,
+/// `instruction-service.ts` ~186–255):
+/// 1. the enabled `endUserRules` override for `agent_type` (settings **wins**),
+/// 2. else a non-empty `<ws>/.augment/agent-rules/{agent_type}.md` workspace file,
+/// 3. else the bundled built-in via
+///    [`crate::instructions::get_instruction_with_common`].
+///
+/// Tier 3 always yields content (unknown types fall back to the `workspace`
+/// body), so this returns a non-optional `String`.
+///
+/// PARITY NOTE: [`crate::agent_manager`]'s `DEFAULT_AGENT_TYPE = "interactive"`
+/// is an unknown instruction id, so tier 3 composes `common + workspace +
+/// workspace` via the reference's `fallbackToWorkspace` path. The FE file-watch
+/// cache-invalidation around the workspace file is intentionally not ported — the
+/// daemon re-resolves per spawn, so the file is always read fresh.
+pub(crate) async fn get_specialization_rules(
+    store: &Store,
+    workspace_path: Option<&Path>,
+    agent_type: &str,
+) -> String {
+    // 1. User-settings override (highest precedence — settings win over file/bundled).
+    let overrides = read_overrides(store).await;
+    if let Some(c) = enabled_override(&overrides, agent_type) {
+        return c;
+    }
+    // 2. Workspace file `<ws>/.augment/agent-rules/{agent_type}.md` (non-empty wins).
+    if let Some(path) = workspace_path {
+        let file = path
+            .join(".augment")
+            .join("agent-rules")
+            .join(format!("{agent_type}.md"));
+        if let Ok(content) = std::fs::read_to_string(&file) {
+            if !content.trim().is_empty() {
+                return content;
+            }
+        }
+    }
+    // 3. Bundled built-in (composed with common/workspace per the reference).
+    crate::instructions::get_instruction_with_common(agent_type)
+}
+
 /// Assemble the effective system prompt (the **internal** injection pipeline,
 /// §18.1) in documented precedence: base-system-prompt override →
-/// specialization override (the agent-type key) → workspace override → live
-/// workspace rule files. Returns `None` when nothing applies.
+/// specialization rules (the 3-tier resolver: agent-type override → workspace
+/// `.augment/agent-rules/{type}.md` → bundled built-in) → workspace override →
+/// live workspace rule files. The specialization slot is always populated (tier
+/// 3 always resolves), so this returns `None` only in the unreachable case where
+/// even the bundled specialization is empty.
 pub(crate) async fn assemble_system_prompt(
     store: &Store,
     workspace_path: Option<&Path>,
@@ -189,8 +234,9 @@ pub(crate) async fn assemble_system_prompt(
     if let Some(c) = enabled_override(&overrides, "base-system-prompt") {
         parts.push(c);
     }
-    if let Some(c) = enabled_override(&overrides, agent_type) {
-        parts.push(c);
+    let specialization = get_specialization_rules(store, workspace_path, agent_type).await;
+    if !specialization.trim().is_empty() {
+        parts.push(specialization);
     }
     if let Some(c) = enabled_override(&overrides, "workspace") {
         parts.push(c);
