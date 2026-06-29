@@ -43,6 +43,7 @@ mod agent_manager;
 mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
+mod auto_commit;
 mod drafts;
 mod event_ops;
 pub mod events;
