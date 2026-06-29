@@ -13,8 +13,9 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 use async_trait::async_trait;
 use intent_core::{Config, WorkspaceApi};
 use intent_linear::{
-    AuthStatus, Error as LinearError, IssueFilter, LinearEngine, LinearIssueResult, LinearLabel,
-    LinearProject, LinearTeam, LinearUser, LinearWorkflowState,
+    AuthStatus, CreateIssueRequest, Error as LinearError, IssueFilter, LinearEngine,
+    LinearIssueResult, LinearLabel, LinearProject, LinearTeam, LinearUser, LinearWorkflowState,
+    UpdateIssueRequest,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -52,6 +53,8 @@ struct StubEngine {
     seen_filter: Arc<Mutex<Option<IssueFilter>>>,
     seen_query: Arc<Mutex<Option<String>>>,
     seen_id: Arc<Mutex<Option<String>>>,
+    seen_create: Arc<Mutex<Option<CreateIssueRequest>>>,
+    seen_update: Arc<Mutex<Option<UpdateIssueRequest>>>,
 }
 
 #[async_trait]
@@ -167,6 +170,28 @@ impl LinearEngine for StubEngine {
             color: None,
         }])
     }
+
+    async fn create_issue(
+        &self,
+        req: CreateIssueRequest,
+    ) -> intent_linear::Result<LinearIssueResult> {
+        if self.fail {
+            return Err(LinearError::NotConfigured("no key".into()));
+        }
+        *self.seen_create.lock().unwrap() = Some(req.clone());
+        Ok(issue("ENG-100"))
+    }
+
+    async fn update_issue(
+        &self,
+        req: UpdateIssueRequest,
+    ) -> intent_linear::Result<LinearIssueResult> {
+        if self.fail {
+            return Err(LinearError::NotConfigured("no key".into()));
+        }
+        *self.seen_update.lock().unwrap() = Some(req.clone());
+        Ok(issue("ENG-101"))
+    }
 }
 
 async fn send(socket: &Path, frame: &str) -> Value {
@@ -223,11 +248,15 @@ async fn uds_linear_read_surface_round_trip() {
     let seen_filter = Arc::new(Mutex::new(None));
     let seen_query = Arc::new(Mutex::new(None));
     let seen_id = Arc::new(Mutex::new(None));
+    let seen_create = Arc::new(Mutex::new(None));
+    let seen_update = Arc::new(Mutex::new(None));
     let engine = Arc::new(StubEngine {
         fail: false,
         seen_filter: seen_filter.clone(),
         seen_query: seen_query.clone(),
         seen_id: seen_id.clone(),
+        seen_create: seen_create.clone(),
+        seen_update: seen_update.clone(),
     });
     let (socket, _tx) = start(engine, "ok").await;
 
@@ -340,6 +369,58 @@ async fn uds_linear_read_surface_round_trip() {
             .collect();
         assert!(names.contains(&key), "{method} missing {key}");
     }
+
+    // (k) createIssue forwards the typed request and returns a bare object.
+    let resp = send(
+        &socket,
+        r#"{"jsonrpc":"2.0","id":15,"method":"linear.createIssue","params":{"title":"New issue","teamId":"team-uuid","priority":2,"labelIds":["l1"]}}"#,
+    )
+    .await;
+    assert!(resp["result"].is_object());
+    assert_eq!(resp["result"]["identifier"], json!("ENG-100"));
+    let recorded = seen_create.lock().unwrap().clone().expect("create seen");
+    assert_eq!(recorded.title, "New issue");
+    assert_eq!(recorded.team_id, "team-uuid");
+    assert_eq!(recorded.priority, Some(2.0));
+    assert_eq!(recorded.label_ids.as_deref(), Some(&["l1".to_string()][..]));
+
+    // (l) createIssue rejects a missing `title` with `-32602`.
+    let resp = send(
+        &socket,
+        r#"{"jsonrpc":"2.0","id":16,"method":"linear.createIssue","params":{"teamId":"t1"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+
+    // (m) createIssue rejects a missing `teamId` with `-32602`.
+    let resp = send(
+        &socket,
+        r#"{"jsonrpc":"2.0","id":17,"method":"linear.createIssue","params":{"title":"X"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+
+    // (n) updateIssue forwards the typed request and returns a bare object.
+    let resp = send(
+        &socket,
+        r#"{"jsonrpc":"2.0","id":18,"method":"linear.updateIssue","params":{"issueId":"uuid-1","title":"Updated","stateId":"s1"}}"#,
+    )
+    .await;
+    assert!(resp["result"].is_object());
+    assert_eq!(resp["result"]["identifier"], json!("ENG-101"));
+    let recorded = seen_update.lock().unwrap().clone().expect("update seen");
+    assert_eq!(recorded.issue_id, "uuid-1");
+    assert_eq!(recorded.title.as_deref(), Some("Updated"));
+    assert_eq!(recorded.state_id.as_deref(), Some("s1"));
+    assert!(recorded.description.is_none());
+
+    // (o) updateIssue rejects a missing `issueId` with `-32602`.
+    let resp = send(
+        &socket,
+        r#"{"jsonrpc":"2.0","id":19,"method":"linear.updateIssue","params":{"title":"X"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
 }
 
 #[tokio::test]
@@ -349,6 +430,8 @@ async fn uds_linear_not_configured_is_internal() {
         seen_filter: Arc::new(Mutex::new(None)),
         seen_query: Arc::new(Mutex::new(None)),
         seen_id: Arc::new(Mutex::new(None)),
+        seen_create: Arc::new(Mutex::new(None)),
+        seen_update: Arc::new(Mutex::new(None)),
     });
     let (socket, _tx) = start(engine, "unconfigured").await;
 
@@ -382,6 +465,14 @@ async fn uds_linear_not_configured_is_internal() {
         (
             7,
             r#"{"jsonrpc":"2.0","id":7,"method":"linear.listLabels","params":{}}"#,
+        ),
+        (
+            8,
+            r#"{"jsonrpc":"2.0","id":8,"method":"linear.createIssue","params":{"title":"X","teamId":"t1"}}"#,
+        ),
+        (
+            9,
+            r#"{"jsonrpc":"2.0","id":9,"method":"linear.updateIssue","params":{"issueId":"uuid-1"}}"#,
         ),
     ] {
         let resp = send(&socket, frame).await;

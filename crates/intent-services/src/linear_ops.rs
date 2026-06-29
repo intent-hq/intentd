@@ -13,7 +13,10 @@
 use std::sync::Arc;
 
 use intent_core::{Error, Result};
-use intent_linear::{IssueFilter, LinearEngine, LinearRegistry, LinearSettings};
+use intent_linear::{
+    CreateIssueRequest, IssueFilter, LinearEngine, LinearRegistry, LinearSettings,
+    UpdateIssueRequest,
+};
 
 /// Map a Linear engine/registry error onto the domain `Internal` error
 /// (→ `-32603`): a missing/invalid key (`NotConfigured`) and any other Linear
@@ -54,6 +57,41 @@ pub(crate) fn parse_filter(filter: Option<String>) -> Result<IssueFilter> {
 /// or out-of-range values fall through to the engine's own default/clamp.
 pub(crate) fn wire_limit(limit: Option<i64>) -> Option<u32> {
     limit.and_then(|n| u32::try_from(n).ok())
+}
+
+/// Parse and validate a `linear.createIssue` request (§5.28). Rejects with
+/// `InvalidParams` (→ `-32602`) when `title` or `teamId` is missing/empty or
+/// when the JSON shape itself is invalid (e.g. `priority` not numeric). The
+/// router enforces the same `-32602` contract before this is called.
+pub(crate) fn parse_create_issue(request: serde_json::Value) -> Result<CreateIssueRequest> {
+    let req: CreateIssueRequest = serde_json::from_value(request)
+        .map_err(|e| Error::InvalidParams(format!("invalid createIssue request: {e}")))?;
+    if req.title.trim().is_empty() {
+        return Err(Error::InvalidParams(
+            "Missing required parameter: title".to_string(),
+        ));
+    }
+    if req.team_id.trim().is_empty() {
+        return Err(Error::InvalidParams(
+            "Missing required parameter: teamId".to_string(),
+        ));
+    }
+    Ok(req)
+}
+
+/// Parse and validate a `linear.updateIssue` request (§5.28). Rejects with
+/// `InvalidParams` (→ `-32602`) when `issueId` is missing/empty or the JSON
+/// shape itself is invalid. The router enforces the same `-32602` contract
+/// before this is called.
+pub(crate) fn parse_update_issue(request: serde_json::Value) -> Result<UpdateIssueRequest> {
+    let req: UpdateIssueRequest = serde_json::from_value(request)
+        .map_err(|e| Error::InvalidParams(format!("invalid updateIssue request: {e}")))?;
+    if req.issue_id.trim().is_empty() {
+        return Err(Error::InvalidParams(
+            "Missing required parameter: issueId".to_string(),
+        ));
+    }
+    Ok(req)
 }
 
 #[cfg(test)]
@@ -101,5 +139,64 @@ mod tests {
     fn maps_not_configured_to_internal() {
         let mapped = map_linear_err(intent_linear::Error::NotConfigured("no key".into()));
         assert!(matches!(mapped, Error::Internal(_)));
+    }
+
+    #[test]
+    fn parse_create_issue_accepts_minimal_required() {
+        let req = parse_create_issue(serde_json::json!({
+            "title": "Do it",
+            "teamId": "team-uuid",
+        }))
+        .unwrap();
+        assert_eq!(req.title, "Do it");
+        assert_eq!(req.team_id, "team-uuid");
+    }
+
+    #[test]
+    fn parse_create_issue_rejects_missing_title() {
+        for body in [
+            serde_json::json!({ "teamId": "t1" }),
+            serde_json::json!({ "title": "", "teamId": "t1" }),
+            serde_json::json!({ "title": "   ", "teamId": "t1" }),
+        ] {
+            assert!(matches!(
+                parse_create_issue(body),
+                Err(Error::InvalidParams(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_create_issue_rejects_missing_team_id() {
+        for body in [
+            serde_json::json!({ "title": "X" }),
+            serde_json::json!({ "title": "X", "teamId": "" }),
+        ] {
+            assert!(matches!(
+                parse_create_issue(body),
+                Err(Error::InvalidParams(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_update_issue_accepts_minimal_required() {
+        let req = parse_update_issue(serde_json::json!({ "issueId": "uuid-1" })).unwrap();
+        assert_eq!(req.issue_id, "uuid-1");
+        assert!(req.title.is_none());
+    }
+
+    #[test]
+    fn parse_update_issue_rejects_missing_issue_id() {
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({ "issueId": "" }),
+            serde_json::json!({ "title": "X" }),
+        ] {
+            assert!(matches!(
+                parse_update_issue(body),
+                Err(Error::InvalidParams(_))
+            ));
+        }
     }
 }

@@ -5708,8 +5708,9 @@ mod linear {
     use async_trait::async_trait;
     use intent_core::WorkspaceApi;
     use intent_linear::{
-        Error as LinearError, IssueFilter, LinearEngine, LinearIssueResult, LinearLabel,
-        LinearProject, LinearTeam, LinearUser, LinearWorkflowState, Result as LinearResult,
+        CreateIssueRequest, Error as LinearError, IssueFilter, LinearEngine, LinearIssueResult,
+        LinearLabel, LinearProject, LinearTeam, LinearUser, LinearWorkflowState,
+        Result as LinearResult, UpdateIssueRequest,
     };
 
     use super::*;
@@ -5840,6 +5841,20 @@ mod linear {
                 color: None,
             }])
         }
+
+        async fn create_issue(&self, _req: CreateIssueRequest) -> LinearResult<LinearIssueResult> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(Self::issue())
+        }
+
+        async fn update_issue(&self, _req: UpdateIssueRequest) -> LinearResult<LinearIssueResult> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(Self::issue())
+        }
     }
 
     async fn svc(fail: bool) -> (TempDb, Services) {
@@ -5873,6 +5888,16 @@ mod linear {
             s.linear_list_labels(None).await,
             Err(Error::Internal(_))
         ));
+        assert!(matches!(
+            s.linear_create_issue(serde_json::json!({"title":"t","teamId":"team-1"}))
+                .await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            s.linear_update_issue(serde_json::json!({"issueId":"uuid-1","title":"t"}))
+                .await,
+            Err(Error::Internal(_))
+        ));
     }
 
     #[tokio::test]
@@ -5896,6 +5921,56 @@ mod linear {
             assert!(arr.is_array(), "expected bare array, got {arr}");
             assert!(arr.get("items").is_none(), "no envelope");
         }
+
+        let created = s
+            .linear_create_issue(serde_json::json!({"title":"New","teamId":"team-1"}))
+            .await
+            .unwrap();
+        assert!(created.is_object());
+        assert_eq!(created["identifier"], "ENG-1");
+        assert!(created.get("items").is_none(), "no envelope");
+
+        let updated = s
+            .linear_update_issue(serde_json::json!({"issueId":"uuid-1","title":"Edit"}))
+            .await
+            .unwrap();
+        assert!(updated.is_object());
+        assert_eq!(updated["identifier"], "ENG-1");
+        assert!(updated.get("items").is_none(), "no envelope");
+    }
+
+    #[tokio::test]
+    async fn create_and_update_reject_invalid_params() {
+        let (_tmp, s) = svc(false).await;
+
+        // createIssue requires `title` and `teamId`.
+        assert!(matches!(
+            s.linear_create_issue(serde_json::json!({"teamId":"team-1"}))
+                .await,
+            Err(Error::InvalidParams(_))
+        ));
+        assert!(matches!(
+            s.linear_create_issue(serde_json::json!({"title":"X"}))
+                .await,
+            Err(Error::InvalidParams(_))
+        ));
+        assert!(matches!(
+            s.linear_create_issue(serde_json::json!({"title":"  ","teamId":"team-1"}))
+                .await,
+            Err(Error::InvalidParams(_))
+        ));
+
+        // updateIssue requires `issueId`.
+        assert!(matches!(
+            s.linear_update_issue(serde_json::json!({"title":"X"}))
+                .await,
+            Err(Error::InvalidParams(_))
+        ));
+        assert!(matches!(
+            s.linear_update_issue(serde_json::json!({"issueId":""}))
+                .await,
+            Err(Error::InvalidParams(_))
+        ));
     }
 }
 

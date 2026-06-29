@@ -1446,6 +1446,32 @@ async fn dispatch(
             let r = api.linear_list_labels(limit).await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        // `linear.*` P2 writes (§5.28). Required wire fields are validated here
+        // before the request is forwarded; the engine maps any other failure
+        // (incl. not-configured) to `-32603` via the services layer.
+        "linear.createIssue" => {
+            // `title` AND `teamId` are required. Reject missing/empty values
+            // up front so we never call the engine with a bogus payload.
+            let _title = require_non_empty_str(params, "title")?;
+            let _team_id = require_non_empty_str(params, "teamId")?;
+            let request = Value::Object(params.clone());
+            match api.linear_create_issue(request).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "linear.updateIssue" => {
+            // `issueId` is required; every other field is optional and only
+            // forwarded when present.
+            let _issue_id = require_non_empty_str(params, "issueId")?;
+            let request = Value::Object(params.clone());
+            match api.linear_update_issue(request).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         // `sentry.*` (§5.29) is daemon-owned and global: no `workspaceId`. A
         // credential pair that is absent or fails the org probe ("not
         // configured") and any other Sentry failure surface as `-32603`; an
@@ -2129,6 +2155,18 @@ fn opt_value(params: &Map<String, Value>, name: &str) -> Option<Value> {
 fn require_str_param(params: &Map<String, Value>, name: &str) -> Result<String, RpcErr> {
     match params.get(name) {
         Some(Value::String(s)) => Ok(s.clone()),
+        _ => Err(rpc(
+            INVALID_PARAMS,
+            format!("Missing required parameter: {name}"),
+        )),
+    }
+}
+
+/// Require a non-empty string param (used for `linear.createIssue`/`updateIssue`
+/// where the empty string is just as invalid as a missing field).
+fn require_non_empty_str(params: &Map<String, Value>, name: &str) -> Result<String, RpcErr> {
+    match params.get(name) {
+        Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.clone()),
         _ => Err(rpc(
             INVALID_PARAMS,
             format!("Missing required parameter: {name}"),

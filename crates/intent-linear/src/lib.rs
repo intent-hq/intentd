@@ -25,8 +25,8 @@ pub use client::{LinearClient, LINEAR_API_URL};
 pub use engine::{LinearEngine, LinearEngineImpl};
 pub use error::{Error, Result};
 pub use model::{
-    AuthStatus, IssueFilter, LinearIssueResult, LinearLabel, LinearProject, LinearTeam, LinearUser,
-    LinearWorkflowState,
+    AuthStatus, CreateIssueRequest, IssueFilter, LinearIssueResult, LinearLabel, LinearProject,
+    LinearTeam, LinearUser, LinearWorkflowState, UpdateIssueRequest,
 };
 pub use registry::{LinearRegistry, LinearSettings};
 pub use token::TokenSource;
