@@ -1364,6 +1364,78 @@ async fn linear_p1_read_arms_route() {
     }
 }
 
+#[tokio::test]
+async fn linear_create_issue_missing_title_or_team_is_minus_32602() {
+    // Empty params → `-32602` (title missing).
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"linear.createIssue","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: title")
+    );
+
+    // Title present but `teamId` missing → `-32602`.
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"linear.createIssue","params":{"title":"X"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: teamId")
+    );
+
+    // Empty string title is also rejected.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"linear.createIssue","params":{"title":"","teamId":"t1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn linear_create_issue_with_required_routes_past_param_validation() {
+    // Both required fields present → reaches the trait default (`-32603`).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"linear.createIssue","params":{"title":"X","teamId":"t1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+}
+
+#[tokio::test]
+async fn linear_update_issue_missing_issue_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"linear.updateIssue","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: issueId")
+    );
+
+    // Empty string issueId is also rejected.
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"linear.updateIssue","params":{"issueId":""}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn linear_update_issue_with_issue_id_routes_past_param_validation() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"linear.updateIssue","params":{"issueId":"uuid-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+}
+
 fn err_code(v: &Value) -> i64 {
     v["error"]["code"].as_i64().expect("error code")
 }

@@ -10,8 +10,8 @@ use serde_json::{json, Value};
 use crate::client::LinearClient;
 use crate::error::{Error, Result};
 use crate::model::{
-    AuthStatus, IssueFilter, LinearIssueResult, LinearLabel, LinearProject, LinearTeam, LinearUser,
-    LinearWorkflowState,
+    AuthStatus, CreateIssueRequest, IssueFilter, LinearIssueResult, LinearLabel, LinearProject,
+    LinearTeam, LinearUser, LinearWorkflowState, UpdateIssueRequest,
 };
 
 /// Default page size when the caller does not specify one.
@@ -74,6 +74,14 @@ pub trait LinearEngine: Send + Sync {
 
     /// List issue labels.
     async fn list_labels(&self, limit: Option<u32>) -> Result<Vec<LinearLabel>>;
+
+    /// Create a new issue (`issueCreate` mutation). Returns the flattened
+    /// issue mirroring the read shape.
+    async fn create_issue(&self, req: CreateIssueRequest) -> Result<LinearIssueResult>;
+
+    /// Update an existing issue (`issueUpdate` mutation). Only the fields
+    /// present in `req` are sent through `IssueUpdateInput`.
+    async fn update_issue(&self, req: UpdateIssueRequest) -> Result<LinearIssueResult>;
 }
 
 /// GraphQL-backed [`LinearEngine`] over [`LinearClient`].
@@ -212,11 +220,91 @@ impl LinearEngine for LinearEngineImpl {
         let data = self.client.graphql(query, variables).await?;
         Ok(map_nodes(data.pointer("/issueLabels/nodes"), map_label))
     }
+
+    async fn create_issue(&self, req: CreateIssueRequest) -> Result<LinearIssueResult> {
+        let mutation = format!(
+            "mutation CreateIssue($input: IssueCreateInput!) {{ \
+                issueCreate(input: $input) {{ success issue {{ {ISSUE_FIELDS} }} }} \
+            }}"
+        );
+        let variables = json!({ "input": build_create_input(&req) });
+        let data = self.client.graphql(&mutation, variables).await?;
+        let node = data
+            .pointer("/issueCreate/issue")
+            .filter(|v| !v.is_null())
+            .ok_or_else(|| Error::Api("issueCreate returned no issue".to_string()))?;
+        Ok(map_issue(node))
+    }
+
+    async fn update_issue(&self, req: UpdateIssueRequest) -> Result<LinearIssueResult> {
+        let mutation = format!(
+            "mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) {{ \
+                issueUpdate(id: $id, input: $input) {{ success issue {{ {ISSUE_FIELDS} }} }} \
+            }}"
+        );
+        let variables = json!({
+            "id": req.issue_id,
+            "input": build_update_input(&req),
+        });
+        let data = self.client.graphql(&mutation, variables).await?;
+        let node = data
+            .pointer("/issueUpdate/issue")
+            .filter(|v| !v.is_null())
+            .ok_or_else(|| Error::Api("issueUpdate returned no issue".to_string()))?;
+        Ok(map_issue(node))
+    }
 }
 
 /// Clamp an optional limit into `[1, MAX_LIMIT]`, defaulting when absent.
 fn clamp_limit(limit: Option<u32>) -> u32 {
     limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
+}
+
+/// Build the GraphQL `IssueCreateInput` from [`CreateIssueRequest`]. Optional
+/// fields are only included when present so they don't overwrite defaults.
+pub(crate) fn build_create_input(req: &CreateIssueRequest) -> Value {
+    let mut input = serde_json::Map::new();
+    input.insert("title".to_string(), Value::String(req.title.clone()));
+    input.insert("teamId".to_string(), Value::String(req.team_id.clone()));
+    if let Some(d) = &req.description {
+        input.insert("description".to_string(), Value::String(d.clone()));
+    }
+    if let Some(id) = &req.assignee_id {
+        input.insert("assigneeId".to_string(), Value::String(id.clone()));
+    }
+    if let Some(id) = &req.state_id {
+        input.insert("stateId".to_string(), Value::String(id.clone()));
+    }
+    if let Some(p) = req.priority {
+        input.insert("priority".to_string(), json!(p));
+    }
+    if let Some(ids) = &req.label_ids {
+        input.insert("labelIds".to_string(), json!(ids));
+    }
+    Value::Object(input)
+}
+
+/// Build the GraphQL `IssueUpdateInput` from [`UpdateIssueRequest`]. Only the
+/// fields present in `req` are included so an absent field is left untouched on
+/// the server.
+pub(crate) fn build_update_input(req: &UpdateIssueRequest) -> Value {
+    let mut input = serde_json::Map::new();
+    if let Some(t) = &req.title {
+        input.insert("title".to_string(), Value::String(t.clone()));
+    }
+    if let Some(d) = &req.description {
+        input.insert("description".to_string(), Value::String(d.clone()));
+    }
+    if let Some(id) = &req.assignee_id {
+        input.insert("assigneeId".to_string(), Value::String(id.clone()));
+    }
+    if let Some(id) = &req.state_id {
+        input.insert("stateId".to_string(), Value::String(id.clone()));
+    }
+    if let Some(p) = req.priority {
+        input.insert("priority".to_string(), json!(p));
+    }
+    Value::Object(input)
 }
 
 /// Map the FE filter enum to a typed Linear `IssueFilter`. `isMe` comparators
@@ -550,5 +638,66 @@ mod tests {
         assert_eq!(parse_identifier("-123"), None);
         assert_eq!(parse_identifier("ENG123"), None);
         assert_eq!(parse_identifier("ENG-12a"), None);
+    }
+
+    #[test]
+    fn build_create_input_includes_required_and_omits_absent() {
+        let req = CreateIssueRequest {
+            title: "Do it".into(),
+            team_id: "team-uuid".into(),
+            ..Default::default()
+        };
+        let v = build_create_input(&req);
+        assert_eq!(v["title"], "Do it");
+        assert_eq!(v["teamId"], "team-uuid");
+        assert!(v.get("description").is_none());
+        assert!(v.get("assigneeId").is_none());
+        assert!(v.get("stateId").is_none());
+        assert!(v.get("priority").is_none());
+        assert!(v.get("labelIds").is_none());
+    }
+
+    #[test]
+    fn build_create_input_includes_all_optionals_when_set() {
+        let req = CreateIssueRequest {
+            title: "Do it".into(),
+            description: Some("desc".into()),
+            team_id: "team-uuid".into(),
+            assignee_id: Some("u1".into()),
+            state_id: Some("s1".into()),
+            priority: Some(2.0),
+            label_ids: Some(vec!["l1".into(), "l2".into()]),
+        };
+        let v = build_create_input(&req);
+        assert_eq!(v["title"], "Do it");
+        assert_eq!(v["teamId"], "team-uuid");
+        assert_eq!(v["description"], "desc");
+        assert_eq!(v["assigneeId"], "u1");
+        assert_eq!(v["stateId"], "s1");
+        assert_eq!(v["priority"], json!(2.0));
+        assert_eq!(v["labelIds"], json!(["l1", "l2"]));
+    }
+
+    #[test]
+    fn build_update_input_only_includes_present_fields() {
+        let req = UpdateIssueRequest {
+            issue_id: "uuid-1".into(),
+            ..Default::default()
+        };
+        let v = build_update_input(&req);
+        assert!(v.as_object().unwrap().is_empty());
+
+        let req = UpdateIssueRequest {
+            issue_id: "uuid-1".into(),
+            title: Some("New".into()),
+            priority: Some(0.0),
+            ..Default::default()
+        };
+        let v = build_update_input(&req);
+        assert_eq!(v["title"], "New");
+        assert_eq!(v["priority"], json!(0.0));
+        assert!(v.get("description").is_none());
+        assert!(v.get("assigneeId").is_none());
+        assert!(v.get("stateId").is_none());
     }
 }

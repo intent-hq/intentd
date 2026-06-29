@@ -2083,6 +2083,40 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `linear.createIssue`: create a Linear issue (`issueCreate` mutation).
+    /// `request` is the bare `CreateIssueRequest` JSON: `title` and `teamId`
+    /// are required; everything else is optional. Returns the flattened
+    /// issue (`LinearIssueResult`); the API key never crosses the wire
+    /// (PROTOCOL §5.28).
+    fn linear_create_issue(
+        &self,
+        request: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = request;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::linear_create_issue not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `linear.updateIssue`: update a Linear issue (`issueUpdate` mutation).
+    /// `request` is the bare `UpdateIssueRequest` JSON: `issueId` is required;
+    /// only the fields present are sent through `IssueUpdateInput`. Returns
+    /// the flattened issue (`LinearIssueResult`); the API key never crosses
+    /// the wire (PROTOCOL §5.28).
+    fn linear_update_issue(
+        &self,
+        request: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = request;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::linear_update_issue not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `sentry.authStatus`: probe the resolved Sentry credentials via
     /// `GET /organizations/{org}/` and report `{ authenticated, organization?,
     /// error? }`. The token is never returned. A missing pair surfaces as

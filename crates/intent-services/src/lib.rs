@@ -6795,6 +6795,40 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn linear_create_issue(
+        &self,
+        request: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.linear_engine.clone();
+        Box::pin(async move {
+            let req = linear_ops::parse_create_issue(request)?;
+            let engine = linear_ops::resolve_engine(injected)?;
+            let issue = engine
+                .create_issue(req)
+                .await
+                .map_err(linear_ops::map_linear_err)?;
+            serde_json::to_value(issue)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    fn linear_update_issue(
+        &self,
+        request: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.linear_engine.clone();
+        Box::pin(async move {
+            let req = linear_ops::parse_update_issue(request)?;
+            let engine = linear_ops::resolve_engine(injected)?;
+            let issue = engine
+                .update_issue(req)
+                .await
+                .map_err(linear_ops::map_linear_err)?;
+            serde_json::to_value(issue)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
     // ========================================================================
     // sentry.* read surface (PROTOCOL §5.29). Maps onto the `SentryEngine`
     // trait; the engine resolves the credential pair (org + token from

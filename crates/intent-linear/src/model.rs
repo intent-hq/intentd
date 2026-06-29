@@ -155,9 +155,52 @@ pub struct LinearLabel {
     pub color: Option<String>,
 }
 
+/// Request body for `linear.createIssue` (P2 write, §5.28).
+///
+/// Mirrors the FE `CreateIssueRequest` (`linear-auth/types.ts`) field-for-field.
+/// `title` and `teamId` are required; everything else is optional.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateIssueRequest {
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub team_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignee_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_ids: Option<Vec<String>>,
+}
+
+/// Request body for `linear.updateIssue` (P2 write, §5.28).
+///
+/// Mirrors the FE `UpdateIssueRequest` (`linear-auth/types.ts`) field-for-field.
+/// `issueId` is required; every other field is optional and only included in the
+/// GraphQL `IssueUpdateInput` when present.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateIssueRequest {
+    pub issue_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignee_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<f64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn issue_filter_deserializes_lowercase() {
@@ -282,5 +325,54 @@ mod tests {
         assert_eq!(v["name"], "bug");
         assert_eq!(v["description"], "a bug");
         assert!(v.get("color").is_none());
+    }
+
+    #[test]
+    fn create_issue_request_deserializes_camel_case_and_omits_none() {
+        let req: CreateIssueRequest = serde_json::from_value(json!({
+            "title": "Do it",
+            "teamId": "team-uuid",
+            "assigneeId": "u1",
+            "labelIds": ["l1", "l2"],
+        }))
+        .unwrap();
+        assert_eq!(req.title, "Do it");
+        assert_eq!(req.team_id, "team-uuid");
+        assert_eq!(req.assignee_id.as_deref(), Some("u1"));
+        assert!(req.description.is_none());
+        assert!(req.state_id.is_none());
+        assert!(req.priority.is_none());
+        assert_eq!(req.label_ids.as_deref().unwrap().len(), 2);
+
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["teamId"], "team-uuid");
+        assert_eq!(v["assigneeId"], "u1");
+        assert_eq!(v["labelIds"], json!(["l1", "l2"]));
+        assert!(v.get("description").is_none());
+        assert!(v.get("priority").is_none());
+        assert!(v.get("stateId").is_none());
+    }
+
+    #[test]
+    fn update_issue_request_deserializes_camel_case_and_omits_none() {
+        let req: UpdateIssueRequest = serde_json::from_value(json!({
+            "issueId": "uuid-1",
+            "title": "New title",
+            "priority": 2,
+        }))
+        .unwrap();
+        assert_eq!(req.issue_id, "uuid-1");
+        assert_eq!(req.title.as_deref(), Some("New title"));
+        assert_eq!(req.priority, Some(2.0));
+        assert!(req.description.is_none());
+        assert!(req.assignee_id.is_none());
+        assert!(req.state_id.is_none());
+
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["issueId"], "uuid-1");
+        assert_eq!(v["title"], "New title");
+        assert!(v.get("assigneeId").is_none());
+        assert!(v.get("stateId").is_none());
+        assert!(v.get("description").is_none());
     }
 }
