@@ -30,6 +30,7 @@ mod drafts;
 mod events;
 mod forward;
 pub mod host;
+mod host_ops;
 pub mod lifecycle;
 pub mod listener;
 pub mod reverse;
