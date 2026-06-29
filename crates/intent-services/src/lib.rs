@@ -4975,6 +4975,8 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         message: String,
+        agent_id: Option<AgentId>,
+        linked_note_id: Option<NoteId>,
         files: Option<Vec<String>>,
         user_requested: bool,
     ) -> BoxFuture<'_, Result<intent_core::GitAgentCommitResult>> {
@@ -5003,7 +5005,12 @@ impl WorkspaceApi for Services {
                 ));
             }
             intent_git::stage::stage(&worktree, &to_commit)?;
-            let outcome = intent_git::commit::commit(&worktree, &message)?;
+            let outcome = intent_git::commit::commit_with_trailers(
+                &worktree,
+                &message,
+                agent_id.as_ref().map(AgentId::as_str),
+                linked_note_id.as_ref().map(NoteId::as_str),
+            )?;
             let file_count = to_commit.len() as i64;
             Ok(intent_core::GitAgentCommitResult {
                 hash: outcome.hash,

@@ -1339,15 +1339,26 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `git.agentCommit`: stage the agent's changes (or `files` when given) and
     /// commit them; `user_requested` bypasses the auto-commit gate (PROTOCOL
-    /// §5.6).
+    /// §5.6). When `agent_id` (and optionally `linked_note_id`) are present, the
+    /// commit body carries `Agent-Id:` / `Linked-Note-Id:` attribution trailers;
+    /// the FE/transport path passes `None` for both (no agent context).
     fn git_agent_commit(
         &self,
         workspace_id: WorkspaceId,
         message: String,
+        agent_id: Option<AgentId>,
+        linked_note_id: Option<NoteId>,
         files: Option<Vec<String>>,
         user_requested: bool,
     ) -> BoxFuture<'_, Result<GitAgentCommitResult>> {
-        let _ = (workspace_id, message, files, user_requested);
+        let _ = (
+            workspace_id,
+            message,
+            agent_id,
+            linked_note_id,
+            files,
+            user_requested,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_agent_commit not implemented".to_string(),

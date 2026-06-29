@@ -996,8 +996,11 @@ async fn dispatch(
             let message = require_str_param(params, "message")?;
             let files = opt_str_array(params, "files");
             let user_requested = parse_bool(params, "userRequested");
+            // The FE/transport path has no agent context, so no attribution
+            // trailers are written here (mirrors the reference, which composes
+            // attribution at the agent-context MCP layer).
             let r = api
-                .git_agent_commit(ws, message, files, user_requested)
+                .git_agent_commit(ws, message, None, None, files, user_requested)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(json!({

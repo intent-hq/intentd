@@ -280,6 +280,26 @@ impl WorkspaceMcpServer {
                     .agent_report_to_parent(ws, report, self.caller_agent_id.clone())
                     .await)
             }
+            // ---- Git write tools ----
+            "git_commit_workspace-mcp" => {
+                // Attribution is sourced from the MCP caller context (Option B,
+                // matching the reference `ws-git-api.ts` agentCommit). Without an
+                // agent context there is nothing to attribute the commit to.
+                let agent_id = self.caller_agent_id.clone().ok_or_else(|| {
+                    Error::InvalidParams(
+                        "No agent context available. This tool must be called by an agent."
+                            .to_string(),
+                    )
+                })?;
+                let message = req_str(args, "message")?;
+                let files = opt_vec_str(args, "files");
+                let user_requested = opt_bool(args, "userRequested").unwrap_or(false);
+                // `linked_note_id` stays `None`: its producer (auto-commit on task
+                // completion) is not yet ported.
+                val(api
+                    .git_agent_commit(ws, message, Some(agent_id), None, files, user_requested)
+                    .await)
+            }
             other => Err(Error::InvalidParams(format!("Tool not found: {other}"))),
         }
     }
