@@ -432,7 +432,8 @@ mod mcp_tests {
     use std::sync::{Arc, Mutex};
 
     use intent_core::{
-        BoxFuture, Note, NoteAddInput, NoteAddResult, NoteId, Result, WorkspaceApi, WorkspaceId,
+        AgentId, BoxFuture, GitAgentCommitResult, Note, NoteAddInput, NoteAddResult, NoteId,
+        Result, WorkspaceApi, WorkspaceId,
     };
     use serde_json::{json, Value};
 
@@ -452,9 +453,13 @@ mod mcp_tests {
 
     /// A `WorkspaceApi` that records the `add_to_note` calls it receives so a tool
     /// call through the MCP server can be observed as a state change.
+    /// A recorded `git_agent_commit` call: (message, agent_id, linked_note_id).
+    type CommitRecord = (String, Option<String>, Option<String>);
+
     #[derive(Default)]
     struct MockApi {
         added: Mutex<Vec<(String, String)>>,
+        committed: Mutex<Vec<CommitRecord>>,
     }
 
     impl WorkspaceApi for MockApi {
@@ -463,6 +468,29 @@ mod mcp_tests {
             _workspace_id: &'a WorkspaceId,
         ) -> BoxFuture<'a, Result<Vec<Note>>> {
             Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn git_agent_commit(
+            &self,
+            _workspace_id: WorkspaceId,
+            message: String,
+            agent_id: Option<AgentId>,
+            linked_note_id: Option<NoteId>,
+            _files: Option<Vec<String>>,
+            _user_requested: bool,
+        ) -> BoxFuture<'_, Result<GitAgentCommitResult>> {
+            self.committed.lock().unwrap().push((
+                message,
+                agent_id.as_ref().map(|a| a.as_str().to_string()),
+                linked_note_id.as_ref().map(|n| n.as_str().to_string()),
+            ));
+            Box::pin(async move {
+                Ok(GitAgentCommitResult {
+                    hash: "deadbeef".to_string(),
+                    files: vec!["a.txt".to_string()],
+                    file_count: 1,
+                })
+            })
         }
 
         fn add_to_note(
@@ -537,6 +565,51 @@ mod mcp_tests {
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["ok"], json!(true));
         assert_eq!(parsed["newContent"], json!("hello"));
+    }
+
+    #[tokio::test]
+    async fn git_commit_threads_caller_agent_id_as_attribution() {
+        let api = Arc::new(MockApi::default());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("ws-1"))
+            .with_caller_agent_id(Some(AgentId::from_string("agent-77")));
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": {
+                    "name": "git_commit_workspace-mcp",
+                    "arguments": { "message": "Add a" }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let committed = api.committed.lock().unwrap();
+        assert_eq!(
+            *committed,
+            vec![("Add a".to_string(), Some("agent-77".to_string()), None)]
+        );
+    }
+
+    #[tokio::test]
+    async fn git_commit_without_agent_context_errors() {
+        let api = Arc::new(MockApi::default());
+        let srv = server(api.clone());
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                "params": {
+                    "name": "git_commit_workspace-mcp",
+                    "arguments": { "message": "Add a" }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("This tool must be called by an agent."));
+        assert!(api.committed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

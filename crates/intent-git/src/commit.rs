@@ -61,6 +61,20 @@ pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
     })
 }
 
+/// Create a commit whose body carries attribution trailers, building the message
+/// via [`build_commit_message`] before committing the staged index. Mirrors
+/// [`commit`] except for the trailer-aware message; used by the agent commit path
+/// while bare [`commit`] backs `git.commit`.
+pub fn commit_with_trailers(
+    worktree_path: &Path,
+    message: &str,
+    agent_id: Option<&str>,
+    linked_note_id: Option<&str>,
+) -> Result<CommitOutcome> {
+    let body = build_commit_message(message, agent_id, linked_note_id);
+    commit(worktree_path, &body)
+}
+
 /// Build a commit message body with attribution trailers, porting the
 /// reference `agent-commit.service.ts::buildCommitMessage`.
 ///
@@ -214,6 +228,18 @@ mod tests {
         let (agent, note) = crate::history::parse_trailers(&agent_only);
         assert_eq!(agent.as_deref(), Some("agent-42"));
         assert!(note.is_none());
+    }
+
+    #[test]
+    fn commit_with_trailers_body_parses_back_via_history() {
+        let dir = init_repo("commit-trailers");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        write_file(dir.path(), "a.txt", "hi\n");
+        stage(dir.path(), &["a.txt".to_string()]).unwrap();
+        commit_with_trailers(dir.path(), "Add a", Some("agent-77"), None).unwrap();
+        let commits = crate::history::history(dir.path(), 1).unwrap();
+        assert_eq!(commits[0].agent_id.as_deref(), Some("agent-77"));
+        assert!(commits[0].linked_note_id.is_none());
     }
 
     #[test]

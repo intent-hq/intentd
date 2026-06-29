@@ -240,4 +240,15 @@ static ALL_TOOLS: &[ToolDef] = &[
         description: "Send a completion report to your parent agent (delegated agents only).",
         params: &[p("report", "string", true)],
     },
+    // ---- Git write tools ----
+    ToolDef {
+        name: "git_commit_workspace-mcp",
+        description: "Stage and commit the agent's changes, recording an Agent-Id attribution \
+                      trailer from the calling agent's context.",
+        params: &[
+            p("message", "string", true),
+            p("files", "array", false),
+            p("userRequested", "boolean", false),
+        ],
+    },
 ];

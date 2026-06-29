@@ -1,7 +1,7 @@
 //! Router error-matrix + dispatch unit tests using a fake `WorkspaceApi`.
 
 use intent_core::{
-    AuthorType, BoxFuture, Comment, CommentAddResult, CommentAnchor, CommentAnchorType,
+    AgentId, AuthorType, BoxFuture, Comment, CommentAddResult, CommentAnchor, CommentAnchorType,
     CommentLocation, CommentResolveThreadResult, CommentRespondResult, CommentRespondThread,
     CommentStatus, CommentType, CommentWire, ContentType, Error, Event, EventQueryParams,
     EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
@@ -861,6 +861,8 @@ impl WorkspaceApi for FakeApi {
         &self,
         _workspace_id: WorkspaceId,
         _message: String,
+        _agent_id: Option<AgentId>,
+        _linked_note_id: Option<NoteId>,
         files: Option<Vec<String>>,
         _user_requested: bool,
     ) -> BoxFuture<'_, Result<GitAgentCommitResult>> {
