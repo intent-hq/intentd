@@ -61,6 +61,55 @@ pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
     })
 }
 
+/// Build a commit message body with attribution trailers, porting the
+/// reference `agent-commit.service.ts::buildCommitMessage`.
+///
+/// The message is trimmed and any run of 3+ consecutive newlines is collapsed to
+/// a single blank line (matching `/\n{3,}/g → \n\n`). An `Agent-Id:` trailer is
+/// appended when `agent_id` is present, followed by a `Linked-Note-Id:` trailer
+/// when `linked_note_id` is present; the trailer block is separated from the body
+/// by a single blank line. When neither id is given the cleaned message is
+/// returned unchanged (no trailing blank line). The output round-trips with
+/// [`crate::history::parse_trailers`].
+pub fn build_commit_message(
+    message: &str,
+    agent_id: Option<&str>,
+    linked_note_id: Option<&str>,
+) -> String {
+    let clean = collapse_blank_lines(message.trim());
+    let mut trailers = Vec::new();
+    if let Some(id) = agent_id {
+        trailers.push(format!("Agent-Id: {id}"));
+    }
+    if let Some(id) = linked_note_id {
+        trailers.push(format!("Linked-Note-Id: {id}"));
+    }
+    if trailers.is_empty() {
+        clean
+    } else {
+        format!("{clean}\n\n{}", trailers.join("\n"))
+    }
+}
+
+/// Collapse any run of 3+ consecutive `\n` into exactly two, mirroring the
+/// reference `message.replace(/\n{3,}/g, '\n\n')`.
+fn collapse_blank_lines(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut run = 0usize;
+    for ch in s.chars() {
+        if ch == '\n' {
+            run += 1;
+            if run <= 2 {
+                out.push('\n');
+            }
+        } else {
+            run = 0;
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// All distinct paths with worktree changes (staged, unstaged, or untracked),
 /// the auto-stage set for `agentCommit` in the absence of agent attribution.
 pub fn all_changed_paths(worktree_path: &Path) -> Result<Vec<String>> {
@@ -124,6 +173,47 @@ mod tests {
         commit_file(dir.path(), "seed.txt", "seed\n");
         let err = commit(dir.path(), "nothing").unwrap_err();
         assert!(format!("{err}").contains("nothing to commit"));
+    }
+
+    #[test]
+    fn build_commit_message_agent_id_only() {
+        let msg = build_commit_message("Fix bug", Some("agent-123"), None);
+        assert_eq!(msg, "Fix bug\n\nAgent-Id: agent-123");
+    }
+
+    #[test]
+    fn build_commit_message_agent_id_and_linked_note_id() {
+        let msg = build_commit_message("Fix bug", Some("agent-123"), Some("note-9"));
+        assert_eq!(
+            msg,
+            "Fix bug\n\nAgent-Id: agent-123\nLinked-Note-Id: note-9"
+        );
+    }
+
+    #[test]
+    fn build_commit_message_no_trailers_returns_cleaned_message() {
+        let msg = build_commit_message("  Fix bug  ", None, None);
+        assert_eq!(msg, "Fix bug");
+        assert!(!msg.ends_with('\n'));
+    }
+
+    #[test]
+    fn build_commit_message_collapses_excess_blank_lines() {
+        let msg = build_commit_message("Subject\n\n\n\nBody", Some("agent-1"), None);
+        assert_eq!(msg, "Subject\n\nBody\n\nAgent-Id: agent-1");
+    }
+
+    #[test]
+    fn build_commit_message_round_trips_via_parse_trailers() {
+        let msg = build_commit_message("Subject", Some("agent-123"), Some("note-9"));
+        let (agent, note) = crate::history::parse_trailers(&msg);
+        assert_eq!(agent.as_deref(), Some("agent-123"));
+        assert_eq!(note.as_deref(), Some("note-9"));
+
+        let agent_only = build_commit_message("Subject", Some("agent-42"), None);
+        let (agent, note) = crate::history::parse_trailers(&agent_only);
+        assert_eq!(agent.as_deref(), Some("agent-42"));
+        assert!(note.is_none());
     }
 
     #[test]

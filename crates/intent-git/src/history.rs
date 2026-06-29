@@ -153,7 +153,7 @@ fn changed_files(repo: &Repository, commit: &Commit) -> Result<Vec<String>> {
 
 /// Parse the `Agent-Id:` / `Linked-Note-Id:` trailers from a commit body,
 /// mirroring the TS `loadCommits` trailer scan.
-fn parse_trailers(body: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn parse_trailers(body: &str) -> (Option<String>, Option<String>) {
     let mut agent_id = None;
     let mut linked_note_id = None;
     for line in body.lines() {
