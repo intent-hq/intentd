@@ -10,10 +10,12 @@
 
 use std::fmt;
 
-use serde_json::{json, Value};
+use intent_core::WorkspaceApi;
+use serde_json::{json, Map, Value};
 
 use crate::discovery::{detect_display_server, detect_has_display, local_hostname};
-use crate::events::success_frame;
+use crate::events::{error_frame, success_frame};
+use crate::host_ops;
 use crate::reverse::{ReverseChannel, DEFAULT_REVERSE_TIMEOUT};
 
 /// Resolve the effective locality for a connection (§5.14): the transport
@@ -24,33 +26,67 @@ pub fn resolve_is_local(transport_local: bool, override_local: Option<bool>) -> 
     override_local.unwrap_or(transport_local)
 }
 
-/// A classified `host.status` request awaiting handling by the connection task.
-pub(crate) struct HostRequest {
-    pub id_present: bool,
-    pub id_echo: Value,
+/// The `host.*` capability-probe methods, once classified. `Status` is the
+/// original host probe (§5.14); `CheckGit`/`ListDirectory`/`DirectoryStatus`/
+/// `CheckAuggie` are additive host-services that let the FE delegate Git
+/// detection, repo-folder browsing, and auggie-binary discovery to the daemon
+/// host (cross-transport, like the rest of `host.*`).
+pub(crate) enum HostMethod {
+    Status,
+    CheckGit,
+    ListDirectory,
+    DirectoryStatus,
+    CheckAuggie,
 }
 
-/// Classify a parsed frame as a `host.status` request, or `None` to fall through
-/// to the events fast-path / JSON-RPC dispatcher. Mirrors `control::classify`:
-/// a JSON-RPC 2.0 object with a string `method` and an `id` (if present) that is
+/// A classified `host.*` request awaiting handling by the connection task.
+/// `params` is the raw params object (already coerced to an empty map when the
+/// frame had no params or non-object params), consumed by the methods that
+/// take input (`ListDirectory`/`DirectoryStatus`).
+pub(crate) struct HostRequest {
+    pub method: HostMethod,
+    pub id_present: bool,
+    pub id_echo: Value,
+    pub params: Map<String, Value>,
+}
+
+/// Classify a parsed frame as a `host.*` request, or `None` to fall through to
+/// the next fast-path / JSON-RPC dispatcher. Mirrors `control::classify`: a
+/// JSON-RPC 2.0 object with a string `method` and an `id` (if present) that is
 /// a string, number, or null.
 pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
     let obj = value.as_object()?;
     if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return None;
     }
-    if obj.get("method").and_then(Value::as_str)? != "host.status" {
-        return None;
-    }
+    let method = obj.get("method").and_then(Value::as_str)?;
     let id_member = obj.get("id");
     if let Some(v) = id_member {
         if !v.is_null() && !v.is_string() && !v.is_number() {
             return None;
         }
     }
+    let method = match method {
+        "host.status" => HostMethod::Status,
+        "host.checkGit" => HostMethod::CheckGit,
+        "host.listDirectory" => HostMethod::ListDirectory,
+        "host.directoryStatus" => HostMethod::DirectoryStatus,
+        "host.checkAuggie" => HostMethod::CheckAuggie,
+        _ => return None,
+    };
+    // `parsed.params || {}`: a non-object (absent/null/array/scalar) yields `{}`,
+    // matching the events fast-path classifier so handlers run the same
+    // required-param checks regardless of the wire shape.
+    let params = obj
+        .get("params")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     Some(HostRequest {
+        method,
         id_present: id_member.is_some(),
         id_echo: id_member.cloned().unwrap_or(Value::Null),
+        params,
     })
 }
 
@@ -78,22 +114,122 @@ pub(crate) fn host_status_json(
     result
 }
 
-/// Handle a classified `host.status` request: probe the host and render the
-/// result frame (or `None` for a notification, which gets no reply). `is_local`
-/// is the resolved locality of the serving connection (§5.14).
-pub(crate) fn handle(req: HostRequest, is_local: bool) -> Option<String> {
-    let result = host_status_json(
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        &local_hostname(),
-        detect_has_display(),
-        detect_display_server().as_deref(),
-        is_local,
-    );
-    if !req.id_present {
+/// Handle a classified `host.*` request: build the response frame (or `None`
+/// for a notification, which gets no reply). `is_local` is the resolved
+/// locality of the serving connection (§5.14). The host-services methods
+/// (`checkGit`/`listDirectory`/`directoryStatus`/`checkAuggie`) run their
+/// filesystem / subprocess work on a blocking thread so the async runtime
+/// stays free; `checkAuggie` consults `api.settings_get` for
+/// `context.auggiePath` and `providers.paths.auggie` before falling back to
+/// the canonical resolver in `intent_services::auggie_discovery`.
+pub(crate) async fn handle(
+    req: HostRequest,
+    api: &dyn WorkspaceApi,
+    is_local: bool,
+) -> Option<String> {
+    let HostRequest {
+        method,
+        id_present,
+        id_echo,
+        params,
+    } = req;
+    let frame = match method {
+        HostMethod::Status => {
+            let result = host_status_json(
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                &local_hostname(),
+                detect_has_display(),
+                detect_display_server().as_deref(),
+                is_local,
+            );
+            success_frame(id_echo, result)
+        }
+        HostMethod::CheckGit => {
+            let result = tokio::task::spawn_blocking(host_ops::check_git)
+                .await
+                .unwrap_or_else(|_| json!({ "available": false }));
+            success_frame(id_echo, result)
+        }
+        HostMethod::ListDirectory => {
+            let path = params
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let join =
+                tokio::task::spawn_blocking(move || host_ops::list_directory(path.as_deref()))
+                    .await;
+            match join {
+                Ok(Ok(v)) => success_frame(id_echo, v),
+                Ok(Err(msg)) => error_frame(id_echo, -32603, &msg),
+                Err(e) => error_frame(id_echo, -32603, &format!("listDirectory join error: {e}")),
+            }
+        }
+        HostMethod::DirectoryStatus => {
+            let path = match params.get("path").and_then(Value::as_str) {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(
+                        id_echo,
+                        -32602,
+                        "Missing required parameter: path",
+                    ));
+                }
+            };
+            let join = tokio::task::spawn_blocking(move || host_ops::directory_status(&path)).await;
+            match join {
+                Ok(v) => success_frame(id_echo, v),
+                Err(e) => error_frame(id_echo, -32603, &format!("directoryStatus join error: {e}")),
+            }
+        }
+        HostMethod::CheckAuggie => {
+            let configured = configured_auggie_path(api).await;
+            let join =
+                tokio::task::spawn_blocking(move || host_ops::check_auggie(configured.as_deref()))
+                    .await;
+            let result = join.unwrap_or_else(|_| json!({ "available": false }));
+            success_frame(id_echo, result)
+        }
+    };
+    if !id_present {
         return None;
     }
-    Some(success_frame(req.id_echo, result))
+    Some(frame)
+}
+
+/// Read the user-configured auggie path from settings, preferring the explicit
+/// `context.auggiePath` and falling back to `providers.paths.auggie`. Returns
+/// `None` when neither is set (the caller then uses
+/// `intent_services::auggie_discovery::find_auggie`).
+async fn configured_auggie_path(api: &dyn WorkspaceApi) -> Option<String> {
+    if let Some(v) = read_setting_string(api, "context.auggiePath").await {
+        return Some(v);
+    }
+    if let Ok(payload) = api.settings_get("providers.paths".to_string()).await {
+        if let Some(map) = payload.get("value").and_then(Value::as_object) {
+            if let Some(s) = map.get("auggie").and_then(Value::as_str) {
+                if !s.trim().is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read a single string-valued setting; returns `None` for missing / null /
+/// non-string / blank values, or when the lookup itself fails.
+async fn read_setting_string(api: &dyn WorkspaceApi, path: &str) -> Option<String> {
+    let payload = api.settings_get(path.to_string()).await.ok()?;
+    let s = payload.get("value")?.as_str()?;
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
 }
 
 /// Opens a URL/file on the daemon host's GUI. Injected so the local path is

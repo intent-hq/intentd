@@ -1,12 +1,38 @@
-//! Unit tests for the `host.*` capability probe fast-path (§5.14).
+//! Unit tests for the `host.*` capability probe fast-path (§5.14) and the
+//! additive `host.*` host-services (`checkGit` / `listDirectory` /
+//! `directoryStatus` / `checkAuggie`).
 
 use std::sync::Mutex;
 
+use intent_core::BoxFuture;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use super::*;
 use crate::reverse::ReverseChannel;
+
+/// Minimal `WorkspaceApi` for the host fast-path tests. `settings_get` returns
+/// the trait default (`Err(Internal)`), so `configured_auggie_path` always
+/// resolves to `None` and `host.checkAuggie` falls through to discovery.
+struct NoopApi;
+
+impl intent_core::WorkspaceApi for NoopApi {}
+
+/// `WorkspaceApi` that returns a configured value for `context.auggiePath` so
+/// `host.checkAuggie` exercises the settings-precedence branch in
+/// `configured_auggie_path` without hitting real settings storage.
+struct AuggiePathApi(String);
+
+impl intent_core::WorkspaceApi for AuggiePathApi {
+    fn settings_get(&self, path: String) -> BoxFuture<'_, intent_core::Result<Value>> {
+        let v = if path == "context.auggiePath" {
+            json!({ "path": path, "value": self.0 })
+        } else {
+            json!({ "path": path, "value": Value::Null })
+        };
+        Box::pin(async move { Ok(v) })
+    }
+}
 
 /// An [`ExternalOpener`] that records opened URLs and can be told to fail.
 struct RecordingOpener {
@@ -144,11 +170,24 @@ fn resolve_locality_per_transport_and_override() {
 }
 
 #[test]
-fn classify_only_matches_host_status() {
+fn classify_matches_host_status_and_host_services() {
     assert!(classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "host.status" })).is_some());
     // Notification shape (no id) still classifies; handling returns no frame.
     assert!(classify(&json!({ "jsonrpc": "2.0", "method": "host.status" })).is_some());
-    // Other methods / wrong version / bad id fall through.
+    // The additive host-services classify too.
+    assert!(classify(&json!({ "jsonrpc": "2.0", "id": 2, "method": "host.checkGit" })).is_some());
+    assert!(classify(
+        &json!({ "jsonrpc": "2.0", "id": 3, "method": "host.listDirectory", "params": { "path": "/tmp" } })
+    )
+    .is_some());
+    assert!(classify(
+        &json!({ "jsonrpc": "2.0", "id": 4, "method": "host.directoryStatus", "params": { "path": "/tmp" } })
+    )
+    .is_some());
+    assert!(
+        classify(&json!({ "jsonrpc": "2.0", "id": 5, "method": "host.checkAuggie" })).is_some()
+    );
+    // `host.openExternal` (FE-served reverse RPC) / wrong version / bad id fall through.
     assert!(
         classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "host.openExternal" })).is_none()
     );
@@ -175,10 +214,12 @@ fn status_json_remote_omits_absent_display_server() {
     assert_eq!(v.get("displayServer"), None, "omitted when not detected");
 }
 
-#[test]
-fn handle_status_returns_a_response_frame() {
+#[tokio::test]
+async fn handle_status_returns_a_response_frame() {
     let req = classify(&json!({ "jsonrpc": "2.0", "id": 7, "method": "host.status" })).unwrap();
-    let frame = handle(req, true).expect("status has a response");
+    let frame = handle(req, &NoopApi, true)
+        .await
+        .expect("status has a response");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["id"], 7);
     assert_eq!(parsed["result"]["locality"], "local");
@@ -188,16 +229,112 @@ fn handle_status_returns_a_response_frame() {
     assert!(parsed["result"]["hasDisplay"].is_boolean());
 }
 
-#[test]
-fn handle_remote_reports_remote_locality() {
+#[tokio::test]
+async fn handle_remote_reports_remote_locality() {
     let req = classify(&json!({ "jsonrpc": "2.0", "id": 8, "method": "host.status" })).unwrap();
-    let frame = handle(req, false).expect("status has a response");
+    let frame = handle(req, &NoopApi, false)
+        .await
+        .expect("status has a response");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["result"]["locality"], "remote");
 }
 
-#[test]
-fn handle_notification_gets_no_response() {
+#[tokio::test]
+async fn handle_notification_gets_no_response() {
     let req = classify(&json!({ "jsonrpc": "2.0", "method": "host.status" })).unwrap();
-    assert!(handle(req, true).is_none(), "a notification gets no reply");
+    assert!(
+        handle(req, &NoopApi, true).await.is_none(),
+        "a notification gets no reply"
+    );
+}
+
+#[tokio::test]
+async fn handle_check_git_returns_available_boolean() {
+    let req = classify(&json!({ "jsonrpc": "2.0", "id": 10, "method": "host.checkGit" })).unwrap();
+    let frame = handle(req, &NoopApi, true)
+        .await
+        .expect("checkGit always replies");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 10);
+    assert!(
+        parsed["result"]["available"].is_boolean(),
+        "available is always present"
+    );
+}
+
+#[tokio::test]
+async fn handle_directory_status_requires_path() {
+    let req = classify(
+        &json!({ "jsonrpc": "2.0", "id": 11, "method": "host.directoryStatus", "params": {} }),
+    )
+    .unwrap();
+    let frame = handle(req, &NoopApi, true)
+        .await
+        .expect("missing path produces an error frame");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 11);
+    assert_eq!(parsed["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn handle_directory_status_reports_existing_directory() {
+    // The CWD is guaranteed to exist on every host the test runs on.
+    let cwd = std::env::current_dir().unwrap();
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "host.directoryStatus",
+        "params": { "path": cwd.to_string_lossy() }
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, true)
+        .await
+        .expect("directoryStatus replies");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 12);
+    assert_eq!(parsed["result"]["exists"], true);
+    assert_eq!(parsed["result"]["isDirectory"], true);
+}
+
+#[tokio::test]
+async fn handle_list_directory_returns_entries_for_cwd() {
+    let cwd = std::env::current_dir().unwrap();
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 13,
+        "method": "host.listDirectory",
+        "params": { "path": cwd.to_string_lossy() }
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, true)
+        .await
+        .expect("listDirectory replies");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 13);
+    assert!(parsed["result"]["entries"].is_array());
+    assert!(parsed["result"]["path"].is_string());
+}
+
+#[tokio::test]
+async fn handle_check_auggie_uses_configured_path() {
+    // Even when the configured path doesn't exist on the host, `available:false`
+    // is the expected shape. We only assert that the response is well-formed.
+    let api = AuggiePathApi("/definitely/does/not/exist/auggie-xyzzy".to_string());
+    let req =
+        classify(&json!({ "jsonrpc": "2.0", "id": 14, "method": "host.checkAuggie" })).unwrap();
+    let frame = handle(req, &api, true)
+        .await
+        .expect("checkAuggie always replies");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 14);
+    assert!(parsed["result"]["available"].is_boolean());
+}
+
+#[tokio::test]
+async fn handle_check_auggie_notification_gets_no_response() {
+    let req = classify(&json!({ "jsonrpc": "2.0", "method": "host.checkAuggie" })).unwrap();
+    assert!(
+        handle(req, &NoopApi, true).await.is_none(),
+        "a notification gets no reply"
+    );
 }

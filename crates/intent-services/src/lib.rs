@@ -73,6 +73,15 @@ pub use mcp_servers::McpHub;
 pub use settings::{InMemorySecretStore, KeyringSecretStore, SecretStore};
 pub use terminal_ops::PtyTerminalHost;
 
+/// Re-export the auggie discovery surface so the transport layer can reuse the
+/// canonical resolver (`find_auggie`, managed binary, enhanced PATH) without
+/// taking a direct dependency on `intent-context` (§3.2 rule 2).
+pub mod auggie_discovery {
+    pub use intent_context::discovery::{
+        enhanced_path_dirs, find_auggie, find_in_dirs, managed_binary_path,
+    };
+}
+
 pub use agent_manager::{
     compute_process_cap, default_process_cap, AgentManager, BusEventSink, ProcessRegistry,
 };
