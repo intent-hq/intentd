@@ -2164,6 +2164,67 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `sentry.listProjects`: projects for the configured organization as a
+    /// bare `SentryProject[]` (PROTOCOL §5.29).
+    fn sentry_list_projects(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = limit;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sentry_list_projects not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sentry.getIssue`: a single flattened `SentryIssueResult` looked up by
+    /// numeric/UUID id or shortId (e.g. `WEB-1`). The router enforces that at
+    /// least one of `id`/`shortId` is supplied (PROTOCOL §5.29).
+    fn sentry_get_issue(&self, id_or_short_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = id_or_short_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sentry_get_issue not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sentry.resolveIssue`: mutate the issue's status to `resolved` and
+    /// return the updated flattened issue (PROTOCOL §5.29).
+    fn sentry_resolve_issue(&self, id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sentry_resolve_issue not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sentry.ignoreIssue`: mutate the issue's status to `ignored` and return
+    /// the updated flattened issue (PROTOCOL §5.29).
+    fn sentry_ignore_issue(&self, id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sentry_ignore_issue not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sentry.assignIssue`: assign the issue to `assignedTo` (an explicit
+    /// `null`/absent unassigns) and return the updated flattened issue
+    /// (PROTOCOL §5.29).
+    fn sentry_assign_issue(
+        &self,
+        id: String,
+        assigned_to: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, assigned_to);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sentry_assign_issue not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `file-tracking.init`: initialize/attach the tracker for a workspace
     /// (`{ ok: true }`) (PROTOCOL §5.19).
     fn file_tracking_init(

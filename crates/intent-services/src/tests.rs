@@ -5984,7 +5984,7 @@ mod sentry {
     use intent_core::WorkspaceApi;
     use intent_sentry::{
         Error as SentryError, FetchIssuesRequest, Result as SentryResult, SentryAuthState,
-        SentryEngine, SentryIssueLevel, SentryIssueResult, SentryIssueStatus,
+        SentryEngine, SentryIssueLevel, SentryIssueResult, SentryIssueStatus, SentryProject,
     };
 
     use super::*;
@@ -6057,6 +6057,51 @@ mod sentry {
             }
             Ok(vec![Self::issue()])
         }
+
+        async fn list_projects(&self, _limit: Option<u32>) -> SentryResult<Vec<SentryProject>> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(vec![SentryProject {
+                id: "p1".into(),
+                slug: "web".into(),
+                name: "Web".into(),
+                platform: Some("javascript".into()),
+                is_member: Some(true),
+            }])
+        }
+
+        async fn get_issue(&self, _id_or_short_id: &str) -> SentryResult<SentryIssueResult> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(Self::issue())
+        }
+
+        async fn resolve_issue(&self, _id: &str) -> SentryResult<SentryIssueResult> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(Self::issue())
+        }
+
+        async fn ignore_issue(&self, _id: &str) -> SentryResult<SentryIssueResult> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(Self::issue())
+        }
+
+        async fn assign_issue(
+            &self,
+            _id: &str,
+            _assigned_to: Option<&str>,
+        ) -> SentryResult<SentryIssueResult> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(Self::issue())
+        }
     }
 
     async fn svc(fail: bool) -> (TempDb, Services) {
@@ -6079,6 +6124,26 @@ mod sentry {
         ));
         assert!(matches!(
             s.sentry_search_issues("boom".into(), None, None).await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            s.sentry_list_projects(None).await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            s.sentry_get_issue("1".into()).await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            s.sentry_resolve_issue("1".into()).await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            s.sentry_ignore_issue("1".into()).await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            s.sentry_assign_issue("1".into(), Some("u1".into())).await,
             Err(Error::Internal(_))
         ));
     }
@@ -6111,6 +6176,34 @@ mod sentry {
             assert!(arr.is_array(), "expected bare array, got {arr}");
             assert!(arr.get("items").is_none(), "no envelope");
             assert_eq!(arr[0]["shortId"], "PROJ-1");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_projects_returns_bare_array() {
+        let (_tmp, s) = svc(false).await;
+        let v = s.sentry_list_projects(None).await.unwrap();
+        assert!(v.is_array(), "expected bare array, got {v}");
+        assert!(v.get("items").is_none(), "no envelope");
+        assert_eq!(v[0]["slug"], "web");
+        assert_eq!(v[0]["isMember"], true);
+    }
+
+    #[tokio::test]
+    async fn p1_get_and_p2_writes_return_bare_object() {
+        let (_tmp, s) = svc(false).await;
+        for v in [
+            s.sentry_get_issue("WEB-1".into()).await.unwrap(),
+            s.sentry_resolve_issue("1".into()).await.unwrap(),
+            s.sentry_ignore_issue("1".into()).await.unwrap(),
+            s.sentry_assign_issue("1".into(), Some("user-1".into()))
+                .await
+                .unwrap(),
+            s.sentry_assign_issue("1".into(), None).await.unwrap(),
+        ] {
+            assert!(v.is_object(), "expected bare object, got {v}");
+            assert_eq!(v["shortId"], "PROJ-1");
+            assert!(v.get("items").is_none(), "no envelope");
         }
     }
 }

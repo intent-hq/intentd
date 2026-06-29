@@ -6,13 +6,13 @@
 //! [`SentryIssueResult`] so the wire shape stays identical to the FE.
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::client::SentryClient;
 use crate::error::{Error, Result};
 use crate::model::{
     FetchIssuesRequest, IssueStatusFilter, SentryAuthState, SentryIssueLevel, SentryIssueResult,
-    SentryIssueStatus,
+    SentryIssueStatus, SentryProject,
 };
 
 /// Default page size when the caller does not specify one (matches the FE).
@@ -37,6 +37,29 @@ pub trait SentryEngine: Send + Sync {
         project: Option<&str>,
         limit: Option<u32>,
     ) -> Result<Vec<SentryIssueResult>>;
+
+    /// List projects for the configured organization (P1 read).
+    /// `GET /organizations/{org}/projects/`.
+    async fn list_projects(&self, limit: Option<u32>) -> Result<Vec<SentryProject>>;
+
+    /// Fetch a single issue by id or shortId (P1 read).
+    ///
+    /// String shape selects the path: a shortId (e.g. `WEB-1`) is resolved via
+    /// a `?query=` lookup on the org `/issues/` endpoint; everything else is
+    /// fetched directly from `GET /organizations/{org}/issues/{id}/`.
+    async fn get_issue(&self, id_or_short_id: &str) -> Result<SentryIssueResult>;
+
+    /// Mutate an issue's status to `resolved` (P2 write).
+    /// `PUT /organizations/{org}/issues/{id}/` body `{"status":"resolved"}`.
+    async fn resolve_issue(&self, id: &str) -> Result<SentryIssueResult>;
+
+    /// Mutate an issue's status to `ignored` (P2 write).
+    /// `PUT /organizations/{org}/issues/{id}/` body `{"status":"ignored"}`.
+    async fn ignore_issue(&self, id: &str) -> Result<SentryIssueResult>;
+
+    /// Assign an issue (P2 write). `assigned_to=None` clears the assignment
+    /// (`{"assignedTo": null}`). `PUT /organizations/{org}/issues/{id}/`.
+    async fn assign_issue(&self, id: &str, assigned_to: Option<&str>) -> Result<SentryIssueResult>;
 }
 
 /// REST-backed [`SentryEngine`] over [`SentryClient`].
@@ -97,6 +120,61 @@ impl SentryEngine for SentryEngineImpl {
         })
         .await
     }
+
+    async fn list_projects(&self, limit: Option<u32>) -> Result<Vec<SentryProject>> {
+        let path = format!("/organizations/{}/projects/", self.client.organization());
+        let lim = clamp_limit(limit).to_string();
+        let params: Vec<(&str, &str)> = vec![("limit", &lim)];
+        let data = self.client.get_with_query(&path, &params).await?;
+        Ok(map_project_nodes(&data))
+    }
+
+    async fn get_issue(&self, id_or_short_id: &str) -> Result<SentryIssueResult> {
+        if looks_like_short_id(id_or_short_id) {
+            let path = format!("/organizations/{}/issues/", self.client.organization());
+            let params: Vec<(&str, &str)> = vec![("query", id_or_short_id), ("limit", "1")];
+            let data = self.client.get_with_query(&path, &params).await?;
+            let first = data
+                .as_array()
+                .and_then(|arr| arr.first())
+                .ok_or_else(|| Error::NotFound(format!("issue {id_or_short_id} not found")))?;
+            map_issue(first).ok_or_else(|| Error::Api("malformed issue payload".to_string()))
+        } else {
+            let path = format!(
+                "/organizations/{}/issues/{}/",
+                self.client.organization(),
+                id_or_short_id
+            );
+            let data = self.client.get(&path).await?;
+            map_issue(&data).ok_or_else(|| Error::Api("malformed issue payload".to_string()))
+        }
+    }
+
+    async fn resolve_issue(&self, id: &str) -> Result<SentryIssueResult> {
+        self.mutate_issue(id, json!({ "status": "resolved" })).await
+    }
+
+    async fn ignore_issue(&self, id: &str) -> Result<SentryIssueResult> {
+        self.mutate_issue(id, json!({ "status": "ignored" })).await
+    }
+
+    async fn assign_issue(&self, id: &str, assigned_to: Option<&str>) -> Result<SentryIssueResult> {
+        self.mutate_issue(id, build_assign_body(assigned_to)).await
+    }
+}
+
+impl SentryEngineImpl {
+    /// Shared `PUT` path for the three P2 write arms. Mutates the issue and
+    /// returns the flattened result.
+    async fn mutate_issue(&self, id: &str, body: Value) -> Result<SentryIssueResult> {
+        let path = format!(
+            "/organizations/{}/issues/{}/",
+            self.client.organization(),
+            id
+        );
+        let data = self.client.put_json(&path, body).await?;
+        map_issue(&data).ok_or_else(|| Error::Api("malformed issue payload".to_string()))
+    }
 }
 
 /// Clamp an optional limit into `[1, MAX_LIMIT]`, defaulting when absent.
@@ -154,6 +232,65 @@ pub(crate) fn map_issue_nodes(data: &Value) -> Vec<SentryIssueResult> {
     data.as_array()
         .map(|arr| arr.iter().filter_map(map_issue).collect())
         .unwrap_or_default()
+}
+
+/// Map the JSON array returned by `/projects/` into flattened
+/// [`SentryProject`]s. Non-array bodies map to an empty list.
+pub(crate) fn map_project_nodes(data: &Value) -> Vec<SentryProject> {
+    data.as_array()
+        .map(|arr| arr.iter().filter_map(map_project).collect())
+        .unwrap_or_default()
+}
+
+/// Map a single raw Sentry project node. Returns `None` when required fields
+/// (`id`/`slug`/`name`) are missing.
+pub(crate) fn map_project(node: &Value) -> Option<SentryProject> {
+    let id = str_field(node, "id")?;
+    let slug = str_field(node, "slug")?;
+    let name = str_field(node, "name")?;
+    Some(SentryProject {
+        id,
+        slug,
+        name,
+        platform: str_field(node, "platform"),
+        is_member: node.get("isMember").and_then(Value::as_bool),
+    })
+}
+
+/// Detect a Sentry issue shortId like `WEB-1` / `PROJ-123`: an uppercase
+/// alphanumeric prefix (starting with a letter), a `-`, and a digits-only
+/// suffix. Numeric ids and UUIDs return `false`.
+pub(crate) fn looks_like_short_id(s: &str) -> bool {
+    let mut parts = s.splitn(2, '-');
+    let prefix = parts.next().unwrap_or_default();
+    let suffix = parts.next().unwrap_or_default();
+    if prefix.is_empty() || suffix.is_empty() {
+        return false;
+    }
+    if !prefix
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_uppercase())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if !prefix
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
+        return false;
+    }
+    suffix.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Build the `PUT /issues/{id}/` body for `assignIssue`. `None` clears the
+/// assignment (`{"assignedTo": null}`); `Some(user)` assigns to that user.
+pub(crate) fn build_assign_body(assigned_to: Option<&str>) -> Value {
+    match assigned_to {
+        Some(s) => json!({ "assignedTo": s }),
+        None => json!({ "assignedTo": Value::Null }),
+    }
 }
 
 /// Flatten a single raw Sentry issue node into [`SentryIssueResult`]. Returns
@@ -383,5 +520,71 @@ mod tests {
         ]));
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].id, "x");
+    }
+
+    #[test]
+    fn maps_project_node_with_optional_fields() {
+        let p = map_project(&json!({
+            "id": "1", "slug": "web", "name": "Web",
+            "platform": "javascript", "isMember": true,
+        }))
+        .expect("project");
+        assert_eq!(p.id, "1");
+        assert_eq!(p.slug, "web");
+        assert_eq!(p.platform.as_deref(), Some("javascript"));
+        assert_eq!(p.is_member, Some(true));
+    }
+
+    #[test]
+    fn maps_project_node_without_optional_fields() {
+        let p = map_project(&json!({ "id": "2", "slug": "api", "name": "API" })).expect("project");
+        assert!(p.platform.is_none());
+        assert!(p.is_member.is_none());
+    }
+
+    #[test]
+    fn skips_invalid_projects() {
+        assert!(map_project(&json!({ "slug": "x", "name": "x" })).is_none());
+        assert!(map_project(&json!({ "id": "1", "name": "x" })).is_none());
+        assert!(map_project(&json!({ "id": "1", "slug": "x" })).is_none());
+    }
+
+    #[test]
+    fn maps_project_nodes_array_or_empty() {
+        assert!(map_project_nodes(&json!(null)).is_empty());
+        assert!(map_project_nodes(&json!({})).is_empty());
+        let v = map_project_nodes(&json!([
+            { "id": "1", "slug": "web", "name": "Web" },
+            { "id": "2", "slug": "api", "name": "API" },
+        ]));
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[1].slug, "api");
+    }
+
+    #[test]
+    fn detects_short_id_by_shape() {
+        assert!(looks_like_short_id("WEB-1"));
+        assert!(looks_like_short_id("PROJ-123"));
+        assert!(looks_like_short_id("WEB42-7"));
+        // numeric ids and UUIDs are NOT short ids.
+        assert!(!looks_like_short_id("123"));
+        assert!(!looks_like_short_id("abc-1"));
+        assert!(!looks_like_short_id("WEB"));
+        assert!(!looks_like_short_id("WEB-"));
+        assert!(!looks_like_short_id("-1"));
+        assert!(!looks_like_short_id("WEB-1a"));
+        assert!(!looks_like_short_id(""));
+        assert!(!looks_like_short_id("550e8400-e29b-41d4-a716-446655440000"));
+    }
+
+    #[test]
+    fn assign_body_serializes_with_explicit_null() {
+        // None → explicit null (unassign).
+        let v = build_assign_body(None);
+        assert_eq!(v["assignedTo"], Value::Null);
+        assert!(v.as_object().unwrap().contains_key("assignedTo"));
+        // Some → string.
+        let v = build_assign_body(Some("user-1"));
+        assert_eq!(v["assignedTo"], "user-1");
     }
 }
