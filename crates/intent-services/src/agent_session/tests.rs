@@ -260,6 +260,8 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         is_active: true,
         messages: Vec::new(),
         stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
         created_at: ts.clone(),
         updated_at: ts,
     }

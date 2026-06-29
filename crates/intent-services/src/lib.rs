@@ -43,6 +43,7 @@ mod agent_manager;
 mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
+mod auto_commit;
 mod drafts;
 mod event_ops;
 pub mod events;
@@ -5253,8 +5254,16 @@ impl WorkspaceApi for Services {
                 idempotency_key,
                 "agent.create",
                 move || async move {
-                    self.agent_create_op(workspace_id, name, model, specialist_id, parent_agent_id)
-                        .await
+                    self.agent_create_op(
+                        workspace_id,
+                        name,
+                        model,
+                        specialist_id,
+                        parent_agent_id,
+                        None,
+                        false,
+                    )
+                    .await
                 },
             )
             .await

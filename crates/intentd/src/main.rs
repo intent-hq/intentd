@@ -279,6 +279,11 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
     // completion watch when their delegated child finishes. No-op-safe without
     // an event bus. Held for the process lifetime and aborted on clean shutdown.
     let completion_delivery = services.spawn_completion_delivery_loop();
+    // Auto-commit-on-idle worker (LNI-1, §5.6): subscribe to `agent:idle` and
+    // commit each task-linked agent's changes with `Agent-Id:` and
+    // `Linked-Note-Id:` trailers via `git_agent_commit`. No-op-safe without an
+    // event bus. Aborted on clean shutdown.
+    let auto_commit_loop = services.spawn_auto_commit_loop();
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group. Disabled entirely
     // when `agents.idleReapMinutes == 0`.
@@ -370,6 +375,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
     pr_refresh.abort();
     token_usage_scan.abort();
     completion_delivery.abort();
+    auto_commit_loop.abort();
     if let Some(reap_task) = reap_task {
         reap_task.abort();
     }

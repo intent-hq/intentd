@@ -394,7 +394,10 @@ impl Services {
     }
 
     /// `agent.create`: persist a new session; the process spawns lazily on first
-    /// turn (PROTOCOL §5.5).
+    /// turn (PROTOCOL §5.5). `task_note_id`/`skip_auto_commit` are set by
+    /// `agent.delegate` so the auto-commit-on-idle subscriber (LNI-1) can
+    /// resolve the `Linked-Note-Id:` trailer and honor the opt-out.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn agent_create_op(
         &self,
         workspace_id: WorkspaceId,
@@ -402,6 +405,8 @@ impl Services {
         model: Option<String>,
         specialist: Option<String>,
         parent_agent_id: Option<AgentId>,
+        task_note_id: Option<NoteId>,
+        skip_auto_commit: bool,
     ) -> Result<Value> {
         let now = now_iso();
         let name_explicitly_set = name.is_some();
@@ -423,6 +428,8 @@ impl Services {
             is_active: false,
             messages: Vec::new(),
             stats: None,
+            task_note_id,
+            skip_auto_commit,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -742,6 +749,10 @@ impl Services {
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
         let wait_mode = input.wait_mode.clone();
+        // Persist the task linkage + skipAutoCommit on the session so the
+        // auto-commit-on-idle subscriber (LNI-1) can resolve `Linked-Note-Id:`
+        // and honor the opt-out without a reverse lookup on every idle event.
+        let session_task_note_id = input.task_note_id.clone().or(input.note_id.clone());
         let created = self
             .agent_create_op(
                 workspace_id.clone(),
@@ -749,6 +760,8 @@ impl Services {
                 input.model,
                 input.specialist,
                 parent_agent_id.clone(),
+                session_task_note_id,
+                input.skip_auto_commit.unwrap_or(false),
             )
             .await?;
         let agent_id = created["agent"]["id"]
@@ -1305,7 +1318,15 @@ impl Services {
             return Ok(json!({ "ok": true, "agentId": agent, "created": false, "result": result }));
         }
         let created = self
-            .agent_create_op(workspace_id.clone(), None, model, None, None)
+            .agent_create_op(
+                workspace_id.clone(),
+                None,
+                model,
+                None,
+                None,
+                Some(task_note_id.clone()),
+                false,
+            )
             .await?;
         let agent_id = created["agent"]["id"]
             .as_str()

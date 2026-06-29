@@ -1260,6 +1260,18 @@ pub struct AgentSession {
     pub messages: Vec<AgentMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<SessionStats>,
+    /// Task note this agent is linked to (set on `agent.delegate` when
+    /// `taskNoteId`/`noteId` is provided). Drives the `Linked-Note-Id:` trailer
+    /// resolution for the daemon-side auto-commit-on-idle subscriber (LNI-1).
+    /// `None` for non-task agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_note_id: Option<NoteId>,
+    /// Opt-out flag forwarded from `agent.delegate`'s `skipAutoCommit`. When
+    /// `true`, the auto-commit-on-idle subscriber skips this session even if it
+    /// is task-linked (LNI-1). Omitted from the wire when `false` to preserve
+    /// the TS `AgentSession` shape for non-opted-out sessions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_auto_commit: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1350,7 +1362,7 @@ impl AgentLite {
             is_background: false,
             specialist: session.specialist,
             created_by_agent_id: session.parent_agent_id.clone(),
-            task_note_id: None,
+            task_note_id: session.task_note_id.clone(),
         };
         Self {
             id: session.id,
@@ -2188,6 +2200,8 @@ mod tests {
             is_active: true,
             messages: vec![],
             stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
         };
@@ -2231,6 +2245,8 @@ mod tests {
                 created_at: "t0".to_string(),
             }],
             stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
         };

@@ -170,6 +170,8 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         is_active: true,
         messages: vec![],
         stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
         created_at: now_iso(),
         updated_at: now_iso(),
     };
@@ -4215,6 +4217,8 @@ mod search_adapters {
             is_active: false,
             messages: vec![],
             stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
             created_at: ts.clone(),
             updated_at: ts.clone(),
         };
