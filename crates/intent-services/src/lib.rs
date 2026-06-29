@@ -6895,6 +6895,75 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn sentry_list_projects(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.sentry_engine.clone();
+        Box::pin(async move {
+            let engine = sentry_ops::resolve_engine(injected)?;
+            let projects = engine
+                .list_projects(sentry_ops::wire_limit(limit))
+                .await
+                .map_err(sentry_ops::map_sentry_err)?;
+            serde_json::to_value(projects)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    fn sentry_get_issue(&self, id_or_short_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.sentry_engine.clone();
+        Box::pin(async move {
+            let engine = sentry_ops::resolve_engine(injected)?;
+            let issue = engine
+                .get_issue(&id_or_short_id)
+                .await
+                .map_err(sentry_ops::map_sentry_err)?;
+            serde_json::to_value(issue)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    fn sentry_resolve_issue(&self, id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.sentry_engine.clone();
+        Box::pin(async move {
+            let engine = sentry_ops::resolve_engine(injected)?;
+            let issue = engine
+                .resolve_issue(&id)
+                .await
+                .map_err(sentry_ops::map_sentry_err)?;
+            serde_json::to_value(issue)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    fn sentry_ignore_issue(&self, id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.sentry_engine.clone();
+        Box::pin(async move {
+            let engine = sentry_ops::resolve_engine(injected)?;
+            let issue = engine
+                .ignore_issue(&id)
+                .await
+                .map_err(sentry_ops::map_sentry_err)?;
+            serde_json::to_value(issue)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    fn sentry_assign_issue(
+        &self,
+        id: String,
+        assigned_to: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.sentry_engine.clone();
+        Box::pin(async move {
+            let engine = sentry_ops::resolve_engine(injected)?;
+            let issue = engine
+                .assign_issue(&id, assigned_to.as_deref())
+                .await
+                .map_err(sentry_ops::map_sentry_err)?;
+            serde_json::to_value(issue)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
     fn file_tracking_init(
         &self,
         workspace_id: WorkspaceId,

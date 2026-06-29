@@ -95,6 +95,39 @@ impl SentryClient {
         let body: Value = resp.json().await?;
         Ok(body)
     }
+
+    /// Execute `PUT {base}{path}` with `body` as JSON and return the parsed
+    /// JSON response. Used for the P2 write mutations (`resolveIssue`,
+    /// `ignoreIssue`, `assignIssue`).
+    pub async fn put_json(&self, path: &str, body: Value) -> Result<Value> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .http
+            .put(&url)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", self.token),
+            )
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(Error::Auth(format!("sentry returned {status}")));
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(Error::NotFound(format!("sentry returned {status}")));
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(Error::RateLimited(format!("sentry returned {status}")));
+        }
+        if !status.is_success() {
+            return Err(Error::Api(format!("sentry returned {status}")));
+        }
+        let body: Value = resp.json().await?;
+        Ok(body)
+    }
 }
 
 #[cfg(test)]

@@ -27,7 +27,7 @@ pub use engine::{SentryEngine, SentryEngineImpl};
 pub use error::{Error, Result};
 pub use model::{
     FetchIssuesRequest, IssueStatusFilter, SentryAuthState, SentryIssueLevel, SentryIssueResult,
-    SentryIssueStatus,
+    SentryIssueStatus, SentryProject,
 };
 pub use registry::{SentryRegistry, SentrySettings};
 pub use token::{Credentials, TokenSource};

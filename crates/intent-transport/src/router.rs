@@ -1501,6 +1501,43 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "sentry.listProjects" => {
+            let limit = opt_int(params, "limit");
+            let r = api
+                .sentry_list_projects(limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sentry.getIssue" => {
+            // Either `id` or `shortId` is required; both missing → `-32602`.
+            let id = opt_str(params, "id")
+                .or_else(|| opt_str(params, "shortId"))
+                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: id"))?;
+            let r = api.sentry_get_issue(id).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sentry.resolveIssue" => {
+            let id = require_non_empty_str(params, "id")?;
+            let r = api.sentry_resolve_issue(id).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sentry.ignoreIssue" => {
+            let id = require_non_empty_str(params, "id")?;
+            let r = api.sentry_ignore_issue(id).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sentry.assignIssue" => {
+            // `id` is required; `assignedTo` is optional — an absent value
+            // unassigns the issue.
+            let id = require_non_empty_str(params, "id")?;
+            let assigned_to = opt_str(params, "assignedTo");
+            let r = api
+                .sentry_assign_issue(id, assigned_to)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "file-tracking.init" => {
             let ws = require_ws_note(params)?;
             let r = api.file_tracking_init(ws).await.map_err(domain_to_rpc)?;

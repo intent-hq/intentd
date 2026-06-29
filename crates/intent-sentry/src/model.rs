@@ -72,6 +72,22 @@ pub struct SentryAuthState {
     pub error: Option<String>,
 }
 
+/// Project descriptor returned by `sentry.listProjects` (P1 read).
+///
+/// Mirrors the FE `SentryProject` (`sentry-auth/types.ts`) field-for-field
+/// (`id`, `slug`, `name`, optional `platform`, optional `isMember`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SentryProject {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_member: Option<bool>,
+}
+
 /// The flattened issue shape returned by `sentry.listIssues` /
 /// `sentry.searchIssues`.
 ///
@@ -164,6 +180,28 @@ mod tests {
         assert!(v.get("culprit").is_none());
         assert!(v.get("value").is_none());
         assert!(v.get("function").is_none());
+    }
+
+    #[test]
+    fn project_serializes_camel_case_and_omits_none() {
+        let p = SentryProject {
+            id: "p1".into(),
+            slug: "web".into(),
+            name: "Web".into(),
+            platform: None,
+            is_member: Some(true),
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["slug"], "web");
+        assert_eq!(v["isMember"], true);
+        assert!(v.get("platform").is_none());
+
+        let p: SentryProject = serde_json::from_value(serde_json::json!({
+            "id": "p2", "slug": "api", "name": "API", "platform": "python",
+        }))
+        .unwrap();
+        assert_eq!(p.platform.as_deref(), Some("python"));
+        assert!(p.is_member.is_none());
     }
 
     #[test]

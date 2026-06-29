@@ -1436,6 +1436,91 @@ async fn linear_update_issue_with_issue_id_routes_past_param_validation() {
     assert_eq!(err_code(&v), -32603);
 }
 
+#[tokio::test]
+async fn sentry_p1_read_arms_route() {
+    // `FakeApi` uses the trait default (`-32603`), so a routed arm means the
+    // method dispatched rather than being reported as unknown (`-32601`).
+    for msg in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"sentry.listProjects","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"sentry.listProjects","params":{"limit":50}}"#,
+    ] {
+        let v = call(msg).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "msg={msg}");
+    }
+}
+
+#[tokio::test]
+async fn sentry_get_issue_missing_id_and_short_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"sentry.getIssue","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: id")
+    );
+}
+
+#[tokio::test]
+async fn sentry_get_issue_routes_with_id_or_short_id() {
+    for params in [r#"{"id":"1"}"#, r#"{"shortId":"WEB-1"}"#] {
+        let msg =
+            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"sentry.getIssue","params":{params}}}"#);
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "params={params}");
+    }
+}
+
+#[tokio::test]
+async fn sentry_write_arms_require_non_empty_id() {
+    for method in [
+        "sentry.resolveIssue",
+        "sentry.ignoreIssue",
+        "sentry.assignIssue",
+    ] {
+        // Missing `id` → `-32602`.
+        let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{}}}}"#);
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "{method}");
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!("Missing required parameter: id"),
+            "{method}"
+        );
+
+        // Empty `id` → `-32602`.
+        let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"id":""}}}}"#);
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "{method}");
+    }
+}
+
+#[tokio::test]
+async fn sentry_write_arms_route_with_id() {
+    for method in ["sentry.resolveIssue", "sentry.ignoreIssue"] {
+        let msg =
+            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"id":"1"}}}}"#);
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "{method}");
+    }
+}
+
+#[tokio::test]
+async fn sentry_assign_issue_routes_with_or_without_assigned_to() {
+    // assignedTo absent → unassign; both routes past param validation.
+    for params in [
+        r#"{"id":"1"}"#,
+        r#"{"id":"1","assignedTo":"user-1"}"#,
+        r#"{"id":"1","assignedTo":null}"#,
+    ] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"sentry.assignIssue","params":{params}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "params={params}");
+    }
+}
+
 fn err_code(v: &Value) -> i64 {
     v["error"]["code"].as_i64().expect("error code")
 }
