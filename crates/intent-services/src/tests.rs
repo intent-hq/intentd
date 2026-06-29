@@ -5404,6 +5404,77 @@ mod rules {
     }
 
     #[tokio::test]
+    async fn specialization_tier3_bundled_when_no_override_or_file() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+        // No override and no `.augment/agent-rules/task-loop.md` → bundled built-in,
+        // composed as common + workspace + specific (task-loop is a workspace agent).
+        let rules =
+            crate::rules::get_specialization_rules(&store, Some(&tree.0), "task-loop").await;
+        assert!(rules.contains("# Task Loop Agent"), "bundled specific body");
+        assert!(rules.contains("## Delegating Tasks"), "common layer");
+        assert!(rules.contains("# Space"), "workspace layer");
+    }
+
+    #[tokio::test]
+    async fn specialization_tier2_workspace_file_overrides_bundled() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+        let dir = tree.0.join(".augment").join("agent-rules");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("task-loop.md"), "WORKSPACE_FILE_RULES").unwrap();
+        let rules =
+            crate::rules::get_specialization_rules(&store, Some(&tree.0), "task-loop").await;
+        assert_eq!(rules, "WORKSPACE_FILE_RULES");
+    }
+
+    #[tokio::test]
+    async fn specialization_tier1_override_wins_over_file() {
+        let tree = worktree();
+        let (_tmp, store, svc, ws) = setup(&tree.0).await;
+        let dir = tree.0.join(".augment").join("agent-rules");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("task-loop.md"), "WORKSPACE_FILE_RULES").unwrap();
+        // Settings override wins over both the workspace file and the bundled default.
+        svc.rules_update(ws, "task-loop".into(), "OVERRIDE_RULES".into(), None)
+            .await
+            .unwrap();
+        let rules =
+            crate::rules::get_specialization_rules(&store, Some(&tree.0), "task-loop").await;
+        assert_eq!(rules, "OVERRIDE_RULES");
+    }
+
+    #[tokio::test]
+    async fn specialization_unknown_type_falls_back_to_workspace_body() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+        // The spawn default `interactive` is an unknown instruction id →
+        // fallbackToWorkspace (common + workspace + workspace).
+        let rules =
+            crate::rules::get_specialization_rules(&store, Some(&tree.0), "interactive").await;
+        assert!(rules.contains("# Space"), "workspace body present");
+        assert!(rules.contains("## Delegating Tasks"), "common prepended");
+    }
+
+    #[tokio::test]
+    async fn assembly_uses_bundled_specialization_when_no_override() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop")
+            .await
+            .expect("assembled prompt");
+        // Bundled specialization is injected, and the live workspace file still applies.
+        assert!(
+            prompt.contains("# Task Loop Agent"),
+            "bundled specialization"
+        );
+        assert!(
+            prompt.contains("ALWAYS run the linter."),
+            "live workspace file"
+        );
+    }
+
+    #[tokio::test]
     async fn update_emits_settings_changed() {
         let tree = worktree();
         let tmp = TempDb::new();

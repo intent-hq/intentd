@@ -8838,6 +8838,7 @@ pub mod file {}
 pub mod event {}
 
 // Agent-Ecosystem modules (§18).
+mod instructions;
 mod mcp_servers;
 mod memories;
 mod rules;
