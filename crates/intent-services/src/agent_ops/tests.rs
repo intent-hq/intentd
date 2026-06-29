@@ -251,6 +251,8 @@ async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
             Some("auggie:sonnet4.5".into()),
             None,
             None,
+            None,
+            false,
         )
         .await
         .expect("create");
@@ -283,6 +285,8 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
             None,
             Some("implementor".into()),
             None,
+            None,
+            false,
         )
         .await
         .expect("create");
@@ -313,6 +317,8 @@ async fn agent_lite_metadata_created_by_agent_id_from_parent() {
             None,
             None,
             Some(parent.clone()),
+            None,
+            false,
         )
         .await
         .expect("create child");
@@ -670,6 +676,8 @@ async fn report_to_parent_delivers_for_delegated_caller() {
             None,
             None,
             Some(parent.clone()),
+            None,
+            false,
         )
         .await
         .expect("create delegated child");

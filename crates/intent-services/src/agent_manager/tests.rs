@@ -611,6 +611,8 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         is_active: true,
         messages: Vec::new(),
         stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
         created_at: ts.clone(),
         updated_at: ts,
     };
@@ -830,6 +832,8 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         is_active: false,
         messages: Vec::new(),
         stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
         created_at: now_iso(),
         updated_at: now_iso(),
     }

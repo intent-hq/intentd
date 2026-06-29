@@ -5253,8 +5253,16 @@ impl WorkspaceApi for Services {
                 idempotency_key,
                 "agent.create",
                 move || async move {
-                    self.agent_create_op(workspace_id, name, model, specialist_id, parent_agent_id)
-                        .await
+                    self.agent_create_op(
+                        workspace_id,
+                        name,
+                        model,
+                        specialist_id,
+                        parent_agent_id,
+                        None,
+                        false,
+                    )
+                    .await
                 },
             )
             .await

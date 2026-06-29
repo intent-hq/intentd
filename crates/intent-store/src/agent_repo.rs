@@ -7,7 +7,9 @@
 //! and `provider` is **immutable** once set on first real use. `stats` (§19.2) is
 //! a derived snapshot and is never persisted — sessions load with `stats: None`.
 
-use intent_core::{AgentId, AgentMessage, AgentSession, AgentStatus, Error, Result, WorkspaceId};
+use intent_core::{
+    AgentId, AgentMessage, AgentSession, AgentStatus, Error, NoteId, Result, WorkspaceId,
+};
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 use uuid::Uuid;
@@ -16,7 +18,7 @@ use crate::{enum_from_db, enum_to_db, Store};
 
 const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session_id, name, \
     name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, \
-    parent_agent_id, specialist";
+    parent_agent_id, specialist, task_note_id, skip_auto_commit";
 
 impl Store {
     /// Insert an agent-session row. `messages`/`stats` are not persisted here;
@@ -24,7 +26,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&s.id.0)
@@ -42,6 +44,8 @@ impl Store {
             .bind(&s.updated_at)
             .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
             .bind(&s.specialist)
+            .bind(s.task_note_id.as_ref().map(|n| n.0.clone()))
+            .bind(s.skip_auto_commit as i64)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
@@ -103,7 +107,8 @@ impl Store {
         sqlx::query(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
-             updated_at=?, parent_agent_id=?, specialist=? WHERE id=?",
+             updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=? \
+             WHERE id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.acp_session_id)
@@ -117,6 +122,8 @@ impl Store {
         .bind(&s.updated_at)
         .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.specialist)
+        .bind(s.task_note_id.as_ref().map(|n| n.0.clone()))
+        .bind(s.skip_auto_commit as i64)
         .bind(&s.id.0)
         .execute(self.pool())
         .await
@@ -203,6 +210,7 @@ impl Store {
 fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
     let backend: Option<String> = col(row, "backend_session_id")?;
     let parent: Option<String> = col(row, "parent_agent_id")?;
+    let task_note: Option<String> = col(row, "task_note_id")?;
     Ok(AgentSession {
         id: AgentId(col(row, "id")?),
         workspace_id: WorkspaceId(col(row, "workspace_id")?),
@@ -220,6 +228,8 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         // Loaded separately by the caller; derived `stats` is never persisted.
         messages: Vec::new(),
         stats: None,
+        task_note_id: task_note.map(NoteId::from),
+        skip_auto_commit: col::<i64>(row, "skip_auto_commit")? != 0,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
     })
