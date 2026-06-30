@@ -240,3 +240,148 @@ fn directory_status_with_treats_empty_dir_as_empty() {
     assert_eq!(v["exists"], true);
     assert_eq!(v["isEmpty"], true);
 }
+
+#[test]
+fn is_safe_binary_name_accepts_plain_names_and_rejects_metacharacters() {
+    assert!(is_safe_binary_name("git"));
+    assert!(is_safe_binary_name("claude-agent-acp"));
+    assert!(is_safe_binary_name("node.exe"));
+    assert!(is_safe_binary_name("a_b.c-1"));
+    assert!(!is_safe_binary_name(""));
+    assert!(!is_safe_binary_name("git rm"));
+    assert!(!is_safe_binary_name("../evil"));
+    assert!(!is_safe_binary_name("a/b"));
+    assert!(!is_safe_binary_name("a;b"));
+    assert!(!is_safe_binary_name("$(whoami)"));
+}
+
+#[test]
+fn build_find_result_unavailable_when_path_is_none() {
+    let v = build_find_result(None, &StubProbe(None));
+    assert_eq!(v["available"], false);
+    assert!(v.get("path").is_none());
+    assert!(v.get("version").is_none());
+}
+
+#[test]
+fn build_find_result_available_without_version_when_probe_fails() {
+    let v = build_find_result(Some(PathBuf::from("/usr/bin/code")), &StubProbe(None));
+    assert_eq!(v["available"], true);
+    assert_eq!(v["path"], "/usr/bin/code");
+    assert!(
+        v.get("version").is_none(),
+        "version is best-effort: omitted when the probe fails"
+    );
+}
+
+#[test]
+fn build_find_result_includes_version_when_probe_succeeds() {
+    let v = build_find_result(
+        Some(PathBuf::from("/usr/bin/git")),
+        &StubProbe(Some("git version 2.45.0".to_string())),
+    );
+    assert_eq!(v["available"], true);
+    assert_eq!(v["path"], "/usr/bin/git");
+    assert_eq!(v["version"], "git version 2.45.0");
+}
+
+#[test]
+fn find_binary_op_rejects_unsafe_names_without_spawning() {
+    let v = find_binary_op("../../bin/sh", &[]);
+    assert_eq!(v["available"], false);
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_binary_path_finds_caller_common_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = unique_temp_dir("resolve-common");
+    let bin = dir.join("totally-bogus-binary-xyzzy");
+    std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The name is not on PATH; resolution must fall through to common_paths.
+    let resolved = resolve_binary_path(
+        "totally-bogus-binary-xyzzy",
+        &[bin.to_string_lossy().into_owned()],
+    );
+    assert_eq!(resolved.as_deref(), Some(bin.as_path()));
+}
+
+#[test]
+fn tool_availability_op_defaults_to_canonical_tool_set() {
+    let v = tool_availability_op(None);
+    let tools = v["tools"].as_object().unwrap();
+    for name in DEFAULT_TOOLS {
+        let entry = tools.get(*name).unwrap_or_else(|| panic!("missing {name}"));
+        assert!(
+            entry["available"].is_boolean(),
+            "{name}.available is always present"
+        );
+    }
+}
+
+#[test]
+fn tool_availability_op_honours_explicit_tool_list() {
+    let v = tool_availability_op(Some(vec![
+        "git".to_string(),
+        "definitely-not-installed-xyzzy".to_string(),
+    ]));
+    let tools = v["tools"].as_object().unwrap();
+    assert_eq!(tools.len(), 2);
+    assert!(tools["git"]["available"].is_boolean());
+    assert_eq!(tools["definitely-not-installed-xyzzy"]["available"], false);
+}
+
+#[test]
+fn enhanced_path_dedups_and_appends_essentials_order_preserving() {
+    let sep = path_separator();
+    let custom = "/opt/tools";
+    let input = format!("{custom}{sep}{custom}");
+    let enhanced = enhanced_path_from(&input);
+    let parts: Vec<&str> = enhanced.split(sep).collect();
+    // The caller's entry comes first and appears exactly once (de-duplicated).
+    assert_eq!(parts[0], custom);
+    assert_eq!(parts.iter().filter(|p| **p == custom).count(), 1);
+    // Every essential system path is merged in.
+    for essential in essential_system_paths() {
+        assert!(
+            parts.iter().any(|p| *p == essential),
+            "missing essential {essential}"
+        );
+    }
+}
+
+#[test]
+fn build_env_json_is_secret_safe_and_well_shaped() {
+    let home = PathBuf::from("/home/me");
+    let raw_path = format!("/usr/bin{0}/bin", path_separator());
+    let v = build_env_json(
+        &raw_path,
+        "/bin/zsh",
+        &home,
+        vec!["PATH".to_string(), "SECRET_TOKEN".to_string()],
+    );
+    assert_eq!(v["path"], raw_path);
+    assert_eq!(v["shell"], "/bin/zsh");
+    assert_eq!(v["home"], "/home/me");
+    let entries = v["pathEntries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0], "/usr/bin");
+    assert!(v["enhancedPath"].is_string());
+    let names = v["varNames"].as_array().unwrap();
+    // Names are reported, but no variable VALUE other than path/shell/home leaks.
+    assert!(names.iter().any(|n| n == "SECRET_TOKEN"));
+    assert!(
+        !v.to_string().contains("secret-value"),
+        "build_env_json never carries arbitrary variable values"
+    );
+}
+
+#[test]
+fn env_probe_reports_path_entries_and_var_names() {
+    let v = env_probe();
+    assert!(v["path"].is_string());
+    assert!(v["pathEntries"].is_array());
+    assert!(v["enhancedPath"].is_string());
+    assert!(v["varNames"].is_array());
+}

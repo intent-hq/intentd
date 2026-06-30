@@ -28,15 +28,20 @@ pub fn resolve_is_local(transport_local: bool, override_local: Option<bool>) -> 
 
 /// The `host.*` capability-probe methods, once classified. `Status` is the
 /// original host probe (§5.14); `CheckGit`/`ListDirectory`/`DirectoryStatus`/
-/// `CheckAuggie` are additive host-services that let the FE delegate Git
-/// detection, repo-folder browsing, and auggie-binary discovery to the daemon
-/// host (cross-transport, like the rest of `host.*`).
+/// `CheckAuggie`/`FindBinary`/`ToolAvailability`/`Env` are additive
+/// host-services that let the FE delegate Git detection, repo-folder browsing,
+/// auggie-binary discovery, generic binary resolution, a batch tool-availability
+/// probe, and the daemon's PATH/environment to the daemon host (cross-transport,
+/// like the rest of `host.*`).
 pub(crate) enum HostMethod {
     Status,
     CheckGit,
     ListDirectory,
     DirectoryStatus,
     CheckAuggie,
+    FindBinary,
+    ToolAvailability,
+    Env,
 }
 
 /// A classified `host.*` request awaiting handling by the connection task.
@@ -72,6 +77,9 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
         "host.listDirectory" => HostMethod::ListDirectory,
         "host.directoryStatus" => HostMethod::DirectoryStatus,
         "host.checkAuggie" => HostMethod::CheckAuggie,
+        "host.findBinary" => HostMethod::FindBinary,
+        "host.toolAvailability" => HostMethod::ToolAvailability,
+        "host.env" => HostMethod::Env,
         _ => return None,
     };
     // `parsed.params || {}`: a non-object (absent/null/array/scalar) yields `{}`,
@@ -117,11 +125,13 @@ pub(crate) fn host_status_json(
 /// Handle a classified `host.*` request: build the response frame (or `None`
 /// for a notification, which gets no reply). `is_local` is the resolved
 /// locality of the serving connection (§5.14). The host-services methods
-/// (`checkGit`/`listDirectory`/`directoryStatus`/`checkAuggie`) run their
-/// filesystem / subprocess work on a blocking thread so the async runtime
-/// stays free; `checkAuggie` consults `api.settings_get` for
-/// `context.auggiePath` and `providers.paths.auggie` before falling back to
-/// the canonical resolver in `intent_services::auggie_discovery`.
+/// (`checkGit`/`listDirectory`/`directoryStatus`/`checkAuggie`/`findBinary`/
+/// `toolAvailability`/`env`) run their filesystem / subprocess work on a
+/// blocking thread so the async runtime stays free; `checkAuggie` consults
+/// `api.settings_get` for `context.auggiePath` and `providers.paths.auggie`
+/// before falling back to the canonical resolver in
+/// `intent_services::auggie_discovery`. `findBinary` requires a `name` param
+/// (`-32602` when absent); `env` is secret-safe (names only, no values).
 pub(crate) async fn handle(
     req: HostRequest,
     api: &dyn WorkspaceApi,
@@ -191,6 +201,53 @@ pub(crate) async fn handle(
                 tokio::task::spawn_blocking(move || host_ops::check_auggie(configured.as_deref()))
                     .await;
             let result = join.unwrap_or_else(|_| json!({ "available": false }));
+            success_frame(id_echo, result)
+        }
+        HostMethod::FindBinary => {
+            let name = match params.get("name").and_then(Value::as_str) {
+                Some(n) if !n.is_empty() => n.to_string(),
+                _ => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(
+                        id_echo,
+                        -32602,
+                        "Missing required parameter: name",
+                    ));
+                }
+            };
+            let common_paths: Vec<String> = params
+                .get("commonPaths")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let result =
+                tokio::task::spawn_blocking(move || host_ops::find_binary_op(&name, &common_paths))
+                    .await
+                    .unwrap_or_else(|_| json!({ "available": false }));
+            success_frame(id_echo, result)
+        }
+        HostMethod::ToolAvailability => {
+            let tools: Option<Vec<String>> =
+                params.get("tools").and_then(Value::as_array).map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                });
+            let result = tokio::task::spawn_blocking(move || host_ops::tool_availability_op(tools))
+                .await
+                .unwrap_or_else(|_| json!({ "tools": {} }));
+            success_frame(id_echo, result)
+        }
+        HostMethod::Env => {
+            let result = tokio::task::spawn_blocking(host_ops::env_probe)
+                .await
+                .unwrap_or_else(|_| json!({ "path": "", "pathEntries": [], "varNames": [] }));
             success_frame(id_echo, result)
         }
     };

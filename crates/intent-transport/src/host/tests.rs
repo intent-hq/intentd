@@ -1,6 +1,7 @@
 //! Unit tests for the `host.*` capability probe fast-path (§5.14) and the
 //! additive `host.*` host-services (`checkGit` / `listDirectory` /
-//! `directoryStatus` / `checkAuggie`).
+//! `directoryStatus` / `checkAuggie` / `findBinary` / `toolAvailability` /
+//! `env`).
 
 use std::sync::Mutex;
 
@@ -187,6 +188,15 @@ fn classify_matches_host_status_and_host_services() {
     assert!(
         classify(&json!({ "jsonrpc": "2.0", "id": 5, "method": "host.checkAuggie" })).is_some()
     );
+    assert!(classify(
+        &json!({ "jsonrpc": "2.0", "id": 6, "method": "host.findBinary", "params": { "name": "git" } })
+    )
+    .is_some());
+    assert!(
+        classify(&json!({ "jsonrpc": "2.0", "id": 7, "method": "host.toolAvailability" }))
+            .is_some()
+    );
+    assert!(classify(&json!({ "jsonrpc": "2.0", "id": 8, "method": "host.env" })).is_some());
     // `host.openExternal` (FE-served reverse RPC) / wrong version / bad id fall through.
     assert!(
         classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "host.openExternal" })).is_none()
@@ -337,4 +347,74 @@ async fn handle_check_auggie_notification_gets_no_response() {
         handle(req, &NoopApi, true).await.is_none(),
         "a notification gets no reply"
     );
+}
+
+#[tokio::test]
+async fn handle_find_binary_requires_name() {
+    let req =
+        classify(&json!({ "jsonrpc": "2.0", "id": 20, "method": "host.findBinary", "params": {} }))
+            .unwrap();
+    let frame = handle(req, &NoopApi, true)
+        .await
+        .expect("missing name produces an error frame");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 20);
+    assert_eq!(parsed["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn handle_find_binary_returns_available_boolean() {
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 21,
+        "method": "host.findBinary",
+        "params": { "name": "git" }
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, true)
+        .await
+        .expect("findBinary always replies");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 21);
+    assert!(
+        parsed["result"]["available"].is_boolean(),
+        "available is always present"
+    );
+}
+
+#[tokio::test]
+async fn handle_find_binary_notification_gets_no_response() {
+    let req = classify(&json!({ "jsonrpc": "2.0", "method": "host.findBinary" })).unwrap();
+    assert!(
+        handle(req, &NoopApi, true).await.is_none(),
+        "a missing-name notification gets no reply"
+    );
+}
+
+#[tokio::test]
+async fn handle_tool_availability_returns_default_tool_map() {
+    let req = classify(&json!({ "jsonrpc": "2.0", "id": 22, "method": "host.toolAvailability" }))
+        .unwrap();
+    let frame = handle(req, &NoopApi, true)
+        .await
+        .expect("toolAvailability always replies");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 22);
+    let tools = parsed["result"]["tools"].as_object().unwrap();
+    assert!(tools.contains_key("git"), "git is in the default tool set");
+    assert!(tools["git"]["available"].is_boolean());
+}
+
+#[tokio::test]
+async fn handle_env_returns_path_and_var_names() {
+    let req = classify(&json!({ "jsonrpc": "2.0", "id": 23, "method": "host.env" })).unwrap();
+    let frame = handle(req, &NoopApi, true)
+        .await
+        .expect("env always replies");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 23);
+    assert!(parsed["result"]["path"].is_string());
+    assert!(parsed["result"]["pathEntries"].is_array());
+    assert!(parsed["result"]["enhancedPath"].is_string());
+    assert!(parsed["result"]["varNames"].is_array());
 }

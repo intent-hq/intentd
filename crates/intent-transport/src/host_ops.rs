@@ -1,13 +1,16 @@
 //! `host.*` host-services: `checkGit` + `listDirectory` + `directoryStatus`
-//! + `checkAuggie` (§5.14).
+//! + `checkAuggie` + `findBinary` + `toolAvailability` + `env` (§5.14).
 //!
 //! These additive methods sit on the existing `host.*` capability-probe surface
 //! (alongside `host.status` + `host.openExternal`) and let the FE delegate
 //! host-machine probes to the daemon: Git binary detection, repo-folder
-//! browsing, directory status (worktree-aware `.git` walk), and auggie binary
-//! discovery. They resolve on the daemon host so callers reach the worktrees
-//! that actually live there — answered on both UDS and WSS, like the rest of
-//! `host.*`.
+//! browsing, directory status (worktree-aware `.git` walk), auggie binary
+//! discovery, generic binary resolution (`findBinary`), a batch tool-availability
+//! probe (`toolAvailability`), and the daemon's PATH/environment (`env`). They
+//! resolve on the daemon host so callers reach the binaries and worktrees that
+//! actually live there — answered on both UDS and WSS, like the rest of
+//! `host.*`. The `env` probe is secret-safe: it returns only variable *names*
+//! plus the non-secret PATH/SHELL/HOME values, never arbitrary variable values.
 //!
 //! Ported from the Electron FE: `packages/cloudlands-fe/src/shared/main/`
 //! `find-binary.ts` (the git binary resolver) and `packages/cloudlands-fe/src/`
@@ -22,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 /// Resolves a binary by name to an absolute path on the daemon host. Injected
 /// so `check_git` is unit-testable without spawning `which`/`where`.
@@ -59,14 +62,28 @@ impl VersionProbe for OsVersionProbe {
 /// Locate a binary by `name`. Mirrors the FE `findBinary` strategy: ask the OS
 /// (`which` on unix, `where` on Windows), then fall back to OS-common
 /// directories. Returns the first existing absolute path, or `None`. Internal
-/// helper — exposed only to `host.checkGit`.
+/// helper — used by `host.checkGit`.
 pub(crate) fn find_binary(name: &str) -> Option<PathBuf> {
+    resolve_binary_path(name, &[])
+}
+
+/// Locate `name` on the daemon host, mirroring the FE `findBinary` lookup
+/// order: PATH (`which`/`where`) → caller-supplied `common_paths` (checked
+/// verbatim, like the FE `commonPaths` option) → OS-common directories.
+/// Returns the first existing absolute path, or `None`.
+pub(crate) fn resolve_binary_path(name: &str, common_paths: &[String]) -> Option<PathBuf> {
     if name.is_empty() {
         return None;
     }
     if let Some(path) = lookup_in_path(name) {
         if path.is_file() || path.is_symlink() {
             return Some(path);
+        }
+    }
+    for candidate in common_paths {
+        let candidate = PathBuf::from(candidate);
+        if candidate.is_file() || candidate.is_symlink() {
+            return Some(candidate);
         }
     }
     for dir in common_dirs() {
@@ -227,6 +244,189 @@ fn build_check_result(path: Option<PathBuf>, probe: &dyn VersionProbe) -> Value 
         "version": version,
         "path": path.to_string_lossy(),
     })
+}
+
+/// Mirror the FE `SAFE_BINARY_NAME` guard (`/^[a-zA-Z0-9._-]+$/`): reject names
+/// with path separators, shell metacharacters, or whitespace before they reach
+/// `which`/`where`. An unsafe name resolves to `available:false`, never an error.
+pub(crate) fn is_safe_binary_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Build the `host.findBinary` result `{ available, path?, version? }`. Unlike
+/// `checkGit`/`checkAuggie`, a binary that resolves but does not answer
+/// `--version` is still `available:true` (the `version` is best-effort/optional).
+fn build_find_result(path: Option<PathBuf>, probe: &dyn VersionProbe) -> Value {
+    let Some(path) = path else {
+        return json!({ "available": false });
+    };
+    let mut result = json!({
+        "available": true,
+        "path": path.to_string_lossy(),
+    });
+    if let Some(version) = probe.probe(&path) {
+        result["version"] = json!(version);
+    }
+    result
+}
+
+/// Production `host.findBinary` — resolve `name` (honouring the optional caller
+/// `common_paths`) and best-effort version-probe it. Rejects unsafe names with
+/// `available:false`.
+pub(crate) fn find_binary_op(name: &str, common_paths: &[String]) -> Value {
+    if !is_safe_binary_name(name) {
+        return json!({ "available": false });
+    }
+    build_find_result(resolve_binary_path(name, common_paths), &OsVersionProbe)
+}
+
+/// The default tool set probed by `host.toolAvailability` when the caller does
+/// not supply an explicit `tools` list: the ACP agent CLIs the FE detects, the
+/// `git` binary, and the `code` editor launcher.
+pub(crate) const DEFAULT_TOOLS: &[&str] = &[
+    "claude",
+    "claude-agent-acp",
+    "opencode",
+    "codex",
+    "codex-acp",
+    "cortex",
+    "git",
+    "code",
+];
+
+/// Build the `host.toolAvailability` result `{ tools: { <name>: { available,
+/// path?, version? } } }`. Each tool is resolved via [`find_binary_op`]; an
+/// empty / absent `tools` list falls back to [`DEFAULT_TOOLS`].
+pub(crate) fn tool_availability_op(tools: Option<Vec<String>>) -> Value {
+    let names: Vec<String> = match tools {
+        Some(t) if !t.is_empty() => t,
+        _ => DEFAULT_TOOLS.iter().map(|s| s.to_string()).collect(),
+    };
+    let mut map = Map::new();
+    for name in names {
+        let result = find_binary_op(&name, &[]);
+        map.insert(name, result);
+    }
+    json!({ "tools": Value::Object(map) })
+}
+
+/// The PATH separator for the host platform.
+fn path_separator() -> char {
+    if cfg!(windows) {
+        ';'
+    } else {
+        ':'
+    }
+}
+
+/// OS-common directories that must always be on PATH for binary resolution
+/// (mirrors the FE `getEssentialSystemPaths`). Merged into the host PATH to
+/// form the "enhanced" PATH the daemon uses to locate tools.
+fn essential_system_paths() -> Vec<String> {
+    if cfg!(target_os = "windows") {
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let mut paths = vec![
+            format!(r"{system_root}\System32"),
+            format!(r"{system_root}\System32\wbem"),
+            r"C:\Program Files\Git\cmd".to_string(),
+            r"C:\Program Files (x86)\Git\cmd".to_string(),
+        ];
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            paths.push(format!(r"{local_app_data}\Programs\Git\cmd"));
+        }
+        if let Ok(user_profile) = std::env::var("USERPROFILE") {
+            paths.push(format!(r"{user_profile}\scoop\shims"));
+        }
+        paths.push(r"C:\ProgramData\chocolatey\bin".to_string());
+        paths
+    } else {
+        vec![
+            "/bin".to_string(),
+            "/usr/bin".to_string(),
+            "/usr/local/bin".to_string(),
+            "/opt/homebrew/bin".to_string(),
+            "/usr/sbin".to_string(),
+            "/sbin".to_string(),
+        ]
+    }
+}
+
+/// Compute the "enhanced" PATH (mirrors the FE `getEnhancedPath`): the host
+/// PATH with the essential system directories merged in, de-duplicated and
+/// order-preserving (existing entries first, then any missing essentials).
+pub(crate) fn enhanced_path_from(current_path: &str) -> String {
+    let sep = path_separator();
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered: Vec<String> = Vec::new();
+    for entry in current_path.split(sep).filter(|s| !s.is_empty()) {
+        if seen.insert(entry.to_string()) {
+            ordered.push(entry.to_string());
+        }
+    }
+    for entry in essential_system_paths() {
+        if seen.insert(entry.clone()) {
+            ordered.push(entry);
+        }
+    }
+    ordered.join(&sep.to_string())
+}
+
+/// Resolve the host login shell (mirrors the FE `getLoginShellPath`): the
+/// `SHELL` env var, else the platform default (empty on Windows).
+fn login_shell() -> String {
+    if let Ok(shell) = std::env::var("SHELL") {
+        if !shell.is_empty() {
+            return shell;
+        }
+    }
+    if cfg!(target_os = "macos") {
+        "/bin/zsh".to_string()
+    } else if cfg!(windows) {
+        String::new()
+    } else {
+        "/bin/bash".to_string()
+    }
+}
+
+/// Build the `host.env` result. Returns the host PATH (raw + split `entries`),
+/// the "enhanced" PATH the daemon uses for binary resolution, the login shell,
+/// the home directory, and the SORTED NAMES of every environment variable.
+/// SECRET SAFETY: only the PATH / SHELL / HOME values (non-secret by
+/// construction) cross the wire verbatim — all other variables are reported by
+/// name only, so no secret values are ever exposed.
+pub(crate) fn build_env_json(
+    raw_path: &str,
+    shell: &str,
+    home: &Path,
+    var_names: Vec<String>,
+) -> Value {
+    let sep = path_separator();
+    let entries: Vec<&str> = raw_path.split(sep).filter(|s| !s.is_empty()).collect();
+    json!({
+        "path": raw_path,
+        "pathEntries": entries,
+        "enhancedPath": enhanced_path_from(raw_path),
+        "shell": shell,
+        "home": home.to_string_lossy(),
+        "varNames": var_names,
+    })
+}
+
+/// Production `host.env` — reads the daemon's actual environment. See
+/// [`build_env_json`] for the secret-safety contract (names only, no values).
+pub(crate) fn env_probe() -> Value {
+    let raw_path = std::env::var("PATH").unwrap_or_default();
+    let shell = login_shell();
+    let home = home_dir();
+    let mut var_names: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .collect();
+    var_names.sort();
+    var_names.dedup();
+    build_env_json(&raw_path, &shell, &home, var_names)
 }
 
 /// Expand `~` / `~/...` to `home` (mirrors the FE `expandPath`). Anything else
