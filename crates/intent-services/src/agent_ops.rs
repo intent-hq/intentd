@@ -404,20 +404,23 @@ impl Services {
 
     /// Project an [`AgentSession`] into [`AgentLite`] and overlay the daemon-owned
     /// runtime activity flags (PROTOCOL §5.5/§7.1): `isResponding`,
-    /// `isWaitingOnTool`, `isWaitingForOtherAgents`. See [`agent_activity_flags_for`].
+    /// `isWaitingOnTool`, `isWaitingForOtherAgents`, `waitingForAgentIds`. See
+    /// [`agent_activity_flags_for`].
     pub(crate) fn project_lite_with_flags(&self, session: AgentSession) -> AgentLite {
-        let (is_responding, is_waiting_on_tool, is_waiting_for_other_agents) =
+        let (is_responding, is_waiting_on_tool, is_waiting_for_other_agents, waiting_for_agent_ids) =
             self.agent_activity_flags_for(&session);
         let mut lite = project_lite(session);
         lite.is_responding = is_responding;
         lite.is_waiting_on_tool = is_waiting_on_tool;
         lite.is_waiting_for_other_agents = is_waiting_for_other_agents;
+        lite.waiting_for_agent_ids = waiting_for_agent_ids;
         lite
     }
 
     /// Compute the daemon-owned runtime activity flags for `session` — the port
     /// of the FE agent-state selectors so clients render verbatim (PROTOCOL
-    /// §5.5/§7.1). Returns `(isResponding, isWaitingOnTool, isWaitingForOtherAgents)`:
+    /// §5.5/§7.1). Returns
+    /// `(isResponding, isWaitingOnTool, isWaitingForOtherAgents, waitingForAgentIds)`:
     ///
     /// - `isResponding` — a worker is draining an in-flight turn for this agent
     ///   ([`agent_is_busy`], the authoritative "active worker" signal; mirrors the
@@ -427,26 +430,43 @@ impl Services {
     ///   (a tool call awaiting its result; the port of FE `hasUnresolvedToolUse`).
     /// - `isWaitingForOtherAgents` — the agent parents one or more pending
     ///   completion watches (the port of FE `isAgentWaitingForOtherAgents`).
+    /// - `waitingForAgentIds` — the distinct `child_agent_id`s of those pending
+    ///   watches, in registration order. Always returned (defaults to empty);
+    ///   non-empty iff `isWaitingForOtherAgents` is `true`, so clients can render
+    ///   the waiting-on names verbatim without consulting `metadata`.
     ///
-    /// Terminal agents (completed/error/deleted) report all `false`, mirroring the
-    /// FE selectors' terminal-status short-circuit.
-    pub(crate) fn agent_activity_flags_for(&self, session: &AgentSession) -> (bool, bool, bool) {
+    /// Terminal agents (completed/error/deleted) report all flags `false` and an
+    /// empty `waitingForAgentIds`, mirroring the FE selectors' terminal-status
+    /// short-circuit.
+    pub(crate) fn agent_activity_flags_for(
+        &self,
+        session: &AgentSession,
+    ) -> (bool, bool, bool, Vec<AgentId>) {
         let terminal = matches!(
             session.status,
             AgentStatus::Completed | AgentStatus::Error | AgentStatus::Deleted
         );
         if terminal {
-            return (false, false, false);
+            return (false, false, false, Vec::new());
         }
         let is_responding = self.agent_is_busy(session.id.clone());
         let is_waiting_on_tool = is_responding && self.live_turn_has_unresolved_tool(&session.id);
-        let is_waiting_for_other_agents = !self
-            .list_watches_for_parent(&session.workspace_id, &session.id)
-            .is_empty();
+        let watches = self.list_watches_for_parent(&session.workspace_id, &session.id);
+        // Distinct child ids in registration order — a parent can register
+        // multiple watches against the same child (e.g. successive `immediate`
+        // delegates), but the FE only wants each waiting-on agent once.
+        let mut waiting_for_agent_ids: Vec<AgentId> = Vec::with_capacity(watches.len());
+        for w in &watches {
+            if !waiting_for_agent_ids.contains(&w.child_agent_id) {
+                waiting_for_agent_ids.push(w.child_agent_id.clone());
+            }
+        }
+        let is_waiting_for_other_agents = !waiting_for_agent_ids.is_empty();
         (
             is_responding,
             is_waiting_on_tool,
             is_waiting_for_other_agents,
+            waiting_for_agent_ids,
         )
     }
 

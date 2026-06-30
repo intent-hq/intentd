@@ -306,6 +306,9 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
     assert_eq!(v["isResponding"], false);
     assert_eq!(v["isWaitingOnTool"], false);
     assert_eq!(v["isWaitingForOtherAgents"], false);
+    // `waitingForAgentIds` is always present (never null/omitted); an idle agent
+    // with no pending completion watches reports an empty array.
+    assert_eq!(v["waitingForAgentIds"], json!([]));
     assert!(v["lastActivity"].is_string());
 }
 
@@ -344,6 +347,9 @@ async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
     assert_eq!(v["isResponding"], true);
     assert_eq!(v["isWaitingOnTool"], true);
     assert_eq!(v["isWaitingForOtherAgents"], true);
+    // The waiting-on id list mirrors the bool: it carries the specific child
+    // agent the parent's pending completion watch is registered against.
+    assert_eq!(v["waitingForAgentIds"], json!([child.0]));
 
     // Once the tool result lands, the in-flight turn is no longer blocked on the
     // tool: still responding, but no longer waiting on it.
@@ -371,12 +377,28 @@ async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
     assert_eq!(v["isResponding"], true);
     assert_eq!(v["isWaitingOnTool"], false);
     assert_eq!(v["isWaitingForOtherAgents"], true);
+    assert_eq!(v["waitingForAgentIds"], json!([child.0]));
 
-    // The child has no worker and parents no watches: every flag false.
+    // A second watch against the SAME child must not duplicate the id in the
+    // waiting-on list (distinct child ids, registration order).
+    svc.register_completion_watch(
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        true,
+        None,
+    );
+    let v = serde_json::to_value(svc.agent_get_op(parent.clone()).await.expect("get")).unwrap();
+    assert_eq!(v["waitingForAgentIds"], json!([child.0]));
+
+    // The child has no worker and parents no watches: every flag false and the
+    // waiting-on id list is the empty array (never null/omitted).
     let cv = serde_json::to_value(svc.agent_get_op(child).await.expect("get")).unwrap();
     assert_eq!(cv["isResponding"], false);
     assert_eq!(cv["isWaitingOnTool"], false);
     assert_eq!(cv["isWaitingForOtherAgents"], false);
+    assert_eq!(cv["waitingForAgentIds"], json!([]));
 }
 
 #[tokio::test]

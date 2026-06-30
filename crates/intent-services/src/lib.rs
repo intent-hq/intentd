@@ -5404,18 +5404,24 @@ impl WorkspaceApi for Services {
             // subscription (matching `chat_snapshot`'s degrade-to-empty pattern).
             match self.store.get_agent_session(&agent_id).await {
                 Ok(session) => {
-                    let (is_responding, is_waiting_on_tool, is_waiting_for_other_agents) =
-                        self.agent_activity_flags_for(&session);
+                    let (
+                        is_responding,
+                        is_waiting_on_tool,
+                        is_waiting_for_other_agents,
+                        waiting_for_agent_ids,
+                    ) = self.agent_activity_flags_for(&session);
                     serde_json::json!({
                         "isResponding": is_responding,
                         "isWaitingOnTool": is_waiting_on_tool,
                         "isWaitingForOtherAgents": is_waiting_for_other_agents,
+                        "waitingForAgentIds": waiting_for_agent_ids,
                     })
                 }
                 Err(_) => serde_json::json!({
                     "isResponding": false,
                     "isWaitingOnTool": false,
                     "isWaitingForOtherAgents": false,
+                    "waitingForAgentIds": [],
                 }),
             }
         })

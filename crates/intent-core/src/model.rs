@@ -1355,6 +1355,15 @@ pub struct AgentLite {
     pub is_waiting_on_tool: bool,
     #[serde(default)]
     pub is_waiting_for_other_agents: bool,
+    /// The specific child agent-ids this agent is waiting on (the distinct
+    /// `child_agent_id`s of its pending completion watches; PROTOCOL §5.5/§7.1).
+    /// Consistent with `isWaitingForOtherAgents`: non-empty iff that flag is
+    /// `true`, empty array otherwise. Always serialized (never null/omitted) so
+    /// clients consume verbatim without healing. Stays empty in
+    /// [`AgentLite::from_session`] (no runtime context) and is overlaid by the
+    /// service projection.
+    #[serde(default)]
+    pub waiting_for_agent_ids: Vec<AgentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<SessionStats>,
     pub created_at: String,
@@ -1406,6 +1415,7 @@ impl AgentLite {
             is_responding: false,
             is_waiting_on_tool: false,
             is_waiting_for_other_agents: false,
+            waiting_for_agent_ids: Vec::new(),
             stats: session.stats,
             last_activity: Some(session.updated_at.clone()),
             created_at: session.created_at,
@@ -2258,6 +2268,9 @@ mod tests {
         assert_eq!(v["isResponding"], false);
         assert_eq!(v["isWaitingOnTool"], false);
         assert_eq!(v["isWaitingForOtherAgents"], false);
+        // `waitingForAgentIds` is always emitted (never null/omitted), defaulting
+        // to `[]` when no completion watches are pending (PROTOCOL §5.5/§7.1).
+        assert_eq!(v["waitingForAgentIds"], json!([]));
         assert_eq!(v["lastUserMessage"], "hi");
         assert_eq!(v["lastActivity"], "t1");
     }

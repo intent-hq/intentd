@@ -309,6 +309,7 @@ async fn chat_subscribe_snapshot_matches_conversation_then_unsubscribe() {
     want_obj.insert("isResponding".into(), json!(false));
     want_obj.insert("isWaitingOnTool".into(), json!(false));
     want_obj.insert("isWaitingForOtherAgents".into(), json!(false));
+    want_obj.insert("waitingForAgentIds".into(), json!([]));
     assert_eq!(snap["params"]["snapshot"], want);
     assert_eq!(snap["params"]["snapshot"]["agentId"], agent_id.as_str());
 

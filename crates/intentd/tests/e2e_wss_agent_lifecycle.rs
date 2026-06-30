@@ -856,7 +856,10 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
     assert!(parked, "busy agent streamed a chunk and parked mid-turn");
 
     // agent.get: the active worker is responding (not waiting on a tool — the
-    // parked turn's only block is text — and parents no other agents).
+    // parked turn's only block is text — and parents no other agents). The
+    // `waitingForAgentIds` list (PROTOCOL §5.5/§7.1) is always present and
+    // mirrors `isWaitingForOtherAgents`: empty array when no watches are
+    // pending (never null/omitted).
     let busy_lite = wss_rpc(&mut rpc, 13, "agent.get", json!({ "agentId": busy_id })).await;
     let busy_lite = &busy_lite["agent"];
     assert_eq!(busy_lite["isResponding"], true, "busy lite: {busy_lite}");
@@ -868,8 +871,14 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
         busy_lite["isWaitingForOtherAgents"], false,
         "busy lite: {busy_lite}"
     );
+    assert_eq!(
+        busy_lite["waitingForAgentIds"],
+        json!([]),
+        "busy lite: {busy_lite}"
+    );
 
-    // agent.get: the idle agent reports every flag false.
+    // agent.get: the idle agent reports every flag false and an empty
+    // `waitingForAgentIds`.
     let idle_lite = wss_rpc(&mut rpc, 14, "agent.get", json!({ "agentId": idle_id })).await;
     let idle_lite = &idle_lite["agent"];
     assert_eq!(idle_lite["isResponding"], false, "idle lite: {idle_lite}");
@@ -881,8 +890,13 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
         idle_lite["isWaitingForOtherAgents"], false,
         "idle lite: {idle_lite}"
     );
+    assert_eq!(
+        idle_lite["waitingForAgentIds"],
+        json!([]),
+        "idle lite: {idle_lite}"
+    );
 
-    // agent.list carries the same per-agent flags.
+    // agent.list carries the same per-agent flags + waiting-on id list.
     let list = wss_rpc(&mut rpc, 15, "agent.list", json!({ "workspaceId": ws_id })).await;
     let agents = list["agents"].as_array().expect("agents array");
     let busy_row = agents
@@ -895,6 +909,16 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
         .expect("idle in list");
     assert_eq!(busy_row["isResponding"], true, "busy row: {busy_row}");
     assert_eq!(idle_row["isResponding"], false, "idle row: {idle_row}");
+    assert_eq!(
+        busy_row["waitingForAgentIds"],
+        json!([]),
+        "busy row: {busy_row}"
+    );
+    assert_eq!(
+        idle_row["waitingForAgentIds"],
+        json!([]),
+        "idle row: {idle_row}"
+    );
 
     // chat.subscribe's seq-0 snapshot for the busy agent carries the flags too.
     let chat = wss_rpc(
@@ -915,9 +939,162 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
         "snapshot: {}",
         push["params"]["snapshot"]
     );
+    assert_eq!(
+        push["params"]["snapshot"]["waitingForAgentIds"],
+        json!([]),
+        "snapshot: {}",
+        push["params"]["snapshot"]
+    );
 
     // Release the parked worker so the daemon tears down cleanly.
     let stopped = wss_rpc(&mut rpc, 17, "agent.stop", json!({ "agentId": busy_id })).await;
+    assert_eq!(stopped["success"], true, "stop ok: {stopped}");
+}
+
+/// AUDIT-P2-1b: when an agent has a real pending completion watch (its
+/// MCP-delegated child is still running), the daemon emits the specific
+/// `waitingForAgentIds: [childId]` alongside `isWaitingForOtherAgents: true`
+/// over the WSS wire (PROTOCOL §5.5/§7.1) — proving the id list reflects the
+/// genuine parent→child watch registered by the MCP `delegate_task` tool.
+/// Drives the full MCP loop (mock ACP fires `delegate_task_workspace-mcp`)
+/// and parks the child so the watch persists for observation.
+#[tokio::test]
+async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
+    let Some(script) = gate("WSS waitingForAgentIds E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // Parent fires `delegate_task` with instructions carrying a marker; the
+    // delegated child sees the marker in its first prompt and parks. The
+    // parent then returns end_turn and goes idle — the watch persists because
+    // the child never completes.
+    const CHILD_MARK: &str = "AUDIT_P2_1B_PARK_CHILD";
+    let behavior = json!({
+        "toolCall": {
+            "name": "delegate_task_workspace-mcp",
+            "arguments": {
+                "agentInstructions": CHILD_MARK,
+                "model": "mock:default",
+            },
+        },
+        "parkIfPromptContains": CHILD_MARK,
+        "response": "parent delegated and is now waiting",
+    })
+    .to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE the turn so we miss no events.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let parent = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+    )
+    .await;
+    let parent_id = parent["agent"]["id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent_id, "content": "go" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Wait for the parent to go idle (its turn finished — the MCP delegate
+    // tool returned and the parent emitted `end_turn`). The child it spawned
+    // is parked, so the parent→child completion watch is still pending.
+    let mut parent_idle = false;
+    for _ in 0..120 {
+        let frame = wss_event(&mut sub, 60).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:idle" && ev["data"]["agentId"] == json!(parent_id) {
+            parent_idle = true;
+            break;
+        }
+    }
+    assert!(parent_idle, "parent went idle after firing delegate tool");
+
+    // The parent's `AgentLite` carries the BE-owned waiting-on id list (PROTOCOL
+    // §5.5/§7.1): the bool is true, the array is the SINGLE distinct child id
+    // the watch is registered against — proving the FE no longer needs to fall
+    // back to `metadata.waitingForAgentIds` to resolve the waiting-on agent.
+    let parent_lite = wss_rpc(&mut rpc, 12, "agent.get", json!({ "agentId": parent_id })).await;
+    let parent_lite = &parent_lite["agent"];
+    assert_eq!(
+        parent_lite["isWaitingForOtherAgents"], true,
+        "parent lite: {parent_lite}"
+    );
+    let waiting = parent_lite["waitingForAgentIds"]
+        .as_array()
+        .expect("waitingForAgentIds array");
+    assert_eq!(
+        waiting.len(),
+        1,
+        "exactly one waiting-on child: {parent_lite}"
+    );
+    let child_id = waiting[0].as_str().expect("child id string").to_string();
+    assert!(
+        child_id.starts_with("agent-"),
+        "child id shape: {parent_lite}"
+    );
+    assert_ne!(child_id, parent_id, "watching a DIFFERENT agent");
+
+    // The child agent the parent is waiting on really exists in the store and
+    // its `AgentLite` reports an empty `waitingForAgentIds` (it parents none).
+    let child_lite = wss_rpc(&mut rpc, 13, "agent.get", json!({ "agentId": child_id })).await;
+    let child_lite = &child_lite["agent"];
+    assert_eq!(
+        child_lite["isWaitingForOtherAgents"], false,
+        "child lite: {child_lite}"
+    );
+    assert_eq!(
+        child_lite["waitingForAgentIds"],
+        json!([]),
+        "child lite: {child_lite}"
+    );
+
+    // Release the parked child so the daemon tears down cleanly.
+    let stopped = wss_rpc(&mut rpc, 14, "agent.stop", json!({ "agentId": child_id })).await;
     assert_eq!(stopped["success"], true, "stop ok: {stopped}");
 }
 
