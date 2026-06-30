@@ -11,7 +11,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use intent_core::{Result as CoreResult, WorkspaceApi};
+use intent_core::{
+    now_iso, ContentType, Note, NoteId, NoteVisibility, Result as CoreResult, TaskMetadata,
+    TaskStatus, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
+    WorkspaceStatus,
+};
 use intent_services::{EventBus, Services};
 use intent_store::Store;
 use intent_transport::{ensure_tls_certificate, serve_uds, TokenStore, WsApiServer, WsOptions};
@@ -131,7 +135,10 @@ fn free_port() -> u16 {
 }
 
 /// Build a real `Services` API + event bus over a fresh temp SQLite store.
-async fn make_services() -> (Arc<dyn WorkspaceApi>, EventBus, std::path::PathBuf) {
+/// The store is returned alongside so tests that need to seed fixtures with a
+/// fixed id (e.g. the workspace `spec` note) can `store.insert_*` directly,
+/// since `note.create` mints a fresh `NoteId` by design.
+async fn make_services() -> (Arc<dyn WorkspaceApi>, EventBus, Store, std::path::PathBuf) {
     let short = uuid::Uuid::new_v4().simple().to_string();
     let dir = Path::new("/tmp").join(format!("intentd-wss-{}", &short[..8]));
     std::fs::create_dir_all(&dir).unwrap();
@@ -139,8 +146,8 @@ async fn make_services() -> (Arc<dyn WorkspaceApi>, EventBus, std::path::PathBuf
         .await
         .expect("open store");
     let bus = EventBus::new(store.clone());
-    let api: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
-    (api, bus, dir)
+    let api: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store.clone()));
+    (api, bus, store, dir)
 }
 
 /// A started WSS listener plus everything a test client needs (the API/bus are
@@ -151,20 +158,21 @@ struct Server {
     cfg: Arc<ClientConfig>,
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
+    store: Store,
     _dir: std::path::PathBuf,
 }
 
 /// Build + start a WSS listener with the given options on a free base port.
 async fn start(mut opts: WsOptions) -> Server {
-    let (api, bus, dir) = make_services().await;
+    let (api, bus, store, dir) = make_services().await;
     let tls = ensure_tls_certificate(&dir).expect("cert");
-    let store = Arc::new(MemTokenStore::default());
-    store.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(MemTokenStore::default());
+    token_store.store_token(TOKEN).unwrap();
     if opts.base_port == WsOptions::default().base_port {
         opts.base_port = free_port();
     }
     opts.bind_address = Ipv4Addr::LOCALHOST.into();
-    let ws = WsApiServer::new(api.clone(), bus.clone(), &tls, store, opts).expect("server");
+    let ws = WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, opts).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Server {
@@ -173,6 +181,7 @@ async fn start(mut opts: WsOptions) -> Server {
         cfg,
         api,
         bus,
+        store,
         _dir: dir,
     }
 }
@@ -570,5 +579,219 @@ async fn heartbeat_terminates_silent_client() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(terminated, "silent client must be terminated by heartbeat");
+    srv.ws.stop().await;
+}
+
+/// Minimal `Workspace` fixture used by `task.list` seeding below.
+fn fixture_workspace(id: &WorkspaceId) -> Workspace {
+    let ts = now_iso();
+    Workspace {
+        id: id.clone(),
+        title: "WS".to_string(),
+        branch: "main".to_string(),
+        base_ref: None,
+        base_commit_sha: None,
+        status: WorkspaceStatus::Active,
+        status_message: None,
+        activity: WorkspaceActivity::Idle,
+        attention: WorkspaceAttention::None,
+        created_at: ts.clone(),
+        updated_at: ts,
+        last_activity: None,
+        tags: vec![],
+        path: None,
+        repository_path: None,
+        repository_owner: None,
+        repository_name: None,
+        worktree_path: None,
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
+        archived: false,
+        archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
+        token_usage: None,
+    }
+}
+
+/// Minimal `Note` fixture used by `task.list` seeding below.
+fn fixture_note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
+    let ts = now_iso();
+    Note {
+        id: NoteId::from(id),
+        workspace_id: ws.clone(),
+        title: id.to_string(),
+        content: content.to_string(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        task: None,
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts,
+    }
+}
+
+/// `task.list` over the real WSS wire returns `{ tasks, stats }` and the
+/// `stats` aggregate mirrors the FE `computeTaskStats` (`task-stats.ts`)
+/// classification: `total` excludes `cancelled`, `completed` counts `complete`,
+/// and `inProgress` counts `in_progress` + `review_required`. The optional
+/// `status` filter narrows `tasks` only — `stats` stays the unfiltered rollup
+/// so the FE renders the progress bar verbatim regardless of the active filter
+/// (PROTOCOL §5.4).
+#[tokio::test]
+async fn wss_task_list_emits_stats_aggregate() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed a workspace + spec note + four task notes directly through the
+    // shared store — `note.create` mints a fresh `NoteId`, so the spec note
+    // (which must have id == "spec") can only be created out-of-band.
+    let ws = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws))
+        .await
+        .expect("insert workspace");
+
+    let spec_body = "\
+- [A](intent://local/task/task-a)\n\
+- [B](intent://local/task/task-b)\n\
+- [C](intent://local/task/task-c)\n\
+- [D](intent://local/task/task-d)\n";
+    srv.store
+        .insert_note(&fixture_note(&ws, "spec", spec_body))
+        .await
+        .expect("insert spec");
+
+    let mk_task = |id: &str, title: &str, status: TaskStatus| {
+        let mut n = fixture_note(&ws, id, "body");
+        n.title = title.to_string();
+        n.parent_id = Some(NoteId::from("spec"));
+        n.task = Some(TaskMetadata {
+            status,
+            ..Default::default()
+        });
+        n
+    };
+    for n in [
+        mk_task("task-a", "Alpha", TaskStatus::InProgress),
+        mk_task("task-b", "Beta", TaskStatus::Complete),
+        mk_task("task-c", "Gamma", TaskStatus::ReviewRequired),
+        mk_task("task-d", "Delta", TaskStatus::Cancelled),
+    ] {
+        srv.store.insert_note(&n).await.expect("insert task note");
+    }
+
+    // Unfiltered: returns the four spec-linked tasks (cancelled included) and
+    // a `stats` rollup where `total` excludes the cancelled task and
+    // `inProgress` counts both in_progress + review_required.
+    let req = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"task.list","params":{{"workspaceId":"{}"}}}}"#,
+        ws.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &req).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 1);
+    let result = &resp["result"];
+    assert!(
+        result["error"].is_null(),
+        "unexpected error envelope: {resp}"
+    );
+
+    let tasks = result["tasks"].as_array().expect("tasks array");
+    // Order is store-list order (`ORDER BY created_at` with second precision —
+    // intentionally undefined for fixtures inserted in the same tick); compare
+    // as a set so the assertion isn't flaky on the timestamp tie-break.
+    let mut task_ids: Vec<&str> = tasks
+        .iter()
+        .map(|t| t["id"].as_str().expect("task id"))
+        .collect();
+    task_ids.sort_unstable();
+    assert_eq!(task_ids, vec!["task-a", "task-b", "task-c", "task-d"]);
+    let by_id: std::collections::HashMap<&str, &Value> = tasks
+        .iter()
+        .map(|t| (t["id"].as_str().unwrap(), t))
+        .collect();
+    assert_eq!(by_id["task-a"]["title"], "Alpha");
+    assert_eq!(by_id["task-a"]["status"], "in_progress");
+    assert_eq!(by_id["task-b"]["status"], "complete");
+    assert_eq!(by_id["task-c"]["status"], "review_required");
+    assert_eq!(by_id["task-d"]["status"], "cancelled");
+    assert!(by_id["task-a"]["updatedAt"].is_string());
+
+    let stats = &result["stats"];
+    assert_eq!(stats["total"], 3, "total excludes cancelled: {stats}");
+    assert_eq!(stats["completed"], 1, "completed = 1 complete: {stats}");
+    assert_eq!(
+        stats["inProgress"], 2,
+        "inProgress = in_progress + review_required: {stats}"
+    );
+    // Only the documented fields cross the wire (camelCase, no `tasks` array).
+    let stats_keys: Vec<&str> = stats
+        .as_object()
+        .expect("stats object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let mut sorted = stats_keys.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec!["completed", "inProgress", "total"]);
+
+    // Status filter narrows `tasks` only; `stats` stays the full workspace
+    // rollup so the FE renders the progress bar verbatim.
+    let req = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"task.list","params":{{"workspaceId":"{}","status":"complete"}}}}"#,
+        ws.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &req).await;
+    let result = &resp["result"];
+    let tasks = result["tasks"].as_array().expect("tasks array (filtered)");
+    assert_eq!(tasks.len(), 1, "status=complete narrows to one task");
+    assert_eq!(tasks[0]["id"], "task-b");
+    assert_eq!(result["stats"]["total"], 3, "stats stay the full rollup");
+    assert_eq!(result["stats"]["completed"], 1);
+    assert_eq!(result["stats"]["inProgress"], 2);
+
+    srv.ws.stop().await;
+}
+
+/// A workspace with no task notes still emits a well-formed `stats` aggregate
+/// (zeroed counts) so the FE never sees a missing `stats` field. Covers the
+/// "fresh workspace" branch the FE renderer hits on the first load.
+#[tokio::test]
+async fn wss_task_list_empty_workspace_emits_zero_stats() {
+    let srv = start(WsOptions::default()).await;
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Empty"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    let req = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"task.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &req).await;
+    let result = &resp["result"];
+    assert_eq!(result["tasks"].as_array().expect("tasks array").len(), 0);
+    assert_eq!(result["stats"]["total"], 0);
+    assert_eq!(result["stats"]["completed"], 0);
+    assert_eq!(result["stats"]["inProgress"], 0);
+
     srv.ws.stop().await;
 }
