@@ -10,8 +10,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use git2::{Commit, Repository, Sort};
-use intent_core::{iso_from_unix_secs, Result};
+use git2::{Commit, Patch, Repository, Sort};
+use intent_core::{iso_from_unix_secs, Error, Result};
 
 use crate::map_git_err;
 use crate::status::current_branch;
@@ -151,6 +151,84 @@ fn changed_files(repo: &Repository, commit: &Commit) -> Result<Vec<String>> {
     Ok(files)
 }
 
+/// Per-file additions/deletions for a single commit, used by [`CommitDetails`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitFileChange {
+    pub path: String,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+/// Full per-commit detail record: metadata plus the changed-file list with
+/// per-file line stats. Returned by [`commit_details`] and projected by
+/// `intent-services` onto the `git.commitDetails` wire shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDetails {
+    pub hash: String,
+    pub author: String,
+    pub author_email: String,
+    pub date: String,
+    pub message: String,
+    pub files: Vec<CommitFileChange>,
+}
+
+/// Resolve `commit_hash` (full SHA or short ref) against `worktree_path` and
+/// return its metadata plus the per-file `(additions, deletions)` diff against
+/// the first parent. A root commit (no parent) diffs against the empty tree, so
+/// every file appears as additions. An unresolvable hash returns
+/// [`Error::NotFound`].
+pub fn commit_details(worktree_path: &Path, commit_hash: &str) -> Result<CommitDetails> {
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    let obj = repo
+        .revparse_single(commit_hash)
+        .map_err(|_| Error::NotFound(format!("commit not found: {commit_hash}")))?;
+    let commit = obj
+        .peel_to_commit()
+        .map_err(|_| Error::NotFound(format!("commit not found: {commit_hash}")))?;
+    let author = commit.author();
+    let tree = commit.tree().map_err(map_git_err)?;
+    let parent_tree = match commit.parent(0) {
+        Ok(parent) => Some(parent.tree().map_err(map_git_err)?),
+        Err(_) => None,
+    };
+    let diff = repo
+        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
+        .map_err(map_git_err)?;
+    let mut files = Vec::new();
+    for i in 0..diff.deltas().len() {
+        let delta = diff.get_delta(i).expect("delta index in range");
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if path.is_empty() {
+            continue;
+        }
+        let (additions, deletions) = match Patch::from_diff(&diff, i).map_err(map_git_err)? {
+            Some(patch) => {
+                let (_ctx, adds, dels) = patch.line_stats().map_err(map_git_err)?;
+                (adds, dels)
+            }
+            None => (0, 0),
+        };
+        files.push(CommitFileChange {
+            path,
+            additions,
+            deletions,
+        });
+    }
+    Ok(CommitDetails {
+        hash: commit.id().to_string(),
+        author: author.name().unwrap_or("").to_string(),
+        author_email: author.email().unwrap_or("").to_string(),
+        date: iso_from_unix_secs(commit.time().seconds()),
+        message: commit.summary().ok().flatten().unwrap_or("").to_string(),
+        files,
+    })
+}
+
 /// Parse the `Agent-Id:` / `Linked-Note-Id:` trailers from a commit body,
 /// mirroring the TS `loadCommits` trailer scan.
 pub(crate) fn parse_trailers(body: &str) -> (Option<String>, Option<String>) {
@@ -218,5 +296,47 @@ mod tests {
         let (none_a, none_n) = parse_trailers("no trailers here");
         assert!(none_a.is_none());
         assert!(none_n.is_none());
+    }
+
+    #[test]
+    fn commit_details_returns_metadata_and_file_stats() {
+        let dir = init_repo("commit-details-basic");
+        commit_file(dir.path(), "a.txt", "line1\nline2\nline3\n");
+        commit_file(dir.path(), "a.txt", "line1\nCHANGED\nline3\nline4\n");
+        let commits = history(dir.path(), 50).unwrap();
+        let head = &commits[0];
+        let details = commit_details(dir.path(), &head.hash).unwrap();
+        assert_eq!(details.hash, head.hash);
+        assert_eq!(details.author, "Test");
+        assert_eq!(details.author_email, "test@example.com");
+        assert!(!details.date.is_empty());
+        assert_eq!(details.files.len(), 1);
+        let f = &details.files[0];
+        assert_eq!(f.path, "a.txt");
+        // One line replaced (1 add + 1 del) + one appended (1 add).
+        assert_eq!(f.additions, 2);
+        assert_eq!(f.deletions, 1);
+    }
+
+    #[test]
+    fn commit_details_root_commit_is_all_additions() {
+        let dir = init_repo("commit-details-root");
+        commit_file(dir.path(), "seed.txt", "one\ntwo\n");
+        let commits = history(dir.path(), 50).unwrap();
+        let root = &commits[0];
+        let details = commit_details(dir.path(), &root.hash).unwrap();
+        assert_eq!(details.files.len(), 1);
+        assert_eq!(details.files[0].path, "seed.txt");
+        assert_eq!(details.files[0].additions, 2);
+        assert_eq!(details.files[0].deletions, 0);
+    }
+
+    #[test]
+    fn commit_details_unknown_hash_is_not_found() {
+        let dir = init_repo("commit-details-missing");
+        commit_file(dir.path(), "a.txt", "seed\n");
+        let err =
+            commit_details(dir.path(), "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
     }
 }

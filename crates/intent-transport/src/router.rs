@@ -1030,8 +1030,20 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let path = opt_str(params, "path");
             let staged = parse_bool(params, "staged");
+            // §5.6 extension: when `commitHash` is set the result is the hunks
+            // for `<commitHash>^..<commitHash>` and `staged` is ignored.
+            let commit_hash = opt_str(params, "commitHash");
             let r = api
-                .git_diffs(ws, path, staged)
+                .git_diffs(ws, path, staged, commit_hash)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "git.commitDetails" => {
+            let ws = require_ws_note(params)?;
+            let commit_hash = require_str_param(params, "commitHash")?;
+            let r = api
+                .git_commit_details(ws, commit_hash)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

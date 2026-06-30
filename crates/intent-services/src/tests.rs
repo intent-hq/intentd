@@ -3871,7 +3871,7 @@ mod file_tracking {
         std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
-        let diffs = svc.git_diffs(ws_id, None, false).await.unwrap();
+        let diffs = svc.git_diffs(ws_id, None, false, None).await.unwrap();
         let arr = diffs.as_array().unwrap();
         let f = arr.iter().find(|d| d["path"] == "seed.txt").unwrap();
         let hunks = f["hunks"].as_array().unwrap();
@@ -3905,7 +3905,7 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some("seed.txt".to_string()), true)
+            .git_diffs(ws_id, Some("seed.txt".to_string()), true, None)
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
@@ -3924,12 +3924,140 @@ mod file_tracking {
             serde_json::json!([])
         );
         assert_eq!(
-            svc.git_diffs(ws.clone(), None, false).await.unwrap(),
+            svc.git_diffs(ws.clone(), None, false, None).await.unwrap(),
             serde_json::json!([])
         );
-        let commits = svc.git_commits(ws, None, None).await.unwrap();
+        let commits = svc.git_commits(ws.clone(), None, None).await.unwrap();
         assert_eq!(commits["items"], serde_json::json!([]));
         assert_eq!(commits["nextToken"], serde_json::Value::Null);
+        // git.commitDetails degrades to an empty envelope (graceful) — same as
+        // the other git reads — when the workspace has no worktree.
+        let details = svc
+            .git_commit_details(ws, "deadbeef".to_string())
+            .await
+            .unwrap();
+        assert_eq!(details["commitHash"], "deadbeef");
+        assert_eq!(details["files"], serde_json::json!([]));
+        assert_eq!(details["fileDetails"], serde_json::json!([]));
+    }
+
+    /// `git.commitDetails` returns the commit's metadata + per-file additions/
+    /// deletions for a real repo (PROTOCOL §5.6).
+    #[tokio::test]
+    async fn git_commit_details_returns_metadata_and_file_stats() {
+        let repo = init_git_repo();
+        // Land a second commit so HEAD has a non-empty parent diff.
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        std::fs::write(repo.dir.join("new.txt"), "hello\n").unwrap();
+        {
+            let r = Repository::open(&repo.dir).unwrap();
+            let mut idx = r.index().unwrap();
+            idx.add_path(std::path::Path::new("seed.txt")).unwrap();
+            idx.add_path(std::path::Path::new("new.txt")).unwrap();
+            idx.write().unwrap();
+            let tree_oid = idx.write_tree().unwrap();
+            let tree = r.find_tree(tree_oid).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let parent = r
+                .head()
+                .unwrap()
+                .target()
+                .and_then(|oid| r.find_commit(oid).ok())
+                .unwrap();
+            r.commit(Some("HEAD"), &sig, &sig, "second", &tree, &[&parent])
+                .unwrap();
+        }
+        let head = Repository::open(&repo.dir)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let details = svc.git_commit_details(ws_id, head.clone()).await.unwrap();
+        assert_eq!(details["commitHash"], head);
+        assert_eq!(details["author"], "Test");
+        assert_eq!(details["authorEmail"], "test@example.com");
+        assert_eq!(details["message"], "second");
+        let files = details["files"].as_array().unwrap();
+        assert!(files.iter().any(|f| f == "seed.txt"));
+        assert!(files.iter().any(|f| f == "new.txt"));
+        let file_details = details["fileDetails"].as_array().unwrap();
+        let seed = file_details
+            .iter()
+            .find(|f| f["path"] == "seed.txt")
+            .unwrap();
+        assert_eq!(seed["additions"], 1);
+        assert_eq!(seed["deletions"], 0);
+    }
+
+    /// An unresolvable `commitHash` degrades to the empty envelope (graceful)
+    /// rather than surfacing as a `-32603` so the FE can render an empty state.
+    #[tokio::test]
+    async fn git_commit_details_unknown_hash_is_empty_envelope() {
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+        let details = svc
+            .git_commit_details(
+                ws_id,
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            details["commitHash"],
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        );
+        assert_eq!(details["files"], serde_json::json!([]));
+        assert_eq!(details["fileDetails"], serde_json::json!([]));
+    }
+
+    /// `git.diffs` with `commitHash` returns the commit's per-file hunks vs
+    /// its first parent (PROTOCOL §5.6 extension).
+    #[tokio::test]
+    async fn git_diffs_with_commit_hash_returns_per_file_hunks() {
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        {
+            let r = Repository::open(&repo.dir).unwrap();
+            let mut idx = r.index().unwrap();
+            idx.add_path(std::path::Path::new("seed.txt")).unwrap();
+            idx.write().unwrap();
+            let tree_oid = idx.write_tree().unwrap();
+            let tree = r.find_tree(tree_oid).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let parent = r
+                .head()
+                .unwrap()
+                .target()
+                .and_then(|oid| r.find_commit(oid).ok())
+                .unwrap();
+            r.commit(Some("HEAD"), &sig, &sig, "second", &tree, &[&parent])
+                .unwrap();
+        }
+        let head = Repository::open(&repo.dir)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let diffs = svc
+            .git_diffs(ws_id, Some("seed.txt".to_string()), false, Some(head))
+            .await
+            .unwrap();
+        let arr = diffs.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["path"], "seed.txt");
+        let lines = arr[0]["hunks"][0]["lines"].as_array().unwrap();
+        assert!(lines
+            .iter()
+            .any(|l| l["type"] == "Addition"
+                && l["content"].as_str().unwrap_or("").contains("added")));
     }
 }
 

@@ -1412,21 +1412,45 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `git.diffs`: per-file diff hunks for the working tree. `staged` selects
-    /// the HEAD→index diff (`true`) or the index→workdir diff (`false`,
-    /// default); `path` restricts the result to a single file. Returns
-    /// `[{ path, hunks }]`; remote/non-repo workspaces return an empty array
+    /// `git.diffs`: per-file diff hunks. When `commit_hash` is set, returns
+    /// the per-file hunks for `<commit_hash>^..<commit_hash>` (the commit's own
+    /// changes vs its first parent; a root commit yields all-additions) and the
+    /// `staged` flag is ignored. Otherwise `staged` selects the HEAD→index diff
+    /// (`true`) or the index→workdir diff (`false`, default). `path` restricts
+    /// the result to a single file. Returns `[{ path, hunks }]`; remote/non-repo
+    /// workspaces and an unresolvable `commit_hash` return an empty array
     /// (wire §7.7).
     fn git_diffs(
         &self,
         workspace_id: WorkspaceId,
         path: Option<String>,
         staged: bool,
+        commit_hash: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, path, staged);
+        let _ = (workspace_id, path, staged, commit_hash);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_diffs not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.commitDetails`: metadata + per-file `(additions, deletions)` for a
+    /// single commit, addressed by `commit_hash` (full SHA or short ref).
+    /// Returns the wire shape `{ commitHash, author, authorEmail, date, message,
+    /// files: string[], fileDetails: [{ path, additions, deletions }] }`.
+    /// Remote/non-repo workspaces and an unresolvable hash return an empty
+    /// envelope (`{ commitHash, fileDetails: [], files: [] }`) so the FE renders
+    /// a friendly empty state instead of crashing (wire §7.7).
+    fn git_commit_details(
+        &self,
+        workspace_id: WorkspaceId,
+        commit_hash: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, commit_hash);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_commit_details not implemented".to_string(),
             ))
         })
     }
