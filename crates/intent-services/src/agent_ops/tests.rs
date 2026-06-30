@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use intent_acp::WorkspaceMcpServer;
 use intent_core::{
-    now_iso, AgentDelegateInput, AgentId, Error, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, AgentDelegateInput, AgentId, Error, NoteCreate, Workspace, WorkspaceActivity,
+    WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use std::time::Duration;
 
@@ -1451,6 +1451,152 @@ async fn mcp_delegate_immediate_registers_oneshot_watch() {
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].child_agent_id, child);
     assert!(watches[0].one_shot);
+}
+
+// ===========================================================================
+// Delegate first-message delivery: the child must receive its instructions and
+// start its turn (PROTOCOL §5.5). Without a runtime `AgentManager` attached the
+// delivery falls back to the store-only persist path (`agent_send_message_op`),
+// so the child's transcript carries exactly one `user` message whose content is
+// resolved by the documented fallback chain.
+// ===========================================================================
+
+async fn child_session_messages_json(svc: &Services, child: &AgentId) -> String {
+    let session = svc
+        .store()
+        .get_agent_session(child)
+        .await
+        .expect("child session");
+    serde_json::to_string(&session.messages).expect("serialize child messages")
+}
+
+/// Explicit `agentInstructions` become the child's first message.
+#[tokio::test]
+async fn delegate_delivers_agent_instructions_as_child_first_message() {
+    let (_t, svc, ws) = setup().await;
+    let input = AgentDelegateInput {
+        agent_instructions: Some("build the thing".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let conv = svc
+        .agent_get_conversation_op(child.clone(), None, None)
+        .await
+        .expect("conv");
+    assert_eq!(conv["totalMessages"], 1, "child got exactly one message");
+    assert_eq!(conv["messages"][0]["role"], "user");
+    assert!(
+        child_session_messages_json(&svc, &child)
+            .await
+            .contains("build the thing"),
+        "child first message carries the agentInstructions"
+    );
+}
+
+/// With no `agentInstructions`, the child's first message falls back to
+/// `taskText`.
+#[tokio::test]
+async fn delegate_falls_back_to_task_text_for_child_first_message() {
+    let (_t, svc, ws) = setup().await;
+    let input = AgentDelegateInput {
+        task_text: Some("the task text".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let conv = svc
+        .agent_get_conversation_op(child.clone(), None, None)
+        .await
+        .expect("conv");
+    assert_eq!(conv["totalMessages"], 1);
+    assert!(child_session_messages_json(&svc, &child)
+        .await
+        .contains("the task text"));
+}
+
+/// `agentInstructions` take priority over `taskText` when both are present.
+#[tokio::test]
+async fn delegate_prefers_agent_instructions_over_task_text() {
+    let (_t, svc, ws) = setup().await;
+    let input = AgentDelegateInput {
+        agent_instructions: Some("instructions win".into()),
+        task_text: Some("task text loses".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let body = child_session_messages_json(&svc, &child).await;
+    assert!(body.contains("instructions win"));
+    assert!(!body.contains("task text loses"));
+}
+
+/// With neither `agentInstructions` nor `taskText`, the child's first message
+/// falls back to the linked task note's content.
+#[tokio::test]
+async fn delegate_falls_back_to_task_note_content_for_child_first_message() {
+    let (_t, svc, ws) = setup().await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Task title".into(),
+                content: Some("note content body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    let input = AgentDelegateInput {
+        task_note_id: Some(note.id.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let conv = svc
+        .agent_get_conversation_op(child.clone(), None, None)
+        .await
+        .expect("conv");
+    assert_eq!(conv["totalMessages"], 1);
+    assert!(child_session_messages_json(&svc, &child)
+        .await
+        .contains("note content body"));
+}
+
+/// A bare delegate (no instructions, no task text, no task note) creates the
+/// child but delivers no first message — there is nothing to send.
+#[tokio::test]
+async fn delegate_without_message_source_delivers_nothing() {
+    let (_t, svc, ws) = setup().await;
+    let resp = svc
+        .agent_delegate_op(ws.clone(), AgentDelegateInput::default(), None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let conv = svc
+        .agent_get_conversation_op(child, None, None)
+        .await
+        .expect("conv");
+    assert_eq!(conv["totalMessages"], 0, "no message delivered");
 }
 
 // ===========================================================================

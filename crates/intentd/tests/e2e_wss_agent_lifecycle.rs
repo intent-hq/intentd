@@ -921,6 +921,132 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
     assert_eq!(stopped["success"], true, "stop ok: {stopped}");
 }
 
+/// Agent delegation over WSS: `agent.delegate` with `agentInstructions` must
+/// create the child AND start its turn, with every `agent:stream:*` event keyed
+/// by the CHILD `agentId` (PROTOCOL §5.5/§6.5). Drives the RPC front door
+/// (caller-less) so the child is the only agent that ever runs — proving the
+/// streamed output belongs to the child's session, not a parent's. Asserts: a
+/// non-empty `agentId` in the result, ≥1 `agent:stream:chunk` + exactly one
+/// terminal `agent:stream:end` + an `agent:idle` all carrying the child id, and
+/// the child transcript carrying the delivered instructions + an assistant reply.
+#[tokio::test]
+async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
+    let Some(script) = gate("WSS delegate child-turn E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "response": "delegated child ran" }).to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE delegating so we miss no child events.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // RPC conn — delegate with instructions; the child runs the mock provider.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let delegated = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "agentInstructions": "do the delegated work",
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    assert_eq!(delegated["ok"], true, "delegate ok: {delegated}");
+    let child_id = delegated["agentId"]
+        .as_str()
+        .expect("child agent id")
+        .to_string();
+    assert!(!child_id.is_empty(), "non-empty child agentId");
+
+    // Every stream event must carry the CHILD id; collect past the terminal
+    // stream:end to the trailing agent:idle (idle is emitted AFTER stream:end
+    // in `run_prompt_turn`, §6.5/§7).
+    let mut chunks = 0u32;
+    let mut ends = 0u32;
+    let mut saw_idle = false;
+    for _ in 0..120 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+        match ev["type"].as_str() {
+            Some("agent:stream:chunk") => {
+                assert_eq!(ev_agent, child_id, "chunk scoped to the child: {ev}");
+                chunks += 1;
+            }
+            Some("agent:stream:end") => {
+                assert_eq!(ev_agent, child_id, "stream:end scoped to the child: {ev}");
+                ends += 1;
+            }
+            Some("agent:idle") if ev_agent == child_id => saw_idle = true,
+            _ => {}
+        }
+        if ends >= 1 && saw_idle {
+            break;
+        }
+    }
+    assert!(chunks >= 1, "child streamed ≥1 chunk keyed by its own id");
+    assert_eq!(ends, 1, "exactly one terminal stream:end for the child");
+    assert!(saw_idle, "child emitted agent:idle on completion");
+
+    // The child transcript carries the delivered instructions (user) and the
+    // mock's assistant reply — observable proof the turn actually ran.
+    let conv = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.getConversation",
+        json!({ "agentId": child_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    assert!(
+        messages.iter().any(|m| m["role"] == "user"
+            && serde_json::to_string(&m["contentBlocks"])
+                .unwrap_or_default()
+                .contains("do the delegated work")),
+        "child first message carries the delegated instructions: {conv}"
+    );
+    assert!(
+        messages.iter().any(|m| m["role"] == "assistant"),
+        "child produced an assistant reply: {conv}"
+    );
+}
+
 /// Pre-seed the daemon's SQLite store with a workspace + target note for the
 /// MCP tool call (the daemon opens the same data dir on launch).
 async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {

@@ -959,6 +959,47 @@ impl Services {
                 }
             }
         }
+        // Deliver the child's first message and start its turn (PROTOCOL §5.5).
+        // Without this the child stays `Pending` and never runs. `wait_mode` is
+        // already honored by the completion-watch registration above; the child
+        // turn itself starts unconditionally. Message source priority mirrors the
+        // TS `DelegateTaskTool`: explicit `agentInstructions`, then `taskText`,
+        // then the linked task note's content (falling back to its title).
+        //
+        // Delivery routes through the runtime `AgentManager` when attached (the
+        // proven `agent.sendMessage` path: persist + spawn the turn worker, which
+        // lazily spawns the child and streams `agent:stream:*` keyed by the CHILD
+        // `agentId`); read-only/test wiring falls back to the store-only persist.
+        fn first_nonempty(s: &str) -> Option<String> {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        let mut message = input
+            .agent_instructions
+            .as_deref()
+            .and_then(first_nonempty)
+            .or_else(|| input.task_text.as_deref().and_then(first_nonempty));
+        if message.is_none() {
+            if let Some(note_id) = input.task_note_id.or(input.note_id) {
+                if let Ok(note) = self.store.get_note(&note_id).await {
+                    message = first_nonempty(&note.content).or_else(|| first_nonempty(&note.title));
+                }
+            }
+        }
+        if let Some(message) = message {
+            let child = AgentId::from(agent_id.as_str());
+            let send = match self.agent_manager() {
+                Some(manager) => {
+                    manager
+                        .send_message(child, workspace_id, message, None)
+                        .await
+                }
+                None => self.agent_send_message_op(child, message, None).await,
+            };
+            if let Err(e) = send {
+                tracing::warn!(agent = %agent_id, error = %e, "delegate: failed to start child turn");
+            }
+        }
         Ok(json!({ "ok": true, "agentId": agent_id, "name": name }))
     }
 
