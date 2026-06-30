@@ -211,7 +211,7 @@ fn long_tool_name_is_truncated_with_ellipsis() {
     )];
     let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
     // 200 cap → 197 chars of head + "..." (3 chars).
-    let head: String = std::iter::repeat('n').take(197).collect();
+    let head: String = "n".repeat(197);
     assert!(xml.contains(&format!("<tool_use name=\"{head}...\" tool_use_id=\"t\">")));
 }
 
