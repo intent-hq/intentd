@@ -191,12 +191,7 @@ async fn non_matching_events_are_filtered_out_silently() {
     let (_tmp, bus) = bus().await;
     // Filter that matches nothing the test publishes; the delivery task must
     // simply skip each event (the `continue` branch) without surfacing them.
-    let mut filter = SubscriptionFilter::for_subscriber(
-        &["task:*".to_string()],
-        None,
-        false,
-        None,
-    );
+    let mut filter = SubscriptionFilter::for_subscriber(&["task:*".to_string()], None, false, None);
     filter.batch_window = None;
     let mut sub = bus.subscribe(filter);
 
@@ -209,7 +204,10 @@ async fn non_matching_events_are_filtered_out_silently() {
 
     // Nothing matches → recv must time out rather than deliver a stray batch.
     let got = timeout(Duration::from_millis(150), sub.recv()).await;
-    assert!(got.is_err(), "non-matching events must not be delivered: {got:?}");
+    assert!(
+        got.is_err(),
+        "non-matching events must not be delivered: {got:?}"
+    );
 }
 
 #[tokio::test]

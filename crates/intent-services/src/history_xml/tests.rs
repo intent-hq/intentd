@@ -144,10 +144,13 @@ fn renders_thinking_block_as_thinking_tag() {
 #[test]
 fn unknown_block_type_and_unknown_role_are_dropped_silently() {
     let messages = vec![
-        msg("user", json!([
-            { "type": "text", "text": "ok" },
-            { "type": "image", "data": "ignored" },
-        ])),
+        msg(
+            "user",
+            json!([
+                { "type": "text", "text": "ok" },
+                { "type": "image", "data": "ignored" },
+            ]),
+        ),
         // Unknown roles fall through the `_ => {}` arm in the exchange grouper.
         msg("system", json!([{ "type": "text", "text": "sys" }])),
     ];
@@ -162,10 +165,7 @@ fn empty_user_and_null_error_content_render_as_empty_wrappers() {
     // Non-assistant turns whose blocks are empty/missing keep their wrapper
     // (sanitize pushes a Msg with empty blocks); the assistant variant is
     // dropped entirely (already covered).
-    let messages = vec![
-        msg("user", json!([])),
-        msg("error", Value::Null),
-    ];
+    let messages = vec![msg("user", json!([])), msg("error", Value::Null)];
     let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
     assert!(xml.contains("<user_request_or_tool_results>\n  </user_request_or_tool_results>"));
     assert!(xml.contains("<error>\n  </error>"));
@@ -212,9 +212,7 @@ fn long_tool_name_is_truncated_with_ellipsis() {
     let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
     // 200 cap → 197 chars of head + "..." (3 chars).
     let head: String = std::iter::repeat('n').take(197).collect();
-    assert!(xml.contains(&format!(
-        "<tool_use name=\"{head}...\" tool_use_id=\"t\">"
-    )));
+    assert!(xml.contains(&format!("<tool_use name=\"{head}...\" tool_use_id=\"t\">")));
 }
 
 #[test]
@@ -223,14 +221,20 @@ fn tool_result_falls_back_to_content_when_output_is_null_or_missing() {
     // (line 143/144); first_truthy on render must then skip the null `output`
     // (is_truthy=false) before returning the truthy `content`.
     let messages = vec![
-        msg("assistant", json!([
-            { "type": "tool_use", "name": "x", "tool_use_id": "n" },
-            { "type": "tool_use", "name": "y", "tool_use_id": "m" },
-        ])),
-        msg("user", json!([
-            { "type": "tool_result", "tool_use_id": "n", "output": null, "content": "from-content" },
-            { "type": "tool_result", "tool_use_id": "m", "content": "bare-content" },
-        ])),
+        msg(
+            "assistant",
+            json!([
+                { "type": "tool_use", "name": "x", "tool_use_id": "n" },
+                { "type": "tool_use", "name": "y", "tool_use_id": "m" },
+            ]),
+        ),
+        msg(
+            "user",
+            json!([
+                { "type": "tool_result", "tool_use_id": "n", "output": null, "content": "from-content" },
+                { "type": "tool_result", "tool_use_id": "m", "content": "bare-content" },
+            ]),
+        ),
     ];
     let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
     assert!(xml.contains("from-content"));
@@ -256,15 +260,21 @@ fn numeric_output_renders_as_json_and_zero_falls_back_to_content() {
     // Sanitize's `has_output` check only keeps String/Object/Array outputs, so
     // these blocks ride past it on the `is_error` flag (matching the TS rule).
     let messages = vec![
-        msg("assistant", json!([
-            { "type": "tool_use", "name": "f", "tool_use_id": "n42" },
-            { "type": "tool_use", "name": "g", "tool_use_id": "n0" },
-        ])),
-        msg("user", json!([
-            { "type": "tool_result", "tool_use_id": "n42", "output": 42, "is_error": true },
-            // Number 0 is falsy → first_truthy skips it and returns `content`.
-            { "type": "tool_result", "tool_use_id": "n0", "output": 0, "content": "fallback", "is_error": true },
-        ])),
+        msg(
+            "assistant",
+            json!([
+                { "type": "tool_use", "name": "f", "tool_use_id": "n42" },
+                { "type": "tool_use", "name": "g", "tool_use_id": "n0" },
+            ]),
+        ),
+        msg(
+            "user",
+            json!([
+                { "type": "tool_result", "tool_use_id": "n42", "output": 42, "is_error": true },
+                // Number 0 is falsy → first_truthy skips it and returns `content`.
+                { "type": "tool_result", "tool_use_id": "n0", "output": 0, "content": "fallback", "is_error": true },
+            ]),
+        ),
     ];
     let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
     assert!(xml.contains("<tool_result tool_use_id=\"n42\" is_error=\"true\">"));
