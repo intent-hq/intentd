@@ -23,8 +23,8 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use super::{
-    compute_process_cap, derive_agent_type, AgentHandle, AgentManager, BusEventSink, KillFn,
-    ProcessRegistry, DEFAULT_AGENT_TYPE,
+    compute_process_cap, derive_agent_type, resolve_spawn, text_prompt, user_text_blocks,
+    AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry, DEFAULT_AGENT_TYPE,
 };
 use crate::events::{EventBus, SubscriptionFilter};
 use crate::Services;
@@ -1037,4 +1037,416 @@ async fn services_permission_rpcs_are_inert_without_a_manager() {
         .await
         .expect("respond");
     assert_eq!(resolved, json!({ "resolved": false }));
+}
+
+// --- Lifecycle plumbing -------------------------------------------------------
+
+#[tokio::test]
+async fn stop_returns_false_for_unknown_agent() {
+    let (_tmp, mgr) = manager().await;
+    assert!(!mgr.stop(&AgentId::from("missing")).await);
+}
+
+/// `stop` drops any pending `recreated` flag so a stale resend bit cannot
+/// survive a teardown into a future spawn (parity with the `recreated` doc on
+/// `AgentManager`).
+#[tokio::test]
+async fn stop_clears_pending_recreate_flag() {
+    let (_tmp, mgr) = manager().await;
+    let id = AgentId::from("a-stop-recreate");
+    track(&mgr, &id);
+    mgr.recreated.lock().unwrap().insert(id.clone());
+
+    assert!(mgr.stop(&id).await);
+    assert!(
+        !mgr.recreated.lock().unwrap().contains(&id),
+        "stop wipes the resend flag",
+    );
+}
+
+#[tokio::test]
+async fn is_busy_reflects_try_begin_and_end_turn() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-busy"), AgentId::from("a-busy"));
+    assert!(!mgr.is_busy(&id), "fresh agent is not busy");
+    assert!(mgr.try_begin(&id, &ws).await);
+    assert!(mgr.is_busy(&id), "claim flips busy on");
+    // Second `try_begin` is rejected — single-flight per agent (§5.5).
+    assert!(
+        !mgr.try_begin(&id, &ws).await,
+        "single-flight rejects 2nd claim"
+    );
+    mgr.end_turn(&id).await;
+    assert!(!mgr.is_busy(&id), "release flips busy off");
+}
+
+/// `try_begin` persists the runtime `Active` transition and publishes the
+/// self-sufficient `agent:status-changed` event so a hydrated client reflects
+/// the live runtime rather than the stored `Pending` placeholder.
+#[tokio::test]
+async fn try_begin_persists_active_status_and_emits_event() {
+    use intent_core::events::AGENT_STATUS_CHANGED;
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-begin"), AgentId::from("a-begin"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::Active);
+    assert!(stored.is_active);
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let status_event = events
+        .iter()
+        .find(|e| e.event_type == AGENT_STATUS_CHANGED)
+        .expect("agent:status-changed published");
+    assert_eq!(status_event.data["status"], json!("active"));
+    assert_eq!(status_event.data["isActive"], json!(true));
+}
+
+/// `end_turn` persists the `RuntimeIdle` transition and publishes
+/// `agent:status-changed`. A no-op `end_turn` on an agent that was never busy
+/// neither writes nor emits.
+#[tokio::test]
+async fn end_turn_persists_runtime_idle_and_emits_event() {
+    use intent_core::events::AGENT_STATUS_CHANGED;
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-end"), AgentId::from("a-end"));
+    seed_agent(&mgr, &ws, &id).await;
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    // Subscribe AFTER `try_begin` so we only capture the `end_turn` emission.
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    mgr.end_turn(&id).await;
+
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::RuntimeIdle);
+    assert!(!stored.is_active);
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let status_event = events
+        .iter()
+        .find(|e| e.event_type == AGENT_STATUS_CHANGED)
+        .expect("agent:status-changed published on end_turn");
+    assert_eq!(status_event.data["status"], json!("idle"));
+    assert_eq!(status_event.data["isActive"], json!(false));
+
+    // Calling `end_turn` again on an already-idle agent is a no-op.
+    mgr.end_turn(&id).await;
+    assert!(!mgr.is_busy(&id));
+}
+
+#[tokio::test]
+async fn interrupt_returns_false_for_unknown_agent() {
+    let (_tmp, mgr) = manager().await;
+    assert!(
+        !mgr.interrupt(&AgentId::from("nope")).await,
+        "no handle → fall through to stop, which reports no removal",
+    );
+}
+
+/// Without an `acpSessionId` to cancel, `interrupt` falls back to the hard
+/// `stop` path (which still tears the handle down).
+#[tokio::test]
+async fn interrupt_falls_back_to_stop_without_acp_session_id() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-int-fb"), AgentId::from("a-int-fb"));
+    seed_agent(&mgr, &ws, &id).await;
+    // Track the handle but leave `acp_session_id` unset.
+    track(&mgr, &id);
+
+    assert!(
+        mgr.interrupt(&id).await,
+        "stop fallback reports the removal"
+    );
+    assert!(!mgr.contains(&id), "fallback tore the handle down");
+}
+
+// --- Queue + drain ------------------------------------------------------------
+
+#[tokio::test]
+async fn try_drain_queue_no_op_when_already_busy() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-drain"), AgentId::from("a-drain"));
+    // Queue a ready message so the only barrier is the busy flag.
+    mgr.services
+        .enqueue_message(&id, "queued".to_string(), None);
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+
+    // Queue is left untouched (no dequeue happened) and the slot stays held.
+    assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+    assert!(mgr.is_busy(&id));
+}
+
+#[tokio::test]
+async fn try_drain_queue_no_op_without_ready_messages() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-empty"), AgentId::from("a-empty"));
+
+    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+
+    assert!(
+        !mgr.is_busy(&id),
+        "no slot claim without ready-to-send work"
+    );
+    assert_eq!(mgr.services.queue_snapshot(&id).len(), 0);
+}
+
+#[tokio::test]
+async fn send_message_queues_when_already_busy() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-q"), AgentId::from("a-q"));
+    // Claim the in-flight slot so `send_message` must enqueue.
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let result = mgr
+        .send_message(id.clone(), ws.clone(), "queued".to_string(), None)
+        .await
+        .expect("send_message returns the queued envelope");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(result["queued"], json!(true));
+    assert_eq!(result["queuedMessage"]["content"], json!("queued"));
+    assert_eq!(result["queuedMessage"]["position"], json!(0));
+    assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+}
+
+// --- Recreate flag + history rendering ---------------------------------------
+
+/// When the resend flag is set but the agent has no prior history (the just-
+/// persisted current user message is excluded), `build_turn_body` just clears
+/// the flag and returns the live content unchanged.
+#[tokio::test]
+async fn build_turn_body_clears_flag_when_only_current_message_exists() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-bt"), AgentId::from("a-bt"));
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "only message" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    mgr.recreated.lock().unwrap().insert(id.clone());
+
+    let body = mgr.build_turn_body(&id, "only message").await;
+
+    assert_eq!(body, "only message", "no prior → live content unchanged");
+    assert!(
+        !mgr.recreated.lock().unwrap().contains(&id),
+        "flag was consumed even though no XML was prepended",
+    );
+}
+
+// --- resolve_spawn ------------------------------------------------------------
+
+/// A bare session with no `provider`/`model` resolves to the default ACP
+/// provider (auggie), no model, and the temp dir as cwd (no workspace path).
+#[test]
+fn resolve_spawn_defaults_to_default_provider_and_temp_cwd() {
+    let session = session_with_specialist(None);
+    let resolved = resolve_spawn(&session, None).expect("default resolves");
+    assert_eq!(
+        resolved.provider.id,
+        intent_providers::default_provider_id()
+    );
+    assert!(resolved.model.is_none(), "no model selected");
+    assert!(resolved.extra_env.is_empty());
+    assert_eq!(resolved.cwd, std::env::temp_dir());
+}
+
+/// A compound `provider:model` id selects both the provider and the bare model
+/// id, without needing an explicit `provider` on the session.
+#[test]
+fn resolve_spawn_parses_compound_model_id() {
+    let mut session = session_with_specialist(None);
+    session.model = Some("claude-code:sonnet".to_string());
+    let resolved = resolve_spawn(&session, None).expect("compound resolves");
+    assert_eq!(resolved.provider.id, "claude-code");
+    assert_eq!(resolved.model.as_deref(), Some("sonnet"));
+}
+
+/// An explicit `session.provider` wins over the prefix encoded in the model id
+/// (the session row is authoritative).
+#[test]
+fn resolve_spawn_session_provider_overrides_model_prefix() {
+    let mut session = session_with_specialist(None);
+    session.provider = Some("codex".to_string());
+    session.model = Some("claude-code:sonnet".to_string());
+    let resolved = resolve_spawn(&session, None).expect("explicit provider wins");
+    assert_eq!(resolved.provider.id, "codex");
+    // The model string is still split off the compound id (the bare half).
+    assert_eq!(resolved.model.as_deref(), Some("sonnet"));
+}
+
+/// A workspace whose `path` exists on disk becomes the spawn cwd; a missing
+/// path silently falls back to the temp dir.
+#[test]
+fn resolve_spawn_prefers_existing_workspace_path() {
+    let session = session_with_specialist(None);
+    let ws_dir = std::env::temp_dir().join(format!("intentd-rs-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+    let mut workspace = intent_core::Workspace {
+        id: WorkspaceId::from("ws-rs"),
+        title: "WS".to_string(),
+        branch: "main".to_string(),
+        base_ref: None,
+        base_commit_sha: None,
+        status: WorkspaceStatus::Active,
+        status_message: None,
+        activity: WorkspaceActivity::Idle,
+        attention: WorkspaceAttention::None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        last_activity: None,
+        tags: vec![],
+        path: Some(ws_dir.display().to_string()),
+        repository_path: None,
+        repository_owner: None,
+        repository_name: None,
+        worktree_path: None,
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
+        archived: false,
+        archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
+        token_usage: None,
+    };
+    let resolved =
+        resolve_spawn(&session, Some(&workspace)).expect("existing workspace path resolves");
+    assert_eq!(resolved.cwd, ws_dir);
+
+    // Switch to a non-existent path → fall back to temp.
+    workspace.path = Some(
+        std::env::temp_dir()
+            .join(format!("intentd-missing-{}", uuid::Uuid::new_v4()))
+            .display()
+            .to_string(),
+    );
+    let resolved = resolve_spawn(&session, Some(&workspace)).expect("falls back to temp");
+    assert_eq!(resolved.cwd, std::env::temp_dir());
+
+    let _ = std::fs::remove_dir_all(&ws_dir);
+}
+
+// --- Prompt block shape helpers ----------------------------------------------
+
+/// The persisted/prompt wire shape for a user text message is a single
+/// `{ type: "text", text }` block in an array (parity with `agent.sendMessage`).
+#[test]
+fn user_text_blocks_emits_single_text_block_array() {
+    let blocks = user_text_blocks("hello world");
+    let arr = blocks.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["type"], json!("text"));
+    assert_eq!(arr[0]["text"], json!("hello world"));
+}
+
+#[test]
+fn text_prompt_produces_one_acp_text_content_block() {
+    let prompt = text_prompt("ping");
+    assert_eq!(prompt.len(), 1);
+    let rendered = serde_json::to_value(&prompt).unwrap();
+    assert_eq!(rendered[0]["type"], json!("text"));
+    assert_eq!(rendered[0]["text"], json!("ping"));
+}
+
+// --- derive_agent_type workspace path tier -----------------------------------
+
+/// When a specialist sits under the workspace project tier
+/// (`<ws>/.augment/specialists/<id>.md`), `derive_agent_type` discovers it via
+/// the workspace path and returns its declared `agentType`.
+#[tokio::test]
+async fn derive_agent_type_uses_workspace_project_specialists_dir() {
+    let ws_dir = std::env::temp_dir().join(format!("intentd-dat-{}", uuid::Uuid::new_v4()));
+    let specialists_dir = ws_dir.join(".augment/specialists");
+    std::fs::create_dir_all(&specialists_dir).unwrap();
+    std::fs::write(
+        specialists_dir.join("worker.md"),
+        "---\nname: \"Worker\"\ndescription: \"d\"\nagentType: \"worker-loop\"\n---\n\nbody",
+    )
+    .unwrap();
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    // No global specialists dirs — the only way to find `worker` is via the
+    // workspace's project tier.
+    let services = Services::new(store);
+
+    let session = session_with_specialist(Some("worker"));
+    let workspace = intent_core::Workspace {
+        id: WorkspaceId::from("ws-dat"),
+        title: "WS".to_string(),
+        branch: "main".to_string(),
+        base_ref: None,
+        base_commit_sha: None,
+        status: WorkspaceStatus::Active,
+        status_message: None,
+        activity: WorkspaceActivity::Idle,
+        attention: WorkspaceAttention::None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        last_activity: None,
+        tags: vec![],
+        path: Some(ws_dir.display().to_string()),
+        repository_path: None,
+        repository_owner: None,
+        repository_name: None,
+        worktree_path: None,
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
+        archived: false,
+        archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
+        token_usage: None,
+    };
+
+    assert_eq!(
+        derive_agent_type(&services, &session, Some(&workspace)),
+        "worker-loop",
+    );
+
+    // A session with no specialist set keeps the default regardless of the
+    // workspace tier (no lookup happens).
+    let plain = session_with_specialist(None);
+    assert_eq!(
+        derive_agent_type(&services, &plain, Some(&workspace)),
+        DEFAULT_AGENT_TYPE,
+    );
+
+    let _ = std::fs::remove_dir_all(&ws_dir);
 }
