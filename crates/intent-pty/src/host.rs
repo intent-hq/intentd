@@ -108,6 +108,11 @@ pub struct SpawnSpec {
     pub cwd: Option<PathBuf>,
     /// Environment overrides layered onto the inherited environment.
     pub env: Vec<(String, String)>,
+    /// Environment variable names to remove from the inherited environment.
+    /// The overlay in `env` can only add/override keys, so scrubbing an
+    /// inherited var (e.g. `npm_config_prefix`, which breaks nvm) needs an
+    /// explicit removal applied via `CommandBuilder::env_remove`.
+    pub env_remove: Vec<String>,
     /// Initial terminal size.
     pub size: PtySize,
     /// Scrollback retention budget in bytes.
@@ -123,6 +128,7 @@ impl SpawnSpec {
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
+            env_remove: Vec::new(),
             size: PtySize::default(),
             scrollback_bytes: DEFAULT_SCROLLBACK_BYTES,
         }
@@ -226,6 +232,9 @@ impl PtyHost {
         }
         for (k, v) in &spec.env {
             cmd.env(k, v);
+        }
+        for k in &spec.env_remove {
+            cmd.env_remove(k);
         }
 
         let child = pair.slave.spawn_command(cmd).map_err(internal)?;
