@@ -259,3 +259,89 @@ fn discovery_disabled_by_default() {
     assert!(is_discovery_enabled(Some(true)));
     assert!(!is_discovery_enabled(Some(false)));
 }
+
+#[test]
+fn extract_bearer_token_rejects_short_and_non_whitespace_separator() {
+    // header.get(..6) returns None for anything shorter than 6 bytes.
+    assert_eq!(extract_bearer_token(Some("abc")), None);
+    assert_eq!(extract_bearer_token(Some("Beare")), None);
+    // 6 chars but no whitespace after.
+    assert_eq!(extract_bearer_token(Some("Bearer")), None);
+    // 6 chars then non-whitespace.
+    assert_eq!(extract_bearer_token(Some("Bearer-x")), None);
+    // Multi-byte char at byte 6 boundary: `header.get(..6)` succeeds on ASCII
+    // prefix, but the next byte is a `-`, not whitespace.
+    assert_eq!(extract_bearer_token(Some("BEARER-abc")), None);
+}
+
+#[test]
+fn extract_token_decodes_plus_to_space_and_handles_no_value() {
+    // `+` → space in the query value.
+    assert_eq!(extract_token(None, "/ws?token=a+b").as_deref(), Some("a b"),);
+    // First `token` wins (matches URLSearchParams.get semantics in TS).
+    assert_eq!(
+        extract_token(None, "/ws?token=first&token=second").as_deref(),
+        Some("first"),
+    );
+    // Bare `?token` (no `=`) splits as ("token", "") and yields None for empty value.
+    assert_eq!(extract_token(None, "/ws?token"), None);
+    // Header neither present nor query.
+    assert_eq!(extract_token(None, ""), None);
+}
+
+#[test]
+fn extract_query_token_strips_fragment() {
+    // Fragment after the query is stripped before scanning.
+    assert_eq!(
+        extract_token(None, "/ws?token=abc#frag").as_deref(),
+        Some("abc"),
+    );
+    // Fragment-only target: split_once('?') is None → no token.
+    assert_eq!(extract_token(None, "/ws#frag"), None);
+}
+
+#[test]
+fn extract_query_token_handles_percent_escape_edges() {
+    // Invalid hex escape — left verbatim (the `%` is preserved, scan continues).
+    assert_eq!(
+        extract_token(None, "/ws?token=%ZZ%21").as_deref(),
+        Some("%ZZ!"),
+        "invalid escape stays verbatim; valid one (%21) decodes",
+    );
+    // Trailing `%` with no two following bytes — fails the i+2 check, kept verbatim.
+    assert_eq!(
+        extract_token(None, "/ws?token=abc%").as_deref(),
+        Some("abc%"),
+    );
+    // Percent-encoded key still matches `token` after decode.
+    assert_eq!(extract_token(None, "/ws?%74oken=x").as_deref(), Some("x"),);
+}
+
+#[test]
+fn origin_hostname_handles_userinfo_and_ipv6_and_paths() {
+    // Userinfo is stripped (rsplit_once('@') keeps the host:port).
+    assert!(is_allowed_origin_with_host(
+        Some("https://user:pass@localhost:5180"),
+        LOCAL
+    ));
+    // IPv6 literal in brackets is preserved as `[::1]` and matches the loopback set.
+    assert!(is_allowed_origin_with_host(
+        Some("https://[::1]:5180/path?q=1#frag"),
+        LOCAL
+    ));
+    // Path/query/hash after the authority are correctly trimmed.
+    assert!(is_allowed_origin_with_host(
+        Some("https://localhost:5180/some/path?x=1#h"),
+        LOCAL
+    ));
+}
+
+#[test]
+fn origin_rejects_empty_authority_and_missing_scheme() {
+    // Missing scheme entirely — split_once("://") returns None → reject.
+    assert!(!is_allowed_origin_with_host(Some("localhost:5180"), LOCAL));
+    // Scheme present but authority empty (`https:///path`) → None hostname → reject.
+    assert!(!is_allowed_origin_with_host(Some("https:///path"), LOCAL));
+    // Scheme with only `:` after authority (empty host before port).
+    assert!(!is_allowed_origin_with_host(Some("https://:5180"), LOCAL));
+}
