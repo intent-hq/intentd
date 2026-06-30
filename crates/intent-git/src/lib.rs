@@ -8,7 +8,7 @@
 use intent_core::Error;
 
 pub use intent_core::{
-    FileStatus, GitAgentCommitResult, GitBranches, GitCommitResult, GitFileStatus,
+    FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
     GitMergeConflicts, GitStatus, Result,
 };
 

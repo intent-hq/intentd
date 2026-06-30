@@ -1478,6 +1478,22 @@ pub struct GitBranches {
     pub default_branch: String,
 }
 
+/// `git.branchStatus` result — ahead/behind of the queried branch's upstream
+/// (`origin/<branchName>`), the worktree's currently-checked-out branch (with a
+/// derived `isCurrentBranch` flag against the queried name), and whether the
+/// working tree has any uncommitted changes (staged + unstaged + untracked,
+/// matching the legacy `git status --porcelain` semantics).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranchStatus {
+    pub branch: String,
+    pub current_branch: String,
+    pub is_current_branch: bool,
+    pub ahead: i64,
+    pub behind: i64,
+    pub has_uncommitted_changes: bool,
+}
+
 /// `git.commit` service result (the `ok` flag is added by the transport). Mirrors
 /// the TS `ws.git.commit` payload `{ hash?, files? }`; on success both are
 /// present (`hash` is the new commit SHA, `files` the files it changed).

@@ -905,3 +905,115 @@ async fn wss_git_commit_details_round_trip() {
     srv.ws.stop().await;
     std::fs::remove_dir_all(&repo).ok();
 }
+
+/// `git.branchStatus` over WSS — the path-based BranchSelector seam (§5.6).
+/// Drives the happy path (response shape parity with the UDS coverage), the
+/// missing-branchName -32602, and the unknown-repo gate.
+#[tokio::test]
+async fn wss_git_branch_status_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed a real git repo with one commit so the worktree has a valid HEAD.
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let repo = Path::new("/tmp").join(format!("intentd-wssbs-{}", &short[..8]));
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "seed"]);
+    let head_branch = String::from_utf8(
+        std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("branch --show-current")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+
+    // Register the repo as a workspace so the known-repo gate authorizes it.
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS branchStatus WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let _ = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+
+    // (a) Clean repo, queried branch == current → flags align.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.branchStatus","params":{{"repoPath":"{}","branchName":"{}"}}}}"#,
+            repo.display(),
+            head_branch,
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["branch"], head_branch);
+    assert_eq!(resp["result"]["currentBranch"], head_branch);
+    assert_eq!(resp["result"]["isCurrentBranch"], true);
+    assert_eq!(resp["result"]["ahead"], 0);
+    assert_eq!(resp["result"]["behind"], 0);
+    assert_eq!(resp["result"]["hasUncommittedChanges"], false);
+
+    // (b) Untracked file → hasUncommittedChanges flips to true.
+    std::fs::write(repo.join("new.txt"), "fresh\n").unwrap();
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"git.branchStatus","params":{{"repoPath":"{}","branchName":"{}"}}}}"#,
+            repo.display(),
+            head_branch,
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["hasUncommittedChanges"], true);
+
+    // (c) Missing branchName → -32602 with the verbatim message.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"git.branchStatus","params":{{"repoPath":"{}"}}}}"#,
+            repo.display(),
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["message"],
+        "Missing required parameter: branchName"
+    );
+
+    // (d) Unknown repo path → -32602 with the gate-rejection message.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":5,"method":"git.branchStatus","params":{"repoPath":"/no/such/repo","branchName":"main"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["message"],
+        "Unknown or unauthorized repository path"
+    );
+
+    srv.ws.stop().await;
+    std::fs::remove_dir_all(&repo).ok();
+}

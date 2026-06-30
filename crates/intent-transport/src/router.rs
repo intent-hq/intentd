@@ -977,6 +977,18 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "git.branchStatus" => {
+            let repo_path = require_str_param(params, "repoPath")?;
+            let branch_name = require_str_param(params, "branchName")?;
+            match api.git_branch_status(repo_path, branch_name).await {
+                Ok(status) => to_result_value(&status),
+                // Same gate as `git.getBranches`: unknown/unauthorized repo path
+                // surfaces verbatim as `-32602` without the `invalid params:`
+                // prefix `domain_to_rpc` would add.
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "repo.list" => {
             // No params; returns `{ repos: KnownRepo[] }` with camelCase keys.
             let r = api.repo_list().await.map_err(domain_to_rpc)?;

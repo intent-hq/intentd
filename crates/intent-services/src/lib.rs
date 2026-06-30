@@ -4995,6 +4995,25 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn git_branch_status(
+        &self,
+        repo_path: String,
+        branch_name: String,
+    ) -> BoxFuture<'_, Result<intent_core::GitBranchStatus>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Same known-repo gate as `git_get_branches`: an unknown/unauthorized
+            // repo path is `-32602` (PROTOCOL §5.6).
+            let workspaces = store.list_workspaces(true).await?;
+            if !git_ops::is_known_repo(&workspaces, &repo_path) {
+                return Err(Error::InvalidParams(
+                    "Unknown or unauthorized repository path".to_string(),
+                ));
+            }
+            intent_git::branches::branch_status(std::path::Path::new(&repo_path), &branch_name)
+        })
+    }
+
     fn repo_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {

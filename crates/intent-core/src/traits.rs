@@ -11,14 +11,15 @@ use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId};
 use crate::model::{
     AgentDelegateInput, AgentLite, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
     CommentListResult, CommentResolveThreadResult, CommentRespondResult, Draft, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, FileActivity, GitAgentCommitResult, GitBranches,
-    GitCommitResult, GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate,
-    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, ProjectType,
-    ReadAssetResult, ScriptCreateParams, SetupScript, TaskAssignAgentResult,
-    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
-    TaskMarkAsTaskResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TokenUsage, Workspace, WorkspaceCreate, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    EventSubscribeResult, EventUnsubscribeResult, FileActivity, GitAgentCommitResult,
+    GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts, GitStatus, Note,
+    NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
+    NoteEditLinesResult, NoteEditResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, ProjectType, ReadAssetResult, ScriptCreateParams, SetupScript,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
+    WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -1335,6 +1336,22 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_get_branches not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.branchStatus`: ahead/behind vs `origin/<branch_name>` + working-tree
+    /// uncommitted-changes flag for a known `repo_path`. Same known-repo gate as
+    /// `git_get_branches`; an unknown repo path is `-32602` (PROTOCOL §5.6).
+    fn git_branch_status(
+        &self,
+        repo_path: String,
+        branch_name: String,
+    ) -> BoxFuture<'_, Result<GitBranchStatus>> {
+        let _ = (repo_path, branch_name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_branch_status not implemented".to_string(),
             ))
         })
     }
