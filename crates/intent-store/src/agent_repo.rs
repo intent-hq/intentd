@@ -145,6 +145,36 @@ impl Store {
         Ok(())
     }
 
+    /// Persist the runtime `status` + `is_active` transition for `agent_session`
+    /// without touching the write-once `acp_session_id` / immutable `provider`
+    /// (the broader [`Store::update_agent_session`] enforces those invariants).
+    /// Drives the `pending → active → idle` lifecycle so a hydrated/reloaded
+    /// chat reflects the live state (PROTOCOL §6.5 `agent:status-changed`).
+    /// `updated_at` is refreshed to the supplied timestamp. `NotFound` if the
+    /// session is absent.
+    pub async fn set_agent_session_status(
+        &self,
+        id: &AgentId,
+        status: AgentStatus,
+        is_active: bool,
+        updated_at: &str,
+    ) -> Result<()> {
+        let rows =
+            sqlx::query("UPDATE agent_session SET status=?, is_active=?, updated_at=? WHERE id=?")
+                .bind(enum_to_db(&status)?)
+                .bind(is_active as i64)
+                .bind(updated_at)
+                .bind(&id.0)
+                .execute(self.pool())
+                .await
+                .map_err(|e| Error::Internal(format!("set agent session status failed: {e}")))?
+                .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(())
+    }
+
     /// Set `acp_session_id` write-once (the provider `session:created` path).
     /// Errors if it is already set to a different value (§9.5). `NotFound` if
     /// the session is absent.

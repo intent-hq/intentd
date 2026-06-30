@@ -25,9 +25,10 @@ use intent_acp::{
     NormalizedMcpServers, PermissionOutcome, PermissionPolicy, PermissionRegistry,
     PermissionRequestData, SinkEvent, SpawnOptions, WorkspaceMcpServer,
 };
+use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
-    now_iso, ActorType, AgentId, AgentSession, BoxFuture, Error, Result, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId,
+    now_iso, ActorType, AgentId, AgentSession, AgentStatus, BoxFuture, Error, EventActor, Result,
+    WorkspaceApi, WorkspaceAttention, WorkspaceId,
 };
 use intent_providers::ProviderConfig;
 use intent_store::{NewEvent, NewTrackedChange};
@@ -1078,6 +1079,9 @@ impl AgentManager {
     /// already running. On a successful claim the agent's workspace is recorded
     /// and the workspace's derived `WorkspaceActivity` is recomputed (§9.9),
     /// emitting `workspace:activity-changed` on the `Idle → AgentRunning` edge.
+    /// Also persists the `agent_session.status` transition to `Active` and
+    /// emits `agent:status-changed` (PROTOCOL §6.5/§6.7) so a hydrated chat
+    /// reflects the live runtime rather than the stored `Pending` placeholder.
     async fn try_begin(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) -> bool {
         let claimed = self.busy.lock().unwrap().insert(agent_id.clone());
         if claimed {
@@ -1086,13 +1090,17 @@ impl AgentManager {
                 .unwrap()
                 .insert(agent_id.clone(), workspace_id.clone());
             self.services.agent_activity_begin(workspace_id).await;
+            self.persist_status(agent_id, workspace_id, AgentStatus::Active, true)
+                .await;
         }
         claimed
     }
 
     /// Release the in-flight slot, recomputing the owning workspace's derived
     /// `WorkspaceActivity` (§9.9) and emitting `workspace:activity-changed` on
-    /// the `AgentRunning → Idle` edge.
+    /// the `AgentRunning → Idle` edge. Also persists the `agent_session.status`
+    /// transition to `RuntimeIdle` and emits `agent:status-changed` (PROTOCOL
+    /// §6.5/§6.7) so a hydrated chat reflects the post-turn idle state.
     async fn end_turn(&self, agent_id: &AgentId) {
         let was_busy = self.busy.lock().unwrap().remove(agent_id);
         if !was_busy {
@@ -1101,7 +1109,60 @@ impl AgentManager {
         let workspace_id = self.agent_ws.lock().unwrap().remove(agent_id);
         if let Some(workspace_id) = workspace_id {
             self.services.agent_activity_end(&workspace_id).await;
+            self.persist_status(agent_id, &workspace_id, AgentStatus::RuntimeIdle, false)
+                .await;
         }
+    }
+
+    /// Persist `agent_session.status` + `is_active` and publish the
+    /// `agent:status-changed` self-sufficient event (PROTOCOL §6.5/§6.7). All
+    /// failures are logged and swallowed: the runtime turn is the source of
+    /// truth and a transient store/bus error must not abort the in-flight slot
+    /// transition.
+    async fn persist_status(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        status: AgentStatus,
+        is_active: bool,
+    ) {
+        let ts = now_iso();
+        if let Err(e) = self
+            .services
+            .store
+            .set_agent_session_status(agent_id, status, is_active, &ts)
+            .await
+        {
+            // Sessions are persisted before the runtime path opens (see
+            // `agent_create_op`), so NotFound here means the row was deleted
+            // mid-turn — swallow it the same as any other transient store error.
+            tracing::warn!(agent = %agent_id, error = %e, "failed to persist agent status");
+            return;
+        }
+        let serialized_status = match serde_json::to_value(status) {
+            Ok(Value::String(s)) => s,
+            _ => return,
+        };
+        let event = NewEvent {
+            workspace_id: workspace_id.clone(),
+            timestamp: ts,
+            event_type: AGENT_STATUS_CHANGED.to_string(),
+            actor: EventActor {
+                actor_type: ActorType::Agent,
+                id: Some(agent_id.0.clone()),
+                ..Default::default()
+            },
+            session_id: Some(agent_id.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({
+                "agentId": agent_id.0,
+                "status": serialized_status,
+                "isActive": is_active,
+            }),
+        };
+        crate::publish_event(&self.services.event_bus, event).await;
     }
 
     /// Forget a finished worker's join handle.

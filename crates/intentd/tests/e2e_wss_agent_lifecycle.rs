@@ -439,6 +439,152 @@ async fn mock_agent_full_turn_over_wss() {
     assert!(mc >= 1, "assistant message persisted (messageCount={mc})");
 }
 
+/// Session-status lifecycle persistence (P0 — chat-spinner clear). A normal
+/// `agent.sendMessage` turn must drive the persisted `agent_session.status`
+/// through `pending → active → idle` and emit the matching
+/// `agent:status-changed` self-sufficient events (PROTOCOL §6.5/§6.7), so a
+/// hydrated/reloaded chat reflects the post-turn idle state rather than the
+/// stored `pending` placeholder. Co-emitted with `agent:idle` at turn end.
+#[tokio::test]
+async fn agent_session_status_persists_pending_active_idle_over_wss() {
+    let Some(script) = gate("WSS status-lifecycle E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "response": "status lifecycle ok" }).to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-Status", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // A brand-new agent persists with the default `pending` status; the runtime
+    // must transition it as the turn runs.
+    let pre = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        pre["agent"]["status"], "pending",
+        "fresh agent persisted with status=pending: {pre}"
+    );
+
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "drive a turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Collect status-changed transitions alongside the terminal agent:idle
+    // (PROTOCOL §6.5 / §7). agent:idle is emitted from `run_prompt_turn`; the
+    // matching status-changed → idle lands shortly after when the worker
+    // releases the in-flight slot via `end_turn`, so we keep draining events
+    // until both transitions are observed.
+    let mut transitions: Vec<(String, bool)> = Vec::new();
+    let mut saw_idle = false;
+    for _ in 0..160 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        match ev["type"].as_str() {
+            Some("agent:status-changed")
+                if ev["data"]["agentId"].as_str() == Some(agent_id.as_str()) =>
+            {
+                let s = ev["data"]["status"]
+                    .as_str()
+                    .expect("status string in agent:status-changed data")
+                    .to_string();
+                let active = ev["data"]["isActive"].as_bool().unwrap_or(false);
+                transitions.push((s, active));
+            }
+            Some("agent:idle") if ev["data"]["agentId"].as_str() == Some(agent_id.as_str()) => {
+                saw_idle = true;
+            }
+            _ => {}
+        }
+        if saw_idle && transitions.contains(&("idle".to_string(), false)) {
+            break;
+        }
+    }
+    assert!(
+        saw_idle,
+        "terminal agent:idle emitted at turn end (transitions so far: {transitions:?})"
+    );
+    assert!(
+        transitions.contains(&("active".to_string(), true)),
+        "saw active/isActive=true transition (got {transitions:?})"
+    );
+    assert!(
+        transitions.contains(&("idle".to_string(), false)),
+        "saw idle/isActive=false transition (got {transitions:?})"
+    );
+
+    // The persisted row reflects the post-turn idle state (hydration parity).
+    let post = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        post["agent"]["status"], "idle",
+        "agent_session.status persisted idle after turn: {post}"
+    );
+    assert_eq!(
+        post["agent"]["isActive"], false,
+        "agent_session.is_active cleared after turn: {post}"
+    );
+}
+
 /// `agent.stop` keep-alive + resume over WSS (step 10). The first turn streams
 /// "streaming-before-cancel" and parks at `session/cancel`; `agent.stop`
 /// interrupts (terminal stream:end emitted, child kept alive); a follow-up
