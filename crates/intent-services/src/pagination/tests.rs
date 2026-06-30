@@ -129,3 +129,44 @@ fn stale_token_past_end_is_clamped() {
     let page = paginate_slice(&source, Some(2), Some(&token));
     assert_eq!(page.items, vec![2, 1]);
 }
+
+#[test]
+fn paginate_text_lines_returns_newest_lines_first_with_token() {
+    let text = "l0\nl1\nl2\nl3\nl4\nl5";
+    let env = paginate_text_lines(text, Some(3), None);
+    assert_eq!(
+        env["items"],
+        json!(["l5", "l4", "l3"]),
+        "first page must be newest-first"
+    );
+    let token = env["nextToken"].as_str().expect("more pages remain");
+    let env2 = paginate_text_lines(text, Some(3), Some(token));
+    assert_eq!(env2["items"], json!(["l2", "l1", "l0"]));
+    // Older page exhausted → no further token.
+    assert_eq!(env2["nextToken"], json!(null));
+}
+
+#[test]
+fn paginate_text_lines_trims_trailing_blank_lines() {
+    // Trailing blank/whitespace-only lines are dropped before paging so a
+    // terminal scrollback's final newline doesn't surface as an empty item.
+    let text = "alpha\nbeta\n   \n\n";
+    let env = paginate_text_lines(text, Some(50), None);
+    assert_eq!(env["items"], json!(["beta", "alpha"]));
+    assert_eq!(env["nextToken"], json!(null));
+}
+
+#[test]
+fn paginate_text_lines_empty_string_yields_empty_page() {
+    let env = paginate_text_lines("", Some(10), None);
+    assert_eq!(env["items"], json!([]));
+    assert_eq!(env["nextToken"], json!(null));
+}
+
+#[test]
+fn page_window_zero_length_source_emits_empty_window() {
+    // First page over an empty source: start == end == 0, no continuation token.
+    let win = page_window(0, Some(10), None);
+    assert_eq!((win.start, win.end), (0, 0));
+    assert!(win.next_token.is_none());
+}

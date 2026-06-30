@@ -164,3 +164,84 @@ async fn batch_window_coalesces_matched_events() {
         .expect("subscription closed");
     assert_eq!(batch.len(), 3, "events within the window should coalesce");
 }
+
+#[tokio::test]
+async fn subscriber_count_tracks_live_subscriptions() {
+    let (_tmp, bus) = bus().await;
+    assert_eq!(bus.subscriber_count(), 0);
+    let s1 = bus.subscribe(SubscriptionFilter::default());
+    let s2 = bus.subscribe(SubscriptionFilter::default());
+    assert_eq!(bus.subscriber_count(), 2);
+    // Dropping a Subscription aborts its delivery task, which drops the
+    // broadcast receiver and decrements the live-subscriber count.
+    drop(s1);
+    // The abort is asynchronous; yield until the receiver actually drops.
+    for _ in 0..50 {
+        if bus.subscriber_count() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(bus.subscriber_count(), 1);
+    drop(s2);
+}
+
+#[tokio::test]
+async fn non_matching_events_are_filtered_out_silently() {
+    let (_tmp, bus) = bus().await;
+    // Filter that matches nothing the test publishes; the delivery task must
+    // simply skip each event (the `continue` branch) without surfacing them.
+    let mut filter = SubscriptionFilter::for_subscriber(
+        &["task:*".to_string()],
+        None,
+        false,
+        None,
+    );
+    filter.batch_window = None;
+    let mut sub = bus.subscribe(filter);
+
+    bus.publish(&new_event("note:created", None, ActorType::User))
+        .await
+        .expect("publish");
+    bus.publish(&new_event("file:changed", None, ActorType::System))
+        .await
+        .expect("publish");
+
+    // Nothing matches → recv must time out rather than deliver a stray batch.
+    let got = timeout(Duration::from_millis(150), sub.recv()).await;
+    assert!(got.is_err(), "non-matching events must not be delivered: {got:?}");
+}
+
+#[tokio::test]
+async fn dropping_bus_flushes_buffered_batch_before_close() {
+    let (_tmp, bus) = bus().await;
+    // Long batch window so the published events stay buffered in the delivery
+    // task; dropping the bus must trigger the `Closed`-branch flush instead of
+    // discarding the in-flight batch.
+    let filter = SubscriptionFilter::for_subscriber(
+        &["note:*".to_string()],
+        None,
+        false,
+        Some(Duration::from_secs(30)),
+    );
+    let mut sub = bus.subscribe(filter);
+
+    bus.publish(&new_event("note:created", Some("u"), ActorType::User))
+        .await
+        .expect("publish");
+    bus.publish(&new_event("note:updated", Some("u"), ActorType::User))
+        .await
+        .expect("publish");
+
+    // Drop the bus → broadcast Sender drops → delivery task observes Closed,
+    // flushes the buffered batch, then returns.
+    drop(bus);
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("flush timed out")
+        .expect("flush yielded no batch");
+    assert_eq!(batch.len(), 2, "buffered events must flush on bus close");
+    // After the flush the channel is closed; no further batches arrive.
+    assert!(sub.recv().await.is_none());
+}

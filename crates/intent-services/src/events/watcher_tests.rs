@@ -157,3 +157,41 @@ async fn ignored_paths_emit_nothing() {
     .await;
     assert!(got.is_none(), "ignored path must not emit: {got:?}");
 }
+
+#[tokio::test]
+async fn modifying_pre_existing_file_emits_changed_event() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let dir = TempDir::new("mod");
+    let file = dir.path.join("bar.txt");
+    // Pre-seed the file BEFORE the watcher starts so notify doesn't see the
+    // initial create and coalesce it with the subsequent modify.
+    std::fs::write(&file, b"v1").expect("write v1");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let _watcher = FileWatcher::start(bus.clone(), WorkspaceId::from("ws-1"), dir.path.clone())
+        .expect("start watcher");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    std::fs::write(&file, b"v2 longer content").expect("write v2");
+    let ev = next_for(&mut sub, "bar.txt", None, Duration::from_secs(5))
+        .await
+        .expect("event for bar.txt after modify");
+    // FSEvents/inotify normalize a write to an existing path differently per
+    // OS (modify on Linux, sometimes create on macOS due to cumulative flags),
+    // so accept any non-delete action and assert the event_type follows the
+    // TS taxonomy for that action.
+    let action = ev.data["action"].as_str().expect("action string");
+    assert_ne!(action, "delete", "writing must not produce a delete event");
+    let expected_type = match action {
+        "create" => "file:created",
+        "modify" | "rename" => "file:changed",
+        other => panic!("unexpected action {other}"),
+    };
+    assert_eq!(ev.event_type, expected_type);
+    assert_eq!(ev.data["path"], "bar.txt");
+    assert_eq!(ev.data["relativePath"], "bar.txt");
+}
