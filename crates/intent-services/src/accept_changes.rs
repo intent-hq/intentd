@@ -463,12 +463,192 @@ pub(crate) fn accept_result(
 mod tests {
     use super::*;
 
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use git2::{Repository, Signature};
+    use intent_core::{
+        now_iso, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity,
+        WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    };
+
+    // ----- Workspace + repo helpers (test-only) -----
+
+    /// Build a minimally-populated `Workspace` for tests. Optional fields can be
+    /// patched by callers after construction.
+    fn mk_workspace() -> Workspace {
+        let ts = now_iso();
+        Workspace {
+            id: WorkspaceId::from("ws-test"),
+            title: "WS".to_string(),
+            branch: "feature/x".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+        }
+    }
+
+    fn mk_pr(status: PullRequestStatus) -> PullRequestInfo {
+        let ts = now_iso();
+        PullRequestInfo {
+            id: "pr-1".to_string(),
+            number: 42,
+            url: "https://example.com/pr/42".to_string(),
+            title: "Test PR".to_string(),
+            status,
+            created_at: ts.clone(),
+            updated_at: ts,
+            base_ref: None,
+            head_ref: None,
+            head_sha: None,
+            author: None,
+            mergeable: None,
+            mergeable_state: None,
+            is_draft: None,
+        }
+    }
+
+    /// Self-cleaning temp directory tied to a unique counter so parallel tests
+    /// can each get their own worktree.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let n = N.fetch_add(1, Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!("intent-svc-ac-{tag}-{nanos}-{n}"));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Initialize a real git repo with a seed commit on `main`. Returns the
+    /// owning `TempDir`.
+    fn init_repo(tag: &str) -> TempDir {
+        let dir = TempDir::new(tag);
+        let repo = Repository::init(dir.path()).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+        // Move HEAD to refs/heads/main so the seed commit lives on `main` even
+        // when the default init branch differs.
+        repo.set_head("refs/heads/main").unwrap();
+        // Seed commit so HEAD exists.
+        std::fs::write(dir.path().join("seed.txt"), "seed\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("seed.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+            .unwrap();
+        dir
+    }
+
+    /// Add a tracked + committed file on top of HEAD with the supplied message.
+    fn commit_file(worktree: &Path, rel: &str, contents: &str, msg: &str) {
+        std::fs::write(worktree.join(rel), contents).unwrap();
+        let repo = Repository::open(worktree).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(rel)).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        let parent = repo.find_commit(head).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &[&parent])
+            .unwrap();
+    }
+
+    /// Create a branch off HEAD and check it out.
+    fn checkout_new_branch(worktree: &Path, name: &str) {
+        let repo = Repository::open(worktree).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        let commit = repo.find_commit(head).unwrap();
+        repo.branch(name, &commit, false).unwrap();
+        repo.set_head(&format!("refs/heads/{name}")).unwrap();
+        let mut opts = git2::build::CheckoutBuilder::new();
+        opts.force();
+        repo.checkout_head(Some(&mut opts)).unwrap();
+    }
+
+    // ----- ACTIONS / validate_action -----
+
     #[test]
     fn validates_actions() {
         assert_eq!(validate_action("commit").unwrap(), "commit");
         assert_eq!(validate_action("create-pr").unwrap(), "create-pr");
         assert!(validate_action("nope").is_err());
     }
+
+    #[test]
+    fn validate_action_accepts_every_listed_action() {
+        // Every canonical action returns itself.
+        for a in ACTIONS {
+            assert_eq!(validate_action(a).unwrap(), a);
+        }
+        assert_eq!(ACTIONS.len(), 9);
+    }
+
+    #[test]
+    fn validate_action_rejects_invalid_with_invalid_params_error() {
+        // Empty, casing, and stray separators all map to -32602 (InvalidParams).
+        for bad in ["", "Commit", " commit", "commit ", "merge-pr", "create_pr"] {
+            let err = validate_action(bad).unwrap_err();
+            assert!(matches!(err, Error::InvalidParams(_)), "{bad}: {err:?}");
+            if let Error::InvalidParams(msg) = err {
+                assert!(msg.contains(bad), "msg `{msg}` should mention `{bad}`");
+            }
+        }
+    }
+
+    // ----- is_safe_ref -----
 
     #[test]
     fn safe_ref_matches_ts_pattern() {
@@ -483,6 +663,29 @@ mod tests {
         assert!(!is_safe_ref("a;rm -rf"));
         assert!(!is_safe_ref("$(whoami)"));
     }
+
+    #[test]
+    fn safe_ref_first_char_class() {
+        // Allowed first chars: alphanumeric or one of '.' '_' '/'.
+        assert!(is_safe_ref("0"));
+        assert!(is_safe_ref("_a"));
+        assert!(is_safe_ref("/a"));
+        // Hyphen is allowed in interior but not as first char.
+        assert!(!is_safe_ref("-name"));
+        assert!(is_safe_ref("a-b-c"));
+    }
+
+    #[test]
+    fn safe_ref_rejects_interior_unsafe_chars() {
+        // Any character outside the allowed alphabet rejects the whole ref.
+        for bad in [
+            "a$b", "a;b", "a|b", "a&b", "a*b", "a?b", "a@b", "a%b", "a:b", "a\tb",
+        ] {
+            assert!(!is_safe_ref(bad), "{bad} should be unsafe");
+        }
+    }
+
+    // ----- is_valid_git_remote_url -----
 
     #[test]
     fn url_allowlist_matches_ts() {
@@ -501,6 +704,43 @@ mod tests {
     }
 
     #[test]
+    fn url_allowlist_rejects_scheme_only_and_accepts_with_path() {
+        // Bare schemes (no host/path) are rejected; one extra char passes.
+        assert!(!is_valid_git_remote_url("https://"));
+        assert!(!is_valid_git_remote_url("ssh://"));
+        assert!(!is_valid_git_remote_url("git://"));
+        assert!(is_valid_git_remote_url("https://a"));
+        assert!(is_valid_git_remote_url("ssh://a"));
+        assert!(is_valid_git_remote_url("git://a"));
+    }
+
+    #[test]
+    fn url_allowlist_git_shorthand_requires_host_and_path() {
+        // `git@host:path` shorthand: both host and path must be non-empty.
+        assert!(is_valid_git_remote_url("git@github.com:o/r"));
+        assert!(!is_valid_git_remote_url("git@:o/r"));
+        assert!(!is_valid_git_remote_url("git@github.com:"));
+        // Missing colon entirely → falls through and is rejected.
+        assert!(!is_valid_git_remote_url("git@github.com"));
+    }
+
+    #[test]
+    fn url_allowlist_rejects_every_shell_unsafe_char() {
+        for c in [
+            ';', '|', '&', '`', '$', '(', ')', '{', '}', '[', ']', '!', '#', '~', '<', '>', '\'',
+            '"', '\\',
+        ] {
+            let bad = format!("https://example.com/r{c}");
+            assert!(!is_valid_git_remote_url(&bad), "{bad} should be rejected");
+        }
+        // Whitespace too.
+        assert!(!is_valid_git_remote_url("https://example.com/r\tname"));
+        assert!(!is_valid_git_remote_url("https://example.com/r\nname"));
+    }
+
+    // ----- parse_owner_repo -----
+
+    #[test]
     fn parses_owner_repo_with_dots_and_git_suffix() {
         assert_eq!(
             parse_owner_repo("https://github.com/octo/molecules.gg.git"),
@@ -511,5 +751,339 @@ mod tests {
             Some(("o".into(), "r".into()))
         );
         assert_eq!(parse_owner_repo("https://gitlab.com/o/r.git"), None);
+    }
+
+    #[test]
+    fn parses_owner_repo_handles_trailing_slash_and_no_git() {
+        assert_eq!(
+            parse_owner_repo("https://github.com/o/r/"),
+            Some(("o".into(), "r".into()))
+        );
+        assert_eq!(
+            parse_owner_repo("https://github.com/o/r"),
+            Some(("o".into(), "r".into()))
+        );
+    }
+
+    #[test]
+    fn parses_owner_repo_rejects_missing_owner_or_repo() {
+        // Missing path segments after `github.com:` or `github.com/`.
+        assert_eq!(parse_owner_repo("https://github.com/"), None);
+        assert_eq!(parse_owner_repo("https://github.com/owner"), None);
+        // Empty owner.
+        assert_eq!(parse_owner_repo("https://github.com//repo"), None);
+        // Trailing-slash-only repo segment collapses to empty.
+        assert_eq!(parse_owner_repo("https://github.com/o//"), None);
+        // Bare `.git` repo name collapses to empty after suffix strip.
+        assert_eq!(parse_owner_repo("https://github.com/o/.git"), None);
+    }
+
+    // ----- trunk_branch -----
+
+    #[test]
+    fn trunk_branch_defaults_to_main() {
+        let ws = mk_workspace();
+        assert_eq!(trunk_branch(&ws), "main");
+    }
+
+    #[test]
+    fn trunk_branch_strips_origin_prefix_and_falls_back_when_empty() {
+        let mut ws = mk_workspace();
+        ws.base_ref = Some("origin/develop".into());
+        assert_eq!(trunk_branch(&ws), "develop");
+        // Plain branch name passes through.
+        ws.base_ref = Some("trunk".into());
+        assert_eq!(trunk_branch(&ws), "trunk");
+        // Empty base_ref string falls back to "main".
+        ws.base_ref = Some(String::new());
+        assert_eq!(trunk_branch(&ws), "main");
+    }
+
+    // ----- existing_pr_value / minimal_status_value -----
+
+    #[test]
+    fn minimal_status_value_has_documented_shape_and_no_pr() {
+        // §5.18 WorkspaceGitStatus shape — minimal worktree (no .git).
+        let ws = mk_workspace();
+        let v = minimal_status_value(&ws, "develop");
+        assert_eq!(v["branch"], "feature/x");
+        assert_eq!(v["trunkBranch"], "develop");
+        assert_eq!(v["aheadOfTrunk"], 0);
+        assert_eq!(v["behindTrunk"], 0);
+        assert_eq!(v["hasRemote"], false);
+        assert_eq!(v["isPushed"], false);
+        assert_eq!(v["uncommittedCount"], 0);
+        assert_eq!(v["stagedCount"], 0);
+        assert!(v["localCommits"].as_array().unwrap().is_empty());
+        assert!(v["existingPR"].is_null());
+        assert!(v["remoteUrl"].is_null());
+        assert!(v["owner"].is_null());
+        assert!(v["repo"].is_null());
+    }
+
+    #[test]
+    fn minimal_status_carries_existing_pr_in_lowercase_states() {
+        // Each persisted status maps to its lowercase wire word (§5.18).
+        for (status, word) in [
+            (PullRequestStatus::Open, "open"),
+            (PullRequestStatus::Closed, "closed"),
+            (PullRequestStatus::Merged, "merged"),
+            (PullRequestStatus::Draft, "draft"),
+        ] {
+            let mut ws = mk_workspace();
+            ws.active_pull_request = Some(mk_pr(status));
+            let v = minimal_status_value(&ws, "main");
+            let pr = v["existingPR"].as_object().expect("PR object");
+            assert_eq!(pr["number"], 42);
+            assert_eq!(pr["url"], "https://example.com/pr/42");
+            // htmlUrl always falls back to url (PROTOCOL §5.18 schema).
+            assert_eq!(pr["htmlUrl"], "https://example.com/pr/42");
+            assert_eq!(pr["title"], "Test PR");
+            assert_eq!(pr["state"], word);
+        }
+    }
+
+    #[test]
+    fn build_git_status_uses_minimal_path_without_dot_git() {
+        // No `.git` under worktree → minimal-status branch.
+        let dir = TempDir::new("nogit");
+        let ws = mk_workspace();
+        let v = build_git_status_value(dir.path(), &ws).unwrap();
+        assert_eq!(v["branch"], "feature/x");
+        assert_eq!(v["trunkBranch"], "main");
+        assert_eq!(v["hasRemote"], false);
+        assert_eq!(v["isPushed"], false);
+        assert!(v["localCommits"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_git_status_for_real_repo_reports_branch_and_local_commits() {
+        // Real repo on `main` with two commits, no remote → branch from git,
+        // hasRemote=false, isPushed=false, owner/repo null.
+        let repo = init_repo("status");
+        commit_file(repo.path(), "a.txt", "a\n", "add a");
+        // Create a feature branch and add another commit there.
+        checkout_new_branch(repo.path(), "feature/foo");
+        commit_file(repo.path(), "b.txt", "b\n", "add b");
+
+        let ws = mk_workspace();
+        let v = build_git_status_value(repo.path(), &ws).unwrap();
+        assert_eq!(v["branch"], "feature/foo");
+        assert_eq!(v["trunkBranch"], "main");
+        assert_eq!(v["hasRemote"], false);
+        assert_eq!(v["isPushed"], false);
+        // One commit ahead of `main` (the feature-branch commit).
+        assert_eq!(v["aheadOfTrunk"], 1);
+        assert_eq!(v["behindTrunk"], 0);
+        // localCommits is a non-empty array of CommitWithAttribution.
+        let commits = v["localCommits"].as_array().unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0]["message"].as_str().unwrap(), "add b");
+        // No remote → null fields.
+        assert!(v["remoteUrl"].is_null());
+        assert!(v["owner"].is_null());
+        assert!(v["repo"].is_null());
+        assert!(v["existingPR"].is_null());
+    }
+
+    // ----- prepare_invalid -----
+
+    #[test]
+    fn prepare_invalid_has_expected_shape() {
+        let v = prepare_invalid("missing workspace");
+        assert_eq!(v["valid"], false);
+        assert_eq!(v["filesCount"], 0);
+        assert_eq!(v["additions"], 0);
+        assert_eq!(v["deletions"], 0);
+        assert!(v["warnings"].as_array().unwrap().is_empty());
+        assert_eq!(v["errors"][0], "missing workspace");
+        assert!(v["files"].as_array().unwrap().is_empty());
+    }
+
+    // ----- build_prepare_value -----
+
+    #[test]
+    fn prepare_without_git_errors_for_push_and_create_pr() {
+        let dir = TempDir::new("nogit-prep");
+        let ws = mk_workspace();
+        for action in ["push", "create-pr"] {
+            let v = build_prepare_value(dir.path(), &ws, action, None).unwrap();
+            assert_eq!(v["valid"], false, "{action}");
+            assert_eq!(
+                v["errors"][0], "No remote configured for this repository",
+                "{action}"
+            );
+            assert!(v["warnings"].as_array().unwrap().is_empty(), "{action}");
+            assert_eq!(v["filesCount"], 0);
+            assert_eq!(v["additions"], 0);
+            assert_eq!(v["deletions"], 0);
+            assert!(v["files"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn prepare_without_git_is_valid_for_non_remote_actions() {
+        let dir = TempDir::new("nogit-prep-ok");
+        let ws = mk_workspace();
+        // No-git + non-remote action → no errors emitted by the validator.
+        for action in ["commit", "merge", "undo-commit", "reset-to-trunk"] {
+            let v = build_prepare_value(dir.path(), &ws, action, None).unwrap();
+            assert_eq!(v["valid"], true, "{action}");
+            assert!(v["errors"].as_array().unwrap().is_empty(), "{action}");
+            // No commits → suggestedPRTitle is "<title> (0 commits)".
+            assert_eq!(v["suggestedPRTitle"], "WS (0 commits)");
+            assert_eq!(v["suggestedCommitMessage"], "");
+            assert_eq!(v["suggestedPRBody"], "");
+        }
+    }
+
+    #[test]
+    fn prepare_without_git_defaults_title_to_changes_when_workspace_title_empty() {
+        let dir = TempDir::new("nogit-prep-empty-title");
+        let mut ws = mk_workspace();
+        ws.title = String::new();
+        let v = build_prepare_value(dir.path(), &ws, "commit", None).unwrap();
+        assert_eq!(v["suggestedPRTitle"], "Changes (0 commits)");
+    }
+
+    #[test]
+    fn prepare_in_real_repo_reports_staged_and_unstaged_files() {
+        let repo = init_repo("prep-files");
+        // Create a fresh branch off main; one commit on top.
+        checkout_new_branch(repo.path(), "topic");
+        commit_file(repo.path(), "kept.txt", "k\n", "topic: keep");
+        // Now: one staged file and one unstaged file in the worktree.
+        std::fs::write(repo.path().join("staged.txt"), "s\n").unwrap();
+        let g = Repository::open(repo.path()).unwrap();
+        let mut idx = g.index().unwrap();
+        idx.add_path(Path::new("staged.txt")).unwrap();
+        idx.write().unwrap();
+        std::fs::write(repo.path().join("unstaged.txt"), "u\n").unwrap();
+
+        let ws = mk_workspace();
+        let v = build_prepare_value(repo.path(), &ws, "commit", None).unwrap();
+        assert_eq!(v["valid"], true);
+
+        let files = v["files"].as_array().unwrap();
+        // staged.txt staged=true, unstaged.txt staged=false. Order is staged then
+        // unstaged per the implementation.
+        let staged: Vec<_> = files
+            .iter()
+            .filter(|f| f["staged"].as_bool().unwrap())
+            .collect();
+        let unstaged: Vec<_> = files
+            .iter()
+            .filter(|f| !f["staged"].as_bool().unwrap())
+            .collect();
+        assert!(staged.iter().any(|f| f["path"] == "staged.txt"));
+        assert!(unstaged.iter().any(|f| f["path"] == "unstaged.txt"));
+        // filesCount is the number of distinct paths.
+        let count = v["filesCount"].as_u64().unwrap();
+        assert!(count >= 2, "expected ≥2 distinct files, got {count}");
+
+        // One commit on the branch → suggestedCommitMessage equals that message
+        // and suggestedPRTitle equals that message (single-commit branch).
+        assert_eq!(v["suggestedCommitMessage"], "topic: keep");
+        assert_eq!(v["suggestedPRTitle"], "topic: keep");
+    }
+
+    #[test]
+    fn prepare_files_filter_narrows_to_requested_paths() {
+        let repo = init_repo("prep-filter");
+        // Stage two files; filter to just one.
+        std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+        std::fs::write(repo.path().join("b.txt"), "b\n").unwrap();
+        let g = Repository::open(repo.path()).unwrap();
+        let mut idx = g.index().unwrap();
+        idx.add_path(Path::new("a.txt")).unwrap();
+        idx.add_path(Path::new("b.txt")).unwrap();
+        idx.write().unwrap();
+
+        let ws = mk_workspace();
+        let filter = vec!["a.txt".to_string()];
+        let v = build_prepare_value(repo.path(), &ws, "commit", Some(&filter)).unwrap();
+        let files = v["files"].as_array().unwrap();
+        assert!(files.iter().all(|f| f["path"] == "a.txt"));
+        assert!(!files.is_empty());
+
+        // Empty filter slice means "no filter": both files appear.
+        let empty: Vec<String> = Vec::new();
+        let v2 = build_prepare_value(repo.path(), &ws, "commit", Some(&empty)).unwrap();
+        let files2 = v2["files"].as_array().unwrap();
+        let paths: std::collections::HashSet<&str> =
+            files2.iter().map(|f| f["path"].as_str().unwrap()).collect();
+        assert!(paths.contains("a.txt"));
+        assert!(paths.contains("b.txt"));
+    }
+
+    #[test]
+    fn prepare_multi_commit_branch_joins_messages_and_counts_in_title() {
+        let repo = init_repo("prep-multi");
+        checkout_new_branch(repo.path(), "topic");
+        commit_file(repo.path(), "f1.txt", "1\n", "first");
+        commit_file(repo.path(), "f2.txt", "2\n", "second");
+
+        let ws = mk_workspace();
+        let v = build_prepare_value(repo.path(), &ws, "commit", None).unwrap();
+        // history_since returns newest-first; expect "second\n- first".
+        let msg = v["suggestedCommitMessage"].as_str().unwrap();
+        assert!(msg.contains("first"));
+        assert!(msg.contains("second"));
+        assert!(msg.contains("\n- "));
+        assert_eq!(v["suggestedPRTitle"], "WS (2 commits)");
+    }
+
+    // ----- step / accept_result -----
+
+    #[test]
+    fn step_includes_only_supplied_fields() {
+        let v = step("s1", "Commit", "pending", None, None);
+        assert_eq!(v["id"], "s1");
+        assert_eq!(v["name"], "Commit");
+        assert_eq!(v["status"], "pending");
+        // Absent optionals are omitted, not `null` (mirrors JSON.stringify).
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("message"));
+        assert!(!obj.contains_key("error"));
+
+        let v2 = step("s2", "Push", "failed", Some("up to date"), Some("denied"));
+        assert_eq!(v2["message"], "up to date");
+        assert_eq!(v2["error"], "denied");
+    }
+
+    #[test]
+    fn accept_result_assembles_success_failure_and_optional_payloads() {
+        // Success-with-result: `result` present, `error` absent.
+        let payload = json!({ "commitHash": "deadbeef" });
+        let v = accept_result(
+            true,
+            vec![step("c", "Commit", "completed", None, None)],
+            Some(payload.clone()),
+            None,
+        );
+        assert_eq!(v["success"], true);
+        assert_eq!(v["result"], payload);
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("error"));
+        assert_eq!(v["steps"].as_array().unwrap().len(), 1);
+
+        // Failure-with-error: `error` present, `result` absent.
+        let v = accept_result(
+            false,
+            vec![step("p", "Push", "failed", None, Some("boom"))],
+            None,
+            Some("boom".into()),
+        );
+        assert_eq!(v["success"], false);
+        assert_eq!(v["error"], "boom");
+        assert!(!v.as_object().unwrap().contains_key("result"));
+
+        // Neither result nor error → only `success` + `steps`.
+        let v = accept_result(true, Vec::new(), None, None);
+        assert_eq!(v["success"], true);
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("result"));
+        assert!(!obj.contains_key("error"));
+        assert!(v["steps"].as_array().unwrap().is_empty());
     }
 }
