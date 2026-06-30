@@ -835,23 +835,33 @@ async fn task_list_and_get_project_workspace_tasks() {
 
     let svc = Services::new(store);
 
-    // task.list returns the three spec-linked task notes (cancelled included).
-    let tasks = svc.task_list(ws.clone(), None).await.expect("task.list");
-    assert_eq!(tasks.len(), 3);
-    let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+    // task.list returns the three spec-linked task notes (cancelled included)
+    // plus the workspace-wide stats aggregate (full set, mirrors the FE
+    // `computeTaskStats`: total excludes cancelled, completed counts complete,
+    // inProgress counts in_progress + review_required).
+    let result = svc.task_list(ws.clone(), None).await.expect("task.list");
+    assert_eq!(result.tasks.len(), 3);
+    let ids: Vec<&str> = result.tasks.iter().map(|t| t.id.as_str()).collect();
     assert_eq!(ids, vec!["task-a", "task-b", "task-c"]);
-    let alpha = &tasks[0];
+    let alpha = &result.tasks[0];
     assert_eq!(alpha.title, "Alpha");
     assert_eq!(alpha.status, TaskStatus::InProgress);
     assert!(!alpha.updated_at.is_empty());
+    assert_eq!(result.stats.total, 2);
+    assert_eq!(result.stats.completed, 1);
+    assert_eq!(result.stats.in_progress, 1);
 
-    // Status filter narrows to the matching task notes.
+    // Status filter narrows `tasks` only; `stats` stays the full rollup so the
+    // FE renders the progress bar verbatim regardless of the active filter.
     let done = svc
         .task_list(ws.clone(), Some("complete".into()))
         .await
         .expect("task.list filtered");
-    assert_eq!(done.len(), 1);
-    assert_eq!(done[0].id.as_str(), "task-b");
+    assert_eq!(done.tasks.len(), 1);
+    assert_eq!(done.tasks[0].id.as_str(), "task-b");
+    assert_eq!(done.stats.total, 2);
+    assert_eq!(done.stats.completed, 1);
+    assert_eq!(done.stats.in_progress, 1);
 
     // Invalid status string is rejected.
     assert!(svc

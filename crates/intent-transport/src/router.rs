@@ -478,8 +478,8 @@ async fn dispatch(
         "task.list" => {
             let ws = require_ws_note(params)?;
             let status = opt_str(params, "status");
-            let tasks = api.task_list(ws, status).await.map_err(domain_to_rpc)?;
-            Ok(json!({ "tasks": tasks }))
+            let result = api.task_list(ws, status).await.map_err(domain_to_rpc)?;
+            Ok(json!({ "tasks": result.tasks, "stats": result.stats }))
         }
         "task.get" => {
             let ws = require_ws_note(params)?;

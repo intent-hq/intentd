@@ -785,6 +785,18 @@ pub struct WorkspaceTask {
     pub updated_at: String,
 }
 
+/// `task.list` result envelope: the projected `WorkspaceTask` list (honouring
+/// the optional `status` filter) **and** the workspace-wide `taskStats`
+/// aggregate (always computed over the unfiltered spec-linked set, mirroring
+/// the canonical FE `computeTaskStats` in `task-stats.ts`). Lets the FE render
+/// the progress rollup verbatim instead of re-deriving it from `note.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskListResult {
+    pub tasks: Vec<WorkspaceTask>,
+    pub stats: WorkspaceTaskStats,
+}
+
 /// Result of `task.markAsTask`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

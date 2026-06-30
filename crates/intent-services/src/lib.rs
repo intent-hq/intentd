@@ -29,11 +29,12 @@ use intent_core::{
     NoteEditLinesResult, NoteEditResult, NoteId, NoteSetContentResult, NoteTaskRow,
     NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ProjectType, ReadAssetResult,
     ScriptCreateParams, SessionStats, SetupScript, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata,
-    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TokenUsage, Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary,
-    WorkspaceAttention, WorkspaceCreate, WorkspaceDiffSummary, WorkspaceEventSummary, WorkspaceId,
-    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
+    TaskMetadata, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult,
+    TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
+    WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceDiffSummary,
+    WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
+    WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -3913,7 +3914,7 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         status: Option<String>,
-    ) -> BoxFuture<'_, Result<Vec<WorkspaceTask>>> {
+    ) -> BoxFuture<'_, Result<TaskListResult>> {
         let store = self.store.clone();
         Box::pin(async move {
             let filter = match status.as_deref() {
@@ -3921,11 +3922,15 @@ impl WorkspaceApi for Services {
                 None => None,
             };
             let notes = store.list_notes(&workspace_id).await?;
+            // `stats` is the workspace-wide rollup over the full spec-linked
+            // set (mirrors the FE `computeTaskStats`); the optional `status`
+            // filter narrows `tasks` only.
+            let stats = compute_task_stats(&notes);
             let mut tasks = workspace_task_list(&notes);
             if let Some(f) = filter {
                 tasks.retain(|t| t.status == f);
             }
-            Ok(tasks)
+            Ok(TaskListResult { tasks, stats })
         })
     }
 

@@ -16,7 +16,7 @@ use crate::model::{
     NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
     NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, ProjectType,
     ReadAssetResult, ScriptCreateParams, SetupScript, TaskAssignAgentResult,
-    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
     TaskMarkAsTaskResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
     TokenUsage, Workspace, WorkspaceCreate, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
@@ -451,14 +451,16 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.list`: project a workspace's spec-linked task notes into the
-    /// canonical `WorkspaceTask` list (PROTOCOL §5.4). `status` optionally filters
-    /// to a single task status. Mirrors the FE `getWorkspaceTasks` set so the FE
-    /// can drop its `note.list`-metadata derivation.
+    /// canonical `WorkspaceTask` list **plus** the workspace-wide `taskStats`
+    /// aggregate (PROTOCOL §5.4). `status` optionally filters the task list to
+    /// a single status; `stats` is always computed over the unfiltered
+    /// spec-linked set so the FE can render the progress rollup verbatim
+    /// (mirrors the canonical FE `computeTaskStats` in `task-stats.ts`).
     fn task_list(
         &self,
         workspace_id: WorkspaceId,
         status: Option<String>,
-    ) -> BoxFuture<'_, Result<Vec<WorkspaceTask>>> {
+    ) -> BoxFuture<'_, Result<TaskListResult>> {
         let _ = (workspace_id, status);
         Box::pin(async {
             Err(Error::Internal(

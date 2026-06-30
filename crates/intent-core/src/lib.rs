@@ -32,7 +32,7 @@ pub use model::{
     NoteUpdateMetadataResult, NoteVisibility, ProjectType, PullRequestInfo, PullRequestStatus,
     ReadAssetResult, Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState, ScriptStatus,
     SessionStats, SetupScript, SetupScriptGeneratedBy, SuggestionDiff, TaskAssignAgentResult,
-    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
     TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult,
     TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, TokenUsageTotals, TopChangedFile,
     Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
