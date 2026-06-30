@@ -670,13 +670,16 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
 
     // Simulate a turn ALREADY mid-flight: the assistant has streamed "I'll run "
     // into block {mid}:0 but nothing is persisted yet (run_prompt_turn drives this
-    // slot via begin_live_turn/update_live_turn).
+    // slot via begin_live_turn/update_live_turn). `chat_snapshot` gates the
+    // live-turn merge on `agent_is_busy`, so the test must also claim the
+    // busy slot the same way `run_prompt_turn`'s `try_begin` would.
     let mid = Uuid::now_v7().to_string();
     services.set_live_turn(
         &agent,
         &mid,
         vec![json!({ "type": "text", "id": format!("{mid}:0"), "text": "I'll run " })],
     );
+    services.set_test_busy(&agent, true);
 
     // Subscribe mid-turn: the snapshot must merge the in-flight message.
     let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
@@ -829,6 +832,119 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
         want["messages"],
         "mid-turn snapshot + deltas reconcile to the fresh conversation snapshot"
     );
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// Iter#1c heal-gate regression: a live-turn slot whose worker is gone (mid-turn
+/// crash, or a race between abort and the slot's `LiveTurnGuard` drop) MUST NOT
+/// produce a phantom in-flight "streaming" message in the seq-0 snapshot. The
+/// gate is [`WorkspaceApi::agent_is_busy`]: without a claim, `chat_snapshot`
+/// returns only the durable conversation page.
+#[tokio::test]
+async fn chat_snapshot_does_not_merge_live_turn_when_agent_is_not_busy() {
+    let (socket, server, shutdown_tx, _tmp, bus, services) = setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A1" }),
+    )
+    .await;
+    let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    // A persisted user message (seq 0) — the durable page.
+    let store = bus.store();
+    let user_id = Uuid::now_v7().to_string();
+    store
+        .append_agent_message_with_id(
+            &agent,
+            &user_id,
+            "user",
+            &json!([{ "type": "text", "id": format!("{user_id}:0"), "text": "Run the tests" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append user message");
+
+    // A lingering live-turn slot with NO busy claim — the orphan shape this fix
+    // guards against. `chat_snapshot` must NOT merge it.
+    let mid = Uuid::now_v7().to_string();
+    services.set_live_turn(
+        &agent,
+        &mid,
+        vec![json!({ "type": "text", "id": format!("{mid}:0"), "text": "I'll run " })],
+    );
+
+    // Subscribe and capture the seq-0 snapshot.
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
+            "params": { "agentId": agent_id }
+        }))
+        .unwrap(),
+    )
+    .await;
+    let _resp = read_json(&mut sub_reader).await;
+    let snap = read_json(&mut sub_reader).await;
+    assert_eq!(snap["params"]["kind"], "snapshot");
+    assert_eq!(
+        snap["params"]["snapshot"]["totalMessages"], 1,
+        "the orphan live-turn slot must not inflate totalMessages"
+    );
+    let messages = snap["params"]["snapshot"]["messages"]
+        .as_array()
+        .cloned()
+        .expect("snapshot messages");
+    assert_eq!(messages.len(), 1, "only the persisted user message");
+    assert_eq!(messages[0]["id"], user_id.as_str());
+    assert!(
+        messages[0].get("isStreaming").is_none()
+            || messages[0]["isStreaming"] == Value::Bool(false),
+        "no streaming flag on the durable user message"
+    );
+
+    // Claiming the busy slot now restores the merge: re-subscribing on a fresh
+    // connection sees the in-flight assistant message exactly as before.
+    services.set_test_busy(&agent, true);
+    let (sub2_read, mut sub2_write) = connect_retry(&socket).await.into_split();
+    let mut sub2_reader = tokio::io::BufReader::new(sub2_read);
+    send(
+        &mut sub2_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "chat.subscribe",
+            "params": { "agentId": agent_id }
+        }))
+        .unwrap(),
+    )
+    .await;
+    let _resp2 = read_json(&mut sub2_reader).await;
+    let snap2 = read_json(&mut sub2_reader).await;
+    assert_eq!(snap2["params"]["snapshot"]["totalMessages"], 2);
+    let messages2 = snap2["params"]["snapshot"]["messages"]
+        .as_array()
+        .cloned()
+        .expect("snapshot messages");
+    assert_eq!(messages2.len(), 2);
+    assert_eq!(messages2[1]["id"], mid.as_str());
+    assert_eq!(messages2[1]["isStreaming"], true);
 
     let _ = shutdown_tx.send(());
     let _ = server.await;

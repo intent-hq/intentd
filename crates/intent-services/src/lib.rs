@@ -91,6 +91,21 @@ pub use events::{EventBus, FileWatcher, Subscription, SubscriptionFilter};
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
 
+/// Statuses that the FE treats as in-flight (its `isActiveAgentThread`
+/// selector returns `true` for these). After a daemon crash the runtime
+/// in-memory `AgentManager` and live-turn slots are empty, so a session
+/// persisted in one of these statuses is "stale": it has no worker but the FE
+/// would still render a "Thinking" spinner. The heal sweep rewrites them to
+/// [`intent_core::AgentStatus::RuntimeIdle`].
+fn is_stale_in_flight_status(status: intent_core::AgentStatus) -> bool {
+    matches!(
+        status,
+        intent_core::AgentStatus::Active
+            | intent_core::AgentStatus::Processing
+            | intent_core::AgentStatus::Waiting
+    )
+}
+
 /// Aggregate service handle wired by the binary composition root. It implements
 /// `WorkspaceApi` so it can be handed to `intent-acp` as `Arc<dyn WorkspaceApi>`
 /// (§6.8) and dispatched to by the transport router.
@@ -199,6 +214,12 @@ pub struct Services {
     /// clones so the [`AgentManager`]'s turn writer and the `WorkspaceApi` chat
     /// read door observe the same state; populated only while a turn streams.
     live_turns: agent_session::LiveTurns,
+    /// Test-only override for [`WorkspaceApi::agent_is_busy`]: lets unit/UDS
+    /// tests simulate an in-flight worker without spawning a real
+    /// [`AgentManager`]. Production composition always attaches a manager and
+    /// reads through it; this set is empty there. Shared across clones so a
+    /// `set_test_busy` on one handle is visible to every other handle.
+    test_busy: Arc<Mutex<HashSet<AgentId>>>,
 }
 
 impl Services {
@@ -227,6 +248,7 @@ impl Services {
             mcp_hub: Arc::new(McpHub::new()),
             context_engine: Arc::new(intent_context::AuggieContextEngine::new()),
             live_turns: Arc::new(Mutex::new(HashMap::new())),
+            test_busy: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -469,6 +491,61 @@ impl Services {
     /// manager has been dropped (read-only/test wiring).
     pub(crate) fn agent_manager(&self) -> Option<Arc<AgentManager>> {
         self.agent_manager.get().and_then(Weak::upgrade)
+    }
+
+    /// Test-only seam: mark `agent_id` as busy (or clear it) so
+    /// [`WorkspaceApi::agent_is_busy`] reports `true` without spawning a real
+    /// [`AgentManager`]. Production composition always attaches a manager and
+    /// never touches this; the seam exists so transport-level chat-snapshot
+    /// tests can simulate a mid-turn alongside [`Services::set_live_turn`].
+    #[doc(hidden)]
+    pub fn set_test_busy(&self, agent_id: &AgentId, busy: bool) {
+        if let Ok(mut set) = self.test_busy.lock() {
+            if busy {
+                set.insert(agent_id.clone());
+            } else {
+                set.remove(agent_id);
+            }
+        }
+    }
+
+    /// Daemon-startup heal for stale in-flight conversations: sessions left in
+    /// an "active" status (`Active`, `Processing`, `Waiting`) across a crash or
+    /// hard shutdown have no live worker after restart — the
+    /// [`AgentManager`]'s in-memory busy set and the per-agent live-turn slots
+    /// start empty — but their persisted [`AgentStatus`] would otherwise drive
+    /// the FE's `isActiveAgentThread` selector to true and surface a phantom
+    /// "Thinking" indicator. This sweep walks every session and rewrites those
+    /// statuses to [`AgentStatus::RuntimeIdle`] (the modern lowercase `"idle"`,
+    /// non-terminal and non-active), so opening a chat after restart shows a
+    /// settled conversation. Pending sessions and any already-terminal status
+    /// (`Completed`/`Error`/`Deleted`) are left untouched. Returns the number
+    /// of sessions healed. Errors are surfaced so the composition root can log
+    /// and continue: heal is best-effort and never gates `serve`.
+    pub async fn heal_stale_agent_sessions(&self) -> Result<usize> {
+        let sessions = self.store.list_all_agent_sessions().await?;
+        let mut healed = 0usize;
+        for mut session in sessions {
+            if !is_stale_in_flight_status(session.status) {
+                continue;
+            }
+            let prev = session.status;
+            session.status = intent_core::AgentStatus::RuntimeIdle;
+            session.is_active = false;
+            session.updated_at = now_iso();
+            // The update path enforces the `acpSessionId` write-once and
+            // `provider` immutability invariants (§9.5); the heal preserves
+            // both because it only edits status/is_active/updated_at.
+            self.store.update_agent_session(&session).await?;
+            healed += 1;
+            tracing::info!(
+                agent_id = %session.id,
+                workspace_id = %session.workspace_id,
+                from = ?prev,
+                "healed stale in-flight agent session"
+            );
+        }
+        Ok(healed)
     }
 
     /// Configure the note-asset root directory (for `note.readAsset`).
@@ -5244,6 +5321,23 @@ impl WorkspaceApi for Services {
             "messageId": live.message_id,
             "contentBlocks": live.blocks,
         }))
+    }
+
+    fn agent_is_busy(&self, agent_id: AgentId) -> bool {
+        // Production: defer to the attached [`AgentManager`] — its in-flight
+        // [`AgentManager::is_busy`] set is the authoritative "active worker"
+        // signal that gates the chat snapshot's live-turn merge. The test seam
+        // below covers unit/UDS tests that simulate a mid-turn without spawning
+        // a real manager.
+        if let Some(manager) = self.agent_manager() {
+            if manager.is_busy(&agent_id) {
+                return true;
+            }
+        }
+        match self.test_busy.lock() {
+            Ok(set) => set.contains(&agent_id),
+            Err(_) => false,
+        }
     }
 
     fn agent_create(

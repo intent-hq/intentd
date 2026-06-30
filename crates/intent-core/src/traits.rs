@@ -622,6 +622,18 @@ pub trait WorkspaceApi: Send + Sync {
         None
     }
 
+    /// Whether a turn loop is currently in flight for `agent_id` — the
+    /// authoritative "active worker" signal backing the chat snapshot's live
+    /// merge gate. `chat.subscribe` consults this before merging the in-memory
+    /// `agent_live_turn` so a lingering live-turn slot with no real worker (or
+    /// a session that never finalized across a crash) does not surface a
+    /// phantom streaming message. Synchronous (no I/O); default `false` so
+    /// non-agent `WorkspaceApi` impls need not implement it.
+    fn agent_is_busy(&self, agent_id: AgentId) -> bool {
+        let _ = agent_id;
+        false
+    }
+
     /// `agent.create`: persist a new agent session; returns `{ agent: { id, name } }`
     /// (the process spawns lazily on first turn) (PROTOCOL §5.5).
     ///

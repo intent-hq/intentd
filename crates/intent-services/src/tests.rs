@@ -6282,3 +6282,138 @@ mod sentry {
         }
     }
 }
+
+/// Daemon-startup heal sweep (iter#1c): sessions left non-terminal across a
+/// crash must be rewritten to a non-active status so the FE does not surface a
+/// phantom "Thinking" spinner the next time the chat is opened.
+mod heal_stale_agent_sessions {
+    use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
+    use intent_store::Store;
+
+    use super::{workspace, TempDb};
+    use crate::Services;
+
+    fn mk_session(ws: &WorkspaceId, id: &str, status: AgentStatus) -> AgentSession {
+        let ts = now_iso();
+        AgentSession {
+            id: AgentId::from(id),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: id.to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status,
+            is_active: matches!(
+                status,
+                AgentStatus::Active | AgentStatus::Processing | AgentStatus::Waiting
+            ),
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    }
+
+    #[tokio::test]
+    async fn rewrites_active_processing_waiting_to_runtime_idle() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+        // Three stale shapes (the FE's `isActiveAgentThread` statuses) + four
+        // shapes the heal MUST leave untouched (pending, both idle variants,
+        // and the terminal completed/error/deleted family).
+        store
+            .insert_agent_session(&mk_session(&ws, "stale-active", AgentStatus::Active))
+            .await
+            .expect("stale-active");
+        store
+            .insert_agent_session(&mk_session(
+                &ws,
+                "stale-processing",
+                AgentStatus::Processing,
+            ))
+            .await
+            .expect("stale-processing");
+        store
+            .insert_agent_session(&mk_session(&ws, "stale-waiting", AgentStatus::Waiting))
+            .await
+            .expect("stale-waiting");
+        store
+            .insert_agent_session(&mk_session(&ws, "untouched-pending", AgentStatus::Pending))
+            .await
+            .expect("pending");
+        store
+            .insert_agent_session(&mk_session(
+                &ws,
+                "untouched-idle-lc",
+                AgentStatus::RuntimeIdle,
+            ))
+            .await
+            .expect("idle-lc");
+        store
+            .insert_agent_session(&mk_session(&ws, "untouched-idle-uc", AgentStatus::Idle))
+            .await
+            .expect("idle-uc");
+        store
+            .insert_agent_session(&mk_session(
+                &ws,
+                "untouched-completed",
+                AgentStatus::Completed,
+            ))
+            .await
+            .expect("completed");
+        store
+            .insert_agent_session(&mk_session(&ws, "untouched-error", AgentStatus::Error))
+            .await
+            .expect("error");
+
+        let services = Services::new(store.clone());
+        let healed = services
+            .heal_stale_agent_sessions()
+            .await
+            .expect("heal sweep");
+        assert_eq!(healed, 3, "exactly the three stale shapes were rewritten");
+
+        // The three stale sessions are now non-active runtime-idle.
+        for id in ["stale-active", "stale-processing", "stale-waiting"] {
+            let s = store
+                .get_agent_session(&AgentId::from(id))
+                .await
+                .expect("reload");
+            assert_eq!(s.status, AgentStatus::RuntimeIdle, "{id} healed to idle");
+            assert!(!s.is_active, "{id} is_active cleared");
+        }
+
+        // Every untouched session keeps its persisted status, including the
+        // pending shape (waiting on a first turn) and the terminal family.
+        for (id, want) in [
+            ("untouched-pending", AgentStatus::Pending),
+            ("untouched-idle-lc", AgentStatus::RuntimeIdle),
+            ("untouched-idle-uc", AgentStatus::Idle),
+            ("untouched-completed", AgentStatus::Completed),
+            ("untouched-error", AgentStatus::Error),
+        ] {
+            let s = store
+                .get_agent_session(&AgentId::from(id))
+                .await
+                .expect("reload");
+            assert_eq!(s.status, want, "{id} status unchanged");
+        }
+
+        // A second sweep is a no-op: the heal is idempotent.
+        let healed_again = services
+            .heal_stale_agent_sessions()
+            .await
+            .expect("heal sweep (idempotent)");
+        assert_eq!(healed_again, 0);
+    }
+}

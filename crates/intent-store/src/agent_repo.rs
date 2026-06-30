@@ -92,6 +92,20 @@ impl Store {
         Ok(sessions)
     }
 
+    /// List every persisted session across workspaces, oldest first. Backs the
+    /// daemon-startup stale-session heal: a session left non-terminal across a
+    /// crash has no live worker after restart, so the heal sweeps the whole
+    /// table once before serving. Sessions are returned WITHOUT their message
+    /// logs (the heal does not need them) to keep the sweep O(rows).
+    pub async fn list_all_agent_sessions(&self) -> Result<Vec<AgentSession>> {
+        let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session ORDER BY created_at");
+        let rows = sqlx::query(&sql)
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list all agent sessions failed: {e}")))?;
+        rows.iter().map(map_session_row).collect()
+    }
+
     /// Update mutable session state, enforcing the `acp_session_id` write-once
     /// and `provider` immutability invariants (§9.5). `NotFound` if absent.
     pub async fn update_agent_session(&self, s: &AgentSession) -> Result<()> {

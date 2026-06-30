@@ -265,6 +265,17 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
         process_cap = manager.registry().cap(),
         "agent manager ready"
     );
+    // Heal stale in-flight conversations from any prior crash BEFORE the chat
+    // subscription path can observe them (iter#1c). Sessions left in an
+    // active status (`Active`/`Processing`/`Waiting`) without a live worker
+    // would otherwise drive the FE's `isActiveAgentThread` selector and
+    // surface a phantom "Thinking" indicator. Best-effort: a failure is
+    // logged but never aborts startup.
+    match services.heal_stale_agent_sessions().await {
+        Ok(0) => {}
+        Ok(healed) => tracing::info!(healed, "healed stale in-flight agent sessions on startup"),
+        Err(e) => tracing::warn!(error = %e, "stale agent session heal sweep failed"),
+    }
     // Background PR refresh (§7.6): periodically re-fetch every linked PR,
     // persist any change, and emit `pr:*` events so clients update without
     // polling. Safe when source control is unconfigured (each refresh logs and
