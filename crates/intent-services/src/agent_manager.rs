@@ -1185,11 +1185,13 @@ impl AgentManager {
     ) -> Result<Value> {
         if !self.try_begin(&agent_id, &workspace_id).await {
             let (queued, position) = self.services.enqueue_message(&agent_id, content, None);
-            return Ok(json!({
+            let result = json!({
                 "success": true,
                 "queued": true,
                 "queuedMessage": queued.to_value(position),
-            }));
+            });
+            self.services.publish_queue_updated(&agent_id).await;
+            return Ok(result);
         }
         let message_id = message_id.unwrap_or_else(new_message_id);
         let blocks = user_text_blocks(&content);
@@ -1201,17 +1203,54 @@ impl AgentManager {
             .is_err()
         {
             // Store write failed (e.g. session not yet persisted) → auto-queue,
-            // matching the `agent.sendMessage` fallback (PROTOCOL §5.5).
+            // matching the `agent.sendMessage` fallback (PROTOCOL §5.5). Self-drain:
+            // the slot we just released will be reclaimed below if the queue is
+            // ready and the agent is otherwise free.
             self.end_turn(&agent_id).await;
             let (queued, position) = self.services.enqueue_message(&agent_id, content, None);
-            return Ok(json!({
+            let result = json!({
                 "success": true,
                 "queued": true,
                 "queuedMessage": queued.to_value(position),
-            }));
+            });
+            self.services.publish_queue_updated(&agent_id).await;
+            self.clone().try_drain_queue(agent_id, workspace_id).await;
+            return Ok(result);
         }
         self.spawn_worker(agent_id, workspace_id, content);
         Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+    }
+
+    /// Self-drain entrypoint (PROTOCOL §5.5). Invoked from `agent.queueMessage`
+    /// (and the `send_message` auto-queue fallback above) so a queued message
+    /// never sits unworked when the agent is idle. Claims the in-flight slot,
+    /// dequeues the head of the queue, persists it, and spawns the turn worker
+    /// (which then drains the rest of the queue via its end-of-turn loop).
+    /// When the slot is already held by another worker this is a no-op — that
+    /// worker's drain loop will pick the message up at turn-end.
+    pub async fn try_drain_queue(self: Arc<Self>, agent_id: AgentId, workspace_id: WorkspaceId) {
+        if self.is_busy(&agent_id) {
+            return;
+        }
+        if !self.try_begin(&agent_id, &workspace_id).await {
+            return;
+        }
+        let next = match self.services.dequeue_message(&agent_id) {
+            Some(msg) => msg,
+            None => {
+                self.end_turn(&agent_id).await;
+                return;
+            }
+        };
+        self.services
+            .publish_queue_updated_for(
+                &agent_id,
+                &workspace_id,
+                self.services.queue_snapshot(&agent_id),
+            )
+            .await;
+        persist_user(&self, &agent_id, &next.content).await;
+        self.spawn_worker(agent_id, workspace_id, next.content);
     }
 
     /// `agent.forceMessage` runtime path (§5.5): stop the current stream (abort
@@ -1225,7 +1264,11 @@ impl AgentManager {
         content: String,
     ) -> Result<Value> {
         self.stop(&agent_id).await;
-        self.services.clear_queue(&agent_id);
+        if self.services.clear_queue(&agent_id) {
+            self.services
+                .publish_queue_updated_for(&agent_id, &workspace_id, Vec::new())
+                .await;
+        }
         let blocks = user_text_blocks(&content);
         self.services
             .store
@@ -1492,9 +1535,13 @@ fn resolve_spawn(
 }
 
 /// Background turn worker: drive the current message to completion, then drain
-/// any queued messages (flipping each to in-flight), re-checking once after the
-/// busy flag clears to absorb a late enqueue. Spawn/turn failures are logged so
-/// the loop always releases the in-flight slot and worker handle.
+/// any queued messages (flipping each to in-flight). After the slot is released
+/// the loop re-checks the queue and reclaims the slot **as long as another
+/// message is waiting**; only when the queue is truly empty (or a concurrent
+/// worker has won the slot) does the loop exit. Each dequeue publishes
+/// `agent:queue:updated` so subscribed FE clients mirror the live queue
+/// (§5.5/§6). Spawn/turn failures are logged so the loop always releases the
+/// in-flight slot and worker handle.
 async fn run_message_worker(
     mgr: Arc<AgentManager>,
     agent_id: AgentId,
@@ -1519,23 +1566,42 @@ async fn run_message_worker(
         }
         // Drain the next queued message while still holding the in-flight slot.
         if let Some(next) = mgr.services.dequeue_message(&agent_id) {
+            mgr.services
+                .publish_queue_updated_for(
+                    &agent_id,
+                    &workspace_id,
+                    mgr.services.queue_snapshot(&agent_id),
+                )
+                .await;
             persist_user(&mgr, &agent_id, &next.content).await;
             content = next.content;
             continue;
         }
-        // Queue drained: release the slot, then re-check once for a message that
-        // raced in just before the release (otherwise it would sit unworked).
+        // Queue drained: release the slot, then re-check for a message that
+        // raced in just before / after the release. The re-check is wrapped in
+        // the outer `'outer` loop (not its own inner loop) so the agent never
+        // goes idle while ready-to-send messages remain — each re-claim of the
+        // slot continues `'outer` and re-enters the drain at the top.
         mgr.end_turn(&agent_id).await;
-        if let Some(next) = mgr.services.dequeue_message(&agent_id) {
-            if mgr.try_begin(&agent_id, &workspace_id).await {
-                persist_user(&mgr, &agent_id, &next.content).await;
-                content = next.content;
-                continue 'outer;
-            }
-            // A concurrent send won the slot; hand the message back to it.
-            mgr.services.requeue_front(&agent_id, next);
+        let Some(next) = mgr.services.dequeue_message(&agent_id) else {
+            break 'outer;
+        };
+        if mgr.try_begin(&agent_id, &workspace_id).await {
+            mgr.services
+                .publish_queue_updated_for(
+                    &agent_id,
+                    &workspace_id,
+                    mgr.services.queue_snapshot(&agent_id),
+                )
+                .await;
+            persist_user(&mgr, &agent_id, &next.content).await;
+            content = next.content;
+            continue 'outer;
         }
-        break;
+        // A concurrent send won the slot; hand the message back to it and
+        // exit — that worker's own drain loop will pick it up.
+        mgr.services.requeue_front(&agent_id, next);
+        break 'outer;
     }
     mgr.clear_worker(&agent_id);
     // The agent finished its work (queue drained, slot released): raise the

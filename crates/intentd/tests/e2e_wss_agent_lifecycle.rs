@@ -1462,3 +1462,177 @@ async fn oversized_request_head_rejected_over_wss() {
         "oversized head must NOT upgrade to a websocket: {resp:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Queue self-drain (P0): `agent.queueMessage` on an IDLE agent must auto-send
+// (drive a turn, persist the assistant reply, emit terminal `agent:stream:end`)
+// with NO follow-up `agent.sendMessage`. `agent.removeQueuedMessage` must be
+// idempotent (always succeeds), and `agent:queue:updated` must fire on every
+// queue mutation carrying `{ agentId, queue }` (PROTOCOL §5.5/§6).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn queue_message_self_drains_on_idle_agent_over_wss() {
+    let Some(script) = gate("WSS queue self-drain E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "response": "queued drain ok" }).to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe to queue + stream events BEFORE the enqueue.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "QDrain", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    // Enqueue with NO prior sendMessage — the BE must self-drain.
+    let queued = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.queueMessage",
+        json!({ "agentId": agent_id, "content": "drain me" }),
+    )
+    .await;
+    assert_eq!(queued["success"], true);
+    assert!(queued["queuedMessage"]["id"].is_string());
+
+    // Collect events until terminal `agent:stream:end`; assert at least one
+    // `agent:queue:updated` carrying `{ agentId, queue }` arrived along the way.
+    let mut saw_queue_updated_enqueue = false;
+    let mut saw_stream_end = false;
+    for _ in 0..120 {
+        let frame = wss_event(&mut sub, 30).await;
+        let evt = &frame["params"]["event"];
+        match evt["type"].as_str() {
+            Some("agent:queue:updated") => {
+                assert_eq!(evt["data"]["agentId"].as_str(), Some(agent_id.as_str()));
+                assert!(evt["data"]["queue"].is_array(), "queue array present");
+                if evt["data"]["queue"]
+                    .as_array()
+                    .map(|q| !q.is_empty())
+                    .unwrap_or(false)
+                {
+                    saw_queue_updated_enqueue = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                saw_stream_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_queue_updated_enqueue,
+        "agent:queue:updated emitted on enqueue"
+    );
+    assert!(
+        saw_stream_end,
+        "self-drain drove a turn to terminal agent:stream:end with NO explicit sendMessage"
+    );
+
+    // Assistant message persisted in the transcript: proves the queued message
+    // actually got flipped to in-flight and a turn ran end-to-end.
+    let list = wss_rpc(&mut rpc, 12, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let listed = list["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == json!(agent_id))
+        .expect("agent listed");
+    let mc = listed["messageCount"].as_u64().unwrap_or(0);
+    assert!(
+        mc >= 1,
+        "queued message produced an assistant reply (mc={mc})"
+    );
+
+    // Queue is empty post-drain.
+    let q = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getQueue",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(q["queue"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn remove_queued_message_is_idempotent_over_wss() {
+    // No mock-agent needed — `agent.removeQueuedMessage` is a pure router arm
+    // when the message id is unknown. The FE's seeded mirror diverges from the
+    // BE's in-memory queue after a daemon restart; the BE must return success
+    // (not an error) so the FE's optimistic delete sticks.
+    let (_daemon, ws_id, _note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    let created = wss_rpc(
+        &mut rpc,
+        1,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "QIdempotent", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    // Unknown message id on a known agent → success.
+    let r = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.removeQueuedMessage",
+        json!({ "agentId": agent_id, "messageId": "msg-does-not-exist" }),
+    )
+    .await;
+    assert_eq!(r["success"], json!(true));
+
+    // Unknown agent → also success.
+    let r2 = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.removeQueuedMessage",
+        json!({
+            "agentId": "agent-00000000-0000-0000-0000-000000000000",
+            "messageId": "anything"
+        }),
+    )
+    .await;
+    assert_eq!(r2["success"], json!(true));
+}

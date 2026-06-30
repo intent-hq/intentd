@@ -9,10 +9,10 @@
 
 use std::collections::HashSet;
 
-use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE};
+use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_QUEUE_UPDATED};
 use intent_core::{
-    now_iso, parse_iso, AgentId, AgentLite, AgentMessage, AgentSession, AgentStatus, Error, NoteId,
-    Result, SessionStats, WorkspaceApi, WorkspaceId,
+    now_iso, parse_iso, ActorType, AgentId, AgentLite, AgentMessage, AgentSession, AgentStatus,
+    Error, EventActor, NoteId, Result, SessionStats, WorkspaceApi, WorkspaceId,
 };
 
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
@@ -506,7 +506,11 @@ impl Services {
         Ok(json!({ "models": models }))
     }
 
-    /// `agent.queueMessage` (PROTOCOL §5.5).
+    /// `agent.queueMessage` (PROTOCOL §5.5). Enqueues the message, publishes
+    /// `agent:queue:updated`, and asks the runtime [`AgentManager`] (when attached)
+    /// to drain the queue immediately if the agent is idle — closing the bug where
+    /// a queued message would never be sent because the BE only drained the queue
+    /// from a live worker loop.
     pub(crate) async fn agent_queue_message_op(
         &self,
         agent_id: AgentId,
@@ -514,60 +518,80 @@ impl Services {
         image_blocks: Option<Value>,
     ) -> Result<Value> {
         let (queued, position) = self.enqueue_message(&agent_id, content, image_blocks);
-        Ok(json!({ "success": true, "queuedMessage": queued.to_value(position) }))
+        let result = json!({ "success": true, "queuedMessage": queued.to_value(position) });
+        self.publish_queue_updated(&agent_id).await;
+        if let Some(manager) = self.agent_manager() {
+            if let Ok(session) = self.store.get_agent_session(&agent_id).await {
+                manager
+                    .try_drain_queue(agent_id, session.workspace_id)
+                    .await;
+            }
+        }
+        Ok(result)
     }
 
     /// `agent.getQueue` (PROTOCOL §5.5).
     pub(crate) async fn agent_get_queue_op(&self, agent_id: AgentId) -> Result<Value> {
-        let queue: Vec<Value> = self
-            .agent_queues
-            .lock()
-            .expect("agent queue registry poisoned")
-            .get(&agent_id)
-            .map(|q| q.iter().enumerate().map(|(i, m)| m.to_value(i)).collect())
-            .unwrap_or_default();
+        let queue = self.queue_snapshot(&agent_id);
         Ok(json!({ "success": true, "queue": queue }))
     }
 
-    /// `agent.editQueuedMessage` (PROTOCOL §5.5).
+    /// `agent.editQueuedMessage` (PROTOCOL §5.5). Edits in place (matching the
+    /// reference's `handleEditQueuedMessage`) and publishes `agent:queue:updated`.
+    /// Returns `Internal` when the message id is unknown — only `removeQueuedMessage`
+    /// is idempotent.
     pub(crate) async fn agent_edit_queued_message_op(
         &self,
         agent_id: AgentId,
         message_id: String,
         content: String,
     ) -> Result<Value> {
-        let mut guard = self
-            .agent_queues
-            .lock()
-            .expect("agent queue registry poisoned");
-        let queue = guard
-            .get_mut(&agent_id)
-            .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
-        let position = queue
-            .iter()
-            .position(|m| m.id == message_id)
-            .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
-        queue[position].content = content;
-        Ok(json!({ "success": true, "queuedMessage": queue[position].to_value(position) }))
+        let edited = {
+            let mut guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            let queue = guard
+                .get_mut(&agent_id)
+                .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
+            let position = queue
+                .iter()
+                .position(|m| m.id == message_id)
+                .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
+            queue[position].content = content;
+            queue[position].to_value(position)
+        };
+        self.publish_queue_updated(&agent_id).await;
+        Ok(json!({ "success": true, "queuedMessage": edited }))
     }
 
-    /// `agent.removeQueuedMessage` (PROTOCOL §5.5).
+    /// `agent.removeQueuedMessage` (PROTOCOL §5.5). **Idempotent**: returns
+    /// `{ success: true }` whether or not the message (or the agent's queue) was
+    /// found. The FE's seeded queue can diverge from the BE's in-memory queue
+    /// (especially after a daemon restart); the original "Queued message not
+    /// found" error caused the FE's optimistic delete to roll back, leaving
+    /// ghost messages on screen.
     pub(crate) async fn agent_remove_queued_message_op(
         &self,
         agent_id: AgentId,
         message_id: String,
     ) -> Result<Value> {
-        let mut guard = self
-            .agent_queues
-            .lock()
-            .expect("agent queue registry poisoned");
-        let queue = guard
-            .get_mut(&agent_id)
-            .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
-        let before = queue.len();
-        queue.retain(|m| m.id != message_id);
-        if queue.len() == before {
-            return Err(Error::Internal("Queued message not found".to_string()));
+        let removed = {
+            let mut guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            match guard.get_mut(&agent_id) {
+                Some(queue) => {
+                    let before = queue.len();
+                    queue.retain(|m| m.id != message_id);
+                    before != queue.len()
+                }
+                None => false,
+            }
+        };
+        if removed {
+            self.publish_queue_updated(&agent_id).await;
         }
         Ok(json!({ "success": true }))
     }
@@ -590,11 +614,13 @@ impl Services {
             Ok(_) => Ok(json!({ "success": true, "queued": false, "messageId": message_id })),
             Err(_) => {
                 let (queued, position) = self.enqueue_message(&agent_id, content, None);
-                Ok(json!({
+                let result = json!({
                     "success": true,
                     "queued": true,
                     "queuedMessage": queued.to_value(position),
-                }))
+                });
+                self.publish_queue_updated(&agent_id).await;
+                Ok(result)
             }
         }
     }
@@ -1406,12 +1432,78 @@ impl Services {
     }
 
     /// Drop all queued messages for an agent (used by `agent.forceMessage`,
-    /// which supersedes the queue with the forced message).
-    pub(crate) fn clear_queue(&self, agent_id: &AgentId) {
+    /// which supersedes the queue with the forced message). Returns `true` iff
+    /// the queue previously held at least one message — the caller uses this to
+    /// decide whether to publish `agent:queue:updated`.
+    pub(crate) fn clear_queue(&self, agent_id: &AgentId) -> bool {
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let had = guard.get(agent_id).map(|q| !q.is_empty()).unwrap_or(false);
+        guard.remove(agent_id);
+        had
+    }
+
+    /// Snapshot the current queue contents as wire-shape `QueuedMessage` JSON
+    /// (the §5.5 `{id, content, queuedAt, position, imageBlocks?}` shape) for
+    /// `agent.getQueue` and the `agent:queue:updated` payload (§6).
+    pub(crate) fn queue_snapshot(&self, agent_id: &AgentId) -> Vec<Value> {
         self.agent_queues
             .lock()
             .expect("agent queue registry poisoned")
-            .remove(agent_id);
+            .get(agent_id)
+            .map(|q| q.iter().enumerate().map(|(i, m)| m.to_value(i)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Publish `agent:queue:updated` with the **current** queue snapshot.
+    /// Looks up the owning workspace from the agent session — when the session
+    /// row is missing (e.g. an idempotent remove on an unknown agent) or no bus
+    /// is wired, the call is a quiet no-op rather than an error: the durable
+    /// mutation is the source of truth and a missing event is not fatal.
+    ///
+    /// The queue snapshot is taken **outside** the mutex it lives behind, but
+    /// since this method only reads (under a brief lock that is dropped before
+    /// the await) it never holds the queue lock across an `await` point.
+    pub(crate) async fn publish_queue_updated(&self, agent_id: &AgentId) {
+        let queue = self.queue_snapshot(agent_id);
+        let workspace_id = match self.store.get_agent_session(agent_id).await {
+            Ok(s) => s.workspace_id,
+            Err(_) => return,
+        };
+        self.publish_queue_updated_for(agent_id, &workspace_id, queue)
+            .await;
+    }
+
+    /// Like [`publish_queue_updated`] but takes the workspace id directly —
+    /// used by call sites (the turn worker, `force_message`) that already hold
+    /// it, avoiding a redundant `get_agent_session` round-trip per drain step.
+    pub(crate) async fn publish_queue_updated_for(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        queue: Vec<Value>,
+    ) {
+        let event = intent_store::NewEvent {
+            workspace_id: workspace_id.clone(),
+            timestamp: now_iso(),
+            event_type: AGENT_QUEUE_UPDATED.to_string(),
+            actor: EventActor {
+                actor_type: ActorType::Agent,
+                id: Some(agent_id.0.clone()),
+                ..Default::default()
+            },
+            session_id: Some(agent_id.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({
+                "agentId": agent_id.0,
+                "queue": queue,
+            }),
+        };
+        crate::publish_event(&self.event_bus, event).await;
     }
 }
 

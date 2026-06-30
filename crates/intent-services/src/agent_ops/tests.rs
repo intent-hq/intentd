@@ -562,6 +562,112 @@ async fn edit_missing_queued_message_errors() {
 }
 
 #[tokio::test]
+async fn remove_queued_message_is_idempotent_for_unknown_id() {
+    // Removing a message that's no longer in the BE queue (e.g. after a daemon
+    // restart, or after the FE's seeded mirror diverged) must succeed so the
+    // FE's optimistic delete sticks rather than rolling back.
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Q").await;
+    let r = svc
+        .agent_remove_queued_message_op(id, "msg-does-not-exist".into())
+        .await
+        .expect("idempotent remove");
+    assert_eq!(r["success"], true);
+}
+
+#[tokio::test]
+async fn remove_queued_message_is_idempotent_for_unknown_agent() {
+    // Same idempotency contract when the agent has never had a queue at all
+    // (no entry in the in-memory map).
+    let (_t, svc, _ws) = setup().await;
+    let unknown = AgentId::from("agent-00000000-0000-0000-0000-000000000000");
+    let r = svc
+        .agent_remove_queued_message_op(unknown, "anything".into())
+        .await
+        .expect("idempotent remove on unknown agent");
+    assert_eq!(r["success"], true);
+}
+
+#[tokio::test]
+async fn queue_message_emits_queue_updated_with_snapshot() {
+    // `agent.queueMessage` must publish `agent:queue:updated` carrying the
+    // current queue snapshot so subscribed FE clients mirror the live queue
+    // (PROTOCOL §6.5).
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Q").await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    let added = svc
+        .agent_queue_message_op(id.clone(), "first".into(), None)
+        .await
+        .expect("queue");
+    let mid = added["queuedMessage"]["id"].as_str().unwrap().to_string();
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert!(!batch.is_empty(), "expected at least one event");
+    let evt = batch
+        .iter()
+        .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
+        .expect("queue:updated emitted");
+    assert_eq!(evt.workspace_id, ws);
+    assert_eq!(evt.data["agentId"].as_str(), Some(id.0.as_str()));
+    let queue = evt.data["queue"].as_array().expect("queue array");
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0]["id"].as_str(), Some(mid.as_str()));
+    assert_eq!(queue[0]["content"], "first");
+    assert_eq!(queue[0]["position"], 0);
+}
+
+#[tokio::test]
+async fn remove_queued_message_emits_queue_updated_only_when_present() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Q").await;
+
+    // Seed one queued message, then drain the events for the seed enqueue.
+    let added = svc
+        .agent_queue_message_op(id.clone(), "first".into(), None)
+        .await
+        .expect("queue");
+    let mid = added["queuedMessage"]["id"].as_str().unwrap().to_string();
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    // Idempotent remove of an unknown id does not emit (queue did not change).
+    let r = svc
+        .agent_remove_queued_message_op(id.clone(), "nope".into())
+        .await
+        .expect("idempotent remove");
+    assert_eq!(r["success"], true);
+    let none = timeout(Duration::from_millis(200), sub.recv()).await;
+    assert!(none.is_err(), "no event when nothing was removed");
+
+    // Real remove emits with the empty snapshot.
+    svc.agent_remove_queued_message_op(id.clone(), mid)
+        .await
+        .expect("remove");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    let evt = batch
+        .iter()
+        .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
+        .expect("queue:updated emitted on real remove");
+    assert_eq!(evt.data["agentId"].as_str(), Some(id.0.as_str()));
+    assert!(evt.data["queue"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn send_message_delivers_when_agent_exists() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Recv").await;
