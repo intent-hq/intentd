@@ -5123,6 +5123,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         path: Option<String>,
         staged: bool,
+        commit_hash: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -5141,7 +5142,37 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
-            git_ops::build_diffs(&worktree, path.as_deref(), staged)
+            git_ops::build_diffs(&worktree, path.as_deref(), staged, commit_hash.as_deref())
+        })
+    }
+
+    fn git_commit_details(
+        &self,
+        workspace_id: WorkspaceId,
+        commit_hash: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let empty = git_ops::empty_commit_details(&commit_hash);
+            let ws = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(Error::NotFound(_)) => return Ok(empty),
+                Err(e) => return Err(e),
+            };
+            if ws.is_remote {
+                return Ok(empty);
+            }
+            let Some(worktree) = git_ops::worktree_path(&ws) else {
+                return Ok(empty);
+            };
+            if !worktree.join(".git").exists() {
+                return Ok(empty);
+            }
+            match git_ops::build_commit_details(&worktree, &commit_hash) {
+                Ok(value) => Ok(value),
+                Err(Error::NotFound(_)) => Ok(empty),
+                Err(e) => Err(e),
+            }
         })
     }
 

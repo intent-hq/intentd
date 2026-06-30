@@ -572,3 +572,113 @@ async fn heartbeat_terminates_silent_client() {
     assert!(terminated, "silent client must be terminated by heartbeat");
     srv.ws.stop().await;
 }
+
+/// `git.commitDetails` + `git.diffs` (with `commitHash`) round-trip over WSS:
+/// proves the daemon's per-commit reads reach a pinned-TLS WebSocket client
+/// with the documented PROTOCOL §5.6 wire shape.
+#[tokio::test]
+async fn wss_git_commit_details_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed a real git repo with two commits so HEAD has a non-empty parent diff.
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let repo = Path::new("/tmp").join(format!("intentd-wssgit-{}", &short[..8]));
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "seed"]);
+    std::fs::write(repo.join("seed.txt"), "seed\nadded\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "second"]);
+    let head = String::from_utf8(
+        std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+
+    // Create a workspace pointing at the seeded repo.
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS git WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    // git.commitDetails over WSS — shape parity with the UDS coverage.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.commitDetails","params":{{"workspaceId":"{ws_id}","commitHash":"{head}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["commitHash"], Value::from(head.clone()));
+    assert_eq!(resp["result"]["author"], "Test");
+    assert_eq!(resp["result"]["authorEmail"], "test@example.com");
+    assert_eq!(resp["result"]["message"], "second");
+    let file_details = resp["result"]["fileDetails"]
+        .as_array()
+        .expect("fileDetails array");
+    let seed = file_details
+        .iter()
+        .find(|f| f["path"] == "seed.txt")
+        .expect("seed.txt fileDetails");
+    assert_eq!(seed["additions"], 1);
+    assert_eq!(seed["deletions"], 0);
+    assert_eq!(resp["result"]["files"], serde_json::json!(["seed.txt"]));
+
+    // git.diffs with commitHash over WSS returns the commit's hunks.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"git.diffs","params":{{"workspaceId":"{ws_id}","commitHash":"{head}","path":"seed.txt"}}}}"#
+        ),
+    )
+    .await;
+    let arr = resp["result"].as_array().expect("diffs array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["path"], "seed.txt");
+    let lines = arr[0]["hunks"][0]["lines"].as_array().expect("hunk lines");
+    assert!(lines
+        .iter()
+        .any(|l| l["type"] == "Addition" && l["content"].as_str().unwrap_or("").contains("added")));
+
+    // Missing commitHash → -32602, matching PROTOCOL §9.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"git.commitDetails","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+    std::fs::remove_dir_all(&repo).ok();
+}
