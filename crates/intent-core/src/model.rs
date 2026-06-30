@@ -1334,14 +1334,27 @@ pub struct AgentLite {
     #[serde(default)]
     pub is_active: bool,
     /// Runtime activity flags (iOS `isStreaming`/`isProcessing`/`isResponding`).
-    /// The headless backend has no live stream state in this projection, so all
-    /// three are `false`; `status` (+ `isActive`) carry the liveness signal.
+    /// `isStreaming`/`isProcessing` stay `false` (the projection has no separate
+    /// stream/process distinction); `isResponding` is the daemon-owned in-flight
+    /// signal and is overlaid by the service projection (it stays `false` here in
+    /// [`AgentLite::from_session`], which has no runtime context).
     #[serde(default)]
     pub is_streaming: bool,
     #[serde(default)]
     pub is_processing: bool,
     #[serde(default)]
     pub is_responding: bool,
+    /// Daemon-owned waiting flags (PROTOCOL §5.5/§7.1): the BE-authoritative port
+    /// of the FE agent-state selectors so clients render verbatim. `isWaitingOnTool`
+    /// is true when the in-flight turn has an unresolved `tool_use` (a tool call
+    /// awaiting its result); `isWaitingForOtherAgents` is true when the agent
+    /// parents one or more pending completion watches. Both stay `false` in
+    /// [`AgentLite::from_session`] (no runtime context) and are overlaid by the
+    /// service projection.
+    #[serde(default)]
+    pub is_waiting_on_tool: bool,
+    #[serde(default)]
+    pub is_waiting_for_other_agents: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<SessionStats>,
     pub created_at: String,
@@ -1391,6 +1404,8 @@ impl AgentLite {
             is_streaming: false,
             is_processing: false,
             is_responding: false,
+            is_waiting_on_tool: false,
+            is_waiting_for_other_agents: false,
             stats: session.stats,
             last_activity: Some(session.updated_at.clone()),
             created_at: session.created_at,
@@ -2241,6 +2256,8 @@ mod tests {
         assert_eq!(v["isStreaming"], false);
         assert_eq!(v["isProcessing"], false);
         assert_eq!(v["isResponding"], false);
+        assert_eq!(v["isWaitingOnTool"], false);
+        assert_eq!(v["isWaitingForOtherAgents"], false);
         assert_eq!(v["lastUserMessage"], "hi");
         assert_eq!(v["lastActivity"], "t1");
     }

@@ -302,7 +302,13 @@ async fn chat_subscribe_snapshot_matches_conversation_then_unsubscribe() {
     let snap = read_json(&mut sub_reader).await;
     assert_eq!(snap["params"]["kind"], "snapshot");
     assert_eq!(snap["params"]["seq"], 0);
-    // seq-0 snapshot equals the agent's newest conversation page (object shape).
+    // seq-0 snapshot equals the agent's newest conversation page plus the
+    // daemon-owned activity flags (PROTOCOL §7.1; all false for an idle agent).
+    let mut want = want;
+    let want_obj = want.as_object_mut().unwrap();
+    want_obj.insert("isResponding".into(), json!(false));
+    want_obj.insert("isWaitingOnTool".into(), json!(false));
+    want_obj.insert("isWaitingForOtherAgents".into(), json!(false));
     assert_eq!(snap["params"]["snapshot"], want);
     assert_eq!(snap["params"]["snapshot"]["agentId"], agent_id.as_str());
 

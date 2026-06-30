@@ -365,18 +365,97 @@ fn project_lite(session: AgentSession) -> AgentLite {
     AgentLite::from_session(session, count, last_response, last_user, digest)
 }
 
+/// Whether `blocks` contains a `tool_use` block with no matching `tool_result`
+/// (matched by `tool_use_id == toolCallId`). The daemon-side port of the FE
+/// `hasUnresolvedToolUse` content-block branch: a tool call that has been
+/// emitted but whose result block has not yet been appended is "unresolved"
+/// (the agent is blocked awaiting the tool).
+fn has_unresolved_tool_use(blocks: &[Value]) -> bool {
+    blocks.iter().any(|block| {
+        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            return false;
+        }
+        let Some(id) = block.get("toolCallId").and_then(Value::as_str) else {
+            return false;
+        };
+        !blocks.iter().any(|candidate| {
+            candidate.get("type").and_then(Value::as_str) == Some("tool_result")
+                && candidate.get("tool_use_id").and_then(Value::as_str) == Some(id)
+        })
+    })
+}
+
 impl Services {
     /// `agent.list` (PROTOCOL §5.5).
     pub(crate) async fn agent_list_op(&self, workspace_id: WorkspaceId) -> Result<Vec<AgentLite>> {
         let sessions = self.store.list_agent_sessions(&workspace_id).await?;
-        Ok(sessions.into_iter().map(project_lite).collect())
+        Ok(sessions
+            .into_iter()
+            .map(|s| self.project_lite_with_flags(s))
+            .collect())
     }
 
     /// `agent.get` (PROTOCOL §5.5). `NotFound` is surfaced to the router which
     /// maps it to `-32602 "Agent not found"`.
     pub(crate) async fn agent_get_op(&self, agent_id: AgentId) -> Result<AgentLite> {
         let session = self.store.get_agent_session(&agent_id).await?;
-        Ok(project_lite(session))
+        Ok(self.project_lite_with_flags(session))
+    }
+
+    /// Project an [`AgentSession`] into [`AgentLite`] and overlay the daemon-owned
+    /// runtime activity flags (PROTOCOL §5.5/§7.1): `isResponding`,
+    /// `isWaitingOnTool`, `isWaitingForOtherAgents`. See [`agent_activity_flags_for`].
+    pub(crate) fn project_lite_with_flags(&self, session: AgentSession) -> AgentLite {
+        let (is_responding, is_waiting_on_tool, is_waiting_for_other_agents) =
+            self.agent_activity_flags_for(&session);
+        let mut lite = project_lite(session);
+        lite.is_responding = is_responding;
+        lite.is_waiting_on_tool = is_waiting_on_tool;
+        lite.is_waiting_for_other_agents = is_waiting_for_other_agents;
+        lite
+    }
+
+    /// Compute the daemon-owned runtime activity flags for `session` — the port
+    /// of the FE agent-state selectors so clients render verbatim (PROTOCOL
+    /// §5.5/§7.1). Returns `(isResponding, isWaitingOnTool, isWaitingForOtherAgents)`:
+    ///
+    /// - `isResponding` — a worker is draining an in-flight turn for this agent
+    ///   ([`agent_is_busy`], the authoritative "active worker" signal; mirrors the
+    ///   FE `selectAgentIsResponding`). Builds on the existing busy/live-turn state
+    ///   rather than adding a parallel notion of "busy".
+    /// - `isWaitingOnTool` — that in-flight turn has an unresolved `tool_use` block
+    ///   (a tool call awaiting its result; the port of FE `hasUnresolvedToolUse`).
+    /// - `isWaitingForOtherAgents` — the agent parents one or more pending
+    ///   completion watches (the port of FE `isAgentWaitingForOtherAgents`).
+    ///
+    /// Terminal agents (completed/error/deleted) report all `false`, mirroring the
+    /// FE selectors' terminal-status short-circuit.
+    pub(crate) fn agent_activity_flags_for(&self, session: &AgentSession) -> (bool, bool, bool) {
+        let terminal = matches!(
+            session.status,
+            AgentStatus::Completed | AgentStatus::Error | AgentStatus::Deleted
+        );
+        if terminal {
+            return (false, false, false);
+        }
+        let is_responding = self.agent_is_busy(session.id.clone());
+        let is_waiting_on_tool = is_responding && self.live_turn_has_unresolved_tool(&session.id);
+        let is_waiting_for_other_agents = !self
+            .list_watches_for_parent(&session.workspace_id, &session.id)
+            .is_empty();
+        (
+            is_responding,
+            is_waiting_on_tool,
+            is_waiting_for_other_agents,
+        )
+    }
+
+    /// Whether the agent's in-flight live turn (if any) is blocked on an
+    /// unresolved tool call. `false` when no turn is streaming.
+    fn live_turn_has_unresolved_tool(&self, agent_id: &AgentId) -> bool {
+        self.live_turn(agent_id)
+            .map(|live| has_unresolved_tool_use(&live.blocks))
+            .unwrap_or(false)
     }
 
     /// `agent.getConversation` (PROTOCOL §5.5). Paginated per the TA-2 contract:

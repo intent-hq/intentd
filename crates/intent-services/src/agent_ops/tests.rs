@@ -299,11 +299,84 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
     assert_eq!(v["metadata"]["specialist"], "implementor");
     assert_eq!(v["metadata"]["isBackground"], false);
     assert!(v["metadata"].get("createdByAgentId").is_none());
-    // Activity flags are present; the headless BE has no live stream so all false.
+    // Activity flags are present; an idle agent (no worker, no watches) reports
+    // every flag false.
     assert_eq!(v["isStreaming"], false);
     assert_eq!(v["isProcessing"], false);
     assert_eq!(v["isResponding"], false);
+    assert_eq!(v["isWaitingOnTool"], false);
+    assert_eq!(v["isWaitingForOtherAgents"], false);
     assert!(v["lastActivity"].is_string());
+}
+
+#[tokio::test]
+async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    // An active worker draining an in-flight turn whose latest block is a
+    // `tool_use` awaiting its result: isResponding + isWaitingOnTool.
+    svc.set_test_busy(&parent, true);
+    svc.set_live_turn(
+        &parent,
+        "msg-1",
+        vec![json!({
+            "type": "tool_use",
+            "id": "msg-1:0",
+            "name": "read_file",
+            "input": {},
+            "toolCallId": "call-1"
+        })],
+    );
+    // The parent also parents a pending completion watch: isWaitingForOtherAgents.
+    svc.register_completion_watch(
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        true,
+        None,
+    );
+
+    let lite = svc.agent_get_op(parent.clone()).await.expect("get");
+    let v = serde_json::to_value(&lite).unwrap();
+    assert_eq!(v["isResponding"], true);
+    assert_eq!(v["isWaitingOnTool"], true);
+    assert_eq!(v["isWaitingForOtherAgents"], true);
+
+    // Once the tool result lands, the in-flight turn is no longer blocked on the
+    // tool: still responding, but no longer waiting on it.
+    svc.set_live_turn(
+        &parent,
+        "msg-1",
+        vec![
+            json!({
+                "type": "tool_use",
+                "id": "msg-1:0",
+                "name": "read_file",
+                "input": {},
+                "toolCallId": "call-1"
+            }),
+            json!({
+                "type": "tool_result",
+                "id": "msg-1:1",
+                "tool_use_id": "call-1",
+                "output": "ok",
+                "is_error": false
+            }),
+        ],
+    );
+    let v = serde_json::to_value(svc.agent_get_op(parent.clone()).await.expect("get")).unwrap();
+    assert_eq!(v["isResponding"], true);
+    assert_eq!(v["isWaitingOnTool"], false);
+    assert_eq!(v["isWaitingForOtherAgents"], true);
+
+    // The child has no worker and parents no watches: every flag false.
+    let cv = serde_json::to_value(svc.agent_get_op(child).await.expect("get")).unwrap();
+    assert_eq!(cv["isResponding"], false);
+    assert_eq!(cv["isWaitingOnTool"], false);
+    assert_eq!(cv["isWaitingForOtherAgents"], false);
 }
 
 #[tokio::test]

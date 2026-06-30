@@ -5395,6 +5395,32 @@ impl WorkspaceApi for Services {
         }
     }
 
+    fn agent_activity_flags(&self, agent_id: AgentId) -> BoxFuture<'_, serde_json::Value> {
+        Box::pin(async move {
+            // Load the session so the flags honor the same terminal-status
+            // short-circuit and parent-watch lookup as the `AgentLite`
+            // projection (see [`agent_activity_flags_for`]). On a read error the
+            // snapshot degrades to all-`false` rather than failing the
+            // subscription (matching `chat_snapshot`'s degrade-to-empty pattern).
+            match self.store.get_agent_session(&agent_id).await {
+                Ok(session) => {
+                    let (is_responding, is_waiting_on_tool, is_waiting_for_other_agents) =
+                        self.agent_activity_flags_for(&session);
+                    serde_json::json!({
+                        "isResponding": is_responding,
+                        "isWaitingOnTool": is_waiting_on_tool,
+                        "isWaitingForOtherAgents": is_waiting_for_other_agents,
+                    })
+                }
+                Err(_) => serde_json::json!({
+                    "isResponding": false,
+                    "isWaitingOnTool": false,
+                    "isWaitingForOtherAgents": false,
+                }),
+            }
+        })
+    }
+
     fn agent_create(
         &self,
         workspace_id: WorkspaceId,

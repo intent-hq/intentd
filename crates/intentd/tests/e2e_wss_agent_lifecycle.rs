@@ -269,6 +269,32 @@ where
     }
 }
 
+/// Read one `subscription.push` notification from a connection (bounded). Used
+/// to read a channel's seq-0 snapshot after `chat.subscribe`.
+async fn wss_push<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let next = timeout(Duration::from_secs(secs), ws.next())
+            .await
+            .expect("wss push timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "subscription.push" {
+                    return v;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
 /// Mock-agent gate (parity with the UDS E2E suite).
 fn gate(test: &str) -> Option<String> {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -731,6 +757,168 @@ async fn agent_stop_keep_alive_resume_over_wss() {
         saw_resume_end,
         "resumed turn emits its own terminal stream:end"
     );
+}
+
+/// AUDIT-P1-3: the daemon-owned activity flags (`isResponding`/`isWaitingOnTool`/
+/// `isWaitingForOtherAgents`, PROTOCOL §5.5/§7.1) reflect a genuinely-active
+/// worker over the WSS wire. A `blockUntilCancel` agent parks mid-turn (a live
+/// worker draining a turn) so its `AgentLite` + chat snapshot report
+/// `isResponding: true`; a freshly-created idle agent reports every flag `false`.
+#[tokio::test]
+async fn agent_activity_flags_active_vs_idle_over_wss() {
+    let Some(script) = gate("WSS agent activity flags E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "blockUntilCancel": true, "response": "parked" }).to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // An idle agent: created but never prompted — no worker, no watches.
+    let idle = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Idle", "model": "mock:default" }),
+    )
+    .await;
+    let idle_id = idle["agent"]["id"].as_str().expect("idle id").to_string();
+
+    // An active worker: prompt the agent and let it park mid-turn.
+    let busy = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Busy", "model": "mock:default" }),
+    )
+    .await;
+    let busy_id = busy["agent"]["id"].as_str().expect("busy id").to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": busy_id, "content": "go" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Wait until the turn has streamed its chunk and parked — the worker is now
+    // genuinely in-flight.
+    let mut parked = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+            && frame["params"]["event"]["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streaming-before-cancel")
+        {
+            parked = true;
+            break;
+        }
+    }
+    assert!(parked, "busy agent streamed a chunk and parked mid-turn");
+
+    // agent.get: the active worker is responding (not waiting on a tool — the
+    // parked turn's only block is text — and parents no other agents).
+    let busy_lite = wss_rpc(&mut rpc, 13, "agent.get", json!({ "agentId": busy_id })).await;
+    let busy_lite = &busy_lite["agent"];
+    assert_eq!(busy_lite["isResponding"], true, "busy lite: {busy_lite}");
+    assert_eq!(
+        busy_lite["isWaitingOnTool"], false,
+        "busy lite: {busy_lite}"
+    );
+    assert_eq!(
+        busy_lite["isWaitingForOtherAgents"], false,
+        "busy lite: {busy_lite}"
+    );
+
+    // agent.get: the idle agent reports every flag false.
+    let idle_lite = wss_rpc(&mut rpc, 14, "agent.get", json!({ "agentId": idle_id })).await;
+    let idle_lite = &idle_lite["agent"];
+    assert_eq!(idle_lite["isResponding"], false, "idle lite: {idle_lite}");
+    assert_eq!(
+        idle_lite["isWaitingOnTool"], false,
+        "idle lite: {idle_lite}"
+    );
+    assert_eq!(
+        idle_lite["isWaitingForOtherAgents"], false,
+        "idle lite: {idle_lite}"
+    );
+
+    // agent.list carries the same per-agent flags.
+    let list = wss_rpc(&mut rpc, 15, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let agents = list["agents"].as_array().expect("agents array");
+    let busy_row = agents
+        .iter()
+        .find(|a| a["id"] == json!(busy_id))
+        .expect("busy in list");
+    let idle_row = agents
+        .iter()
+        .find(|a| a["id"] == json!(idle_id))
+        .expect("idle in list");
+    assert_eq!(busy_row["isResponding"], true, "busy row: {busy_row}");
+    assert_eq!(idle_row["isResponding"], false, "idle row: {idle_row}");
+
+    // chat.subscribe's seq-0 snapshot for the busy agent carries the flags too.
+    let chat = wss_rpc(
+        &mut rpc,
+        16,
+        "chat.subscribe",
+        json!({ "agentId": busy_id }),
+    )
+    .await;
+    assert!(
+        chat["subscriptionId"].is_string(),
+        "chat subscribed: {chat}"
+    );
+    let push = wss_push(&mut rpc, 15).await;
+    assert_eq!(push["params"]["kind"], "snapshot", "push: {push}");
+    assert_eq!(
+        push["params"]["snapshot"]["isResponding"], true,
+        "snapshot: {}",
+        push["params"]["snapshot"]
+    );
+
+    // Release the parked worker so the daemon tears down cleanly.
+    let stopped = wss_rpc(&mut rpc, 17, "agent.stop", json!({ "agentId": busy_id })).await;
+    assert_eq!(stopped["success"], true, "stop ok: {stopped}");
 }
 
 /// Pre-seed the daemon's SQLite store with a workspace + target note for the

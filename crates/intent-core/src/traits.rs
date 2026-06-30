@@ -637,6 +637,27 @@ pub trait WorkspaceApi: Send + Sync {
         false
     }
 
+    /// The daemon-owned runtime activity flags for `agent_id` as the object
+    /// `{ isResponding, isWaitingOnTool, isWaitingForOtherAgents }` (PROTOCOL
+    /// §5.5/§7.1): the BE-authoritative port of the FE agent-state selectors so
+    /// `chat.subscribe`'s seq-0 snapshot carries the same liveness signal as the
+    /// `AgentLite` projection. `isResponding` is the in-flight "active worker"
+    /// signal ([`agent_is_busy`](WorkspaceApi::agent_is_busy)); `isWaitingOnTool`
+    /// is true when that turn has an unresolved `tool_use`; `isWaitingForOtherAgents`
+    /// is true when the agent parents one or more pending completion watches.
+    /// Default returns all-`false` so non-agent `WorkspaceApi` impls need not
+    /// implement it.
+    fn agent_activity_flags(&self, agent_id: AgentId) -> BoxFuture<'_, serde_json::Value> {
+        let _ = agent_id;
+        Box::pin(async {
+            serde_json::json!({
+                "isResponding": false,
+                "isWaitingOnTool": false,
+                "isWaitingForOtherAgents": false,
+            })
+        })
+    }
+
     /// `agent.create`: persist a new agent session; returns `{ agent: { id, name } }`
     /// (the process spawns lazily on first turn) (PROTOCOL §5.5).
     ///
