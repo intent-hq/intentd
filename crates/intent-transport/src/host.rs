@@ -28,11 +28,12 @@ pub fn resolve_is_local(transport_local: bool, override_local: Option<bool>) -> 
 
 /// The `host.*` capability-probe methods, once classified. `Status` is the
 /// original host probe (§5.14); `CheckGit`/`ListDirectory`/`DirectoryStatus`/
-/// `CheckAuggie`/`FindBinary`/`ToolAvailability`/`Env` are additive
-/// host-services that let the FE delegate Git detection, repo-folder browsing,
-/// auggie-binary discovery, generic binary resolution, a batch tool-availability
-/// probe, and the daemon's PATH/environment to the daemon host (cross-transport,
-/// like the rest of `host.*`).
+/// `CheckAuggie`/`FindBinary`/`ToolAvailability`/`Env`/`FindApp`/
+/// `ListInstalledEditors` are additive host-services that let the FE delegate
+/// Git detection, repo-folder browsing, auggie-binary discovery, generic binary
+/// resolution, a batch tool-availability probe, the daemon's PATH/environment,
+/// macOS `.app` bundle lookup, and the cross-platform editor catalog to the
+/// daemon host (cross-transport, like the rest of `host.*`).
 pub(crate) enum HostMethod {
     Status,
     CheckGit,
@@ -42,6 +43,8 @@ pub(crate) enum HostMethod {
     FindBinary,
     ToolAvailability,
     Env,
+    FindApp,
+    ListInstalledEditors,
 }
 
 /// A classified `host.*` request awaiting handling by the connection task.
@@ -80,6 +83,8 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
         "host.findBinary" => HostMethod::FindBinary,
         "host.toolAvailability" => HostMethod::ToolAvailability,
         "host.env" => HostMethod::Env,
+        "host.findApp" => HostMethod::FindApp,
+        "host.listInstalledEditors" => HostMethod::ListInstalledEditors,
         _ => return None,
     };
     // `parsed.params || {}`: a non-object (absent/null/array/scalar) yields `{}`,
@@ -126,12 +131,13 @@ pub(crate) fn host_status_json(
 /// for a notification, which gets no reply). `is_local` is the resolved
 /// locality of the serving connection (§5.14). The host-services methods
 /// (`checkGit`/`listDirectory`/`directoryStatus`/`checkAuggie`/`findBinary`/
-/// `toolAvailability`/`env`) run their filesystem / subprocess work on a
-/// blocking thread so the async runtime stays free; `checkAuggie` consults
-/// `api.settings_get` for `context.auggiePath` and `providers.paths.auggie`
-/// before falling back to the canonical resolver in
-/// `intent_services::auggie_discovery`. `findBinary` requires a `name` param
-/// (`-32602` when absent); `env` is secret-safe (names only, no values).
+/// `toolAvailability`/`env`/`findApp`/`listInstalledEditors`) run their
+/// filesystem / subprocess work on a blocking thread so the async runtime stays
+/// free; `checkAuggie` consults `api.settings_get` for `context.auggiePath` and
+/// `providers.paths.auggie` before falling back to the canonical resolver in
+/// `intent_services::auggie_discovery`. `findBinary` / `findApp` require a
+/// `name` param (`-32602` when absent); `env` is secret-safe (names only, no
+/// values); `findApp` / `listInstalledEditors` return only app names + paths.
 pub(crate) async fn handle(
     req: HostRequest,
     api: &dyn WorkspaceApi,
@@ -248,6 +254,31 @@ pub(crate) async fn handle(
             let result = tokio::task::spawn_blocking(host_ops::env_probe)
                 .await
                 .unwrap_or_else(|_| json!({ "path": "", "pathEntries": [], "varNames": [] }));
+            success_frame(id_echo, result)
+        }
+        HostMethod::FindApp => {
+            let name = match params.get("name").and_then(Value::as_str) {
+                Some(n) if !n.is_empty() => n.to_string(),
+                _ => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(
+                        id_echo,
+                        -32602,
+                        "Missing required parameter: name",
+                    ));
+                }
+            };
+            let result = tokio::task::spawn_blocking(move || host_ops::find_app_op(&name))
+                .await
+                .unwrap_or_else(|_| json!({ "installed": false }));
+            success_frame(id_echo, result)
+        }
+        HostMethod::ListInstalledEditors => {
+            let result = tokio::task::spawn_blocking(host_ops::list_installed_editors_op)
+                .await
+                .unwrap_or_else(|_| json!({ "editors": [] }));
             success_frame(id_echo, result)
         }
     };

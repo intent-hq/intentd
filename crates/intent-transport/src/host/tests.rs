@@ -418,3 +418,67 @@ async fn handle_env_returns_path_and_var_names() {
     assert!(parsed["result"]["enhancedPath"].is_string());
     assert!(parsed["result"]["varNames"].is_array());
 }
+
+#[tokio::test]
+async fn handle_find_app_requires_name() {
+    let req =
+        classify(&json!({ "jsonrpc": "2.0", "id": 30, "method": "host.findApp", "params": {} }))
+            .unwrap();
+    let frame = handle(req, &NoopApi, true)
+        .await
+        .expect("missing name produces an error frame");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 30);
+    assert_eq!(parsed["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn handle_find_app_notification_gets_no_response() {
+    let req = classify(&json!({ "jsonrpc": "2.0", "method": "host.findApp" })).unwrap();
+    assert!(
+        handle(req, &NoopApi, true).await.is_none(),
+        "a missing-name notification gets no reply"
+    );
+}
+
+#[tokio::test]
+async fn handle_find_app_returns_installed_boolean() {
+    // The bogus name is safe (no traversal) but will not match a real `.app`
+    // bundle on any test host; the shape is what matters here.
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 31,
+        "method": "host.findApp",
+        "params": { "name": "DefinitelyNotInstalledXyzzy" }
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, true)
+        .await
+        .expect("findApp always replies");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 31);
+    assert!(
+        parsed["result"]["installed"].is_boolean(),
+        "installed always present"
+    );
+}
+
+#[tokio::test]
+async fn handle_list_installed_editors_returns_editor_array() {
+    let req =
+        classify(&json!({ "jsonrpc": "2.0", "id": 32, "method": "host.listInstalledEditors" }))
+            .unwrap();
+    let frame = handle(req, &NoopApi, true)
+        .await
+        .expect("listInstalledEditors always replies");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 32);
+    let editors = parsed["result"]["editors"]
+        .as_array()
+        .expect("editors array");
+    assert!(!editors.is_empty(), "default catalog is non-empty");
+    for entry in editors {
+        assert!(entry["id"].is_string(), "id always present");
+        assert!(entry["installed"].is_boolean(), "installed always present");
+    }
+}

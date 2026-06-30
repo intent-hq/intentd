@@ -1,10 +1,11 @@
-//! WSS end-to-end host-services (AUDIT-P2-1): drives the additive `host.*`
-//! detection methods — `host.findBinary`, `host.toolAvailability`, and
-//! `host.env` — over a real pinned-TLS WebSocket against a live `intentd serve
-//! --listen both`. These methods resolve binaries / PATH / environment on the
-//! daemon host so a remote client sees what actually lives where workspaces
-//! run; this suite proves the §5.14 wire contract end-to-end (HTTPS upgrade →
-//! JSON-RPC 2.0 over WebSocket → host fast-path → response).
+//! WSS end-to-end host-services (AUDIT-P2-1 / -P2-4): drives the additive
+//! `host.*` detection methods — `host.findBinary`, `host.toolAvailability`,
+//! `host.env`, `host.findApp`, and `host.listInstalledEditors` — over a real
+//! pinned-TLS WebSocket against a live `intentd serve --listen both`. These
+//! methods resolve binaries / PATH / environment / GUI apps on the daemon host
+//! so a remote client sees what actually lives where workspaces run; this
+//! suite proves the §5.14 wire contract end-to-end (HTTPS upgrade → JSON-RPC
+//! 2.0 over WebSocket → host fast-path → response).
 //!
 //! Unlike the agent-lifecycle suite, host-services need neither a workspace nor
 //! the mock ACP provider, so this test is self-contained and always runs.
@@ -358,4 +359,87 @@ async fn host_detection_services_over_wss() {
         !env.to_string().contains(TOKEN),
         "host.env must not leak secret env values"
     );
+}
+
+/// host.findApp / host.listInstalledEditors over the real WSS wire.
+#[tokio::test]
+async fn host_app_detection_services_over_wss() {
+    let (_daemon, port, cfg) = boot().await;
+    let mut ws = connect_ws(port, cfg).await;
+
+    // host.findApp requires a `name` — missing ⇒ -32602 (PROTOCOL §9).
+    {
+        let frame = json!({ "jsonrpc": "2.0", "id": 100, "method": "host.findApp", "params": {} });
+        ws.send(Message::Text(frame.to_string())).await.unwrap();
+        let err = loop {
+            let next = timeout(Duration::from_secs(15), ws.next())
+                .await
+                .expect("timed out")
+                .unwrap()
+                .unwrap();
+            if let Message::Text(t) = next {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["id"] == json!(100) {
+                    break v;
+                }
+            }
+        };
+        assert_eq!(err["error"]["code"], -32602, "missing name ⇒ -32602: {err}");
+    }
+
+    // host.findApp { name } ⇒ { installed, path?, source? }. A bogus but
+    // syntactically-safe name resolves to `installed:false` on every host.
+    let bogus = wss_rpc(
+        &mut ws,
+        101,
+        "host.findApp",
+        json!({ "name": "DefinitelyNotInstalledXyzzy" }),
+    )
+    .await;
+    assert!(
+        bogus["installed"].is_boolean(),
+        "installed always present: {bogus}"
+    );
+    assert_eq!(bogus["installed"], false, "bogus app is not installed");
+
+    // An unsafe name never errors — it resolves to installed:false.
+    let unsafe_name = wss_rpc(
+        &mut ws,
+        102,
+        "host.findApp",
+        json!({ "name": "../../etc/passwd" }),
+    )
+    .await;
+    assert_eq!(
+        unsafe_name["installed"], false,
+        "unsafe app name ⇒ uninstalled"
+    );
+
+    // host.listInstalledEditors ⇒ { editors: [{ id, installed, path?, source?,
+    // flatpakId? }] }. Always replies; every entry carries id + installed.
+    let editors_result = wss_rpc(&mut ws, 103, "host.listInstalledEditors", json!({})).await;
+    let editors = editors_result["editors"].as_array().expect("editors array");
+    assert!(!editors.is_empty(), "default catalog is non-empty");
+    let ids: std::collections::HashSet<&str> = editors
+        .iter()
+        .map(|e| e["id"].as_str().expect("id"))
+        .collect();
+    for expected in ["vscode", "cursor", "zed"] {
+        assert!(
+            ids.contains(expected),
+            "catalog includes {expected}: {editors_result}"
+        );
+    }
+    for entry in editors {
+        assert!(
+            entry["installed"].is_boolean(),
+            "installed boolean: {entry}"
+        );
+        if entry["installed"] == json!(true) {
+            assert!(
+                entry["source"].is_string(),
+                "installed entries carry a source: {entry}"
+            );
+        }
+    }
 }

@@ -385,3 +385,220 @@ fn env_probe_reports_path_entries_and_var_names() {
     assert!(v["enhancedPath"].is_string());
     assert!(v["varNames"].is_array());
 }
+
+/// Stub flatpak probe that returns a fixed set of installed app IDs (or `None`
+/// to model an unavailable flatpak install).
+struct StubFlatpak(Option<std::collections::HashSet<String>>);
+
+impl FlatpakProbe for StubFlatpak {
+    fn list_installed(&self) -> Option<std::collections::HashSet<String>> {
+        self.0.clone()
+    }
+}
+
+/// Stub binary resolver that resolves a fixed mapping of `name -> path`.
+struct MapResolver(std::collections::HashMap<&'static str, PathBuf>);
+
+impl BinaryResolver for MapResolver {
+    fn find(&self, name: &str) -> Option<PathBuf> {
+        self.0.get(name).cloned()
+    }
+}
+
+#[test]
+fn is_safe_app_name_accepts_spaces_and_rejects_traversal() {
+    assert!(is_safe_app_name("Visual Studio Code"));
+    assert!(is_safe_app_name("IntelliJ IDEA"));
+    assert!(is_safe_app_name("kitty"));
+    assert!(!is_safe_app_name(""));
+    assert!(!is_safe_app_name("../Finder"));
+    assert!(!is_safe_app_name(".hidden"));
+    assert!(!is_safe_app_name("foo/bar"));
+    assert!(!is_safe_app_name("foo\\bar"));
+    assert!(!is_safe_app_name("foo\0bar"));
+}
+
+#[test]
+fn find_macos_app_bundle_finds_first_existing_dir() {
+    let root = unique_temp_dir("find-app");
+    let apps = root.join("Applications");
+    std::fs::create_dir_all(apps.join("Cursor.app")).unwrap();
+    let user_apps = root.join("UserApplications");
+    std::fs::create_dir_all(&user_apps).unwrap();
+    let dirs = vec![user_apps, apps.clone()];
+    let found = find_macos_app_bundle("Cursor", &dirs).expect("Cursor.app resolves");
+    assert_eq!(found, apps.join("Cursor.app"));
+}
+
+#[test]
+fn find_macos_app_bundle_returns_none_when_missing() {
+    let root = unique_temp_dir("find-app-missing");
+    let apps = root.join("Applications");
+    std::fs::create_dir_all(&apps).unwrap();
+    let dirs = vec![apps];
+    assert!(find_macos_app_bundle("DoesNotExist", &dirs).is_none());
+}
+
+#[test]
+fn find_macos_app_bundle_rejects_unsafe_names() {
+    let root = unique_temp_dir("find-app-unsafe");
+    let apps = root.join("Applications");
+    std::fs::create_dir_all(&apps).unwrap();
+    assert!(find_macos_app_bundle("../escape", &[apps]).is_none());
+}
+
+#[test]
+fn find_app_with_returns_installed_with_source_on_macos() {
+    let root = unique_temp_dir("find-app-with");
+    let apps = root.join("Applications");
+    std::fs::create_dir_all(apps.join("Zed.app")).unwrap();
+    let v = find_app_with("Zed", &[apps.clone()], true);
+    assert_eq!(v["installed"], true);
+    assert_eq!(
+        v["path"],
+        apps.join("Zed.app").to_string_lossy().into_owned()
+    );
+    assert_eq!(v["source"], "macAppBundle");
+}
+
+#[test]
+fn find_app_with_returns_uninstalled_when_not_macos() {
+    let root = unique_temp_dir("find-app-not-mac");
+    let apps = root.join("Applications");
+    std::fs::create_dir_all(apps.join("Zed.app")).unwrap();
+    let v = find_app_with("Zed", &[apps], false);
+    assert_eq!(v["installed"], false);
+    assert!(v.get("path").is_none());
+}
+
+#[test]
+fn find_app_with_returns_uninstalled_for_unsafe_name() {
+    let root = unique_temp_dir("find-app-unsafe-name");
+    let apps = root.join("Applications");
+    std::fs::create_dir_all(&apps).unwrap();
+    let v = find_app_with("../../etc/passwd", &[apps], true);
+    assert_eq!(v["installed"], false);
+}
+
+#[test]
+fn list_installed_editors_with_detects_macos_app_bundles() {
+    let root = unique_temp_dir("list-mac");
+    let apps = root.join("Applications");
+    std::fs::create_dir_all(apps.join("Visual Studio Code.app")).unwrap();
+    std::fs::create_dir_all(apps.join("Cursor.app")).unwrap();
+    let v = list_installed_editors_with(
+        EditorPlatform::Macos,
+        &[apps.clone()],
+        &StubResolver(None),
+        &StubFlatpak(None),
+    );
+    let editors = v["editors"].as_array().expect("editors array");
+    let vscode = editors
+        .iter()
+        .find(|e| e["id"] == "vscode")
+        .expect("vscode entry");
+    assert_eq!(vscode["installed"], true);
+    assert_eq!(vscode["source"], "macAppBundle");
+    assert_eq!(
+        vscode["path"],
+        apps.join("Visual Studio Code.app")
+            .to_string_lossy()
+            .into_owned()
+    );
+    let cursor = editors
+        .iter()
+        .find(|e| e["id"] == "cursor")
+        .expect("cursor entry");
+    assert_eq!(cursor["installed"], true);
+    let zed = editors
+        .iter()
+        .find(|e| e["id"] == "zed")
+        .expect("zed entry");
+    assert_eq!(zed["installed"], false);
+}
+
+#[test]
+fn list_installed_editors_with_skips_windows_only_editors_on_macos() {
+    let root = unique_temp_dir("list-mac-skip-win");
+    let apps = root.join("Applications");
+    std::fs::create_dir_all(&apps).unwrap();
+    let v = list_installed_editors_with(
+        EditorPlatform::Macos,
+        &[apps],
+        &StubResolver(None),
+        &StubFlatpak(None),
+    );
+    let editors = v["editors"].as_array().unwrap();
+    assert!(
+        editors
+            .iter()
+            .all(|e| e["id"] != "powershell" && e["id"] != "windows-terminal"),
+        "windows-only editors are filtered out on macOS"
+    );
+    assert!(editors.iter().any(|e| e["id"] == "xcode"));
+}
+
+#[test]
+fn list_installed_editors_with_detects_linux_binary_then_flatpak() {
+    let resolver = MapResolver(
+        [("code", PathBuf::from("/usr/bin/code"))]
+            .into_iter()
+            .collect(),
+    );
+    let mut flatpak = std::collections::HashSet::new();
+    flatpak.insert("dev.zed.Zed".to_string());
+    let v = list_installed_editors_with(
+        EditorPlatform::Linux,
+        &[],
+        &resolver,
+        &StubFlatpak(Some(flatpak)),
+    );
+    let editors = v["editors"].as_array().unwrap();
+    let vscode = editors.iter().find(|e| e["id"] == "vscode").unwrap();
+    assert_eq!(vscode["installed"], true);
+    assert_eq!(vscode["source"], "binary");
+    assert_eq!(vscode["path"], "/usr/bin/code");
+    let zed = editors.iter().find(|e| e["id"] == "zed").unwrap();
+    assert_eq!(zed["installed"], true);
+    assert_eq!(zed["source"], "flatpak");
+    assert_eq!(zed["flatpakId"], "dev.zed.Zed");
+    // macOS-only editors are filtered out on Linux.
+    assert!(editors.iter().all(|e| e["id"] != "xcode"));
+    assert!(editors.iter().all(|e| e["id"] != "iterm"));
+}
+
+#[test]
+fn list_installed_editors_with_handles_missing_flatpak_on_linux() {
+    let v = list_installed_editors_with(
+        EditorPlatform::Linux,
+        &[],
+        &StubResolver(None),
+        &StubFlatpak(None),
+    );
+    let editors = v["editors"].as_array().unwrap();
+    for entry in editors {
+        assert_eq!(
+            entry["installed"], false,
+            "no binary + no flatpak ⇒ uninstalled: {entry}"
+        );
+    }
+}
+
+#[test]
+fn list_installed_editors_with_windows_uses_binary_resolver() {
+    let resolver = MapResolver(
+        [("code.cmd", PathBuf::from(r"C:\Program Files\Code\code.cmd"))]
+            .into_iter()
+            .collect(),
+    );
+    let v =
+        list_installed_editors_with(EditorPlatform::Windows, &[], &resolver, &StubFlatpak(None));
+    let editors = v["editors"].as_array().unwrap();
+    let vscode = editors.iter().find(|e| e["id"] == "vscode").unwrap();
+    assert_eq!(vscode["installed"], true);
+    assert_eq!(vscode["source"], "binary");
+    // macOS-only editors are filtered out on Windows.
+    assert!(editors.iter().all(|e| e["id"] != "xcode"));
+    // Windows-only editors are visible on Windows.
+    assert!(editors.iter().any(|e| e["id"] == "powershell"));
+}
