@@ -125,6 +125,13 @@ async function handlePrompt(id) {
   // In keep-alive mode, stamp the turn count so a resumed follow-up turn is
   // distinguishable from a fresh spawn (which would report `turn=1`).
   const text = behavior.blockUntilCancel ? `${base} turn=${promptCount}` : base;
+  // Optional per-turn delay (MS) so a test can set up queue state during the
+  // first turn before it resolves. Only applied to the FIRST turn so subsequent
+  // queue-drained turns proceed at full speed.
+  const delayMs = Number.isFinite(behavior.firstTurnDelayMs) ? behavior.firstTurnDelayMs : 0;
+  if (delayMs > 0 && promptCount === 1) {
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
   note('session/update', {
     sessionId: SESSION_ID,
     update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },

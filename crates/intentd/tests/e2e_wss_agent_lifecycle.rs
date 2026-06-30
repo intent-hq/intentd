@@ -1636,3 +1636,245 @@ async fn remove_queued_message_is_idempotent_over_wss() {
     .await;
     assert_eq!(r2["success"], json!(true));
 }
+
+// ---------------------------------------------------------------------------
+// Mixed-case drain with an under-edit message (PROTOCOL §5.5/§6.5 invariant):
+// when the queue contains ready-to-send messages alongside one marked
+// `editing: true`, the agent MUST drain the ready-to-send ones and must NOT
+// emit `agent:idle` until the under-edit entry is the only thing left.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
+    let Some(script) = gate("WSS mixed-case queue drain E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // First turn delays 1.2s so we have a deterministic setup window to enqueue
+    // + toggle editing + enqueue again while the agent is busy. Subsequent
+    // queue-drained turns proceed at full mock speed.
+    let behavior = json!({ "response": "drained ok", "firstTurnDelayMs": 1200 }).to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "QMixed", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    // Engage the agent in a slow first turn — the mock parks ~1.2s before
+    // replying — so the queue mutations below land while the worker is busy
+    // and don't race with the self-drain.
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "kick-off" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Enqueue msg_edit (agent busy → goes onto the queue, no self-drain race).
+    let q_edit = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.queueMessage",
+        json!({ "agentId": agent_id, "content": "under-edit-draft" }),
+    )
+    .await;
+    assert_eq!(q_edit["success"], true);
+    let edit_mid = q_edit["queuedMessage"]["id"].as_str().unwrap().to_string();
+
+    // Flip msg_edit to `editing: true` BEFORE the second enqueue, so the
+    // drain that fires when the kick-off turn ends sees it as under-edit.
+    let toggled = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.editQueuedMessage",
+        json!({
+            "agentId": agent_id,
+            "messageId": edit_mid,
+            "content": "under-edit-draft",
+            "editing": true,
+        }),
+    )
+    .await;
+    assert_eq!(toggled["success"], true);
+    assert_eq!(
+        toggled["queuedMessage"]["editing"], true,
+        "editing flag surfaced on the wire shape"
+    );
+
+    // Enqueue msg_drain — the ready-to-send entry the worker MUST drain.
+    let q_drain = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.queueMessage",
+        json!({ "agentId": agent_id, "content": "drain-me" }),
+    )
+    .await;
+    assert_eq!(q_drain["success"], true);
+
+    // Confirm the pre-drain queue snapshot: [msg_edit(editing), msg_drain].
+    let pre = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getQueue",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let pre_q = pre["queue"].as_array().expect("queue");
+    assert_eq!(pre_q.len(), 2, "queue mid-turn: {pre_q:?}");
+    assert_eq!(pre_q[0]["id"].as_str(), Some(edit_mid.as_str()));
+    assert_eq!(pre_q[0]["editing"], true);
+    assert_eq!(pre_q[1]["content"], "drain-me");
+    assert!(pre_q[1].get("editing").is_none());
+
+    // Collect events until we have observed TWO terminal `agent:stream:end`s:
+    //   1. kick-off turn ends (drain still has msg_drain ready → idle SUPPRESSED)
+    //   2. msg_drain turn ends (only msg_edit(editing) remains → idle FIRES)
+    // The single `agent:idle` for this agent MUST appear AFTER the second
+    // stream:end — never between the two (PROTOCOL §5.5/§6.5 invariant).
+    let mut stream_ends = 0usize;
+    let mut idles_before_drain_done = 0usize;
+    let mut idle_after_drain_done = 0usize;
+    let mut saw_drain_done = false;
+    for _ in 0..240 {
+        let frame = wss_event(&mut sub, 30).await;
+        let evt = &frame["params"]["event"];
+        let agent_match = evt["data"]["agentId"].as_str() == Some(agent_id.as_str());
+        match evt["type"].as_str() {
+            Some("agent:idle") if agent_match => {
+                if saw_drain_done {
+                    idle_after_drain_done += 1;
+                } else {
+                    idles_before_drain_done += 1;
+                }
+            }
+            Some("agent:stream:end") if agent_match => {
+                stream_ends += 1;
+                if stream_ends >= 2 {
+                    saw_drain_done = true;
+                }
+            }
+            _ => {}
+        }
+        if saw_drain_done && idle_after_drain_done >= 1 {
+            break;
+        }
+    }
+    assert!(
+        stream_ends >= 2,
+        "kick-off + msg_drain both reached terminal stream:end (saw {stream_ends})",
+    );
+    assert_eq!(
+        idles_before_drain_done, 0,
+        "agent:idle MUST be suppressed while a ready-to-send message exists; \
+         only the under-edit entry is allowed to remain mid-drain",
+    );
+    assert_eq!(
+        idle_after_drain_done, 1,
+        "agent:idle fires exactly once when the queue is editing-only",
+    );
+
+    // Post-drain snapshot: only the under-edit entry remains.
+    let mid = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.getQueue",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let mid_q = mid["queue"].as_array().expect("queue");
+    assert_eq!(mid_q.len(), 1, "under-edit entry alone: {mid_q:?}");
+    assert_eq!(mid_q[0]["id"].as_str(), Some(edit_mid.as_str()));
+    assert_eq!(mid_q[0]["editing"], true);
+
+    // Clearing the editing flag (FE "save edit" path) re-includes the entry in
+    // the ready-to-send queue and self-drains — final terminal stream:end +
+    // a fresh agent:idle (queue now genuinely empty).
+    let saved = wss_rpc(
+        &mut rpc,
+        17,
+        "agent.editQueuedMessage",
+        json!({
+            "agentId": agent_id,
+            "messageId": edit_mid,
+            "content": "saved-edit",
+            "editing": false,
+        }),
+    )
+    .await;
+    assert_eq!(saved["success"], true);
+
+    let mut saw_save_end = false;
+    let mut saw_save_idle = false;
+    for _ in 0..240 {
+        let frame = wss_event(&mut sub, 30).await;
+        let evt = &frame["params"]["event"];
+        let agent_match = evt["data"]["agentId"].as_str() == Some(agent_id.as_str());
+        match evt["type"].as_str() {
+            Some("agent:idle") if agent_match => saw_save_idle = true,
+            Some("agent:stream:end") if agent_match => saw_save_end = true,
+            _ => {}
+        }
+        if saw_save_end && saw_save_idle {
+            break;
+        }
+    }
+    assert!(
+        saw_save_end,
+        "saved edit self-drained to a terminal agent:stream:end",
+    );
+    assert!(
+        saw_save_idle,
+        "agent:idle fires once the ready-to-send queue is truly empty",
+    );
+
+    let final_q = wss_rpc(
+        &mut rpc,
+        18,
+        "agent.getQueue",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        final_q["queue"].as_array().unwrap().is_empty(),
+        "queue is empty post-save-drain",
+    );
+}

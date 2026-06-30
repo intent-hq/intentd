@@ -1232,12 +1232,21 @@ impl AgentManager {
         if self.is_busy(&agent_id) {
             return;
         }
+        // Only claim the in-flight slot when at least one ready-to-send (not
+        // under edit) message is waiting — an editing-only queue must stay
+        // idle (PROTOCOL §5.5/§6.5 invariant: idle is permitted iff every
+        // remaining queued item has `editing = true`).
+        if !self.services.has_ready_to_send(&agent_id) {
+            return;
+        }
         if !self.try_begin(&agent_id, &workspace_id).await {
             return;
         }
         let next = match self.services.dequeue_message(&agent_id) {
             Some(msg) => msg,
             None => {
+                // Raced with another mutation (e.g. remove) that emptied the
+                // ready-to-send queue between the check above and the dequeue.
                 self.end_turn(&agent_id).await;
                 return;
             }

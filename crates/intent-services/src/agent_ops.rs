@@ -34,19 +34,27 @@ use crate::Services;
 mod tests;
 
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
+///
+/// `editing` marks the entry as "under edit" — excluded from the **ready-to-send**
+/// queue so the drain skips it (PROTOCOL §5.5/§6.5). The agent may go idle only
+/// when every remaining queued entry has `editing == true`; setting `editing`
+/// back to `false` re-includes the message and self-drains.
 #[derive(Debug, Clone)]
 pub(crate) struct QueuedMessage {
     pub id: String,
     pub content: String,
     pub image_blocks: Option<Value>,
     pub queued_at: String,
+    pub editing: bool,
 }
 
 impl QueuedMessage {
     /// The camelCase wire shape for `agent.getQueue` / queue results, matching the
     /// TS `QueuedMessage` and the iOS decoder (`{id, content, queuedAt, position,
-    /// imageBlocks?}`). `position` is the entry's 0-based index in the queue (0 =
-    /// next to be sent) and is supplied by the caller since it is positional.
+    /// imageBlocks?, editing?}`). `position` is the entry's 0-based index in the
+    /// queue (0 = next to be sent) and is supplied by the caller since it is
+    /// positional. `editing` is only present when `true` (a client that hasn't
+    /// migrated still sees the legacy shape unchanged).
     pub(crate) fn to_value(&self, position: usize) -> Value {
         let mut v = json!({
             "id": self.id,
@@ -56,6 +64,9 @@ impl QueuedMessage {
         });
         if let Some(blocks) = &self.image_blocks {
             v["imageBlocks"] = blocks.clone();
+        }
+        if self.editing {
+            v["editing"] = Value::Bool(true);
         }
         v
     }
@@ -536,17 +547,26 @@ impl Services {
         Ok(json!({ "success": true, "queue": queue }))
     }
 
-    /// `agent.editQueuedMessage` (PROTOCOL §5.5). Edits in place (matching the
-    /// reference's `handleEditQueuedMessage`) and publishes `agent:queue:updated`.
-    /// Returns `Internal` when the message id is unknown — only `removeQueuedMessage`
-    /// is idempotent.
+    /// `agent.editQueuedMessage` (PROTOCOL §5.5). Updates the entry's content
+    /// in place (matching the reference's `handleEditQueuedMessage`) and, when
+    /// the optional `editing` flag is provided, transitions the entry between
+    /// "ready-to-send" (`editing = false`) and "under edit" (`editing = true`).
+    /// Publishes `agent:queue:updated` with the post-edit snapshot. Returns
+    /// `Internal` when the message id is unknown — only `removeQueuedMessage` is
+    /// idempotent.
+    ///
+    /// When an entry transitions `editing: true → false` (the FE finished
+    /// editing) we additionally fire `try_drain_queue` so the message
+    /// self-drains as if it had just been enqueued — honouring the user's
+    /// "re-queued on save, which self-drains" semantics (PROTOCOL §5.5/§6.5).
     pub(crate) async fn agent_edit_queued_message_op(
         &self,
         agent_id: AgentId,
         message_id: String,
         content: String,
+        editing: Option<bool>,
     ) -> Result<Value> {
-        let edited = {
+        let (edited, was_editing, now_editing) = {
             let mut guard = self
                 .agent_queues
                 .lock()
@@ -558,10 +578,25 @@ impl Services {
                 .iter()
                 .position(|m| m.id == message_id)
                 .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
+            let was = queue[position].editing;
             queue[position].content = content;
-            queue[position].to_value(position)
+            if let Some(flag) = editing {
+                queue[position].editing = flag;
+            }
+            let now = queue[position].editing;
+            (queue[position].to_value(position), was, now)
         };
         self.publish_queue_updated(&agent_id).await;
+        // editing: true → false ⇒ the message is now ready-to-send. Self-drain.
+        if was_editing && !now_editing {
+            if let Some(manager) = self.agent_manager() {
+                if let Ok(session) = self.store.get_agent_session(&agent_id).await {
+                    manager
+                        .try_drain_queue(agent_id, session.workspace_id)
+                        .await;
+                }
+            }
+        }
         Ok(json!({ "success": true, "queuedMessage": edited }))
     }
 
@@ -1381,7 +1416,9 @@ impl Services {
     }
 
     /// Push a message onto an agent's in-memory queue and return it together with
-    /// its 0-based `position` in the queue (the index just appended).
+    /// its 0-based `position` in the queue (the index just appended). New messages
+    /// are always ready-to-send (`editing = false`) — the FE may transition an
+    /// entry to `editing = true` later via `agent.editQueuedMessage`.
     pub(crate) fn enqueue_message(
         &self,
         agent_id: &AgentId,
@@ -1393,6 +1430,7 @@ impl Services {
             content,
             image_blocks,
             queued_at: now_iso(),
+            editing: false,
         };
         let mut guard = self
             .agent_queues
@@ -1404,20 +1442,19 @@ impl Services {
         (queued, position)
     }
 
-    /// Pop the oldest queued message for an agent (FIFO), if any. Used by the
-    /// runtime turn loop to flip a queued message to in-flight when the current
-    /// turn ends.
+    /// Pop the oldest **ready-to-send** queued message for an agent, if any. Used
+    /// by the runtime turn loop to flip a queued message to in-flight when the
+    /// current turn ends. Entries with `editing = true` are skipped (left in
+    /// place) so the agent stays idle only when *every* remaining entry is under
+    /// edit (PROTOCOL §5.5/§6.5 invariant).
     pub(crate) fn dequeue_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
         let mut guard = self
             .agent_queues
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
-        if queue.is_empty() {
-            None
-        } else {
-            Some(queue.remove(0))
-        }
+        let idx = queue.iter().position(|m| !m.editing)?;
+        Some(queue.remove(idx))
     }
 
     /// Re-insert a message at the front of an agent's queue (used when a
@@ -1429,6 +1466,19 @@ impl Services {
             .entry(agent_id.clone())
             .or_default()
             .insert(0, message);
+    }
+
+    /// `true` iff the agent has at least one queued message that is **not**
+    /// under edit (i.e. the "ready-to-send" queue is non-empty). Drives the
+    /// self-drain trigger and gates `agent:idle` emission so the agent never
+    /// reports idle while ready-to-send work remains (PROTOCOL §5.5/§6.5).
+    pub(crate) fn has_ready_to_send(&self, agent_id: &AgentId) -> bool {
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .map(|q| q.iter().any(|m| !m.editing))
+            .unwrap_or(false)
     }
 
     /// Drop all queued messages for an agent (used by `agent.forceMessage`,

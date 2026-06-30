@@ -536,7 +536,7 @@ async fn queue_lifecycle_add_get_edit_remove() {
     assert!(q["queue"][0]["queuedAt"].is_string());
 
     let edited = svc
-        .agent_edit_queued_message_op(id.clone(), mid.clone(), "edited".into())
+        .agent_edit_queued_message_op(id.clone(), mid.clone(), "edited".into(), None)
         .await
         .expect("edit");
     assert_eq!(edited["queuedMessage"]["position"], 0);
@@ -555,7 +555,7 @@ async fn edit_missing_queued_message_errors() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Q").await;
     let err = svc
-        .agent_edit_queued_message_op(id, "nope".into(), "x".into())
+        .agent_edit_queued_message_op(id, "nope".into(), "x".into(), None)
         .await
         .expect_err("missing");
     assert!(matches!(err, Error::Internal(_)));
@@ -665,6 +665,112 @@ async fn remove_queued_message_emits_queue_updated_only_when_present() {
         .expect("queue:updated emitted on real remove");
     assert_eq!(evt.data["agentId"].as_str(), Some(id.0.as_str()));
     assert!(evt.data["queue"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn editing_flag_excludes_message_from_dequeue() {
+    // PROTOCOL §5.5/§6.5 invariant: a queued entry with `editing = true` is
+    // excluded from the ready-to-send queue. `dequeue_message` must skip past
+    // it and surface a later ready-to-send entry; with only-editing entries
+    // remaining, `dequeue_message` returns `None` and `has_ready_to_send` is
+    // false (so the agent is allowed to go idle).
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Q").await;
+
+    let a = svc
+        .agent_queue_message_op(id.clone(), "first".into(), None)
+        .await
+        .expect("queue first");
+    let a_mid = a["queuedMessage"]["id"].as_str().unwrap().to_string();
+    let b = svc
+        .agent_queue_message_op(id.clone(), "second".into(), None)
+        .await
+        .expect("queue second");
+    let b_mid = b["queuedMessage"]["id"].as_str().unwrap().to_string();
+
+    // Mark the FIRST entry as under edit.
+    let edited = svc
+        .agent_edit_queued_message_op(id.clone(), a_mid.clone(), "first".into(), Some(true))
+        .await
+        .expect("mark editing");
+    assert_eq!(
+        edited["queuedMessage"]["editing"], true,
+        "editing flag surfaced on the wire shape"
+    );
+    assert!(svc.has_ready_to_send(&id), "second is still ready-to-send");
+
+    // Dequeue must skip the under-edit head and surface the second entry.
+    let next = svc
+        .dequeue_message(&id)
+        .expect("dequeues non-editing entry");
+    assert_eq!(next.id, b_mid, "dequeue skipped the editing entry");
+
+    // With only the under-edit entry remaining, the agent has nothing ready-to-send.
+    assert!(
+        !svc.has_ready_to_send(&id),
+        "editing-only queue is treated as empty for the idle invariant",
+    );
+    assert!(
+        svc.dequeue_message(&id).is_none(),
+        "dequeue returns None for an editing-only queue",
+    );
+
+    // Snapshot still carries the under-edit entry (so the FE can render it).
+    let q = svc.queue_snapshot(&id);
+    assert_eq!(q.len(), 1);
+    assert_eq!(q[0]["id"].as_str(), Some(a_mid.as_str()));
+    assert_eq!(q[0]["editing"], true);
+}
+
+#[tokio::test]
+async fn clearing_editing_flag_emits_queue_updated() {
+    // Toggling `editing` via `editQueuedMessage` must publish
+    // `agent:queue:updated` carrying the post-edit snapshot, regardless of
+    // whether the content actually changed.
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Q").await;
+    let added = svc
+        .agent_queue_message_op(id.clone(), "draft".into(), None)
+        .await
+        .expect("queue");
+    let mid = added["queuedMessage"]["id"].as_str().unwrap().to_string();
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    // editing: false → true
+    svc.agent_edit_queued_message_op(id.clone(), mid.clone(), "draft".into(), Some(true))
+        .await
+        .expect("mark editing");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    let evt = batch
+        .iter()
+        .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
+        .expect("queue:updated emitted on editing: true");
+    assert_eq!(evt.data["queue"][0]["editing"], true);
+
+    // editing: true → false (save) — must emit again with the cleared flag.
+    svc.agent_edit_queued_message_op(id.clone(), mid.clone(), "saved".into(), Some(false))
+        .await
+        .expect("save edit");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    let evt = batch
+        .iter()
+        .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
+        .expect("queue:updated emitted on editing: false");
+    assert_eq!(evt.data["queue"][0]["content"], "saved");
+    assert!(
+        evt.data["queue"][0].get("editing").is_none(),
+        "editing flag omitted from the wire shape when false",
+    );
 }
 
 #[tokio::test]

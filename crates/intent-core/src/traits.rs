@@ -746,13 +746,18 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.editQueuedMessage`: edit a queued message's content (PROTOCOL §5.5).
+    /// `editing` (optional) toggles the entry's under-edit state — when `Some(true)`
+    /// the entry is excluded from the ready-to-send queue (drain skips it); when
+    /// `Some(false)` it is re-included and self-drains; when `None` the editing
+    /// flag is left unchanged (backwards-compatible with the original wire shape).
     fn agent_edit_queued_message(
         &self,
         agent_id: AgentId,
         message_id: String,
         content: String,
+        editing: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, message_id, content);
+        let _ = (agent_id, message_id, content, editing);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_edit_queued_message not implemented".to_string(),

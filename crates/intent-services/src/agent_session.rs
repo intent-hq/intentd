@@ -488,8 +488,14 @@ impl Services {
         // this worker before the turn resolves and emits only `stream:end` — so
         // `agent:idle` is suppressed for interrupted agents (mirrors the TS
         // `emitAgentIdleEvent` interrupt suppression).
+        //
+        // PROTOCOL §5.5/§6.5 invariant: `agent:idle` is **also** suppressed
+        // while the agent has at least one ready-to-send queued message — the
+        // drain loop is about to flip the next message to in-flight, so the
+        // agent is not actually idle. A queue containing only under-edit
+        // messages (`editing = true`) is treated as empty for this check.
         match &result {
-            Ok(stop_reason) => {
+            Ok(stop_reason) if !self.has_ready_to_send(agent_id) => {
                 let mut data = json!({
                     "agentId": agent_id.0,
                     "reason": "stream_complete",
@@ -501,6 +507,16 @@ impl Services {
                 }
                 self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
                     .await;
+            }
+            Ok(_) => {
+                // Ready-to-send messages remain — stay busy and skip the idle
+                // signal so the FE/auto-commit do not key off a transient
+                // mid-drain "idle" snapshot. The terminal `agent:idle` will
+                // fire when the queue is truly drained.
+                tracing::debug!(
+                    agent = %agent_id,
+                    "agent:idle suppressed — ready-to-send queue non-empty",
+                );
             }
             Err(e) => {
                 self.publish_agent_event(

@@ -5457,9 +5457,10 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         message_id: String,
         content: String,
+        editing: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_edit_queued_message_op(agent_id, message_id, content)
+            self.agent_edit_queued_message_op(agent_id, message_id, content, editing)
                 .await
         })
     }
