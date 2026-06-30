@@ -607,24 +607,59 @@ impl ScriptManager {
     }
 
     /// Build the [`SpawnSpec`] for a run: login shell + `-c command`, workspace
-    /// scope, and the FORCE_COLOR/TERM + script env overlay.
+    /// scope, and the FORCE_COLOR/TERM + enhanced-PATH + script env overlay,
+    /// with `npm_config_prefix` scrubbed so nvm's login-shell init succeeds.
     fn build_spec(&self, ws: &WorkspaceId, def: &Script, cwd: &Option<PathBuf>) -> SpawnSpec {
         let shell = default_shell();
         let mut spec = SpawnSpec::new(ws.as_str(), shell.clone());
         spec.args = shell_args(&shell, &def.command);
         spec.cwd = cwd.clone();
-        let mut env = vec![
-            ("FORCE_COLOR".to_string(), "1".to_string()),
-            ("TERM".to_string(), "xterm-256color".to_string()),
-        ];
-        if let Some(map) = &def.env {
-            for (k, v) in map {
-                env.push((k.clone(), v.clone()));
-            }
-        }
-        spec.env = env;
+        spec.env = spawn_env_overlay(def.env.as_ref());
+        spec.env_remove = SCRUBBED_ENV_VARS.iter().map(|s| s.to_string()).collect();
         spec
     }
+}
+
+/// Environment variables removed from daemon-spawned shells. `npm_config_prefix`
+/// (set by the app's launcher) makes nvm abort its `~/.zshrc` init, which breaks
+/// the wrapped git/node tools agents rely on; the overlay can only add keys, so
+/// this is applied via `SpawnSpec::env_remove` at the PTY spawn site.
+const SCRUBBED_ENV_VARS: &[&str] = &["npm_config_prefix"];
+
+/// Build the env overlay for a spawned script/agent shell: FORCE_COLOR/TERM, an
+/// enhanced PATH (essential system dirs + homebrew + node/version-manager dirs),
+/// then the script's own `env` last so it can override. The enhanced PATH keeps
+/// git/node resolvable even when the daemon inherited a sparse Finder/launchd
+/// PATH or the login-shell init is degraded.
+fn spawn_env_overlay(
+    def_env: Option<&std::collections::BTreeMap<String, String>>,
+) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("FORCE_COLOR".to_string(), "1".to_string()),
+        ("TERM".to_string(), "xterm-256color".to_string()),
+    ];
+    if let Some(path) = enhanced_shell_path() {
+        env.push(("PATH".to_string(), path));
+    }
+    if let Some(map) = def_env {
+        for (k, v) in map {
+            env.push((k.clone(), v.clone()));
+        }
+    }
+    env
+}
+
+/// The enhanced PATH for a spawned shell, reusing the canonical de-duplicated,
+/// order-preserving dir list (current PATH first, then essential system dirs and
+/// node/version-manager locations). Returns `None` when no dirs resolve.
+fn enhanced_shell_path() -> Option<String> {
+    let dirs = crate::auggie_discovery::enhanced_path_dirs();
+    if dirs.is_empty() {
+        return None;
+    }
+    std::env::join_paths(dirs)
+        .ok()
+        .map(|joined| joined.to_string_lossy().into_owned())
 }
 
 /// The login shell to run scripts under (`$SHELL`, then `/bin/sh`).
@@ -792,5 +827,696 @@ fn script_event(workspace_id: &WorkspaceId, event_type: &str, data: Value) -> Ne
         parent_event_id: None,
         metadata: None,
         data,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use intent_core::{
+        now_iso, ScriptCreateParams, ScriptMode, ScriptStatus, Workspace, WorkspaceActivity,
+        WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    };
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use super::*;
+    use crate::events::{EventBus, Subscription, SubscriptionFilter};
+    use crate::Services;
+
+    // ---- pure-helper tests (no PTY, no event bus) --------------------------
+
+    #[test]
+    fn clamp_line_count_clamps_extremes_and_uses_fallback() {
+        assert_eq!(clamp_line_count(None, 100), 100);
+        assert_eq!(clamp_line_count(Some(0), 50), 1);
+        assert_eq!(clamp_line_count(Some(-5), 50), 1);
+        assert_eq!(clamp_line_count(Some(99_999), 50), 10_000);
+        assert_eq!(clamp_line_count(Some(42), 50), 42);
+    }
+
+    #[test]
+    fn last_n_lines_returns_verbatim_when_short_enough() {
+        assert_eq!(last_n_lines("a\nb\nc", 5), "a\nb\nc");
+        assert_eq!(last_n_lines("a\nb\nc", 3), "a\nb\nc");
+    }
+
+    #[test]
+    fn last_n_lines_keeps_trailing_n_when_longer() {
+        assert_eq!(last_n_lines("a\nb\nc\nd\ne", 2), "d\ne");
+        assert_eq!(last_n_lines("a\nb\nc\nd\ne", 1), "e");
+    }
+
+    #[test]
+    fn is_safe_relative_accepts_subpath_rejects_absolute_and_parent() {
+        assert!(is_safe_relative("src/main.rs"));
+        assert!(is_safe_relative("a/b/c"));
+        assert!(!is_safe_relative("/etc/passwd"));
+        assert!(!is_safe_relative("../escape"));
+        assert!(!is_safe_relative("a/../b"));
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_and_osc_sequences() {
+        assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m text"), "red text");
+        assert_eq!(strip_ansi("\u{1b}]0;title\u{07}body"), "body");
+        assert_eq!(strip_ansi("plain"), "plain");
+        // Lone ESC trailer (no follow-up) is dropped without panic.
+        assert_eq!(strip_ansi("ok\u{1b}"), "ok");
+    }
+
+    #[test]
+    fn find_local_url_matches_http_and_https_with_port_and_path() {
+        assert_eq!(
+            find_local_url("listening on http://localhost:3000/").as_deref(),
+            Some("http://localhost:3000/")
+        );
+        assert_eq!(
+            find_local_url("ready: https://127.0.0.1:8443/api?x=1").as_deref(),
+            Some("https://127.0.0.1:8443/api?x=1")
+        );
+        assert_eq!(
+            find_local_url("dev http://localhost:5173 done").as_deref(),
+            Some("http://localhost:5173")
+        );
+    }
+
+    #[test]
+    fn find_local_url_ignores_non_local_or_portless() {
+        assert!(find_local_url("https://example.com:443/").is_none());
+        assert!(find_local_url("http://localhost/no-port").is_none());
+        assert!(find_local_url("nothing here").is_none());
+    }
+
+    #[test]
+    fn find_local_url_terminates_path_on_whitespace_and_punctuation() {
+        assert_eq!(
+            find_local_url("see (http://localhost:3000/x) for").as_deref(),
+            Some("http://localhost:3000/x")
+        );
+        assert_eq!(
+            find_local_url("\"http://localhost:3000/y\" said it").as_deref(),
+            Some("http://localhost:3000/y")
+        );
+    }
+
+    #[test]
+    fn match_local_url_rejects_unsupported_schemes_and_hosts() {
+        assert!(match_local_url("ftp://localhost:3000/").is_none());
+        assert!(match_local_url("http://example.com:3000/").is_none());
+        assert!(match_local_url("http://localhost").is_none());
+    }
+
+    #[test]
+    fn with_runtime_attaches_runtime_field() {
+        let def = Script {
+            id: "s1".into(),
+            workspace_id: "ws".into(),
+            name: "n".into(),
+            command: "echo".into(),
+            cwd: None,
+            env: None,
+            mode: ScriptMode::Command,
+            category: None,
+            source: "user".into(),
+            auto_start: None,
+            created_at: "t".into(),
+            updated_at: None,
+        };
+        let state = ScriptRuntimeState {
+            status: ScriptStatus::Running,
+            restart_count: 2,
+            ..Default::default()
+        };
+        let merged = with_runtime(&def, &state);
+        assert_eq!(merged["id"], "s1");
+        assert_eq!(merged["runtime"]["status"], "running");
+        assert_eq!(merged["runtime"]["restartCount"], 2);
+    }
+
+    #[test]
+    fn shell_args_uses_dash_c_for_sh_and_login_for_bash_zsh() {
+        assert_eq!(shell_args("/bin/sh", "echo hi"), vec!["-c", "echo hi"]);
+        assert_eq!(
+            shell_args("/bin/bash", "echo hi"),
+            vec!["-l", "-c", "echo hi"]
+        );
+        assert_eq!(
+            shell_args("/opt/homebrew/bin/zsh", "echo hi"),
+            vec!["-l", "-c", "echo hi"]
+        );
+        // Unknown shell base falls through the login-shell default arm.
+        assert_eq!(shell_args("/bin/fish", "x"), vec!["-l", "-c", "x"]);
+    }
+
+    #[test]
+    fn spawn_overlay_strips_npm_config_prefix_and_enhances_path() {
+        // npm_config_prefix is scrubbed via env_remove, not present as an overlay key.
+        assert!(SCRUBBED_ENV_VARS.contains(&"npm_config_prefix"));
+        let env = spawn_env_overlay(None);
+        assert!(!env.iter().any(|(k, _)| k == "npm_config_prefix"));
+
+        // The enhanced PATH overlay includes the essential system dirs + homebrew.
+        let path = env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .expect("PATH overlay present");
+        let dirs: Vec<&str> = path.split(if cfg!(windows) { ';' } else { ':' }).collect();
+        assert!(dirs.contains(&"/usr/bin"), "PATH missing /usr/bin: {path}");
+        assert!(
+            dirs.contains(&"/opt/homebrew/bin"),
+            "PATH missing /opt/homebrew/bin: {path}"
+        );
+    }
+
+    #[test]
+    fn spawn_overlay_appends_script_env_last() {
+        let mut def_env = std::collections::BTreeMap::new();
+        def_env.insert("MY_VAR".to_string(), "1".to_string());
+        let env = spawn_env_overlay(Some(&def_env));
+        assert_eq!(env.last(), Some(&("MY_VAR".to_string(), "1".to_string())));
+    }
+
+    #[test]
+    fn script_event_carries_workspace_actor_and_type() {
+        let ws = WorkspaceId::from("ws-evt");
+        let ev = script_event(&ws, "script:state", json!({ "scriptId": "s" }));
+        assert_eq!(ev.workspace_id.as_str(), "ws-evt");
+        assert_eq!(ev.event_type, "script:state");
+        assert_eq!(ev.data["scriptId"], "s");
+        assert_eq!(ev.actor.id.as_deref(), Some("system"));
+    }
+
+    #[test]
+    fn default_shell_falls_back_when_env_unset() {
+        // SAFETY: tests run with cargo-set $SHELL; we just check the function
+        // returns *something* non-empty (env or "/bin/sh" fallback).
+        let s = default_shell();
+        assert!(!s.is_empty());
+    }
+
+    // ---- ScriptManager lifecycle / error-path tests ------------------------
+
+    struct TempDb {
+        path: PathBuf,
+    }
+
+    impl TempDb {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("intentd-scriptops-{}.db", uuid::Uuid::new_v4()));
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ =
+                    std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
+            }
+        }
+    }
+
+    struct WorktreeDir(PathBuf);
+    impl WorktreeDir {
+        fn new() -> Self {
+            let p =
+                std::env::temp_dir().join(format!("intentd-scriptops-wt-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&p).expect("mkdir worktree");
+            Self(p)
+        }
+    }
+    impl Drop for WorktreeDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn workspace(id: &WorkspaceId, worktree: Option<&PathBuf>) -> Workspace {
+        let ts = now_iso();
+        Workspace {
+            id: id.clone(),
+            title: "WS".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: worktree.map(|p| p.display().to_string()),
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+        }
+    }
+
+    struct Harness {
+        _tmp: TempDb,
+        services: Services,
+        bus: EventBus,
+        ws: WorkspaceId,
+        _worktree: Option<WorktreeDir>,
+    }
+
+    async fn harness() -> Harness {
+        harness_with_worktree(false).await
+    }
+
+    async fn harness_with_worktree(with_worktree: bool) -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let worktree = if with_worktree {
+            Some(WorktreeDir::new())
+        } else {
+            None
+        };
+        store
+            .insert_workspace(&workspace(&ws, worktree.as_ref().map(|w| &w.0)))
+            .await
+            .expect("ws");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store).with_event_bus(bus.clone());
+        Harness {
+            _tmp: tmp,
+            services,
+            bus,
+            ws,
+            _worktree: worktree,
+        }
+    }
+
+    fn subscribe(h: &Harness) -> Subscription {
+        h.bus.subscribe(SubscriptionFilter {
+            event_types: vec!["script:*".to_string()],
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        })
+    }
+
+    async fn create(h: &Harness, params: ScriptCreateParams) -> String {
+        let v = h
+            .services
+            .script_create(h.ws.clone(), params)
+            .await
+            .expect("create");
+        v["id"].as_str().expect("script id").to_string()
+    }
+
+    async fn create_simple(h: &Harness, name: &str, command: &str, mode: ScriptMode) -> String {
+        create(
+            h,
+            ScriptCreateParams {
+                name: name.to_string(),
+                command: command.to_string(),
+                mode,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn await_state<F>(sub: &mut Subscription, timeout: Duration, mut pred: F) -> Value
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let batch = tokio::time::timeout(remaining, sub.recv())
+                .await
+                .expect("event delivered before deadline")
+                .expect("subscription open");
+            for ev in &batch {
+                let v = serde_json::to_value(ev).expect("serialize");
+                if v["type"] == "script:state" && pred(&v) {
+                    return v;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn script_status_returns_not_found_for_missing_id() {
+        let h = harness().await;
+        let err = h.services.script_status("nope".into()).await.unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn script_remove_returns_not_found_for_missing_id() {
+        let h = harness().await;
+        let err = h.services.script_remove("nope".into()).await.unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn script_start_returns_not_found_for_missing_id() {
+        let h = harness().await;
+        let err = h.services.script_start("nope".into()).await.unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn script_stop_returns_not_found_for_missing_id() {
+        let h = harness().await;
+        let err = h.services.script_stop("nope".into()).await.unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn script_output_returns_not_found_for_missing_id() {
+        let h = harness().await;
+        let err = h
+            .services
+            .script_output("nope".into(), None, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn script_run_returns_not_found_for_missing_id() {
+        let h = harness().await;
+        let err = h
+            .services
+            .script_run("nope".into(), None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn script_create_preserves_explicit_script_id() {
+        let h = harness().await;
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "named".into(),
+                command: "echo".into(),
+                mode: ScriptMode::Command,
+                script_id: Some("custom-id".into()),
+                auto_start: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(id, "custom-id");
+        let listed = h.services.script_list(h.ws.clone()).await.expect("list");
+        let entry = listed["scripts"]
+            .as_array()
+            .expect("scripts array")
+            .iter()
+            .find(|s| s["id"] == "custom-id")
+            .expect("custom-id in list");
+        assert_eq!(entry["autoStart"], true);
+        assert_eq!(entry["source"], "user");
+        assert_eq!(entry["runtime"]["status"], "idle");
+    }
+
+    #[tokio::test]
+    async fn script_create_empty_script_id_falls_back_to_uuid() {
+        let h = harness().await;
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "n".into(),
+                command: "echo".into(),
+                mode: ScriptMode::Command,
+                script_id: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(!id.is_empty());
+        assert_eq!(id.split('-').count(), 5, "id should be a uuid: {id}");
+    }
+
+    #[tokio::test]
+    async fn script_list_is_workspace_scoped() {
+        let h = harness().await;
+        let _a = create_simple(&h, "a", "echo a", ScriptMode::Command).await;
+        let _b = create_simple(&h, "b", "echo b", ScriptMode::Command).await;
+        let other_ws = WorkspaceId::new();
+        h.services
+            .store()
+            .insert_workspace(&workspace(&other_ws, None))
+            .await
+            .expect("foreign ws");
+        let _foreign = h
+            .services
+            .script_create(
+                other_ws.clone(),
+                ScriptCreateParams {
+                    name: "foreign".into(),
+                    command: "echo".into(),
+                    mode: ScriptMode::Command,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("foreign create");
+        let listed = h.services.script_list(h.ws.clone()).await.expect("list");
+        let scripts = listed["scripts"].as_array().expect("scripts array");
+        let mut names: Vec<&str> = scripts.iter().filter_map(|s| s["name"].as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a", "b"], "workspace-scoped");
+    }
+
+    #[tokio::test]
+    async fn script_start_is_noop_when_already_running() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", "sleep 5", ScriptMode::Service).await;
+        h.services.script_start(id.clone()).await.expect("start");
+        await_state(&mut sub, Duration::from_secs(5), |v| {
+            v["data"]["status"] == "running"
+        })
+        .await;
+        // Second start while already running is a no-op (returns Ok, no extra `running` event).
+        let v = h
+            .services
+            .script_start(id.clone())
+            .await
+            .expect("noop start");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["scriptId"], id);
+        // Drain a short window — there must be no SECOND `running` state transition.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, sub.recv()).await {
+                Err(_) => break,
+                Ok(None) => break,
+                Ok(Some(batch)) => {
+                    for ev in &batch {
+                        let v = serde_json::to_value(ev).expect("serialize");
+                        if v["type"] == "script:state" && v["data"]["status"] == "running" {
+                            panic!("redundant start re-emitted `running`: {v}");
+                        }
+                    }
+                }
+            }
+        }
+        h.services.script_stop(id).await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn script_stop_on_idle_keeps_idle_state() {
+        let h = harness().await;
+        let id = create_simple(&h, "idle", "echo nope", ScriptMode::Command).await;
+        let v = h.services.script_stop(id.clone()).await.expect("stop");
+        assert_eq!(v["ok"], true);
+        let st = h.services.script_status(id).await.expect("status");
+        assert_eq!(st["status"], "idle");
+    }
+
+    #[tokio::test]
+    async fn script_restart_returns_ok_and_emits_running() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", "sleep 5", ScriptMode::Service).await;
+        h.services.script_start(id.clone()).await.expect("start");
+        await_state(&mut sub, Duration::from_secs(5), |v| {
+            v["data"]["status"] == "running"
+        })
+        .await;
+        let v = h
+            .services
+            .script_restart(id.clone())
+            .await
+            .expect("restart");
+        assert_eq!(v["ok"], true);
+        await_state(&mut sub, Duration::from_secs(5), |v| {
+            v["data"]["status"] == "running"
+        })
+        .await;
+        let st = h.services.script_status(id.clone()).await.expect("status");
+        assert_eq!(st["restartCount"], 0);
+        assert_eq!(st["status"], "running");
+        h.services.script_stop(id).await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn script_run_service_mode_returns_warning_envelope() {
+        let h = harness().await;
+        let id = create_simple(&h, "svc", "sleep 5", ScriptMode::Service).await;
+        let out = h
+            .services
+            .script_run(id, None, None)
+            .await
+            .expect("run service");
+        assert_eq!(out["output"], "");
+        assert!(
+            out["warning"]
+                .as_str()
+                .unwrap_or("")
+                .contains("script.start"),
+            "warning directs caller to script.start: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn script_run_with_timeout_marks_timed_out() {
+        let h = harness().await;
+        let id = create_simple(&h, "long", "sleep 10", ScriptMode::Command).await;
+        let out = h.services.script_run(id, None, Some(1)).await.expect("run");
+        assert_eq!(out["timedOut"], true);
+    }
+
+    #[tokio::test]
+    async fn script_run_max_lines_truncates_captured_output() {
+        let h = harness().await;
+        let id = create_simple(
+            &h,
+            "many",
+            "for i in 1 2 3 4 5 ; do echo line-$i ; done",
+            ScriptMode::Command,
+        )
+        .await;
+        let out = h
+            .services
+            .script_run(id, Some(2), Some(10))
+            .await
+            .expect("run");
+        let text = out["output"].as_str().unwrap_or("");
+        assert!(text.contains("line-5"), "output: {text:?}");
+        assert!(!text.contains("line-1"), "output: {text:?}");
+    }
+
+    #[tokio::test]
+    async fn script_output_paginated_returns_items_envelope() {
+        let h = harness().await;
+        let id = create_simple(&h, "echo", "echo hello-pag", ScriptMode::Command).await;
+        h.services
+            .script_run(id.clone(), None, Some(10))
+            .await
+            .expect("run");
+        let out = h
+            .services
+            .script_output(id, Some(50), Some(true), None)
+            .await
+            .expect("output");
+        assert!(out.get("items").is_some(), "envelope shape: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn script_output_truncated_header_shows_last_n_of_m() {
+        let h = harness().await;
+        let id = create_simple(
+            &h,
+            "many",
+            "for i in 1 2 3 4 5 6 7 ; do echo line-$i ; done",
+            ScriptMode::Command,
+        )
+        .await;
+        h.services
+            .script_run(id.clone(), None, Some(10))
+            .await
+            .expect("run");
+        let out = h
+            .services
+            .script_output(id, Some(2), None, None)
+            .await
+            .expect("output");
+        let text = out.as_str().expect("string");
+        assert!(
+            text.starts_with("[showing last 2 of "),
+            "truncation header: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn script_remove_kills_running_pty_and_drops_definition() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", "sleep 30", ScriptMode::Service).await;
+        h.services.script_start(id.clone()).await.expect("start");
+        await_state(&mut sub, Duration::from_secs(5), |v| {
+            v["data"]["status"] == "running"
+        })
+        .await;
+        let res = h.services.script_remove(id.clone()).await.expect("remove");
+        assert_eq!(res["ok"], true);
+        let err = h.services.script_status(id).await.unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn supervise_records_cwd_escape_error_via_fail_path() {
+        let h = harness_with_worktree(true).await;
+        let mut sub = subscribe(&h);
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "bad-cwd".into(),
+                command: "echo never".into(),
+                mode: ScriptMode::Service,
+                cwd: Some("../escape".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        h.services.script_start(id.clone()).await.expect("start");
+        let ev = await_state(&mut sub, Duration::from_secs(5), |v| {
+            v["data"]["status"] == "exited" && v["data"].get("error").is_some()
+        })
+        .await;
+        let err = ev["data"]["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("escapes workspace root"),
+            "fail() error surfaces cwd escape: {err:?}"
+        );
+        let st = h.services.script_status(id).await.expect("status");
+        assert_eq!(st["status"], "exited");
+        assert_eq!(st["error"], err);
     }
 }

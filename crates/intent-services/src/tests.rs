@@ -5244,6 +5244,12 @@ mod script {
 
     /// A service that exits faster than the 2s floor is treated as a config error
     /// and is NOT auto-restarted (the ported backoff guard).
+    ///
+    /// Deterministic against scheduling jitter: after observing `exited`, keep
+    /// draining `script:state` events across a window that comfortably exceeds
+    /// `AUTO_RESTART_DELAY` and assert no second `running` arrives. A spurious
+    /// restart shows up as an event (failure with a clear message) rather than
+    /// hiding behind a wall-clock poll.
     #[tokio::test]
     async fn service_too_fast_exit_does_not_restart() {
         let h = harness().await;
@@ -5254,8 +5260,29 @@ mod script {
             (v["type"] == "script:state" && v["data"]["status"] == "exited").then_some(())
         })
         .await;
-        // Past the restart delay it must stay exited, with no restart attempts.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // Observation window > AUTO_RESTART_DELAY (1s) so any restart attempt
+        // emits a `running` `script:state` we'd catch deterministically.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(3000);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, sub.recv()).await {
+                Err(_) => break,
+                Ok(None) => break,
+                Ok(Some(batch)) => {
+                    for ev in &batch {
+                        let v = serde_json::to_value(ev).expect("serialize");
+                        if v["type"] == "script:state" && v["data"]["status"] == "running" {
+                            panic!(
+                                "too-fast-exit service must NOT auto-restart; saw second `running` script:state: {v}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let st = h.services.script_status(id).await.expect("status");
         assert_eq!(st["status"], "exited");
         assert_eq!(st["restartCount"], 0);
