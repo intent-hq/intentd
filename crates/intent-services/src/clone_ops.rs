@@ -30,6 +30,11 @@ use crate::system_actor;
 /// so a stalled child never wedges the daemon.
 const CLONE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Grace period between SIGTERM and SIGKILL when reaping a timed-out clone,
+/// mirroring `host_exec`'s TERM_GRACE so the whole process group (git-remote-
+/// https / git-fetch-pack / git-index-pack) settles before we escalate.
+const TERM_GRACE: Duration = Duration::from_millis(500);
+
 /// Preserved from the reference `cloneWithProgress`: skip LFS smudge during
 /// checkout so a missing/unreachable LFS object does not fail the clone. The
 /// caller can invoke `git lfs pull` after the clone succeeds.
@@ -230,8 +235,7 @@ async fn run_clone(job: CloneJob) {
             .await;
         }
         Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            reap_child_group(&mut child).await;
             publish(
                 &bus,
                 &ws,
@@ -240,6 +244,36 @@ async fn run_clone(job: CloneJob) {
             .await;
         }
     }
+}
+
+/// Reap a timed-out clone's whole process group: SIGTERM → grace → SIGKILL,
+/// then `wait()` to drain the zombie. Mirrors `host_exec::run`'s group-reap so
+/// git's helper subprocesses (`git-remote-https`, `git-fetch-pack`,
+/// `git-index-pack`, and any LFS helpers) cannot survive a clone timeout.
+async fn reap_child_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            kill_group(pid, nix::sys::signal::Signal::SIGTERM);
+            tokio::time::sleep(TERM_GRACE).await;
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                kill_group(pid, nix::sys::signal::Signal::SIGKILL);
+            }
+            let _ = child.wait().await;
+            return;
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+/// Signal a whole process group by its leader pid (pgid == pid via
+/// `process_group(0)` at spawn). Mirrors `host_exec::kill_group`.
+#[cfg(unix)]
+fn kill_group(pid: u32, sig: nix::sys::signal::Signal) {
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+    let _ = killpg(Pid::from_raw(pid as i32), sig);
 }
 
 /// Parse `git clone --progress` stderr line-by-line and publish one
@@ -502,5 +536,59 @@ mod tests {
         let ch = parse_progress("Checking out files: 100% (1/1), done.");
         assert_eq!(ch[0].0, "checkout");
         assert_eq!(ch[0].1, 100);
+    }
+
+    /// Spawn a shell that forks a `sleep 30` grandchild in the same process
+    /// group, then reap the parent — the grandchild pid must be gone after the
+    /// reap. This mirrors what happens on a `git clone` timeout: git spawns
+    /// helpers (`git-remote-https`, `git-fetch-pack`, `git-index-pack`) that we
+    /// need to reap alongside the direct child. Using `killpg` (via
+    /// `reap_child_group`) is what makes that possible; a bare `start_kill()`
+    /// on the direct child would leave the grandchild orphaned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reap_child_group_kills_grandchildren() {
+        use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
+        use tokio::process::Command;
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & echo $! ; wait")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn sh");
+
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut byte = [0u8; 1];
+            loop {
+                let n = stdout.read(&mut byte).await.unwrap_or(0);
+                if n == 0 || byte[0] == b'\n' {
+                    break;
+                }
+                line.push(byte[0] as char);
+            }
+        })
+        .await
+        .expect("read grandchild pid");
+        let grandchild_pid: i32 = line.trim().parse().expect("parse grandchild pid");
+
+        reap_child_group(&mut child).await;
+
+        // Give the kernel a moment to deliver signals and reap zombies. The
+        // grandchild is not our direct child, so it stays until init reaps it;
+        // `kill(pid, 0)` returns ESRCH once the pid is gone.
+        for _ in 0..20 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(grandchild_pid), None).is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("grandchild pid {grandchild_pid} still alive after group-reap");
     }
 }
