@@ -45,6 +45,7 @@ pub(crate) enum HostMethod {
     Env,
     FindApp,
     ListInstalledEditors,
+    Exec,
 }
 
 /// A classified `host.*` request awaiting handling by the connection task.
@@ -85,6 +86,7 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
         "host.env" => HostMethod::Env,
         "host.findApp" => HostMethod::FindApp,
         "host.listInstalledEditors" => HostMethod::ListInstalledEditors,
+        "host.exec" => HostMethod::Exec,
         _ => return None,
     };
     // `parsed.params || {}`: a non-object (absent/null/array/scalar) yields `{}`,
@@ -281,6 +283,21 @@ pub(crate) async fn handle(
                 .unwrap_or_else(|_| json!({ "editors": [] }));
             success_frame(id_echo, result)
         }
+        HostMethod::Exec => {
+            let parsed = match intent_services::host_exec::parse_args(&params) {
+                Ok(a) => a,
+                Err(e) => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(id_echo, e.code, &e.message));
+                }
+            };
+            match intent_services::host_exec::run_default(api, parsed).await {
+                Ok(v) => success_frame(id_echo, v),
+                Err(e) => error_frame(id_echo, e.code, &e.message),
+            }
+        }
     };
     if !id_present {
         return None;
@@ -401,7 +418,7 @@ impl fmt::Display for OpenExternalError {
 
 impl std::error::Error for OpenExternalError {}
 
-/// Open `url` on the *user's* machine (§12.4). When the connection is local the
+/// Open `url` on the *user's* machine (§5.14). When the connection is local the
 /// daemon resolves it directly via `opener`; if the local host is headless
 /// (`has_display=false`) this is a clear headless warning instead of a silent
 /// failure. When the connection is remote the intent is dispatched to the
@@ -436,6 +453,333 @@ pub async fn open_external(
         .await
         .map(|_| ())
         .map_err(|e| OpenExternalError::Proxy(e.message))
+}
+
+/// Where the editor should open. Line/column are 1-based hints (best-effort in
+/// the local launch path; forwarded verbatim on the reverse RPC).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorTarget {
+    pub path: String,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+}
+
+/// Resolved detection metadata for a known editor entry, mirroring the
+/// per-entry payload emitted by `host.listInstalledEditors`. Consumed by
+/// [`EditorLauncher::launch`] so the launcher can pick the right spawn strategy
+/// (native binary vs macOS `.app` bundle vs flatpak) without re-doing the
+/// resolution work.
+#[derive(Debug, Clone)]
+pub struct ResolvedEditor {
+    pub id: String,
+    pub installed: bool,
+    pub path: Option<String>,
+    pub source: Option<String>,
+    pub flatpak_id: Option<String>,
+}
+
+impl ResolvedEditor {
+    /// Locate `editor_id` in the `host.listInstalledEditors` payload. Returns
+    /// `None` when the id is unknown to the current platform's catalog.
+    pub fn from_editors_payload(editor_id: &str, payload: &Value) -> Option<Self> {
+        let entries = payload.get("editors")?.as_array()?;
+        entries
+            .iter()
+            .find(|e| e.get("id").and_then(Value::as_str) == Some(editor_id))
+            .map(|e| ResolvedEditor {
+                id: editor_id.to_string(),
+                installed: e.get("installed").and_then(Value::as_bool).unwrap_or(false),
+                path: e.get("path").and_then(Value::as_str).map(str::to_string),
+                source: e.get("source").and_then(Value::as_str).map(str::to_string),
+                flatpak_id: e
+                    .get("flatpakId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+    }
+}
+
+/// Launch a resolved editor on the daemon host with the requested target.
+/// Injected so the local path is unit-testable without spawning a real editor.
+pub trait EditorLauncher: Send + Sync {
+    /// Launch `editor` on `target`. Returns a descriptive error when the
+    /// platform launch cannot be spawned.
+    fn launch(&self, editor: &ResolvedEditor, target: &EditorTarget) -> Result<(), String>;
+}
+
+/// Default editor launcher: mirrors [`OsOpener`], spawning the resolved editor
+/// detached from this process's stdio. The launcher picks the right invocation
+/// per `source`: a native binary path, a macOS `.app` bundle via `open -a`, or
+/// a flatpak application id via `flatpak run`. Line/column are best-effort and
+/// only honored for editors that accept a `--goto <file>:<line>[:<col>]` arg;
+/// unknown editors receive just the target path.
+pub struct OsEditorLauncher;
+
+impl EditorLauncher for OsEditorLauncher {
+    fn launch(&self, editor: &ResolvedEditor, target: &EditorTarget) -> Result<(), String> {
+        if !editor.installed {
+            return Err(format!("editor '{}' is not installed", editor.id));
+        }
+        let goto_id = matches!(editor.id.as_str(), "vscode" | "cursor");
+        let mut cmd = if let Some(flatpak_id) = editor.flatpak_id.as_deref() {
+            let mut c = std::process::Command::new("flatpak");
+            c.args(["run", flatpak_id]);
+            append_editor_args(&mut c, goto_id, target);
+            c
+        } else if editor.source.as_deref() == Some("macAppBundle") {
+            let app_path = editor
+                .path
+                .as_deref()
+                .ok_or_else(|| format!("editor '{}' is missing an app bundle path", editor.id))?;
+            let mut c = std::process::Command::new("open");
+            c.args(["-a", app_path, &target.path]);
+            c
+        } else {
+            let bin = editor
+                .path
+                .as_deref()
+                .ok_or_else(|| format!("editor '{}' is missing a launch path", editor.id))?;
+            let mut c = std::process::Command::new(bin);
+            append_editor_args(&mut c, goto_id, target);
+            c
+        };
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        cmd.spawn()
+            .map(|_| ())
+            .map_err(|e| format!("open in editor failed: {e}"))
+    }
+}
+
+/// Append editor-specific target args. When `goto` is set (VS Code / Cursor)
+/// and a line hint is present, use `--goto path:line[:col]`; otherwise pass the
+/// target path verbatim.
+fn append_editor_args(cmd: &mut std::process::Command, goto: bool, target: &EditorTarget) {
+    if goto {
+        if let Some(line) = target.line {
+            let mut spec = format!("{}:{}", target.path, line);
+            if let Some(col) = target.column {
+                spec.push_str(&format!(":{col}"));
+            }
+            cmd.args(["--goto", &spec]);
+            return;
+        }
+    }
+    cmd.arg(&target.path);
+}
+
+/// Why an [`open_in_editor`] call could not be satisfied. `code()` maps each to
+/// a standard JSON-RPC error code (PROTOCOL §9: no custom codes — server-side
+/// conditions are `-32602`/`-32603` with a descriptive message).
+#[derive(Debug)]
+pub enum OpenInEditorError {
+    /// `editorId` / `path` was missing or empty, or the editor id is unknown to
+    /// the current platform's `host.listInstalledEditors` catalog.
+    InvalidParams(String),
+    /// The editor is known but not installed on the daemon host (`installed:false`).
+    NotInstalled(String),
+    /// `hasDisplay=false` on the daemon host and the launch needs a display.
+    Headless(String),
+    /// The host launcher failed (the local path).
+    Launcher(String),
+    /// The FE-served reverse RPC failed / timed out (the remote path).
+    Proxy(String),
+}
+
+impl OpenInEditorError {
+    /// JSON-RPC 2.0 numeric error code for this condition (PROTOCOL §9).
+    pub fn code(&self) -> i32 {
+        match self {
+            OpenInEditorError::InvalidParams(_) => -32602,
+            OpenInEditorError::NotInstalled(_)
+            | OpenInEditorError::Headless(_)
+            | OpenInEditorError::Launcher(_)
+            | OpenInEditorError::Proxy(_) => -32603,
+        }
+    }
+}
+
+impl fmt::Display for OpenInEditorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpenInEditorError::InvalidParams(m)
+            | OpenInEditorError::NotInstalled(m)
+            | OpenInEditorError::Headless(m)
+            | OpenInEditorError::Launcher(m)
+            | OpenInEditorError::Proxy(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for OpenInEditorError {}
+
+/// Open `path` in `editor_id` on the *user's* machine (§5.14). On a local
+/// connection the daemon resolves the editor against the current platform's
+/// `host.listInstalledEditors` catalog (`editors` — the raw payload from
+/// [`host_ops::list_installed_editors_op`]) and launches it directly via
+/// `launcher`; a headless local host returns a clear warning instead of a
+/// silent failure. On a remote connection the intent is dispatched to the
+/// connected frontend as an FE-served reverse RPC (`host.openInEditor`) so the
+/// editor opens on the user's laptop (mirroring `host.openExternal`).
+#[allow(clippy::too_many_arguments)]
+pub async fn open_in_editor(
+    editor_id: &str,
+    path: &str,
+    line: Option<u32>,
+    column: Option<u32>,
+    is_local: bool,
+    has_display: bool,
+    editors: &Value,
+    launcher: &dyn EditorLauncher,
+    reverse: &ReverseChannel,
+) -> Result<(), OpenInEditorError> {
+    if editor_id.is_empty() {
+        return Err(OpenInEditorError::InvalidParams(
+            "Missing required parameter: editorId".to_string(),
+        ));
+    }
+    if path.is_empty() {
+        return Err(OpenInEditorError::InvalidParams(
+            "Missing required parameter: path".to_string(),
+        ));
+    }
+    if is_local {
+        if !has_display {
+            return Err(OpenInEditorError::Headless(format!(
+                "host is headless (hasDisplay=false); cannot launch '{editor_id}' on the daemon host — connect a client with a display"
+            )));
+        }
+        let resolved =
+            ResolvedEditor::from_editors_payload(editor_id, editors).ok_or_else(|| {
+                OpenInEditorError::InvalidParams(format!("unknown editorId: {editor_id}"))
+            })?;
+        if !resolved.installed {
+            return Err(OpenInEditorError::NotInstalled(format!(
+                "editor '{editor_id}' is not installed on the daemon host"
+            )));
+        }
+        let target = EditorTarget {
+            path: path.to_string(),
+            line,
+            column,
+        };
+        return launcher
+            .launch(&resolved, &target)
+            .map_err(OpenInEditorError::Launcher);
+    }
+    let mut params = Map::new();
+    params.insert("editorId".to_string(), json!(editor_id));
+    params.insert("path".to_string(), json!(path));
+    if let Some(l) = line {
+        params.insert("line".to_string(), json!(l));
+    }
+    if let Some(c) = column {
+        params.insert("column".to_string(), json!(c));
+    }
+    reverse
+        .request(
+            "host.openInEditor",
+            Value::Object(params),
+            DEFAULT_REVERSE_TIMEOUT,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| OpenInEditorError::Proxy(e.message))
+}
+
+/// Present an "open with…" application chooser for `path` to the user.
+/// Injected so the local path is unit-testable without launching a real OS
+/// chooser dialog.
+pub trait AppPicker: Send + Sync {
+    /// Prompt the user for the application to open `path` with. Returns
+    /// `Ok(Some(applicationId))` on selection, `Ok(None)` when the user
+    /// cancelled / the daemon host has no local chooser, or `Err(message)`
+    /// when the picker itself failed.
+    fn pick(&self, path: &str) -> Result<Option<String>, String>;
+}
+
+/// Default local app picker: returns `Ok(None)` because the daemon has no
+/// display-less way to present an "open with…" dialog. On a local connection
+/// with a display, callers can inject a native picker; otherwise clients
+/// gate the UI on `host.status.hasDisplay` and let the FE-served reverse RPC
+/// (`host.pickApplication`) present the chooser on the user's machine.
+pub struct NoopAppPicker;
+
+impl AppPicker for NoopAppPicker {
+    fn pick(&self, _path: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+}
+
+/// Why a [`pick_application`] call could not be satisfied. `code()` maps each
+/// to a standard JSON-RPC error code (PROTOCOL §9).
+#[derive(Debug)]
+pub enum PickApplicationError {
+    /// `path` was missing or empty.
+    InvalidPath(String),
+    /// The host picker failed (the local path).
+    Picker(String),
+    /// The FE-served reverse RPC failed / timed out (the remote path).
+    Proxy(String),
+}
+
+impl PickApplicationError {
+    /// JSON-RPC 2.0 numeric error code for this condition (PROTOCOL §9).
+    pub fn code(&self) -> i32 {
+        match self {
+            PickApplicationError::InvalidPath(_) => -32602,
+            PickApplicationError::Picker(_) | PickApplicationError::Proxy(_) => -32603,
+        }
+    }
+}
+
+impl fmt::Display for PickApplicationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PickApplicationError::InvalidPath(m)
+            | PickApplicationError::Picker(m)
+            | PickApplicationError::Proxy(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for PickApplicationError {}
+
+/// Present the "open with…" chooser for `path` on the *user's* machine
+/// (§5.14). On a local connection the daemon invokes `picker` directly; the
+/// default [`NoopAppPicker`] returns `Ok(None)` because a display-less daemon
+/// cannot show a native chooser. On a remote connection the intent is
+/// dispatched to the connected frontend as an FE-served reverse RPC
+/// (`host.pickApplication`) so the chooser appears on the user's laptop; the
+/// client's `{ applicationId? }` reply is echoed back verbatim.
+pub async fn pick_application(
+    path: &str,
+    is_local: bool,
+    picker: &dyn AppPicker,
+    reverse: &ReverseChannel,
+) -> Result<Option<String>, PickApplicationError> {
+    if path.is_empty() {
+        return Err(PickApplicationError::InvalidPath(
+            "Missing required parameter: path".to_string(),
+        ));
+    }
+    if is_local {
+        return picker.pick(path).map_err(PickApplicationError::Picker);
+    }
+    let result = reverse
+        .request(
+            "host.pickApplication",
+            json!({ "path": path }),
+            DEFAULT_REVERSE_TIMEOUT,
+        )
+        .await
+        .map_err(|e| PickApplicationError::Proxy(e.message))?;
+    let app_id = result
+        .get("applicationId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok(app_id)
 }
 
 #[cfg(test)]
