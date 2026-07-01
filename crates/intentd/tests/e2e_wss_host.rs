@@ -443,3 +443,180 @@ async fn host_app_detection_services_over_wss() {
         }
     }
 }
+
+/// Seed one workspace with a filesystem root so `host.exec` can enforce the
+/// within-workspace containment guard on `cwd`. Returns `(workspace_id, root)`.
+async fn seed_workspace_with_path(data_dir: &Path, root: &Path) -> String {
+    use intent_core::{
+        now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    };
+    use intent_store::Store;
+    let db_path = data_dir.join("intentd.db");
+    let store = Store::open(&db_path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    let ts = now_iso();
+    let ws = Workspace {
+        id: ws_id.clone(),
+        title: "WSS-HOST-EXEC".to_string(),
+        branch: "main".to_string(),
+        base_ref: None,
+        base_commit_sha: None,
+        status: WorkspaceStatus::Active,
+        status_message: None,
+        activity: WorkspaceActivity::Idle,
+        attention: WorkspaceAttention::None,
+        created_at: ts.clone(),
+        updated_at: ts,
+        last_activity: None,
+        tags: vec![],
+        path: Some(root.to_string_lossy().into_owned()),
+        repository_path: None,
+        repository_owner: None,
+        repository_name: None,
+        worktree_path: Some(root.to_string_lossy().into_owned()),
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
+        archived: false,
+        archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
+        token_usage: None,
+    };
+    store.insert_workspace(&ws).await.expect("insert ws");
+    ws_id.0
+}
+
+/// Read the id-matched error frame after sending `frame`.
+async fn wss_expect_error<S>(ws: &mut WebSocketStream<S>, id: i64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let next = timeout(Duration::from_secs(15), ws.next())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        if let Message::Text(t) = next {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == json!(id) {
+                return v;
+            }
+        }
+    }
+}
+
+/// host.exec: happy-path round-trip + timeout + cwd-outside-workspace rejection.
+#[tokio::test]
+async fn host_exec_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    // Real filesystem root the daemon can `cd` into; kept alive until the
+    // daemon drops (its `Drop` removes the whole data dir; the workspace root
+    // is a sibling temp dir, cleaned up here).
+    let root = std::env::temp_dir().join(format!("itd-wss-exec-root-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&root).expect("mkdir workspace root");
+    let ws_id = seed_workspace_with_path(&daemon.data_dir, &root).await;
+    let mut ws = connect_ws(port, cfg).await;
+
+    // 1) Happy path — echo returns stdout + exitCode 0 without cwd validation.
+    let out = wss_rpc(
+        &mut ws,
+        200,
+        "host.exec",
+        json!({ "command": "echo", "args": ["hello", "world"], "timeoutMs": 5000 }),
+    )
+    .await;
+    assert_eq!(out["exitCode"], 0, "exitCode 0: {out}");
+    assert_eq!(
+        out["stdout"].as_str().unwrap().trim(),
+        "hello world",
+        "stdout carries argv payload: {out}"
+    );
+    assert!(
+        out.get("timedOut").is_none(),
+        "no timedOut on the happy path: {out}"
+    );
+
+    // 2) cwd inside the workspace succeeds — /bin/sh -c is intentionally NOT
+    // used; the daemon spawns argv only. `pwd` prints the resolved cwd.
+    let inside = wss_rpc(
+        &mut ws,
+        201,
+        "host.exec",
+        json!({
+            "command": "pwd",
+            "cwd": ".",
+            "workspaceId": ws_id,
+            "timeoutMs": 5000,
+        }),
+    )
+    .await;
+    assert_eq!(inside["exitCode"], 0, "cwd inside ⇒ ok: {inside}");
+    let printed = inside["stdout"].as_str().unwrap().trim();
+    // macOS `/tmp` resolves through a `/private` symlink; the daemon's lexical
+    // guard operates on the resolved path so we accept either prefix here.
+    let canonical = std::fs::canonicalize(&root)
+        .unwrap_or_else(|_| root.clone())
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        printed == root.to_string_lossy() || printed == canonical,
+        "pwd prints the workspace root ({} or {}): {printed}",
+        root.display(),
+        canonical
+    );
+
+    // 3) cwd OUTSIDE the workspace ⇒ -32603 with a clear containment message.
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 202, "method": "host.exec",
+        "params": {
+            "command": "pwd",
+            "cwd": "/etc",
+            "workspaceId": ws_id,
+            "timeoutMs": 5000,
+        }
+    });
+    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    let err = wss_expect_error(&mut ws, 202).await;
+    assert_eq!(err["error"]["code"], -32603, "cwd outside ⇒ -32603: {err}");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cwd outside workspace"),
+        "clear containment message: {err}"
+    );
+
+    // 4) Timeout ⇒ result carries `timedOut: true` and the child is reaped
+    // (SIGTERM → grace → SIGKILL on unix). Use `sleep 30` capped at 500ms.
+    let timed_out = wss_rpc(
+        &mut ws,
+        203,
+        "host.exec",
+        json!({ "command": "sleep", "args": ["30"], "timeoutMs": 500 }),
+    )
+    .await;
+    assert_eq!(
+        timed_out["timedOut"], true,
+        "timedOut flag set: {timed_out}"
+    );
+
+    // 5) Missing `command` ⇒ -32602 (PROTOCOL §9).
+    let frame = json!({ "jsonrpc": "2.0", "id": 204, "method": "host.exec", "params": {} });
+    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    let err = wss_expect_error(&mut ws, 204).await;
+    assert_eq!(
+        err["error"]["code"], -32602,
+        "missing command ⇒ -32602: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

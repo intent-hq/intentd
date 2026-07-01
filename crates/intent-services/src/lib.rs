@@ -50,6 +50,7 @@ mod event_ops;
 pub mod events;
 mod file_ops;
 mod git_ops;
+pub mod host_exec;
 
 mod github_ops;
 
