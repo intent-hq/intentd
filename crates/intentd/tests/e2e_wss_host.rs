@@ -644,7 +644,7 @@ where
                 }
                 let event = &v["params"]["event"];
                 let ty = event["type"].as_str().unwrap_or("");
-                if !type_filter.iter().any(|t| *t == ty) {
+                if !type_filter.contains(&ty) {
                     continue;
                 }
                 if event["data"]["requestId"].as_str() != Some(request_id) {
@@ -867,4 +867,189 @@ async fn host_exec_stream_over_wss() {
     rpc.send(Message::Text(frame.to_string())).await.unwrap();
     let err = wss_expect_error(&mut rpc, 322).await;
     assert_eq!(err["error"]["code"], -32602, "missing requestId ⇒ -32602");
+}
+
+/// ACP model/readiness handshake probe over `host.execStream` (§5.14).
+///
+/// AUDIT-R1c-BE. R1b retired the four bidirectional-stdio ACP probes; the
+/// replacement is **not** a net-new `provider.probeAcp` RPC but a thin FE parser
+/// on top of the existing streaming exec surface, which already provides every
+/// guarantee an ACP probe needs (argv-only spawn, process-group + `kill_on_drop`
+/// reap on `timeoutMs`/cancel, PATH enrichment, workspace-cwd containment,
+/// secret-safe env, initial `stdin` + streamed base64 stdout + terminal exit).
+///
+/// This e2e proves that shape end-to-end against the deterministic mock ACP
+/// agent (`tests/fixtures/mock-acp-agent.mjs`, which responds to `initialize`
+/// with `{ protocolVersion: 1, agentCapabilities: { loadSession: false } }`):
+///
+/// 1. **Handshake happy path** — subscribe to `host:exec:*`, call
+///    `host.execStream` with `command:"node"`, `args:[mock-script]`, and an
+///    initial `stdin` carrying the `initialize` JSON-RPC line. Assemble stdout
+///    chunks (base64) until a full `\n`-terminated line arrives, parse it, and
+///    assert the capability payload. Close stdin via
+///    `host.execStream.write { eof:true }` so the mock agent exits cleanly.
+/// 2. **Timeout reap** — call `host.execStream` on the same agent with a short
+///    `timeoutMs` and **no** initial stdin. The agent blocks reading stdin, so
+///    the daemon reaps the process group at the deadline and publishes
+///    `host:exec:exit { timedOut:true, ok:false }`.
+#[tokio::test]
+async fn host_exec_stream_acp_handshake_probe_over_wss() {
+    use base64::Engine as _;
+
+    // Gate: skip when `node` or the mock script isn't available (parity with
+    // the WSS agent-lifecycle suite's gate).
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping ACP handshake probe: node not on PATH");
+        return;
+    }
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("skipping ACP handshake probe: mock script missing at {script}");
+        return;
+    }
+
+    let (_daemon, port, cfg) = boot().await;
+
+    // Subscriber conn: subscribe BEFORE spawning so no chunk is missed. No
+    // workspaceId is passed on `host.execStream`, so events publish under the
+    // empty-workspace id and the events fast-path routes them to global
+    // subscribers on the same connection.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        400,
+        "events.subscribe",
+        json!({ "eventTypes": ["host:exec:stdout", "host:exec:stderr", "host:exec:exit"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // ── Handshake happy path ──────────────────────────────────────────────
+    // The initialize line is what a real FE probe would send; the mock ACP
+    // agent responds with a single `\n`-terminated JSON-RPC result line.
+    let init_line =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}}\n";
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let started = wss_rpc(
+        &mut rpc,
+        401,
+        "host.execStream",
+        json!({
+            "command": "node",
+            "args": [&script],
+            "stdin": init_line,
+            "timeoutMs": 15_000,
+        }),
+    )
+    .await;
+    let request_id = started["requestId"]
+        .as_str()
+        .expect("requestId on handshake exec")
+        .to_string();
+
+    // Accumulate stdout base64 chunks until we have at least one full line.
+    let mut acc: Vec<u8> = Vec::new();
+    let mut parsed: Option<Value> = None;
+    for _ in 0..40 {
+        let v = wss_next_stream_event(
+            &mut sub,
+            &request_id,
+            &["host:exec:stdout", "host:exec:exit"],
+            15,
+        )
+        .await;
+        let event = &v["params"]["event"];
+        match event["type"].as_str() {
+            Some("host:exec:stdout") => {
+                if let Some(chunk) = event["data"]["chunk"].as_str() {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(chunk)
+                        .expect("valid base64 in host:exec:stdout.chunk");
+                    acc.extend_from_slice(&bytes);
+                }
+                if let Some(nl) = acc.iter().position(|b| *b == b'\n') {
+                    let line = &acc[..nl];
+                    parsed =
+                        Some(serde_json::from_slice(line).expect("mock agent stdout is JSON-RPC"));
+                    break;
+                }
+            }
+            Some("host:exec:exit") => {
+                panic!(
+                    "child exited before reply (acc={:?})",
+                    String::from_utf8_lossy(&acc)
+                );
+            }
+            _ => continue,
+        }
+    }
+    let parsed = parsed.expect("received a JSON-RPC reply line on stdout");
+
+    // Assert the ACP capability payload the mock agent returns for `initialize`.
+    assert_eq!(parsed["jsonrpc"], "2.0", "handshake reply: {parsed}");
+    assert_eq!(parsed["id"], 1, "handshake reply: {parsed}");
+    assert_eq!(
+        parsed["result"]["protocolVersion"], 1,
+        "handshake reply carries protocolVersion=1: {parsed}"
+    );
+    assert_eq!(
+        parsed["result"]["agentCapabilities"]["loadSession"], false,
+        "handshake reply carries capability payload: {parsed}"
+    );
+
+    // Close stdin so the mock agent's readline loop drains and the child exits
+    // cleanly (exitCode=0). The exit frame surfaces on the bus.
+    let write_resp = wss_rpc(
+        &mut rpc,
+        402,
+        "host.execStream.write",
+        json!({ "requestId": &request_id, "eof": true }),
+    )
+    .await;
+    assert_eq!(write_resp["ok"], true, "eof write ok: {write_resp}");
+
+    let exit = wss_next_stream_event(&mut sub, &request_id, &["host:exec:exit"], 15).await;
+    let data = &exit["params"]["event"]["data"];
+    assert_eq!(data["ok"], true, "mock agent exits cleanly: {exit}");
+    assert!(
+        data.get("timedOut").and_then(Value::as_bool) != Some(true),
+        "no timedOut on the happy handshake path: {exit}"
+    );
+
+    // ── Timeout reap path ─────────────────────────────────────────────────
+    // Spawn the same agent with a short `timeoutMs` and NO initial stdin. The
+    // agent's readline loop blocks waiting for input, so the daemon must reap
+    // the process group at the deadline and surface `timedOut:true`.
+    let started = wss_rpc(
+        &mut rpc,
+        410,
+        "host.execStream",
+        json!({
+            "command": "node",
+            "args": [&script],
+            "timeoutMs": 500,
+        }),
+    )
+    .await;
+    let timeout_id = started["requestId"]
+        .as_str()
+        .expect("requestId on timeout-probe exec")
+        .to_string();
+
+    let exit = wss_next_stream_event(&mut sub, &timeout_id, &["host:exec:exit"], 10).await;
+    let data = &exit["params"]["event"]["data"];
+    assert_eq!(
+        data["timedOut"], true,
+        "timedOut:true on the reap path: {exit}"
+    );
+    assert_eq!(data["ok"], false, "reaped child is not `ok`: {exit}");
 }
