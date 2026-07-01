@@ -129,3 +129,186 @@ fn budget_omits_older_exchanges_newest_first() {
     assert!(!xml.contains("OLDEST"));
     assert!(xml.contains("earlier exchanges omitted due to size limits"));
 }
+
+#[test]
+fn renders_thinking_block_as_thinking_tag() {
+    let messages = vec![msg(
+        "assistant",
+        json!([{ "type": "thinking", "text": "pondering <x>" }]),
+    )];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    // Thinking blocks are escaped just like text blocks (TS `escapeXml`).
+    assert!(xml.contains("<thinking>pondering &lt;x&gt;</thinking>"));
+}
+
+#[test]
+fn unknown_block_type_and_unknown_role_are_dropped_silently() {
+    let messages = vec![
+        msg(
+            "user",
+            json!([
+                { "type": "text", "text": "ok" },
+                { "type": "image", "data": "ignored" },
+            ]),
+        ),
+        // Unknown roles fall through the `_ => {}` arm in the exchange grouper.
+        msg("system", json!([{ "type": "text", "text": "sys" }])),
+    ];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    assert!(xml.contains("<text>ok</text>"));
+    assert!(!xml.contains("ignored"));
+    assert!(!xml.contains("sys"));
+}
+
+#[test]
+fn empty_user_and_null_error_content_render_as_empty_wrappers() {
+    // Non-assistant turns whose blocks are empty/missing keep their wrapper
+    // (sanitize pushes a Msg with empty blocks); the assistant variant is
+    // dropped entirely (already covered).
+    let messages = vec![msg("user", json!([])), msg("error", Value::Null)];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    assert!(xml.contains("<user_request_or_tool_results>\n  </user_request_or_tool_results>"));
+    assert!(xml.contains("<error>\n  </error>"));
+}
+
+#[test]
+fn assistant_whose_blocks_all_get_sanitized_is_dropped() {
+    // tool_result with empty tool_use_id is dropped → assistant turn ends up
+    // with zero clean blocks → entire assistant message is dropped (line 161).
+    let messages = vec![msg(
+        "assistant",
+        json!([{ "type": "tool_result", "tool_use_id": "", "output": "x" }]),
+    )];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    // The supervisor wrapper still appears, but the (now-empty) exchange list
+    // contains no assistant tag and no tool_result.
+    assert!(xml.starts_with("<supervisor>\n"));
+    assert!(!xml.contains("tool_result"));
+    assert!(!xml.contains("agent_response_or_tool_uses"));
+}
+
+#[test]
+fn tool_use_without_name_or_input_renders_defaults() {
+    // Missing `name`/`toolName` → str_field returns "" (the `String::new()`
+    // tail); missing/falsy `input` → defaults to `{}` (the `_` match arm).
+    let messages = vec![msg(
+        "assistant",
+        json!([{ "type": "tool_use", "tool_use_id": "t1" }]),
+    )];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    assert!(xml.contains("<tool_use name=\"\" tool_use_id=\"t1\">"));
+    // Empty input object stringifies to `{}` (then XML-escapes to `{}`).
+    assert!(xml.contains("  {}\n"));
+}
+
+#[test]
+fn long_tool_name_is_truncated_with_ellipsis() {
+    // tool_name > MAX_TOOL_NAME_CHARS (200) → truncated head + "...".
+    let long = "n".repeat(300);
+    let messages = vec![msg(
+        "assistant",
+        json!([{ "type": "tool_use", "name": long, "tool_use_id": "t" }]),
+    )];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    // 200 cap → 197 chars of head + "..." (3 chars).
+    let head: String = "n".repeat(197);
+    assert!(xml.contains(&format!("<tool_use name=\"{head}...\" tool_use_id=\"t\">")));
+}
+
+#[test]
+fn tool_result_falls_back_to_content_when_output_is_null_or_missing() {
+    // Output null → sanitize falls through the `_` arm to read `content`
+    // (line 143/144); first_truthy on render must then skip the null `output`
+    // (is_truthy=false) before returning the truthy `content`.
+    let messages = vec![
+        msg(
+            "assistant",
+            json!([
+                { "type": "tool_use", "name": "x", "tool_use_id": "n" },
+                { "type": "tool_use", "name": "y", "tool_use_id": "m" },
+            ]),
+        ),
+        msg(
+            "user",
+            json!([
+                { "type": "tool_result", "tool_use_id": "n", "output": null, "content": "from-content" },
+                { "type": "tool_result", "tool_use_id": "m", "content": "bare-content" },
+            ]),
+        ),
+    ];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    assert!(xml.contains("from-content"));
+    assert!(xml.contains("bare-content"));
+}
+
+#[test]
+fn tool_result_is_error_true_with_no_output_renders_empty_content() {
+    // is_error=true keeps the block past sanitize even with no output/content;
+    // first_truthy then returns None → content defaults to "" (line 101).
+    let messages = vec![msg(
+        "assistant",
+        json!([{ "type": "tool_result", "tool_use_id": "e", "is_error": true }]),
+    )];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    assert!(xml.contains("<tool_result tool_use_id=\"e\" is_error=\"true\">"));
+}
+
+#[test]
+fn numeric_output_renders_as_json_and_zero_falls_back_to_content() {
+    // Number output: is_truthy(42) → true → safe_stringify yields "42" (covers
+    // the Number arm of is_truthy and the JSON-encoding arm of safe_stringify).
+    // Sanitize's `has_output` check only keeps String/Object/Array outputs, so
+    // these blocks ride past it on the `is_error` flag (matching the TS rule).
+    let messages = vec![
+        msg(
+            "assistant",
+            json!([
+                { "type": "tool_use", "name": "f", "tool_use_id": "n42" },
+                { "type": "tool_use", "name": "g", "tool_use_id": "n0" },
+            ]),
+        ),
+        msg(
+            "user",
+            json!([
+                { "type": "tool_result", "tool_use_id": "n42", "output": 42, "is_error": true },
+                // Number 0 is falsy → first_truthy skips it and returns `content`.
+                { "type": "tool_result", "tool_use_id": "n0", "output": 0, "content": "fallback", "is_error": true },
+            ]),
+        ),
+    ];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    assert!(xml.contains("<tool_result tool_use_id=\"n42\" is_error=\"true\">"));
+    // Indent inside the assistant wrapper is 4 spaces; tool body adds 2 more.
+    assert!(xml.contains("\n      42\n"));
+    assert!(xml.contains("fallback"));
+}
+
+#[test]
+fn consecutive_assistants_without_user_split_into_exchanges() {
+    // Two assistants in a row with no leading user: the second triggers the
+    // "current.user.is_none() && !current.assistants.is_empty()" branch that
+    // closes out the prior exchange and starts a fresh one.
+    let messages = vec![
+        msg("assistant", json!([{ "type": "text", "text": "first" }])),
+        msg("assistant", json!([{ "type": "text", "text": "second" }])),
+    ];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    assert_eq!(
+        xml.matches("<exchange>\n").count(),
+        2,
+        "two consecutive userless assistants must split into two exchanges"
+    );
+    assert!(xml.contains("first"));
+    assert!(xml.contains("second"));
+}
+
+#[test]
+fn error_role_renders_as_error_tag_within_current_exchange() {
+    let messages = vec![
+        msg("user", json!([{ "type": "text", "text": "go" }])),
+        msg("error", json!([{ "type": "text", "text": "boom" }])),
+    ];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    // Error messages render with the `<error>` tag (not `agent_response_…`).
+    assert!(xml.contains("  <error>\n    <text>boom</text>\n  </error>\n"));
+}

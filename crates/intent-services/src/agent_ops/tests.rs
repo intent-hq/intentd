@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use intent_acp::WorkspaceMcpServer;
 use intent_core::{
-    now_iso, AgentDelegateInput, AgentId, Error, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, AgentDelegateInput, AgentId, Error, NoteCreate, Workspace, WorkspaceActivity,
+    WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use std::time::Duration;
 
@@ -253,6 +253,7 @@ async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect("create");
@@ -276,6 +277,60 @@ async fn create_then_list_and_get_projects_agent_lite() {
 }
 
 #[tokio::test]
+async fn agent_create_honors_client_supplied_agent_id() {
+    // The FE (`UnifiedAgentFactory`) pre-mints an `agent-{uuid}` and immediately
+    // addresses `agent.sendMessage` at it. When the daemon adopts the id
+    // verbatim, the follow-up send lands on a persisted session instead of
+    // `-32602 not found: agent session` (the create+send race this task fixes).
+    let (_t, svc, ws) = setup().await;
+    let requested = AgentId::from(format!("agent-{}", uuid::Uuid::new_v4()).as_str());
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Client-Minted".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some(requested.clone()),
+        )
+        .await
+        .expect("create honors client id");
+    assert_eq!(created["agent"]["id"].as_str(), Some(requested.0.as_str()));
+    // Round-trip through the store proves the session is addressable at the
+    // client-supplied id.
+    let got = svc.agent_get_op(requested.clone()).await.expect("get");
+    assert_eq!(got.id, requested);
+}
+
+#[tokio::test]
+async fn agent_create_rejects_malformed_client_agent_id() {
+    // Anything other than `agent-{uuid}` is `-32602` (PROTOCOL §5.5 / §9): a
+    // stray/hand-typed id must not collide with future daemon-minted ids.
+    let (_t, svc, ws) = setup().await;
+    for bad in ["not-an-agent", "agent-", "agent-not-a-uuid", ""] {
+        let err = svc
+            .agent_create_op(
+                ws.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some(AgentId::from(bad)),
+            )
+            .await
+            .expect_err("malformed id must be rejected");
+        assert!(
+            matches!(err, Error::InvalidParams(_)),
+            "expected InvalidParams for {bad:?}, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn agent_lite_carries_metadata_and_activity_fields() {
     let (_t, svc, ws) = setup().await;
     let created = svc
@@ -287,6 +342,7 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect("create");
@@ -299,11 +355,106 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
     assert_eq!(v["metadata"]["specialist"], "implementor");
     assert_eq!(v["metadata"]["isBackground"], false);
     assert!(v["metadata"].get("createdByAgentId").is_none());
-    // Activity flags are present; the headless BE has no live stream so all false.
+    // Activity flags are present; an idle agent (no worker, no watches) reports
+    // every flag false.
     assert_eq!(v["isStreaming"], false);
     assert_eq!(v["isProcessing"], false);
     assert_eq!(v["isResponding"], false);
+    assert_eq!(v["isWaitingOnTool"], false);
+    assert_eq!(v["isWaitingForOtherAgents"], false);
+    // `waitingForAgentIds` is always present (never null/omitted); an idle agent
+    // with no pending completion watches reports an empty array.
+    assert_eq!(v["waitingForAgentIds"], json!([]));
     assert!(v["lastActivity"].is_string());
+}
+
+#[tokio::test]
+async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    // An active worker draining an in-flight turn whose latest block is a
+    // `tool_use` awaiting its result: isResponding + isWaitingOnTool.
+    svc.set_test_busy(&parent, true);
+    svc.set_live_turn(
+        &parent,
+        "msg-1",
+        vec![json!({
+            "type": "tool_use",
+            "id": "msg-1:0",
+            "name": "read_file",
+            "input": {},
+            "toolCallId": "call-1"
+        })],
+    );
+    // The parent also parents a pending completion watch: isWaitingForOtherAgents.
+    svc.register_completion_watch(
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        true,
+        None,
+    );
+
+    let lite = svc.agent_get_op(parent.clone()).await.expect("get");
+    let v = serde_json::to_value(&lite).unwrap();
+    assert_eq!(v["isResponding"], true);
+    assert_eq!(v["isWaitingOnTool"], true);
+    assert_eq!(v["isWaitingForOtherAgents"], true);
+    // The waiting-on id list mirrors the bool: it carries the specific child
+    // agent the parent's pending completion watch is registered against.
+    assert_eq!(v["waitingForAgentIds"], json!([child.0]));
+
+    // Once the tool result lands, the in-flight turn is no longer blocked on the
+    // tool: still responding, but no longer waiting on it.
+    svc.set_live_turn(
+        &parent,
+        "msg-1",
+        vec![
+            json!({
+                "type": "tool_use",
+                "id": "msg-1:0",
+                "name": "read_file",
+                "input": {},
+                "toolCallId": "call-1"
+            }),
+            json!({
+                "type": "tool_result",
+                "id": "msg-1:1",
+                "tool_use_id": "call-1",
+                "output": "ok",
+                "is_error": false
+            }),
+        ],
+    );
+    let v = serde_json::to_value(svc.agent_get_op(parent.clone()).await.expect("get")).unwrap();
+    assert_eq!(v["isResponding"], true);
+    assert_eq!(v["isWaitingOnTool"], false);
+    assert_eq!(v["isWaitingForOtherAgents"], true);
+    assert_eq!(v["waitingForAgentIds"], json!([child.0]));
+
+    // A second watch against the SAME child must not duplicate the id in the
+    // waiting-on list (distinct child ids, registration order).
+    svc.register_completion_watch(
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        true,
+        None,
+    );
+    let v = serde_json::to_value(svc.agent_get_op(parent.clone()).await.expect("get")).unwrap();
+    assert_eq!(v["waitingForAgentIds"], json!([child.0]));
+
+    // The child has no worker and parents no watches: every flag false and the
+    // waiting-on id list is the empty array (never null/omitted).
+    let cv = serde_json::to_value(svc.agent_get_op(child).await.expect("get")).unwrap();
+    assert_eq!(cv["isResponding"], false);
+    assert_eq!(cv["isWaitingOnTool"], false);
+    assert_eq!(cv["isWaitingForOtherAgents"], false);
+    assert_eq!(cv["waitingForAgentIds"], json!([]));
 }
 
 #[tokio::test]
@@ -319,6 +470,7 @@ async fn agent_lite_metadata_created_by_agent_id_from_parent() {
             Some(parent.clone()),
             None,
             false,
+            None,
         )
         .await
         .expect("create child");
@@ -536,7 +688,7 @@ async fn queue_lifecycle_add_get_edit_remove() {
     assert!(q["queue"][0]["queuedAt"].is_string());
 
     let edited = svc
-        .agent_edit_queued_message_op(id.clone(), mid.clone(), "edited".into())
+        .agent_edit_queued_message_op(id.clone(), mid.clone(), "edited".into(), None)
         .await
         .expect("edit");
     assert_eq!(edited["queuedMessage"]["position"], 0);
@@ -555,10 +707,222 @@ async fn edit_missing_queued_message_errors() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Q").await;
     let err = svc
-        .agent_edit_queued_message_op(id, "nope".into(), "x".into())
+        .agent_edit_queued_message_op(id, "nope".into(), "x".into(), None)
         .await
         .expect_err("missing");
     assert!(matches!(err, Error::Internal(_)));
+}
+
+#[tokio::test]
+async fn remove_queued_message_is_idempotent_for_unknown_id() {
+    // Removing a message that's no longer in the BE queue (e.g. after a daemon
+    // restart, or after the FE's seeded mirror diverged) must succeed so the
+    // FE's optimistic delete sticks rather than rolling back.
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Q").await;
+    let r = svc
+        .agent_remove_queued_message_op(id, "msg-does-not-exist".into())
+        .await
+        .expect("idempotent remove");
+    assert_eq!(r["success"], true);
+}
+
+#[tokio::test]
+async fn remove_queued_message_is_idempotent_for_unknown_agent() {
+    // Same idempotency contract when the agent has never had a queue at all
+    // (no entry in the in-memory map).
+    let (_t, svc, _ws) = setup().await;
+    let unknown = AgentId::from("agent-00000000-0000-0000-0000-000000000000");
+    let r = svc
+        .agent_remove_queued_message_op(unknown, "anything".into())
+        .await
+        .expect("idempotent remove on unknown agent");
+    assert_eq!(r["success"], true);
+}
+
+#[tokio::test]
+async fn queue_message_emits_queue_updated_with_snapshot() {
+    // `agent.queueMessage` must publish `agent:queue:updated` carrying the
+    // current queue snapshot so subscribed FE clients mirror the live queue
+    // (PROTOCOL §6.5).
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Q").await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    let added = svc
+        .agent_queue_message_op(id.clone(), "first".into(), None)
+        .await
+        .expect("queue");
+    let mid = added["queuedMessage"]["id"].as_str().unwrap().to_string();
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert!(!batch.is_empty(), "expected at least one event");
+    let evt = batch
+        .iter()
+        .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
+        .expect("queue:updated emitted");
+    assert_eq!(evt.workspace_id, ws);
+    assert_eq!(evt.data["agentId"].as_str(), Some(id.0.as_str()));
+    let queue = evt.data["queue"].as_array().expect("queue array");
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0]["id"].as_str(), Some(mid.as_str()));
+    assert_eq!(queue[0]["content"], "first");
+    assert_eq!(queue[0]["position"], 0);
+}
+
+#[tokio::test]
+async fn remove_queued_message_emits_queue_updated_only_when_present() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Q").await;
+
+    // Seed one queued message, then drain the events for the seed enqueue.
+    let added = svc
+        .agent_queue_message_op(id.clone(), "first".into(), None)
+        .await
+        .expect("queue");
+    let mid = added["queuedMessage"]["id"].as_str().unwrap().to_string();
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    // Idempotent remove of an unknown id does not emit (queue did not change).
+    let r = svc
+        .agent_remove_queued_message_op(id.clone(), "nope".into())
+        .await
+        .expect("idempotent remove");
+    assert_eq!(r["success"], true);
+    let none = timeout(Duration::from_millis(200), sub.recv()).await;
+    assert!(none.is_err(), "no event when nothing was removed");
+
+    // Real remove emits with the empty snapshot.
+    svc.agent_remove_queued_message_op(id.clone(), mid)
+        .await
+        .expect("remove");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    let evt = batch
+        .iter()
+        .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
+        .expect("queue:updated emitted on real remove");
+    assert_eq!(evt.data["agentId"].as_str(), Some(id.0.as_str()));
+    assert!(evt.data["queue"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn editing_flag_excludes_message_from_dequeue() {
+    // PROTOCOL §5.5/§6.5 invariant: a queued entry with `editing = true` is
+    // excluded from the ready-to-send queue. `dequeue_message` must skip past
+    // it and surface a later ready-to-send entry; with only-editing entries
+    // remaining, `dequeue_message` returns `None` and `has_ready_to_send` is
+    // false (so the agent is allowed to go idle).
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Q").await;
+
+    let a = svc
+        .agent_queue_message_op(id.clone(), "first".into(), None)
+        .await
+        .expect("queue first");
+    let a_mid = a["queuedMessage"]["id"].as_str().unwrap().to_string();
+    let b = svc
+        .agent_queue_message_op(id.clone(), "second".into(), None)
+        .await
+        .expect("queue second");
+    let b_mid = b["queuedMessage"]["id"].as_str().unwrap().to_string();
+
+    // Mark the FIRST entry as under edit.
+    let edited = svc
+        .agent_edit_queued_message_op(id.clone(), a_mid.clone(), "first".into(), Some(true))
+        .await
+        .expect("mark editing");
+    assert_eq!(
+        edited["queuedMessage"]["editing"], true,
+        "editing flag surfaced on the wire shape"
+    );
+    assert!(svc.has_ready_to_send(&id), "second is still ready-to-send");
+
+    // Dequeue must skip the under-edit head and surface the second entry.
+    let next = svc
+        .dequeue_message(&id)
+        .expect("dequeues non-editing entry");
+    assert_eq!(next.id, b_mid, "dequeue skipped the editing entry");
+
+    // With only the under-edit entry remaining, the agent has nothing ready-to-send.
+    assert!(
+        !svc.has_ready_to_send(&id),
+        "editing-only queue is treated as empty for the idle invariant",
+    );
+    assert!(
+        svc.dequeue_message(&id).is_none(),
+        "dequeue returns None for an editing-only queue",
+    );
+
+    // Snapshot still carries the under-edit entry (so the FE can render it).
+    let q = svc.queue_snapshot(&id);
+    assert_eq!(q.len(), 1);
+    assert_eq!(q[0]["id"].as_str(), Some(a_mid.as_str()));
+    assert_eq!(q[0]["editing"], true);
+}
+
+#[tokio::test]
+async fn clearing_editing_flag_emits_queue_updated() {
+    // Toggling `editing` via `editQueuedMessage` must publish
+    // `agent:queue:updated` carrying the post-edit snapshot, regardless of
+    // whether the content actually changed.
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Q").await;
+    let added = svc
+        .agent_queue_message_op(id.clone(), "draft".into(), None)
+        .await
+        .expect("queue");
+    let mid = added["queuedMessage"]["id"].as_str().unwrap().to_string();
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    // editing: false → true
+    svc.agent_edit_queued_message_op(id.clone(), mid.clone(), "draft".into(), Some(true))
+        .await
+        .expect("mark editing");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    let evt = batch
+        .iter()
+        .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
+        .expect("queue:updated emitted on editing: true");
+    assert_eq!(evt.data["queue"][0]["editing"], true);
+
+    // editing: true → false (save) — must emit again with the cleared flag.
+    svc.agent_edit_queued_message_op(id.clone(), mid.clone(), "saved".into(), Some(false))
+        .await
+        .expect("save edit");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    let evt = batch
+        .iter()
+        .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
+        .expect("queue:updated emitted on editing: false");
+    assert_eq!(evt.data["queue"][0]["content"], "saved");
+    assert!(
+        evt.data["queue"][0].get("editing").is_none(),
+        "editing flag omitted from the wire shape when false",
+    );
 }
 
 #[tokio::test]
@@ -678,6 +1042,7 @@ async fn report_to_parent_delivers_for_delegated_caller() {
             Some(parent.clone()),
             None,
             false,
+            None,
         )
         .await
         .expect("create delegated child");
@@ -1166,6 +1531,152 @@ async fn mcp_delegate_immediate_registers_oneshot_watch() {
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].child_agent_id, child);
     assert!(watches[0].one_shot);
+}
+
+// ===========================================================================
+// Delegate first-message delivery: the child must receive its instructions and
+// start its turn (PROTOCOL §5.5). Without a runtime `AgentManager` attached the
+// delivery falls back to the store-only persist path (`agent_send_message_op`),
+// so the child's transcript carries exactly one `user` message whose content is
+// resolved by the documented fallback chain.
+// ===========================================================================
+
+async fn child_session_messages_json(svc: &Services, child: &AgentId) -> String {
+    let session = svc
+        .store()
+        .get_agent_session(child)
+        .await
+        .expect("child session");
+    serde_json::to_string(&session.messages).expect("serialize child messages")
+}
+
+/// Explicit `agentInstructions` become the child's first message.
+#[tokio::test]
+async fn delegate_delivers_agent_instructions_as_child_first_message() {
+    let (_t, svc, ws) = setup().await;
+    let input = AgentDelegateInput {
+        agent_instructions: Some("build the thing".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let conv = svc
+        .agent_get_conversation_op(child.clone(), None, None)
+        .await
+        .expect("conv");
+    assert_eq!(conv["totalMessages"], 1, "child got exactly one message");
+    assert_eq!(conv["messages"][0]["role"], "user");
+    assert!(
+        child_session_messages_json(&svc, &child)
+            .await
+            .contains("build the thing"),
+        "child first message carries the agentInstructions"
+    );
+}
+
+/// With no `agentInstructions`, the child's first message falls back to
+/// `taskText`.
+#[tokio::test]
+async fn delegate_falls_back_to_task_text_for_child_first_message() {
+    let (_t, svc, ws) = setup().await;
+    let input = AgentDelegateInput {
+        task_text: Some("the task text".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let conv = svc
+        .agent_get_conversation_op(child.clone(), None, None)
+        .await
+        .expect("conv");
+    assert_eq!(conv["totalMessages"], 1);
+    assert!(child_session_messages_json(&svc, &child)
+        .await
+        .contains("the task text"));
+}
+
+/// `agentInstructions` take priority over `taskText` when both are present.
+#[tokio::test]
+async fn delegate_prefers_agent_instructions_over_task_text() {
+    let (_t, svc, ws) = setup().await;
+    let input = AgentDelegateInput {
+        agent_instructions: Some("instructions win".into()),
+        task_text: Some("task text loses".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let body = child_session_messages_json(&svc, &child).await;
+    assert!(body.contains("instructions win"));
+    assert!(!body.contains("task text loses"));
+}
+
+/// With neither `agentInstructions` nor `taskText`, the child's first message
+/// falls back to the linked task note's content.
+#[tokio::test]
+async fn delegate_falls_back_to_task_note_content_for_child_first_message() {
+    let (_t, svc, ws) = setup().await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Task title".into(),
+                content: Some("note content body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    let input = AgentDelegateInput {
+        task_note_id: Some(note.id.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let conv = svc
+        .agent_get_conversation_op(child.clone(), None, None)
+        .await
+        .expect("conv");
+    assert_eq!(conv["totalMessages"], 1);
+    assert!(child_session_messages_json(&svc, &child)
+        .await
+        .contains("note content body"));
+}
+
+/// A bare delegate (no instructions, no task text, no task note) creates the
+/// child but delivers no first message — there is nothing to send.
+#[tokio::test]
+async fn delegate_without_message_source_delivers_nothing() {
+    let (_t, svc, ws) = setup().await;
+    let resp = svc
+        .agent_delegate_op(ws.clone(), AgentDelegateInput::default(), None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let conv = svc
+        .agent_get_conversation_op(child, None, None)
+        .await
+        .expect("conv");
+    assert_eq!(conv["totalMessages"], 0, "no message delivered");
 }
 
 // ===========================================================================

@@ -5,13 +5,13 @@ use intent_core::{
     CommentLocation, CommentResolveThreadResult, CommentRespondResult, CommentRespondThread,
     CommentStatus, CommentType, CommentWire, ContentType, Error, Event, EventQueryParams,
     EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
-    GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitStatus, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
-    NoteEditLinesResult, NoteEditResult, NoteId, NoteSetContentResult, NoteTaskRow,
-    NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, Result,
-    ScriptCreateParams, ScriptMode, TaskUpdateResult, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
-    WorkspaceUpdate,
+    GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitStatus,
+    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteSetContentResult,
+    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult,
+    Result, ScriptCreateParams, ScriptMode, TaskUpdateResult, Workspace, WorkspaceActivity,
+    WorkspaceApi, WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary, WorkspaceId,
+    WorkspaceStatus, WorkspaceUpdate,
 };
 use serde_json::Value;
 
@@ -746,6 +746,28 @@ impl WorkspaceApi for FakeApi {
                 },
                 current_branch: "feature".to_string(),
                 default_branch: "main".to_string(),
+            })
+        })
+    }
+
+    fn git_branch_status(
+        &self,
+        repo_path: String,
+        branch_name: String,
+    ) -> BoxFuture<'_, Result<GitBranchStatus>> {
+        Box::pin(async move {
+            if repo_path == "/unknown" {
+                return Err(Error::InvalidParams(
+                    "Unknown or unauthorized repository path".to_string(),
+                ));
+            }
+            Ok(GitBranchStatus {
+                branch: branch_name.clone(),
+                current_branch: "feature".to_string(),
+                is_current_branch: branch_name == "feature",
+                ahead: 1,
+                behind: 2,
+                has_uncommitted_changes: true,
             })
         })
     }
@@ -2404,6 +2426,78 @@ async fn git_get_branches_missing_repo_path_is_minus_32602() {
 async fn git_get_branches_unknown_repo_is_minus_32602_with_message() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"git.getBranches","params":{"repoPath":"/unknown"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Unknown or unauthorized repository path")
+    );
+}
+
+#[tokio::test]
+async fn git_branch_status_returns_status_shape() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.branchStatus","params":{"repoPath":"/repo","branchName":"feature"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["branch"], serde_json::json!("feature"));
+    assert_eq!(v["result"]["currentBranch"], serde_json::json!("feature"));
+    assert_eq!(v["result"]["isCurrentBranch"], serde_json::json!(true));
+    assert_eq!(v["result"]["ahead"], serde_json::json!(1));
+    assert_eq!(v["result"]["behind"], serde_json::json!(2));
+    assert_eq!(
+        v["result"]["hasUncommittedChanges"],
+        serde_json::json!(true)
+    );
+}
+
+#[tokio::test]
+async fn git_branch_status_other_branch_marks_not_current() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.branchStatus","params":{"repoPath":"/repo","branchName":"main"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["branch"], serde_json::json!("main"));
+    assert_eq!(v["result"]["currentBranch"], serde_json::json!("feature"));
+    assert_eq!(v["result"]["isCurrentBranch"], serde_json::json!(false));
+}
+
+#[tokio::test]
+async fn git_branch_status_missing_repo_path_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.branchStatus","params":{"branchName":"main"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: repoPath")
+    );
+}
+
+#[tokio::test]
+async fn git_branch_status_missing_branch_name_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.branchStatus","params":{"repoPath":"/repo"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: branchName")
+    );
+}
+
+#[tokio::test]
+async fn git_branch_status_unknown_repo_is_minus_32602_with_message() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.branchStatus","params":{"repoPath":"/unknown","branchName":"main"}}"#,
     )
     .await
     .unwrap();

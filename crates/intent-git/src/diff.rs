@@ -136,6 +136,29 @@ pub fn diff_range(repo_path: &Path, base_ref: &str) -> Result<Vec<FileDiff>> {
     diff_to_file_summaries(&diff)
 }
 
+/// Per-file summaries for the commit `<commit_hash>^..<commit_hash>` (the
+/// commit's own changes against its first parent). A root commit (no parent)
+/// diffs against the empty tree, so every file appears as additions. An
+/// unresolvable `commit_hash` returns [`Error::NotFound`].
+pub fn diff_commit(repo_path: &Path, commit_hash: &str) -> Result<Vec<FileDiff>> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let obj = repo
+        .revparse_single(commit_hash)
+        .map_err(|_| Error::NotFound(format!("commit not found: {commit_hash}")))?;
+    let commit = obj
+        .peel_to_commit()
+        .map_err(|_| Error::NotFound(format!("commit not found: {commit_hash}")))?;
+    let tree = commit.tree().map_err(map_git_err)?;
+    let parent_tree = match commit.parent(0) {
+        Ok(parent) => Some(parent.tree().map_err(map_git_err)?),
+        Err(_) => None,
+    };
+    let diff = repo
+        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
+        .map_err(map_git_err)?;
+    diff_to_file_summaries(&diff)
+}
+
 /// Aggregate `git diff HEAD` rollup for a workspace card (ports the TS
 /// `computeWorkspaceDiffSummary`): returns `(total_files, total_additions,
 /// total_deletions)`.
@@ -418,6 +441,41 @@ mod tests {
         let dir = init_repo("diff-rollup-clean");
         commit_file(dir.path(), "a.txt", "seed\n");
         assert_eq!(head_diff_rollup(dir.path()).unwrap(), (0, 0, 0));
+    }
+
+    #[test]
+    fn diff_commit_returns_per_file_summaries_for_a_commit() {
+        let dir = init_repo("diff-commit");
+        commit_file(dir.path(), "a.txt", "line1\nline2\nline3\n");
+        commit_file(dir.path(), "a.txt", "line1\nCHANGED\nline3\nline4\n");
+        // HEAD is the second commit; its parent has the original three lines.
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let head_hash = repo.head().unwrap().target().unwrap().to_string();
+        let files = diff_commit(dir.path(), &head_hash).unwrap();
+        assert_eq!(files.len(), 1);
+        let f = &files[0];
+        assert_eq!(f.path, "a.txt");
+        assert_eq!(f.additions, 2);
+        assert_eq!(f.deletions, 1);
+        assert!(f.old_blob.is_some());
+        assert!(f.new_blob.is_some());
+
+        // Hunks for the same file are recoverable from the recorded blob SHAs.
+        let hunks =
+            hunks_between(dir.path(), f.old_blob.as_deref(), f.new_blob.as_deref()).unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert!(hunks[0]
+            .lines
+            .iter()
+            .any(|l| l.kind == DiffLineKind::Addition && l.content.contains("CHANGED")));
+    }
+
+    #[test]
+    fn diff_commit_unknown_hash_is_not_found() {
+        let dir = init_repo("diff-commit-missing");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        let err = diff_commit(dir.path(), "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
     }
 
     #[test]

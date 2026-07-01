@@ -93,7 +93,15 @@ function callWorkspaceTool(toolCall) {
   });
 }
 
-async function handlePrompt(id) {
+function extractPromptText(params) {
+  const prompt = params && params.prompt;
+  if (!Array.isArray(prompt)) return '';
+  return prompt
+    .map((b) => (b && typeof b.text === 'string' ? b.text : ''))
+    .join(' ');
+}
+
+async function handlePrompt(id, params) {
   promptCount += 1;
   let behavior = {};
   try {
@@ -112,6 +120,19 @@ async function handlePrompt(id) {
     pendingPromptIds.push(id);
     return;
   }
+  // Per-prompt park: when this prompt's text contains the configured marker, the
+  // session parks until `session/cancel`. Lets one MOCK_AGENT_BEHAVIOR drive both
+  // a delegating parent (no match → fall through to `toolCall`) and a parked
+  // child whose delegated `agentInstructions` carry the marker.
+  const promptText = extractPromptText(params);
+  if (
+    typeof behavior.parkIfPromptContains === 'string' &&
+    behavior.parkIfPromptContains.length > 0 &&
+    promptText.includes(behavior.parkIfPromptContains)
+  ) {
+    pendingPromptIds.push(id);
+    return;
+  }
   if (behavior.toolCall) {
     try {
       const res = await callWorkspaceTool(behavior.toolCall);
@@ -125,6 +146,13 @@ async function handlePrompt(id) {
   // In keep-alive mode, stamp the turn count so a resumed follow-up turn is
   // distinguishable from a fresh spawn (which would report `turn=1`).
   const text = behavior.blockUntilCancel ? `${base} turn=${promptCount}` : base;
+  // Optional per-turn delay (MS) so a test can set up queue state during the
+  // first turn before it resolves. Only applied to the FIRST turn so subsequent
+  // queue-drained turns proceed at full speed.
+  const delayMs = Number.isFinite(behavior.firstTurnDelayMs) ? behavior.firstTurnDelayMs : 0;
+  if (delayMs > 0 && promptCount === 1) {
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
   note('session/update', {
     sessionId: SESSION_ID,
     update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
@@ -143,7 +171,7 @@ async function dispatch(msg) {
     case 'session/load':
       return send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'no load' } });
     case 'session/prompt':
-      return handlePrompt(msg.id);
+      return handlePrompt(msg.id, msg.params);
     case 'session/cancel':
       // Resolve any turn parked by `blockUntilCancel` with a `cancelled` stop
       // reason and stay alive for a follow-up (resume) prompt — the observable

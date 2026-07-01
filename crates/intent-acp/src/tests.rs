@@ -457,9 +457,9 @@ mod mcp_tests {
     type CommitRecord = (String, Option<String>, Option<String>);
 
     #[derive(Default)]
-    struct MockApi {
-        added: Mutex<Vec<(String, String)>>,
-        committed: Mutex<Vec<CommitRecord>>,
+    pub(super) struct MockApi {
+        pub(super) added: Mutex<Vec<(String, String)>>,
+        pub(super) committed: Mutex<Vec<CommitRecord>>,
     }
 
     impl WorkspaceApi for MockApi {
@@ -522,6 +522,12 @@ mod mcp_tests {
 
     fn server(api: Arc<MockApi>) -> WorkspaceMcpServer {
         WorkspaceMcpServer::new(api, WorkspaceId::from_string("ws-1"))
+    }
+
+    /// Sibling test modules build their own `MockApi` instances through this helper
+    /// so the unit-test fixture lives in exactly one place.
+    pub(super) fn mock_api() -> Arc<MockApi> {
+        Arc::new(MockApi::default())
     }
 
     #[tokio::test]
@@ -1224,5 +1230,788 @@ mod client_served_tests {
             .as_str()
             .unwrap()
             .contains("no terminal host wired"));
+    }
+}
+
+/// Display / `From` coverage for `error::{AcpError, JsonRpcError}`.
+mod error_tests {
+    use crate::{AcpError, JsonRpcError};
+    use serde_json::json;
+
+    #[test]
+    fn json_rpc_error_display_format() {
+        let e = JsonRpcError {
+            code: -32000,
+            message: "boom".to_string(),
+            data: Some(json!({"k": 1})),
+        };
+        assert_eq!(e.to_string(), "JSON-RPC error -32000: boom");
+        // Cloned equality and Debug both exercise their derives.
+        let cloned = e.clone();
+        assert_eq!(cloned, e);
+        assert!(format!("{e:?}").contains("boom"));
+    }
+
+    #[test]
+    fn acp_error_display_for_every_variant() {
+        let cases: Vec<(AcpError, &str)> = vec![
+            (
+                AcpError::Spawn("pipe".into()),
+                "failed to spawn provider: pipe",
+            ),
+            (AcpError::Transport("eof".into()), "transport closed: eof"),
+            (AcpError::Timeout("foo".into()), "request `foo` timed out"),
+            (AcpError::Serde("bad".into()), "serialization error: bad"),
+            (AcpError::Auth("login".into()), "login"),
+            (AcpError::Protocol("xx".into()), "protocol error: xx"),
+            (AcpError::Fs("io".into()), "filesystem error: io"),
+            (AcpError::Terminal("pty".into()), "terminal error: pty"),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected, "variant {err:?}");
+        }
+        let rpc = AcpError::Rpc(JsonRpcError {
+            code: 7,
+            message: "m".into(),
+            data: None,
+        });
+        // `#[error("{0}")]` delegates to JsonRpcError::Display.
+        assert_eq!(rpc.to_string(), "JSON-RPC error 7: m");
+    }
+
+    #[test]
+    fn from_serde_error_into_acp_serde_variant() {
+        let serde_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let raw_msg = serde_err.to_string();
+        let acp: AcpError = serde_err.into();
+        match &acp {
+            AcpError::Serde(msg) => assert_eq!(msg, &raw_msg),
+            other => panic!("expected Serde, got {other:?}"),
+        }
+        // And Display matches the formatted variant string.
+        assert_eq!(acp.to_string(), format!("serialization error: {raw_msg}"));
+    }
+}
+
+/// Exhaustive branches of `tool_restrictions::*` (denylist tables + agent-type
+/// predicates).
+mod tool_restriction_tests {
+    use crate::tool_restrictions::{
+        background_agent_types, get_tool_denylist_for_agent_type, is_background_agent_type,
+        AGENT_CREATION_TOOLS, CONFLICTING_BUILTIN_TOOLS, EXECUTION_TOOLS, EXTERNAL_TOOLS,
+        FILE_WRITE_TOOLS, GIT_TOOLS, NOTE_WRITE_TOOLS, SUBAGENT_TOOLS, UNIFIED_WORKSPACE_TOOLS,
+        WORKSPACE_WRITE_TOOLS,
+    };
+
+    #[test]
+    fn pure_text_agents_share_full_denylist() {
+        let pure = [
+            "commit-message",
+            "pr-description",
+            "code-review",
+            "code-walkthrough",
+        ];
+        let mut prev: Option<Vec<&'static str>> = None;
+        for ty in pure {
+            let deny = get_tool_denylist_for_agent_type(ty);
+            // Every category appears in the denylist for every pure-text agent.
+            for cat in [
+                FILE_WRITE_TOOLS,
+                GIT_TOOLS,
+                AGENT_CREATION_TOOLS,
+                NOTE_WRITE_TOOLS,
+                WORKSPACE_WRITE_TOOLS,
+                UNIFIED_WORKSPACE_TOOLS,
+                EXECUTION_TOOLS,
+                EXTERNAL_TOOLS,
+                SUBAGENT_TOOLS,
+            ] {
+                for name in cat {
+                    assert!(deny.contains(name), "{ty} denylist missing {name}");
+                }
+            }
+            if let Some(p) = &prev {
+                assert_eq!(p, &deny, "pure-text denylists should be identical");
+            }
+            prev = Some(deny);
+        }
+    }
+
+    #[test]
+    fn working_agents_deny_only_subagents() {
+        for ty in ["task-loop", "ralph-loop", "chat"] {
+            let deny = get_tool_denylist_for_agent_type(ty);
+            assert_eq!(deny, SUBAGENT_TOOLS.to_vec(), "{ty}");
+        }
+    }
+
+    #[test]
+    fn unknown_agent_types_have_empty_denylist() {
+        for ty in ["interactive", "", "foreground", "implementor", "verifier"] {
+            assert!(
+                get_tool_denylist_for_agent_type(ty).is_empty(),
+                "expected empty denylist for {ty}"
+            );
+        }
+    }
+
+    #[test]
+    fn background_agent_predicate_matches_listed_types() {
+        for ty in background_agent_types() {
+            assert!(is_background_agent_type(ty), "{ty} should be background");
+        }
+        for ty in ["interactive", "", "foo", "implementor"] {
+            assert!(
+                !is_background_agent_type(ty),
+                "{ty} should not be background"
+            );
+        }
+        // The list is the closed set of seven names — fix it here so any
+        // accidental addition/removal trips a test.
+        assert_eq!(background_agent_types().len(), 7);
+    }
+
+    #[test]
+    fn denylist_categories_are_non_empty_and_distinct() {
+        // Sanity: each constant table actually exposes names; CONFLICTING_BUILTIN_TOOLS
+        // is exported but not part of the per-type denylist computation.
+        for cat in [
+            FILE_WRITE_TOOLS,
+            GIT_TOOLS,
+            AGENT_CREATION_TOOLS,
+            NOTE_WRITE_TOOLS,
+            WORKSPACE_WRITE_TOOLS,
+            UNIFIED_WORKSPACE_TOOLS,
+            EXECUTION_TOOLS,
+            EXTERNAL_TOOLS,
+            SUBAGENT_TOOLS,
+            CONFLICTING_BUILTIN_TOOLS,
+        ] {
+            assert!(!cat.is_empty(), "empty category {cat:?}");
+        }
+        // The unified workspace API tool comes in two flavours (bare + suffixed).
+        assert!(UNIFIED_WORKSPACE_TOOLS.contains(&"workspace_api"));
+        assert!(UNIFIED_WORKSPACE_TOOLS.contains(&"workspace_api_workspace-mcp"));
+    }
+}
+
+/// Schema synthesis + tool-registry shape.
+mod tool_registry_tests {
+    use crate::mcp_server::ToolDef;
+    use crate::tool_restrictions::background_agent_types;
+    // `tools::all_tools` is `pub(crate)` via the `mcp_server::tools` mod — re-export
+    // it through the public façade by walking through `WorkspaceMcpServer::new`'s
+    // `available_tools()` with an empty denylist.
+    use crate::WorkspaceMcpServer;
+
+    fn unrestricted_tools() -> Vec<&'static ToolDef> {
+        let srv = WorkspaceMcpServer::new(
+            super::mcp_tests::mock_api(),
+            intent_core::WorkspaceId::from_string("ws-1"),
+        );
+        srv.available_tools()
+    }
+
+    #[test]
+    fn schema_marks_required_and_injects_array_items() {
+        // Pick a tool with mixed required/optional/array params: create_note has
+        // required `title`, optional `content`, and an `array` `tags`.
+        let tools = unrestricted_tools();
+        let def = tools
+            .iter()
+            .find(|t| t.name == "create_note_workspace-mcp")
+            .expect("create_note tool present");
+        let schema = def.schema();
+        assert_eq!(schema["type"], serde_json::json!("object"));
+        let required = schema["required"].as_array().expect("required array");
+        let req_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(req_names, vec!["title"]);
+        // Array params get `items: { type: "string" }`.
+        assert_eq!(
+            schema["properties"]["tags"]["items"]["type"],
+            serde_json::json!("string")
+        );
+        // Scalars do not get `items` synthesized.
+        assert!(schema["properties"]["content"].get("items").is_none());
+        assert_eq!(
+            schema["properties"]["title"]["type"],
+            serde_json::json!("string")
+        );
+    }
+
+    #[test]
+    fn schema_for_tool_without_params_is_empty_object() {
+        let tools = unrestricted_tools();
+        let def = tools
+            .iter()
+            .find(|t| t.name == "list_notes_workspace-mcp")
+            .expect("list_notes tool present");
+        let schema = def.schema();
+        assert_eq!(schema["type"], serde_json::json!("object"));
+        assert!(schema["properties"]
+            .as_object()
+            .map(|m| m.is_empty())
+            .unwrap_or(false));
+        assert_eq!(schema["required"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn registry_has_unique_tool_names_and_includes_expected_set() {
+        let tools = unrestricted_tools();
+        let names: Vec<&'static str> = tools.iter().map(|t| t.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            names.len(),
+            "duplicate tool names in registry"
+        );
+        // Every name must end with `_workspace-mcp` per the §18.4 naming convention.
+        for n in &names {
+            assert!(
+                n.ends_with("_workspace-mcp"),
+                "tool name {n} missing workspace-mcp suffix"
+            );
+        }
+        // A representative read, write, agent-creation, and git tool are all present.
+        for required in [
+            "list_notes_workspace-mcp",
+            "add_to_note_workspace-mcp",
+            "delegate_task_workspace-mcp",
+            "git_commit_workspace-mcp",
+            "report_to_parent_workspace-mcp",
+        ] {
+            assert!(names.contains(&required), "missing {required}");
+        }
+    }
+
+    #[test]
+    fn pure_text_agent_types_strictly_shrink_registry() {
+        // Pure-text background agents (commit-message, pr-description, code-review,
+        // code-walkthrough) deny note/task/agent/git/workspace-write tools that DO
+        // live in the workspace-MCP registry, so their available set must be
+        // strictly smaller than the unrestricted set. The other background types
+        // (task-loop / ralph-loop / chat) only deny auggie subagent tools that
+        // are intentionally absent from this registry.
+        let full = unrestricted_tools().len();
+        for ty in [
+            "commit-message",
+            "pr-description",
+            "code-review",
+            "code-walkthrough",
+        ] {
+            let srv = WorkspaceMcpServer::for_agent_type(
+                super::mcp_tests::mock_api(),
+                intent_core::WorkspaceId::from_string("ws-1"),
+                ty,
+            );
+            let available = srv.available_tools().len();
+            assert!(
+                available < full,
+                "{ty} did not filter any tools ({available}/{full})"
+            );
+            // Read tools survive.
+            let names: Vec<&str> = srv.available_tools().iter().map(|t| t.name).collect();
+            assert!(names.contains(&"get_note_workspace-mcp"), "{ty}");
+            assert!(names.contains(&"list_notes_workspace-mcp"), "{ty}");
+        }
+    }
+
+    #[test]
+    fn working_agent_types_keep_full_registry() {
+        // task-loop / ralph-loop / chat only deny auggie subagent tools that are
+        // not in the workspace-MCP registry, so the available set is unchanged.
+        let full = unrestricted_tools().len();
+        for ty in ["task-loop", "ralph-loop", "chat"] {
+            let srv = WorkspaceMcpServer::for_agent_type(
+                super::mcp_tests::mock_api(),
+                intent_core::WorkspaceId::from_string("ws-1"),
+                ty,
+            );
+            assert_eq!(srv.available_tools().len(), full, "{ty}");
+        }
+        // Sanity: background_agent_types() enumerates exactly these seven types
+        // (4 pure-text + 3 working), keeping the two branches of this pair test
+        // exhaustive over the predicate.
+        let bg: Vec<&str> = background_agent_types().to_vec();
+        assert_eq!(bg.len(), 7);
+    }
+}
+
+/// Additional dispatch coverage: each tool arm hits its `WorkspaceApi` method
+/// (default `Internal` from the mock when unoverridden, `InvalidParams` for
+/// missing required parameters) and the catch-all `Tool not found` branch.
+mod dispatch_unit_tests {
+    use serde_json::json;
+    use std::sync::Arc;
+
+    use intent_core::WorkspaceId;
+
+    use super::mcp_tests::{mock_api, MockApi};
+    use crate::WorkspaceMcpServer;
+
+    fn server() -> (WorkspaceMcpServer, Arc<MockApi>) {
+        let api = mock_api();
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("ws-1"));
+        (srv, api)
+    }
+
+    async fn call(
+        srv: &WorkspaceMcpServer,
+        name: &str,
+        args: serde_json::Value,
+    ) -> serde_json::Value {
+        srv.handle_message(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": name, "arguments": args }
+        }))
+        .await
+        .expect("tools/call must produce a response")
+    }
+
+    #[tokio::test]
+    async fn tools_call_without_name_is_invalid_params() {
+        let (srv, _) = server();
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "arguments": {} }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Missing tool name"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_without_arguments_defaults_to_empty_object() {
+        let (srv, _) = server();
+        // get_note requires noteId. With no `arguments`, dispatch defaults args to
+        // `{}` and the required-parameter check fires (InvalidParams).
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "get_note_workspace-mcp" }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("noteId"));
+    }
+
+    #[tokio::test]
+    async fn unknown_top_level_method_returns_method_not_found() {
+        let (srv, _) = server();
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 9, "method": "frobnicate"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32601));
+    }
+
+    #[tokio::test]
+    async fn handle_message_ignores_message_without_method() {
+        let (srv, _) = server();
+        let resp = srv.handle_message(&json!({ "id": 1 })).await;
+        assert!(resp.is_none(), "no method => no response");
+    }
+
+    #[tokio::test]
+    async fn missing_required_parameters_surface_invalid_params() {
+        let (srv, _) = server();
+        // (tool, args, expected substring in error message)
+        let cases: &[(&str, serde_json::Value, &str)] = &[
+            ("get_note_workspace-mcp", json!({}), "noteId"),
+            ("list_note_tasks_workspace-mcp", json!({}), "noteId"),
+            ("create_note_workspace-mcp", json!({}), "title"),
+            (
+                "add_to_note_workspace-mcp",
+                json!({ "noteId": "n" }),
+                "content",
+            ),
+            (
+                "set_note_content_workspace-mcp",
+                json!({ "noteId": "n" }),
+                "content",
+            ),
+            (
+                "edit_note_workspace-mcp",
+                json!({ "noteId": "n", "old": "x" }),
+                "new",
+            ),
+            (
+                "edit_note_lines_workspace-mcp",
+                json!({ "noteId": "n", "start": 1, "end": 2 }),
+                "content",
+            ),
+            (
+                "edit_note_lines_workspace-mcp",
+                json!({ "noteId": "n", "end": 2, "content": "x" }),
+                "start",
+            ),
+            ("delete_note_workspace-mcp", json!({}), "noteId"),
+            (
+                "update_task_status_workspace-mcp",
+                json!({ "noteId": "n", "taskText": "t" }),
+                "status",
+            ),
+            (
+                "update_note_task_status_workspace-mcp",
+                json!({ "noteId": "n" }),
+                "status",
+            ),
+            (
+                "update_task_workspace-mcp",
+                json!({ "noteId": "n" }),
+                "line",
+            ),
+            (
+                "mark_as_task_workspace-mcp",
+                json!({ "noteId": "n" }),
+                "status",
+            ),
+            ("convert_task_blocks_workspace-mcp", json!({}), "noteId"),
+            (
+                "create_prerequisite_workspace-mcp",
+                json!({ "noteId": "n" }),
+                "title",
+            ),
+            (
+                "assign_agent_workspace-mcp",
+                json!({ "noteId": "n" }),
+                "agentId",
+            ),
+            (
+                "add_note_comment_workspace-mcp",
+                json!({ "noteId": "n", "searchContext": "s", "commentTarget": "t" }),
+                "comment",
+            ),
+            (
+                "respond_to_comment_thread_workspace-mcp",
+                json!({ "noteId": "n" }),
+                "comment",
+            ),
+            ("git_commit_workspace-mcp", json!({}), "agent"),
+            ("report_to_parent_workspace-mcp", json!({}), "report"),
+        ];
+        for (tool, args, needle) in cases {
+            let resp = call(&srv, tool, args.clone()).await;
+            assert_eq!(
+                resp["error"]["code"],
+                json!(-32602),
+                "{tool}: expected InvalidParams, got {resp}"
+            );
+            let msg = resp["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.contains(needle),
+                "{tool}: error {msg:?} does not mention {needle:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn each_dispatch_arm_reaches_workspace_api_default() {
+        // For tools not overridden on MockApi, the default trait method returns
+        // `Error::Internal(...)` → JSON-RPC -32603. The catch-all branch would
+        // return -32602 "Tool not found", so seeing -32603 proves each arm is
+        // wired through to the real method.
+        let (srv, _) = server();
+        let valid_args: &[(&str, serde_json::Value)] = &[
+            ("get_note_workspace-mcp", json!({ "noteId": "n" })),
+            ("list_note_tasks_workspace-mcp", json!({ "noteId": "n" })),
+            ("create_note_workspace-mcp", json!({ "title": "t" })),
+            (
+                "set_note_content_workspace-mcp",
+                json!({ "noteId": "n", "content": "c", "confirmReplacement": true, "expectedVersion": 3 }),
+            ),
+            (
+                "edit_note_workspace-mcp",
+                json!({ "noteId": "n", "old": "a", "new": "b" }),
+            ),
+            (
+                "edit_note_lines_workspace-mcp",
+                json!({ "noteId": "n", "start": 1, "end": 2, "content": "x" }),
+            ),
+            (
+                "update_note_metadata_workspace-mcp",
+                json!({ "noteId": "n", "title": "T", "tags": ["a", "b"] }),
+            ),
+            ("delete_note_workspace-mcp", json!({ "noteId": "n" })),
+            (
+                "update_task_status_workspace-mcp",
+                json!({ "noteId": "n", "taskText": "t", "status": "done" }),
+            ),
+            (
+                "update_note_task_status_workspace-mcp",
+                json!({ "noteId": "n", "status": "complete", "expectedVersion": 1 }),
+            ),
+            (
+                "update_task_workspace-mcp",
+                json!({ "noteId": "n", "line": 2, "text": "T", "status": "todo", "expected": "old" }),
+            ),
+            (
+                "mark_as_task_workspace-mcp",
+                json!({ "noteId": "n", "status": "in_progress", "acceptanceCriteria": ["a"], "effort": "small" }),
+            ),
+            (
+                "convert_task_blocks_workspace-mcp",
+                json!({ "noteId": "n" }),
+            ),
+            (
+                "create_prerequisite_workspace-mcp",
+                json!({ "noteId": "n", "title": "t", "content": "c", "status": "todo" }),
+            ),
+            (
+                "assign_agent_workspace-mcp",
+                json!({ "noteId": "n", "agentId": "agent-1" }),
+            ),
+            (
+                "add_note_comment_workspace-mcp",
+                json!({ "noteId": "n", "searchContext": "s", "commentTarget": "t", "comment": "c", "type": "comment", "author": "me" }),
+            ),
+            (
+                "respond_to_comment_thread_workspace-mcp",
+                json!({ "noteId": "n", "threadId": "th", "comment": "c", "type": "comment", "author": "me", "suggestionOriginal": "o", "suggestionProposed": "p" }),
+            ),
+            (
+                "delegate_task_workspace-mcp",
+                json!({ "taskNoteId": "tn", "noteId": "n", "taskText": "t", "agentInstructions": "i",
+                        "specialist": "implementor", "model": "opus", "behaviorPrompt": "b",
+                        "waitMode": "after_all", "skipAutoCommit": true }),
+            ),
+            (
+                "report_to_parent_workspace-mcp",
+                json!({ "report": "all done" }),
+            ),
+        ];
+        for (tool, args) in valid_args {
+            let resp = call(&srv, tool, args.clone()).await;
+            assert_eq!(
+                resp["error"]["code"],
+                json!(-32603),
+                "{tool}: expected Internal default, got {resp}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_more_catchall_reports_tool_not_found() {
+        // A name that does not exist in the registry: the `tools/call` filter
+        // catches it first (-32602 "Tool not found"). The internal `dispatch_more`
+        // catch-all is reached when bypassing the filter via `dispatch` directly,
+        // but here we just confirm the public surface returns the registry error.
+        let (srv, _) = server();
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": { "name": "totally_made_up_workspace-mcp", "arguments": {} }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Tool not found"));
+    }
+
+    #[tokio::test]
+    async fn with_denylist_blocks_individual_tool() {
+        // The custom-denylist builder removes a single tool without affecting
+        // the rest of the registry.
+        let api = mock_api();
+        let srv = WorkspaceMcpServer::new(api, WorkspaceId::from_string("ws-1"))
+            .with_denylist(["get_note_workspace-mcp"]);
+        assert!(srv.is_denied("get_note_workspace-mcp"));
+        assert!(!srv.is_denied("list_notes_workspace-mcp"));
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                "params": { "name": "get_note_workspace-mcp", "arguments": { "noteId": "n" } }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Tool not available"));
+    }
+
+    #[tokio::test]
+    async fn tools_list_excludes_denied_entries() {
+        let api = mock_api();
+        let srv = WorkspaceMcpServer::new(api, WorkspaceId::from_string("ws-1"))
+            .with_denylist(["delete_note_workspace-mcp"]);
+        let resp = srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        assert!(!tools
+            .iter()
+            .any(|t| t["name"] == json!("delete_note_workspace-mcp")));
+        assert!(tools
+            .iter()
+            .any(|t| t["name"] == json!("list_notes_workspace-mcp")));
+    }
+}
+
+/// `mcp_bridge`: real loopback TCP listener + line-framed JSON-RPC proxy.
+mod mcp_bridge_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use intent_core::WorkspaceId;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+
+    use super::mcp_tests::mock_api;
+    use crate::mcp_bridge::serve_workspace_mcp_tcp;
+    use crate::WorkspaceMcpServer;
+
+    fn build_bridge_server() -> Arc<WorkspaceMcpServer> {
+        Arc::new(WorkspaceMcpServer::new(
+            mock_api(),
+            WorkspaceId::from_string("ws-1"),
+        ))
+    }
+
+    async fn send_line(stream: &mut TcpStream, line: &str) {
+        stream.write_all(line.as_bytes()).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    async fn read_next_line(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> String {
+        let mut buf = String::new();
+        timeout(Duration::from_secs(2), reader.read_line(&mut buf))
+            .await
+            .expect("read_line timed out")
+            .expect("read_line ok");
+        buf
+    }
+
+    #[tokio::test]
+    async fn connect_addr_is_localhost_port() {
+        let bridge = serve_workspace_mcp_tcp(build_bridge_server())
+            .await
+            .unwrap();
+        let addr = bridge.connect_addr();
+        assert!(
+            addr.starts_with("127.0.0.1:"),
+            "unexpected connect_addr: {addr}"
+        );
+        assert_eq!(addr, format!("127.0.0.1:{}", bridge.addr().port()));
+    }
+
+    #[tokio::test]
+    async fn request_is_proxied_and_response_returns() {
+        let bridge = serve_workspace_mcp_tcp(build_bridge_server())
+            .await
+            .unwrap();
+        let stream = TcpStream::connect(bridge.connect_addr()).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut reader = BufReader::new(read);
+
+        write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n")
+            .await
+            .unwrap();
+        write.flush().await.unwrap();
+
+        let mut line = String::new();
+        timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let resp: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(resp["id"], json!(1));
+        assert_eq!(resp["result"]["protocolVersion"], json!("2024-11-05"));
+    }
+
+    #[tokio::test]
+    async fn empty_and_malformed_lines_are_tolerated() {
+        let bridge = serve_workspace_mcp_tcp(build_bridge_server())
+            .await
+            .unwrap();
+        let mut stream = TcpStream::connect(bridge.connect_addr()).await.unwrap();
+        // A blank line and a non-JSON line both produce no response and must not
+        // close the connection; the follow-up request still gets answered.
+        send_line(&mut stream, "").await;
+        send_line(&mut stream, "not-valid-json{").await;
+        send_line(
+            &mut stream,
+            "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"initialize\"}",
+        )
+        .await;
+        let (read, _w) = stream.into_split();
+        let mut reader = BufReader::new(read);
+        let line = read_next_line(&mut reader).await;
+        let resp: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(resp["id"], json!(42));
+    }
+
+    #[tokio::test]
+    async fn notification_yields_no_response_line() {
+        let bridge = serve_workspace_mcp_tcp(build_bridge_server())
+            .await
+            .unwrap();
+        let mut stream = TcpStream::connect(bridge.connect_addr()).await.unwrap();
+        // A notification (no `id`) yields no response, then a request still works.
+        send_line(
+            &mut stream,
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}",
+        )
+        .await;
+        send_line(
+            &mut stream,
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\"}",
+        )
+        .await;
+        let (read, _w) = stream.into_split();
+        let mut reader = BufReader::new(read);
+        let line = read_next_line(&mut reader).await;
+        let resp: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(resp["id"], json!(7), "notification must not consume a line");
+    }
+
+    #[tokio::test]
+    async fn dropping_bridge_aborts_listener() {
+        let bridge = serve_workspace_mcp_tcp(build_bridge_server())
+            .await
+            .unwrap();
+        let addr = bridge.connect_addr();
+        drop(bridge);
+        // Give the abort a moment to tear down the listener, then a fresh
+        // connection attempt must fail (refused or reset). We retry briefly.
+        let mut last_err = None;
+        for _ in 0..20 {
+            match TcpStream::connect(&addr).await {
+                Ok(_) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert!(
+            last_err.is_some(),
+            "listener still accepting after McpBridge drop"
+        );
     }
 }

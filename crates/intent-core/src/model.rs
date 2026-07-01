@@ -785,6 +785,18 @@ pub struct WorkspaceTask {
     pub updated_at: String,
 }
 
+/// `task.list` result envelope: the projected `WorkspaceTask` list (honouring
+/// the optional `status` filter) **and** the workspace-wide `taskStats`
+/// aggregate (always computed over the unfiltered spec-linked set, mirroring
+/// the canonical FE `computeTaskStats` in `task-stats.ts`). Lets the FE render
+/// the progress rollup verbatim instead of re-deriving it from `note.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskListResult {
+    pub tasks: Vec<WorkspaceTask>,
+    pub stats: WorkspaceTaskStats,
+}
+
 /// Result of `task.markAsTask`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1322,14 +1334,36 @@ pub struct AgentLite {
     #[serde(default)]
     pub is_active: bool,
     /// Runtime activity flags (iOS `isStreaming`/`isProcessing`/`isResponding`).
-    /// The headless backend has no live stream state in this projection, so all
-    /// three are `false`; `status` (+ `isActive`) carry the liveness signal.
+    /// `isStreaming`/`isProcessing` stay `false` (the projection has no separate
+    /// stream/process distinction); `isResponding` is the daemon-owned in-flight
+    /// signal and is overlaid by the service projection (it stays `false` here in
+    /// [`AgentLite::from_session`], which has no runtime context).
     #[serde(default)]
     pub is_streaming: bool,
     #[serde(default)]
     pub is_processing: bool,
     #[serde(default)]
     pub is_responding: bool,
+    /// Daemon-owned waiting flags (PROTOCOL §5.5/§7.1): the BE-authoritative port
+    /// of the FE agent-state selectors so clients render verbatim. `isWaitingOnTool`
+    /// is true when the in-flight turn has an unresolved `tool_use` (a tool call
+    /// awaiting its result); `isWaitingForOtherAgents` is true when the agent
+    /// parents one or more pending completion watches. Both stay `false` in
+    /// [`AgentLite::from_session`] (no runtime context) and are overlaid by the
+    /// service projection.
+    #[serde(default)]
+    pub is_waiting_on_tool: bool,
+    #[serde(default)]
+    pub is_waiting_for_other_agents: bool,
+    /// The specific child agent-ids this agent is waiting on (the distinct
+    /// `child_agent_id`s of its pending completion watches; PROTOCOL §5.5/§7.1).
+    /// Consistent with `isWaitingForOtherAgents`: non-empty iff that flag is
+    /// `true`, empty array otherwise. Always serialized (never null/omitted) so
+    /// clients consume verbatim without healing. Stays empty in
+    /// [`AgentLite::from_session`] (no runtime context) and is overlaid by the
+    /// service projection.
+    #[serde(default)]
+    pub waiting_for_agent_ids: Vec<AgentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<SessionStats>,
     pub created_at: String,
@@ -1379,6 +1413,9 @@ impl AgentLite {
             is_streaming: false,
             is_processing: false,
             is_responding: false,
+            is_waiting_on_tool: false,
+            is_waiting_for_other_agents: false,
+            waiting_for_agent_ids: Vec::new(),
             stats: session.stats,
             last_activity: Some(session.updated_at.clone()),
             created_at: session.created_at,
@@ -1464,6 +1501,22 @@ pub struct GitBranches {
     pub remote_branches: Vec<String>,
     pub current_branch: String,
     pub default_branch: String,
+}
+
+/// `git.branchStatus` result — ahead/behind of the queried branch's upstream
+/// (`origin/<branchName>`), the worktree's currently-checked-out branch (with a
+/// derived `isCurrentBranch` flag against the queried name), and whether the
+/// working tree has any uncommitted changes (staged + unstaged + untracked,
+/// matching the legacy `git status --porcelain` semantics).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranchStatus {
+    pub branch: String,
+    pub current_branch: String,
+    pub is_current_branch: bool,
+    pub ahead: i64,
+    pub behind: i64,
+    pub has_uncommitted_changes: bool,
 }
 
 /// `git.commit` service result (the `ok` flag is added by the transport). Mirrors
@@ -2213,6 +2266,11 @@ mod tests {
         assert_eq!(v["isStreaming"], false);
         assert_eq!(v["isProcessing"], false);
         assert_eq!(v["isResponding"], false);
+        assert_eq!(v["isWaitingOnTool"], false);
+        assert_eq!(v["isWaitingForOtherAgents"], false);
+        // `waitingForAgentIds` is always emitted (never null/omitted), defaulting
+        // to `[]` when no completion watches are pending (PROTOCOL §5.5/§7.1).
+        assert_eq!(v["waitingForAgentIds"], json!([]));
         assert_eq!(v["lastUserMessage"], "hi");
         assert_eq!(v["lastActivity"], "t1");
     }

@@ -369,3 +369,300 @@ async fn uds_git_read_ops_round_trip() {
     let _ = server.await;
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// Over-the-wire per-commit read slice: `git.commitDetails` returns metadata +
+/// `fileDetails`, and `git.diffs` with `commitHash` returns the commit's own
+/// per-file hunks.
+#[tokio::test]
+async fn uds_git_commit_details_round_trip() {
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let base = Path::new("/tmp").join(format!("intentd-gitc-{}", &short[..8]));
+    let data_dir = base.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let repo = base.join("repo");
+    seed_repo(&repo);
+    // Land a second commit so HEAD has a non-empty per-file diff against its parent.
+    std::fs::write(repo.join("seed.txt"), "seed\nadded\n").unwrap();
+    std::fs::write(repo.join("new.txt"), "hello\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "second"]);
+    let head = String::from_utf8(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+
+    let config = {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTENTD_DATA_DIR", &data_dir);
+        Config::resolve().expect("resolve config")
+    };
+
+    let ws_id = WorkspaceId::from("ws-gitc");
+    {
+        let store = Store::open(&config.db_path).await.expect("open store");
+        store
+            .insert_workspace(&seed_workspace(&ws_id, repo.to_str().unwrap()))
+            .await
+            .expect("seed ws");
+    }
+
+    let store = Store::open(&config.db_path).await.expect("reopen store");
+    let bus = EventBus::new(store.clone());
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let socket = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_uds(services, bus, &socket, None, async move {
+            let _ = rx.await;
+        })
+        .await
+        .expect("serve");
+    });
+    for _ in 0..50 {
+        if config.socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // (a) git.commitDetails → metadata + fileDetails for the commit's two files.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"git.commitDetails","params":{{"workspaceId":"ws-gitc","commitHash":"{head}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["commitHash"], json!(head));
+    assert_eq!(resp["result"]["author"], json!("Test"));
+    assert_eq!(resp["result"]["authorEmail"], json!("test@example.com"));
+    assert_eq!(resp["result"]["message"], json!("second"));
+    let files = resp["result"]["files"].as_array().expect("files");
+    assert!(files.iter().any(|f| f == &json!("seed.txt")));
+    assert!(files.iter().any(|f| f == &json!("new.txt")));
+    let file_details = resp["result"]["fileDetails"]
+        .as_array()
+        .expect("fileDetails");
+    let seed = file_details
+        .iter()
+        .find(|f| f["path"] == json!("seed.txt"))
+        .expect("seed.txt fileDetails");
+    assert_eq!(seed["additions"], json!(1));
+    assert_eq!(seed["deletions"], json!(0));
+    let new = file_details
+        .iter()
+        .find(|f| f["path"] == json!("new.txt"))
+        .expect("new.txt fileDetails");
+    assert_eq!(new["additions"], json!(1));
+    assert_eq!(new["deletions"], json!(0));
+
+    // (b) git.diffs with commitHash → per-file hunks for <hash>^..<hash>.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.diffs","params":{{"workspaceId":"ws-gitc","commitHash":"{head}","path":"seed.txt"}}}}"#
+        ),
+    )
+    .await;
+    let arr = resp["result"].as_array().expect("diffs array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["path"], json!("seed.txt"));
+    let lines = arr[0]["hunks"][0]["lines"].as_array().expect("lines");
+    assert!(lines
+        .iter()
+        .any(|l| l["type"] == json!("Addition")
+            && l["content"].as_str().unwrap_or("").contains("added")));
+
+    // (c) git.commitDetails for an unresolvable hash → graceful empty envelope.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":3,"method":"git.commitDetails","params":{"workspaceId":"ws-gitc","commitHash":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}}"#,
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["commitHash"],
+        json!("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+    );
+    assert_eq!(resp["result"]["files"], json!([]));
+    assert_eq!(resp["result"]["fileDetails"], json!([]));
+
+    // (d) git.diffs with an unresolvable commitHash → empty array (graceful).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":4,"method":"git.diffs","params":{"workspaceId":"ws-gitc","commitHash":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"], json!([]));
+
+    // (e) Missing commitHash → -32602.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":5,"method":"git.commitDetails","params":{"workspaceId":"ws-gitc"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+
+    let _ = tx.send(());
+    let _ = server.await;
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Over-the-wire `git.branchStatus` slice: path-based ahead/behind + dirty-tree
+/// flag for the workspace-initializer BranchSelector seam (PROTOCOL §5.6).
+#[tokio::test]
+async fn uds_git_branch_status_round_trip() {
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let base = Path::new("/tmp").join(format!("intentd-gitbs-{}", &short[..8]));
+    let data_dir = base.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let repo = base.join("repo");
+    seed_repo(&repo);
+
+    let config = {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTENTD_DATA_DIR", &data_dir);
+        Config::resolve().expect("resolve config")
+    };
+
+    let ws_id = WorkspaceId::from("ws-gitbs");
+    {
+        let store = Store::open(&config.db_path).await.expect("open store");
+        store
+            .insert_workspace(&seed_workspace(&ws_id, repo.to_str().unwrap()))
+            .await
+            .expect("seed ws");
+    }
+
+    let store = Store::open(&config.db_path).await.expect("reopen store");
+    let bus = EventBus::new(store.clone());
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let socket = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_uds(services, bus, &socket, None, async move {
+            let _ = rx.await;
+        })
+        .await
+        .expect("serve");
+    });
+    for _ in 0..50 {
+        if config.socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Discover the actual checked-out branch so we can query against it (the
+    // initial branch name is git-config-dependent — `main` vs `master`).
+    let head_branch = String::from_utf8(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("branch --show-current")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+
+    // (a) Clean repo, current branch queried → ahead/behind 0, isCurrentBranch.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"git.branchStatus","params":{{"repoPath":"{}","branchName":"{}"}}}}"#,
+            repo.display(),
+            head_branch,
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["branch"], json!(head_branch));
+    assert_eq!(resp["result"]["currentBranch"], json!(head_branch));
+    assert_eq!(resp["result"]["isCurrentBranch"], json!(true));
+    assert_eq!(resp["result"]["ahead"], json!(0));
+    assert_eq!(resp["result"]["behind"], json!(0));
+    assert_eq!(resp["result"]["hasUncommittedChanges"], json!(false));
+
+    // (b) Modify a tracked file → hasUncommittedChanges flips to true.
+    std::fs::write(repo.join("seed.txt"), "seed changed\n").unwrap();
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.branchStatus","params":{{"repoPath":"{}","branchName":"{}"}}}}"#,
+            repo.display(),
+            head_branch,
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["hasUncommittedChanges"], json!(true));
+
+    // (c) Untracked file alone still counts as uncommitted changes (porcelain
+    // semantics: any output ⇒ dirty).
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    std::fs::write(repo.join("new.txt"), "fresh\n").unwrap();
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"git.branchStatus","params":{{"repoPath":"{}","branchName":"{}"}}}}"#,
+            repo.display(),
+            head_branch,
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["hasUncommittedChanges"], json!(true));
+    std::fs::remove_file(repo.join("new.txt")).unwrap();
+
+    // (d) Querying a non-checked-out branch sets isCurrentBranch=false but the
+    // worktree's currentBranch is still reported.
+    git(&repo, &["branch", "feature-x"]);
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"git.branchStatus","params":{{"repoPath":"{}","branchName":"feature-x"}}}}"#,
+            repo.display(),
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["branch"], json!("feature-x"));
+    assert_eq!(resp["result"]["currentBranch"], json!(head_branch));
+    assert_eq!(resp["result"]["isCurrentBranch"], json!(false));
+
+    // (e) Missing branchName → -32602.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"git.branchStatus","params":{{"repoPath":"{}"}}}}"#,
+            repo.display(),
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(
+        resp["error"]["message"],
+        json!("Missing required parameter: branchName")
+    );
+
+    // (f) Unknown repo path → -32602 with the verbatim gate message (mirrors
+    // git.getBranches).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":6,"method":"git.branchStatus","params":{"repoPath":"/no/such/repo","branchName":"main"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(
+        resp["error"]["message"],
+        json!("Unknown or unauthorized repository path")
+    );
+
+    let _ = tx.send(());
+    let _ = server.await;
+    std::fs::remove_dir_all(&base).ok();
+}

@@ -92,6 +92,20 @@ impl Store {
         Ok(sessions)
     }
 
+    /// List every persisted session across workspaces, oldest first. Backs the
+    /// daemon-startup stale-session heal: a session left non-terminal across a
+    /// crash has no live worker after restart, so the heal sweeps the whole
+    /// table once before serving. Sessions are returned WITHOUT their message
+    /// logs (the heal does not need them) to keep the sweep O(rows).
+    pub async fn list_all_agent_sessions(&self) -> Result<Vec<AgentSession>> {
+        let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session ORDER BY created_at");
+        let rows = sqlx::query(&sql)
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list all agent sessions failed: {e}")))?;
+        rows.iter().map(map_session_row).collect()
+    }
+
     /// Update mutable session state, enforcing the `acp_session_id` write-once
     /// and `provider` immutability invariants (§9.5). `NotFound` if absent.
     pub async fn update_agent_session(&self, s: &AgentSession) -> Result<()> {
@@ -128,6 +142,36 @@ impl Store {
         .execute(self.pool())
         .await
         .map_err(|e| Error::Internal(format!("update agent session failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Persist the runtime `status` + `is_active` transition for `agent_session`
+    /// without touching the write-once `acp_session_id` / immutable `provider`
+    /// (the broader [`Store::update_agent_session`] enforces those invariants).
+    /// Drives the `pending → active → idle` lifecycle so a hydrated/reloaded
+    /// chat reflects the live state (PROTOCOL §6.5 `agent:status-changed`).
+    /// `updated_at` is refreshed to the supplied timestamp. `NotFound` if the
+    /// session is absent.
+    pub async fn set_agent_session_status(
+        &self,
+        id: &AgentId,
+        status: AgentStatus,
+        is_active: bool,
+        updated_at: &str,
+    ) -> Result<()> {
+        let rows =
+            sqlx::query("UPDATE agent_session SET status=?, is_active=?, updated_at=? WHERE id=?")
+                .bind(enum_to_db(&status)?)
+                .bind(is_active as i64)
+                .bind(updated_at)
+                .bind(&id.0)
+                .execute(self.pool())
+                .await
+                .map_err(|e| Error::Internal(format!("set agent session status failed: {e}")))?
+                .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
         Ok(())
     }
 

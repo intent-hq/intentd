@@ -478,8 +478,8 @@ async fn dispatch(
         "task.list" => {
             let ws = require_ws_note(params)?;
             let status = opt_str(params, "status");
-            let tasks = api.task_list(ws, status).await.map_err(domain_to_rpc)?;
-            Ok(json!({ "tasks": tasks }))
+            let result = api.task_list(ws, status).await.map_err(domain_to_rpc)?;
+            Ok(json!({ "tasks": result.tasks, "stats": result.stats }))
         }
         "task.get" => {
             let ws = require_ws_note(params)?;
@@ -704,9 +704,22 @@ async fn dispatch(
             let model = opt_str(params, "model");
             let specialist_id = opt_str(params, "specialistId");
             let idempotency_key = opt_str(params, "idempotencyKey");
+            // Honor a client-supplied `agentId` verbatim so the FE can address
+            // `agent.sendMessage` at the same id it just handed us (fixes the
+            // create+send "not found: agent session" race). Malformed values
+            // are rejected inside the service as `-32602`.
+            let requested_agent_id = opt_str(params, "agentId").map(|s| AgentId::from(s.as_str()));
             // FE/RPC front door: top-level creates stay parentless.
             let result = api
-                .agent_create(ws, name, model, specialist_id, None, idempotency_key)
+                .agent_create(
+                    ws,
+                    name,
+                    model,
+                    specialist_id,
+                    None,
+                    idempotency_key,
+                    requested_agent_id,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -774,8 +787,9 @@ async fn dispatch(
             let agent_id = require_agent_id(params)?;
             let message_id = require_str_param(params, "messageId")?;
             let content = require_str_param(params, "content")?;
+            let editing = opt_bool(params, "editing");
             let result = api
-                .agent_edit_queued_message(agent_id, message_id, content)
+                .agent_edit_queued_message(agent_id, message_id, content, editing)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -976,6 +990,18 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "git.branchStatus" => {
+            let repo_path = require_str_param(params, "repoPath")?;
+            let branch_name = require_str_param(params, "branchName")?;
+            match api.git_branch_status(repo_path, branch_name).await {
+                Ok(status) => to_result_value(&status),
+                // Same gate as `git.getBranches`: unknown/unauthorized repo path
+                // surfaces verbatim as `-32602` without the `invalid params:`
+                // prefix `domain_to_rpc` would add.
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "repo.list" => {
             // No params; returns `{ repos: KnownRepo[] }` with camelCase keys.
             let r = api.repo_list().await.map_err(domain_to_rpc)?;
@@ -1029,8 +1055,20 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let path = opt_str(params, "path");
             let staged = parse_bool(params, "staged");
+            // §5.6 extension: when `commitHash` is set the result is the hunks
+            // for `<commitHash>^..<commitHash>` and `staged` is ignored.
+            let commit_hash = opt_str(params, "commitHash");
             let r = api
-                .git_diffs(ws, path, staged)
+                .git_diffs(ws, path, staged, commit_hash)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "git.commitDetails" => {
+            let ws = require_ws_note(params)?;
+            let commit_hash = require_str_param(params, "commitHash")?;
+            let r = api
+                .git_commit_details(ws, commit_hash)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

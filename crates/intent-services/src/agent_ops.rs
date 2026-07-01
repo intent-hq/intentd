@@ -9,10 +9,10 @@
 
 use std::collections::HashSet;
 
-use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE};
+use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_QUEUE_UPDATED};
 use intent_core::{
-    now_iso, parse_iso, AgentId, AgentLite, AgentMessage, AgentSession, AgentStatus, Error, NoteId,
-    Result, SessionStats, WorkspaceApi, WorkspaceId,
+    now_iso, parse_iso, ActorType, AgentId, AgentLite, AgentMessage, AgentSession, AgentStatus,
+    Error, EventActor, NoteId, Result, SessionStats, WorkspaceApi, WorkspaceId,
 };
 
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
@@ -34,19 +34,27 @@ use crate::Services;
 mod tests;
 
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
+///
+/// `editing` marks the entry as "under edit" — excluded from the **ready-to-send**
+/// queue so the drain skips it (PROTOCOL §5.5/§6.5). The agent may go idle only
+/// when every remaining queued entry has `editing == true`; setting `editing`
+/// back to `false` re-includes the message and self-drains.
 #[derive(Debug, Clone)]
 pub(crate) struct QueuedMessage {
     pub id: String,
     pub content: String,
     pub image_blocks: Option<Value>,
     pub queued_at: String,
+    pub editing: bool,
 }
 
 impl QueuedMessage {
     /// The camelCase wire shape for `agent.getQueue` / queue results, matching the
     /// TS `QueuedMessage` and the iOS decoder (`{id, content, queuedAt, position,
-    /// imageBlocks?}`). `position` is the entry's 0-based index in the queue (0 =
-    /// next to be sent) and is supplied by the caller since it is positional.
+    /// imageBlocks?, editing?}`). `position` is the entry's 0-based index in the
+    /// queue (0 = next to be sent) and is supplied by the caller since it is
+    /// positional. `editing` is only present when `true` (a client that hasn't
+    /// migrated still sees the legacy shape unchanged).
     pub(crate) fn to_value(&self, position: usize) -> Value {
         let mut v = json!({
             "id": self.id,
@@ -56,6 +64,9 @@ impl QueuedMessage {
         });
         if let Some(blocks) = &self.image_blocks {
             v["imageBlocks"] = blocks.clone();
+        }
+        if self.editing {
+            v["editing"] = Value::Bool(true);
         }
         v
     }
@@ -341,6 +352,24 @@ pub(crate) fn new_message_id() -> String {
     format!("user-msg-{}", Uuid::new_v4())
 }
 
+/// Validate a client-supplied `agent.create` `agentId` (PROTOCOL §5.5): the id
+/// must be the exact `agent-{uuid}` form (`agent-` prefix + a parsable UUID
+/// tail), matching the form the daemon mints. Anything else surfaces as
+/// `-32602` so a stray/hand-typed id cannot collide with future runtime ids.
+pub(crate) fn validate_client_agent_id(id: &str) -> Result<()> {
+    let Some(tail) = id.strip_prefix("agent-") else {
+        return Err(Error::InvalidParams(format!(
+            "agentId must be of the form 'agent-{{uuid}}' (got {id:?})"
+        )));
+    };
+    Uuid::parse_str(tail).map_err(|_| {
+        Error::InvalidParams(format!(
+            "agentId must be of the form 'agent-{{uuid}}' (got {id:?})"
+        ))
+    })?;
+    Ok(())
+}
+
 /// A single user text content block (the persisted/queued message shape).
 fn user_content_blocks(content: &str) -> Value {
     json!([{ "type": "text", "text": content }])
@@ -354,18 +383,117 @@ fn project_lite(session: AgentSession) -> AgentLite {
     AgentLite::from_session(session, count, last_response, last_user, digest)
 }
 
+/// Whether `blocks` contains a `tool_use` block with no matching `tool_result`
+/// (matched by `tool_use_id == toolCallId`). The daemon-side port of the FE
+/// `hasUnresolvedToolUse` content-block branch: a tool call that has been
+/// emitted but whose result block has not yet been appended is "unresolved"
+/// (the agent is blocked awaiting the tool).
+fn has_unresolved_tool_use(blocks: &[Value]) -> bool {
+    blocks.iter().any(|block| {
+        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            return false;
+        }
+        let Some(id) = block.get("toolCallId").and_then(Value::as_str) else {
+            return false;
+        };
+        !blocks.iter().any(|candidate| {
+            candidate.get("type").and_then(Value::as_str) == Some("tool_result")
+                && candidate.get("tool_use_id").and_then(Value::as_str) == Some(id)
+        })
+    })
+}
+
 impl Services {
     /// `agent.list` (PROTOCOL §5.5).
     pub(crate) async fn agent_list_op(&self, workspace_id: WorkspaceId) -> Result<Vec<AgentLite>> {
         let sessions = self.store.list_agent_sessions(&workspace_id).await?;
-        Ok(sessions.into_iter().map(project_lite).collect())
+        Ok(sessions
+            .into_iter()
+            .map(|s| self.project_lite_with_flags(s))
+            .collect())
     }
 
     /// `agent.get` (PROTOCOL §5.5). `NotFound` is surfaced to the router which
     /// maps it to `-32602 "Agent not found"`.
     pub(crate) async fn agent_get_op(&self, agent_id: AgentId) -> Result<AgentLite> {
         let session = self.store.get_agent_session(&agent_id).await?;
-        Ok(project_lite(session))
+        Ok(self.project_lite_with_flags(session))
+    }
+
+    /// Project an [`AgentSession`] into [`AgentLite`] and overlay the daemon-owned
+    /// runtime activity flags (PROTOCOL §5.5/§7.1): `isResponding`,
+    /// `isWaitingOnTool`, `isWaitingForOtherAgents`, `waitingForAgentIds`. See
+    /// [`agent_activity_flags_for`].
+    pub(crate) fn project_lite_with_flags(&self, session: AgentSession) -> AgentLite {
+        let (is_responding, is_waiting_on_tool, is_waiting_for_other_agents, waiting_for_agent_ids) =
+            self.agent_activity_flags_for(&session);
+        let mut lite = project_lite(session);
+        lite.is_responding = is_responding;
+        lite.is_waiting_on_tool = is_waiting_on_tool;
+        lite.is_waiting_for_other_agents = is_waiting_for_other_agents;
+        lite.waiting_for_agent_ids = waiting_for_agent_ids;
+        lite
+    }
+
+    /// Compute the daemon-owned runtime activity flags for `session` — the port
+    /// of the FE agent-state selectors so clients render verbatim (PROTOCOL
+    /// §5.5/§7.1). Returns
+    /// `(isResponding, isWaitingOnTool, isWaitingForOtherAgents, waitingForAgentIds)`:
+    ///
+    /// - `isResponding` — a worker is draining an in-flight turn for this agent
+    ///   ([`agent_is_busy`], the authoritative "active worker" signal; mirrors the
+    ///   FE `selectAgentIsResponding`). Builds on the existing busy/live-turn state
+    ///   rather than adding a parallel notion of "busy".
+    /// - `isWaitingOnTool` — that in-flight turn has an unresolved `tool_use` block
+    ///   (a tool call awaiting its result; the port of FE `hasUnresolvedToolUse`).
+    /// - `isWaitingForOtherAgents` — the agent parents one or more pending
+    ///   completion watches (the port of FE `isAgentWaitingForOtherAgents`).
+    /// - `waitingForAgentIds` — the distinct `child_agent_id`s of those pending
+    ///   watches, in registration order. Always returned (defaults to empty);
+    ///   non-empty iff `isWaitingForOtherAgents` is `true`, so clients can render
+    ///   the waiting-on names verbatim without consulting `metadata`.
+    ///
+    /// Terminal agents (completed/error/deleted) report all flags `false` and an
+    /// empty `waitingForAgentIds`, mirroring the FE selectors' terminal-status
+    /// short-circuit.
+    pub(crate) fn agent_activity_flags_for(
+        &self,
+        session: &AgentSession,
+    ) -> (bool, bool, bool, Vec<AgentId>) {
+        let terminal = matches!(
+            session.status,
+            AgentStatus::Completed | AgentStatus::Error | AgentStatus::Deleted
+        );
+        if terminal {
+            return (false, false, false, Vec::new());
+        }
+        let is_responding = self.agent_is_busy(session.id.clone());
+        let is_waiting_on_tool = is_responding && self.live_turn_has_unresolved_tool(&session.id);
+        let watches = self.list_watches_for_parent(&session.workspace_id, &session.id);
+        // Distinct child ids in registration order — a parent can register
+        // multiple watches against the same child (e.g. successive `immediate`
+        // delegates), but the FE only wants each waiting-on agent once.
+        let mut waiting_for_agent_ids: Vec<AgentId> = Vec::with_capacity(watches.len());
+        for w in &watches {
+            if !waiting_for_agent_ids.contains(&w.child_agent_id) {
+                waiting_for_agent_ids.push(w.child_agent_id.clone());
+            }
+        }
+        let is_waiting_for_other_agents = !waiting_for_agent_ids.is_empty();
+        (
+            is_responding,
+            is_waiting_on_tool,
+            is_waiting_for_other_agents,
+            waiting_for_agent_ids,
+        )
+    }
+
+    /// Whether the agent's in-flight live turn (if any) is blocked on an
+    /// unresolved tool call. `false` when no turn is streaming.
+    fn live_turn_has_unresolved_tool(&self, agent_id: &AgentId) -> bool {
+        self.live_turn(agent_id)
+            .map(|live| has_unresolved_tool_use(&live.blocks))
+            .unwrap_or(false)
     }
 
     /// `agent.getConversation` (PROTOCOL §5.5). Paginated per the TA-2 contract:
@@ -397,6 +525,12 @@ impl Services {
     /// turn (PROTOCOL §5.5). `task_note_id`/`skip_auto_commit` are set by
     /// `agent.delegate` so the auto-commit-on-idle subscriber (LNI-1) can
     /// resolve the `Linked-Note-Id:` trailer and honor the opt-out.
+    ///
+    /// `requested_agent_id` is honored verbatim when it is a well-formed
+    /// `agent-{uuid}`, so the FE can create + address the session under an id
+    /// it already minted (fixes the UI create→sendMessage "not found: agent
+    /// session" race). Malformed values surface as `-32602`; when `None` a
+    /// fresh id is generated (existing behavior).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn agent_create_op(
         &self,
@@ -407,13 +541,21 @@ impl Services {
         parent_agent_id: Option<AgentId>,
         task_note_id: Option<NoteId>,
         skip_auto_commit: bool,
+        requested_agent_id: Option<AgentId>,
     ) -> Result<Value> {
         let now = now_iso();
         let name_explicitly_set = name.is_some();
         let name =
             name.unwrap_or_else(|| format!("Agent {}", &Uuid::new_v4().simple().to_string()[..6]));
+        let id = match requested_agent_id {
+            Some(requested) => {
+                validate_client_agent_id(requested.as_str())?;
+                requested
+            }
+            None => AgentId(format!("agent-{}", Uuid::new_v4())),
+        };
         let session = AgentSession {
-            id: AgentId(format!("agent-{}", Uuid::new_v4())),
+            id,
             workspace_id,
             parent_agent_id,
             backend_session_id: None,
@@ -506,7 +648,11 @@ impl Services {
         Ok(json!({ "models": models }))
     }
 
-    /// `agent.queueMessage` (PROTOCOL §5.5).
+    /// `agent.queueMessage` (PROTOCOL §5.5). Enqueues the message, publishes
+    /// `agent:queue:updated`, and asks the runtime [`AgentManager`] (when attached)
+    /// to drain the queue immediately if the agent is idle — closing the bug where
+    /// a queued message would never be sent because the BE only drained the queue
+    /// from a live worker loop.
     pub(crate) async fn agent_queue_message_op(
         &self,
         agent_id: AgentId,
@@ -514,60 +660,104 @@ impl Services {
         image_blocks: Option<Value>,
     ) -> Result<Value> {
         let (queued, position) = self.enqueue_message(&agent_id, content, image_blocks);
-        Ok(json!({ "success": true, "queuedMessage": queued.to_value(position) }))
+        let result = json!({ "success": true, "queuedMessage": queued.to_value(position) });
+        self.publish_queue_updated(&agent_id).await;
+        if let Some(manager) = self.agent_manager() {
+            if let Ok(session) = self.store.get_agent_session(&agent_id).await {
+                manager
+                    .try_drain_queue(agent_id, session.workspace_id)
+                    .await;
+            }
+        }
+        Ok(result)
     }
 
     /// `agent.getQueue` (PROTOCOL §5.5).
     pub(crate) async fn agent_get_queue_op(&self, agent_id: AgentId) -> Result<Value> {
-        let queue: Vec<Value> = self
-            .agent_queues
-            .lock()
-            .expect("agent queue registry poisoned")
-            .get(&agent_id)
-            .map(|q| q.iter().enumerate().map(|(i, m)| m.to_value(i)).collect())
-            .unwrap_or_default();
+        let queue = self.queue_snapshot(&agent_id);
         Ok(json!({ "success": true, "queue": queue }))
     }
 
-    /// `agent.editQueuedMessage` (PROTOCOL §5.5).
+    /// `agent.editQueuedMessage` (PROTOCOL §5.5). Updates the entry's content
+    /// in place (matching the reference's `handleEditQueuedMessage`) and, when
+    /// the optional `editing` flag is provided, transitions the entry between
+    /// "ready-to-send" (`editing = false`) and "under edit" (`editing = true`).
+    /// Publishes `agent:queue:updated` with the post-edit snapshot. Returns
+    /// `Internal` when the message id is unknown — only `removeQueuedMessage` is
+    /// idempotent.
+    ///
+    /// When an entry transitions `editing: true → false` (the FE finished
+    /// editing) we additionally fire `try_drain_queue` so the message
+    /// self-drains as if it had just been enqueued — honouring the user's
+    /// "re-queued on save, which self-drains" semantics (PROTOCOL §5.5/§6.5).
     pub(crate) async fn agent_edit_queued_message_op(
         &self,
         agent_id: AgentId,
         message_id: String,
         content: String,
+        editing: Option<bool>,
     ) -> Result<Value> {
-        let mut guard = self
-            .agent_queues
-            .lock()
-            .expect("agent queue registry poisoned");
-        let queue = guard
-            .get_mut(&agent_id)
-            .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
-        let position = queue
-            .iter()
-            .position(|m| m.id == message_id)
-            .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
-        queue[position].content = content;
-        Ok(json!({ "success": true, "queuedMessage": queue[position].to_value(position) }))
+        let (edited, was_editing, now_editing) = {
+            let mut guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            let queue = guard
+                .get_mut(&agent_id)
+                .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
+            let position = queue
+                .iter()
+                .position(|m| m.id == message_id)
+                .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
+            let was = queue[position].editing;
+            queue[position].content = content;
+            if let Some(flag) = editing {
+                queue[position].editing = flag;
+            }
+            let now = queue[position].editing;
+            (queue[position].to_value(position), was, now)
+        };
+        self.publish_queue_updated(&agent_id).await;
+        // editing: true → false ⇒ the message is now ready-to-send. Self-drain.
+        if was_editing && !now_editing {
+            if let Some(manager) = self.agent_manager() {
+                if let Ok(session) = self.store.get_agent_session(&agent_id).await {
+                    manager
+                        .try_drain_queue(agent_id, session.workspace_id)
+                        .await;
+                }
+            }
+        }
+        Ok(json!({ "success": true, "queuedMessage": edited }))
     }
 
-    /// `agent.removeQueuedMessage` (PROTOCOL §5.5).
+    /// `agent.removeQueuedMessage` (PROTOCOL §5.5). **Idempotent**: returns
+    /// `{ success: true }` whether or not the message (or the agent's queue) was
+    /// found. The FE's seeded queue can diverge from the BE's in-memory queue
+    /// (especially after a daemon restart); the original "Queued message not
+    /// found" error caused the FE's optimistic delete to roll back, leaving
+    /// ghost messages on screen.
     pub(crate) async fn agent_remove_queued_message_op(
         &self,
         agent_id: AgentId,
         message_id: String,
     ) -> Result<Value> {
-        let mut guard = self
-            .agent_queues
-            .lock()
-            .expect("agent queue registry poisoned");
-        let queue = guard
-            .get_mut(&agent_id)
-            .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
-        let before = queue.len();
-        queue.retain(|m| m.id != message_id);
-        if queue.len() == before {
-            return Err(Error::Internal("Queued message not found".to_string()));
+        let removed = {
+            let mut guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            match guard.get_mut(&agent_id) {
+                Some(queue) => {
+                    let before = queue.len();
+                    queue.retain(|m| m.id != message_id);
+                    before != queue.len()
+                }
+                None => false,
+            }
+        };
+        if removed {
+            self.publish_queue_updated(&agent_id).await;
         }
         Ok(json!({ "success": true }))
     }
@@ -590,11 +780,13 @@ impl Services {
             Ok(_) => Ok(json!({ "success": true, "queued": false, "messageId": message_id })),
             Err(_) => {
                 let (queued, position) = self.enqueue_message(&agent_id, content, None);
-                Ok(json!({
+                let result = json!({
                     "success": true,
                     "queued": true,
                     "queuedMessage": queued.to_value(position),
-                }))
+                });
+                self.publish_queue_updated(&agent_id).await;
+                Ok(result)
             }
         }
     }
@@ -762,6 +954,7 @@ impl Services {
                 parent_agent_id.clone(),
                 session_task_note_id,
                 input.skip_auto_commit.unwrap_or(false),
+                None,
             )
             .await?;
         let agent_id = created["agent"]["id"]
@@ -817,6 +1010,47 @@ impl Services {
                         None,
                     );
                 }
+            }
+        }
+        // Deliver the child's first message and start its turn (PROTOCOL §5.5).
+        // Without this the child stays `Pending` and never runs. `wait_mode` is
+        // already honored by the completion-watch registration above; the child
+        // turn itself starts unconditionally. Message source priority mirrors the
+        // TS `DelegateTaskTool`: explicit `agentInstructions`, then `taskText`,
+        // then the linked task note's content (falling back to its title).
+        //
+        // Delivery routes through the runtime `AgentManager` when attached (the
+        // proven `agent.sendMessage` path: persist + spawn the turn worker, which
+        // lazily spawns the child and streams `agent:stream:*` keyed by the CHILD
+        // `agentId`); read-only/test wiring falls back to the store-only persist.
+        fn first_nonempty(s: &str) -> Option<String> {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        let mut message = input
+            .agent_instructions
+            .as_deref()
+            .and_then(first_nonempty)
+            .or_else(|| input.task_text.as_deref().and_then(first_nonempty));
+        if message.is_none() {
+            if let Some(note_id) = input.task_note_id.or(input.note_id) {
+                if let Ok(note) = self.store.get_note(&note_id).await {
+                    message = first_nonempty(&note.content).or_else(|| first_nonempty(&note.title));
+                }
+            }
+        }
+        if let Some(message) = message {
+            let child = AgentId::from(agent_id.as_str());
+            let send = match self.agent_manager() {
+                Some(manager) => {
+                    manager
+                        .send_message(child, workspace_id, message, None)
+                        .await
+                }
+                None => self.agent_send_message_op(child, message, None).await,
+            };
+            if let Err(e) = send {
+                tracing::warn!(agent = %agent_id, error = %e, "delegate: failed to start child turn");
             }
         }
         Ok(json!({ "ok": true, "agentId": agent_id, "name": name }))
@@ -1326,6 +1560,7 @@ impl Services {
                 None,
                 Some(task_note_id.clone()),
                 false,
+                None,
             )
             .await?;
         let agent_id = created["agent"]["id"]
@@ -1355,7 +1590,9 @@ impl Services {
     }
 
     /// Push a message onto an agent's in-memory queue and return it together with
-    /// its 0-based `position` in the queue (the index just appended).
+    /// its 0-based `position` in the queue (the index just appended). New messages
+    /// are always ready-to-send (`editing = false`) — the FE may transition an
+    /// entry to `editing = true` later via `agent.editQueuedMessage`.
     pub(crate) fn enqueue_message(
         &self,
         agent_id: &AgentId,
@@ -1367,6 +1604,7 @@ impl Services {
             content,
             image_blocks,
             queued_at: now_iso(),
+            editing: false,
         };
         let mut guard = self
             .agent_queues
@@ -1378,20 +1616,19 @@ impl Services {
         (queued, position)
     }
 
-    /// Pop the oldest queued message for an agent (FIFO), if any. Used by the
-    /// runtime turn loop to flip a queued message to in-flight when the current
-    /// turn ends.
+    /// Pop the oldest **ready-to-send** queued message for an agent, if any. Used
+    /// by the runtime turn loop to flip a queued message to in-flight when the
+    /// current turn ends. Entries with `editing = true` are skipped (left in
+    /// place) so the agent stays idle only when *every* remaining entry is under
+    /// edit (PROTOCOL §5.5/§6.5 invariant).
     pub(crate) fn dequeue_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
         let mut guard = self
             .agent_queues
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
-        if queue.is_empty() {
-            None
-        } else {
-            Some(queue.remove(0))
-        }
+        let idx = queue.iter().position(|m| !m.editing)?;
+        Some(queue.remove(idx))
     }
 
     /// Re-insert a message at the front of an agent's queue (used when a
@@ -1405,13 +1642,92 @@ impl Services {
             .insert(0, message);
     }
 
-    /// Drop all queued messages for an agent (used by `agent.forceMessage`,
-    /// which supersedes the queue with the forced message).
-    pub(crate) fn clear_queue(&self, agent_id: &AgentId) {
+    /// `true` iff the agent has at least one queued message that is **not**
+    /// under edit (i.e. the "ready-to-send" queue is non-empty). Drives the
+    /// self-drain trigger and gates `agent:idle` emission so the agent never
+    /// reports idle while ready-to-send work remains (PROTOCOL §5.5/§6.5).
+    pub(crate) fn has_ready_to_send(&self, agent_id: &AgentId) -> bool {
         self.agent_queues
             .lock()
             .expect("agent queue registry poisoned")
-            .remove(agent_id);
+            .get(agent_id)
+            .map(|q| q.iter().any(|m| !m.editing))
+            .unwrap_or(false)
+    }
+
+    /// Drop all queued messages for an agent (used by `agent.forceMessage`,
+    /// which supersedes the queue with the forced message). Returns `true` iff
+    /// the queue previously held at least one message — the caller uses this to
+    /// decide whether to publish `agent:queue:updated`.
+    pub(crate) fn clear_queue(&self, agent_id: &AgentId) -> bool {
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let had = guard.get(agent_id).map(|q| !q.is_empty()).unwrap_or(false);
+        guard.remove(agent_id);
+        had
+    }
+
+    /// Snapshot the current queue contents as wire-shape `QueuedMessage` JSON
+    /// (the §5.5 `{id, content, queuedAt, position, imageBlocks?}` shape) for
+    /// `agent.getQueue` and the `agent:queue:updated` payload (§6).
+    pub(crate) fn queue_snapshot(&self, agent_id: &AgentId) -> Vec<Value> {
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .map(|q| q.iter().enumerate().map(|(i, m)| m.to_value(i)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Publish `agent:queue:updated` with the **current** queue snapshot.
+    /// Looks up the owning workspace from the agent session — when the session
+    /// row is missing (e.g. an idempotent remove on an unknown agent) or no bus
+    /// is wired, the call is a quiet no-op rather than an error: the durable
+    /// mutation is the source of truth and a missing event is not fatal.
+    ///
+    /// The queue snapshot is taken **outside** the mutex it lives behind, but
+    /// since this method only reads (under a brief lock that is dropped before
+    /// the await) it never holds the queue lock across an `await` point.
+    pub(crate) async fn publish_queue_updated(&self, agent_id: &AgentId) {
+        let queue = self.queue_snapshot(agent_id);
+        let workspace_id = match self.store.get_agent_session(agent_id).await {
+            Ok(s) => s.workspace_id,
+            Err(_) => return,
+        };
+        self.publish_queue_updated_for(agent_id, &workspace_id, queue)
+            .await;
+    }
+
+    /// Like [`publish_queue_updated`] but takes the workspace id directly —
+    /// used by call sites (the turn worker, `force_message`) that already hold
+    /// it, avoiding a redundant `get_agent_session` round-trip per drain step.
+    pub(crate) async fn publish_queue_updated_for(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        queue: Vec<Value>,
+    ) {
+        let event = intent_store::NewEvent {
+            workspace_id: workspace_id.clone(),
+            timestamp: now_iso(),
+            event_type: AGENT_QUEUE_UPDATED.to_string(),
+            actor: EventActor {
+                actor_type: ActorType::Agent,
+                id: Some(agent_id.0.clone()),
+                ..Default::default()
+            },
+            session_id: Some(agent_id.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({
+                "agentId": agent_id.0,
+                "queue": queue,
+            }),
+        };
+        crate::publish_event(&self.event_bus, event).await;
     }
 }
 

@@ -383,3 +383,89 @@ fn auth_error_message_uses_login_hint() {
     let codex = auth_error_message("codex", false);
     assert!(codex.contains("codex-acp login"));
 }
+
+#[test]
+fn disableable_and_always_enabled_partition_registry() {
+    let disableable: Vec<&str> = disableable_providers().iter().map(|p| p.id).collect();
+    assert_eq!(
+        disableable,
+        vec![
+            "claude-code",
+            "codex",
+            "cortex",
+            "opencode",
+            "droid",
+            "mock"
+        ]
+    );
+    assert!(disableable_providers().iter().all(|p| p.can_be_disabled));
+
+    let always: Vec<&str> = always_enabled_providers().iter().map(|p| p.id).collect();
+    assert_eq!(always, vec!["auggie"]);
+    assert!(always_enabled_providers()
+        .iter()
+        .all(|p| !p.can_be_disabled));
+
+    // Partition is total — every registered provider is in exactly one bucket.
+    assert_eq!(disableable.len() + always.len(), all_provider_ids().len());
+}
+
+#[test]
+fn auth_error_pattern_matching_is_case_insensitive_across_patterns() {
+    // The first registered pattern ("authentication required") matches with
+    // arbitrary input casing (the matcher lower-cases both sides).
+    assert!(is_provider_authentication_error(
+        "auggie",
+        "AUTHENTICATION REQUIRED"
+    ));
+    // A later pattern in the list ("auggie login") also matches — proves the
+    // matcher walks past the first entry rather than short-circuiting on it.
+    assert!(is_provider_authentication_error(
+        "auggie",
+        "please run AUGGIE LOGIN now"
+    ));
+    // The third pattern, which contains backticks, is matched substring-wise.
+    assert!(is_provider_authentication_error(
+        "auggie",
+        "hint: Please Run `Auggie Login`"
+    ));
+    // Unknown provider ids fall through to the default provider's patterns.
+    assert!(is_provider_authentication_error(
+        "nope",
+        "Authentication required"
+    ));
+    // Providers without patterns never match, regardless of message content.
+    assert!(!is_provider_authentication_error("cortex", "auggie login"));
+}
+
+#[test]
+fn auth_error_message_remote_falls_back_to_command_login() {
+    // claude-code has no login_command_hint → falls back to `{command} login`,
+    // and the remote variant includes the remote-server phrasing.
+    let msg = auth_error_message("claude-code", true);
+    assert!(msg.contains("Anthropic Claude Code"));
+    assert!(msg.contains("claude-agent-acp login"));
+    assert!(msg.contains("on the remote server"));
+
+    // Unknown provider ids resolve to the default provider's message.
+    let unknown = auth_error_message("not-a-real-provider", false);
+    assert_eq!(unknown, auth_error_message("auggie", false));
+}
+
+#[test]
+fn registry_invariants() {
+    // Exactly one provider is the default.
+    assert_eq!(ACP_PROVIDERS.iter().filter(|p| p.is_default).count(), 1);
+    // ids are unique.
+    let ids = all_provider_ids();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), ids.len());
+    // Every provider has a non-empty id / display_name / command.
+    for p in ACP_PROVIDERS {
+        assert!(!p.id.is_empty());
+        assert!(!p.display_name.is_empty());
+        assert!(!p.command.is_empty());
+    }
+}

@@ -1,13 +1,21 @@
 //! `host.*` host-services: `checkGit` + `listDirectory` + `directoryStatus`
-//! + `checkAuggie` (§5.14).
+//!   + `checkAuggie` + `findBinary` + `toolAvailability` + `env` + `findApp`
+//!   + `listInstalledEditors` (§5.14).
 //!
 //! These additive methods sit on the existing `host.*` capability-probe surface
 //! (alongside `host.status` + `host.openExternal`) and let the FE delegate
 //! host-machine probes to the daemon: Git binary detection, repo-folder
-//! browsing, directory status (worktree-aware `.git` walk), and auggie binary
-//! discovery. They resolve on the daemon host so callers reach the worktrees
-//! that actually live there — answered on both UDS and WSS, like the rest of
-//! `host.*`.
+//! browsing, directory status (worktree-aware `.git` walk), auggie binary
+//! discovery, generic binary resolution (`findBinary`), a batch tool-availability
+//! probe (`toolAvailability`), the daemon's PATH/environment (`env`), macOS
+//! `.app` bundle lookup (`findApp`), and a cross-platform catalog of installed
+//! editors/terminals (`listInstalledEditors`). They resolve on the daemon host
+//! so callers reach the binaries, app bundles, and worktrees that actually live
+//! there — answered on both UDS and WSS, like the rest of `host.*`. The `env`
+//! probe is secret-safe: it returns only variable *names* plus the non-secret
+//! PATH/SHELL/HOME values, never arbitrary variable values. `findApp` /
+//! `listInstalledEditors` are secret-safe by construction: only app names + paths
+//! cross the wire.
 //!
 //! Ported from the Electron FE: `packages/cloudlands-fe/src/shared/main/`
 //! `find-binary.ts` (the git binary resolver) and `packages/cloudlands-fe/src/`
@@ -22,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 /// Resolves a binary by name to an absolute path on the daemon host. Injected
 /// so `check_git` is unit-testable without spawning `which`/`where`.
@@ -59,14 +67,28 @@ impl VersionProbe for OsVersionProbe {
 /// Locate a binary by `name`. Mirrors the FE `findBinary` strategy: ask the OS
 /// (`which` on unix, `where` on Windows), then fall back to OS-common
 /// directories. Returns the first existing absolute path, or `None`. Internal
-/// helper — exposed only to `host.checkGit`.
+/// helper — used by `host.checkGit`.
 pub(crate) fn find_binary(name: &str) -> Option<PathBuf> {
+    resolve_binary_path(name, &[])
+}
+
+/// Locate `name` on the daemon host, mirroring the FE `findBinary` lookup
+/// order: PATH (`which`/`where`) → caller-supplied `common_paths` (checked
+/// verbatim, like the FE `commonPaths` option) → OS-common directories.
+/// Returns the first existing absolute path, or `None`.
+pub(crate) fn resolve_binary_path(name: &str, common_paths: &[String]) -> Option<PathBuf> {
     if name.is_empty() {
         return None;
     }
     if let Some(path) = lookup_in_path(name) {
         if path.is_file() || path.is_symlink() {
             return Some(path);
+        }
+    }
+    for candidate in common_paths {
+        let candidate = PathBuf::from(candidate);
+        if candidate.is_file() || candidate.is_symlink() {
+            return Some(candidate);
         }
     }
     for dir in common_dirs() {
@@ -229,6 +251,189 @@ fn build_check_result(path: Option<PathBuf>, probe: &dyn VersionProbe) -> Value 
     })
 }
 
+/// Mirror the FE `SAFE_BINARY_NAME` guard (`/^[a-zA-Z0-9._-]+$/`): reject names
+/// with path separators, shell metacharacters, or whitespace before they reach
+/// `which`/`where`. An unsafe name resolves to `available:false`, never an error.
+pub(crate) fn is_safe_binary_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Build the `host.findBinary` result `{ available, path?, version? }`. Unlike
+/// `checkGit`/`checkAuggie`, a binary that resolves but does not answer
+/// `--version` is still `available:true` (the `version` is best-effort/optional).
+fn build_find_result(path: Option<PathBuf>, probe: &dyn VersionProbe) -> Value {
+    let Some(path) = path else {
+        return json!({ "available": false });
+    };
+    let mut result = json!({
+        "available": true,
+        "path": path.to_string_lossy(),
+    });
+    if let Some(version) = probe.probe(&path) {
+        result["version"] = json!(version);
+    }
+    result
+}
+
+/// Production `host.findBinary` — resolve `name` (honouring the optional caller
+/// `common_paths`) and best-effort version-probe it. Rejects unsafe names with
+/// `available:false`.
+pub(crate) fn find_binary_op(name: &str, common_paths: &[String]) -> Value {
+    if !is_safe_binary_name(name) {
+        return json!({ "available": false });
+    }
+    build_find_result(resolve_binary_path(name, common_paths), &OsVersionProbe)
+}
+
+/// The default tool set probed by `host.toolAvailability` when the caller does
+/// not supply an explicit `tools` list: the ACP agent CLIs the FE detects, the
+/// `git` binary, and the `code` editor launcher.
+pub(crate) const DEFAULT_TOOLS: &[&str] = &[
+    "claude",
+    "claude-agent-acp",
+    "opencode",
+    "codex",
+    "codex-acp",
+    "cortex",
+    "git",
+    "code",
+];
+
+/// Build the `host.toolAvailability` result `{ tools: { <name>: { available,
+/// path?, version? } } }`. Each tool is resolved via [`find_binary_op`]; an
+/// empty / absent `tools` list falls back to [`DEFAULT_TOOLS`].
+pub(crate) fn tool_availability_op(tools: Option<Vec<String>>) -> Value {
+    let names: Vec<String> = match tools {
+        Some(t) if !t.is_empty() => t,
+        _ => DEFAULT_TOOLS.iter().map(|s| s.to_string()).collect(),
+    };
+    let mut map = Map::new();
+    for name in names {
+        let result = find_binary_op(&name, &[]);
+        map.insert(name, result);
+    }
+    json!({ "tools": Value::Object(map) })
+}
+
+/// The PATH separator for the host platform.
+fn path_separator() -> char {
+    if cfg!(windows) {
+        ';'
+    } else {
+        ':'
+    }
+}
+
+/// OS-common directories that must always be on PATH for binary resolution
+/// (mirrors the FE `getEssentialSystemPaths`). Merged into the host PATH to
+/// form the "enhanced" PATH the daemon uses to locate tools.
+fn essential_system_paths() -> Vec<String> {
+    if cfg!(target_os = "windows") {
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let mut paths = vec![
+            format!(r"{system_root}\System32"),
+            format!(r"{system_root}\System32\wbem"),
+            r"C:\Program Files\Git\cmd".to_string(),
+            r"C:\Program Files (x86)\Git\cmd".to_string(),
+        ];
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            paths.push(format!(r"{local_app_data}\Programs\Git\cmd"));
+        }
+        if let Ok(user_profile) = std::env::var("USERPROFILE") {
+            paths.push(format!(r"{user_profile}\scoop\shims"));
+        }
+        paths.push(r"C:\ProgramData\chocolatey\bin".to_string());
+        paths
+    } else {
+        vec![
+            "/bin".to_string(),
+            "/usr/bin".to_string(),
+            "/usr/local/bin".to_string(),
+            "/opt/homebrew/bin".to_string(),
+            "/usr/sbin".to_string(),
+            "/sbin".to_string(),
+        ]
+    }
+}
+
+/// Compute the "enhanced" PATH (mirrors the FE `getEnhancedPath`): the host
+/// PATH with the essential system directories merged in, de-duplicated and
+/// order-preserving (existing entries first, then any missing essentials).
+pub(crate) fn enhanced_path_from(current_path: &str) -> String {
+    let sep = path_separator();
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered: Vec<String> = Vec::new();
+    for entry in current_path.split(sep).filter(|s| !s.is_empty()) {
+        if seen.insert(entry.to_string()) {
+            ordered.push(entry.to_string());
+        }
+    }
+    for entry in essential_system_paths() {
+        if seen.insert(entry.clone()) {
+            ordered.push(entry);
+        }
+    }
+    ordered.join(&sep.to_string())
+}
+
+/// Resolve the host login shell (mirrors the FE `getLoginShellPath`): the
+/// `SHELL` env var, else the platform default (empty on Windows).
+fn login_shell() -> String {
+    if let Ok(shell) = std::env::var("SHELL") {
+        if !shell.is_empty() {
+            return shell;
+        }
+    }
+    if cfg!(target_os = "macos") {
+        "/bin/zsh".to_string()
+    } else if cfg!(windows) {
+        String::new()
+    } else {
+        "/bin/bash".to_string()
+    }
+}
+
+/// Build the `host.env` result. Returns the host PATH (raw + split `entries`),
+/// the "enhanced" PATH the daemon uses for binary resolution, the login shell,
+/// the home directory, and the SORTED NAMES of every environment variable.
+/// SECRET SAFETY: only the PATH / SHELL / HOME values (non-secret by
+/// construction) cross the wire verbatim — all other variables are reported by
+/// name only, so no secret values are ever exposed.
+pub(crate) fn build_env_json(
+    raw_path: &str,
+    shell: &str,
+    home: &Path,
+    var_names: Vec<String>,
+) -> Value {
+    let sep = path_separator();
+    let entries: Vec<&str> = raw_path.split(sep).filter(|s| !s.is_empty()).collect();
+    json!({
+        "path": raw_path,
+        "pathEntries": entries,
+        "enhancedPath": enhanced_path_from(raw_path),
+        "shell": shell,
+        "home": home.to_string_lossy(),
+        "varNames": var_names,
+    })
+}
+
+/// Production `host.env` — reads the daemon's actual environment. See
+/// [`build_env_json`] for the secret-safety contract (names only, no values).
+pub(crate) fn env_probe() -> Value {
+    let raw_path = std::env::var("PATH").unwrap_or_default();
+    let shell = login_shell();
+    let home = home_dir();
+    let mut var_names: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .collect();
+    var_names.sort();
+    var_names.dedup();
+    build_env_json(&raw_path, &shell, &home, var_names)
+}
+
 /// Expand `~` / `~/...` to `home` (mirrors the FE `expandPath`). Anything else
 /// passes through verbatim.
 pub(crate) fn expand_path(input: &str, home: &Path) -> PathBuf {
@@ -387,6 +592,535 @@ pub(crate) fn directory_status_with(path: &str, home: &Path) -> Value {
 /// Production `directory_status` — resolves `home` from the environment.
 pub(crate) fn directory_status(path: &str) -> Value {
     directory_status_with(path, &home_dir())
+}
+
+/// A known editor / terminal / file-manager the `host.listInstalledEditors`
+/// probe enumerates. Mirrors the FE `EDITOR_REGISTRY` (only the fields the BE
+/// needs for detection — display strings stay on the FE, keyed by `id`).
+pub(crate) struct KnownEditor {
+    pub id: &'static str,
+    /// macOS `<name>.app` bundle name (e.g. `Visual Studio Code`).
+    pub app_name: &'static str,
+    /// Linux native binary names (e.g. `code`, `code-oss`).
+    pub linux_binaries: &'static [&'static str],
+    /// Linux flatpak application IDs (e.g. `com.visualstudio.code`).
+    pub flatpak_ids: &'static [&'static str],
+    /// Windows binaries on PATH (e.g. `code`, `code.cmd`).
+    pub win_binaries: &'static [&'static str],
+    /// `true` ⇒ skip on non-macOS hosts.
+    pub macos_only: bool,
+    /// `true` ⇒ skip on non-Windows hosts.
+    pub win32_only: bool,
+}
+
+/// Built-in catalog of editors / terminals / file-managers the host can detect.
+/// Stays in sync with `cloudlands-fe/src/shared/editors/editor-registry.ts` —
+/// when an editor is added on the FE, mirror only the detection fields here.
+pub(crate) const KNOWN_EDITORS: &[KnownEditor] = &[
+    KnownEditor {
+        id: "finder",
+        app_name: "Finder",
+        linux_binaries: &["nautilus", "dolphin", "thunar", "nemo", "pcmanfm"],
+        flatpak_ids: &[],
+        win_binaries: &["explorer"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "vscode",
+        app_name: "Visual Studio Code",
+        linux_binaries: &["code", "code-oss"],
+        flatpak_ids: &["com.visualstudio.code", "com.visualstudio.code.oss"],
+        win_binaries: &["code", "code.cmd"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "cursor",
+        app_name: "Cursor",
+        linux_binaries: &["cursor"],
+        flatpak_ids: &["com.cursor.Cursor"],
+        win_binaries: &["cursor", "cursor.cmd"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "zed",
+        app_name: "Zed",
+        linux_binaries: &["zed", "zeditor"],
+        flatpak_ids: &["dev.zed.Zed"],
+        win_binaries: &["zed", "zed.exe"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "xcode",
+        app_name: "Xcode",
+        linux_binaries: &[],
+        flatpak_ids: &[],
+        win_binaries: &[],
+        macos_only: true,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "intellij",
+        app_name: "IntelliJ IDEA",
+        linux_binaries: &["idea", "intellij-idea-ultimate"],
+        flatpak_ids: &["com.jetbrains.IntelliJ-IDEA-Ultimate"],
+        win_binaries: &["idea64.exe", "idea.cmd"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "intellij-ce",
+        app_name: "IntelliJ IDEA CE",
+        linux_binaries: &["idea-ce", "intellij-idea-community"],
+        flatpak_ids: &["com.jetbrains.IntelliJ-IDEA-Community"],
+        win_binaries: &["idea64.exe", "idea.cmd"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "webstorm",
+        app_name: "WebStorm",
+        linux_binaries: &["webstorm"],
+        flatpak_ids: &["com.jetbrains.WebStorm"],
+        win_binaries: &["webstorm64.exe", "webstorm.cmd"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "pycharm",
+        app_name: "PyCharm",
+        linux_binaries: &["pycharm", "pycharm-professional"],
+        flatpak_ids: &["com.jetbrains.PyCharm-Professional"],
+        win_binaries: &["pycharm64.exe", "pycharm.cmd"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "pycharm-ce",
+        app_name: "PyCharm CE",
+        linux_binaries: &["pycharm-community"],
+        flatpak_ids: &["com.jetbrains.PyCharm-Community"],
+        win_binaries: &["pycharm64.exe", "pycharm.cmd"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "goland",
+        app_name: "GoLand",
+        linux_binaries: &["goland"],
+        flatpak_ids: &["com.jetbrains.GoLand"],
+        win_binaries: &["goland64.exe", "goland.cmd"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "phpstorm",
+        app_name: "PhpStorm",
+        linux_binaries: &["phpstorm"],
+        flatpak_ids: &["com.jetbrains.PhpStorm"],
+        win_binaries: &["phpstorm64.exe", "phpstorm.cmd"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "rubymine",
+        app_name: "RubyMine",
+        linux_binaries: &["rubymine"],
+        flatpak_ids: &["com.jetbrains.RubyMine"],
+        win_binaries: &["rubymine64.exe", "rubymine.cmd"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "clion",
+        app_name: "CLion",
+        linux_binaries: &["clion"],
+        flatpak_ids: &["com.jetbrains.CLion"],
+        win_binaries: &["clion64.exe", "clion.cmd"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "rider",
+        app_name: "Rider",
+        linux_binaries: &["rider"],
+        flatpak_ids: &["com.jetbrains.Rider"],
+        win_binaries: &["rider64.exe", "rider.cmd"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "datagrip",
+        app_name: "DataGrip",
+        linux_binaries: &["datagrip"],
+        flatpak_ids: &["com.jetbrains.DataGrip"],
+        win_binaries: &["datagrip64.exe", "datagrip.cmd"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "android-studio",
+        app_name: "Android Studio",
+        linux_binaries: &["android-studio", "studio"],
+        flatpak_ids: &["com.google.AndroidStudio"],
+        win_binaries: &["studio64.exe", "studio.cmd"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "sublime",
+        app_name: "Sublime Text",
+        linux_binaries: &["subl", "sublime_text"],
+        flatpak_ids: &["com.sublimetext.three"],
+        win_binaries: &["subl", "subl.exe"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "nova",
+        app_name: "Nova",
+        linux_binaries: &[],
+        flatpak_ids: &[],
+        win_binaries: &[],
+        macos_only: true,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "textmate",
+        app_name: "TextMate",
+        linux_binaries: &[],
+        flatpak_ids: &[],
+        win_binaries: &[],
+        macos_only: true,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "warp",
+        app_name: "Warp",
+        linux_binaries: &["warp-terminal", "warp"],
+        flatpak_ids: &[],
+        win_binaries: &["warp", "warp.exe"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "ghostty",
+        app_name: "Ghostty",
+        linux_binaries: &["ghostty"],
+        flatpak_ids: &["com.mitchellh.ghostty"],
+        win_binaries: &[],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "iterm",
+        app_name: "iTerm",
+        linux_binaries: &[],
+        flatpak_ids: &[],
+        win_binaries: &[],
+        macos_only: true,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "kitty",
+        app_name: "kitty",
+        linux_binaries: &["kitty"],
+        flatpak_ids: &["net.kovidgoyal.kitty"],
+        win_binaries: &[],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "alacritty",
+        app_name: "Alacritty",
+        linux_binaries: &["alacritty"],
+        flatpak_ids: &["org.alacritty.Alacritty"],
+        win_binaries: &["alacritty", "alacritty.exe"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "hyper",
+        app_name: "Hyper",
+        linux_binaries: &["hyper"],
+        flatpak_ids: &["co.zeit.Hyper"],
+        win_binaries: &["hyper", "hyper.exe"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "terminal",
+        app_name: "Terminal",
+        linux_binaries: &["gnome-terminal", "konsole", "xfce4-terminal", "xterm"],
+        flatpak_ids: &[],
+        win_binaries: &["cmd"],
+        macos_only: false,
+        win32_only: false,
+    },
+    KnownEditor {
+        id: "powershell",
+        app_name: "PowerShell",
+        linux_binaries: &[],
+        flatpak_ids: &[],
+        win_binaries: &["pwsh", "powershell"],
+        macos_only: false,
+        win32_only: true,
+    },
+    KnownEditor {
+        id: "windows-terminal",
+        app_name: "Windows Terminal",
+        linux_binaries: &[],
+        flatpak_ids: &[],
+        win_binaries: &["wt"],
+        macos_only: false,
+        win32_only: true,
+    },
+];
+
+/// Probes for installed Flatpak applications. Injected so detection is
+/// unit-testable without spawning `flatpak`.
+pub(crate) trait FlatpakProbe: Send + Sync {
+    /// Return the set of installed flatpak application IDs (lowercased), or
+    /// `None` when flatpak is unavailable / errors out.
+    fn list_installed(&self) -> Option<std::collections::HashSet<String>>;
+}
+
+/// Production flatpak probe: runs `flatpak list --app --columns=application`
+/// with a short timeout and returns the parsed set of installed app IDs.
+pub(crate) struct OsFlatpakProbe;
+
+impl FlatpakProbe for OsFlatpakProbe {
+    fn list_installed(&self) -> Option<std::collections::HashSet<String>> {
+        run_flatpak_list()
+    }
+}
+
+/// Run `flatpak list --app --columns=application` with a 5s wall timeout and
+/// return the parsed set of app IDs. `None` when flatpak is missing/errors.
+fn run_flatpak_list() -> Option<std::collections::HashSet<String>> {
+    let mut child = Command::new("flatpak")
+        .args(["list", "--app", "--columns=application"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            if !status.success() {
+                return None;
+            }
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut buf = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        use std::io::Read;
+        let _ = out.read_to_string(&mut buf);
+    }
+    Some(
+        buf.lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Guard for the `host.findApp` `name` parameter. Allows spaces (macOS app
+/// names like "Visual Studio Code" contain them) but rejects path separators,
+/// `..`, leading dots, and NULs so the value can't escape its parent directory.
+pub(crate) fn is_safe_app_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && !name.starts_with('.')
+        && !name.contains('\0')
+}
+
+/// macOS application search directories: `/Applications` then `~/Applications`,
+/// mirroring the FE `isAppInstalledMacOS` lookup.
+pub(crate) fn macos_app_dirs(home: &Path) -> Vec<PathBuf> {
+    vec![PathBuf::from("/Applications"), home.join("Applications")]
+}
+
+/// Probe macOS `.app` bundles in `dirs` for `<name>.app`. Returns the first
+/// existing bundle path, or `None`. Pure — the dirs are injected so tests can
+/// fixture a fake `/Applications`.
+pub(crate) fn find_macos_app_bundle(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    if !is_safe_app_name(name) {
+        return None;
+    }
+    let leaf = format!("{name}.app");
+    for dir in dirs {
+        let candidate = dir.join(&leaf);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Build the `host.findApp` result. On macOS searches the `.app` bundle dirs;
+/// elsewhere returns `installed:false` (cross-platform editor detection lives
+/// on `host.listInstalledEditors`). An unsafe `name` is also `installed:false`
+/// (never an RPC error). Pure: injected dirs + platform flag.
+pub(crate) fn find_app_with(name: &str, macos_dirs: &[PathBuf], is_macos: bool) -> Value {
+    if !is_macos || !is_safe_app_name(name) {
+        return json!({ "installed": false });
+    }
+    match find_macos_app_bundle(name, macos_dirs) {
+        Some(path) => json!({
+            "installed": true,
+            "path": path.to_string_lossy(),
+            "source": "macAppBundle",
+        }),
+        None => json!({ "installed": false }),
+    }
+}
+
+/// Production `host.findApp` — resolves `home` + the platform from the
+/// environment; honours the same macOS `.app` bundle lookup the FE used.
+pub(crate) fn find_app_op(name: &str) -> Value {
+    let home = home_dir();
+    find_app_with(name, &macos_app_dirs(&home), cfg!(target_os = "macos"))
+}
+
+/// Detect a single editor's install state on macOS (`.app` bundle lookup).
+fn detect_editor_macos(editor: &KnownEditor, dirs: &[PathBuf]) -> Value {
+    match find_macos_app_bundle(editor.app_name, dirs) {
+        Some(path) => json!({
+            "id": editor.id,
+            "installed": true,
+            "path": path.to_string_lossy(),
+            "source": "macAppBundle",
+        }),
+        None => json!({ "id": editor.id, "installed": false }),
+    }
+}
+
+/// Detect a single editor's install state on Linux: native binary first, then
+/// flatpak ID. `binary_resolver` is reused so injected stubs work in tests.
+fn detect_editor_linux(
+    editor: &KnownEditor,
+    binary_resolver: &dyn BinaryResolver,
+    flatpak_installed: &std::collections::HashSet<String>,
+) -> Value {
+    for binary in editor.linux_binaries {
+        if let Some(path) = binary_resolver.find(binary) {
+            return json!({
+                "id": editor.id,
+                "installed": true,
+                "path": path.to_string_lossy(),
+                "source": "binary",
+            });
+        }
+    }
+    for flatpak_id in editor.flatpak_ids {
+        if flatpak_installed.contains(*flatpak_id) {
+            return json!({
+                "id": editor.id,
+                "installed": true,
+                "flatpakId": flatpak_id,
+                "source": "flatpak",
+            });
+        }
+    }
+    json!({ "id": editor.id, "installed": false })
+}
+
+/// Detect a single editor's install state on Windows: probe each candidate
+/// binary in turn via the resolver.
+fn detect_editor_windows(editor: &KnownEditor, binary_resolver: &dyn BinaryResolver) -> Value {
+    for binary in editor.win_binaries {
+        if let Some(path) = binary_resolver.find(binary) {
+            return json!({
+                "id": editor.id,
+                "installed": true,
+                "path": path.to_string_lossy(),
+                "source": "binary",
+            });
+        }
+    }
+    json!({ "id": editor.id, "installed": false })
+}
+
+/// Which platform `list_installed_editors_with` is detecting against. Carried
+/// as an enum so tests can pin a platform regardless of the runtime host.
+#[derive(Clone, Copy)]
+pub(crate) enum EditorPlatform {
+    Macos,
+    Linux,
+    Windows,
+}
+
+impl EditorPlatform {
+    pub(crate) fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            EditorPlatform::Macos
+        } else if cfg!(target_os = "windows") {
+            EditorPlatform::Windows
+        } else {
+            EditorPlatform::Linux
+        }
+    }
+}
+
+/// Build the `host.listInstalledEditors` result for an injected platform +
+/// resolvers. `macos_only`/`win32_only` editors are skipped on other platforms;
+/// every remaining entry reports its detection result.
+pub(crate) fn list_installed_editors_with(
+    platform: EditorPlatform,
+    macos_dirs: &[PathBuf],
+    binary_resolver: &dyn BinaryResolver,
+    flatpak: &dyn FlatpakProbe,
+) -> Value {
+    let flatpak_installed = match platform {
+        EditorPlatform::Linux => flatpak.list_installed().unwrap_or_default(),
+        _ => std::collections::HashSet::new(),
+    };
+    let mut editors: Vec<Value> = Vec::with_capacity(KNOWN_EDITORS.len());
+    for editor in KNOWN_EDITORS {
+        let applies = match platform {
+            EditorPlatform::Macos => !editor.win32_only,
+            EditorPlatform::Windows => !editor.macos_only,
+            EditorPlatform::Linux => !editor.macos_only && !editor.win32_only,
+        };
+        if !applies {
+            continue;
+        }
+        let entry = match platform {
+            EditorPlatform::Macos => detect_editor_macos(editor, macos_dirs),
+            EditorPlatform::Linux => {
+                detect_editor_linux(editor, binary_resolver, &flatpak_installed)
+            }
+            EditorPlatform::Windows => detect_editor_windows(editor, binary_resolver),
+        };
+        editors.push(entry);
+    }
+    json!({ "editors": editors })
+}
+
+/// Production `host.listInstalledEditors` — wires in the real platform +
+/// resolvers + `home`-derived macOS app dirs.
+pub(crate) fn list_installed_editors_op() -> Value {
+    let home = home_dir();
+    list_installed_editors_with(
+        EditorPlatform::current(),
+        &macos_app_dirs(&home),
+        &OsBinaryResolver,
+        &OsFlatpakProbe,
+    )
 }
 
 /// Resolve the host home directory. Falls back to `/` so a missing `HOME`

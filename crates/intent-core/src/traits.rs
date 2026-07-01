@@ -11,14 +11,15 @@ use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId};
 use crate::model::{
     AgentDelegateInput, AgentLite, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
     CommentListResult, CommentResolveThreadResult, CommentRespondResult, Draft, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, FileActivity, GitAgentCommitResult, GitBranches,
-    GitCommitResult, GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate,
-    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, ProjectType,
-    ReadAssetResult, ScriptCreateParams, SetupScript, TaskAssignAgentResult,
-    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult,
-    TaskMarkAsTaskResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TokenUsage, Workspace, WorkspaceCreate, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    EventSubscribeResult, EventUnsubscribeResult, FileActivity, GitAgentCommitResult,
+    GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts, GitStatus, Note,
+    NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
+    NoteEditLinesResult, NoteEditResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, ProjectType, ReadAssetResult, ScriptCreateParams, SetupScript,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
+    WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -451,14 +452,16 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.list`: project a workspace's spec-linked task notes into the
-    /// canonical `WorkspaceTask` list (PROTOCOL §5.4). `status` optionally filters
-    /// to a single task status. Mirrors the FE `getWorkspaceTasks` set so the FE
-    /// can drop its `note.list`-metadata derivation.
+    /// canonical `WorkspaceTask` list **plus** the workspace-wide `taskStats`
+    /// aggregate (PROTOCOL §5.4). `status` optionally filters the task list to
+    /// a single status; `stats` is always computed over the unfiltered
+    /// spec-linked set so the FE can render the progress rollup verbatim
+    /// (mirrors the canonical FE `computeTaskStats` in `task-stats.ts`).
     fn task_list(
         &self,
         workspace_id: WorkspaceId,
         status: Option<String>,
-    ) -> BoxFuture<'_, Result<Vec<WorkspaceTask>>> {
+    ) -> BoxFuture<'_, Result<TaskListResult>> {
         let _ = (workspace_id, status);
         Box::pin(async {
             Err(Error::Internal(
@@ -622,12 +625,55 @@ pub trait WorkspaceApi: Send + Sync {
         None
     }
 
+    /// Whether a turn loop is currently in flight for `agent_id` — the
+    /// authoritative "active worker" signal backing the chat snapshot's live
+    /// merge gate. `chat.subscribe` consults this before merging the in-memory
+    /// `agent_live_turn` so a lingering live-turn slot with no real worker (or
+    /// a session that never finalized across a crash) does not surface a
+    /// phantom streaming message. Synchronous (no I/O); default `false` so
+    /// non-agent `WorkspaceApi` impls need not implement it.
+    fn agent_is_busy(&self, agent_id: AgentId) -> bool {
+        let _ = agent_id;
+        false
+    }
+
+    /// The daemon-owned runtime activity flags for `agent_id` as the object
+    /// `{ isResponding, isWaitingOnTool, isWaitingForOtherAgents, waitingForAgentIds }`
+    /// (PROTOCOL §5.5/§7.1): the BE-authoritative port of the FE agent-state
+    /// selectors so `chat.subscribe`'s seq-0 snapshot carries the same liveness
+    /// signal as the `AgentLite` projection. `isResponding` is the in-flight
+    /// "active worker" signal ([`agent_is_busy`](WorkspaceApi::agent_is_busy));
+    /// `isWaitingOnTool` is true when that turn has an unresolved `tool_use`;
+    /// `isWaitingForOtherAgents` is true when the agent parents one or more
+    /// pending completion watches; `waitingForAgentIds` is the distinct child
+    /// agent-ids of those watches (non-empty iff `isWaitingForOtherAgents`,
+    /// always emitted as `[]` otherwise — never null/omitted). Default returns
+    /// all-`false`/`[]` so non-agent `WorkspaceApi` impls need not implement it.
+    fn agent_activity_flags(&self, agent_id: AgentId) -> BoxFuture<'_, serde_json::Value> {
+        let _ = agent_id;
+        Box::pin(async {
+            serde_json::json!({
+                "isResponding": false,
+                "isWaitingOnTool": false,
+                "isWaitingForOtherAgents": false,
+                "waitingForAgentIds": [],
+            })
+        })
+    }
+
     /// `agent.create`: persist a new agent session; returns `{ agent: { id, name } }`
     /// (the process spawns lazily on first turn) (PROTOCOL §5.5).
     ///
     /// `parent_agent_id` is the caller/spawning agent: the MCP front door passes
     /// `Some(caller)` to stamp the child's `parentAgentId`; the FE/RPC front door
     /// passes `None` (top-level creates stay parentless).
+    ///
+    /// `requested_agent_id` is an optional well-formed `agent-{uuid}` id the
+    /// client already minted (e.g. the FE's `UnifiedAgentFactory` uses it to
+    /// key the pending session, then addresses `agent.sendMessage` at the same
+    /// id). When `Some`, the service adopts it verbatim; otherwise a fresh id
+    /// is minted. Malformed values are rejected as `-32602`.
+    #[allow(clippy::too_many_arguments)]
     fn agent_create(
         &self,
         workspace_id: WorkspaceId,
@@ -636,6 +682,7 @@ pub trait WorkspaceApi: Send + Sync {
         specialist_id: Option<String>,
         parent_agent_id: Option<AgentId>,
         idempotency_key: Option<String>,
+        requested_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
@@ -644,6 +691,7 @@ pub trait WorkspaceApi: Send + Sync {
             specialist_id,
             parent_agent_id,
             idempotency_key,
+            requested_agent_id,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -732,13 +780,18 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.editQueuedMessage`: edit a queued message's content (PROTOCOL §5.5).
+    /// `editing` (optional) toggles the entry's under-edit state — when `Some(true)`
+    /// the entry is excluded from the ready-to-send queue (drain skips it); when
+    /// `Some(false)` it is re-included and self-drains; when `None` the editing
+    /// flag is left unchanged (backwards-compatible with the original wire shape).
     fn agent_edit_queued_message(
         &self,
         agent_id: AgentId,
         message_id: String,
         content: String,
+        editing: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, message_id, content);
+        let _ = (agent_id, message_id, content, editing);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_edit_queued_message not implemented".to_string(),
@@ -1320,6 +1373,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `git.branchStatus`: ahead/behind vs `origin/<branch_name>` + working-tree
+    /// uncommitted-changes flag for a known `repo_path`. Same known-repo gate as
+    /// `git_get_branches`; an unknown repo path is `-32602` (PROTOCOL §5.6).
+    fn git_branch_status(
+        &self,
+        repo_path: String,
+        branch_name: String,
+    ) -> BoxFuture<'_, Result<GitBranchStatus>> {
+        let _ = (repo_path, branch_name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_branch_status not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `git.commit` (deprecated; prefer `git_agent_commit`): commit the already
     /// staged changes with `message`. Failures (incl. nothing to commit) are
     /// `-32603` (PROTOCOL §5.6).
@@ -1393,21 +1462,45 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `git.diffs`: per-file diff hunks for the working tree. `staged` selects
-    /// the HEAD→index diff (`true`) or the index→workdir diff (`false`,
-    /// default); `path` restricts the result to a single file. Returns
-    /// `[{ path, hunks }]`; remote/non-repo workspaces return an empty array
+    /// `git.diffs`: per-file diff hunks. When `commit_hash` is set, returns
+    /// the per-file hunks for `<commit_hash>^..<commit_hash>` (the commit's own
+    /// changes vs its first parent; a root commit yields all-additions) and the
+    /// `staged` flag is ignored. Otherwise `staged` selects the HEAD→index diff
+    /// (`true`) or the index→workdir diff (`false`, default). `path` restricts
+    /// the result to a single file. Returns `[{ path, hunks }]`; remote/non-repo
+    /// workspaces and an unresolvable `commit_hash` return an empty array
     /// (wire §7.7).
     fn git_diffs(
         &self,
         workspace_id: WorkspaceId,
         path: Option<String>,
         staged: bool,
+        commit_hash: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, path, staged);
+        let _ = (workspace_id, path, staged, commit_hash);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_diffs not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.commitDetails`: metadata + per-file `(additions, deletions)` for a
+    /// single commit, addressed by `commit_hash` (full SHA or short ref).
+    /// Returns the wire shape `{ commitHash, author, authorEmail, date, message,
+    /// files: string[], fileDetails: [{ path, additions, deletions }] }`.
+    /// Remote/non-repo workspaces and an unresolvable hash return an empty
+    /// envelope (`{ commitHash, fileDetails: [], files: [] }`) so the FE renders
+    /// a friendly empty state instead of crashing (wire §7.7).
+    fn git_commit_details(
+        &self,
+        workspace_id: WorkspaceId,
+        commit_hash: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, commit_hash);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_commit_details not implemented".to_string(),
             ))
         })
     }

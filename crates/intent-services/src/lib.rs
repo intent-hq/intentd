@@ -29,11 +29,12 @@ use intent_core::{
     NoteEditLinesResult, NoteEditResult, NoteId, NoteSetContentResult, NoteTaskRow,
     NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ProjectType, ReadAssetResult,
     ScriptCreateParams, SessionStats, SetupScript, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata,
-    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TokenUsage, Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary,
-    WorkspaceAttention, WorkspaceCreate, WorkspaceDiffSummary, WorkspaceEventSummary, WorkspaceId,
-    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
+    TaskMetadata, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult,
+    TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
+    WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceDiffSummary,
+    WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
+    WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -90,6 +91,21 @@ pub use agent_manager::{
 pub use events::{EventBus, FileWatcher, Subscription, SubscriptionFilter};
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
+
+/// Statuses that the FE treats as in-flight (its `isActiveAgentThread`
+/// selector returns `true` for these). After a daemon crash the runtime
+/// in-memory `AgentManager` and live-turn slots are empty, so a session
+/// persisted in one of these statuses is "stale": it has no worker but the FE
+/// would still render a "Thinking" spinner. The heal sweep rewrites them to
+/// [`intent_core::AgentStatus::RuntimeIdle`].
+fn is_stale_in_flight_status(status: intent_core::AgentStatus) -> bool {
+    matches!(
+        status,
+        intent_core::AgentStatus::Active
+            | intent_core::AgentStatus::Processing
+            | intent_core::AgentStatus::Waiting
+    )
+}
 
 /// Aggregate service handle wired by the binary composition root. It implements
 /// `WorkspaceApi` so it can be handed to `intent-acp` as `Arc<dyn WorkspaceApi>`
@@ -199,6 +215,12 @@ pub struct Services {
     /// clones so the [`AgentManager`]'s turn writer and the `WorkspaceApi` chat
     /// read door observe the same state; populated only while a turn streams.
     live_turns: agent_session::LiveTurns,
+    /// Test-only override for [`WorkspaceApi::agent_is_busy`]: lets unit/UDS
+    /// tests simulate an in-flight worker without spawning a real
+    /// [`AgentManager`]. Production composition always attaches a manager and
+    /// reads through it; this set is empty there. Shared across clones so a
+    /// `set_test_busy` on one handle is visible to every other handle.
+    test_busy: Arc<Mutex<HashSet<AgentId>>>,
 }
 
 impl Services {
@@ -227,6 +249,7 @@ impl Services {
             mcp_hub: Arc::new(McpHub::new()),
             context_engine: Arc::new(intent_context::AuggieContextEngine::new()),
             live_turns: Arc::new(Mutex::new(HashMap::new())),
+            test_busy: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -469,6 +492,61 @@ impl Services {
     /// manager has been dropped (read-only/test wiring).
     pub(crate) fn agent_manager(&self) -> Option<Arc<AgentManager>> {
         self.agent_manager.get().and_then(Weak::upgrade)
+    }
+
+    /// Test-only seam: mark `agent_id` as busy (or clear it) so
+    /// [`WorkspaceApi::agent_is_busy`] reports `true` without spawning a real
+    /// [`AgentManager`]. Production composition always attaches a manager and
+    /// never touches this; the seam exists so transport-level chat-snapshot
+    /// tests can simulate a mid-turn alongside [`Services::set_live_turn`].
+    #[doc(hidden)]
+    pub fn set_test_busy(&self, agent_id: &AgentId, busy: bool) {
+        if let Ok(mut set) = self.test_busy.lock() {
+            if busy {
+                set.insert(agent_id.clone());
+            } else {
+                set.remove(agent_id);
+            }
+        }
+    }
+
+    /// Daemon-startup heal for stale in-flight conversations: sessions left in
+    /// an "active" status (`Active`, `Processing`, `Waiting`) across a crash or
+    /// hard shutdown have no live worker after restart — the
+    /// [`AgentManager`]'s in-memory busy set and the per-agent live-turn slots
+    /// start empty — but their persisted [`AgentStatus`] would otherwise drive
+    /// the FE's `isActiveAgentThread` selector to true and surface a phantom
+    /// "Thinking" indicator. This sweep walks every session and rewrites those
+    /// statuses to [`AgentStatus::RuntimeIdle`] (the modern lowercase `"idle"`,
+    /// non-terminal and non-active), so opening a chat after restart shows a
+    /// settled conversation. Pending sessions and any already-terminal status
+    /// (`Completed`/`Error`/`Deleted`) are left untouched. Returns the number
+    /// of sessions healed. Errors are surfaced so the composition root can log
+    /// and continue: heal is best-effort and never gates `serve`.
+    pub async fn heal_stale_agent_sessions(&self) -> Result<usize> {
+        let sessions = self.store.list_all_agent_sessions().await?;
+        let mut healed = 0usize;
+        for mut session in sessions {
+            if !is_stale_in_flight_status(session.status) {
+                continue;
+            }
+            let prev = session.status;
+            session.status = intent_core::AgentStatus::RuntimeIdle;
+            session.is_active = false;
+            session.updated_at = now_iso();
+            // The update path enforces the `acpSessionId` write-once and
+            // `provider` immutability invariants (§9.5); the heal preserves
+            // both because it only edits status/is_active/updated_at.
+            self.store.update_agent_session(&session).await?;
+            healed += 1;
+            tracing::info!(
+                agent_id = %session.id,
+                workspace_id = %session.workspace_id,
+                from = ?prev,
+                "healed stale in-flight agent session"
+            );
+        }
+        Ok(healed)
     }
 
     /// Configure the note-asset root directory (for `note.readAsset`).
@@ -3836,7 +3914,7 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         status: Option<String>,
-    ) -> BoxFuture<'_, Result<Vec<WorkspaceTask>>> {
+    ) -> BoxFuture<'_, Result<TaskListResult>> {
         let store = self.store.clone();
         Box::pin(async move {
             let filter = match status.as_deref() {
@@ -3844,11 +3922,15 @@ impl WorkspaceApi for Services {
                 None => None,
             };
             let notes = store.list_notes(&workspace_id).await?;
+            // `stats` is the workspace-wide rollup over the full spec-linked
+            // set (mirrors the FE `computeTaskStats`); the optional `status`
+            // filter narrows `tasks` only.
+            let stats = compute_task_stats(&notes);
             let mut tasks = workspace_task_list(&notes);
             if let Some(f) = filter {
                 tasks.retain(|t| t.status == f);
             }
-            Ok(tasks)
+            Ok(TaskListResult { tasks, stats })
         })
     }
 
@@ -4913,6 +4995,25 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn git_branch_status(
+        &self,
+        repo_path: String,
+        branch_name: String,
+    ) -> BoxFuture<'_, Result<intent_core::GitBranchStatus>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Same known-repo gate as `git_get_branches`: an unknown/unauthorized
+            // repo path is `-32602` (PROTOCOL §5.6).
+            let workspaces = store.list_workspaces(true).await?;
+            if !git_ops::is_known_repo(&workspaces, &repo_path) {
+                return Err(Error::InvalidParams(
+                    "Unknown or unauthorized repository path".to_string(),
+                ));
+            }
+            intent_git::branches::branch_status(std::path::Path::new(&repo_path), &branch_name)
+        })
+    }
+
     fn repo_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -5123,6 +5224,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         path: Option<String>,
         staged: bool,
+        commit_hash: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -5141,7 +5243,37 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
-            git_ops::build_diffs(&worktree, path.as_deref(), staged)
+            git_ops::build_diffs(&worktree, path.as_deref(), staged, commit_hash.as_deref())
+        })
+    }
+
+    fn git_commit_details(
+        &self,
+        workspace_id: WorkspaceId,
+        commit_hash: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let empty = git_ops::empty_commit_details(&commit_hash);
+            let ws = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(Error::NotFound(_)) => return Ok(empty),
+                Err(e) => return Err(e),
+            };
+            if ws.is_remote {
+                return Ok(empty);
+            }
+            let Some(worktree) = git_ops::worktree_path(&ws) else {
+                return Ok(empty);
+            };
+            if !worktree.join(".git").exists() {
+                return Ok(empty);
+            }
+            match git_ops::build_commit_details(&worktree, &commit_hash) {
+                Ok(value) => Ok(value),
+                Err(Error::NotFound(_)) => Ok(empty),
+                Err(e) => Err(e),
+            }
         })
     }
 
@@ -5246,6 +5378,55 @@ impl WorkspaceApi for Services {
         }))
     }
 
+    fn agent_is_busy(&self, agent_id: AgentId) -> bool {
+        // Production: defer to the attached [`AgentManager`] — its in-flight
+        // [`AgentManager::is_busy`] set is the authoritative "active worker"
+        // signal that gates the chat snapshot's live-turn merge. The test seam
+        // below covers unit/UDS tests that simulate a mid-turn without spawning
+        // a real manager.
+        if let Some(manager) = self.agent_manager() {
+            if manager.is_busy(&agent_id) {
+                return true;
+            }
+        }
+        match self.test_busy.lock() {
+            Ok(set) => set.contains(&agent_id),
+            Err(_) => false,
+        }
+    }
+
+    fn agent_activity_flags(&self, agent_id: AgentId) -> BoxFuture<'_, serde_json::Value> {
+        Box::pin(async move {
+            // Load the session so the flags honor the same terminal-status
+            // short-circuit and parent-watch lookup as the `AgentLite`
+            // projection (see [`agent_activity_flags_for`]). On a read error the
+            // snapshot degrades to all-`false` rather than failing the
+            // subscription (matching `chat_snapshot`'s degrade-to-empty pattern).
+            match self.store.get_agent_session(&agent_id).await {
+                Ok(session) => {
+                    let (
+                        is_responding,
+                        is_waiting_on_tool,
+                        is_waiting_for_other_agents,
+                        waiting_for_agent_ids,
+                    ) = self.agent_activity_flags_for(&session);
+                    serde_json::json!({
+                        "isResponding": is_responding,
+                        "isWaitingOnTool": is_waiting_on_tool,
+                        "isWaitingForOtherAgents": is_waiting_for_other_agents,
+                        "waitingForAgentIds": waiting_for_agent_ids,
+                    })
+                }
+                Err(_) => serde_json::json!({
+                    "isResponding": false,
+                    "isWaitingOnTool": false,
+                    "isWaitingForOtherAgents": false,
+                    "waitingForAgentIds": [],
+                }),
+            }
+        })
+    }
+
     fn agent_create(
         &self,
         workspace_id: WorkspaceId,
@@ -5254,6 +5435,7 @@ impl WorkspaceApi for Services {
         specialist_id: Option<String>,
         parent_agent_id: Option<AgentId>,
         idempotency_key: Option<String>,
+        requested_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             let ws_scope = workspace_id.0.clone();
@@ -5271,6 +5453,7 @@ impl WorkspaceApi for Services {
                         parent_agent_id,
                         None,
                         false,
+                        requested_agent_id,
                     )
                     .await
                 },
@@ -5358,9 +5541,10 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         message_id: String,
         content: String,
+        editing: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_edit_queued_message_op(agent_id, message_id, content)
+            self.agent_edit_queued_message_op(agent_id, message_id, content, editing)
                 .await
         })
     }

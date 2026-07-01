@@ -400,9 +400,12 @@ pub(crate) async fn channel_snapshot(
 /// existing paginated read, then — when a turn is currently streaming —
 /// the in-flight partial assistant message merged in (CS-0 D5) so a
 /// `chat.subscribe` arriving mid-turn reconstructs a coherent in-flight message.
-/// On a read error the snapshot degrades to an empty messages page rather than
-/// failing the subscription (matching [`channel_snapshot`]'s degrade-to-empty
-/// pattern).
+/// The merge is gated on [`WorkspaceApi::agent_is_busy`]: a lingering
+/// `agent_live_turn` slot whose worker is gone (mid-turn crash, race between
+/// abort and slot release) MUST NOT surface a phantom "streaming" message
+/// when a client opens the chat. On a read error the snapshot degrades to an
+/// empty messages page rather than failing the subscription (matching
+/// [`channel_snapshot`]'s degrade-to-empty pattern).
 pub(crate) async fn chat_snapshot(api: &dyn WorkspaceApi, agent_id: &AgentId) -> Value {
     let mut snapshot = match api
         .agent_get_conversation(agent_id.clone(), None, None, None)
@@ -417,8 +420,20 @@ pub(crate) async fn chat_snapshot(api: &dyn WorkspaceApi, agent_id: &AgentId) ->
             "nextToken": Value::Null,
         }),
     };
-    if let Some(live) = api.agent_live_turn(agent_id.clone()) {
-        merge_live_turn(&mut snapshot, agent_id, &live);
+    if api.agent_is_busy(agent_id.clone()) {
+        if let Some(live) = api.agent_live_turn(agent_id.clone()) {
+            merge_live_turn(&mut snapshot, agent_id, &live);
+        }
+    }
+    // Overlay the daemon-owned activity flags (PROTOCOL §7.1) so a client
+    // arriving mid-turn renders the same `isResponding`/`isWaitingOnTool`/
+    // `isWaitingForOtherAgents` (+ the companion `waitingForAgentIds` list)
+    // state as the `AgentLite` projection (§5.5).
+    let flags = api.agent_activity_flags(agent_id.clone()).await;
+    if let (Some(obj), Some(flag_obj)) = (snapshot.as_object_mut(), flags.as_object()) {
+        for (key, value) in flag_obj {
+            obj.insert(key.clone(), value.clone());
+        }
     }
     snapshot
 }

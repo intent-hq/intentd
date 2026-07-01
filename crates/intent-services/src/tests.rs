@@ -835,23 +835,33 @@ async fn task_list_and_get_project_workspace_tasks() {
 
     let svc = Services::new(store);
 
-    // task.list returns the three spec-linked task notes (cancelled included).
-    let tasks = svc.task_list(ws.clone(), None).await.expect("task.list");
-    assert_eq!(tasks.len(), 3);
-    let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+    // task.list returns the three spec-linked task notes (cancelled included)
+    // plus the workspace-wide stats aggregate (full set, mirrors the FE
+    // `computeTaskStats`: total excludes cancelled, completed counts complete,
+    // inProgress counts in_progress + review_required).
+    let result = svc.task_list(ws.clone(), None).await.expect("task.list");
+    assert_eq!(result.tasks.len(), 3);
+    let ids: Vec<&str> = result.tasks.iter().map(|t| t.id.as_str()).collect();
     assert_eq!(ids, vec!["task-a", "task-b", "task-c"]);
-    let alpha = &tasks[0];
+    let alpha = &result.tasks[0];
     assert_eq!(alpha.title, "Alpha");
     assert_eq!(alpha.status, TaskStatus::InProgress);
     assert!(!alpha.updated_at.is_empty());
+    assert_eq!(result.stats.total, 2);
+    assert_eq!(result.stats.completed, 1);
+    assert_eq!(result.stats.in_progress, 1);
 
-    // Status filter narrows to the matching task notes.
+    // Status filter narrows `tasks` only; `stats` stays the full rollup so the
+    // FE renders the progress bar verbatim regardless of the active filter.
     let done = svc
         .task_list(ws.clone(), Some("complete".into()))
         .await
         .expect("task.list filtered");
-    assert_eq!(done.len(), 1);
-    assert_eq!(done[0].id.as_str(), "task-b");
+    assert_eq!(done.tasks.len(), 1);
+    assert_eq!(done.tasks[0].id.as_str(), "task-b");
+    assert_eq!(done.stats.total, 2);
+    assert_eq!(done.stats.completed, 1);
+    assert_eq!(done.stats.in_progress, 1);
 
     // Invalid status string is rejected.
     assert!(svc
@@ -3861,7 +3871,7 @@ mod file_tracking {
         std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
-        let diffs = svc.git_diffs(ws_id, None, false).await.unwrap();
+        let diffs = svc.git_diffs(ws_id, None, false, None).await.unwrap();
         let arr = diffs.as_array().unwrap();
         let f = arr.iter().find(|d| d["path"] == "seed.txt").unwrap();
         let hunks = f["hunks"].as_array().unwrap();
@@ -3895,7 +3905,7 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some("seed.txt".to_string()), true)
+            .git_diffs(ws_id, Some("seed.txt".to_string()), true, None)
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
@@ -3914,12 +3924,140 @@ mod file_tracking {
             serde_json::json!([])
         );
         assert_eq!(
-            svc.git_diffs(ws.clone(), None, false).await.unwrap(),
+            svc.git_diffs(ws.clone(), None, false, None).await.unwrap(),
             serde_json::json!([])
         );
-        let commits = svc.git_commits(ws, None, None).await.unwrap();
+        let commits = svc.git_commits(ws.clone(), None, None).await.unwrap();
         assert_eq!(commits["items"], serde_json::json!([]));
         assert_eq!(commits["nextToken"], serde_json::Value::Null);
+        // git.commitDetails degrades to an empty envelope (graceful) — same as
+        // the other git reads — when the workspace has no worktree.
+        let details = svc
+            .git_commit_details(ws, "deadbeef".to_string())
+            .await
+            .unwrap();
+        assert_eq!(details["commitHash"], "deadbeef");
+        assert_eq!(details["files"], serde_json::json!([]));
+        assert_eq!(details["fileDetails"], serde_json::json!([]));
+    }
+
+    /// `git.commitDetails` returns the commit's metadata + per-file additions/
+    /// deletions for a real repo (PROTOCOL §5.6).
+    #[tokio::test]
+    async fn git_commit_details_returns_metadata_and_file_stats() {
+        let repo = init_git_repo();
+        // Land a second commit so HEAD has a non-empty parent diff.
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        std::fs::write(repo.dir.join("new.txt"), "hello\n").unwrap();
+        {
+            let r = Repository::open(&repo.dir).unwrap();
+            let mut idx = r.index().unwrap();
+            idx.add_path(std::path::Path::new("seed.txt")).unwrap();
+            idx.add_path(std::path::Path::new("new.txt")).unwrap();
+            idx.write().unwrap();
+            let tree_oid = idx.write_tree().unwrap();
+            let tree = r.find_tree(tree_oid).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let parent = r
+                .head()
+                .unwrap()
+                .target()
+                .and_then(|oid| r.find_commit(oid).ok())
+                .unwrap();
+            r.commit(Some("HEAD"), &sig, &sig, "second", &tree, &[&parent])
+                .unwrap();
+        }
+        let head = Repository::open(&repo.dir)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let details = svc.git_commit_details(ws_id, head.clone()).await.unwrap();
+        assert_eq!(details["commitHash"], head);
+        assert_eq!(details["author"], "Test");
+        assert_eq!(details["authorEmail"], "test@example.com");
+        assert_eq!(details["message"], "second");
+        let files = details["files"].as_array().unwrap();
+        assert!(files.iter().any(|f| f == "seed.txt"));
+        assert!(files.iter().any(|f| f == "new.txt"));
+        let file_details = details["fileDetails"].as_array().unwrap();
+        let seed = file_details
+            .iter()
+            .find(|f| f["path"] == "seed.txt")
+            .unwrap();
+        assert_eq!(seed["additions"], 1);
+        assert_eq!(seed["deletions"], 0);
+    }
+
+    /// An unresolvable `commitHash` degrades to the empty envelope (graceful)
+    /// rather than surfacing as a `-32603` so the FE can render an empty state.
+    #[tokio::test]
+    async fn git_commit_details_unknown_hash_is_empty_envelope() {
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+        let details = svc
+            .git_commit_details(
+                ws_id,
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            details["commitHash"],
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        );
+        assert_eq!(details["files"], serde_json::json!([]));
+        assert_eq!(details["fileDetails"], serde_json::json!([]));
+    }
+
+    /// `git.diffs` with `commitHash` returns the commit's per-file hunks vs
+    /// its first parent (PROTOCOL §5.6 extension).
+    #[tokio::test]
+    async fn git_diffs_with_commit_hash_returns_per_file_hunks() {
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        {
+            let r = Repository::open(&repo.dir).unwrap();
+            let mut idx = r.index().unwrap();
+            idx.add_path(std::path::Path::new("seed.txt")).unwrap();
+            idx.write().unwrap();
+            let tree_oid = idx.write_tree().unwrap();
+            let tree = r.find_tree(tree_oid).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let parent = r
+                .head()
+                .unwrap()
+                .target()
+                .and_then(|oid| r.find_commit(oid).ok())
+                .unwrap();
+            r.commit(Some("HEAD"), &sig, &sig, "second", &tree, &[&parent])
+                .unwrap();
+        }
+        let head = Repository::open(&repo.dir)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let diffs = svc
+            .git_diffs(ws_id, Some("seed.txt".to_string()), false, Some(head))
+            .await
+            .unwrap();
+        let arr = diffs.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["path"], "seed.txt");
+        let lines = arr[0]["hunks"][0]["lines"].as_array().unwrap();
+        assert!(lines
+            .iter()
+            .any(|l| l["type"] == "Addition"
+                && l["content"].as_str().unwrap_or("").contains("added")));
     }
 }
 
@@ -5106,6 +5244,12 @@ mod script {
 
     /// A service that exits faster than the 2s floor is treated as a config error
     /// and is NOT auto-restarted (the ported backoff guard).
+    ///
+    /// Deterministic against scheduling jitter: after observing `exited`, keep
+    /// draining `script:state` events across a window that comfortably exceeds
+    /// `AUTO_RESTART_DELAY` and assert no second `running` arrives. A spurious
+    /// restart shows up as an event (failure with a clear message) rather than
+    /// hiding behind a wall-clock poll.
     #[tokio::test]
     async fn service_too_fast_exit_does_not_restart() {
         let h = harness().await;
@@ -5116,8 +5260,29 @@ mod script {
             (v["type"] == "script:state" && v["data"]["status"] == "exited").then_some(())
         })
         .await;
-        // Past the restart delay it must stay exited, with no restart attempts.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // Observation window > AUTO_RESTART_DELAY (1s) so any restart attempt
+        // emits a `running` `script:state` we'd catch deterministically.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(3000);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, sub.recv()).await {
+                Err(_) => break,
+                Ok(None) => break,
+                Ok(Some(batch)) => {
+                    for ev in &batch {
+                        let v = serde_json::to_value(ev).expect("serialize");
+                        if v["type"] == "script:state" && v["data"]["status"] == "running" {
+                            panic!(
+                                "too-fast-exit service must NOT auto-restart; saw second `running` script:state: {v}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let st = h.services.script_status(id).await.expect("status");
         assert_eq!(st["status"], "exited");
         assert_eq!(st["restartCount"], 0);
@@ -6280,5 +6445,140 @@ mod sentry {
             assert_eq!(v["shortId"], "PROJ-1");
             assert!(v.get("items").is_none(), "no envelope");
         }
+    }
+}
+
+/// Daemon-startup heal sweep (iter#1c): sessions left non-terminal across a
+/// crash must be rewritten to a non-active status so the FE does not surface a
+/// phantom "Thinking" spinner the next time the chat is opened.
+mod heal_stale_agent_sessions {
+    use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
+    use intent_store::Store;
+
+    use super::{workspace, TempDb};
+    use crate::Services;
+
+    fn mk_session(ws: &WorkspaceId, id: &str, status: AgentStatus) -> AgentSession {
+        let ts = now_iso();
+        AgentSession {
+            id: AgentId::from(id),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: id.to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status,
+            is_active: matches!(
+                status,
+                AgentStatus::Active | AgentStatus::Processing | AgentStatus::Waiting
+            ),
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    }
+
+    #[tokio::test]
+    async fn rewrites_active_processing_waiting_to_runtime_idle() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+        // Three stale shapes (the FE's `isActiveAgentThread` statuses) + four
+        // shapes the heal MUST leave untouched (pending, both idle variants,
+        // and the terminal completed/error/deleted family).
+        store
+            .insert_agent_session(&mk_session(&ws, "stale-active", AgentStatus::Active))
+            .await
+            .expect("stale-active");
+        store
+            .insert_agent_session(&mk_session(
+                &ws,
+                "stale-processing",
+                AgentStatus::Processing,
+            ))
+            .await
+            .expect("stale-processing");
+        store
+            .insert_agent_session(&mk_session(&ws, "stale-waiting", AgentStatus::Waiting))
+            .await
+            .expect("stale-waiting");
+        store
+            .insert_agent_session(&mk_session(&ws, "untouched-pending", AgentStatus::Pending))
+            .await
+            .expect("pending");
+        store
+            .insert_agent_session(&mk_session(
+                &ws,
+                "untouched-idle-lc",
+                AgentStatus::RuntimeIdle,
+            ))
+            .await
+            .expect("idle-lc");
+        store
+            .insert_agent_session(&mk_session(&ws, "untouched-idle-uc", AgentStatus::Idle))
+            .await
+            .expect("idle-uc");
+        store
+            .insert_agent_session(&mk_session(
+                &ws,
+                "untouched-completed",
+                AgentStatus::Completed,
+            ))
+            .await
+            .expect("completed");
+        store
+            .insert_agent_session(&mk_session(&ws, "untouched-error", AgentStatus::Error))
+            .await
+            .expect("error");
+
+        let services = Services::new(store.clone());
+        let healed = services
+            .heal_stale_agent_sessions()
+            .await
+            .expect("heal sweep");
+        assert_eq!(healed, 3, "exactly the three stale shapes were rewritten");
+
+        // The three stale sessions are now non-active runtime-idle.
+        for id in ["stale-active", "stale-processing", "stale-waiting"] {
+            let s = store
+                .get_agent_session(&AgentId::from(id))
+                .await
+                .expect("reload");
+            assert_eq!(s.status, AgentStatus::RuntimeIdle, "{id} healed to idle");
+            assert!(!s.is_active, "{id} is_active cleared");
+        }
+
+        // Every untouched session keeps its persisted status, including the
+        // pending shape (waiting on a first turn) and the terminal family.
+        for (id, want) in [
+            ("untouched-pending", AgentStatus::Pending),
+            ("untouched-idle-lc", AgentStatus::RuntimeIdle),
+            ("untouched-idle-uc", AgentStatus::Idle),
+            ("untouched-completed", AgentStatus::Completed),
+            ("untouched-error", AgentStatus::Error),
+        ] {
+            let s = store
+                .get_agent_session(&AgentId::from(id))
+                .await
+                .expect("reload");
+            assert_eq!(s.status, want, "{id} status unchanged");
+        }
+
+        // A second sweep is a no-op: the heal is idempotent.
+        let healed_again = services
+            .heal_stale_agent_sessions()
+            .await
+            .expect("heal sweep (idempotent)");
+        assert_eq!(healed_again, 0);
     }
 }

@@ -7,8 +7,8 @@
 
 use std::path::Path;
 
-use git2::{BranchType, Repository};
-use intent_core::{GitBranches, Result};
+use git2::{BranchType, Repository, Status, StatusOptions};
+use intent_core::{GitBranchStatus, GitBranches, Result};
 
 use crate::map_git_err;
 use crate::status::current_branch;
@@ -31,6 +31,68 @@ pub fn get_branches(repo_path: &Path, include_remote: bool) -> Result<GitBranche
         current_branch: current,
         default_branch,
     })
+}
+
+/// Branch status for `branch_name` in the repository at `repo_path`: ahead/behind
+/// vs `refs/remotes/origin/<branch_name>` (`(0, 0)` when there is no upstream,
+/// mirroring the TS `git rev-list ... || 0\t0` fallback), the worktree's
+/// currently-checked-out branch (with `is_current_branch` derived against the
+/// queried name), and whether the working tree has any uncommitted changes
+/// (staged, unstaged, or untracked — matching the legacy
+/// `git status --porcelain` semantics). Local-only: no fetch is performed.
+pub fn branch_status(repo_path: &Path, branch_name: &str) -> Result<GitBranchStatus> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let current = current_branch(&repo);
+    let (ahead, behind) = ahead_behind_vs_origin(&repo, branch_name);
+    let has_uncommitted_changes = has_any_changes(&repo)?;
+    Ok(GitBranchStatus {
+        branch: branch_name.to_string(),
+        is_current_branch: current == branch_name,
+        current_branch: current,
+        ahead,
+        behind,
+        has_uncommitted_changes,
+    })
+}
+
+/// Ahead/behind of HEAD vs `refs/remotes/origin/<branch_name>`. Returns
+/// `(0, 0)` when HEAD or the upstream ref is unresolvable (no upstream
+/// configured, unborn HEAD, etc.) — mirrors the TS `0\t0` fallback in
+/// `git rev-list --left-right --count HEAD...origin/<branch>`.
+fn ahead_behind_vs_origin(repo: &Repository, branch_name: &str) -> (i64, i64) {
+    if branch_name.is_empty() {
+        return (0, 0);
+    }
+    let Some(local) = repo.head().ok().and_then(|h| h.target()) else {
+        return (0, 0);
+    };
+    let upstream_ref = format!("refs/remotes/origin/{branch_name}");
+    let Some(upstream) = repo
+        .find_reference(&upstream_ref)
+        .ok()
+        .and_then(|r| r.target())
+    else {
+        return (0, 0);
+    };
+    match repo.graph_ahead_behind(local, upstream) {
+        Ok((a, b)) => (a as i64, b as i64),
+        Err(_) => (0, 0),
+    }
+}
+
+/// Whether the working tree has any uncommitted changes (staged, unstaged, or
+/// untracked), mirroring the legacy `git status --porcelain` "any output ⇒
+/// dirty" check. Ignored files are excluded (parity with the porcelain default).
+fn has_any_changes(repo: &Repository) -> Result<bool> {
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false)
+        .include_unmodified(false);
+    let statuses = repo.statuses(Some(&mut opts)).map_err(map_git_err)?;
+    Ok(statuses
+        .iter()
+        .any(|e| !e.status().contains(Status::IGNORED) && !e.status().is_empty()))
 }
 
 fn local_branches(repo: &Repository) -> Result<Vec<String>> {
@@ -165,5 +227,53 @@ mod tests {
             .unwrap();
         // Current ranks above a plain branch despite the later alphabetical name.
         assert!(cur < other);
+    }
+
+    #[test]
+    fn branch_status_no_upstream_returns_zero_counts_and_clean() {
+        let dir = init_repo("branch-status-clean");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let current = current_branch(&repo);
+        let result = branch_status(dir.path(), &current).unwrap();
+        assert_eq!(result.branch, current);
+        assert_eq!(result.current_branch, current);
+        assert!(result.is_current_branch);
+        assert_eq!(result.ahead, 0);
+        assert_eq!(result.behind, 0);
+        assert!(!result.has_uncommitted_changes);
+    }
+
+    #[test]
+    fn branch_status_detects_modified_file_as_dirty() {
+        let dir = init_repo("branch-status-dirty");
+        commit_file(dir.path(), "a.txt", "one\n");
+        crate::testutil::write_file(dir.path(), "a.txt", "two\n");
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let current = current_branch(&repo);
+        let result = branch_status(dir.path(), &current).unwrap();
+        assert!(result.has_uncommitted_changes);
+    }
+
+    #[test]
+    fn branch_status_detects_untracked_file_as_dirty() {
+        let dir = init_repo("branch-status-untracked");
+        commit_file(dir.path(), "a.txt", "x\n");
+        crate::testutil::write_file(dir.path(), "new.txt", "hi");
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let current = current_branch(&repo);
+        let result = branch_status(dir.path(), &current).unwrap();
+        assert!(result.has_uncommitted_changes);
+    }
+
+    #[test]
+    fn branch_status_is_current_branch_false_for_other_branch() {
+        let dir = init_repo("branch-status-other");
+        commit_file(dir.path(), "a.txt", "x\n");
+        create_branch(dir.path(), "feature");
+        let result = branch_status(dir.path(), "feature").unwrap();
+        assert_eq!(result.branch, "feature");
+        assert!(!result.is_current_branch);
+        assert_ne!(result.current_branch, "feature");
     }
 }

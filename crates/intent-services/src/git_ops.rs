@@ -111,16 +111,33 @@ pub(crate) fn commit_to_commit_info(c: &intent_git::history::CommitRecord) -> Va
 }
 
 /// Build the `git.diffs` wire result (`[{ path, hunks }]`) for a worktree.
-/// `staged` selects the HEAD→index diff (else index→workdir); `path` filters to
-/// a single file. Hunks for staged changes are hydrated from the recorded blob
-/// SHAs; unstaged changes read workdir content directly. Binary files yield an
-/// empty `hunks` array.
-pub(crate) fn build_diffs(worktree: &Path, path: Option<&str>, staged: bool) -> Result<Value> {
-    let files = if staged {
-        intent_git::diff::diff_head_to_index(worktree)?
-    } else {
-        intent_git::diff::diff_index_to_workdir(worktree)?
+/// When `commit_hash` is set, returns hunks for `<commit_hash>^..<commit_hash>`
+/// and `staged` is ignored. Otherwise `staged` selects the HEAD→index diff
+/// (else index→workdir). `path` filters to a single file. Hunks for staged /
+/// committed changes are hydrated from the recorded blob SHAs; unstaged changes
+/// read workdir content directly. Binary files yield an empty `hunks` array.
+/// A `commit_hash` that does not resolve degrades to an empty array.
+pub(crate) fn build_diffs(
+    worktree: &Path,
+    path: Option<&str>,
+    staged: bool,
+    commit_hash: Option<&str>,
+) -> Result<Value> {
+    let files = match commit_hash {
+        Some(hash) => match intent_git::diff::diff_commit(worktree, hash) {
+            Ok(f) => f,
+            Err(Error::NotFound(_)) => return Ok(Value::Array(Vec::new())),
+            Err(e) => return Err(e),
+        },
+        None => {
+            if staged {
+                intent_git::diff::diff_head_to_index(worktree)?
+            } else {
+                intent_git::diff::diff_index_to_workdir(worktree)?
+            }
+        }
     };
+    let use_blob_hunks = commit_hash.is_some() || staged;
     let mut out = Vec::new();
     for fd in &files {
         if let Some(p) = path {
@@ -130,7 +147,7 @@ pub(crate) fn build_diffs(worktree: &Path, path: Option<&str>, staged: bool) -> 
         }
         let hunks = if fd.is_binary {
             Vec::new()
-        } else if staged {
+        } else if use_blob_hunks {
             intent_git::diff::hunks_between(
                 worktree,
                 fd.old_blob.as_deref(),
@@ -142,6 +159,50 @@ pub(crate) fn build_diffs(worktree: &Path, path: Option<&str>, staged: bool) -> 
         out.push(json!({ "path": fd.path, "hunks": hunks_to_value(&hunks) }));
     }
     Ok(Value::Array(out))
+}
+
+/// Build the `git.commitDetails` wire result for a single commit. Returns the
+/// flattened shape consumed by the FE ChangesTabType: metadata plus the
+/// per-file `fileDetails: [{ path, additions, deletions }]` array (`files` is
+/// the flat path-string list, kept for callers that only want names).
+pub(crate) fn build_commit_details(worktree: &Path, commit_hash: &str) -> Result<Value> {
+    let details = intent_git::history::commit_details(worktree, commit_hash)?;
+    let files: Vec<Value> = details.files.iter().map(|f| json!(f.path)).collect();
+    let file_details: Vec<Value> = details
+        .files
+        .iter()
+        .map(|f| {
+            json!({
+                "path": f.path,
+                "additions": f.additions,
+                "deletions": f.deletions,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "commitHash": details.hash,
+        "author": details.author,
+        "authorEmail": details.author_email,
+        "date": details.date,
+        "message": details.message,
+        "files": files,
+        "fileDetails": file_details,
+    }))
+}
+
+/// Empty `git.commitDetails` envelope returned for non-repo / remote / unknown
+/// workspaces and for an unresolvable `commit_hash`. Mirrors the graceful-empty
+/// pattern used by `git_diffs`/`git_commits`.
+pub(crate) fn empty_commit_details(commit_hash: &str) -> Value {
+    json!({
+        "commitHash": commit_hash,
+        "author": "",
+        "authorEmail": "",
+        "date": "",
+        "message": "",
+        "files": Vec::<Value>::new(),
+        "fileDetails": Vec::<Value>::new(),
+    })
 }
 
 /// Convert the internal hunk list to the wire shape consumed by the FE diff

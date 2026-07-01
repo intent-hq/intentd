@@ -730,3 +730,797 @@ impl<'a> McpServersService<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use super::*;
+    use crate::events::{EventBus, SubscriptionFilter};
+    use crate::settings::InMemorySecretStore;
+
+    /// Self-cleaning sqlite path so the tests never share Store state.
+    struct TempDb {
+        path: PathBuf,
+    }
+    impl TempDb {
+        fn new() -> Self {
+            Self {
+                path: std::env::temp_dir().join(format!("intentd-mcp-srv-{}.db", Uuid::new_v4())),
+            }
+        }
+    }
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ =
+                    std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
+            }
+        }
+    }
+
+    async fn open_store() -> (TempDb, Store) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        (tmp, store)
+    }
+
+    /// A command guaranteed not to exist so `Command::spawn` fails synchronously
+    /// (keeps the `start`/`spawn_stdio` error paths fast and deterministic).
+    const BOGUS_CMD: &str = "/this/does/not/exist/intentd-mcp-test-cmd";
+
+    fn stdio_cfg(id: &str, command: &str) -> Value {
+        json!({
+            "id": id,
+            "name": id,
+            "transport": "stdio",
+            "command": command,
+            "enabled": true,
+        })
+    }
+
+    // -- pure helpers ------------------------------------------------------
+
+    #[test]
+    fn now_millis_is_monotonic_enough() {
+        let a = now_millis();
+        let b = now_millis();
+        assert!(b >= a, "now_millis must not go backwards");
+    }
+
+    #[test]
+    fn status_value_omits_absent_optional_fields() {
+        let v = status_value("s", "running", None, None, None, None);
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.get("serverId"), Some(&json!("s")));
+        assert_eq!(obj.get("state"), Some(&json!("running")));
+        assert!(obj.get("pid").is_none());
+        assert!(obj.get("toolCount").is_none());
+        assert!(obj.get("lastError").is_none());
+        assert!(obj.get("startedAt").is_none());
+    }
+
+    #[test]
+    fn status_value_includes_all_optionals_when_present() {
+        let v = status_value("s", "running", Some(42), Some(3), Some("err"), Some(123));
+        assert_eq!(v["pid"], json!(42));
+        assert_eq!(v["toolCount"], json!(3));
+        assert_eq!(v["lastError"], json!("err"));
+        assert_eq!(v["startedAt"], json!(123));
+    }
+
+    #[test]
+    fn status_stopped_is_minimal() {
+        let v = status_stopped("abc");
+        assert_eq!(v["serverId"], json!("abc"));
+        assert_eq!(v["state"], json!("stopped"));
+        assert_eq!(v.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn status_error_carries_last_error() {
+        let v = status_error("abc", "boom");
+        assert_eq!(v["state"], json!("error"));
+        assert_eq!(v["lastError"], json!("boom"));
+    }
+
+    #[test]
+    fn config_id_absent_is_empty_string() {
+        assert_eq!(config_id(&json!({})), "");
+        assert_eq!(config_id(&json!({"id": 7})), ""); // non-string id is ignored
+    }
+
+    #[test]
+    fn config_id_returns_string_id() {
+        assert_eq!(config_id(&json!({"id": "srv-1"})), "srv-1");
+    }
+
+    #[test]
+    fn redact_config_replaces_env_and_headers_values() {
+        let c = json!({
+            "id": "s",
+            "command": "node",
+            "env": { "TOKEN": "supersecret", "OTHER": "value" },
+            "headers": { "Authorization": "Bearer xyz" },
+        });
+        let r = redact_config(&c);
+        assert_eq!(r["id"], json!("s"));
+        assert_eq!(r["command"], json!("node"));
+        for (_, v) in r["env"].as_object().unwrap() {
+            assert_eq!(v, &json!(REDACTED_PLACEHOLDER));
+        }
+        for (_, v) in r["headers"].as_object().unwrap() {
+            assert_eq!(v, &json!(REDACTED_PLACEHOLDER));
+        }
+        // Original is untouched.
+        assert_eq!(c["env"]["TOKEN"], json!("supersecret"));
+    }
+
+    #[test]
+    fn redact_config_noop_without_env_or_headers() {
+        let c = json!({ "id": "s", "command": "x" });
+        assert_eq!(redact_config(&c), c);
+    }
+
+    #[test]
+    fn redact_config_skips_non_object_env_and_headers() {
+        // env/headers must be objects to be redacted; non-object values are passthrough.
+        let c = json!({ "env": "stringy", "headers": ["a"] });
+        let r = redact_config(&c);
+        assert_eq!(r, c);
+    }
+
+    // -- normalize_config branches ----------------------------------------
+
+    #[test]
+    fn normalize_config_rejects_non_object() {
+        let err = normalize_config(json!("nope"), None).unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    #[test]
+    fn normalize_config_generates_id_and_fills_defaults() {
+        let v = normalize_config(json!({ "command": "x" }), None).unwrap();
+        let id = v["id"].as_str().unwrap();
+        assert!(id.starts_with("srv-") && id.len() > 4);
+        assert_eq!(v["transport"], json!("stdio"));
+        assert_eq!(v["name"], json!(id), "name defaults to id when absent");
+        assert_eq!(v["enabled"], json!(false));
+    }
+
+    #[test]
+    fn normalize_config_preserves_existing_id_name_enabled() {
+        let v = normalize_config(
+            json!({ "id": "keep", "name": "n", "enabled": true, "command": "x" }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["id"], json!("keep"));
+        assert_eq!(v["name"], json!("n"));
+        assert_eq!(v["enabled"], json!(true));
+    }
+
+    #[test]
+    fn normalize_config_forced_id_overrides_payload_id() {
+        let v =
+            normalize_config(json!({ "id": "ignored", "command": "x" }), Some("forced")).unwrap();
+        assert_eq!(v["id"], json!("forced"));
+    }
+
+    #[test]
+    fn normalize_config_empty_id_is_replaced() {
+        let v = normalize_config(json!({ "id": "", "command": "x" }), None).unwrap();
+        assert!(v["id"].as_str().unwrap().starts_with("srv-"));
+    }
+
+    #[test]
+    fn normalize_config_rejects_unknown_transport() {
+        let err = normalize_config(json!({ "transport": "carrier-pigeon" }), None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("invalid transport"), "got: {msg}");
+    }
+
+    #[test]
+    fn normalize_config_stdio_requires_non_empty_command() {
+        let err = normalize_config(json!({}), None).unwrap_err();
+        assert!(format!("{err}").contains("stdio server requires"));
+        let err = normalize_config(json!({ "command": "" }), None).unwrap_err();
+        assert!(format!("{err}").contains("stdio server requires"));
+    }
+
+    #[test]
+    fn normalize_config_http_and_sse_require_url() {
+        for t in ["http", "sse"] {
+            let err = normalize_config(json!({ "transport": t }), None).unwrap_err();
+            assert!(format!("{err}").contains("requires a url"), "{t}");
+        }
+        // happy path: url present → ok
+        let v = normalize_config(json!({ "transport": "http", "url": "https://x" }), None).unwrap();
+        assert_eq!(v["transport"], json!("http"));
+    }
+
+    // -- secret / setting accessors ---------------------------------------
+
+    #[test]
+    fn read_configs_missing_returns_empty_map() {
+        let s = InMemorySecretStore::default();
+        assert!(read_configs(&s).is_empty());
+    }
+
+    #[test]
+    fn read_configs_garbled_returns_empty_map() {
+        let s = InMemorySecretStore::default();
+        s.store(SETTING_KEY, "this is not json").unwrap();
+        assert!(read_configs(&s).is_empty());
+    }
+
+    #[test]
+    fn read_configs_non_object_returns_empty_map() {
+        let s = InMemorySecretStore::default();
+        s.store(SETTING_KEY, "[1,2,3]").unwrap();
+        assert!(read_configs(&s).is_empty());
+    }
+
+    #[test]
+    fn write_then_read_configs_round_trips() {
+        let s = InMemorySecretStore::default();
+        let mut m = Map::new();
+        m.insert("a".into(), json!({"id":"a","command":"x"}));
+        write_configs(&s, &m).unwrap();
+        let got = read_configs(&s);
+        assert_eq!(got, m);
+    }
+
+    #[tokio::test]
+    async fn enable_user_servers_defaults_true_without_setting() {
+        let (_tmp, store) = open_store().await;
+        assert!(enable_user_servers(&store).await);
+    }
+
+    #[tokio::test]
+    async fn enable_user_servers_reads_false() {
+        let (_tmp, store) = open_store().await;
+        store
+            .set_setting("mcp.enableUserServers", "false")
+            .await
+            .unwrap();
+        assert!(!enable_user_servers(&store).await);
+    }
+
+    #[tokio::test]
+    async fn enable_user_servers_invalid_json_defaults_true() {
+        let (_tmp, store) = open_store().await;
+        store
+            .set_setting("mcp.enableUserServers", "not-json")
+            .await
+            .unwrap();
+        assert!(enable_user_servers(&store).await);
+    }
+
+    #[tokio::test]
+    async fn enable_user_servers_non_bool_defaults_true() {
+        let (_tmp, store) = open_store().await;
+        store
+            .set_setting("mcp.enableUserServers", "42")
+            .await
+            .unwrap();
+        assert!(enable_user_servers(&store).await);
+    }
+
+    #[tokio::test]
+    async fn disabled_servers_empty_without_setting() {
+        let (_tmp, store) = open_store().await;
+        assert!(disabled_servers(&store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_servers_round_trip_via_setter() {
+        let (_tmp, store) = open_store().await;
+        let list = vec!["a".to_string(), "b".to_string()];
+        set_disabled_servers(&store, &list).await.unwrap();
+        let got = disabled_servers(&store).await;
+        assert_eq!(got, list);
+    }
+
+    #[tokio::test]
+    async fn disabled_servers_invalid_json_returns_empty() {
+        let (_tmp, store) = open_store().await;
+        store
+            .set_setting("mcp.disabledServers", "garbled")
+            .await
+            .unwrap();
+        assert!(disabled_servers(&store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_servers_non_array_returns_empty() {
+        let (_tmp, store) = open_store().await;
+        store
+            .set_setting("mcp.disabledServers", "\"x\"")
+            .await
+            .unwrap();
+        assert!(disabled_servers(&store).await.is_empty());
+    }
+
+    // -- McpHub: non-spawning lifecycle -----------------------------------
+
+    #[test]
+    fn hub_default_constructs_empty_hub() {
+        let h = McpHub::default();
+        assert_eq!(h.status("anything"), status_stopped("anything"));
+    }
+
+    #[tokio::test]
+    async fn hub_status_unknown_id_is_stopped() {
+        let h = McpHub::new();
+        assert_eq!(h.status("ghost"), status_stopped("ghost"));
+    }
+
+    #[tokio::test]
+    async fn hub_stop_unknown_id_returns_false() {
+        let h = McpHub::new();
+        assert!(!h.stop("nope").await);
+    }
+
+    #[tokio::test]
+    async fn hub_start_with_user_servers_disabled_emits_stopped_no_spawn() {
+        let h = McpHub::new();
+        let status = h.start(stdio_cfg("s1", BOGUS_CMD), false).await;
+        assert_eq!(status, status_stopped("s1"));
+        // Server is never registered when the gate is off.
+        assert_eq!(h.status("s1"), status_stopped("s1"));
+    }
+
+    #[tokio::test]
+    async fn hub_start_spawn_failure_returns_error_status() {
+        let h = McpHub::new();
+        let status = h.start(stdio_cfg("err", BOGUS_CMD), true).await;
+        assert_eq!(status["state"], json!("error"));
+        let msg = status["lastError"].as_str().unwrap();
+        assert!(
+            msg.contains(BOGUS_CMD),
+            "lastError should mention command: {msg}"
+        );
+        // Failed spawn does not insert into the live map.
+        assert_eq!(h.status("err"), status_stopped("err"));
+    }
+
+    #[tokio::test]
+    async fn hub_start_non_stdio_transport_returns_error_status() {
+        let h = McpHub::new();
+        let cfg = json!({ "id": "h", "transport": "http", "url": "https://x" });
+        let status = h.start(cfg, true).await;
+        assert_eq!(status["state"], json!("error"));
+        assert!(status["lastError"]
+            .as_str()
+            .unwrap()
+            .contains("not supported"));
+    }
+
+    #[tokio::test]
+    async fn hub_start_missing_command_returns_error_status() {
+        let h = McpHub::new();
+        let cfg = json!({ "id": "h", "transport": "stdio" });
+        let status = h.start(cfg, true).await;
+        assert_eq!(status["state"], json!("error"));
+        assert!(status["lastError"]
+            .as_str()
+            .unwrap()
+            .contains("requires a command"));
+    }
+
+    #[tokio::test]
+    async fn hub_restart_with_disabled_gate_returns_stopped() {
+        let h = McpHub::new();
+        let status = h.restart(stdio_cfg("r1", BOGUS_CMD), false).await;
+        assert_eq!(status, status_stopped("r1"));
+    }
+
+    #[tokio::test]
+    async fn hub_shutdown_empty_is_noop() {
+        let h = McpHub::new();
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hub_health_tick_empty_is_noop() {
+        let h = McpHub::new();
+        h.health_tick().await;
+    }
+
+    #[tokio::test]
+    async fn hub_publish_status_without_bus_is_noop() {
+        let h = McpHub::new();
+        // Should simply return without panicking when no bus is wired.
+        h.publish_status(&status_stopped("x")).await;
+    }
+
+    #[tokio::test]
+    async fn hub_publish_status_emits_event_when_bus_is_wired() {
+        let (_tmp, store) = open_store().await;
+        let bus = EventBus::new(store);
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let h = McpHub::new();
+        h.set_event_bus(bus);
+
+        let status = status_value("s1", "running", Some(7), Some(2), None, Some(99));
+        h.publish_status(&status).await;
+
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        assert_eq!(batch.len(), 1);
+        let ev = &batch[0];
+        assert_eq!(ev.event_type, MCP_SERVERS_STATUS_CHANGED);
+        let data = serde_json::to_value(&ev.data).unwrap();
+        assert_eq!(data["serverId"], json!("s1"));
+        assert_eq!(data["status"]["state"], json!("running"));
+        assert_eq!(data["status"]["pid"], json!(7));
+    }
+
+    // -- McpServersService -------------------------------------------------
+
+    fn svc<'a>(
+        store: &'a Store,
+        secrets: &'a InMemorySecretStore,
+        hub: &'a McpHub,
+    ) -> McpServersService<'a> {
+        McpServersService::new(store, secrets, hub)
+    }
+
+    #[tokio::test]
+    async fn list_empty_when_no_configs() {
+        let (_tmp, store) = open_store().await;
+        let s = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let r = svc(&store, &s, &h).list(None).await.unwrap();
+        assert_eq!(r["servers"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_sorted_by_id_and_redacts_secrets() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let mut m = Map::new();
+        m.insert(
+            "b".into(),
+            json!({"id":"b","command":"x","env":{"K":"VAL"}}),
+        );
+        m.insert(
+            "a".into(),
+            json!({"id":"a","command":"x","headers":{"H":"hidden"}}),
+        );
+        write_configs(&secrets, &m).unwrap();
+
+        let r = svc(&store, &secrets, &h).list(None).await.unwrap();
+        let arr = r["servers"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], json!("a"));
+        assert_eq!(arr[1]["id"], json!("b"));
+        assert_eq!(arr[0]["headers"]["H"], json!(REDACTED_PLACEHOLDER));
+        assert_eq!(arr[1]["env"]["K"], json!(REDACTED_PLACEHOLDER));
+    }
+
+    #[tokio::test]
+    async fn create_persists_and_redacts() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let s = svc(&store, &secrets, &h);
+        let out = s
+            .create(json!({
+                "id": "n1",
+                "transport": "stdio",
+                "command": "node",
+                "env": { "T": "secret" },
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out["server"]["id"], json!("n1"));
+        assert_eq!(out["server"]["env"]["T"], json!(REDACTED_PLACEHOLDER));
+        // Stored plaintext keeps the original secret.
+        let stored = read_configs(&secrets);
+        assert_eq!(stored["n1"]["env"]["T"], json!("secret"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_duplicate_id() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let s = svc(&store, &secrets, &h);
+        let cfg = json!({ "id": "dup", "transport": "stdio", "command": "x" });
+        s.create(cfg.clone()).await.unwrap();
+        let err = s.create(cfg).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+        assert!(format!("{err}").contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn create_propagates_normalize_error() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let err = svc(&store, &secrets, &h)
+            .create(json!({ "transport": "stdio" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    #[tokio::test]
+    async fn update_returns_not_found_for_unknown_id() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let err = svc(&store, &secrets, &h)
+            .update("missing", json!({ "command": "x" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn update_pins_id_and_redacts() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let s = svc(&store, &secrets, &h);
+        s.create(json!({ "id": "u1", "transport": "stdio", "command": "x" }))
+            .await
+            .unwrap();
+        // The payload id is ignored — server_id pins the id.
+        let out = s
+            .update(
+                "u1",
+                json!({
+                    "id": "WRONG",
+                    "transport": "stdio",
+                    "command": "y",
+                    "env": { "K": "v" },
+                    "name": "renamed",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["server"]["id"], json!("u1"));
+        assert_eq!(out["server"]["name"], json!("renamed"));
+        assert_eq!(out["server"]["env"]["K"], json!(REDACTED_PLACEHOLDER));
+    }
+
+    #[tokio::test]
+    async fn delete_returns_not_found_for_unknown_id() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let err = svc(&store, &secrets, &h)
+            .delete("missing")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_removes_config_and_returns_success() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let s = svc(&store, &secrets, &h);
+        s.create(json!({ "id": "d1", "transport": "stdio", "command": "x" }))
+            .await
+            .unwrap();
+        let out = s.delete("d1").await.unwrap();
+        assert_eq!(out["success"], json!(true));
+        assert!(read_configs(&secrets).is_empty());
+    }
+
+    #[tokio::test]
+    async fn toggle_enable_with_user_servers_off_returns_stopped_and_persists_flag() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let s = svc(&store, &secrets, &h);
+        s.create(json!({ "id": "t1", "transport": "stdio", "command": "x", "enabled": false }))
+            .await
+            .unwrap();
+        // Gate off: even toggle(true) yields stopped status.
+        store
+            .set_setting("mcp.enableUserServers", "false")
+            .await
+            .unwrap();
+
+        let out = s.toggle("t1", true).await.unwrap();
+        assert_eq!(out["status"]["state"], json!("stopped"));
+        // Persisted enabled flag flipped to true.
+        assert_eq!(read_configs(&secrets)["t1"]["enabled"], json!(true));
+        // Enabled means the id should NOT be in disabledServers.
+        assert!(!disabled_servers(&store).await.iter().any(|d| d == "t1"));
+    }
+
+    #[tokio::test]
+    async fn toggle_disable_emits_stopped_and_tracks_disabled_list() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let s = svc(&store, &secrets, &h);
+        s.create(json!({ "id": "t2", "transport": "stdio", "command": "x", "enabled": true }))
+            .await
+            .unwrap();
+
+        let out = s.toggle("t2", false).await.unwrap();
+        assert_eq!(out["status"]["state"], json!("stopped"));
+        assert_eq!(read_configs(&secrets)["t2"]["enabled"], json!(false));
+        assert!(disabled_servers(&store).await.iter().any(|d| d == "t2"));
+
+        // Disabling again is idempotent — id appears only once.
+        s.toggle("t2", false).await.unwrap();
+        let list = disabled_servers(&store).await;
+        assert_eq!(list.iter().filter(|d| *d == "t2").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn toggle_enable_removes_id_from_disabled_list() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let s = svc(&store, &secrets, &h);
+        s.create(json!({ "id": "t3", "transport": "stdio", "command": "x" }))
+            .await
+            .unwrap();
+        // Pre-populate the disabled list.
+        set_disabled_servers(&store, &["t3".to_string(), "other".to_string()])
+            .await
+            .unwrap();
+        store
+            .set_setting("mcp.enableUserServers", "false")
+            .await
+            .unwrap();
+
+        let _ = s.toggle("t3", true).await.unwrap();
+        let list = disabled_servers(&store).await;
+        assert!(!list.iter().any(|d| d == "t3"));
+        assert!(list.iter().any(|d| d == "other"));
+    }
+
+    #[tokio::test]
+    async fn toggle_returns_not_found_for_unknown_id() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let err = svc(&store, &secrets, &h)
+            .toggle("ghost", true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn restart_returns_not_found_for_unknown_id() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let err = svc(&store, &secrets, &h)
+            .restart("ghost")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn restart_returns_stopped_when_user_servers_gate_off() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let s = svc(&store, &secrets, &h);
+        s.create(json!({ "id": "r1", "transport": "stdio", "command": BOGUS_CMD }))
+            .await
+            .unwrap();
+        store
+            .set_setting("mcp.enableUserServers", "false")
+            .await
+            .unwrap();
+        let out = s.restart("r1").await.unwrap();
+        assert_eq!(out["status"]["state"], json!("stopped"));
+    }
+
+    #[tokio::test]
+    async fn get_status_returns_not_found_for_unknown_id() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let err = svc(&store, &secrets, &h)
+            .get_status("ghost")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn get_status_returns_stopped_for_known_but_inactive_server() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let s = svc(&store, &secrets, &h);
+        s.create(json!({ "id": "g1", "transport": "stdio", "command": "x" }))
+            .await
+            .unwrap();
+        let out = s.get_status("g1").await.unwrap();
+        assert_eq!(out["status"], status_stopped("g1"));
+    }
+
+    #[tokio::test]
+    async fn start_enabled_no_op_when_gate_off() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        // Even a config that would normally be started is skipped.
+        let mut m = Map::new();
+        m.insert(
+            "x".into(),
+            json!({"id":"x","command":BOGUS_CMD,"enabled":true}),
+        );
+        write_configs(&secrets, &m).unwrap();
+        store
+            .set_setting("mcp.enableUserServers", "false")
+            .await
+            .unwrap();
+
+        svc(&store, &secrets, &h).start_enabled().await;
+        // Nothing was started.
+        assert_eq!(h.status("x"), status_stopped("x"));
+    }
+
+    #[tokio::test]
+    async fn start_enabled_skips_disabled_ids_and_disabled_configs() {
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let mut m = Map::new();
+        // (1) enabled=true but id in disabledServers → skipped
+        m.insert(
+            "blocked".into(),
+            json!({"id":"blocked","command":BOGUS_CMD,"enabled":true}),
+        );
+        // (2) enabled=false → skipped
+        m.insert(
+            "off".into(),
+            json!({"id":"off","command":BOGUS_CMD,"enabled":false}),
+        );
+        write_configs(&secrets, &m).unwrap();
+        set_disabled_servers(&store, &["blocked".to_string()])
+            .await
+            .unwrap();
+
+        svc(&store, &secrets, &h).start_enabled().await;
+
+        // Neither id was started (no error status from a failed spawn either).
+        assert_eq!(h.status("blocked"), status_stopped("blocked"));
+        assert_eq!(h.status("off"), status_stopped("off"));
+    }
+
+    #[tokio::test]
+    async fn start_enabled_attempts_to_start_eligible_configs() {
+        // Eligible config has enabled=true and is NOT in disabledServers; the gate
+        // is on by default. A bogus command makes spawn fail fast (error status),
+        // which is the best-effort branch we want to cover.
+        let (_tmp, store) = open_store().await;
+        let secrets = InMemorySecretStore::default();
+        let h = McpHub::new();
+        let mut m = Map::new();
+        m.insert(
+            "go".into(),
+            json!({"id":"go","command":BOGUS_CMD,"enabled":true,"transport":"stdio"}),
+        );
+        write_configs(&secrets, &m).unwrap();
+
+        svc(&store, &secrets, &h).start_enabled().await;
+        // Spawn failed → no live entry → status stays stopped.
+        assert_eq!(h.status("go"), status_stopped("go"));
+    }
+}
