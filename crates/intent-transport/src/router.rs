@@ -704,9 +704,22 @@ async fn dispatch(
             let model = opt_str(params, "model");
             let specialist_id = opt_str(params, "specialistId");
             let idempotency_key = opt_str(params, "idempotencyKey");
+            // Honor a client-supplied `agentId` verbatim so the FE can address
+            // `agent.sendMessage` at the same id it just handed us (fixes the
+            // create+send "not found: agent session" race). Malformed values
+            // are rejected inside the service as `-32602`.
+            let requested_agent_id = opt_str(params, "agentId").map(|s| AgentId::from(s.as_str()));
             // FE/RPC front door: top-level creates stay parentless.
             let result = api
-                .agent_create(ws, name, model, specialist_id, None, idempotency_key)
+                .agent_create(
+                    ws,
+                    name,
+                    model,
+                    specialist_id,
+                    None,
+                    idempotency_key,
+                    requested_agent_id,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

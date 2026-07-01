@@ -352,6 +352,24 @@ pub(crate) fn new_message_id() -> String {
     format!("user-msg-{}", Uuid::new_v4())
 }
 
+/// Validate a client-supplied `agent.create` `agentId` (PROTOCOL §5.5): the id
+/// must be the exact `agent-{uuid}` form (`agent-` prefix + a parsable UUID
+/// tail), matching the form the daemon mints. Anything else surfaces as
+/// `-32602` so a stray/hand-typed id cannot collide with future runtime ids.
+pub(crate) fn validate_client_agent_id(id: &str) -> Result<()> {
+    let Some(tail) = id.strip_prefix("agent-") else {
+        return Err(Error::InvalidParams(format!(
+            "agentId must be of the form 'agent-{{uuid}}' (got {id:?})"
+        )));
+    };
+    Uuid::parse_str(tail).map_err(|_| {
+        Error::InvalidParams(format!(
+            "agentId must be of the form 'agent-{{uuid}}' (got {id:?})"
+        ))
+    })?;
+    Ok(())
+}
+
 /// A single user text content block (the persisted/queued message shape).
 fn user_content_blocks(content: &str) -> Value {
     json!([{ "type": "text", "text": content }])
@@ -507,6 +525,12 @@ impl Services {
     /// turn (PROTOCOL §5.5). `task_note_id`/`skip_auto_commit` are set by
     /// `agent.delegate` so the auto-commit-on-idle subscriber (LNI-1) can
     /// resolve the `Linked-Note-Id:` trailer and honor the opt-out.
+    ///
+    /// `requested_agent_id` is honored verbatim when it is a well-formed
+    /// `agent-{uuid}`, so the FE can create + address the session under an id
+    /// it already minted (fixes the UI create→sendMessage "not found: agent
+    /// session" race). Malformed values surface as `-32602`; when `None` a
+    /// fresh id is generated (existing behavior).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn agent_create_op(
         &self,
@@ -517,13 +541,21 @@ impl Services {
         parent_agent_id: Option<AgentId>,
         task_note_id: Option<NoteId>,
         skip_auto_commit: bool,
+        requested_agent_id: Option<AgentId>,
     ) -> Result<Value> {
         let now = now_iso();
         let name_explicitly_set = name.is_some();
         let name =
             name.unwrap_or_else(|| format!("Agent {}", &Uuid::new_v4().simple().to_string()[..6]));
+        let id = match requested_agent_id {
+            Some(requested) => {
+                validate_client_agent_id(requested.as_str())?;
+                requested
+            }
+            None => AgentId(format!("agent-{}", Uuid::new_v4())),
+        };
         let session = AgentSession {
-            id: AgentId(format!("agent-{}", Uuid::new_v4())),
+            id,
             workspace_id,
             parent_agent_id,
             backend_session_id: None,
@@ -922,6 +954,7 @@ impl Services {
                 parent_agent_id.clone(),
                 session_task_note_id,
                 input.skip_auto_commit.unwrap_or(false),
+                None,
             )
             .await?;
         let agent_id = created["agent"]["id"]
@@ -1527,6 +1560,7 @@ impl Services {
                 None,
                 Some(task_note_id.clone()),
                 false,
+                None,
             )
             .await?;
         let agent_id = created["agent"]["id"]

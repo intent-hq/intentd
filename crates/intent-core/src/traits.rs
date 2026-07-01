@@ -667,6 +667,13 @@ pub trait WorkspaceApi: Send + Sync {
     /// `parent_agent_id` is the caller/spawning agent: the MCP front door passes
     /// `Some(caller)` to stamp the child's `parentAgentId`; the FE/RPC front door
     /// passes `None` (top-level creates stay parentless).
+    ///
+    /// `requested_agent_id` is an optional well-formed `agent-{uuid}` id the
+    /// client already minted (e.g. the FE's `UnifiedAgentFactory` uses it to
+    /// key the pending session, then addresses `agent.sendMessage` at the same
+    /// id). When `Some`, the service adopts it verbatim; otherwise a fresh id
+    /// is minted. Malformed values are rejected as `-32602`.
+    #[allow(clippy::too_many_arguments)]
     fn agent_create(
         &self,
         workspace_id: WorkspaceId,
@@ -675,6 +682,7 @@ pub trait WorkspaceApi: Send + Sync {
         specialist_id: Option<String>,
         parent_agent_id: Option<AgentId>,
         idempotency_key: Option<String>,
+        requested_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
@@ -683,6 +691,7 @@ pub trait WorkspaceApi: Send + Sync {
             specialist_id,
             parent_agent_id,
             idempotency_key,
+            requested_agent_id,
         );
         Box::pin(async {
             Err(Error::Internal(

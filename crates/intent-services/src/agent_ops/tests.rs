@@ -253,6 +253,7 @@ async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect("create");
@@ -276,6 +277,60 @@ async fn create_then_list_and_get_projects_agent_lite() {
 }
 
 #[tokio::test]
+async fn agent_create_honors_client_supplied_agent_id() {
+    // The FE (`UnifiedAgentFactory`) pre-mints an `agent-{uuid}` and immediately
+    // addresses `agent.sendMessage` at it. When the daemon adopts the id
+    // verbatim, the follow-up send lands on a persisted session instead of
+    // `-32602 not found: agent session` (the create+send race this task fixes).
+    let (_t, svc, ws) = setup().await;
+    let requested = AgentId::from(format!("agent-{}", uuid::Uuid::new_v4()).as_str());
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Client-Minted".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some(requested.clone()),
+        )
+        .await
+        .expect("create honors client id");
+    assert_eq!(created["agent"]["id"].as_str(), Some(requested.0.as_str()));
+    // Round-trip through the store proves the session is addressable at the
+    // client-supplied id.
+    let got = svc.agent_get_op(requested.clone()).await.expect("get");
+    assert_eq!(got.id, requested);
+}
+
+#[tokio::test]
+async fn agent_create_rejects_malformed_client_agent_id() {
+    // Anything other than `agent-{uuid}` is `-32602` (PROTOCOL §5.5 / §9): a
+    // stray/hand-typed id must not collide with future daemon-minted ids.
+    let (_t, svc, ws) = setup().await;
+    for bad in ["not-an-agent", "agent-", "agent-not-a-uuid", ""] {
+        let err = svc
+            .agent_create_op(
+                ws.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some(AgentId::from(bad)),
+            )
+            .await
+            .expect_err("malformed id must be rejected");
+        assert!(
+            matches!(err, Error::InvalidParams(_)),
+            "expected InvalidParams for {bad:?}, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn agent_lite_carries_metadata_and_activity_fields() {
     let (_t, svc, ws) = setup().await;
     let created = svc
@@ -287,6 +342,7 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect("create");
@@ -414,6 +470,7 @@ async fn agent_lite_metadata_created_by_agent_id_from_parent() {
             Some(parent.clone()),
             None,
             false,
+            None,
         )
         .await
         .expect("create child");
@@ -985,6 +1042,7 @@ async fn report_to_parent_delivers_for_delegated_caller() {
             Some(parent.clone()),
             None,
             false,
+            None,
         )
         .await
         .expect("create delegated child");

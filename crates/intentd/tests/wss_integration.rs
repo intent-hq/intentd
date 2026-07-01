@@ -344,6 +344,71 @@ async fn wss_client_hello_and_drafts_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `agent.create` accepts a client-supplied `agentId` and the follow-up
+/// `agent.sendMessage` addressed to the same id lands on the persisted session
+/// instead of the pre-fix `-32602 not found: agent session` (PROTOCOL §5.5).
+/// This proves the create+send race the FE `UnifiedAgentFactory` was hitting.
+#[tokio::test]
+async fn wss_agent_create_honors_client_supplied_agent_id() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Agent ID"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let requested = format!("agent-{}", uuid::Uuid::new_v4());
+
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","agentId":"{requested}","name":"WSS Client Id"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"agent.get","params":{{"agentId":"{requested}"}}}}"#
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        sess[0]["result"]["agent"]["id"].as_str(),
+        Some(requested.as_str()),
+        "agent.create must adopt the client-supplied agentId verbatim: {}",
+        sess[0]
+    );
+    assert_eq!(
+        sess[1]["result"]["agent"]["id"].as_str(),
+        Some(requested.as_str()),
+        "agent.get at the client-supplied id must resolve: {}",
+        sess[1]
+    );
+
+    // A malformed id is `-32602` (PROTOCOL §5.5 / §9) — a stray/hand-typed id
+    // must not slip through and collide with future daemon-minted ids.
+    let bad = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}","agentId":"not-an-agent"}}}}"#
+        )
+        .as_str(),
+    )
+    .await;
+    assert_eq!(
+        bad["error"]["code"].as_i64(),
+        Some(-32602),
+        "malformed agentId must be -32602: {bad}"
+    );
+
+    srv.ws.stop().await;
+}
+
 #[tokio::test]
 async fn health_reports_ok_and_client_count() {
     let srv = start(WsOptions::default()).await;
