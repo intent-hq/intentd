@@ -2551,11 +2551,12 @@ impl WorkspaceApi for Services {
         rows: u16,
         cwd: Option<String>,
         command: Option<String>,
+        env: Option<std::collections::BTreeMap<String, String>>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
-            terminal_ops::create(pty, bus, workspace_id, cols, rows, cwd, command).await
+            terminal_ops::create(pty, bus, workspace_id, cols, rows, cwd, command, env).await
         })
     }
 

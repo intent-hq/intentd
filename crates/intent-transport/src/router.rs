@@ -1862,7 +1862,8 @@ async fn dispatch(
             let rows = opt_dim(params, "rows", 24);
             let cwd = opt_str(params, "cwd");
             let command = opt_str(params, "command");
-            api.terminal_create(ws, cols, rows, cwd, command)
+            let env = opt_string_map(params, "env");
+            api.terminal_create(ws, cols, rows, cwd, command, env)
                 .await
                 .map_err(domain_to_rpc)
         }

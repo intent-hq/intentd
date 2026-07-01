@@ -50,7 +50,11 @@ fn resolve(terminal_id: &str) -> Result<PtyId> {
 }
 
 /// Spawn a workspace-scoped PTY for `terminal.create` and begin streaming its
-/// output onto the bus; returns `{ terminalId }`.
+/// output onto the bus; returns `{ terminalId }`. `env` is an optional
+/// overlay layered onto the daemon's inherited environment (`portable-pty`
+/// inherits by default), so callers can pass per-terminal variables through
+/// without dropping them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create(
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
@@ -59,11 +63,15 @@ pub(crate) async fn create(
     rows: u16,
     cwd: Option<String>,
     command: Option<String>,
+    env: Option<std::collections::BTreeMap<String, String>>,
 ) -> Result<Value> {
     let mut spec = SpawnSpec::new(workspace_id.as_str(), command.unwrap_or_else(default_shell));
     spec.size = PtySize { rows, cols };
     if let Some(cwd) = cwd {
         spec.cwd = Some(PathBuf::from(cwd));
+    }
+    if let Some(map) = env {
+        spec.env = map.into_iter().collect();
     }
     let pty_id = pty.spawn(spec)?;
     let terminal_id = pty_id.to_string();
@@ -708,7 +716,7 @@ mod tests {
     #[tokio::test]
     async fn create_with_default_shell_lists_then_kills() {
         let pty = host();
-        let res = create(pty.clone(), None, ws("ws-1"), 80, 24, None, None)
+        let res = create(pty.clone(), None, ws("ws-1"), 80, 24, None, None, None)
             .await
             .unwrap();
         let id = term_id(&res);
@@ -746,6 +754,7 @@ mod tests {
             24,
             Some("/".to_string()),
             Some("cat".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -772,6 +781,7 @@ mod tests {
             24,
             None,
             Some("cat".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -807,6 +817,7 @@ mod tests {
             24,
             None,
             Some("echo".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -834,6 +845,7 @@ mod tests {
             24,
             None,
             Some("cat".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -861,6 +873,7 @@ mod tests {
             24,
             None,
             Some("cat".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -904,6 +917,7 @@ mod tests {
             24,
             None,
             Some("cat".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -928,6 +942,7 @@ mod tests {
             24,
             None,
             Some("cat".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -951,6 +966,7 @@ mod tests {
             24,
             None,
             Some("cat".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -971,6 +987,7 @@ mod tests {
             24,
             None,
             Some("cat".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -1011,6 +1028,7 @@ mod tests {
             24,
             None,
             Some("cat".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -1048,6 +1066,7 @@ mod tests {
             24,
             None,
             Some("cat".to_string()),
+            None,
         )
         .await
         .unwrap();

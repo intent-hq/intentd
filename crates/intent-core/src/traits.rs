@@ -3070,7 +3070,10 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `terminal.create`: spawn a PTY (default shell when `command` is absent)
     /// scoped to the workspace and start fanning its output to subscribers as
-    /// `terminal:data` events. Returns `{ terminalId }` (PROTOCOL §5.13).
+    /// `terminal:data` events. `env` is an optional overlay layered over the
+    /// daemon's inherited environment so callers can pass through per-terminal
+    /// variables (e.g. `FORCE_COLOR`, `PATH` additions). Returns
+    /// `{ terminalId }` (PROTOCOL §5.13).
     fn terminal_create(
         &self,
         workspace_id: WorkspaceId,
@@ -3078,8 +3081,9 @@ pub trait WorkspaceApi: Send + Sync {
         rows: u16,
         cwd: Option<String>,
         command: Option<String>,
+        env: Option<std::collections::BTreeMap<String, String>>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, cols, rows, cwd, command);
+        let _ = (workspace_id, cols, rows, cwd, command, env);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::terminal_create not implemented".to_string(),
