@@ -11,8 +11,9 @@ use std::collections::HashSet;
 
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_QUEUE_UPDATED};
 use intent_core::{
-    now_iso, parse_iso, ActorType, AgentId, AgentLite, AgentMessage, AgentSession, AgentStatus,
-    Error, EventActor, NoteId, Result, SessionStats, WorkspaceApi, WorkspaceId,
+    now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
+    AgentSession, AgentStatus, Error, EventActor, NoteId, Result, SessionStats, WorkspaceApi,
+    WorkspaceId,
 };
 
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
@@ -531,6 +532,16 @@ impl Services {
     /// it already minted (fixes the UI create→sendMessage "not found: agent
     /// session" race). Malformed values surface as `-32602`; when `None` a
     /// fresh id is generated (existing behavior).
+    ///
+    /// `extra` carries the widened FE-facing spawn hints
+    /// (`provider`/`agentType`/`metadata`/`workspacePath`/`workspaceContext`).
+    /// `provider` lands on the persisted [`AgentSession`]; the rest are accepted
+    /// but currently forwarded no further (persistence deferred per P2-12a).
+    ///
+    /// Returns `{ agent: <AgentLite> }` — the full projection so the FE can
+    /// upsert the created session without a follow-up `agent.get` round-trip.
+    /// This is a superset of the earlier `{ id, name }` shape, so existing
+    /// callers that only read `agent.id` / `agent.name` stay green.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn agent_create_op(
         &self,
@@ -542,6 +553,7 @@ impl Services {
         task_note_id: Option<NoteId>,
         skip_auto_commit: bool,
         requested_agent_id: Option<AgentId>,
+        extra: AgentCreateExtra,
     ) -> Result<Value> {
         let now = now_iso();
         let name_explicitly_set = name.is_some();
@@ -554,6 +566,16 @@ impl Services {
             }
             None => AgentId(format!("agent-{}", Uuid::new_v4())),
         };
+        // `agent_type`, `metadata`, `workspace_path`, `workspace_context` are
+        // accepted for the widened wire shape but have no session-column home
+        // today; the P2-12a audit records that persistence is deferred.
+        let AgentCreateExtra {
+            provider,
+            agent_type: _,
+            metadata: _,
+            workspace_path: _,
+            workspace_context: _,
+        } = extra;
         let session = AgentSession {
             id,
             workspace_id,
@@ -563,7 +585,7 @@ impl Services {
             name,
             name_explicitly_set,
             model,
-            provider: None,
+            provider,
             system_prompt: None,
             specialist,
             status: AgentStatus::Pending,
@@ -576,7 +598,12 @@ impl Services {
             updated_at: now,
         };
         self.store.insert_agent_session(&session).await?;
-        Ok(json!({ "agent": { "id": session.id, "name": session.name } }))
+        // Project into `AgentLite` so the wire returns the full agent object
+        // (superset of `{ id, name }`). A fresh session has no messages, so the
+        // derived counts/last-* fields are `None`/0; runtime activity flags stay
+        // at their `AgentLite::from_session` defaults (no live runtime state).
+        let lite = AgentLite::from_session(session, 0, None, None, None);
+        Ok(json!({ "agent": lite }))
     }
 
     /// `agent.rename` (PROTOCOL §5.5). A missing agent surfaces as `-32603`
@@ -955,6 +982,7 @@ impl Services {
                 session_task_note_id,
                 input.skip_auto_commit.unwrap_or(false),
                 None,
+                AgentCreateExtra::default(),
             )
             .await?;
         let agent_id = created["agent"]["id"]
@@ -1561,6 +1589,7 @@ impl Services {
                 Some(task_note_id.clone()),
                 false,
                 None,
+                AgentCreateExtra::default(),
             )
             .await?;
         let agent_id = created["agent"]["id"]

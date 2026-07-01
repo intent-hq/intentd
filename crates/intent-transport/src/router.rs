@@ -7,9 +7,9 @@
 //! transport (UDS today, WS/TLS later) shares one code path.
 
 use intent_core::{
-    AgentDelegateInput, AgentId, Error, EventQueryParams, NoteAddInput, NoteCreate, NoteEditInput,
-    NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode, WorkspaceApi,
-    WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
+    AgentCreateExtra, AgentDelegateInput, AgentId, Error, EventQueryParams, NoteAddInput,
+    NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams,
+    ScriptMode, WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
 };
 use serde_json::{json, Map, Value};
 
@@ -709,6 +709,16 @@ async fn dispatch(
             // create+send "not found: agent session" race). Malformed values
             // are rejected inside the service as `-32602`.
             let requested_agent_id = opt_str(params, "agentId").map(|s| AgentId::from(s.as_str()));
+            // Widened FE-facing spawn hints (P2-12a): `provider`/`agentType`/
+            // `metadata`/`workspacePath`/`workspaceContext`. All optional and
+            // additive — omitted params behave exactly as pre-widening callers.
+            let extra = AgentCreateExtra {
+                provider: opt_str(params, "provider"),
+                agent_type: opt_str(params, "agentType"),
+                metadata: opt_value(params, "metadata"),
+                workspace_path: opt_str(params, "workspacePath"),
+                workspace_context: opt_value(params, "workspaceContext"),
+            };
             // FE/RPC front door: top-level creates stay parentless.
             let result = api
                 .agent_create(
@@ -719,6 +729,7 @@ async fn dispatch(
                     None,
                     idempotency_key,
                     requested_agent_id,
+                    extra,
                 )
                 .await
                 .map_err(domain_to_rpc)?;

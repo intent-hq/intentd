@@ -105,7 +105,16 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
         .await
         .expect("create note");
     let agent_val = services
-        .agent_create(ws.clone(), Some("E2E".into()), None, None, None, None, None)
+        .agent_create(
+            ws.clone(),
+            Some("E2E".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+        )
         .await
         .expect("create agent");
     let agent_id = AgentId::from(agent_val["agent"]["id"].as_str().unwrap());

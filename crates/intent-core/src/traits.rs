@@ -661,8 +661,9 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `agent.create`: persist a new agent session; returns `{ agent: { id, name } }`
-    /// (the process spawns lazily on first turn) (PROTOCOL §5.5).
+    /// `agent.create`: persist a new agent session; returns
+    /// `{ agent: <AgentLite> }` (the full projection — a superset of the earlier
+    /// `{ id, name }` shape, so existing readers stay green) (PROTOCOL §5.5).
     ///
     /// `parent_agent_id` is the caller/spawning agent: the MCP front door passes
     /// `Some(caller)` to stamp the child's `parentAgentId`; the FE/RPC front door
@@ -673,6 +674,12 @@ pub trait WorkspaceApi: Send + Sync {
     /// key the pending session, then addresses `agent.sendMessage` at the same
     /// id). When `Some`, the service adopts it verbatim; otherwise a fresh id
     /// is minted. Malformed values are rejected as `-32602`.
+    ///
+    /// `extra` carries the widened FE-facing spawn hints
+    /// (`provider`/`agentType`/`metadata`/`workspacePath`/`workspaceContext`).
+    /// Only `provider` currently lands on the persisted session; the other
+    /// fields are accepted so the FE seam can bind to the wire shape ahead of
+    /// full persistence.
     #[allow(clippy::too_many_arguments)]
     fn agent_create(
         &self,
@@ -683,6 +690,7 @@ pub trait WorkspaceApi: Send + Sync {
         parent_agent_id: Option<AgentId>,
         idempotency_key: Option<String>,
         requested_agent_id: Option<AgentId>,
+        extra: crate::model::AgentCreateExtra,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
@@ -692,6 +700,7 @@ pub trait WorkspaceApi: Send + Sync {
             parent_agent_id,
             idempotency_key,
             requested_agent_id,
+            extra,
         );
         Box::pin(async {
             Err(Error::Internal(

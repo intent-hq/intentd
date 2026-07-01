@@ -5475,6 +5475,7 @@ impl WorkspaceApi for Services {
         parent_agent_id: Option<AgentId>,
         idempotency_key: Option<String>,
         requested_agent_id: Option<AgentId>,
+        extra: intent_core::AgentCreateExtra,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             let ws_scope = workspace_id.0.clone();
@@ -5493,6 +5494,7 @@ impl WorkspaceApi for Services {
                         None,
                         false,
                         requested_agent_id,
+                        extra,
                     )
                     .await
                 },
