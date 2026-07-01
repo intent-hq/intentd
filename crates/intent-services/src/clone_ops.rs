@@ -1,0 +1,506 @@
+//! Streaming `git.clone` (§5.6 / §6.5).
+//!
+//! Spawns `git clone --progress <url> <target>` with a piped stderr, parses the
+//! canonical progress phases (counting / compressing / receiving / resolving /
+//! checkout) into `git:clone:progress` bus frames, and emits a terminal
+//! `git:clone:done` when the child exits — mirroring the streaming shape of
+//! `search:result` / `search:done` (§14.3) but over a real subprocess rather
+//! than an in-process walk.
+//!
+//! Secret-safety: neither the URL nor the environment ever crosses the wire.
+//! The URL is used at spawn time only; if the child fails, its stderr is
+//! stripped of any `user:pass@` credential fragment before being surfaced in
+//! the terminal `git:clone:done { error }` frame.
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use intent_core::events::{GIT_CLONE_DONE, GIT_CLONE_PROGRESS};
+use intent_core::{now_iso, Error, Result, WorkspaceId};
+use intent_store::NewEvent;
+use serde_json::json;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+
+use crate::events::EventBus;
+use crate::system_actor;
+
+/// Hard cap on a clone: the FE has always allowed 5 minutes; keep that budget
+/// so a stalled child never wedges the daemon.
+const CLONE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Preserved from the reference `cloneWithProgress`: skip LFS smudge during
+/// checkout so a missing/unreachable LFS object does not fail the clone. The
+/// caller can invoke `git lfs pull` after the clone succeeds.
+const GIT_LFS_SKIP_SMUDGE: &str = "1";
+
+/// Derive the on-disk `<parent_dir>/<target>` a clone would produce. When
+/// `target_name` is `None`, port `git`'s own basename-of-URL default (strip a
+/// trailing `.git`), rejecting anything that would escape `parent_dir`.
+pub(crate) fn resolve_target_path(
+    parent_dir: &str,
+    url: &str,
+    target_name: Option<&str>,
+) -> Result<PathBuf> {
+    let parent = PathBuf::from(parent_dir);
+    if parent.as_os_str().is_empty() {
+        return Err(Error::InvalidParams("parentDir is required".to_string()));
+    }
+    let name = match target_name {
+        Some(n) => n.trim().to_string(),
+        None => derive_default_target(url),
+    };
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err(Error::InvalidParams(
+            "targetName must be a single path segment".to_string(),
+        ));
+    }
+    Ok(parent.join(name))
+}
+
+/// Basename-of-URL default (strip a trailing `.git`), matching `git clone`.
+fn derive_default_target(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    let base = trimmed.rsplit(['/', ':']).next().unwrap_or("");
+    base.strip_suffix(".git").unwrap_or(base).to_string()
+}
+
+/// Redact a `user[:pass]@` credential fragment from any URL-like substring in
+/// `text`. Best-effort; used only for the terminal `error` payload.
+fn redact_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(scheme_end) = rest.find("://") {
+        out.push_str(&rest[..scheme_end + 3]);
+        rest = &rest[scheme_end + 3..];
+        let end_authority = rest.find(['/', ' ', '\t', '\n']).unwrap_or(rest.len());
+        let authority = &rest[..end_authority];
+        if let Some(at) = authority.rfind('@') {
+            out.push_str("***@");
+            out.push_str(&authority[at + 1..]);
+        } else {
+            out.push_str(authority);
+        }
+        rest = &rest[end_authority..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Streaming-clone request handed to [`run_clone`]. Held plain (not `Clone`)
+/// because it is consumed once by the spawned task.
+pub(crate) struct CloneJob {
+    pub request_id: String,
+    /// Workspace to publish progress under. `None` when the caller has no
+    /// workspace context (workspace-adjacent clone); the empty [`WorkspaceId`]
+    /// is used so `workspaceId`-less subscribers still receive the frames.
+    pub workspace_id: Option<WorkspaceId>,
+    pub url: String,
+    pub target_path: PathBuf,
+    pub bus: EventBus,
+}
+
+/// Kick off a streaming clone on a background task and return immediately. The
+/// task publishes `git:clone:progress` frames as they are parsed and one
+/// terminal `git:clone:done` when the child exits, times out, or fails to
+/// spawn. Never returns an error — spawn failures are surfaced on the terminal
+/// event so the caller only correlates by `requestId`.
+pub(crate) fn spawn_clone(job: CloneJob) {
+    tokio::spawn(async move { run_clone(job).await });
+}
+
+async fn run_clone(job: CloneJob) {
+    let CloneJob {
+        request_id,
+        workspace_id,
+        url,
+        target_path,
+        bus,
+    } = job;
+    let ws = workspace_id.unwrap_or_else(|| WorkspaceId::from_string(String::new()));
+
+    // Initial "starting" frame (parity with the FE's first tick).
+    publish(
+        &bus,
+        &ws,
+        progress_event(&ws, &request_id, "starting", 0, "Starting clone..."),
+    )
+    .await;
+
+    // Ensure a target-parent exists so `git clone` doesn't fail on a fresh
+    // workspace path. Not fatal if it already exists.
+    if let Some(parent) = target_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+    }
+
+    let mut cmd = Command::new("git");
+    cmd.arg("clone")
+        .arg("--progress")
+        .arg(&url)
+        .arg(&target_path)
+        .env("GIT_LFS_SKIP_SMUDGE", GIT_LFS_SKIP_SMUDGE)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            publish(
+                &bus,
+                &ws,
+                done_event(
+                    &ws,
+                    &request_id,
+                    false,
+                    Some(&format!("git spawn failed: {e}")),
+                ),
+            )
+            .await;
+            return;
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill().await;
+            publish(
+                &bus,
+                &ws,
+                done_event(&ws, &request_id, false, Some("git stderr not piped")),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let bus_reader = bus.clone();
+    let ws_reader = ws.clone();
+    let request_id_reader = request_id.clone();
+    let reader_task = tokio::spawn(async move {
+        stream_stderr(stderr, bus_reader, ws_reader, request_id_reader).await
+    });
+
+    // Wait for the child under a hard timeout so a stalled clone never wedges
+    // the daemon. On timeout, reap the process group and emit `ok:false`.
+    let wait_result = tokio::time::timeout(CLONE_TIMEOUT, child.wait()).await;
+    // Ensure the reader task drains any final stderr before we settle.
+    let tail_error = reader_task.await.ok().flatten();
+
+    match wait_result {
+        Ok(Ok(status)) if status.success() => {
+            publish(
+                &bus,
+                &ws,
+                progress_event(&ws, &request_id, "complete", 100, "Clone complete!"),
+            )
+            .await;
+            publish(&bus, &ws, done_event(&ws, &request_id, true, None)).await;
+        }
+        Ok(Ok(status)) => {
+            let msg = match tail_error {
+                Some(t) if !t.is_empty() => format!("git clone failed ({}): {}", status, t),
+                _ => format!("git clone failed ({})", status),
+            };
+            publish(
+                &bus,
+                &ws,
+                done_event(&ws, &request_id, false, Some(&redact_credentials(&msg))),
+            )
+            .await;
+        }
+        Ok(Err(e)) => {
+            publish(
+                &bus,
+                &ws,
+                done_event(
+                    &ws,
+                    &request_id,
+                    false,
+                    Some(&format!("git wait failed: {e}")),
+                ),
+            )
+            .await;
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            publish(
+                &bus,
+                &ws,
+                done_event(&ws, &request_id, false, Some("git clone timed out")),
+            )
+            .await;
+        }
+    }
+}
+
+/// Parse `git clone --progress` stderr line-by-line and publish one
+/// `git:clone:progress` per matched phase transition. Returns the final chunk
+/// of stderr text (best-effort) so a non-zero exit can surface a useful error.
+async fn stream_stderr<R>(
+    stderr: R,
+    bus: EventBus,
+    ws: WorkspaceId,
+    request_id: String,
+) -> Option<String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(stderr);
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let mut last_phase = String::from("starting");
+    let mut last_percent: u32 = 0;
+    let mut tail: String = String::new();
+    loop {
+        buf.clear();
+        // Git emits carriage-returned progress; split on either \r or \n so we
+        // observe each in-place update, not just terminal lines.
+        let n = match read_until_any(&mut reader, b"\r\n", &mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let text = String::from_utf8_lossy(&buf[..n]);
+        for (phase, percent, message) in parse_progress(&text) {
+            if phase != last_phase || percent > last_percent {
+                last_phase = phase.to_string();
+                last_percent = percent;
+                publish(
+                    &bus,
+                    &ws,
+                    progress_event(&ws, &request_id, phase, percent, &message),
+                )
+                .await;
+            }
+        }
+        // Keep a bounded tail (~4KiB) of stderr for error messages.
+        tail.push_str(&text);
+        if tail.len() > 4096 {
+            let drop_to = tail.len() - 4096;
+            tail.drain(..drop_to);
+        }
+    }
+    if tail.trim().is_empty() {
+        None
+    } else {
+        Some(tail.trim().to_string())
+    }
+}
+
+/// `read_until` but matching *any* byte in `delims`, mirroring `tokio`'s
+/// single-byte helper. Needed because git progress uses `\r` for in-place
+/// updates.
+async fn read_until_any<R>(
+    reader: &mut BufReader<R>,
+    delims: &[u8],
+    out: &mut Vec<u8>,
+) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut total = 0usize;
+    loop {
+        let (done, used) = {
+            let available = match reader.fill_buf().await {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if available.is_empty() {
+                return Ok(total);
+            }
+            match available.iter().position(|b| delims.contains(b)) {
+                Some(i) => {
+                    out.extend_from_slice(&available[..=i]);
+                    (true, i + 1)
+                }
+                None => {
+                    out.extend_from_slice(available);
+                    (false, available.len())
+                }
+            }
+        };
+        reader.consume(used);
+        total += used;
+        if done {
+            return Ok(total);
+        }
+    }
+}
+
+/// Ported from the FE's stderr regex table: match one canonical phase per line.
+fn parse_progress(text: &str) -> Vec<(&'static str, u32, String)> {
+    let mut out = Vec::new();
+    // Static regex-lite scanners keep the dep footprint at zero. Each rule
+    // returns (phase, percent, human_message).
+    if text.contains("Cloning into") {
+        out.push(("starting", 0, "Cloning repository...".to_string()));
+    }
+    if text.contains("Counting objects") {
+        out.push(("counting", 0, "Counting objects...".to_string()));
+    }
+    if let Some(pct) = percent_after(text, "Compressing objects:") {
+        out.push(("compressing", pct, format!("Compressing objects: {pct}%")));
+    }
+    if let Some(pct) = percent_after(text, "Receiving objects:") {
+        out.push(("receiving", pct, format!("Receiving objects: {pct}%")));
+    }
+    if let Some(pct) = percent_after(text, "Resolving deltas:") {
+        out.push(("resolving", pct, format!("Resolving deltas: {pct}%")));
+    }
+    if let Some(pct) = percent_after(text, "Checking out files:") {
+        out.push(("checkout", pct, format!("Checking out files: {pct}%")));
+    }
+    out
+}
+
+/// Return the integer percent immediately after `label` in `text`, e.g. for
+/// "Receiving objects:  45% (1234/2743)" returns `Some(45)`. Whitespace between
+/// the label and digits is skipped.
+fn percent_after(text: &str, label: &str) -> Option<u32> {
+    let idx = text.find(label)?;
+    let rest = &text[idx + label.len()..];
+    let mut chars = rest.char_indices().peekable();
+    while let Some(&(_, c)) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    let start = chars.peek().map(|(i, _)| *i)?;
+    let mut end = start;
+    for (i, c) in rest[start..].char_indices() {
+        if c.is_ascii_digit() {
+            end = start + i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == start {
+        return None;
+    }
+    rest[start..end].parse::<u32>().ok().map(|p| p.min(100))
+}
+
+fn progress_event(
+    workspace_id: &WorkspaceId,
+    request_id: &str,
+    phase: &str,
+    percent: u32,
+    message: &str,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: GIT_CLONE_PROGRESS.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: json!({
+            "requestId": request_id,
+            "phase": phase,
+            "percent": percent,
+            "message": message,
+        }),
+    }
+}
+
+fn done_event(
+    workspace_id: &WorkspaceId,
+    request_id: &str,
+    ok: bool,
+    error: Option<&str>,
+) -> NewEvent {
+    let mut data = json!({ "requestId": request_id, "ok": ok });
+    if let Some(err) = error {
+        data.as_object_mut()
+            .unwrap()
+            .insert("error".to_string(), json!(err));
+    }
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: GIT_CLONE_DONE.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    }
+}
+
+async fn publish(bus: &EventBus, _ws: &WorkspaceId, event: NewEvent) {
+    if let Err(e) = bus.publish(&event).await {
+        tracing::warn!(error = %e, "failed to publish git:clone event");
+    }
+}
+
+/// Read-only helper for the caller: whether `path` already exists on disk.
+/// Kept here so `Services::git_clone` can early-reject a non-empty target
+/// without duplicating path logic.
+pub(crate) fn target_exists(target_path: &Path) -> bool {
+    target_path.exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_default_target_strips_dot_git() {
+        assert_eq!(derive_default_target("https://github.com/a/b.git"), "b");
+        assert_eq!(derive_default_target("https://github.com/a/b"), "b");
+        assert_eq!(derive_default_target("git@github.com:a/b.git"), "b");
+        assert_eq!(derive_default_target("https://github.com/a/b/"), "b");
+    }
+
+    #[test]
+    fn resolve_target_rejects_traversal() {
+        assert!(resolve_target_path("/tmp", "https://x/y.git", Some("../evil")).is_err());
+        assert!(resolve_target_path("/tmp", "https://x/y.git", Some("a/b")).is_err());
+        assert!(resolve_target_path("/tmp", "https://x/y.git", Some("")).is_err());
+    }
+
+    #[test]
+    fn resolve_target_uses_default_when_missing() {
+        let p = resolve_target_path("/tmp", "https://github.com/a/b.git", None).unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/b"));
+    }
+
+    #[test]
+    fn redact_credentials_masks_user_pass() {
+        let input = "fatal: unable to access 'https://user:secret@host/x.git': timed out";
+        let out = redact_credentials(input);
+        assert!(!out.contains("user:secret"));
+        assert!(out.contains("***@host"));
+    }
+
+    #[test]
+    fn redact_credentials_passthrough_when_none() {
+        let input = "fatal: repository not found";
+        assert_eq!(redact_credentials(input), input);
+    }
+
+    #[test]
+    fn parse_progress_matches_phases() {
+        let ph = parse_progress("Receiving objects:  45% (10/22)");
+        assert_eq!(ph.len(), 1);
+        assert_eq!(ph[0].0, "receiving");
+        assert_eq!(ph[0].1, 45);
+        let ch = parse_progress("Checking out files: 100% (1/1), done.");
+        assert_eq!(ch[0].0, "checkout");
+        assert_eq!(ch[0].1, 100);
+    }
+}

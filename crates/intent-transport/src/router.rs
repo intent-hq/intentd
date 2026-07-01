@@ -1007,6 +1007,17 @@ async fn dispatch(
             let r = api.repo_list().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "git.clone" => {
+            let url = require_str_param(params, "url")?;
+            let parent_dir = require_str_param(params, "parentDir")?;
+            let target_name = opt_str(params, "targetName");
+            let request_id = opt_str(params, "requestId");
+            let r = api
+                .git_clone(url, parent_dir, target_name, request_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "git.commit" => {
             let ws = require_ws_note(params)?;
             let message = require_str_param(params, "message")?;

@@ -45,6 +45,7 @@ mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
 mod auto_commit;
+mod clone_ops;
 mod drafts;
 mod event_ops;
 pub mod events;
@@ -5012,6 +5013,43 @@ impl WorkspaceApi for Services {
                 ));
             }
             intent_git::branches::branch_status(std::path::Path::new(&repo_path), &branch_name)
+        })
+    }
+
+    fn git_clone(
+        &self,
+        url: String,
+        parent_dir: String,
+        target_name: Option<String>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            if url.trim().is_empty() {
+                return Err(Error::InvalidParams("url is required".to_string()));
+            }
+            let target = clone_ops::resolve_target_path(&parent_dir, &url, target_name.as_deref())?;
+            if clone_ops::target_exists(&target) {
+                return Err(Error::Internal(format!(
+                    "target already exists: {}",
+                    target.display()
+                )));
+            }
+            let request_id = request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let bus = bus.ok_or_else(|| {
+                Error::Internal("event bus not wired; git.clone requires streaming".to_string())
+            })?;
+            clone_ops::spawn_clone(clone_ops::CloneJob {
+                request_id: request_id.clone(),
+                workspace_id: None,
+                url,
+                target_path: target.clone(),
+                bus,
+            });
+            Ok(serde_json::json!({
+                "requestId": request_id,
+                "targetPath": target.to_string_lossy(),
+            }))
         })
     }
 

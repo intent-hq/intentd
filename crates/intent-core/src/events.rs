@@ -193,6 +193,15 @@ pub const SEARCH_DONE: &str = "search:done";
 // cleared so other connections can sync/refetch.
 pub const DRAFT_CHANGED: &str = "draft:changed";
 
+// Streaming `git.clone` events (new in intentd; PROTOCOL §5.6 / §6.5). The
+// `git.clone` method returns `{ requestId }` promptly, then the daemon streams
+// `git:clone:progress` frames (`data: { requestId, phase, percent, message }`)
+// as parsed from `git clone --progress` stderr, followed by a terminal
+// `git:clone:done` (`data: { requestId, ok, error? }`), all correlated by
+// `requestId`. Payloads never carry the source URL / credentials.
+pub const GIT_CLONE_PROGRESS: &str = "git:clone:progress";
+pub const GIT_CLONE_DONE: &str = "git:clone:done";
+
 // MCP events.
 pub const MCP_NOTIFICATION: &str = "mcp:notification";
 
@@ -298,6 +307,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SEARCH_RESULT,
     SEARCH_DONE,
     DRAFT_CHANGED,
+    GIT_CLONE_PROGRESS,
+    GIT_CLONE_DONE,
     MCP_NOTIFICATION,
     MCP_SERVERS_STATUS_CHANGED,
     SETTINGS_CHANGED,

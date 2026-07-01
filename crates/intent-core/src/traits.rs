@@ -1522,6 +1522,28 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `git.clone`: streaming clone of `url` into `<parent_dir>/<target_name>`
+    /// (or the URL-derived basename when `target_name` is `None`). Returns
+    /// `{ requestId, targetPath }` promptly and pushes `git:clone:progress`
+    /// frames followed by a terminal `git:clone:done` on the event bus,
+    /// correlated by `requestId` (PROTOCOL §5.6 / §6.5). Payloads never carry
+    /// the source URL or credentials. `-32602` on missing/invalid params;
+    /// `-32603` when the daemon cannot spawn `git`.
+    fn git_clone(
+        &self,
+        url: String,
+        parent_dir: String,
+        target_name: Option<String>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (url, parent_dir, target_name, request_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_clone not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `repo.list`: the persistent known-repository registry, most-recently-used
     /// first, as `{ repos: KnownRepo[] }` (PROTOCOL §5.6). Populates the iOS
     /// Create-Workspace picker; the first invocation also lazily syncs repos from
