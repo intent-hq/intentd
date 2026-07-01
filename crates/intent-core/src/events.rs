@@ -202,6 +202,18 @@ pub const DRAFT_CHANGED: &str = "draft:changed";
 pub const GIT_CLONE_PROGRESS: &str = "git:clone:progress";
 pub const GIT_CLONE_DONE: &str = "git:clone:done";
 
+// Streaming `host.execStream` events (new in intentd; PROTOCOL §5.14 / §6.5).
+// The `host.execStream` method returns `{ requestId }` promptly, then the daemon
+// streams `host:exec:stdout` / `host:exec:stderr` frames (`data: { requestId,
+// chunk }` — `chunk` is base64-encoded so binary output crosses the wire
+// intact) as the child produces output, followed by a terminal `host:exec:exit`
+// (`data: { requestId, exitCode?, timedOut?, cancelled?, ok }`), all correlated
+// by `requestId`. Payloads never carry the command's env or argv (secret-safe;
+// mirrors the one-shot `host.exec` guarantees).
+pub const HOST_EXEC_STDOUT: &str = "host:exec:stdout";
+pub const HOST_EXEC_STDERR: &str = "host:exec:stderr";
+pub const HOST_EXEC_EXIT: &str = "host:exec:exit";
+
 // MCP events.
 pub const MCP_NOTIFICATION: &str = "mcp:notification";
 
@@ -309,6 +321,9 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     DRAFT_CHANGED,
     GIT_CLONE_PROGRESS,
     GIT_CLONE_DONE,
+    HOST_EXEC_STDOUT,
+    HOST_EXEC_STDERR,
+    HOST_EXEC_EXIT,
     MCP_NOTIFICATION,
     MCP_SERVERS_STATUS_CHANGED,
     SETTINGS_CHANGED,

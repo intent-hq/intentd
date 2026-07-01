@@ -620,3 +620,251 @@ async fn host_exec_over_wss() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Read one `events.event` frame whose `event.type` matches `type_filter` AND
+/// whose `event.data.requestId` equals `request_id`; ignore anything else.
+async fn wss_next_stream_event<S>(
+    ws: &mut WebSocketStream<S>,
+    request_id: &str,
+    type_filter: &[&str],
+    secs: u64,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let next = timeout(Duration::from_secs(secs), ws.next())
+            .await
+            .expect("wss stream event timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] != "events.event" {
+                    continue;
+                }
+                let event = &v["params"]["event"];
+                let ty = event["type"].as_str().unwrap_or("");
+                if !type_filter.iter().any(|t| *t == ty) {
+                    continue;
+                }
+                if event["data"]["requestId"].as_str() != Some(request_id) {
+                    continue;
+                }
+                return v;
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// host.execStream: happy-path streaming (`cat` echoes an initial stdin payload
+/// then a follow-up write closes stdin so the child exits) + cancel path
+/// (`sleep 30` reaped by `host.execStream.cancel`) + `-32602` on missing
+/// `command`. Exercises the full §5.14 streaming wire: `{ requestId }` on the
+/// request, `host:exec:stdout` bus frames (base64 chunks), stdin write with
+/// `eof=true`, and terminal `host:exec:exit`.
+#[tokio::test]
+async fn host_exec_stream_over_wss() {
+    use base64::Engine as _;
+
+    let (_daemon, port, cfg) = boot().await;
+
+    // SUBSCRIBER conn — subscribe BEFORE starting the stream so no chunk is
+    // missed. `workspaceId` is intentionally omitted: `host.execStream` without
+    // a workspace context publishes under the empty-workspace id, and the
+    // events fast-path routes matching frames to global (workspace-less)
+    // subscribers on the same connection.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        300,
+        "events.subscribe",
+        json!({ "eventTypes": ["host:exec:stdout", "host:exec:stderr", "host:exec:exit"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // RPC conn — kick off a `cat` streaming exec with an initial stdin payload
+    // that MUST be echoed back on stdout, correlated by the returned
+    // requestId. `cat` reads to EOF, so the follow-up `write { eof:true }`
+    // closes stdin and lets the child exit cleanly (exitCode=0).
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let started = wss_rpc(
+        &mut rpc,
+        301,
+        "host.execStream",
+        json!({ "command": "cat", "stdin": "hello world\n" }),
+    )
+    .await;
+    let request_id = started["requestId"]
+        .as_str()
+        .expect("requestId in host.execStream result")
+        .to_string();
+
+    // Collect stdout chunks (base64) until the marker appears; stop on exit.
+    let mut acc: Vec<u8> = Vec::new();
+    let mut saw_exit = false;
+    let mut exit_ok: Option<bool> = None;
+
+    // First: watch for the initial stdin's echo.
+    for _ in 0..40 {
+        let v = wss_next_stream_event(
+            &mut sub,
+            &request_id,
+            &["host:exec:stdout", "host:exec:exit"],
+            15,
+        )
+        .await;
+        let event = &v["params"]["event"];
+        match event["type"].as_str() {
+            Some("host:exec:stdout") => {
+                if let Some(chunk) = event["data"]["chunk"].as_str() {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(chunk)
+                        .expect("valid base64 in host:exec:stdout.chunk");
+                    acc.extend_from_slice(&bytes);
+                }
+            }
+            Some("host:exec:exit") => {
+                saw_exit = true;
+                exit_ok = event["data"]["ok"].as_bool();
+                break;
+            }
+            _ => continue,
+        }
+        if String::from_utf8_lossy(&acc).contains("hello world") {
+            break;
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&acc).contains("hello world"),
+        "initial stdin was echoed on host:exec:stdout: {:?}",
+        String::from_utf8_lossy(&acc)
+    );
+
+    // Send a follow-up stdin chunk + close so `cat` exits (unless it already
+    // exited above via some other race — the write is idempotent-safe).
+    if !saw_exit {
+        let write_resp = wss_rpc(
+            &mut rpc,
+            302,
+            "host.execStream.write",
+            json!({ "requestId": &request_id, "stdin": "goodbye\n", "eof": true }),
+        )
+        .await;
+        assert_eq!(write_resp["ok"], true, "write ok: {write_resp}");
+        // Drain until we see the terminal exit frame.
+        for _ in 0..40 {
+            let v = wss_next_stream_event(
+                &mut sub,
+                &request_id,
+                &["host:exec:stdout", "host:exec:exit"],
+                15,
+            )
+            .await;
+            let event = &v["params"]["event"];
+            match event["type"].as_str() {
+                Some("host:exec:stdout") => {
+                    if let Some(chunk) = event["data"]["chunk"].as_str() {
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(chunk)
+                            .expect("valid base64 in host:exec:stdout.chunk");
+                        acc.extend_from_slice(&bytes);
+                    }
+                }
+                Some("host:exec:exit") => {
+                    saw_exit = true;
+                    exit_ok = event["data"]["ok"].as_bool();
+                    break;
+                }
+                _ => continue,
+            }
+        }
+    }
+    assert!(
+        saw_exit,
+        "host:exec:exit reached (accumulated stdout so far: {:?})",
+        String::from_utf8_lossy(&acc)
+    );
+    assert_eq!(exit_ok, Some(true), "cat exited cleanly (exitCode=0)");
+
+    // ── Cancel path ────────────────────────────────────────────────────────
+    // A long-lived `sleep 30` MUST be reaped by `host.execStream.cancel`
+    // (SIGTERM → grace → SIGKILL). Terminal frame carries `cancelled:true`.
+    let started = wss_rpc(
+        &mut rpc,
+        310,
+        "host.execStream",
+        json!({ "command": "sleep", "args": ["30"] }),
+    )
+    .await;
+    let cancel_id = started["requestId"]
+        .as_str()
+        .expect("requestId for cancel case")
+        .to_string();
+
+    // Give the child a moment to start before cancelling.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let cancel_resp = wss_rpc(
+        &mut rpc,
+        311,
+        "host.execStream.cancel",
+        json!({ "requestId": &cancel_id }),
+    )
+    .await;
+    assert_eq!(cancel_resp["ok"], true, "cancel ok: {cancel_resp}");
+    assert_eq!(
+        cancel_resp["cancelled"], true,
+        "cancel flipped live token: {cancel_resp}"
+    );
+
+    // The exit frame arrives promptly (SIGTERM plus 500ms grace).
+    let exit = wss_next_stream_event(&mut sub, &cancel_id, &["host:exec:exit"], 10).await;
+    let data = &exit["params"]["event"]["data"];
+    assert_eq!(data["cancelled"], true, "cancelled:true on exit: {exit}");
+    assert_eq!(data["ok"], false, "cancelled sleep is not `ok`: {exit}");
+
+    // A repeat cancel on the (now-finished) id is idempotent: `ok:true` still,
+    // but `cancelled:false` because no live token remained.
+    let repeat = wss_rpc(
+        &mut rpc,
+        312,
+        "host.execStream.cancel",
+        json!({ "requestId": &cancel_id }),
+    )
+    .await;
+    assert_eq!(repeat["ok"], true, "idempotent cancel is ok: {repeat}");
+    assert_eq!(repeat["cancelled"], false, "no live token: {repeat}");
+
+    // ── -32602 arms ────────────────────────────────────────────────────────
+    // Missing `command` on the stream request ⇒ -32602 (PROTOCOL §9).
+    let frame = json!({ "jsonrpc": "2.0", "id": 320, "method": "host.execStream", "params": {} });
+    rpc.send(Message::Text(frame.to_string())).await.unwrap();
+    let err = wss_expect_error(&mut rpc, 320).await;
+    assert_eq!(
+        err["error"]["code"], -32602,
+        "missing command ⇒ -32602: {err}"
+    );
+    // Missing `requestId` on the write / cancel surfaces likewise.
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 321, "method": "host.execStream.write", "params": {}
+    });
+    rpc.send(Message::Text(frame.to_string())).await.unwrap();
+    let err = wss_expect_error(&mut rpc, 321).await;
+    assert_eq!(err["error"]["code"], -32602, "missing requestId ⇒ -32602");
+
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 322, "method": "host.execStream.cancel", "params": {}
+    });
+    rpc.send(Message::Text(frame.to_string())).await.unwrap();
+    let err = wss_expect_error(&mut rpc, 322).await;
+    assert_eq!(err["error"]["code"], -32602, "missing requestId ⇒ -32602");
+}

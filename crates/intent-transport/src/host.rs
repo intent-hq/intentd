@@ -10,7 +10,9 @@
 
 use std::fmt;
 
+use base64::Engine as _;
 use intent_core::WorkspaceApi;
+use intent_services::EventBus;
 use serde_json::{json, Map, Value};
 
 use crate::discovery::{detect_display_server, detect_has_display, local_hostname};
@@ -46,6 +48,15 @@ pub(crate) enum HostMethod {
     FindApp,
     ListInstalledEditors,
     Exec,
+    /// Streaming/interactive exec surface (`host.execStream`, §5.14): returns
+    /// `{ requestId }` immediately, then streams `host:exec:*` bus frames.
+    ExecStream,
+    /// Follow-up stdin write to a live `host.execStream` (`{ requestId, stdin?,
+    /// stdinBase64?, eof? }` → `{ ok: true }`).
+    ExecStreamWrite,
+    /// Cancellation for a live `host.execStream` (`{ requestId }` →
+    /// `{ ok: true, cancelled: bool }`); idempotent on unknown ids.
+    ExecStreamCancel,
 }
 
 /// A classified `host.*` request awaiting handling by the connection task.
@@ -87,6 +98,9 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
         "host.findApp" => HostMethod::FindApp,
         "host.listInstalledEditors" => HostMethod::ListInstalledEditors,
         "host.exec" => HostMethod::Exec,
+        "host.execStream" => HostMethod::ExecStream,
+        "host.execStream.write" => HostMethod::ExecStreamWrite,
+        "host.execStream.cancel" => HostMethod::ExecStreamCancel,
         _ => return None,
     };
     // `parsed.params || {}`: a non-object (absent/null/array/scalar) yields `{}`,
@@ -143,6 +157,7 @@ pub(crate) fn host_status_json(
 pub(crate) async fn handle(
     req: HostRequest,
     api: &dyn WorkspaceApi,
+    bus: Option<&EventBus>,
     is_local: bool,
 ) -> Option<String> {
     let HostRequest {
@@ -298,11 +313,113 @@ pub(crate) async fn handle(
                 Err(e) => error_frame(id_echo, e.code, &e.message),
             }
         }
+        HostMethod::ExecStream => {
+            let bus = match bus {
+                Some(b) => b.clone(),
+                None => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(
+                        id_echo,
+                        -32603,
+                        "host.execStream requires an event bus",
+                    ));
+                }
+            };
+            let parsed = match intent_services::host_exec_stream::parse_args(&params) {
+                Ok(a) => a,
+                Err(e) => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(id_echo, e.code, &e.message));
+                }
+            };
+            match intent_services::host_exec_stream::start_stream(api, bus, parsed).await {
+                Ok(request_id) => success_frame(id_echo, json!({ "requestId": request_id })),
+                Err(e) => error_frame(id_echo, e.code, &e.message),
+            }
+        }
+        HostMethod::ExecStreamWrite => {
+            let request_id = match params.get("requestId").and_then(Value::as_str) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(
+                        id_echo,
+                        -32602,
+                        "Missing required parameter: requestId",
+                    ));
+                }
+            };
+            let data = match parse_write_stdin(&params) {
+                Ok(v) => v,
+                Err(msg) => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(id_echo, -32602, &msg));
+                }
+            };
+            let eof = params.get("eof").and_then(Value::as_bool).unwrap_or(false);
+            match intent_services::host_exec_stream::registry()
+                .write(&request_id, data, eof)
+                .await
+            {
+                Ok(()) => success_frame(id_echo, json!({ "ok": true })),
+                Err(e) => error_frame(id_echo, e.code, &e.message),
+            }
+        }
+        HostMethod::ExecStreamCancel => {
+            let request_id = match params.get("requestId").and_then(Value::as_str) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(
+                        id_echo,
+                        -32602,
+                        "Missing required parameter: requestId",
+                    ));
+                }
+            };
+            let cancelled = intent_services::host_exec_stream::registry().cancel(&request_id);
+            success_frame(id_echo, json!({ "ok": true, "cancelled": cancelled }))
+        }
     };
     if !id_present {
         return None;
     }
     Some(frame)
+}
+
+/// Extract the optional stdin payload from a `host.execStream.write` request.
+/// Accepts either a plain UTF-8 `stdin` string or a base64 `stdinBase64` blob;
+/// returns `None` when neither is supplied, `Err(message)` on a type error or
+/// invalid base64 (mapped to `-32602` by the caller).
+fn parse_write_stdin(params: &Map<String, Value>) -> Result<Option<Vec<u8>>, String> {
+    match (params.get("stdin"), params.get("stdinBase64")) {
+        (None, None) | (Some(Value::Null), None) | (None, Some(Value::Null)) => Ok(None),
+        (Some(Value::Null), Some(Value::Null)) => Ok(None),
+        (Some(text), None) | (Some(text), Some(Value::Null)) => match text {
+            Value::String(s) => Ok(Some(s.as_bytes().to_vec())),
+            _ => Err("Invalid parameter: stdin must be a string".to_string()),
+        },
+        (None, Some(b64)) | (Some(Value::Null), Some(b64)) => match b64 {
+            Value::String(s) => base64::engine::general_purpose::STANDARD
+                .decode(s.as_bytes())
+                .map(Some)
+                .map_err(|_| "Invalid parameter: stdinBase64 is not valid base64".to_string()),
+            _ => Err("Invalid parameter: stdinBase64 must be a string".to_string()),
+        },
+        (Some(_), Some(_)) => {
+            Err("Invalid parameter: pass either stdin or stdinBase64, not both".to_string())
+        }
+    }
 }
 
 /// Read the user-configured auggie path from settings, preferring the explicit

@@ -224,7 +224,9 @@ fn node_resolve(base: &str, rel: &str) -> PathBuf {
 /// Resolve the workspace filesystem root, then apply the same lexical
 /// prefix-check `file_ops` uses. An empty root (unset `worktreePath`/`path`)
 /// rejects any `cwd` — the containment guard cannot be enforced without one.
-async fn resolve_cwd_within_workspace(
+/// Public so the streaming surface (`host_exec_stream`) can reuse the guard
+/// bit-identically instead of re-deriving it.
+pub async fn resolve_cwd_within_workspace(
     api: &dyn WorkspaceApi,
     workspace_id: &str,
     cwd: &str,

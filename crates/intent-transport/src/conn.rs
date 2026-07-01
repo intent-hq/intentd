@@ -121,7 +121,7 @@ pub(crate) async fn process_frame(
             }
         }
         if let Some(req) = host::classify(&value) {
-            return match host::handle(req, api.as_ref(), is_local).await {
+            return match host::handle(req, api.as_ref(), Some(bus), is_local).await {
                 Some(frame) => out_tx.send(frame).await.is_ok(),
                 None => true,
             };

@@ -452,7 +452,7 @@ fn find_app_with_returns_installed_with_source_on_macos() {
     let root = unique_temp_dir("find-app-with");
     let apps = root.join("Applications");
     std::fs::create_dir_all(apps.join("Zed.app")).unwrap();
-    let v = find_app_with("Zed", &[apps.clone()], true);
+    let v = find_app_with("Zed", std::slice::from_ref(&apps), true);
     assert_eq!(v["installed"], true);
     assert_eq!(
         v["path"],
@@ -488,7 +488,7 @@ fn list_installed_editors_with_detects_macos_app_bundles() {
     std::fs::create_dir_all(apps.join("Cursor.app")).unwrap();
     let v = list_installed_editors_with(
         EditorPlatform::Macos,
-        &[apps.clone()],
+        std::slice::from_ref(&apps),
         &StubResolver(None),
         &StubFlatpak(None),
     );
