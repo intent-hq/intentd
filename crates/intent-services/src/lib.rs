@@ -529,18 +529,24 @@ impl Services {
     pub async fn heal_stale_agent_sessions(&self) -> Result<usize> {
         let sessions = self.store.list_all_agent_sessions().await?;
         let mut healed = 0usize;
-        for mut session in sessions {
+        for session in sessions {
             if !is_stale_in_flight_status(session.status) {
                 continue;
             }
             let prev = session.status;
-            session.status = intent_core::AgentStatus::RuntimeIdle;
-            session.is_active = false;
-            session.updated_at = now_iso();
-            // The update path enforces the `acpSessionId` write-once and
-            // `provider` immutability invariants (§9.5); the heal preserves
-            // both because it only edits status/is_active/updated_at.
-            self.store.update_agent_session(&session).await?;
+            // Narrow write: `set_agent_session_status` persists only
+            // (status, is_active, updated_at) without loading the full
+            // message log, keeping the startup sweep O(rows). The write-once
+            // `acpSessionId` and immutable `provider` invariants (§9.5) are
+            // untouched because those columns are not written here.
+            self.store
+                .set_agent_session_status(
+                    &session.id,
+                    intent_core::AgentStatus::RuntimeIdle,
+                    false,
+                    &now_iso(),
+                )
+                .await?;
             healed += 1;
             tracing::info!(
                 agent_id = %session.id,
