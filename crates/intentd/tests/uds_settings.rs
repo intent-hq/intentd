@@ -152,6 +152,9 @@ async fn settings_round_trip_redaction_validation_and_event() {
     assert_eq!(token["value"], Value::Null, "unset secret reads as null");
     assert_eq!(token["sensitive"], json!(true));
     assert_eq!(entry(&list, "server.auth.token")["sensitive"], json!(true));
+    let linear = entry(&list, "linear.token");
+    assert_eq!(linear["value"], Value::Null, "unset secret reads as null");
+    assert_eq!(linear["sensitive"], json!(true));
 
     // settings.get — one definition with its (default) value.
     let got = rpc(
@@ -259,7 +262,10 @@ async fn settings_round_trip_redaction_validation_and_event() {
         &mut r,
         8,
         "settings.update",
-        json!({ "changes": [{ "path": "sourceControl.github.token", "value": SECRET }] }),
+        json!({ "changes": [
+            { "path": "sourceControl.github.token", "value": SECRET },
+            { "path": "linear.token", "value": SECRET },
+        ] }),
     )
     .await;
     let applied_text = serde_json::to_string(&applied).unwrap();
@@ -269,6 +275,9 @@ async fn settings_round_trip_redaction_validation_and_event() {
     );
     assert_ne!(applied["applied"][0]["value"], json!(SECRET));
     assert!(applied["applied"][0]["value"].is_string());
+    assert_eq!(applied["applied"][1]["path"], "linear.token");
+    assert_ne!(applied["applied"][1]["value"], json!(SECRET));
+    assert!(applied["applied"][1]["value"].is_string());
     let ev = read_json(&mut sr).await;
     let ev_text = serde_json::to_string(&ev).unwrap();
     assert!(
@@ -312,6 +321,37 @@ async fn settings_round_trip_redaction_validation_and_event() {
     assert_eq!(
         ev["params"]["event"]["data"]["changes"][0],
         json!({ "path": "git.autoCommit", "value": true })
+    );
+
+    // linear.token behaves the same as other secrets: get stays redacted and
+    // reset clears the keychain entry (value back to null) + emits the event.
+    let got = rpc(
+        &mut w,
+        &mut r,
+        12,
+        "settings.get",
+        json!({ "path": "linear.token" }),
+    )
+    .await;
+    assert!(!serde_json::to_string(&got).unwrap().contains(SECRET));
+    assert!(
+        got["value"].is_string(),
+        "set secret reads as a placeholder"
+    );
+    let reset = rpc(
+        &mut w,
+        &mut r,
+        13,
+        "settings.reset",
+        json!({ "path": "linear.token" }),
+    )
+    .await;
+    assert_eq!(reset, json!({ "path": "linear.token", "value": null }));
+    let ev = read_json(&mut sr).await;
+    assert_eq!(ev["params"]["event"]["type"], "settings:changed");
+    assert_eq!(
+        ev["params"]["event"]["data"]["changes"][0],
+        json!({ "path": "linear.token", "value": null })
     );
 
     let _ = shutdown_tx.send(());

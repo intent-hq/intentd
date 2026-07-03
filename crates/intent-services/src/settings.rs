@@ -4,7 +4,7 @@
 //! min/max validation, and the redaction rule for **sensitive** settings.
 //! Non-secret values persist in the `settings` table (`intent-store`); sensitive
 //! values (`workspace.sshKeyPath`, `mcp.servers`, `server.auth.token`,
-//! `sourceControl.github.token`) live in the OS keychain via the [`SecretStore`]
+//! `sourceControl.github.token`, `linear.token`) live in the OS keychain via the [`SecretStore`]
 //! seam and are **never** returned in plaintext over the wire — list/get redact
 //! them to presence/placeholder only, and `server.auth.token` is read-only.
 
@@ -580,6 +580,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "sourceControl",
             Some("https://api.github.com"),
         ),
+        // --- Group A: Linear integration --------------------------------------
+        secret(
+            "linear.token",
+            "Linear API key",
+            "API key used by the Linear integration",
+            "linear",
+        ),
         // --- Group B: context engine ----------------------------------------
         boolean(
             "context.enabled",
@@ -773,5 +780,28 @@ impl<'a> SettingsService<'a> {
         }
         let value = self.current_value(&def).await;
         Ok(json!({ "path": def.path, "value": value }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `linear.token` must be a sensitive catalog entry so `settings.update`
+    /// persists it to the keychain under service `intentd` / account
+    /// `linear.token` (account = setting path) — the exact entry
+    /// `intent-linear`'s token resolver reads.
+    #[test]
+    fn linear_token_is_a_sensitive_catalog_entry() {
+        let def = find_definition("linear.token").expect("linear.token missing from catalog");
+        assert_eq!(def.path, "linear.token", "keychain account = setting path");
+        assert!(
+            def.sensitive,
+            "must persist to keychain + redact on the wire"
+        );
+        assert!(!def.read_only);
+        assert_eq!(def.category, "linear");
+        assert!(matches!(def.ty, SettingType::String));
+        assert!(def.default_value.is_none());
     }
 }
