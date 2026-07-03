@@ -2,8 +2,9 @@
 //!
 //! Worktree-path resolution, the `git.stage` CSV/array parse + `.`/`*`/`--all`
 //! rejection (ported from the TS `ws.git.stage` builder), and the
-//! `git.getBranches` "known repo" authorization check. The actual git operations
-//! live in `intent-git`; this module owns only the parity-critical wire policy.
+//! `git.getBranches`/`git.branchStatus` repo-path validation. The actual git
+//! operations live in `intent-git`; this module owns only the parity-critical
+//! wire policy.
 
 use std::path::{Path, PathBuf};
 
@@ -76,14 +77,27 @@ pub(crate) fn parse_stage_paths(paths: &Value) -> Result<Vec<String>> {
     Ok(list)
 }
 
-/// Whether `repo_path` matches a known workspace path or worktree path. Mirrors
-/// the TS `getAllRepos()` authorization check (intentd derives the known set
-/// from persisted workspaces, archived included, rather than a separate
-/// registry).
-pub(crate) fn is_known_repo(workspaces: &[Workspace], repo_path: &str) -> bool {
-    workspaces.iter().any(|ws| {
-        ws.path.as_deref() == Some(repo_path) || ws.worktree_path.as_deref() == Some(repo_path)
-    })
+/// Validate the path-based `repoPath` param of the read-only branch methods
+/// (`git.getBranches`, `git.branchStatus`): the path must exist locally and be
+/// a git repository. Mirrors the ungated legacy IPC handlers (`git:getBranches`
+/// `{ repoPath }` variant and `git:getBranchStatus`), which ran git directly
+/// against any user-picked path — the workspace-create flow lists branches
+/// *before* the repo is registered as a workspace, so a known-repo gate breaks
+/// it. Nonexistent paths and non-git directories are rejected with distinct
+/// `-32602` errors; mutating `git.*` methods remain workspace-scoped.
+pub(crate) fn validate_repo_path(repo_path: &str) -> Result<()> {
+    let path = Path::new(repo_path);
+    if !path.exists() {
+        return Err(Error::InvalidParams(format!(
+            "Repository path does not exist: {repo_path}"
+        )));
+    }
+    if !intent_git::is_repository(path) {
+        return Err(Error::InvalidParams(format!(
+            "Path is not a git repository: {repo_path}"
+        )));
+    }
+    Ok(())
 }
 
 /// Build the wire `CommitInfo` (§8.9) for a history record: `files` is the list
@@ -271,5 +285,34 @@ mod tests {
         assert!(format!("{err}").contains("No file paths provided"));
         let err = parse_stage_paths(&json!([])).unwrap_err();
         assert!(format!("{err}").contains("No file paths provided"));
+    }
+
+    #[test]
+    fn repo_path_nonexistent_is_invalid_params() {
+        let err = validate_repo_path("/no/such/repo").unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+        assert_eq!(
+            format!("{err}"),
+            "invalid params: Repository path does not exist: /no/such/repo"
+        );
+    }
+
+    #[test]
+    fn repo_path_non_git_dir_is_invalid_params() {
+        let dir = std::env::temp_dir().join(format!("intentd-nongit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = validate_repo_path(dir.to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+        assert!(format!("{err}").contains("Path is not a git repository:"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn repo_path_unregistered_git_repo_is_accepted() {
+        let dir = std::env::temp_dir().join(format!("intentd-gitok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        git2::Repository::init(&dir).unwrap();
+        assert!(validate_repo_path(dir.to_str().unwrap()).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

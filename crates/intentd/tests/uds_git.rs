@@ -649,8 +649,8 @@ async fn uds_git_branch_status_round_trip() {
         json!("Missing required parameter: branchName")
     );
 
-    // (f) Unknown repo path → -32602 with the verbatim gate message (mirrors
-    // git.getBranches).
+    // (f) Nonexistent repo path → -32602 with the verbatim validation message
+    // (mirrors git.getBranches).
     let resp = send(
         &config.socket_path,
         r#"{"jsonrpc":"2.0","id":6,"method":"git.branchStatus","params":{"repoPath":"/no/such/repo","branchName":"main"}}"#,
@@ -659,7 +659,141 @@ async fn uds_git_branch_status_round_trip() {
     assert_eq!(resp["error"]["code"], json!(-32602));
     assert_eq!(
         resp["error"]["message"],
-        json!("Unknown or unauthorized repository path")
+        json!("Repository path does not exist: /no/such/repo")
+    );
+
+    let _ = tx.send(());
+    let _ = server.await;
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Over-the-wire `git.getBranches` slice: the path-based branch listing used by
+/// the workspace-initializer BranchSelector (PROTOCOL §5.6). The repo does NOT
+/// need to be a registered workspace — the create flow lists branches before
+/// the workspace exists — but nonexistent paths and non-git directories are
+/// rejected with distinct -32602 errors.
+#[tokio::test]
+async fn uds_git_get_branches_round_trip() {
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let base = Path::new("/tmp").join(format!("intentd-gitgb-{}", &short[..8]));
+    let data_dir = base.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    // `known` is registered as a workspace; `unreg` is a valid git repo the
+    // daemon has never seen; `plain` is an existing non-git directory.
+    let known = base.join("known");
+    seed_repo(&known);
+    let unreg = base.join("unreg");
+    seed_repo(&unreg);
+    git(&unreg, &["branch", "feature-y"]);
+    let plain = base.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+
+    let config = {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTENTD_DATA_DIR", &data_dir);
+        Config::resolve().expect("resolve config")
+    };
+
+    let ws_id = WorkspaceId::from("ws-gitgb");
+    {
+        let store = Store::open(&config.db_path).await.expect("open store");
+        store
+            .insert_workspace(&seed_workspace(&ws_id, known.to_str().unwrap()))
+            .await
+            .expect("seed ws");
+    }
+
+    let store = Store::open(&config.db_path).await.expect("reopen store");
+    let bus = EventBus::new(store.clone());
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let socket = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_uds(services, bus, &socket, None, async move {
+            let _ = rx.await;
+        })
+        .await
+        .expect("serve");
+    });
+    for _ in 0..50 {
+        if config.socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let head_branch = |repo: &Path| {
+        String::from_utf8(
+            Command::new("git")
+                .current_dir(repo)
+                .args(["branch", "--show-current"])
+                .output()
+                .expect("branch --show-current")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string()
+    };
+
+    // (a) Known-workspace repo → branch payload (unchanged behavior).
+    let known_head = head_branch(&known);
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"git.getBranches","params":{{"repoPath":"{}"}}}}"#,
+            known.display(),
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["currentBranch"], json!(known_head));
+    assert!(resp["result"]["branches"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(known_head)));
+
+    // (b) Unregistered-but-valid local repo → succeeds (the workspace-create
+    // flow needs branches before the repo is known to the daemon).
+    let unreg_head = head_branch(&unreg);
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.getBranches","params":{{"repoPath":"{}","includeRemote":true}}}}"#,
+            unreg.display(),
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["currentBranch"], json!(unreg_head));
+    let branches = resp["result"]["branches"].as_array().unwrap();
+    assert!(branches.contains(&json!(unreg_head)));
+    assert!(branches.contains(&json!("feature-y")));
+    assert_eq!(resp["result"]["remoteBranches"], json!([]));
+
+    // (c) Existing directory that is not a git repository → -32602.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"git.getBranches","params":{{"repoPath":"{}"}}}}"#,
+            plain.display(),
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(
+        resp["error"]["message"],
+        json!(format!("Path is not a git repository: {}", plain.display()))
+    );
+
+    // (d) Nonexistent path → -32602 with the distinct message.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":4,"method":"git.getBranches","params":{"repoPath":"/no/such/repo"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(
+        resp["error"]["message"],
+        json!("Repository path does not exist: /no/such/repo")
     );
 
     let _ = tx.send(());

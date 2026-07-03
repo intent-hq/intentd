@@ -1089,9 +1089,11 @@ async fn wss_git_commit_details_round_trip() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
-/// `git.branchStatus` over WSS — the path-based BranchSelector seam (§5.6).
-/// Drives the happy path (response shape parity with the UDS coverage), the
-/// missing-branchName -32602, and the unknown-repo gate.
+/// `git.branchStatus` + `git.getBranches` over WSS — the path-based
+/// BranchSelector seam (§5.6). Drives the happy path (response shape parity
+/// with the UDS coverage), the missing-branchName -32602, the
+/// nonexistent-path -32602, and the unregistered-repo branch listing used by
+/// the workspace-create flow.
 #[tokio::test]
 async fn wss_git_branch_status_round_trip() {
     let srv = start(WsOptions::default()).await;
@@ -1128,7 +1130,8 @@ async fn wss_git_branch_status_round_trip() {
     .trim()
     .to_string();
 
-    // Register the repo as a workspace so the known-repo gate authorizes it.
+    // Register the repo as a workspace (the path-based reads do not require
+    // it, but a registered repo must keep working unchanged).
     let create_frame = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS branchStatus WS","worktreePath":"{}","path":"{}"}}}}"#,
         repo.display(),
@@ -1184,7 +1187,7 @@ async fn wss_git_branch_status_round_trip() {
         "Missing required parameter: branchName"
     );
 
-    // (d) Unknown repo path → -32602 with the gate-rejection message.
+    // (d) Nonexistent repo path → -32602 with the validation message.
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1194,11 +1197,79 @@ async fn wss_git_branch_status_round_trip() {
     assert_eq!(resp["error"]["code"], -32602);
     assert_eq!(
         resp["error"]["message"],
-        "Unknown or unauthorized repository path"
+        "Repository path does not exist: /no/such/repo"
+    );
+
+    // (e) `git.getBranches` on a valid local repo the daemon has never seen →
+    // succeeds (the workspace-create flow lists branches before the repo is
+    // registered; PROTOCOL §5.6).
+    let unreg = Path::new("/tmp").join(format!("intentd-wssgb-{}", &short[..8]));
+    std::fs::create_dir_all(&unreg).unwrap();
+    let git_in = |dir: &Path, args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git_in(&unreg, &["init", "-q"]);
+    git_in(&unreg, &["config", "user.name", "Test"]);
+    git_in(&unreg, &["config", "user.email", "test@example.com"]);
+    git_in(&unreg, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(unreg.join("seed.txt"), "seed\n").unwrap();
+    git_in(&unreg, &["add", "."]);
+    git_in(&unreg, &["commit", "-q", "-m", "seed"]);
+    let unreg_head = String::from_utf8(
+        std::process::Command::new("git")
+            .current_dir(&unreg)
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("branch --show-current")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"git.getBranches","params":{{"repoPath":"{}"}}}}"#,
+            unreg.display(),
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["currentBranch"], unreg_head);
+    assert!(resp["result"]["branches"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!(unreg_head)));
+
+    // (f) `git.getBranches` on an existing non-git directory → -32602 with the
+    // distinct message.
+    let plain = Path::new("/tmp").join(format!("intentd-wsspl-{}", &short[..8]));
+    std::fs::create_dir_all(&plain).unwrap();
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"git.getBranches","params":{{"repoPath":"{}"}}}}"#,
+            plain.display(),
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["message"],
+        format!("Path is not a git repository: {}", plain.display())
     );
 
     srv.ws.stop().await;
     std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&unreg).ok();
+    std::fs::remove_dir_all(&plain).ok();
 }
 
 /// Note version history over WSS (PROTOCOL §5.2 version-history extensions):

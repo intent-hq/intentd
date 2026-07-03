@@ -38,6 +38,14 @@ pub(crate) fn map_git_err(e: git2::Error) -> Error {
     Error::Internal(e.message().to_string())
 }
 
+/// Whether `path` points at a git repository (a repo root or a linked
+/// worktree). Read-only probe backing the `repoPath` validation of the
+/// path-based branch reads (`git.getBranches`, `git.branchStatus`) in
+/// `intent-services`.
+pub fn is_repository(path: &std::path::Path) -> bool {
+    git2::Repository::open(path).is_ok()
+}
+
 /// Whether a libgit2 error represents a merge/checkout conflict, mirroring the TS
 /// `message.includes('conflict')` classification (used to tell a conflicting
 /// rebase/stash-pop apart from an unrelated failure). Checks the structured error

@@ -5086,16 +5086,12 @@ impl WorkspaceApi for Services {
         repo_path: String,
         include_remote: bool,
     ) -> BoxFuture<'_, Result<intent_core::GitBranches>> {
-        let store = self.store.clone();
         Box::pin(async move {
-            // Validate against known repos (archived included) to prevent
-            // arbitrary filesystem access, matching the TS registry check.
-            let workspaces = store.list_workspaces(true).await?;
-            if !git_ops::is_known_repo(&workspaces, &repo_path) {
-                return Err(Error::InvalidParams(
-                    "Unknown or unauthorized repository path".to_string(),
-                ));
-            }
+            // Path-based read used by the workspace-create flow *before* the
+            // repo is registered: any existing local git repo is accepted
+            // (matching the ungated TS handler); nonexistent / non-git paths
+            // are `-32602` (PROTOCOL §5.6).
+            git_ops::validate_repo_path(&repo_path)?;
             intent_git::branches::get_branches(std::path::Path::new(&repo_path), include_remote)
         })
     }
@@ -5105,16 +5101,9 @@ impl WorkspaceApi for Services {
         repo_path: String,
         branch_name: String,
     ) -> BoxFuture<'_, Result<intent_core::GitBranchStatus>> {
-        let store = self.store.clone();
         Box::pin(async move {
-            // Same known-repo gate as `git_get_branches`: an unknown/unauthorized
-            // repo path is `-32602` (PROTOCOL §5.6).
-            let workspaces = store.list_workspaces(true).await?;
-            if !git_ops::is_known_repo(&workspaces, &repo_path) {
-                return Err(Error::InvalidParams(
-                    "Unknown or unauthorized repository path".to_string(),
-                ));
-            }
+            // Same repo-path validation as `git_get_branches` (PROTOCOL §5.6).
+            git_ops::validate_repo_path(&repo_path)?;
             intent_git::branches::branch_status(std::path::Path::new(&repo_path), &branch_name)
         })
     }

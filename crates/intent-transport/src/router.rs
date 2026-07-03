@@ -1035,8 +1035,9 @@ async fn dispatch(
             let include_remote = parse_bool(params, "includeRemote");
             match api.git_get_branches(repo_path, include_remote).await {
                 Ok(branches) => to_result_value(&branches),
-                // Unknown/unauthorized repo path → -32602 with the TS message
-                // verbatim (no `invalid params:` prefix from `domain_to_rpc`).
+                // Nonexistent / non-git repo path → -32602 with the service
+                // message verbatim (no `invalid params:` prefix from
+                // `domain_to_rpc`).
                 Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
@@ -1046,9 +1047,9 @@ async fn dispatch(
             let branch_name = require_str_param(params, "branchName")?;
             match api.git_branch_status(repo_path, branch_name).await {
                 Ok(status) => to_result_value(&status),
-                // Same gate as `git.getBranches`: unknown/unauthorized repo path
-                // surfaces verbatim as `-32602` without the `invalid params:`
-                // prefix `domain_to_rpc` would add.
+                // Same validation as `git.getBranches`: nonexistent / non-git
+                // repo path surfaces verbatim as `-32602` without the
+                // `invalid params:` prefix `domain_to_rpc` would add.
                 Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
