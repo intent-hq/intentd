@@ -89,7 +89,8 @@ pub fn rebase_with_autostash(worktree_path: &Path, trunk_ref: &str) -> Result<Re
 }
 
 /// `git status --porcelain` non-empty: any staged/unstaged/untracked change.
-fn is_dirty(repo: &Repository) -> Result<bool> {
+/// Shared with [`crate::pull`], whose auto-stash bookends need the same check.
+pub(crate) fn is_dirty(repo: &Repository) -> Result<bool> {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
@@ -100,8 +101,11 @@ fn is_dirty(repo: &Repository) -> Result<bool> {
 
 /// Drive the libgit2 rebase of `HEAD` onto `trunk_ref`, returning
 /// `(success, error, aborted)`. On any failure the rebase is aborted (restoring
-/// the pre-rebase state) and the error is classified conflict-vs-other.
-fn run_rebase(repo: &Repository, trunk_ref: &str) -> (bool, Option<String>, bool) {
+/// the pre-rebase state) and the error is classified conflict-vs-other. Also
+/// backs the pull-with-rebase step of [`crate::pull`] (upstream =
+/// `refs/remotes/origin/<branch>`); a behind-only branch replays zero commits
+/// and fast-forwards to the upstream tip.
+pub(crate) fn run_rebase(repo: &Repository, trunk_ref: &str) -> (bool, Option<String>, bool) {
     let committer = match repo.signature() {
         Ok(sig) => sig,
         Err(_) => match Signature::now("Intent", "intent@local") {

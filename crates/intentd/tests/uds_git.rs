@@ -800,3 +800,143 @@ async fn uds_git_get_branches_round_trip() {
     let _ = server.await;
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// Over-the-wire `git.pull` slice: the workspace-create auto-pull (PROTOCOL
+/// §5.6). Path-based like `git.getBranches` — the repo does NOT need to be a
+/// registered workspace. Covers the checked-out fast-forward pull (with a
+/// dirty worktree exercising the auto-stash bookends), the structured
+/// `{ ok: false, error }` failure, and the -32602 param rejections.
+#[tokio::test]
+async fn uds_git_pull_round_trip() {
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let base = Path::new("/tmp").join(format!("intentd-gitpl-{}", &short[..8]));
+    let data_dir = base.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // `repo` tracks a bare `origin` and is one commit behind it; `lone` has no
+    // remote at all (the structured-failure path).
+    let repo = base.join("repo");
+    seed_repo(&repo);
+    let bare = base.join("origin.git");
+    git(&base, &["init", "-q", "--bare", "origin.git"]);
+    git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    let branch = String::from_utf8(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("branch --show-current")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+    git(&repo, &["push", "-q", "origin", &branch]);
+    std::fs::write(repo.join("remote.txt"), "from-remote\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "remote change"]);
+    git(&repo, &["push", "-q", "origin", &branch]);
+    git(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+    // A dirty untracked file must survive the pull (auto-stash + pop).
+    std::fs::write(repo.join("local.txt"), "uncommitted\n").unwrap();
+    let lone = base.join("lone");
+    seed_repo(&lone);
+
+    let config = {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTENTD_DATA_DIR", &data_dir);
+        Config::resolve().expect("resolve config")
+    };
+    let store = Store::open(&config.db_path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let socket = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_uds(services, bus, &socket, None, async move {
+            let _ = rx.await;
+        })
+        .await
+        .expect("serve");
+    });
+    for _ in 0..50 {
+        if config.socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // (a) Behind + dirty checked-out branch → fast-forward pull succeeds, the
+    // remote commit arrives, and the local change is restored.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"git.pull","params":{{"repoPath":"{}","branchName":"{}"}}}}"#,
+            repo.display(),
+            branch,
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"], json!({ "ok": true }));
+    assert!(repo.join("remote.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(repo.join("local.txt")).unwrap(),
+        "uncommitted\n"
+    );
+
+    // (b) Repo without an `origin` remote → structured { ok: false, error }
+    // (an ordinary pull failure is never a JSON-RPC error).
+    let lone_branch = String::from_utf8(
+        Command::new("git")
+            .current_dir(&lone)
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("branch --show-current")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.pull","params":{{"repoPath":"{}","branchName":"{}"}}}}"#,
+            lone.display(),
+            lone_branch,
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(false));
+    assert!(!resp["result"]["error"].as_str().unwrap().is_empty());
+
+    // (c) Nonexistent repo path → -32602 with the validation message verbatim.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":3,"method":"git.pull","params":{"repoPath":"/no/such/repo","branchName":"main"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(
+        resp["error"]["message"],
+        json!("Repository path does not exist: /no/such/repo")
+    );
+
+    // (d) Missing branchName → -32602.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"git.pull","params":{{"repoPath":"{}"}}}}"#,
+            repo.display(),
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(
+        resp["error"]["message"],
+        json!("Missing required parameter: branchName")
+    );
+
+    let _ = tx.send(());
+    let _ = server.await;
+    std::fs::remove_dir_all(&base).ok();
+}

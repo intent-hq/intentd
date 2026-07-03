@@ -1272,6 +1272,114 @@ async fn wss_git_branch_status_round_trip() {
     std::fs::remove_dir_all(&plain).ok();
 }
 
+/// `git.pull` over WSS — the workspace-create auto-pull seam (§5.6).
+/// Path-based like `git.getBranches`: the repo is never registered as a
+/// workspace. Drives the checked-out fast-forward pull (`{ ok: true }`), the
+/// structured `{ ok: false, error }` failure for a repo without a remote, and
+/// the nonexistent-path -32602.
+#[tokio::test]
+async fn wss_git_pull_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let base = Path::new("/tmp").join(format!("intentd-wsspull-{}", &short[..8]));
+    std::fs::create_dir_all(&base).unwrap();
+    let git_in = |dir: &Path, args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    let seed = |dir: &Path| {
+        std::fs::create_dir_all(dir).unwrap();
+        git_in(dir, &["init", "-q"]);
+        git_in(dir, &["config", "user.name", "Test"]);
+        git_in(dir, &["config", "user.email", "test@example.com"]);
+        git_in(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        git_in(dir, &["add", "."]);
+        git_in(dir, &["commit", "-q", "-m", "seed"]);
+    };
+    let head_branch = |dir: &Path| {
+        String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["branch", "--show-current"])
+                .output()
+                .expect("branch --show-current")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string()
+    };
+
+    // `repo` tracks a bare origin and is one commit behind it.
+    let repo = base.join("repo");
+    seed(&repo);
+    let bare = base.join("origin.git");
+    git_in(&base, &["init", "-q", "--bare", "origin.git"]);
+    git_in(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    let branch = head_branch(&repo);
+    git_in(&repo, &["push", "-q", "origin", &branch]);
+    std::fs::write(repo.join("remote.txt"), "from-remote\n").unwrap();
+    git_in(&repo, &["add", "."]);
+    git_in(&repo, &["commit", "-q", "-m", "remote change"]);
+    git_in(&repo, &["push", "-q", "origin", &branch]);
+    git_in(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+
+    // (a) Behind checked-out branch → fast-forward pull succeeds with the
+    // exact `{ ok: true }` result (`error` omitted on success).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"git.pull","params":{{"repoPath":"{}","branchName":"{}"}}}}"#,
+            repo.display(),
+            branch,
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"], serde_json::json!({ "ok": true }));
+    assert!(repo.join("remote.txt").exists());
+
+    // (b) Repo without an `origin` remote → structured `{ ok: false, error }`.
+    let lone = base.join("lone");
+    seed(&lone);
+    let lone_branch = head_branch(&lone);
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.pull","params":{{"repoPath":"{}","branchName":"{}"}}}}"#,
+            lone.display(),
+            lone_branch,
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], false);
+    assert!(!resp["result"]["error"].as_str().unwrap().is_empty());
+
+    // (c) Nonexistent repo path → -32602 with the validation message.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"git.pull","params":{"repoPath":"/no/such/repo","branchName":"main"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["message"],
+        "Repository path does not exist: /no/such/repo"
+    );
+
+    srv.ws.stop().await;
+    std::fs::remove_dir_all(&base).ok();
+}
+
 /// Note version history over WSS (PROTOCOL §5.2 version-history extensions):
 /// every content mutation appends a full snapshot, `note.listVersions` returns
 /// summaries (no content blob), `note.getVersion` returns one snapshot with

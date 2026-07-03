@@ -12,14 +12,15 @@ use crate::model::{
     AgentDelegateInput, AgentLite, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
     CommentListResult, CommentResolveThreadResult, CommentRespondResult, Draft, EventQueryParams,
     EventSubscribeResult, EventUnsubscribeResult, FileActivity, GitAgentCommitResult,
-    GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts, GitStatus, Note,
-    NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
-    NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult, NoteSetContentResult,
-    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary,
-    ProjectType, ReadAssetResult, ScriptCreateParams, SetupScript, TaskAssignAgentResult,
-    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
-    TaskMarkAsTaskResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TokenUsage, Workspace, WorkspaceCreate, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts, GitPullResult, GitStatus,
+    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
+    NoteVersionSummary, ProjectType, ReadAssetResult, ScriptCreateParams, SetupScript,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
+    WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -1445,6 +1446,23 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_branch_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.pull`: fetch + rebase-pull `branch_name` from `origin` for the repo
+    /// at `repo_path` (path-based like `git_get_branches`; an invalid repo path
+    /// is `-32602`). Ordinary pull failures are a structured `{ ok: false,
+    /// error }` result, not an `Err` (PROTOCOL §5.6).
+    fn git_pull(
+        &self,
+        repo_path: String,
+        branch_name: String,
+    ) -> BoxFuture<'_, Result<GitPullResult>> {
+        let _ = (repo_path, branch_name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_pull not implemented".to_string(),
             ))
         })
     }

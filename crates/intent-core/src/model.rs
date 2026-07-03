@@ -1657,6 +1657,19 @@ pub struct GitBranchStatus {
     pub has_uncommitted_changes: bool,
 }
 
+/// `git.pull` result (`{ ok, error? }`), mirroring the legacy `git:pullBranch`
+/// IPC's `{ success, error? }` payload: ordinary pull failures (conflicts,
+/// unreachable remote, stash-recovery problems) are a structured `ok: false` +
+/// `error` rather than a JSON-RPC error, so the workspace-create flow can show
+/// its pull-conflict dialog. `error` is omitted on success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPullResult {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// `git.commit` service result (the `ok` flag is added by the transport). Mirrors
 /// the TS `ws.git.commit` payload `{ hash?, files? }`; on success both are
 /// present (`hash` is the new commit SHA, `files` the files it changed).

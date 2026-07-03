@@ -5108,6 +5108,24 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn git_pull(
+        &self,
+        repo_path: String,
+        branch_name: String,
+    ) -> BoxFuture<'_, Result<intent_core::GitPullResult>> {
+        Box::pin(async move {
+            // Path-based like `git_get_branches`: the workspace-create auto-pull
+            // runs *before* the repo is registered, so any existing local git
+            // repo is accepted; nonexistent / non-git paths are `-32602`
+            // (PROTOCOL §5.6).
+            git_ops::validate_repo_path(&repo_path)?;
+            if branch_name.trim().is_empty() {
+                return Err(Error::InvalidParams("branchName is required".to_string()));
+            }
+            intent_git::pull::pull_branch(std::path::Path::new(&repo_path), &branch_name)
+        })
+    }
+
     fn git_clone(
         &self,
         url: String,

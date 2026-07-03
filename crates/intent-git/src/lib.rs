@@ -9,7 +9,7 @@ use intent_core::Error;
 
 pub use intent_core::{
     FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
-    GitMergeConflicts, GitStatus, Result,
+    GitMergeConflicts, GitPullResult, GitStatus, Result,
 };
 
 pub mod auth;
@@ -19,6 +19,7 @@ pub mod conflicts;
 pub mod diff;
 pub mod fetch;
 pub mod history;
+pub mod pull;
 pub mod push;
 pub mod rebase;
 pub mod refs;

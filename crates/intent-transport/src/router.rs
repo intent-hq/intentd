@@ -1054,6 +1054,21 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "git.pull" => {
+            let repo_path = require_str_param(params, "repoPath")?;
+            let branch_name = require_str_param(params, "branchName")?;
+            match api.git_pull(repo_path, branch_name).await {
+                // Ordinary pull failures are a structured `{ ok: false, error }`
+                // result (the FE shows its pull-conflict dialog), never a
+                // JSON-RPC error.
+                Ok(r) => to_result_value(&r),
+                // Same validation as `git.getBranches`: nonexistent / non-git
+                // repo path surfaces verbatim as `-32602` without the
+                // `invalid params:` prefix `domain_to_rpc` would add.
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "repo.list" => {
             // No params; returns `{ repos: KnownRepo[] }` with camelCase keys.
             let r = api.repo_list().await.map_err(domain_to_rpc)?;
