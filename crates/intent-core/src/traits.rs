@@ -949,6 +949,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.enhancePrompt`: one-shot prompt-enhance / AI-layout generation via
+    /// the auggie CLI — `{ enhanced, original, mode }`; `mode` is `"enhance"` or
+    /// `"layout"`, `workspaceId` optionally pins the CLI's cwd (PROTOCOL §5.31).
+    fn agent_enhance_prompt(
+        &self,
+        prompt: String,
+        mode: String,
+        model: Option<String>,
+        workspace_id: Option<WorkspaceId>,
+        timeout_ms: Option<u64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (prompt, mode, model, workspace_id, timeout_ms);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_enhance_prompt not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.respondPermission`: resolve an outstanding interactive permission
     /// prompt by `requestId`, unblocking the agent with the §8 `outcome`
     /// (`{ outcome: "selected", optionId }` / `{ outcome: "cancelled" }`).

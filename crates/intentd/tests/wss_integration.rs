@@ -137,8 +137,12 @@ fn free_port() -> u16 {
 /// Build a real `Services` API + event bus over a fresh temp SQLite store.
 /// The store is returned alongside so tests that need to seed fixtures with a
 /// fixed id (e.g. the workspace `spec` note) can `store.insert_*` directly,
-/// since `note.create` mints a fresh `NoteId` by design.
-async fn make_services() -> (Arc<dyn WorkspaceApi>, EventBus, Store, std::path::PathBuf) {
+/// since `note.create` mints a fresh `NoteId` by design. `auggie_bin`
+/// optionally pins the auggie binary `agent.enhancePrompt` spawns (§5.31) to a
+/// deterministic fixture script.
+async fn make_services(
+    auggie_bin: Option<std::path::PathBuf>,
+) -> (Arc<dyn WorkspaceApi>, EventBus, Store, std::path::PathBuf) {
     let short = uuid::Uuid::new_v4().simple().to_string();
     let dir = Path::new("/tmp").join(format!("intentd-wss-{}", &short[..8]));
     std::fs::create_dir_all(&dir).unwrap();
@@ -146,8 +150,11 @@ async fn make_services() -> (Arc<dyn WorkspaceApi>, EventBus, Store, std::path::
         .await
         .expect("open store");
     let bus = EventBus::new(store.clone());
-    let api: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store.clone()).with_assets_root(dir.join("assets")));
+    let mut services = Services::new(store.clone()).with_assets_root(dir.join("assets"));
+    if let Some(bin) = auggie_bin {
+        services = services.with_auggie_bin(bin);
+    }
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     (api, bus, store, dir)
 }
 
@@ -164,8 +171,14 @@ struct Server {
 }
 
 /// Build + start a WSS listener with the given options on a free base port.
-async fn start(mut opts: WsOptions) -> Server {
-    let (api, bus, store, dir) = make_services().await;
+async fn start(opts: WsOptions) -> Server {
+    start_with_auggie(opts, None).await
+}
+
+/// [`start`] with an optional auggie-binary override for `agent.enhancePrompt`
+/// tests (§5.31).
+async fn start_with_auggie(mut opts: WsOptions, auggie_bin: Option<std::path::PathBuf>) -> Server {
+    let (api, bus, store, dir) = make_services(auggie_bin).await;
     let tls = ensure_tls_certificate(&dir).expect("cert");
     let token_store = Arc::new(MemTokenStore::default());
     token_store.store_token(TOKEN).unwrap();
@@ -681,6 +694,135 @@ async fn wss_models_list_returns_catalog_with_source() {
     }
     let source = resp["result"]["source"].as_str().expect("source");
     assert!(source == "auggie" || source == "static", "source: {source}");
+    srv.ws.stop().await;
+}
+
+/// Write a deterministic fake `auggie` script for `agent.enhancePrompt` tests
+/// (§5.31): swallows the piped stdin, then runs `body`.
+#[cfg(unix)]
+fn fake_auggie_script(tag: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Path::new("/tmp").join(format!("intentd-wss-auggie-{tag}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("auggie");
+    std::fs::write(&bin, format!("#!/bin/sh\ncat > /dev/null\n{body}\n")).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_enhance_prompt_round_trip() {
+    // agent.enhancePrompt (§5.31): `mode: "enhance"` (the default) extracts the
+    // `<augment-enhanced-prompt>` payload; `mode: "layout"` returns the full
+    // cleaned reply. Both `{ enhanced, original, mode }` shapes ride the same
+    // deterministic fixture CLI.
+    let bin = fake_auggie_script(
+        "ok",
+        "printf '\u{1b}[32m🔧 Tool call: noise\u{1b}[0m\\n🤖\\n<augment-enhanced-prompt>Enhanced: ship it</augment-enhanced-prompt>\\n'",
+    );
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":31,"method":"agent.enhancePrompt","params":{"prompt":"ship it"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 31);
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["result"]["enhanced"], "Enhanced: ship it");
+    assert_eq!(resp["result"]["original"], "ship it");
+    assert_eq!(resp["result"]["mode"], "enhance");
+
+    // Layout mode: no template wrap, no tag extraction — the cleaned reply
+    // (everything after the 🤖 marker) comes back verbatim.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":32,"method":"agent.enhancePrompt","params":{"prompt":"make a layout","mode":"layout"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 32);
+    assert_eq!(
+        resp["result"]["enhanced"],
+        "<augment-enhanced-prompt>Enhanced: ship it</augment-enhanced-prompt>"
+    );
+    assert_eq!(resp["result"]["original"], "make a layout");
+    assert_eq!(resp["result"]["mode"], "layout");
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_enhance_prompt_parse_failure_is_internal_error() {
+    // A reply without the `<augment-enhanced-prompt>` tags in enhance mode is
+    // the documented -32603 parse failure (§5.31).
+    let bin = fake_auggie_script("notags", "printf '🤖\\nno tags here\\n'");
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":33,"method":"agent.enhancePrompt","params":{"prompt":"ship it"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 33);
+    assert_eq!(resp["error"]["code"], -32603);
+    assert_eq!(
+        resp["error"]["data"],
+        "Failed to parse enhanced prompt from response"
+    );
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn wss_agent_enhance_prompt_cli_missing_is_internal_error() {
+    // A missing/unspawnable auggie binary is a hard -32603 (§5.31) — there is
+    // no static fallback for enhancement.
+    let srv = start_with_auggie(
+        WsOptions::default(),
+        Some(std::path::PathBuf::from("/nonexistent/intentd-wss/auggie")),
+    )
+    .await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":34,"method":"agent.enhancePrompt","params":{"prompt":"ship it"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 34);
+    assert_eq!(resp["error"]["code"], -32603);
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn wss_agent_enhance_prompt_validates_params() {
+    // Router-side -32602s (§5.31): missing prompt, unknown mode — rejected
+    // before any CLI spawn, so no auggie override is needed.
+    let srv = start(WsOptions::default()).await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":35,"method":"agent.enhancePrompt","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["message"],
+        "Missing required parameter: prompt"
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":36,"method":"agent.enhancePrompt","params":{"prompt":"x","mode":"summarize"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["message"],
+        "mode must be \"enhance\" or \"layout\""
+    );
     srv.ws.stop().await;
 }
 

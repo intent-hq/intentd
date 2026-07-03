@@ -2282,6 +2282,52 @@ async fn agent_methods_validate_required_params() {
         v["error"]["message"],
         serde_json::json!("Missing required parameter: outcome")
     );
+
+    // agent.enhancePrompt (§5.31) without prompt.
+    let v = call(r#"{"jsonrpc":"2.0","id":8,"method":"agent.enhancePrompt","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: prompt")
+    );
+
+    // agent.enhancePrompt with a blank prompt.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":9,"method":"agent.enhancePrompt","params":{"prompt":"   "}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("prompt cannot be empty")
+    );
+
+    // agent.enhancePrompt with an unknown mode.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":10,"method":"agent.enhancePrompt","params":{"prompt":"improve me","mode":"summarize"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("mode must be \"enhance\" or \"layout\"")
+    );
+
+    // agent.enhancePrompt with a non-positive timeoutMs.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":11,"method":"agent.enhancePrompt","params":{"prompt":"improve me","timeoutMs":0}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("timeoutMs must be a positive integer")
+    );
 }
 
 #[tokio::test]
@@ -2304,6 +2350,15 @@ async fn agent_methods_are_routed_not_method_not_found() {
     let v = call(r#"{"jsonrpc":"2.0","id":8,"method":"models.list"}"#)
         .await
         .unwrap();
+    assert_eq!(err_code(&v), -32603);
+
+    // agent.enhancePrompt (§5.31) with valid params routes past dispatch (the
+    // default impl yields -32603, never -32601).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":9,"method":"agent.enhancePrompt","params":{"prompt":"improve me","mode":"layout","model":"haiku4.5","timeoutMs":5000}}"#,
+    )
+    .await
+    .unwrap();
     assert_eq!(err_code(&v), -32603);
 
     // agent.pendingPermissions takes an optional agentId and must route.

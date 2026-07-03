@@ -48,6 +48,7 @@ mod agent_subscriptions;
 mod auto_commit;
 mod clone_ops;
 mod drafts;
+mod enhance_ops;
 mod event_ops;
 pub mod events;
 mod file_ops;
@@ -144,6 +145,11 @@ pub struct Services {
     /// successful auggie CLI fetch is cached; the static fallback is recomputed
     /// per call. Shared across clones so every handle sees the same window.
     models_cache: agent_ops::ModelsCache,
+    /// Test-only override for the auggie binary `agent.enhancePrompt` (§5.31)
+    /// spawns. Production composition leaves this `None` and the op resolves
+    /// the CLI via `intent_context::discovery::find_auggie`; tests point it at
+    /// a deterministic fixture script.
+    auggie_bin: Option<PathBuf>,
     /// Daemon-owned parent→child completion-watch registry (AS-2), keyed by
     /// workspace. A oneShot watch is registered when an agent delegates with
     /// `waitMode` `immediate` over the MCP front door; the delivery worker (AS-3)
@@ -243,6 +249,7 @@ impl Services {
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             models_cache: Arc::new(Mutex::new(None)),
+            auggie_bin: None,
             agent_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
@@ -568,6 +575,14 @@ impl Services {
     /// Configure the note-asset root directory (for `note.readAsset`).
     pub fn with_assets_root(mut self, root: PathBuf) -> Self {
         self.assets_root = Some(root);
+        self
+    }
+
+    /// Override the auggie binary `agent.enhancePrompt` (§5.31) spawns. The
+    /// composition root keeps the discovery default (`find_auggie`); tests
+    /// inject a fixture script so the one-shot CLI path is deterministic.
+    pub fn with_auggie_bin(mut self, bin: PathBuf) -> Self {
+        self.auggie_bin = Some(bin);
         self
     }
 
@@ -5827,6 +5842,20 @@ impl WorkspaceApi for Services {
 
     fn models_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.models_list_op().await })
+    }
+
+    fn agent_enhance_prompt(
+        &self,
+        prompt: String,
+        mode: String,
+        model: Option<String>,
+        workspace_id: Option<WorkspaceId>,
+        timeout_ms: Option<u64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_enhance_prompt_op(prompt, mode, model, workspace_id, timeout_ms)
+                .await
+        })
     }
 
     fn agent_respond_permission(

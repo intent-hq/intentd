@@ -890,6 +890,34 @@ async fn dispatch(
             let result = api.models_list().await.map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.enhancePrompt" => {
+            // One-shot prompt-enhance / AI-layout generation (PROTOCOL §5.31).
+            let prompt = require_str_param(params, "prompt")?;
+            if prompt.trim().is_empty() {
+                return Err(rpc(INVALID_PARAMS, "prompt cannot be empty"));
+            }
+            let mode = opt_str(params, "mode").unwrap_or_else(|| "enhance".to_string());
+            if mode != "enhance" && mode != "layout" {
+                return Err(rpc(
+                    INVALID_PARAMS,
+                    "mode must be \"enhance\" or \"layout\"",
+                ));
+            }
+            let model = opt_str(params, "model");
+            let ws = opt_workspace_id(params);
+            let timeout_ms =
+                match params.get("timeoutMs") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
+                        rpc(INVALID_PARAMS, "timeoutMs must be a positive integer")
+                    })?),
+                };
+            let result = api
+                .agent_enhance_prompt(prompt, mode, model, ws, timeout_ms)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.respondPermission" => {
             // Resolve an outstanding interactive prompt (PROTOCOL §8). `requestId`
             // is required; the §8 `outcome` object is validated in the handler so
