@@ -66,6 +66,9 @@ impl WorkspaceMcpServer {
                 val(api.list_note_tasks(ws, note_id(args, "noteId")?).await)
             }
             // ---- Note write tools ----
+            // `note.create` is an idempotent method (TB-0 §5): the daemon is the
+            // caller here, so mint a fresh key when the tool arguments carry
+            // none rather than tripping the services-layer soft-launch warn.
             "create_note_workspace-mcp" => val(api
                 .create_note(
                     ws,
@@ -75,7 +78,8 @@ impl WorkspaceMcpServer {
                         tags: opt_vec_str(args, "tags"),
                         parent_id: None,
                     },
-                    opt_str(args, "idempotencyKey"),
+                    opt_str(args, "idempotencyKey")
+                        .or_else(|| Some(uuid::Uuid::new_v4().to_string())),
                 )
                 .await),
             "add_to_note_workspace-mcp" => {
@@ -255,6 +259,9 @@ impl WorkspaceMcpServer {
                     .await)
             }
             // ---- Agent creation tools ----
+            // No idempotency key here: `agent.delegate` reaches the create op
+            // directly inside services (an explicit internal caller), so it
+            // never crosses the `agent.create` soft-launch warn.
             "delegate_task_workspace-mcp" => val(api
                 .agent_delegate(
                     ws,

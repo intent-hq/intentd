@@ -432,8 +432,8 @@ mod mcp_tests {
     use std::sync::{Arc, Mutex};
 
     use intent_core::{
-        AgentId, BoxFuture, GitAgentCommitResult, Note, NoteAddInput, NoteAddResult, NoteId,
-        Result, WorkspaceApi, WorkspaceId,
+        AgentId, BoxFuture, GitAgentCommitResult, Note, NoteAddInput, NoteAddResult, NoteCreate,
+        NoteId, Result, WorkspaceApi, WorkspaceId,
     };
     use serde_json::{json, Value};
 
@@ -460,9 +460,42 @@ mod mcp_tests {
     pub(super) struct MockApi {
         pub(super) added: Mutex<Vec<(String, String)>>,
         pub(super) committed: Mutex<Vec<CommitRecord>>,
+        /// Recorded `create_note` calls: (title, idempotency_key).
+        pub(super) created: Mutex<Vec<(String, Option<String>)>>,
     }
 
     impl WorkspaceApi for MockApi {
+        fn create_note(
+            &self,
+            workspace_id: WorkspaceId,
+            input: NoteCreate,
+            idempotency_key: Option<String>,
+        ) -> BoxFuture<'_, Result<Note>> {
+            self.created
+                .lock()
+                .unwrap()
+                .push((input.title.clone(), idempotency_key));
+            Box::pin(async move {
+                Ok(Note {
+                    id: NoteId::from_string("n-created"),
+                    workspace_id,
+                    title: input.title,
+                    content: input.content.unwrap_or_default(),
+                    content_type: Default::default(),
+                    tags: input.tags.unwrap_or_default(),
+                    is_pinned: false,
+                    is_archived: false,
+                    is_default: false,
+                    parent_id: None,
+                    visibility: Default::default(),
+                    task: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    rev: 0,
+                    updated_at: "2026-01-01T00:00:00Z".to_string(),
+                })
+            })
+        }
+
         fn list_notes<'a>(
             &'a self,
             _workspace_id: &'a WorkspaceId,
@@ -1728,7 +1761,6 @@ mod dispatch_unit_tests {
         let valid_args: &[(&str, serde_json::Value)] = &[
             ("get_note_workspace-mcp", json!({ "noteId": "n" })),
             ("list_note_tasks_workspace-mcp", json!({ "noteId": "n" })),
-            ("create_note_workspace-mcp", json!({ "title": "t" })),
             (
                 "set_note_content_workspace-mcp",
                 json!({ "noteId": "n", "content": "c", "confirmReplacement": true, "expectedVersion": 3 }),
@@ -1801,6 +1833,45 @@ mod dispatch_unit_tests {
                 "{tool}: expected Internal default, got {resp}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn create_note_mints_idempotency_key_when_absent() {
+        // Daemon-internal `note.create`: agents do not pass an idempotencyKey,
+        // so the dispatch arm mints one — the services soft-launch warn
+        // ("idempotencyKey missing on idempotent method") must never fire for
+        // MCP tool calls.
+        let (srv, api) = server();
+        let resp = call(&srv, "create_note_workspace-mcp", json!({ "title": "t" })).await;
+        assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+        let created = api.created.lock().unwrap();
+        assert_eq!(created.len(), 1);
+        let (title, key) = &created[0];
+        assert_eq!(title, "t");
+        let key = key
+            .as_deref()
+            .expect("dispatch must mint an idempotencyKey");
+        assert!(
+            uuid::Uuid::parse_str(key).is_ok(),
+            "minted key {key:?} is not a UUID"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_note_passes_caller_idempotency_key_through() {
+        // A caller-supplied key is adopted verbatim (no re-mint), preserving
+        // dedupe across retries of the same tool call.
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "create_note_workspace-mcp",
+            json!({ "title": "t", "idempotencyKey": "key-from-caller" }),
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+        let created = api.created.lock().unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].1.as_deref(), Some("key-from-caller"));
     }
 
     #[tokio::test]
