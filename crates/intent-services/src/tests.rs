@@ -4879,7 +4879,7 @@ mod terminal {
         let mut b = subscribe(&h);
         let created = h
             .services
-            .terminal_create(h.ws.clone(), 80, 24, None, Some("cat".into()))
+            .terminal_create(h.ws.clone(), 80, 24, None, Some("cat".into()), None)
             .await
             .expect("create");
         let terminal_id = created["terminalId"]
@@ -4913,7 +4913,7 @@ mod terminal {
         let mut sub = subscribe(&h);
         let created = h
             .services
-            .terminal_create(h.ws.clone(), 80, 24, None, Some("cat".into()))
+            .terminal_create(h.ws.clone(), 80, 24, None, Some("cat".into()), None)
             .await
             .expect("create");
         let terminal_id = created["terminalId"].as_str().unwrap().to_string();
@@ -4965,7 +4965,7 @@ mod terminal {
         let mut sub = subscribe(&h);
         let created = h
             .services
-            .terminal_create(h.ws.clone(), 80, 24, None, Some("cat".into()))
+            .terminal_create(h.ws.clone(), 80, 24, None, Some("cat".into()), None)
             .await
             .expect("create");
         let terminal_id = created["terminalId"].as_str().unwrap().to_string();
@@ -5023,7 +5023,7 @@ mod terminal {
         // `false` exits with code 1 immediately.
         let created = h
             .services
-            .terminal_create(h.ws.clone(), 80, 24, None, Some("false".into()))
+            .terminal_create(h.ws.clone(), 80, 24, None, Some("false".into()), None)
             .await
             .expect("create");
         let terminal_id = created["terminalId"].as_str().unwrap().to_string();
@@ -5047,7 +5047,7 @@ mod terminal {
 
         let created = h
             .services
-            .terminal_create(h.ws.clone(), 80, 24, None, Some("cat".into()))
+            .terminal_create(h.ws.clone(), 80, 24, None, Some("cat".into()), None)
             .await
             .expect("create");
         let terminal_id = created["terminalId"].as_str().unwrap().to_string();

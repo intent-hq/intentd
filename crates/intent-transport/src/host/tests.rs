@@ -227,7 +227,7 @@ fn status_json_remote_omits_absent_display_server() {
 #[tokio::test]
 async fn handle_status_returns_a_response_frame() {
     let req = classify(&json!({ "jsonrpc": "2.0", "id": 7, "method": "host.status" })).unwrap();
-    let frame = handle(req, &NoopApi, true)
+    let frame = handle(req, &NoopApi, None, true)
         .await
         .expect("status has a response");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -242,7 +242,7 @@ async fn handle_status_returns_a_response_frame() {
 #[tokio::test]
 async fn handle_remote_reports_remote_locality() {
     let req = classify(&json!({ "jsonrpc": "2.0", "id": 8, "method": "host.status" })).unwrap();
-    let frame = handle(req, &NoopApi, false)
+    let frame = handle(req, &NoopApi, None, false)
         .await
         .expect("status has a response");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -253,7 +253,7 @@ async fn handle_remote_reports_remote_locality() {
 async fn handle_notification_gets_no_response() {
     let req = classify(&json!({ "jsonrpc": "2.0", "method": "host.status" })).unwrap();
     assert!(
-        handle(req, &NoopApi, true).await.is_none(),
+        handle(req, &NoopApi, None, true).await.is_none(),
         "a notification gets no reply"
     );
 }
@@ -261,7 +261,7 @@ async fn handle_notification_gets_no_response() {
 #[tokio::test]
 async fn handle_check_git_returns_available_boolean() {
     let req = classify(&json!({ "jsonrpc": "2.0", "id": 10, "method": "host.checkGit" })).unwrap();
-    let frame = handle(req, &NoopApi, true)
+    let frame = handle(req, &NoopApi, None, true)
         .await
         .expect("checkGit always replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -278,7 +278,7 @@ async fn handle_directory_status_requires_path() {
         &json!({ "jsonrpc": "2.0", "id": 11, "method": "host.directoryStatus", "params": {} }),
     )
     .unwrap();
-    let frame = handle(req, &NoopApi, true)
+    let frame = handle(req, &NoopApi, None, true)
         .await
         .expect("missing path produces an error frame");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -297,7 +297,7 @@ async fn handle_directory_status_reports_existing_directory() {
         "params": { "path": cwd.to_string_lossy() }
     }))
     .unwrap();
-    let frame = handle(req, &NoopApi, true)
+    let frame = handle(req, &NoopApi, None, true)
         .await
         .expect("directoryStatus replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -316,7 +316,7 @@ async fn handle_list_directory_returns_entries_for_cwd() {
         "params": { "path": cwd.to_string_lossy() }
     }))
     .unwrap();
-    let frame = handle(req, &NoopApi, true)
+    let frame = handle(req, &NoopApi, None, true)
         .await
         .expect("listDirectory replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -332,7 +332,7 @@ async fn handle_check_auggie_uses_configured_path() {
     let api = AuggiePathApi("/definitely/does/not/exist/auggie-xyzzy".to_string());
     let req =
         classify(&json!({ "jsonrpc": "2.0", "id": 14, "method": "host.checkAuggie" })).unwrap();
-    let frame = handle(req, &api, true)
+    let frame = handle(req, &api, None, true)
         .await
         .expect("checkAuggie always replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -344,7 +344,7 @@ async fn handle_check_auggie_uses_configured_path() {
 async fn handle_check_auggie_notification_gets_no_response() {
     let req = classify(&json!({ "jsonrpc": "2.0", "method": "host.checkAuggie" })).unwrap();
     assert!(
-        handle(req, &NoopApi, true).await.is_none(),
+        handle(req, &NoopApi, None, true).await.is_none(),
         "a notification gets no reply"
     );
 }
@@ -354,7 +354,7 @@ async fn handle_find_binary_requires_name() {
     let req =
         classify(&json!({ "jsonrpc": "2.0", "id": 20, "method": "host.findBinary", "params": {} }))
             .unwrap();
-    let frame = handle(req, &NoopApi, true)
+    let frame = handle(req, &NoopApi, None, true)
         .await
         .expect("missing name produces an error frame");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -371,7 +371,7 @@ async fn handle_find_binary_returns_available_boolean() {
         "params": { "name": "git" }
     }))
     .unwrap();
-    let frame = handle(req, &NoopApi, true)
+    let frame = handle(req, &NoopApi, None, true)
         .await
         .expect("findBinary always replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -386,7 +386,7 @@ async fn handle_find_binary_returns_available_boolean() {
 async fn handle_find_binary_notification_gets_no_response() {
     let req = classify(&json!({ "jsonrpc": "2.0", "method": "host.findBinary" })).unwrap();
     assert!(
-        handle(req, &NoopApi, true).await.is_none(),
+        handle(req, &NoopApi, None, true).await.is_none(),
         "a missing-name notification gets no reply"
     );
 }
@@ -395,7 +395,7 @@ async fn handle_find_binary_notification_gets_no_response() {
 async fn handle_tool_availability_returns_default_tool_map() {
     let req = classify(&json!({ "jsonrpc": "2.0", "id": 22, "method": "host.toolAvailability" }))
         .unwrap();
-    let frame = handle(req, &NoopApi, true)
+    let frame = handle(req, &NoopApi, None, true)
         .await
         .expect("toolAvailability always replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -408,7 +408,7 @@ async fn handle_tool_availability_returns_default_tool_map() {
 #[tokio::test]
 async fn handle_env_returns_path_and_var_names() {
     let req = classify(&json!({ "jsonrpc": "2.0", "id": 23, "method": "host.env" })).unwrap();
-    let frame = handle(req, &NoopApi, true)
+    let frame = handle(req, &NoopApi, None, true)
         .await
         .expect("env always replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -424,7 +424,7 @@ async fn handle_find_app_requires_name() {
     let req =
         classify(&json!({ "jsonrpc": "2.0", "id": 30, "method": "host.findApp", "params": {} }))
             .unwrap();
-    let frame = handle(req, &NoopApi, true)
+    let frame = handle(req, &NoopApi, None, true)
         .await
         .expect("missing name produces an error frame");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -436,7 +436,7 @@ async fn handle_find_app_requires_name() {
 async fn handle_find_app_notification_gets_no_response() {
     let req = classify(&json!({ "jsonrpc": "2.0", "method": "host.findApp" })).unwrap();
     assert!(
-        handle(req, &NoopApi, true).await.is_none(),
+        handle(req, &NoopApi, None, true).await.is_none(),
         "a missing-name notification gets no reply"
     );
 }
@@ -452,7 +452,7 @@ async fn handle_find_app_returns_installed_boolean() {
         "params": { "name": "DefinitelyNotInstalledXyzzy" }
     }))
     .unwrap();
-    let frame = handle(req, &NoopApi, true)
+    let frame = handle(req, &NoopApi, None, true)
         .await
         .expect("findApp always replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -468,7 +468,7 @@ async fn handle_list_installed_editors_returns_editor_array() {
     let req =
         classify(&json!({ "jsonrpc": "2.0", "id": 32, "method": "host.listInstalledEditors" }))
             .unwrap();
-    let frame = handle(req, &NoopApi, true)
+    let frame = handle(req, &NoopApi, None, true)
         .await
         .expect("listInstalledEditors always replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -481,4 +481,436 @@ async fn handle_list_installed_editors_returns_editor_array() {
         assert!(entry["id"].is_string(), "id always present");
         assert!(entry["installed"].is_boolean(), "installed always present");
     }
+}
+
+/// An [`EditorLauncher`] that records every launch and can be told to fail.
+struct RecordingLauncher {
+    ok: bool,
+    launches: Mutex<Vec<(String, EditorTarget)>>,
+}
+
+impl RecordingLauncher {
+    fn new(ok: bool) -> Self {
+        Self {
+            ok,
+            launches: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl EditorLauncher for RecordingLauncher {
+    fn launch(&self, editor: &ResolvedEditor, target: &EditorTarget) -> Result<(), String> {
+        self.launches
+            .lock()
+            .unwrap()
+            .push((editor.id.clone(), target.clone()));
+        if self.ok {
+            Ok(())
+        } else {
+            Err("editor launcher failed".to_string())
+        }
+    }
+}
+
+/// Fixture `host.listInstalledEditors` payload with one installed vscode entry
+/// (native binary) and one uninstalled xcode entry.
+fn editors_payload() -> Value {
+    json!({
+        "editors": [
+            { "id": "vscode", "installed": true, "path": "/usr/local/bin/code", "source": "binary" },
+            { "id": "xcode", "installed": false },
+        ]
+    })
+}
+
+#[tokio::test]
+async fn open_in_editor_local_short_circuits_via_launcher() {
+    let launcher = RecordingLauncher::new(true);
+    let editors = editors_payload();
+    open_in_editor(
+        "vscode",
+        "/repo/src/main.rs",
+        Some(12),
+        Some(3),
+        true,
+        true,
+        &editors,
+        &launcher,
+        &idle_reverse(),
+    )
+    .await
+    .expect("local + display resolves directly");
+    let launches = launcher.launches.lock().unwrap();
+    assert_eq!(launches.len(), 1);
+    assert_eq!(launches[0].0, "vscode");
+    assert_eq!(launches[0].1.path, "/repo/src/main.rs");
+    assert_eq!(launches[0].1.line, Some(12));
+    assert_eq!(launches[0].1.column, Some(3));
+}
+
+#[tokio::test]
+async fn open_in_editor_local_headless_returns_headless() {
+    let launcher = RecordingLauncher::new(true);
+    let editors = editors_payload();
+    let err = open_in_editor(
+        "vscode",
+        "/repo/src/main.rs",
+        None,
+        None,
+        true,
+        false,
+        &editors,
+        &launcher,
+        &idle_reverse(),
+    )
+    .await
+    .expect_err("headless host warns");
+    assert!(matches!(err, OpenInEditorError::Headless(_)));
+    assert_eq!(err.code(), -32603);
+    assert!(launcher.launches.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn open_in_editor_local_unknown_editor_is_invalid_params() {
+    let launcher = RecordingLauncher::new(true);
+    let editors = editors_payload();
+    let err = open_in_editor(
+        "vim-fantasy",
+        "/repo/src/main.rs",
+        None,
+        None,
+        true,
+        true,
+        &editors,
+        &launcher,
+        &idle_reverse(),
+    )
+    .await
+    .expect_err("unknown editorId rejected");
+    assert!(matches!(err, OpenInEditorError::InvalidParams(_)));
+    assert_eq!(err.code(), -32602);
+}
+
+#[tokio::test]
+async fn open_in_editor_local_not_installed_returns_not_installed() {
+    let launcher = RecordingLauncher::new(true);
+    let editors = editors_payload();
+    let err = open_in_editor(
+        "xcode",
+        "/repo/src/main.rs",
+        None,
+        None,
+        true,
+        true,
+        &editors,
+        &launcher,
+        &idle_reverse(),
+    )
+    .await
+    .expect_err("uninstalled editor rejected");
+    assert!(matches!(err, OpenInEditorError::NotInstalled(_)));
+    assert_eq!(err.code(), -32603);
+}
+
+#[tokio::test]
+async fn open_in_editor_empty_editor_id_is_invalid_params() {
+    let launcher = RecordingLauncher::new(true);
+    let editors = editors_payload();
+    let err = open_in_editor(
+        "",
+        "/repo/src/main.rs",
+        None,
+        None,
+        true,
+        true,
+        &editors,
+        &launcher,
+        &idle_reverse(),
+    )
+    .await
+    .expect_err("empty editorId rejected");
+    assert!(matches!(err, OpenInEditorError::InvalidParams(_)));
+    assert_eq!(err.code(), -32602);
+}
+
+#[tokio::test]
+async fn open_in_editor_empty_path_is_invalid_params() {
+    let launcher = RecordingLauncher::new(true);
+    let editors = editors_payload();
+    let err = open_in_editor(
+        "vscode",
+        "",
+        None,
+        None,
+        true,
+        true,
+        &editors,
+        &launcher,
+        &idle_reverse(),
+    )
+    .await
+    .expect_err("empty path rejected");
+    assert!(matches!(err, OpenInEditorError::InvalidParams(_)));
+    assert_eq!(err.code(), -32602);
+}
+
+#[tokio::test]
+async fn open_in_editor_remote_dispatches_to_connected_client() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let reverse = ReverseChannel::new(out_tx);
+    let launcher = RecordingLauncher::new(true);
+
+    let caller = reverse.clone();
+    let handle = tokio::spawn(async move {
+        let launcher = RecordingLauncher::new(true);
+        let editors = editors_payload();
+        open_in_editor(
+            "vscode",
+            "/repo/src/main.rs",
+            Some(7),
+            Some(1),
+            false,
+            false,
+            &editors,
+            &launcher,
+            &caller,
+        )
+        .await
+    });
+
+    // The mock FE receives the FE-served request and replies success.
+    let frame = out_rx.recv().await.unwrap();
+    let req: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(req["method"], "host.openInEditor");
+    assert_eq!(req["params"]["editorId"], "vscode");
+    assert_eq!(req["params"]["path"], "/repo/src/main.rs");
+    assert_eq!(req["params"]["line"], 7);
+    assert_eq!(req["params"]["column"], 1);
+    let id = req["id"].as_str().unwrap();
+    assert!(id.starts_with("rev-"), "reverse ids use the rev- prefix");
+    let response = json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } });
+    assert!(reverse.route_response(&response));
+
+    handle.await.unwrap().expect("client opened the editor");
+    // The daemon host launcher is never used on the remote path.
+    assert!(launcher.launches.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn open_in_editor_remote_omits_absent_line_and_column() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let reverse = ReverseChannel::new(out_tx);
+
+    let caller = reverse.clone();
+    let handle = tokio::spawn(async move {
+        let launcher = RecordingLauncher::new(true);
+        let editors = editors_payload();
+        open_in_editor(
+            "vscode",
+            "/repo/src/main.rs",
+            None,
+            None,
+            false,
+            false,
+            &editors,
+            &launcher,
+            &caller,
+        )
+        .await
+    });
+
+    let frame = out_rx.recv().await.unwrap();
+    let req: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(req["params"].get("line"), None);
+    assert_eq!(req["params"].get("column"), None);
+    let response = json!({ "jsonrpc": "2.0", "id": req["id"], "result": { "ok": true } });
+    assert!(reverse.route_response(&response));
+    handle.await.unwrap().expect("client opened the editor");
+}
+
+#[tokio::test]
+async fn open_in_editor_remote_client_failure_is_proxy_error() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let reverse = ReverseChannel::new(out_tx);
+
+    let caller = reverse.clone();
+    let handle = tokio::spawn(async move {
+        let launcher = RecordingLauncher::new(true);
+        let editors = editors_payload();
+        open_in_editor(
+            "vscode",
+            "/repo/src/main.rs",
+            None,
+            None,
+            false,
+            false,
+            &editors,
+            &launcher,
+            &caller,
+        )
+        .await
+    });
+
+    let frame = out_rx.recv().await.unwrap();
+    let id = serde_json::from_str::<Value>(&frame).unwrap()["id"].clone();
+    let response = json!({
+        "jsonrpc": "2.0", "id": id,
+        "error": { "code": -32603, "message": "editor missing on client" }
+    });
+    assert!(reverse.route_response(&response));
+
+    let err = handle.await.unwrap().expect_err("client failure surfaces");
+    assert!(matches!(err, OpenInEditorError::Proxy(_)));
+    assert_eq!(err.code(), -32603);
+}
+
+#[test]
+fn resolved_editor_from_payload_matches_id() {
+    let payload = editors_payload();
+    let vscode = ResolvedEditor::from_editors_payload("vscode", &payload).unwrap();
+    assert!(vscode.installed);
+    assert_eq!(vscode.path.as_deref(), Some("/usr/local/bin/code"));
+    assert_eq!(vscode.source.as_deref(), Some("binary"));
+    assert!(ResolvedEditor::from_editors_payload("missing", &payload).is_none());
+}
+
+/// An [`AppPicker`] that records paths and returns a canned reply.
+struct RecordingPicker {
+    reply: Result<Option<String>, String>,
+    picked: Mutex<Vec<String>>,
+}
+
+impl RecordingPicker {
+    fn new(reply: Result<Option<String>, String>) -> Self {
+        Self {
+            reply,
+            picked: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl AppPicker for RecordingPicker {
+    fn pick(&self, path: &str) -> Result<Option<String>, String> {
+        self.picked.lock().unwrap().push(path.to_string());
+        self.reply.clone()
+    }
+}
+
+#[tokio::test]
+async fn pick_application_empty_path_is_invalid_params() {
+    let picker = NoopAppPicker;
+    let err = pick_application("", true, &picker, &idle_reverse())
+        .await
+        .expect_err("empty path rejected");
+    assert!(matches!(err, PickApplicationError::InvalidPath(_)));
+    assert_eq!(err.code(), -32602);
+}
+
+#[tokio::test]
+async fn pick_application_local_default_returns_none() {
+    let picker = NoopAppPicker;
+    let out = pick_application("/repo/README.md", true, &picker, &idle_reverse())
+        .await
+        .expect("noop picker never fails");
+    assert_eq!(out, None);
+}
+
+#[tokio::test]
+async fn pick_application_local_delegates_to_picker() {
+    let picker = RecordingPicker::new(Ok(Some("com.vscode".to_string())));
+    let out = pick_application("/repo/README.md", true, &picker, &idle_reverse())
+        .await
+        .expect("picker succeeded");
+    assert_eq!(out.as_deref(), Some("com.vscode"));
+    assert_eq!(
+        picker.picked.lock().unwrap().as_slice(),
+        ["/repo/README.md"]
+    );
+}
+
+#[tokio::test]
+async fn pick_application_local_picker_failure_surfaces() {
+    let picker = RecordingPicker::new(Err("picker crashed".to_string()));
+    let err = pick_application("/repo/README.md", true, &picker, &idle_reverse())
+        .await
+        .expect_err("picker failure propagates");
+    assert!(matches!(err, PickApplicationError::Picker(_)));
+    assert_eq!(err.code(), -32603);
+}
+
+#[tokio::test]
+async fn pick_application_remote_dispatches_to_connected_client() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let reverse = ReverseChannel::new(out_tx);
+    let picker = NoopAppPicker;
+
+    let caller = reverse.clone();
+    let handle = tokio::spawn(async move {
+        let picker = NoopAppPicker;
+        pick_application("/repo/README.md", false, &picker, &caller).await
+    });
+
+    let frame = out_rx.recv().await.unwrap();
+    let req: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(req["method"], "host.pickApplication");
+    assert_eq!(req["params"]["path"], "/repo/README.md");
+    let id = req["id"].as_str().unwrap();
+    assert!(id.starts_with("rev-"), "reverse ids use the rev- prefix");
+    let response = json!({
+        "jsonrpc": "2.0", "id": id,
+        "result": { "applicationId": "com.jetbrains.intellij" }
+    });
+    assert!(reverse.route_response(&response));
+
+    let out = handle.await.unwrap().expect("client picked an application");
+    assert_eq!(out.as_deref(), Some("com.jetbrains.intellij"));
+    // The daemon host picker is never consulted on the remote path.
+    let _ = picker;
+}
+
+#[tokio::test]
+async fn pick_application_remote_missing_application_id_is_none() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let reverse = ReverseChannel::new(out_tx);
+
+    let caller = reverse.clone();
+    let handle = tokio::spawn(async move {
+        let picker = NoopAppPicker;
+        pick_application("/repo/README.md", false, &picker, &caller).await
+    });
+
+    let frame = out_rx.recv().await.unwrap();
+    let id = serde_json::from_str::<Value>(&frame).unwrap()["id"].clone();
+    let response = json!({ "jsonrpc": "2.0", "id": id, "result": {} });
+    assert!(reverse.route_response(&response));
+
+    let out = handle
+        .await
+        .unwrap()
+        .expect("client replied without a pick");
+    assert_eq!(out, None);
+}
+
+#[tokio::test]
+async fn pick_application_remote_client_failure_is_proxy_error() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let reverse = ReverseChannel::new(out_tx);
+
+    let caller = reverse.clone();
+    let handle = tokio::spawn(async move {
+        let picker = NoopAppPicker;
+        pick_application("/repo/README.md", false, &picker, &caller).await
+    });
+
+    let frame = out_rx.recv().await.unwrap();
+    let id = serde_json::from_str::<Value>(&frame).unwrap()["id"].clone();
+    let response = json!({
+        "jsonrpc": "2.0", "id": id,
+        "error": { "code": -32603, "message": "no chooser on client" }
+    });
+    assert!(reverse.route_response(&response));
+
+    let err = handle.await.unwrap().expect_err("client failure surfaces");
+    assert!(matches!(err, PickApplicationError::Proxy(_)));
+    assert_eq!(err.code(), -32603);
 }

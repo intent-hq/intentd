@@ -1641,6 +1641,89 @@ async fn router_read_lifecycle_arms_over_wss() {
     );
 }
 
+/// WSS-2 (terminal.create env, §5.13 gap): the `env` param is layered onto the
+/// daemon's inherited environment before the PTY spawn, so an agent-supplied
+/// variable is visible to the spawned child. Runs the `env` binary as the
+/// terminal command, subscribes to `terminal:data`, and asserts the decoded
+/// output carries `MY_TEST_VAR=PROT_MARKER_env_wss`.
+#[tokio::test]
+async fn terminal_create_env_over_wss() {
+    use base64::Engine as _;
+
+    let (_daemon, ws_id, _note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE spawning so no chunk is missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["terminal:data", "terminal:exit"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // RPC conn — spawn `env` with a per-terminal env overlay.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "terminal.create",
+        json!({
+            "workspaceId": ws_id,
+            "cols": 80,
+            "rows": 24,
+            "command": "env",
+            "env": { "MY_TEST_VAR": "PROT_MARKER_env_wss" },
+        }),
+    )
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId in terminal.create result")
+        .to_string();
+
+    // Collect `terminal:data` chunks (base64) until the marker appears; stop
+    // on `terminal:exit` — the child exits naturally after printing its env.
+    let mut acc: Vec<u8> = Vec::new();
+    let mut saw_exit = false;
+    for _ in 0..40 {
+        let frame = wss_event(&mut sub, 10).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["terminalId"].as_str() != Some(&terminal_id) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("terminal:data") => {
+                if let Some(chunk) = event["data"]["chunk"].as_str() {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(chunk)
+                        .expect("valid base64 in terminal:data.chunk");
+                    acc.extend_from_slice(&bytes);
+                }
+            }
+            Some("terminal:exit") => {
+                saw_exit = true;
+            }
+            _ => {}
+        }
+        let text = String::from_utf8_lossy(&acc);
+        if text.contains("MY_TEST_VAR=PROT_MARKER_env_wss") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&acc);
+    assert!(
+        text.contains("MY_TEST_VAR=PROT_MARKER_env_wss"),
+        "terminal.create must overlay the caller's env onto the spawned child \
+         (PROTOCOL §5.13); output was: {text:?}, saw_exit={saw_exit}"
+    );
+}
+
 /// WSS-2 (subscriptions): narrow `eventTypes` filters route only matching
 /// events to a subscriber. Two pinned WSS subscribers — one scoped to
 /// `["note:*"]`, one to `["agent:*"]` — observe a single mock agent turn and

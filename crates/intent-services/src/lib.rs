@@ -45,11 +45,14 @@ mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
 mod auto_commit;
+mod clone_ops;
 mod drafts;
 mod event_ops;
 pub mod events;
 mod file_ops;
 mod git_ops;
+pub mod host_exec;
+pub mod host_exec_stream;
 
 mod github_ops;
 
@@ -526,18 +529,24 @@ impl Services {
     pub async fn heal_stale_agent_sessions(&self) -> Result<usize> {
         let sessions = self.store.list_all_agent_sessions().await?;
         let mut healed = 0usize;
-        for mut session in sessions {
+        for session in sessions {
             if !is_stale_in_flight_status(session.status) {
                 continue;
             }
             let prev = session.status;
-            session.status = intent_core::AgentStatus::RuntimeIdle;
-            session.is_active = false;
-            session.updated_at = now_iso();
-            // The update path enforces the `acpSessionId` write-once and
-            // `provider` immutability invariants (§9.5); the heal preserves
-            // both because it only edits status/is_active/updated_at.
-            self.store.update_agent_session(&session).await?;
+            // Narrow write: `set_agent_session_status` persists only
+            // (status, is_active, updated_at) without loading the full
+            // message log, keeping the startup sweep O(rows). The write-once
+            // `acpSessionId` and immutable `provider` invariants (§9.5) are
+            // untouched because those columns are not written here.
+            self.store
+                .set_agent_session_status(
+                    &session.id,
+                    intent_core::AgentStatus::RuntimeIdle,
+                    false,
+                    &now_iso(),
+                )
+                .await?;
             healed += 1;
             tracing::info!(
                 agent_id = %session.id,
@@ -2549,11 +2558,12 @@ impl WorkspaceApi for Services {
         rows: u16,
         cwd: Option<String>,
         command: Option<String>,
+        env: Option<std::collections::BTreeMap<String, String>>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
-            terminal_ops::create(pty, bus, workspace_id, cols, rows, cwd, command).await
+            terminal_ops::create(pty, bus, workspace_id, cols, rows, cwd, command, env).await
         })
     }
 
@@ -5014,6 +5024,43 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn git_clone(
+        &self,
+        url: String,
+        parent_dir: String,
+        target_name: Option<String>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            if url.trim().is_empty() {
+                return Err(Error::InvalidParams("url is required".to_string()));
+            }
+            let target = clone_ops::resolve_target_path(&parent_dir, &url, target_name.as_deref())?;
+            if clone_ops::target_exists(&target) {
+                return Err(Error::Internal(format!(
+                    "target already exists: {}",
+                    target.display()
+                )));
+            }
+            let request_id = request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let bus = bus.ok_or_else(|| {
+                Error::Internal("event bus not wired; git.clone requires streaming".to_string())
+            })?;
+            clone_ops::spawn_clone(clone_ops::CloneJob {
+                request_id: request_id.clone(),
+                workspace_id: None,
+                url,
+                target_path: target.clone(),
+                bus,
+            });
+            Ok(serde_json::json!({
+                "requestId": request_id,
+                "targetPath": target.to_string_lossy(),
+            }))
+        })
+    }
+
     fn repo_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -5436,6 +5483,7 @@ impl WorkspaceApi for Services {
         parent_agent_id: Option<AgentId>,
         idempotency_key: Option<String>,
         requested_agent_id: Option<AgentId>,
+        extra: intent_core::AgentCreateExtra,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             let ws_scope = workspace_id.0.clone();
@@ -5454,6 +5502,7 @@ impl WorkspaceApi for Services {
                         None,
                         false,
                         requested_agent_id,
+                        extra,
                     )
                     .await
                 },

@@ -409,6 +409,110 @@ async fn wss_agent_create_honors_client_supplied_agent_id() {
     srv.ws.stop().await;
 }
 
+/// `agent.create` accepts the widened P2-12a wire shape (optional `provider`,
+/// `agentType`, `metadata`, `workspacePath`, `workspaceContext`) and returns
+/// the full `AgentLite` projection instead of the pre-widening `{id, name}`
+/// snippet. All new params are additive — omitted params still succeed and
+/// still round-trip through `agent.get` (PROTOCOL §5.5).
+#[tokio::test]
+async fn wss_agent_create_widened_params_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Widen"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let requested = format!("agent-{}", uuid::Uuid::new_v4());
+
+    // Full-param create: exercise every new optional field. `provider`
+    // persists on the session; `agentType`/`metadata`/`workspacePath`/
+    // `workspaceContext` are accepted but deferred (per P2-12a audit).
+    let params = format!(
+        concat!(
+            r#"{{"workspaceId":"{ws}","agentId":"{aid}","name":"WSS Wide","#,
+            r#""model":"auggie:sonnet4.5","specialistId":"implementor","#,
+            r#""provider":"auggie","agentType":"task-loop","#,
+            r#""metadata":{{"tag":"unit"}},"workspacePath":"/tmp/wid","#,
+            r#""workspaceContext":{{"selection":"note:1"}}}}"#
+        ),
+        ws = ws_id,
+        aid = requested,
+    );
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{params}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"agent.get","params":{{"agentId":"{requested}"}}}}"#
+            ),
+        ],
+    )
+    .await;
+
+    let created = &sess[0]["result"]["agent"];
+    // Return shape is the full `AgentLite` projection — a superset of the
+    // pre-widening `{id, name}` snippet. Assert the persisted fields land.
+    assert_eq!(
+        created["id"].as_str(),
+        Some(requested.as_str()),
+        "widened create must adopt the client-supplied id: {}",
+        sess[0]
+    );
+    assert_eq!(created["name"].as_str(), Some("WSS Wide"));
+    assert_eq!(created["model"].as_str(), Some("auggie:sonnet4.5"));
+    assert_eq!(created["provider"].as_str(), Some("auggie"));
+    assert_eq!(created["workspaceId"].as_str(), Some(ws_id.as_str()));
+    assert_eq!(created["metadata"]["specialist"], "implementor");
+    // Full-`AgentLite` shape check: `messageCount` is present on the projection.
+    assert!(
+        created.get("messageCount").is_some(),
+        "AgentLite projection must expose messageCount: {}",
+        sess[0]
+    );
+
+    // `agent.get` must resolve at the same id and return the same projection.
+    assert_eq!(
+        sess[1]["result"]["agent"]["id"].as_str(),
+        Some(requested.as_str()),
+    );
+    assert_eq!(
+        sess[1]["result"]["agent"]["provider"].as_str(),
+        Some("auggie"),
+    );
+
+    // Backward-compat: a create that omits every widened param still returns
+    // the full `AgentLite` shape (no error, no missing required fields).
+    let minimal_id = format!("agent-{}", uuid::Uuid::new_v4());
+    let minimal = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}","agentId":"{minimal_id}"}}}}"#
+        )
+        .as_str(),
+    )
+    .await;
+    assert_eq!(
+        minimal["result"]["agent"]["id"].as_str(),
+        Some(minimal_id.as_str()),
+        "minimal create must still succeed: {minimal}",
+    );
+    assert!(
+        minimal["result"]["agent"].get("createdAt").is_some(),
+        "minimal create still returns full AgentLite: {minimal}",
+    );
+
+    srv.ws.stop().await;
+}
+
 #[tokio::test]
 async fn health_reports_ok_and_client_count() {
     let srv = start(WsOptions::default()).await;

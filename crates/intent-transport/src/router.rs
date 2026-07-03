@@ -7,9 +7,9 @@
 //! transport (UDS today, WS/TLS later) shares one code path.
 
 use intent_core::{
-    AgentDelegateInput, AgentId, Error, EventQueryParams, NoteAddInput, NoteCreate, NoteEditInput,
-    NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode, WorkspaceApi,
-    WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
+    AgentCreateExtra, AgentDelegateInput, AgentId, Error, EventQueryParams, NoteAddInput,
+    NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams,
+    ScriptMode, WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
 };
 use serde_json::{json, Map, Value};
 
@@ -709,6 +709,19 @@ async fn dispatch(
             // create+send "not found: agent session" race). Malformed values
             // are rejected inside the service as `-32602`.
             let requested_agent_id = opt_str(params, "agentId").map(|s| AgentId::from(s.as_str()));
+            // Widened FE-facing spawn hints (P2-12a): `provider`/`agentType`/
+            // `metadata`/`workspacePath`/`workspaceContext`. All optional and
+            // additive — omitted params behave exactly as pre-widening
+            // callers. Empty/whitespace-only string hints are collapsed to
+            // `None` at the boundary so downstream selection logic never sees
+            // an ambiguous `Some("")` (Copilot #78 review).
+            let extra = AgentCreateExtra {
+                provider: opt_nonempty_str(params, "provider"),
+                agent_type: opt_nonempty_str(params, "agentType"),
+                metadata: opt_value(params, "metadata"),
+                workspace_path: opt_nonempty_str(params, "workspacePath"),
+                workspace_context: opt_value(params, "workspaceContext"),
+            };
             // FE/RPC front door: top-level creates stay parentless.
             let result = api
                 .agent_create(
@@ -719,6 +732,7 @@ async fn dispatch(
                     None,
                     idempotency_key,
                     requested_agent_id,
+                    extra,
                 )
                 .await
                 .map_err(domain_to_rpc)?;
@@ -1005,6 +1019,19 @@ async fn dispatch(
         "repo.list" => {
             // No params; returns `{ repos: KnownRepo[] }` with camelCase keys.
             let r = api.repo_list().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "git.clone" => {
+            let url = require_str_param(params, "url")?;
+            let parent_dir = require_str_param(params, "parentDir")?;
+            let target_name = opt_str(params, "targetName");
+            // Empty/whitespace-only `requestId` is treated as absent so it
+            // cannot correlate `git:clone:*` streams (Copilot #78 review).
+            let request_id = opt_nonempty_str(params, "requestId");
+            let r = api
+                .git_clone(url, parent_dir, target_name, request_id)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "git.commit" => {
@@ -1840,7 +1867,8 @@ async fn dispatch(
             let rows = opt_dim(params, "rows", 24);
             let cwd = opt_str(params, "cwd");
             let command = opt_str(params, "command");
-            api.terminal_create(ws, cols, rows, cwd, command)
+            let env = opt_string_map(params, "env");
+            api.terminal_create(ws, cols, rows, cwd, command, env)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -2277,6 +2305,15 @@ fn require_present(params: &Map<String, Value>, name: &str) -> Result<(), RpcErr
 /// Optional string param (absent/null/non-string → `None`).
 fn opt_str(params: &Map<String, Value>, name: &str) -> Option<String> {
     params.get(name).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Like [`opt_str`] but treats empty and whitespace-only values as absent, so
+/// downstream code cannot distinguish `Some("")` from `None`. Used at the
+/// router boundary for optional hints where an empty string would be
+/// ambiguous (e.g. `git.clone`'s `requestId` correlator or `agent.create`'s
+/// widened `provider`/`agentType`/`workspacePath` fields).
+fn opt_nonempty_str(params: &Map<String, Value>, name: &str) -> Option<String> {
+    opt_str(params, name).filter(|s| !s.trim().is_empty())
 }
 
 /// Optional string-array param (absent/null/non-array → `None`); non-string

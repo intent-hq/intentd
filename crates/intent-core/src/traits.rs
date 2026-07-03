@@ -661,8 +661,9 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `agent.create`: persist a new agent session; returns `{ agent: { id, name } }`
-    /// (the process spawns lazily on first turn) (PROTOCOL §5.5).
+    /// `agent.create`: persist a new agent session; returns
+    /// `{ agent: <AgentLite> }` (the full projection — a superset of the earlier
+    /// `{ id, name }` shape, so existing readers stay green) (PROTOCOL §5.5).
     ///
     /// `parent_agent_id` is the caller/spawning agent: the MCP front door passes
     /// `Some(caller)` to stamp the child's `parentAgentId`; the FE/RPC front door
@@ -673,6 +674,12 @@ pub trait WorkspaceApi: Send + Sync {
     /// key the pending session, then addresses `agent.sendMessage` at the same
     /// id). When `Some`, the service adopts it verbatim; otherwise a fresh id
     /// is minted. Malformed values are rejected as `-32602`.
+    ///
+    /// `extra` carries the widened FE-facing spawn hints
+    /// (`provider`/`agentType`/`metadata`/`workspacePath`/`workspaceContext`).
+    /// Only `provider` currently lands on the persisted session; the other
+    /// fields are accepted so the FE seam can bind to the wire shape ahead of
+    /// full persistence.
     #[allow(clippy::too_many_arguments)]
     fn agent_create(
         &self,
@@ -683,6 +690,7 @@ pub trait WorkspaceApi: Send + Sync {
         parent_agent_id: Option<AgentId>,
         idempotency_key: Option<String>,
         requested_agent_id: Option<AgentId>,
+        extra: crate::model::AgentCreateExtra,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
@@ -692,6 +700,7 @@ pub trait WorkspaceApi: Send + Sync {
             parent_agent_id,
             idempotency_key,
             requested_agent_id,
+            extra,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -1518,6 +1527,28 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_commits not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.clone`: streaming clone of `url` into `<parent_dir>/<target_name>`
+    /// (or the URL-derived basename when `target_name` is `None`). Returns
+    /// `{ requestId, targetPath }` promptly and pushes `git:clone:progress`
+    /// frames followed by a terminal `git:clone:done` on the event bus,
+    /// correlated by `requestId` (PROTOCOL §5.6 / §6.5). Payloads never carry
+    /// the source URL or credentials. `-32602` on missing/invalid params;
+    /// `-32603` when the daemon cannot spawn `git`.
+    fn git_clone(
+        &self,
+        url: String,
+        parent_dir: String,
+        target_name: Option<String>,
+        request_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (url, parent_dir, target_name, request_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_clone not implemented".to_string(),
             ))
         })
     }
@@ -3039,7 +3070,10 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `terminal.create`: spawn a PTY (default shell when `command` is absent)
     /// scoped to the workspace and start fanning its output to subscribers as
-    /// `terminal:data` events. Returns `{ terminalId }` (PROTOCOL §5.13).
+    /// `terminal:data` events. `env` is an optional overlay layered over the
+    /// daemon's inherited environment so callers can pass through per-terminal
+    /// variables (e.g. `FORCE_COLOR`, `PATH` additions). Returns
+    /// `{ terminalId }` (PROTOCOL §5.13).
     fn terminal_create(
         &self,
         workspace_id: WorkspaceId,
@@ -3047,8 +3081,9 @@ pub trait WorkspaceApi: Send + Sync {
         rows: u16,
         cwd: Option<String>,
         command: Option<String>,
+        env: Option<std::collections::BTreeMap<String, String>>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, cols, rows, cwd, command);
+        let _ = (workspace_id, cols, rows, cwd, command, env);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::terminal_create not implemented".to_string(),

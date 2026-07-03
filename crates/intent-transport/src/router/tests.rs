@@ -1029,6 +1029,7 @@ impl WorkspaceApi for FakeApi {
         rows: u16,
         cwd: Option<String>,
         command: Option<String>,
+        env: Option<std::collections::BTreeMap<String, String>>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             Ok(serde_json::json!({
@@ -1038,6 +1039,7 @@ impl WorkspaceApi for FakeApi {
                 "rows": rows,
                 "cwd": cwd,
                 "command": command,
+                "env": env,
             }))
         })
     }
@@ -2958,9 +2960,9 @@ async fn search_codebase_requires_workspace_and_query_and_maps_regex() {
 
 #[tokio::test]
 async fn terminal_create_parses_dims_and_defaults() {
-    // Explicit cols/rows/cwd/command flow through to the service call.
+    // Explicit cols/rows/cwd/command/env flow through to the service call.
     let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"terminal.create","params":{"workspaceId":"ws-1","cols":120,"rows":40,"cwd":"/tmp","command":"bash"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"terminal.create","params":{"workspaceId":"ws-1","cols":120,"rows":40,"cwd":"/tmp","command":"bash","env":{"FOO":"bar","BAZ":"qux"}}}"#,
     )
     .await
     .unwrap();
@@ -2969,8 +2971,12 @@ async fn terminal_create_parses_dims_and_defaults() {
     assert_eq!(v["result"]["rows"], serde_json::json!(40));
     assert_eq!(v["result"]["cwd"], serde_json::json!("/tmp"));
     assert_eq!(v["result"]["command"], serde_json::json!("bash"));
+    assert_eq!(
+        v["result"]["env"],
+        serde_json::json!({ "FOO": "bar", "BAZ": "qux" })
+    );
 
-    // Defaults applied (80x24) when dims are absent.
+    // Defaults applied (80x24) when dims are absent; env absent → null.
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"terminal.create","params":{"workspaceId":"ws-1"}}"#,
     )
@@ -2979,6 +2985,7 @@ async fn terminal_create_parses_dims_and_defaults() {
     assert_eq!(v["result"]["cols"], serde_json::json!(80));
     assert_eq!(v["result"]["rows"], serde_json::json!(24));
     assert_eq!(v["result"]["command"], serde_json::json!(null));
+    assert_eq!(v["result"]["env"], serde_json::json!(null));
 
     // workspaceId is required.
     let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"terminal.create","params":{"cols":80}}"#)

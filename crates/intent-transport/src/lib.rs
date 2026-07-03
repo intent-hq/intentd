@@ -14,7 +14,11 @@ pub use auth::{
 };
 pub use control::{SystemControl, SystemStatus};
 pub use discovery::{detect_display_server, detect_has_display, Discovery, SERVICE_TYPE};
-pub use host::{open_external, resolve_is_local, ExternalOpener, OpenExternalError, OsOpener};
+pub use host::{
+    open_external, open_in_editor, pick_application, resolve_is_local, AppPicker, EditorLauncher,
+    EditorTarget, ExternalOpener, NoopAppPicker, OpenExternalError, OpenInEditorError,
+    OsEditorLauncher, OsOpener, PickApplicationError, ResolvedEditor,
+};
 pub use listener::serve_uds;
 pub use reverse::{ReverseChannel, ReverseError, DEFAULT_REVERSE_TIMEOUT};
 pub use router::handle_message;

@@ -254,6 +254,7 @@ async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
             None,
             false,
             None,
+            Default::default(),
         )
         .await
         .expect("create");
@@ -294,6 +295,7 @@ async fn agent_create_honors_client_supplied_agent_id() {
             None,
             false,
             Some(requested.clone()),
+            Default::default(),
         )
         .await
         .expect("create honors client id");
@@ -320,6 +322,7 @@ async fn agent_create_rejects_malformed_client_agent_id() {
                 None,
                 false,
                 Some(AgentId::from(bad)),
+                Default::default(),
             )
             .await
             .expect_err("malformed id must be rejected");
@@ -343,6 +346,7 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
             None,
             false,
             None,
+            Default::default(),
         )
         .await
         .expect("create");
@@ -471,6 +475,7 @@ async fn agent_lite_metadata_created_by_agent_id_from_parent() {
             None,
             false,
             None,
+            Default::default(),
         )
         .await
         .expect("create child");
@@ -1043,6 +1048,7 @@ async fn report_to_parent_delivers_for_delegated_caller() {
             None,
             false,
             None,
+            Default::default(),
         )
         .await
         .expect("create delegated child");

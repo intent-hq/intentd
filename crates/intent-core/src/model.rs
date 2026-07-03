@@ -1429,6 +1429,27 @@ impl AgentLite {
     }
 }
 
+/// Optional wire fields on `agent.create` beyond the ported core
+/// (`workspaceId`/`name`/`model`/`specialistId`/`idempotencyKey`/`agentId`)
+/// — carried in a struct to keep the trait signature manageable. All fields are
+/// optional; the FE fills them in when routing an agent-spawn through the daemon
+/// so the seam does not need to make a follow-up RPC for provider/context.
+///
+/// `provider` is persisted on the created [`AgentSession`] (existing column);
+/// `agentType`, `metadata`, `workspacePath`, and `workspaceContext` are accepted
+/// and currently forwarded no further (the widened seam unblocks the FE
+/// flip — persistence for the new hints is deferred to a follow-up per the
+/// P2-12a audit).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AgentCreateExtra {
+    pub provider: Option<String>,
+    pub agent_type: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub workspace_path: Option<String>,
+    pub workspace_context: Option<serde_json::Value>,
+}
+
 /// Wire input for `agent.delegate` (PROTOCOL §5.5). `workspaceId` is passed
 /// separately; these are the delegation options. Built by the router/MCP
 /// surface; the runtime wiring lands in a later milestone.

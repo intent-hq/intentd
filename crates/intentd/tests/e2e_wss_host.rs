@@ -443,3 +443,622 @@ async fn host_app_detection_services_over_wss() {
         }
     }
 }
+
+/// Seed one workspace with a filesystem root so `host.exec` can enforce the
+/// within-workspace containment guard on `cwd`. Returns `(workspace_id, root)`.
+async fn seed_workspace_with_path(data_dir: &Path, root: &Path) -> String {
+    use intent_core::{
+        now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    };
+    use intent_store::Store;
+    let db_path = data_dir.join("intentd.db");
+    let store = Store::open(&db_path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    let ts = now_iso();
+    let ws = Workspace {
+        id: ws_id.clone(),
+        title: "WSS-HOST-EXEC".to_string(),
+        branch: "main".to_string(),
+        base_ref: None,
+        base_commit_sha: None,
+        status: WorkspaceStatus::Active,
+        status_message: None,
+        activity: WorkspaceActivity::Idle,
+        attention: WorkspaceAttention::None,
+        created_at: ts.clone(),
+        updated_at: ts,
+        last_activity: None,
+        tags: vec![],
+        path: Some(root.to_string_lossy().into_owned()),
+        repository_path: None,
+        repository_owner: None,
+        repository_name: None,
+        worktree_path: Some(root.to_string_lossy().into_owned()),
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
+        archived: false,
+        archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
+        token_usage: None,
+    };
+    store.insert_workspace(&ws).await.expect("insert ws");
+    ws_id.0
+}
+
+/// Read the id-matched error frame after sending `frame`. Handles server
+/// heartbeats by replying to `Ping` with `Pong` (matches the other WSS
+/// helpers in this file); otherwise a mid-wait heartbeat could close the
+/// connection and flake the test.
+async fn wss_expect_error<S>(ws: &mut WebSocketStream<S>, id: i64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let next = timeout(Duration::from_secs(15), ws.next())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        match next {
+            Message::Text(t) => {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["id"] == json!(id) {
+                    return v;
+                }
+            }
+            Message::Ping(p) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// host.exec: happy-path round-trip + timeout + cwd-outside-workspace rejection.
+#[tokio::test]
+async fn host_exec_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    // Real filesystem root the daemon can `cd` into; kept alive until the
+    // daemon drops (its `Drop` removes the whole data dir; the workspace root
+    // is a sibling temp dir, cleaned up here).
+    let root = std::env::temp_dir().join(format!("itd-wss-exec-root-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&root).expect("mkdir workspace root");
+    let ws_id = seed_workspace_with_path(&daemon.data_dir, &root).await;
+    let mut ws = connect_ws(port, cfg).await;
+
+    // 1) Happy path — echo returns stdout + exitCode 0 without cwd validation.
+    let out = wss_rpc(
+        &mut ws,
+        200,
+        "host.exec",
+        json!({ "command": "echo", "args": ["hello", "world"], "timeoutMs": 5000 }),
+    )
+    .await;
+    assert_eq!(out["exitCode"], 0, "exitCode 0: {out}");
+    assert_eq!(
+        out["stdout"].as_str().unwrap().trim(),
+        "hello world",
+        "stdout carries argv payload: {out}"
+    );
+    assert!(
+        out.get("timedOut").is_none(),
+        "no timedOut on the happy path: {out}"
+    );
+
+    // 2) cwd inside the workspace succeeds — /bin/sh -c is intentionally NOT
+    // used; the daemon spawns argv only. `pwd` prints the resolved cwd.
+    let inside = wss_rpc(
+        &mut ws,
+        201,
+        "host.exec",
+        json!({
+            "command": "pwd",
+            "cwd": ".",
+            "workspaceId": ws_id,
+            "timeoutMs": 5000,
+        }),
+    )
+    .await;
+    assert_eq!(inside["exitCode"], 0, "cwd inside ⇒ ok: {inside}");
+    let printed = inside["stdout"].as_str().unwrap().trim();
+    // macOS `/tmp` resolves through a `/private` symlink; the daemon's lexical
+    // guard operates on the resolved path so we accept either prefix here.
+    let canonical = std::fs::canonicalize(&root)
+        .unwrap_or_else(|_| root.clone())
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        printed == root.to_string_lossy() || printed == canonical,
+        "pwd prints the workspace root ({} or {}): {printed}",
+        root.display(),
+        canonical
+    );
+
+    // 3) cwd OUTSIDE the workspace ⇒ -32603 with a clear containment message.
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 202, "method": "host.exec",
+        "params": {
+            "command": "pwd",
+            "cwd": "/etc",
+            "workspaceId": ws_id,
+            "timeoutMs": 5000,
+        }
+    });
+    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    let err = wss_expect_error(&mut ws, 202).await;
+    assert_eq!(err["error"]["code"], -32603, "cwd outside ⇒ -32603: {err}");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cwd outside workspace"),
+        "clear containment message: {err}"
+    );
+
+    // 4) Timeout ⇒ result carries `timedOut: true` and the child is reaped
+    // (SIGTERM → grace → SIGKILL on unix). Use `sleep 30` capped at 500ms.
+    let timed_out = wss_rpc(
+        &mut ws,
+        203,
+        "host.exec",
+        json!({ "command": "sleep", "args": ["30"], "timeoutMs": 500 }),
+    )
+    .await;
+    assert_eq!(
+        timed_out["timedOut"], true,
+        "timedOut flag set: {timed_out}"
+    );
+
+    // 5) Missing `command` ⇒ -32602 (PROTOCOL §9).
+    let frame = json!({ "jsonrpc": "2.0", "id": 204, "method": "host.exec", "params": {} });
+    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    let err = wss_expect_error(&mut ws, 204).await;
+    assert_eq!(
+        err["error"]["code"], -32602,
+        "missing command ⇒ -32602: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Read one `events.event` frame whose `event.type` matches `type_filter` AND
+/// whose `event.data.requestId` equals `request_id`; ignore anything else.
+async fn wss_next_stream_event<S>(
+    ws: &mut WebSocketStream<S>,
+    request_id: &str,
+    type_filter: &[&str],
+    secs: u64,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let next = timeout(Duration::from_secs(secs), ws.next())
+            .await
+            .expect("wss stream event timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] != "events.event" {
+                    continue;
+                }
+                let event = &v["params"]["event"];
+                let ty = event["type"].as_str().unwrap_or("");
+                if !type_filter.contains(&ty) {
+                    continue;
+                }
+                if event["data"]["requestId"].as_str() != Some(request_id) {
+                    continue;
+                }
+                return v;
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// host.execStream: happy-path streaming (`cat` echoes an initial stdin payload
+/// then a follow-up write closes stdin so the child exits) + cancel path
+/// (`sleep 30` reaped by `host.execStream.cancel`) + `-32602` on missing
+/// `command`. Exercises the full §5.14 streaming wire: `{ requestId }` on the
+/// request, `host:exec:stdout` bus frames (base64 chunks), stdin write with
+/// `eof=true`, and terminal `host:exec:exit`.
+#[tokio::test]
+async fn host_exec_stream_over_wss() {
+    use base64::Engine as _;
+
+    let (_daemon, port, cfg) = boot().await;
+
+    // SUBSCRIBER conn — subscribe BEFORE starting the stream so no chunk is
+    // missed. `workspaceId` is intentionally omitted: `host.execStream` without
+    // a workspace context publishes under the empty-workspace id, and the
+    // events fast-path routes matching frames to global (workspace-less)
+    // subscribers on the same connection.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        300,
+        "events.subscribe",
+        json!({ "eventTypes": ["host:exec:stdout", "host:exec:stderr", "host:exec:exit"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // RPC conn — kick off a `cat` streaming exec with an initial stdin payload
+    // that MUST be echoed back on stdout, correlated by the returned
+    // requestId. `cat` reads to EOF, so the follow-up `write { eof:true }`
+    // closes stdin and lets the child exit cleanly (exitCode=0).
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let started = wss_rpc(
+        &mut rpc,
+        301,
+        "host.execStream",
+        json!({ "command": "cat", "stdin": "hello world\n" }),
+    )
+    .await;
+    let request_id = started["requestId"]
+        .as_str()
+        .expect("requestId in host.execStream result")
+        .to_string();
+
+    // Collect stdout chunks (base64) until the marker appears; stop on exit.
+    let mut acc: Vec<u8> = Vec::new();
+    let mut saw_exit = false;
+    let mut exit_ok: Option<bool> = None;
+
+    // First: watch for the initial stdin's echo.
+    for _ in 0..40 {
+        let v = wss_next_stream_event(
+            &mut sub,
+            &request_id,
+            &["host:exec:stdout", "host:exec:exit"],
+            15,
+        )
+        .await;
+        let event = &v["params"]["event"];
+        match event["type"].as_str() {
+            Some("host:exec:stdout") => {
+                if let Some(chunk) = event["data"]["chunk"].as_str() {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(chunk)
+                        .expect("valid base64 in host:exec:stdout.chunk");
+                    acc.extend_from_slice(&bytes);
+                }
+            }
+            Some("host:exec:exit") => {
+                saw_exit = true;
+                exit_ok = event["data"]["ok"].as_bool();
+                break;
+            }
+            _ => continue,
+        }
+        if String::from_utf8_lossy(&acc).contains("hello world") {
+            break;
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&acc).contains("hello world"),
+        "initial stdin was echoed on host:exec:stdout: {:?}",
+        String::from_utf8_lossy(&acc)
+    );
+
+    // Send a follow-up stdin chunk + close so `cat` exits (unless it already
+    // exited above via some other race — the write is idempotent-safe).
+    if !saw_exit {
+        let write_resp = wss_rpc(
+            &mut rpc,
+            302,
+            "host.execStream.write",
+            json!({ "requestId": &request_id, "stdin": "goodbye\n", "eof": true }),
+        )
+        .await;
+        assert_eq!(write_resp["ok"], true, "write ok: {write_resp}");
+        // Drain until we see the terminal exit frame.
+        for _ in 0..40 {
+            let v = wss_next_stream_event(
+                &mut sub,
+                &request_id,
+                &["host:exec:stdout", "host:exec:exit"],
+                15,
+            )
+            .await;
+            let event = &v["params"]["event"];
+            match event["type"].as_str() {
+                Some("host:exec:stdout") => {
+                    if let Some(chunk) = event["data"]["chunk"].as_str() {
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(chunk)
+                            .expect("valid base64 in host:exec:stdout.chunk");
+                        acc.extend_from_slice(&bytes);
+                    }
+                }
+                Some("host:exec:exit") => {
+                    saw_exit = true;
+                    exit_ok = event["data"]["ok"].as_bool();
+                    break;
+                }
+                _ => continue,
+            }
+        }
+    }
+    assert!(
+        saw_exit,
+        "host:exec:exit reached (accumulated stdout so far: {:?})",
+        String::from_utf8_lossy(&acc)
+    );
+    assert_eq!(exit_ok, Some(true), "cat exited cleanly (exitCode=0)");
+
+    // ── Cancel path ────────────────────────────────────────────────────────
+    // A long-lived `sleep 30` MUST be reaped by `host.execStream.cancel`
+    // (SIGTERM → grace → SIGKILL). Terminal frame carries `cancelled:true`.
+    let started = wss_rpc(
+        &mut rpc,
+        310,
+        "host.execStream",
+        json!({ "command": "sleep", "args": ["30"] }),
+    )
+    .await;
+    let cancel_id = started["requestId"]
+        .as_str()
+        .expect("requestId for cancel case")
+        .to_string();
+
+    // Give the child a moment to start before cancelling.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let cancel_resp = wss_rpc(
+        &mut rpc,
+        311,
+        "host.execStream.cancel",
+        json!({ "requestId": &cancel_id }),
+    )
+    .await;
+    assert_eq!(cancel_resp["ok"], true, "cancel ok: {cancel_resp}");
+    assert_eq!(
+        cancel_resp["cancelled"], true,
+        "cancel flipped live token: {cancel_resp}"
+    );
+
+    // The exit frame arrives promptly (SIGTERM plus 500ms grace).
+    let exit = wss_next_stream_event(&mut sub, &cancel_id, &["host:exec:exit"], 10).await;
+    let data = &exit["params"]["event"]["data"];
+    assert_eq!(data["cancelled"], true, "cancelled:true on exit: {exit}");
+    assert_eq!(data["ok"], false, "cancelled sleep is not `ok`: {exit}");
+
+    // A repeat cancel on the (now-finished) id is idempotent: `ok:true` still,
+    // but `cancelled:false` because no live token remained.
+    let repeat = wss_rpc(
+        &mut rpc,
+        312,
+        "host.execStream.cancel",
+        json!({ "requestId": &cancel_id }),
+    )
+    .await;
+    assert_eq!(repeat["ok"], true, "idempotent cancel is ok: {repeat}");
+    assert_eq!(repeat["cancelled"], false, "no live token: {repeat}");
+
+    // ── -32602 arms ────────────────────────────────────────────────────────
+    // Missing `command` on the stream request ⇒ -32602 (PROTOCOL §9).
+    let frame = json!({ "jsonrpc": "2.0", "id": 320, "method": "host.execStream", "params": {} });
+    rpc.send(Message::Text(frame.to_string())).await.unwrap();
+    let err = wss_expect_error(&mut rpc, 320).await;
+    assert_eq!(
+        err["error"]["code"], -32602,
+        "missing command ⇒ -32602: {err}"
+    );
+    // Missing `requestId` on the write / cancel surfaces likewise.
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 321, "method": "host.execStream.write", "params": {}
+    });
+    rpc.send(Message::Text(frame.to_string())).await.unwrap();
+    let err = wss_expect_error(&mut rpc, 321).await;
+    assert_eq!(err["error"]["code"], -32602, "missing requestId ⇒ -32602");
+
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 322, "method": "host.execStream.cancel", "params": {}
+    });
+    rpc.send(Message::Text(frame.to_string())).await.unwrap();
+    let err = wss_expect_error(&mut rpc, 322).await;
+    assert_eq!(err["error"]["code"], -32602, "missing requestId ⇒ -32602");
+}
+
+/// ACP model/readiness handshake probe over `host.execStream` (§5.14).
+///
+/// AUDIT-R1c-BE. R1b retired the four bidirectional-stdio ACP probes; the
+/// replacement is **not** a net-new `provider.probeAcp` RPC but a thin FE parser
+/// on top of the existing streaming exec surface, which already provides every
+/// guarantee an ACP probe needs (argv-only spawn, process-group + `kill_on_drop`
+/// reap on `timeoutMs`/cancel, PATH enrichment, workspace-cwd containment,
+/// secret-safe env, initial `stdin` + streamed base64 stdout + terminal exit).
+///
+/// This e2e proves that shape end-to-end against the deterministic mock ACP
+/// agent (`tests/fixtures/mock-acp-agent.mjs`, which responds to `initialize`
+/// with `{ protocolVersion: 1, agentCapabilities: { loadSession: false } }`):
+///
+/// 1. **Handshake happy path** — subscribe to `host:exec:*`, call
+///    `host.execStream` with `command:"node"`, `args:[mock-script]`, and an
+///    initial `stdin` carrying the `initialize` JSON-RPC line. Assemble stdout
+///    chunks (base64) until a full `\n`-terminated line arrives, parse it, and
+///    assert the capability payload. Close stdin via
+///    `host.execStream.write { eof:true }` so the mock agent exits cleanly.
+/// 2. **Timeout reap** — call `host.execStream` on the same agent with a short
+///    `timeoutMs` and **no** initial stdin. The agent blocks reading stdin, so
+///    the daemon reaps the process group at the deadline and publishes
+///    `host:exec:exit { timedOut:true, ok:false }`.
+#[tokio::test]
+async fn host_exec_stream_acp_handshake_probe_over_wss() {
+    use base64::Engine as _;
+
+    // Gate: skip when `node` or the mock script isn't available (parity with
+    // the WSS agent-lifecycle suite's gate).
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping ACP handshake probe: node not on PATH");
+        return;
+    }
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("skipping ACP handshake probe: mock script missing at {script}");
+        return;
+    }
+
+    let (_daemon, port, cfg) = boot().await;
+
+    // Subscriber conn: subscribe BEFORE spawning so no chunk is missed. No
+    // workspaceId is passed on `host.execStream`, so events publish under the
+    // empty-workspace id and the events fast-path routes them to global
+    // subscribers on the same connection.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        400,
+        "events.subscribe",
+        json!({ "eventTypes": ["host:exec:stdout", "host:exec:stderr", "host:exec:exit"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // ── Handshake happy path ──────────────────────────────────────────────
+    // The initialize line is what a real FE probe would send; the mock ACP
+    // agent responds with a single `\n`-terminated JSON-RPC result line.
+    let init_line =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}}\n";
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let started = wss_rpc(
+        &mut rpc,
+        401,
+        "host.execStream",
+        json!({
+            "command": "node",
+            "args": [&script],
+            "stdin": init_line,
+            "timeoutMs": 15_000,
+        }),
+    )
+    .await;
+    let request_id = started["requestId"]
+        .as_str()
+        .expect("requestId on handshake exec")
+        .to_string();
+
+    // Accumulate stdout base64 chunks until we have at least one full line.
+    let mut acc: Vec<u8> = Vec::new();
+    let mut parsed: Option<Value> = None;
+    for _ in 0..40 {
+        let v = wss_next_stream_event(
+            &mut sub,
+            &request_id,
+            &["host:exec:stdout", "host:exec:exit"],
+            15,
+        )
+        .await;
+        let event = &v["params"]["event"];
+        match event["type"].as_str() {
+            Some("host:exec:stdout") => {
+                if let Some(chunk) = event["data"]["chunk"].as_str() {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(chunk)
+                        .expect("valid base64 in host:exec:stdout.chunk");
+                    acc.extend_from_slice(&bytes);
+                }
+                if let Some(nl) = acc.iter().position(|b| *b == b'\n') {
+                    let line = &acc[..nl];
+                    parsed =
+                        Some(serde_json::from_slice(line).expect("mock agent stdout is JSON-RPC"));
+                    break;
+                }
+            }
+            Some("host:exec:exit") => {
+                panic!(
+                    "child exited before reply (acc={:?})",
+                    String::from_utf8_lossy(&acc)
+                );
+            }
+            _ => continue,
+        }
+    }
+    let parsed = parsed.expect("received a JSON-RPC reply line on stdout");
+
+    // Assert the ACP capability payload the mock agent returns for `initialize`.
+    assert_eq!(parsed["jsonrpc"], "2.0", "handshake reply: {parsed}");
+    assert_eq!(parsed["id"], 1, "handshake reply: {parsed}");
+    assert_eq!(
+        parsed["result"]["protocolVersion"], 1,
+        "handshake reply carries protocolVersion=1: {parsed}"
+    );
+    assert_eq!(
+        parsed["result"]["agentCapabilities"]["loadSession"], false,
+        "handshake reply carries capability payload: {parsed}"
+    );
+
+    // Close stdin so the mock agent's readline loop drains and the child exits
+    // cleanly (exitCode=0). The exit frame surfaces on the bus.
+    let write_resp = wss_rpc(
+        &mut rpc,
+        402,
+        "host.execStream.write",
+        json!({ "requestId": &request_id, "eof": true }),
+    )
+    .await;
+    assert_eq!(write_resp["ok"], true, "eof write ok: {write_resp}");
+
+    let exit = wss_next_stream_event(&mut sub, &request_id, &["host:exec:exit"], 15).await;
+    let data = &exit["params"]["event"]["data"];
+    assert_eq!(data["ok"], true, "mock agent exits cleanly: {exit}");
+    assert!(
+        data.get("timedOut").and_then(Value::as_bool) != Some(true),
+        "no timedOut on the happy handshake path: {exit}"
+    );
+
+    // ── Timeout reap path ─────────────────────────────────────────────────
+    // Spawn the same agent with a short `timeoutMs` and NO initial stdin. The
+    // agent's readline loop blocks waiting for input, so the daemon must reap
+    // the process group at the deadline and surface `timedOut:true`.
+    let started = wss_rpc(
+        &mut rpc,
+        410,
+        "host.execStream",
+        json!({
+            "command": "node",
+            "args": [&script],
+            "timeoutMs": 500,
+        }),
+    )
+    .await;
+    let timeout_id = started["requestId"]
+        .as_str()
+        .expect("requestId on timeout-probe exec")
+        .to_string();
+
+    let exit = wss_next_stream_event(&mut sub, &timeout_id, &["host:exec:exit"], 10).await;
+    let data = &exit["params"]["event"]["data"];
+    assert_eq!(
+        data["timedOut"], true,
+        "timedOut:true on the reap path: {exit}"
+    );
+    assert_eq!(data["ok"], false, "reaped child is not `ok`: {exit}");
+}
