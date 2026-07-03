@@ -262,6 +262,12 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         stats: None,
         task_note_id: None,
         skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
         created_at: ts.clone(),
         updated_at: ts,
     }

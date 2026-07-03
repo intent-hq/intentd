@@ -1341,6 +1341,24 @@ impl WorkspaceApi for FakeApi {
             }))
         })
     }
+
+    // Echo the parsed rename params so the router tests can assert the
+    // optional `skipIfExplicitlySet` flag is forwarded (P3-1.2b).
+    fn agent_rename(
+        &self,
+        agent_id: AgentId,
+        name: String,
+        skip_if_explicitly_set: bool,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "success": true,
+                "name": name,
+                "agentId": agent_id,
+                "skipIfExplicitlySet": skip_if_explicitly_set,
+            }))
+        })
+    }
 }
 
 async fn call(msg: &str) -> Option<Value> {
@@ -2296,6 +2314,28 @@ async fn agent_methods_are_routed_not_method_not_found() {
     .await
     .unwrap();
     assert_eq!(err_code(&v), -32603);
+}
+
+/// `agent.rename` forwards the optional `skipIfExplicitlySet` flag (defaulting
+/// to `false` when omitted) and trims the name before dispatch (P3-1.2b).
+#[tokio::test]
+async fn agent_rename_forwards_skip_if_explicitly_set() {
+    // Omitted → false.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.rename","params":{"agentId":"agent-1","name":" Neo "}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["name"], "Neo");
+    assert_eq!(v["result"]["skipIfExplicitlySet"], serde_json::json!(false));
+
+    // Supplied → forwarded verbatim.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.rename","params":{"agentId":"agent-1","name":"Neo","skipIfExplicitlySet":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["skipIfExplicitlySet"], serde_json::json!(true));
 }
 
 #[tokio::test]

@@ -942,6 +942,12 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         stats: None,
         task_note_id: None,
         skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
         created_at: ts.clone(),
         updated_at: ts,
     }
@@ -1015,6 +1021,114 @@ async fn agent_session_round_trip_and_append_only_log() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, agent_id);
     assert_eq!(listed[0].messages.len(), 2);
+}
+
+/// The P3-1.2b persistence-gap fields round-trip through insert → get →
+/// update → get: `completion_report(_timestamp)`, `delegation_depth`,
+/// `initial_message`, and the JSON `context_references` / `image_blocks`.
+#[tokio::test]
+async fn agent_session_gap_fields_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let agent_id = AgentId::from("agent-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    let mut session = sample_agent_session(&agent_id, &ws);
+    session.delegation_depth = Some(2);
+    session.initial_message = Some("kick off".to_string());
+    session.context_references = Some(json!([{ "type": "file", "path": "src/a.rs" }]));
+    session.image_blocks = Some(json!([{ "type": "image", "data": "abc" }]));
+    store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert session");
+
+    let loaded = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(loaded.delegation_depth, Some(2));
+    assert_eq!(loaded.initial_message.as_deref(), Some("kick off"));
+    assert_eq!(
+        loaded.context_references,
+        Some(json!([{ "type": "file", "path": "src/a.rs" }]))
+    );
+    assert_eq!(
+        loaded.image_blocks,
+        Some(json!([{ "type": "image", "data": "abc" }]))
+    );
+    assert_eq!(loaded.completion_report, None);
+
+    // The report fields land via the update path.
+    let mut updated = loaded.clone();
+    updated.completion_report = Some("done".to_string());
+    updated.completion_report_timestamp = Some("t9".to_string());
+    store.update_agent_session(&updated).await.expect("update");
+    let reloaded = store.get_agent_session(&agent_id).await.expect("reload");
+    assert_eq!(reloaded.completion_report.as_deref(), Some("done"));
+    assert_eq!(reloaded.completion_report_timestamp.as_deref(), Some("t9"));
+    // The spawn-time fields survive the update untouched.
+    assert_eq!(reloaded.delegation_depth, Some(2));
+    assert_eq!(reloaded.initial_message.as_deref(), Some("kick off"));
+}
+
+/// Transient streaming flags are NEVER persisted (P3-1.2b; the daemon-side
+/// mirror of the FE `performAtomicWrite` scrub): the `agent_session` schema
+/// has no column for them, and the persisted session's wire form carries no
+/// `isResponding` / `isStreaming` / `isProcessing` / `currentStreamId` keys —
+/// those exist only on the runtime-overlaid `AgentLite` projection.
+#[tokio::test]
+async fn transient_streaming_flags_are_never_persisted() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+
+    // Schema guard: no transient-flag column exists on agent_session.
+    let cols: Vec<String> = sqlx::query("PRAGMA table_info(agent_session)")
+        .fetch_all(store.pool())
+        .await
+        .expect("pragma")
+        .iter()
+        .map(|r| sqlx::Row::get::<String, _>(r, "name"))
+        .collect();
+    for forbidden in [
+        "is_responding",
+        "is_streaming",
+        "is_processing",
+        "current_stream_id",
+    ] {
+        assert!(
+            !cols.iter().any(|c| c == forbidden),
+            "agent_session must not have a `{forbidden}` column"
+        );
+    }
+
+    // Wire guard: a persisted-and-reloaded session serializes without any
+    // transient streaming keys.
+    let agent_id = AgentId::from("agent-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+    let loaded = store.get_agent_session(&agent_id).await.expect("get");
+    let v = serde_json::to_value(&loaded).expect("session json");
+    let obj = v.as_object().expect("object");
+    for forbidden in [
+        "isResponding",
+        "isStreaming",
+        "isProcessing",
+        "currentStreamId",
+    ] {
+        assert!(
+            !obj.contains_key(forbidden),
+            "persisted AgentSession must not carry `{forbidden}`"
+        );
+    }
 }
 
 #[tokio::test]

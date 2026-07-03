@@ -18,7 +18,28 @@ use crate::{enum_from_db, enum_to_db, Store};
 
 const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session_id, name, \
     name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, \
-    parent_agent_id, specialist, task_note_id, skip_auto_commit";
+    parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, \
+    completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks";
+
+/// Encode an optional JSON payload column (`context_references` /
+/// `image_blocks`) as its TEXT form, `None` staying NULL.
+fn json_col_to_db(v: &Option<serde_json::Value>) -> Result<Option<String>> {
+    v.as_ref()
+        .map(|value| {
+            serde_json::to_string(value)
+                .map_err(|e| Error::Internal(format!("encode session json column failed: {e}")))
+        })
+        .transpose()
+}
+
+/// Decode an optional JSON payload column back into its `serde_json::Value`.
+fn json_col_from_db(raw: Option<String>, name: &str) -> Result<Option<serde_json::Value>> {
+    raw.map(|s| {
+        serde_json::from_str(&s)
+            .map_err(|e| Error::Internal(format!("decode session column {name} failed: {e}")))
+    })
+    .transpose()
+}
 
 impl Store {
     /// Insert an agent-session row. `messages`/`stats` are not persisted here;
@@ -26,7 +47,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&s.id.0)
@@ -46,6 +67,12 @@ impl Store {
             .bind(&s.specialist)
             .bind(s.task_note_id.as_ref().map(|n| n.0.clone()))
             .bind(s.skip_auto_commit as i64)
+            .bind(&s.completion_report)
+            .bind(&s.completion_report_timestamp)
+            .bind(s.delegation_depth)
+            .bind(&s.initial_message)
+            .bind(json_col_to_db(&s.context_references)?)
+            .bind(json_col_to_db(&s.image_blocks)?)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
@@ -121,7 +148,9 @@ impl Store {
         sqlx::query(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
-             updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=? \
+             updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
+             completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
+             initial_message=?, context_references=?, image_blocks=? \
              WHERE id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
@@ -138,6 +167,12 @@ impl Store {
         .bind(&s.specialist)
         .bind(s.task_note_id.as_ref().map(|n| n.0.clone()))
         .bind(s.skip_auto_commit as i64)
+        .bind(&s.completion_report)
+        .bind(&s.completion_report_timestamp)
+        .bind(s.delegation_depth)
+        .bind(&s.initial_message)
+        .bind(json_col_to_db(&s.context_references)?)
+        .bind(json_col_to_db(&s.image_blocks)?)
         .bind(&s.id.0)
         .execute(self.pool())
         .await
@@ -274,6 +309,15 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         stats: None,
         task_note_id: task_note.map(NoteId::from),
         skip_auto_commit: col::<i64>(row, "skip_auto_commit")? != 0,
+        completion_report: col(row, "completion_report")?,
+        completion_report_timestamp: col(row, "completion_report_timestamp")?,
+        delegation_depth: col(row, "delegation_depth")?,
+        initial_message: col(row, "initial_message")?,
+        context_references: json_col_from_db(
+            col(row, "context_references")?,
+            "context_references",
+        )?,
+        image_blocks: json_col_from_db(col(row, "image_blocks")?, "image_blocks")?,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
     })

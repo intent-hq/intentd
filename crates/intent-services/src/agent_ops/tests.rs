@@ -16,7 +16,10 @@ use intent_store::{NewEvent, Store};
 use serde_json::json;
 use tokio::time::timeout;
 
-use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_SESSION_STATS_CHANGED};
+use intent_core::events::{
+    AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RENAMED,
+    AGENT_SESSION_STATS_CHANGED, AGENT_UPDATED,
+};
 use intent_core::{ActorType, Event, EventActor, SessionStats};
 
 use crate::{EventBus, SubscriptionFilter};
@@ -634,7 +637,7 @@ async fn rename_and_set_model_persist() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Old").await;
     let r = svc
-        .agent_rename_op(id.clone(), "New".into())
+        .agent_rename_op(id.clone(), "New".into(), false)
         .await
         .expect("rename");
     assert_eq!(r["name"], "New");
@@ -654,10 +657,244 @@ async fn rename_missing_agent_is_internal() {
         .agent_rename_op(
             AgentId::from("agent-00000000-0000-0000-0000-000000000000"),
             "x".into(),
+            false,
         )
         .await
         .expect_err("missing");
     assert!(matches!(err, Error::Internal(_)));
+}
+
+/// `agent.rename` `skipIfExplicitlySet` (P3-1.2b): an explicitly-named session
+/// is left untouched (`skipped: true`, existing name echoed); an auto-named
+/// session is renamed normally, after which the skip flag holds.
+#[tokio::test]
+async fn rename_skip_if_explicitly_set() {
+    let (_t, svc, ws) = setup().await;
+    // `create_agent` supplies a name -> nameExplicitlySet = true.
+    let explicit = create_agent(&svc, &ws, "Named").await;
+    let r = svc
+        .agent_rename_op(explicit.clone(), "Clobber".into(), true)
+        .await
+        .expect("skip rename");
+    assert_eq!(r["success"], json!(true));
+    assert_eq!(r["skipped"], json!(true));
+    assert_eq!(r["name"], "Named");
+    let got = svc.agent_get_op(explicit).await.expect("get");
+    assert_eq!(got.name, "Named");
+
+    // No client name -> auto-generated, nameExplicitlySet = false: the
+    // skip-guarded rename applies (and `skipped` is absent from the result).
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create auto-named");
+    let auto = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let r = svc
+        .agent_rename_op(auto.clone(), "Chosen".into(), true)
+        .await
+        .expect("rename");
+    assert_eq!(r["name"], "Chosen");
+    assert!(r.get("skipped").is_none());
+    let got = svc.agent_get_op(auto.clone()).await.expect("get");
+    assert_eq!(got.name, "Chosen");
+    assert!(got.name_explicitly_set);
+    // Now explicitly set -> a further skip-guarded rename is a no-op.
+    let r = svc
+        .agent_rename_op(auto, "Again".into(), true)
+        .await
+        .expect("skip");
+    assert_eq!(r["skipped"], json!(true));
+    assert_eq!(r["name"], "Chosen");
+}
+
+/// `agent.create` harvests the persistence-gap fields (P3-1.2b) from the
+/// `metadata` spawn hint / top-level params and re-serves them via
+/// `agent.get`/`agent.list`: `metadata.delegationDepth`, `metadata.initialMessage`,
+/// and session-level `contextReferences` / `imageBlocks`.
+#[tokio::test]
+async fn create_persists_and_reserves_gap_fields() {
+    let (_t, svc, ws) = setup().await;
+    let extra = intent_core::AgentCreateExtra {
+        metadata: Some(json!({
+            "delegationDepth": 2,
+            "initialMessage": "start here",
+            "contextReferences": [{ "type": "file", "path": "src/a.rs" }],
+        })),
+        image_blocks: Some(json!([{ "type": "image", "data": "abc" }])),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Gaps".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            extra,
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    // Re-served on `agent.get` (session-level fields + nested metadata).
+    let got = svc.agent_get_op(id.clone()).await.expect("get");
+    let v = serde_json::to_value(&got).expect("lite json");
+    assert_eq!(v["metadata"]["delegationDepth"], json!(2));
+    assert_eq!(v["metadata"]["initialMessage"], "start here");
+    assert_eq!(
+        v["contextReferences"],
+        json!([{ "type": "file", "path": "src/a.rs" }])
+    );
+    assert_eq!(
+        v["imageBlocks"],
+        json!([{ "type": "image", "data": "abc" }])
+    );
+
+    // And on `agent.list`.
+    let agents = svc.agent_list_op(ws).await.expect("list");
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0].metadata.delegation_depth, Some(2));
+}
+
+/// `agent.create` / `agent.rename` / `agent.setModel` emit their `agent:*`
+/// invalidation events (P3-1.2b): `agent:created`, `agent:renamed`,
+/// `agent:updated`.
+#[tokio::test]
+async fn create_rename_set_model_emit_agent_events() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![
+            AGENT_CREATED.to_string(),
+            AGENT_RENAMED.to_string(),
+            AGENT_UPDATED.to_string(),
+        ],
+        ..Default::default()
+    });
+
+    let id = create_agent(&svc, &ws, "Evented").await;
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("created recv")
+        .expect("sub closed");
+    assert_eq!(batch[0].event_type, AGENT_CREATED);
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
+
+    svc.agent_rename_op(id.clone(), "Renamed".into(), false)
+        .await
+        .expect("rename");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("renamed recv")
+        .expect("sub closed");
+    assert_eq!(batch[0].event_type, AGENT_RENAMED);
+    assert_eq!(batch[0].data["name"], "Renamed");
+
+    svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into())
+        .await
+        .expect("setModel");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("updated recv")
+        .expect("sub closed");
+    assert_eq!(batch[0].event_type, AGENT_UPDATED);
+    assert_eq!(batch[0].data["modelId"], "auggie:opus4.7");
+}
+
+/// A skipped rename mutates nothing and therefore emits no `agent:renamed`.
+#[tokio::test]
+async fn skipped_rename_emits_no_event() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Named").await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_RENAMED.to_string()],
+        ..Default::default()
+    });
+    let r = svc
+        .agent_rename_op(id, "Clobber".into(), true)
+        .await
+        .expect("skip");
+    assert_eq!(r["skipped"], json!(true));
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "no agent:renamed expected for a skipped rename"
+    );
+}
+
+/// `agent.reportToParent` persists `completionReport` /
+/// `completionReportTimestamp` on the child session (re-served under
+/// `metadata` by `agent.get`) in addition to delivering to the parent
+/// (P3-1.2b).
+#[tokio::test]
+async fn report_to_parent_persists_completion_report() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let r = svc
+        .agent_report_to_parent_op(ws.clone(), json!("all done"), Some(child.clone()))
+        .await
+        .expect("report");
+    assert_eq!(r["ok"], json!(true));
+    assert_eq!(r["parentAgentId"].as_str(), Some(parent.0.as_str()));
+
+    let got = svc.agent_get_op(child).await.expect("get child");
+    let v = serde_json::to_value(&got).expect("lite json");
+    assert_eq!(v["metadata"]["completionReport"], "all done");
+    assert_eq!(v["metadata"]["completionReportTimestamp"], r["savedAt"]);
+}
+
+/// `agent.delegate` persists the resolved first message as
+/// `metadata.initialMessage` and the child's `metadata.delegationDepth`
+/// (parent depth + 1) so a wake-up can resume (P3-1.2b).
+#[tokio::test]
+async fn delegate_persists_initial_message_and_delegation_depth() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let out = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("Do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(out["agentId"].as_str().unwrap());
+    let got = svc.agent_get_op(child).await.expect("get child");
+    let v = serde_json::to_value(&got).expect("lite json");
+    assert_eq!(v["metadata"]["initialMessage"], "Do the thing");
+    assert_eq!(v["metadata"]["delegationDepth"], json!(1));
 }
 
 #[tokio::test]

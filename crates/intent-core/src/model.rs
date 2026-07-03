@@ -1284,6 +1284,32 @@ pub struct AgentSession {
     /// the TS `AgentSession` shape for non-opted-out sessions.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skip_auto_commit: bool,
+    /// The child's final report persisted by `agent.reportToParent` (P3-1.2b;
+    /// FE `metadata.completionReport`). Surfaced as `metadata.completionReport`
+    /// in the [`AgentLite`] projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_report: Option<String>,
+    /// ISO timestamp the completion report was saved at (FE
+    /// `metadata.completionReportTimestamp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_report_timestamp: Option<String>,
+    /// Delegation-chain depth (FE `metadata.delegationDepth`): 0/absent for
+    /// user-created agents, parent depth + 1 for delegated children. Gates
+    /// runaway delegation loops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_depth: Option<i64>,
+    /// The first message a delegated agent was started with (FE
+    /// `metadata.initialMessage`), persisted so a wake-up can resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_message: Option<String>,
+    /// Session-level context references captured at spawn (FE top-level
+    /// `contextReferences`); an opaque JSON array persisted verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_references: Option<serde_json::Value>,
+    /// Session-level image blocks captured at spawn (FE top-level
+    /// `imageBlocks`); an opaque JSON array persisted verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_blocks: Option<serde_json::Value>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1291,8 +1317,11 @@ pub struct AgentSession {
 /// Nested `metadata` object on [`AgentLite`] (PROTOCOL §5.5). Mirrors the subset
 /// of the TS `AgentMetadata` the iOS `AgentSession.parseAgent` reads:
 /// `isBackground`, `specialist`, `createdByAgentId` (the parent/spawning agent),
-/// and `taskNoteId`. `isBackground` is always emitted (iOS reads it with a
-/// `false` default); the rest are omitted when absent.
+/// and `taskNoteId` — plus the persistence-gap fields the FE writer stored
+/// under `metadata` (`completionReport`, `completionReportTimestamp`,
+/// `delegationDepth`, `initialMessage`; P3-1.2b). `isBackground` is always
+/// emitted (iOS reads it with a `false` default); the rest are omitted when
+/// absent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentMetadata {
@@ -1303,6 +1332,14 @@ pub struct AgentMetadata {
     pub created_by_agent_id: Option<AgentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_note_id: Option<NoteId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_report: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_report_timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_depth: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_message: Option<String>,
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
@@ -1379,6 +1416,14 @@ pub struct AgentLite {
     pub last_user_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+    /// Session-level context references persisted at spawn (P3-1.2b); omitted
+    /// when absent so pre-gap wire shapes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_references: Option<serde_json::Value>,
+    /// Session-level image blocks persisted at spawn (P3-1.2b); omitted when
+    /// absent so pre-gap wire shapes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_blocks: Option<serde_json::Value>,
     pub metadata: AgentMetadata,
 }
 
@@ -1397,6 +1442,10 @@ impl AgentLite {
             specialist: session.specialist,
             created_by_agent_id: session.parent_agent_id.clone(),
             task_note_id: session.task_note_id.clone(),
+            completion_report: session.completion_report,
+            completion_report_timestamp: session.completion_report_timestamp,
+            delegation_depth: session.delegation_depth,
+            initial_message: session.initial_message,
         };
         Self {
             id: session.id,
@@ -1424,6 +1473,8 @@ impl AgentLite {
             last_agent_response,
             last_user_message,
             digest,
+            context_references: session.context_references,
+            image_blocks: session.image_blocks,
             metadata,
         }
     }
@@ -1435,11 +1486,13 @@ impl AgentLite {
 /// optional; the FE fills them in when routing an agent-spawn through the daemon
 /// so the seam does not need to make a follow-up RPC for provider/context.
 ///
-/// `provider` is persisted on the created [`AgentSession`] (existing column);
-/// `agentType`, `metadata`, `workspacePath`, and `workspaceContext` are accepted
-/// and currently forwarded no further (the widened seam unblocks the FE
-/// flip — persistence for the new hints is deferred to a follow-up per the
-/// P2-12a audit).
+/// `provider` is persisted on the created [`AgentSession`] (existing column).
+/// `metadata` is harvested for the persistence-gap fields (`delegationDepth`,
+/// `initialMessage`, `contextReferences`; P3-1.2b); `contextReferences` /
+/// `imageBlocks` also land as session-level fields (top-level params win over
+/// the `metadata` fallback). `agentType`, `workspacePath`, and
+/// `workspaceContext` are accepted and currently forwarded no further
+/// (deferred per the P2-12a audit).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentCreateExtra {
@@ -1448,6 +1501,8 @@ pub struct AgentCreateExtra {
     pub metadata: Option<serde_json::Value>,
     pub workspace_path: Option<String>,
     pub workspace_context: Option<serde_json::Value>,
+    pub context_references: Option<serde_json::Value>,
+    pub image_blocks: Option<serde_json::Value>,
 }
 
 /// Wire input for `agent.delegate` (PROTOCOL §5.5). `workspaceId` is passed
@@ -2276,6 +2331,12 @@ mod tests {
             stats: None,
             task_note_id: None,
             skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
         };
@@ -2326,6 +2387,12 @@ mod tests {
             stats: None,
             task_note_id: None,
             skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
         };

@@ -522,6 +522,33 @@ impl Services {
         }))
     }
 
+    /// Publish an `agent:*` session-mutation event (P3-1.2b): every persisted
+    /// session mutation emits an invalidation event so subscribed clients
+    /// re-read the projection instead of relying on a local cache.
+    pub(crate) async fn publish_agent_mutation_event(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        event_type: &str,
+        data: Value,
+    ) {
+        crate::publish_event(
+            &self.event_bus,
+            intent_store::NewEvent {
+                workspace_id: workspace_id.clone(),
+                timestamp: now_iso(),
+                event_type: event_type.to_string(),
+                actor: crate::system_actor(),
+                session_id: Some(agent_id.0.clone()),
+                correlation_id: None,
+                parent_event_id: None,
+                metadata: None,
+                data,
+            },
+        )
+        .await;
+    }
+
     /// `agent.create`: persist a new session; the process spawns lazily on first
     /// turn (PROTOCOL §5.5). `task_note_id`/`skip_auto_commit` are set by
     /// `agent.delegate` so the auto-commit-on-idle subscriber (LNI-1) can
@@ -533,10 +560,15 @@ impl Services {
     /// session" race). Malformed values surface as `-32602`; when `None` a
     /// fresh id is generated (existing behavior).
     ///
-    /// `extra` carries the widened FE-facing spawn hints
-    /// (`provider`/`agentType`/`metadata`/`workspacePath`/`workspaceContext`).
-    /// `provider` lands on the persisted [`AgentSession`]; the rest are accepted
-    /// but currently forwarded no further (persistence deferred per P2-12a).
+    /// `extra` carries the widened FE-facing spawn hints. `provider` lands on
+    /// the persisted [`AgentSession`]; `metadata` is harvested for the
+    /// persistence-gap fields (`delegationDepth`, `initialMessage`,
+    /// `contextReferences`, `imageBlocks`; P3-1.2b) with the top-level
+    /// `contextReferences`/`imageBlocks` params winning over the `metadata`
+    /// fallback. `agentType`/`workspacePath`/`workspaceContext` remain
+    /// accepted-but-unpersisted (P2-12a audit).
+    ///
+    /// Emits `agent:created` after the insert.
     ///
     /// Returns `{ agent: <AgentLite> }` — the full projection so the FE can
     /// upsert the created session without a follow-up `agent.get` round-trip.
@@ -566,16 +598,33 @@ impl Services {
             }
             None => AgentId(format!("agent-{}", Uuid::new_v4())),
         };
-        // `agent_type`, `metadata`, `workspace_path`, `workspace_context` are
-        // accepted for the widened wire shape but have no session-column home
-        // today; the P2-12a audit records that persistence is deferred.
+        // `agent_type`, `workspace_path`, `workspace_context` are accepted for
+        // the widened wire shape but have no session-column home today; the
+        // P2-12a audit records that persistence is deferred.
         let AgentCreateExtra {
             provider,
             agent_type: _,
-            metadata: _,
+            metadata,
             workspace_path: _,
             workspace_context: _,
+            context_references,
+            image_blocks,
         } = extra;
+        // Harvest the persistence-gap fields the FE writer kept under
+        // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
+        let meta = metadata.as_ref().and_then(Value::as_object);
+        let meta_get = |key: &str| meta.and_then(|m| m.get(key)).cloned();
+        let delegation_depth = meta_get("delegationDepth").and_then(|v| v.as_i64());
+        let initial_message = meta_get("initialMessage")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.trim().is_empty());
+        let context_references = context_references
+            .or_else(|| meta_get("contextReferences"))
+            .or_else(|| meta_get("contextRefs"))
+            .filter(|v| !v.is_null());
+        let image_blocks = image_blocks
+            .or_else(|| meta_get("imageBlocks"))
+            .filter(|v| !v.is_null());
         let session = AgentSession {
             id,
             workspace_id,
@@ -594,10 +643,23 @@ impl Services {
             stats: None,
             task_note_id,
             skip_auto_commit,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth,
+            initial_message,
+            context_references,
+            image_blocks,
             created_at: now.clone(),
             updated_at: now,
         };
         self.store.insert_agent_session(&session).await?;
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            &session.id,
+            intent_core::events::AGENT_CREATED,
+            json!({ "agentId": session.id.0, "name": session.name }),
+        )
+        .await;
         // Project into `AgentLite` so the wire returns the full agent object
         // (superset of `{ id, name }`). A fresh session has no messages, so the
         // derived counts/last-* fields are `None`/0; runtime activity flags stay
@@ -607,17 +669,36 @@ impl Services {
     }
 
     /// `agent.rename` (PROTOCOL §5.5). A missing agent surfaces as `-32603`
-    /// (matching the TS `renameAgentOnDisk` failure path).
-    pub(crate) async fn agent_rename_op(&self, agent_id: AgentId, name: String) -> Result<Value> {
+    /// (matching the TS `renameAgentOnDisk` failure path). When
+    /// `skip_if_explicitly_set` is `true` and the session's name was already
+    /// explicitly set, the rename is a no-op returning the existing name with
+    /// `skipped: true` (the FE `renameAgent` semantics). An applied rename
+    /// emits `agent:renamed`.
+    pub(crate) async fn agent_rename_op(
+        &self,
+        agent_id: AgentId,
+        name: String,
+        skip_if_explicitly_set: bool,
+    ) -> Result<Value> {
         let mut session = self.load_session_internal(&agent_id).await?;
+        if skip_if_explicitly_set && session.name_explicitly_set {
+            return Ok(json!({ "success": true, "name": session.name, "skipped": true }));
+        }
         session.name = name.clone();
         session.name_explicitly_set = true;
         session.updated_at = now_iso();
         self.store.update_agent_session(&session).await?;
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            &agent_id,
+            intent_core::events::AGENT_RENAMED,
+            json!({ "agentId": agent_id.0, "name": name }),
+        )
+        .await;
         Ok(json!({ "success": true, "name": name }))
     }
 
-    /// `agent.setModel` (PROTOCOL §5.5).
+    /// `agent.setModel` (PROTOCOL §5.5). Emits `agent:updated`.
     pub(crate) async fn agent_set_model_op(
         &self,
         agent_id: AgentId,
@@ -627,6 +708,13 @@ impl Services {
         session.model = Some(model_id.clone());
         session.updated_at = now_iso();
         self.store.update_agent_session(&session).await?;
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            &agent_id,
+            intent_core::events::AGENT_UPDATED,
+            json!({ "agentId": agent_id.0, "modelId": model_id }),
+        )
+        .await;
         Ok(json!({ "success": true, "modelId": model_id }))
     }
 
@@ -922,8 +1010,10 @@ impl Services {
     /// (PROTOCOL §5.5). Caller identity comes only from the MCP front door; the
     /// RPC dispatch path passes `None`, so it always surfaces `-32603`. When the
     /// caller has no `parentAgentId` (created directly by a user), this is also
-    /// `-32603`. Otherwise the report is delivered to the parent by reusing the
-    /// send-message path.
+    /// `-32603`. Otherwise the report is persisted on the child session
+    /// (`metadata.completionReport` / `completionReportTimestamp`, the TS
+    /// parity; P3-1.2b) — emitting `agent:updated` — and delivered to the
+    /// parent by reusing the send-message path.
     pub(crate) async fn agent_report_to_parent_op(
         &self,
         _workspace_id: WorkspaceId,
@@ -934,8 +1024,8 @@ impl Services {
             Error::Internal("report_to_parent is only available to delegated agents".to_string())
         };
         let caller = caller_agent_id.ok_or_else(not_delegated)?;
-        let session = self.load_session_internal(&caller).await?;
-        let parent = session.parent_agent_id.ok_or_else(not_delegated)?;
+        let mut session = self.load_session_internal(&caller).await?;
+        let parent = session.parent_agent_id.clone().ok_or_else(not_delegated)?;
         // `report` is declared as a string on the MCP surface; coerce other
         // JSON shapes to their textual form for delivery.
         let report_text = match &report {
@@ -943,11 +1033,20 @@ impl Services {
             other => other.to_string(),
         };
         let report_len = report_text.chars().count() as i64;
-        // NOTE: TS persists a `completionReport` on the child that the parent
-        // reads on completion; here we deliver eagerly via the send-message path
-        // (no completion-subscription/waitMode behavior). The returned shape
-        // mirrors the TS service result: { ok, parentAgentId, reportLength,
-        // savedAt }.
+        // Persist the completion report on the child so `agent.get`/`agent.list`
+        // (and `ws.agent.summary`) can re-serve it after restarts.
+        let saved_at = now_iso();
+        session.completion_report = Some(report_text.clone());
+        session.completion_report_timestamp = Some(saved_at.clone());
+        session.updated_at = saved_at.clone();
+        self.store.update_agent_session(&session).await?;
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            &caller,
+            intent_core::events::AGENT_UPDATED,
+            json!({ "agentId": caller.0, "completionReportLength": report_len }),
+        )
+        .await;
         let _ = self
             .agent_send_message_op(parent.clone(), report_text, None)
             .await?;
@@ -955,7 +1054,7 @@ impl Services {
             "ok": true,
             "parentAgentId": parent,
             "reportLength": report_len,
-            "savedAt": now_iso(),
+            "savedAt": saved_at,
         }))
     }
 
@@ -972,6 +1071,52 @@ impl Services {
         // auto-commit-on-idle subscriber (LNI-1) can resolve `Linked-Note-Id:`
         // and honor the opt-out without a reverse lookup on every idle event.
         let session_task_note_id = input.task_note_id.clone().or(input.note_id.clone());
+        // Resolve the child's first message up front so it can be persisted as
+        // `metadata.initialMessage` on the created session (P3-1.2b; the FE
+        // stored it so a wake-up can resume). Source priority mirrors the TS
+        // `DelegateTaskTool`: explicit `agentInstructions`, then `taskText`,
+        // then the linked task note's content (falling back to its title).
+        fn first_nonempty(s: &str) -> Option<String> {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        let mut message = input
+            .agent_instructions
+            .as_deref()
+            .and_then(first_nonempty)
+            .or_else(|| input.task_text.as_deref().and_then(first_nonempty));
+        if message.is_none() {
+            if let Some(note_id) = input.task_note_id.clone().or(input.note_id.clone()) {
+                if let Ok(note) = self.store.get_note(&note_id).await {
+                    message = first_nonempty(&note.content).or_else(|| first_nonempty(&note.title));
+                }
+            }
+        }
+        // Load the delegating parent once: it feeds the child's
+        // `delegationDepth` (parent depth + 1; P3-1.2b) and the completion-watch
+        // registration below.
+        let parent_session = match &parent_agent_id {
+            Some(parent) => self.store.get_agent_session(parent).await.ok(),
+            None => None,
+        };
+        let delegation_depth = parent_agent_id.as_ref().map(|_| {
+            parent_session
+                .as_ref()
+                .and_then(|s| s.delegation_depth)
+                .unwrap_or(0)
+                + 1
+        });
+        let mut extra_metadata = serde_json::Map::new();
+        if let Some(depth) = delegation_depth {
+            extra_metadata.insert("delegationDepth".to_string(), json!(depth));
+        }
+        if let Some(msg) = &message {
+            extra_metadata.insert("initialMessage".to_string(), json!(msg));
+        }
+        let extra = AgentCreateExtra {
+            metadata: (!extra_metadata.is_empty()).then_some(Value::Object(extra_metadata)),
+            ..AgentCreateExtra::default()
+        };
         let created = self
             .agent_create_op(
                 workspace_id.clone(),
@@ -982,7 +1127,7 @@ impl Services {
                 session_task_note_id,
                 input.skip_auto_commit.unwrap_or(false),
                 None,
-                AgentCreateExtra::default(),
+                extra,
             )
             .await?;
         let agent_id = created["agent"]["id"]
@@ -1005,7 +1150,6 @@ impl Services {
         if let Some(parent) = parent_agent_id {
             // Best-effort guard: skip if the parent agent is already deleted
             // (TS `selectIsAgentDeleted`).
-            let parent_session = self.store.get_agent_session(&parent).await.ok();
             let parent_deleted = parent_session
                 .as_ref()
                 .map(|s| s.status == AgentStatus::Deleted)
@@ -1040,33 +1184,16 @@ impl Services {
                 }
             }
         }
-        // Deliver the child's first message and start its turn (PROTOCOL §5.5).
+        // Deliver the child's first message (resolved above, persisted as
+        // `metadata.initialMessage`) and start its turn (PROTOCOL §5.5).
         // Without this the child stays `Pending` and never runs. `wait_mode` is
         // already honored by the completion-watch registration above; the child
-        // turn itself starts unconditionally. Message source priority mirrors the
-        // TS `DelegateTaskTool`: explicit `agentInstructions`, then `taskText`,
-        // then the linked task note's content (falling back to its title).
+        // turn itself starts unconditionally.
         //
         // Delivery routes through the runtime `AgentManager` when attached (the
         // proven `agent.sendMessage` path: persist + spawn the turn worker, which
         // lazily spawns the child and streams `agent:stream:*` keyed by the CHILD
         // `agentId`); read-only/test wiring falls back to the store-only persist.
-        fn first_nonempty(s: &str) -> Option<String> {
-            let trimmed = s.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        }
-        let mut message = input
-            .agent_instructions
-            .as_deref()
-            .and_then(first_nonempty)
-            .or_else(|| input.task_text.as_deref().and_then(first_nonempty));
-        if message.is_none() {
-            if let Some(note_id) = input.task_note_id.or(input.note_id) {
-                if let Ok(note) = self.store.get_note(&note_id).await {
-                    message = first_nonempty(&note.content).or_else(|| first_nonempty(&note.title));
-                }
-            }
-        }
         if let Some(message) = message {
             let child = AgentId::from(agent_id.as_str());
             let send = match self.agent_manager() {

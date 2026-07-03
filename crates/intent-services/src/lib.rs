@@ -5688,8 +5688,12 @@ impl WorkspaceApi for Services {
         &self,
         agent_id: AgentId,
         name: String,
+        skip_if_explicitly_set: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_rename_op(agent_id, name).await })
+        Box::pin(async move {
+            self.agent_rename_op(agent_id, name, skip_if_explicitly_set)
+                .await
+        })
     }
 
     fn agent_delete(

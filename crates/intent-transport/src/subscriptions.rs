@@ -13,8 +13,8 @@
 use intent_core::events::{
     AGENT_COMPLETED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RENAMED,
     AGENT_RESTORED, AGENT_STARTED, AGENT_STATUS_CHANGED, AGENT_STREAM_CHUNK, AGENT_STREAM_END,
-    AGENT_TOOL_CALL, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED,
-    PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
+    AGENT_TOOL_CALL, AGENT_UPDATED, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED,
+    PR_LINKED, PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_UPDATED,
 };
 use intent_core::{now_iso, AgentId, Event, NoteId, WorkspaceApi, WorkspaceId};
@@ -318,6 +318,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             AGENT_IDLE,
             AGENT_STATUS_CHANGED,
             AGENT_RENAMED,
+            AGENT_UPDATED,
             AGENT_RESTORED,
             AGENT_DELETED,
         ],
@@ -844,7 +845,7 @@ pub(crate) async fn agent_delta(api: &dyn WorkspaceApi, event: &Event) -> Option
             Some(json!({ "added": [serde_json::to_value(agent).ok()?] }))
         }
         AGENT_STARTED | AGENT_COMPLETED | AGENT_FAILED | AGENT_IDLE | AGENT_STATUS_CHANGED
-        | AGENT_RENAMED | AGENT_RESTORED => {
+        | AGENT_RENAMED | AGENT_UPDATED | AGENT_RESTORED => {
             let agent = api.agent_get(AgentId::from(agent_id), None).await.ok()?;
             Some(json!({ "updated": [serde_json::to_value(agent).ok()?] }))
         }

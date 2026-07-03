@@ -29,6 +29,7 @@ pub const AGENT_CREATED: &str = "agent:created";
 pub const AGENT_DELETED: &str = "agent:deleted";
 pub const AGENT_RESTORED: &str = "agent:restored";
 pub const AGENT_RENAMED: &str = "agent:renamed";
+pub const AGENT_UPDATED: &str = "agent:updated";
 pub const AGENT_IDLE: &str = "agent:idle";
 pub const AGENT_STATUS_CHANGED: &str = "agent:status-changed";
 pub const AGENT_MESSAGE_SENT: &str = "agent:message:sent";
@@ -248,6 +249,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_DELETED,
     AGENT_RESTORED,
     AGENT_RENAMED,
+    AGENT_UPDATED,
     AGENT_IDLE,
     AGENT_STATUS_CHANGED,
     AGENT_MESSAGE_SENT,

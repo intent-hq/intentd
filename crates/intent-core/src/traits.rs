@@ -902,12 +902,15 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.rename`: rename an agent; `{ success: true, name }` (PROTOCOL §5.5).
+    /// With `skip_if_explicitly_set = true`, an already-explicitly-named session
+    /// is left untouched and the result carries `skipped: true` (P3-1.2b).
     fn agent_rename(
         &self,
         agent_id: AgentId,
         name: String,
+        skip_if_explicitly_set: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, name);
+        let _ = (agent_id, name, skip_if_explicitly_set);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_rename not implemented".to_string(),

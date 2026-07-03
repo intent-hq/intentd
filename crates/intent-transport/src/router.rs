@@ -721,6 +721,8 @@ async fn dispatch(
                 metadata: opt_value(params, "metadata"),
                 workspace_path: opt_nonempty_str(params, "workspacePath"),
                 workspace_context: opt_value(params, "workspaceContext"),
+                context_references: opt_value(params, "contextReferences"),
+                image_blocks: opt_value(params, "imageBlocks"),
             };
             // FE/RPC front door: top-level creates stay parentless.
             let result = api
@@ -871,8 +873,12 @@ async fn dispatch(
             if trimmed.is_empty() {
                 return Err(rpc(INVALID_PARAMS, "Name cannot be empty"));
             }
+            // `skipIfExplicitlySet` (optional, default false): leave an
+            // already-explicitly-named session untouched (P3-1.2b; the FE
+            // `renameAgent` option) — the result then carries `skipped: true`.
+            let skip_if_explicitly_set = opt_bool(params, "skipIfExplicitlySet").unwrap_or(false);
             let result = api
-                .agent_rename(agent_id, trimmed)
+                .agent_rename(agent_id, trimmed, skip_if_explicitly_set)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
