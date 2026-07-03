@@ -535,12 +535,14 @@ impl fmt::Display for OpenExternalError {
 
 impl std::error::Error for OpenExternalError {}
 
-/// Open `url` on the *user's* machine (§5.14). When the connection is local the
-/// daemon resolves it directly via `opener`; if the local host is headless
-/// (`has_display=false`) this is a clear headless warning instead of a silent
-/// failure. When the connection is remote the intent is dispatched to the
-/// connected frontend as an FE-served reverse RPC (`host.openExternal`) so it
-/// opens on the user's machine (mirroring the ACP client-served pattern, §6.7).
+/// Open `url` on the *user's* machine (§5.14; the daemon→client reverse RPC
+/// itself is `host.openExternal`, §12.4 — see `reverse.rs`). When the
+/// connection is local the daemon resolves it directly via `opener`; if the
+/// local host is headless (`has_display=false`) this is a clear headless
+/// warning instead of a silent failure. When the connection is remote the
+/// intent is dispatched to the connected frontend as an FE-served reverse RPC
+/// (`host.openExternal`) so it opens on the user's machine (mirroring the
+/// ACP client-served pattern, §6.7).
 pub async fn open_external(
     url: &str,
     is_local: bool,

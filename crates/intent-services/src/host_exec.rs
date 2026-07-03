@@ -1,8 +1,12 @@
 //! Daemon-owned one-shot process exec for `host.exec` (PROTOCOL §5.14).
 //!
 //! Spawns `command` with `args` on the daemon host (no shell interpolation —
-//! `argv` only), captures stdout/stderr/exit code, and enforces the same
-//! workspace-containment guard on `cwd` that `file_ops` applies to file I/O.
+//! `argv` only), captures stdout/stderr/exit code, and enforces a
+//! workspace-containment guard on `cwd` in the same spirit as `file_ops`
+//! (lexical resolve against the workspace root). The guard here uses the
+//! component-aware `Path::starts_with` instead of a raw-string prefix so
+//! sibling paths like `/tmp/ws2` cannot escape a `/tmp/ws` root; `file_ops`
+//! is not (yet) bit-for-bit identical.
 //! Reuses the process-group leader + `kill_on_drop` discipline (`mcp_servers` /
 //! `intent-acp::spawn`) so a `timeoutMs` reaps the whole tree (no orphaned
 //! grandchildren). PATH is enriched via `intent_providers::enhanced_path` and
