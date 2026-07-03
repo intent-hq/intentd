@@ -242,12 +242,20 @@ pub async fn resolve_cwd_within_workspace(
         ));
     }
     let full = node_resolve(&root, cwd);
-    if !full.to_string_lossy().starts_with(&root) {
+    if !cwd_within_root(Path::new(&root), &full) {
         return Err(HostExecError::internal(
             "Access denied: cwd outside workspace",
         ));
     }
     Ok(full)
+}
+
+/// Component-aware containment check for the `cwd` guard: a raw-string
+/// `starts_with` on `root` admits sibling prefixes (root `/tmp/ws` wrongly
+/// matches `/tmp/ws2`); `Path::starts_with` compares whole components, so
+/// only `/tmp/ws` and `/tmp/ws/…` are accepted.
+fn cwd_within_root(root: &Path, full: &Path) -> bool {
+    full.starts_with(root)
 }
 
 /// Assemble the tokio `Command` for a validated exec request. Pipes stdio,
@@ -443,5 +451,18 @@ mod tests {
     fn allow_all_policy_never_rejects() {
         let p = AllowAllPolicy;
         assert!(p.evaluate("rm", &["-rf".into(), "/".into()]).is_ok());
+    }
+
+    #[test]
+    fn cwd_within_root_rejects_sibling_prefix() {
+        // Raw-string `starts_with` would wrongly admit `/tmp/ws2` when the
+        // root is `/tmp/ws`; the component-aware guard must reject it while
+        // still admitting genuine subdirectories.
+        let root = Path::new("/tmp/ws");
+        assert!(!cwd_within_root(root, Path::new("/tmp/ws2")));
+        assert!(!cwd_within_root(root, Path::new("/tmp/ws-other")));
+        assert!(cwd_within_root(root, Path::new("/tmp/ws")));
+        assert!(cwd_within_root(root, Path::new("/tmp/ws/sub")));
+        assert!(cwd_within_root(root, Path::new("/tmp/ws/sub/nested")));
     }
 }
