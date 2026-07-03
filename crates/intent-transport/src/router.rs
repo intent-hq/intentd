@@ -874,6 +874,11 @@ async fn dispatch(
             let result = api.agent_get_models().await.map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "models.list" => {
+            // Additive rich model catalog (PROTOCOL §5.30); no params.
+            let result = api.models_list().await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.respondPermission" => {
             // Resolve an outstanding interactive prompt (PROTOCOL §8). `requestId`
             // is required; the §8 `outcome` object is validated in the handler so

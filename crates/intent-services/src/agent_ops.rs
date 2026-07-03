@@ -8,6 +8,7 @@
 //! and auggie CLI parser respectively.
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_QUEUE_UPDATED};
 use intent_core::{
@@ -294,6 +295,144 @@ pub(crate) async fn fetch_auggie_models() -> Result<Option<Vec<Value>>> {
         })
         .collect();
     Ok(Some(models))
+}
+
+/// How long a successful `models.list` CLI fetch stays fresh (PROTOCOL §5.30),
+/// porting the reference app's 5-minute provider-model cache.
+pub(crate) const MODELS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// The shared `models.list` success-cache slot on [`Services`]: the fetch
+/// instant plus the finalized rows (PROTOCOL §5.30).
+pub(crate) type ModelsCache = Arc<Mutex<Option<(std::time::Instant, Vec<Value>)>>>;
+
+/// Parse `auggie model list --json` output into rich wire `ModelInfo` rows
+/// (PROTOCOL §5.30), porting the TS `parseModelListJson`: expects
+/// `{ models: [...] }`, maps `id` ← `shortName` and `name` ← `displayName`,
+/// and skips rows missing either string. Optional picker metadata
+/// (`description`, `modelGroupPriority`, `costTier`, `badges`, `effortLevels`,
+/// `isDefault`, `priority`) is copied only when present/non-empty. The
+/// transient `isLegacyModel` flag is kept so [`finalize_model_rows`] can
+/// filter it, then stripped from the wire. Returns `None` when the payload is
+/// not the expected JSON shape, so the caller falls back to plain text.
+pub(crate) fn parse_model_list_json(stdout: &str) -> Option<Vec<Value>> {
+    let parsed: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let models = parsed.get("models")?.as_array()?;
+    let mut out = Vec::new();
+    for m in models {
+        let (Some(short), Some(display)) = (
+            m.get("shortName").and_then(Value::as_str),
+            m.get("displayName").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let mut row = json!({ "id": short, "name": display, "provider": "auggie" });
+        if let Some(d) = m.get("description").and_then(Value::as_str) {
+            if !d.is_empty() {
+                row["description"] = Value::String(d.to_string());
+            }
+        }
+        for key in ["modelGroupPriority", "costTier", "priority"] {
+            if let Some(v) = m.get(key).filter(|v| v.is_number()) {
+                row[key] = v.clone();
+            }
+        }
+        for key in ["badges", "effortLevels"] {
+            if let Some(v) = m.get(key).and_then(Value::as_array) {
+                if !v.is_empty() {
+                    row[key] = Value::Array(v.clone());
+                }
+            }
+        }
+        if m.get("isDefault").and_then(Value::as_bool) == Some(true) {
+            row["isDefault"] = Value::Bool(true);
+        }
+        if m.get("isLegacyModel").and_then(Value::as_bool) == Some(true) {
+            row["isLegacyModel"] = Value::Bool(true);
+        }
+        out.push(row);
+    }
+    Some(out)
+}
+
+/// Post-process parsed `models.list` rows (PROTOCOL §5.30), porting the
+/// reference `fetchAuggieModels` tail: drop rows flagged `isLegacyModel`
+/// (stripping the flag from survivors) and sort by `modelGroupPriority`, then
+/// `priority`, then `name` — missing priorities sort last (`999`).
+pub(crate) fn finalize_model_rows(rows: Vec<Value>) -> Vec<Value> {
+    fn priority(row: &Value, key: &str) -> f64 {
+        row.get(key).and_then(Value::as_f64).unwrap_or(999.0)
+    }
+    fn name(row: &Value) -> &str {
+        row.get("name").and_then(Value::as_str).unwrap_or("")
+    }
+    let mut kept: Vec<Value> = rows
+        .into_iter()
+        .filter(|r| r.get("isLegacyModel").and_then(Value::as_bool) != Some(true))
+        .map(|mut r| {
+            if let Some(obj) = r.as_object_mut() {
+                obj.remove("isLegacyModel");
+            }
+            r
+        })
+        .collect();
+    kept.sort_by(|a, b| {
+        priority(a, "modelGroupPriority")
+            .total_cmp(&priority(b, "modelGroupPriority"))
+            .then_with(|| priority(a, "priority").total_cmp(&priority(b, "priority")))
+            .then_with(|| name(a).cmp(name(b)))
+    });
+    kept
+}
+
+/// Best-effort `models.list` dynamic fetch (PROTOCOL §5.30), porting the
+/// reference `fetchAuggieModels`: try `auggie model list --json` for the rich
+/// rows, fall back to the plain-text parser ([`parse_model_list_output`]),
+/// then filter legacy models and sort ([`finalize_model_rows`]). Returns
+/// `None` when the CLI is unavailable or yields nothing parseable, so the
+/// caller can fall back to [`static_models`].
+pub(crate) async fn fetch_auggie_models_rich() -> Option<Vec<Value>> {
+    let mut rows: Option<Vec<Value>> = None;
+    if let Ok(output) = tokio::process::Command::new("auggie")
+        .args(["model", "list", "--json"])
+        .output()
+        .await
+    {
+        rows = parse_model_list_json(&String::from_utf8_lossy(&output.stdout))
+            .filter(|r| !r.is_empty());
+    }
+    if rows.is_none() {
+        let output = tokio::process::Command::new("auggie")
+            .args(["model", "list"])
+            .output()
+            .await
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut parsed = parse_model_list_output(&stdout);
+        if parsed.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            parsed = parse_model_list_output(&stderr);
+        }
+        if !parsed.is_empty() {
+            rows = Some(
+                parsed
+                    .into_iter()
+                    .map(|(value, label, description)| {
+                        let mut m = json!({ "id": value, "name": label, "provider": "auggie" });
+                        if let Some(d) = description {
+                            m["description"] = Value::String(d);
+                        }
+                        m
+                    })
+                    .collect(),
+            );
+        }
+    }
+    let finalized = finalize_model_rows(rows?);
+    if finalized.is_empty() {
+        None
+    } else {
+        Some(finalized)
+    }
 }
 
 /// Parse the JSON emitted by `auggie session stats <sessionId> --json` into a
@@ -767,6 +906,36 @@ impl Services {
             None => static_models(),
         };
         Ok(json!({ "models": models }))
+    }
+
+    /// `models.list`: the rich model catalog for FE model pickers (PROTOCOL
+    /// §5.30) — auggie CLI (JSON → plain-text fallback) with a 5-minute
+    /// success cache; degrades to the static tier catalog (`source: "static"`)
+    /// when the CLI is unavailable, so the result is never empty.
+    pub(crate) async fn models_list_op(&self) -> Result<Value> {
+        if let Some(models) = self.cached_models() {
+            return Ok(json!({ "models": models, "source": "auggie" }));
+        }
+        if let Some(models) = fetch_auggie_models_rich().await {
+            self.store_models_cache(models.clone());
+            return Ok(json!({ "models": models, "source": "auggie" }));
+        }
+        Ok(json!({ "models": static_models(), "source": "static" }))
+    }
+
+    /// The cached `models.list` rows when still within [`MODELS_CACHE_TTL`].
+    fn cached_models(&self) -> Option<Vec<Value>> {
+        self.models_cache
+            .lock()
+            .expect("models cache poisoned")
+            .as_ref()
+            .and_then(|(at, rows)| (at.elapsed() < MODELS_CACHE_TTL).then(|| rows.clone()))
+    }
+
+    /// Record a successful `models.list` CLI fetch for [`MODELS_CACHE_TTL`].
+    fn store_models_cache(&self, rows: Vec<Value>) {
+        *self.models_cache.lock().expect("models cache poisoned") =
+            Some((std::time::Instant::now(), rows));
     }
 
     /// `agent.queueMessage` (PROTOCOL §5.5). Enqueues the message, publishes

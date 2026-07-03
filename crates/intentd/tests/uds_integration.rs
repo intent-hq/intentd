@@ -557,6 +557,20 @@ async fn uds_slice_end_to_end() {
     let models = resp["result"]["models"].as_array().expect("models array");
     assert!(!models.is_empty());
 
+    // (o′) models.list (§5.30) → non-empty rich catalog + `source` tag.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":93,"method":"models.list"}"#,
+    )
+    .await;
+    let models = resp["result"]["models"].as_array().expect("models array");
+    assert!(!models.is_empty());
+    assert!(models[0]["id"].is_string());
+    assert!(models[0]["name"].is_string());
+    assert!(models[0]["provider"].is_string());
+    let source = resp["result"]["source"].as_str().expect("source");
+    assert!(source == "auggie" || source == "static", "source: {source}");
+
     // (p) agent.create → { agent: { id, name } } on the seeded workspace.
     let resp = send(
         &config.socket_path,

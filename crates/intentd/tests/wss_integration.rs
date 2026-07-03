@@ -663,6 +663,27 @@ async fn wss_jsonrpc_roundtrip_matches_uds() {
 }
 
 #[tokio::test]
+async fn wss_models_list_returns_catalog_with_source() {
+    // models.list (§5.30): the rich FE model catalog — `{ models, source }`
+    // where `source` is "auggie" (live CLI) or "static" (tier fallback), and
+    // every row carries the id/name/provider triple; never empty.
+    let srv = start(WsOptions::default()).await;
+    let frame = r#"{"jsonrpc":"2.0","id":7,"method":"models.list"}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 7);
+    let models = resp["result"]["models"].as_array().expect("models array");
+    assert!(!models.is_empty(), "catalog must never be empty");
+    for m in models {
+        assert!(m["id"].is_string(), "{m}");
+        assert!(m["name"].is_string(), "{m}");
+        assert!(m["provider"].is_string(), "{m}");
+    }
+    let source = resp["result"]["source"].as_str().expect("source");
+    assert!(source == "auggie" || source == "static", "source: {source}");
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
 async fn wss_host_status_reports_remote_locality() {
     // host.status is answered on the WSS transport (§5.14) and reports `remote`
     // by default, with the host capability fields a client gates UI on.

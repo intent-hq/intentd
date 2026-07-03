@@ -24,7 +24,10 @@ use intent_core::{ActorType, Event, EventActor, SessionStats};
 
 use crate::{EventBus, SubscriptionFilter};
 
-use crate::agent_ops::{parse_model_list_output, parse_session_stats_output, static_models};
+use crate::agent_ops::{
+    finalize_model_rows, parse_model_list_json, parse_model_list_output,
+    parse_session_stats_output, static_models,
+};
 use crate::Services;
 
 struct TempDb {
@@ -1308,6 +1311,84 @@ fn parse_model_list_output_extracts_rows() {
     assert_eq!(rows[0].2.as_deref(), Some("Balanced general model"));
     assert_eq!(rows[1].0, "haiku4.5");
     assert_eq!(rows[1].2, None);
+}
+
+#[test]
+fn parse_model_list_json_maps_rich_rows_and_skips_incomplete() {
+    let out = r#"{ "models": [
+        { "shortName": "sonnet4.5", "displayName": "Sonnet 4.5",
+          "description": "Balanced general model", "modelGroupPriority": 1,
+          "costTier": 2, "badges": [{ "color": "green", "label": "Auto" }],
+          "effortLevels": ["low", "high"], "isDefault": true, "priority": 1 },
+        { "shortName": "old-model", "displayName": "Old", "isLegacyModel": true },
+        { "displayName": "No shortName" },
+        { "shortName": "haiku4.5", "displayName": "Haiku", "description": "",
+          "badges": [], "effortLevels": [] }
+    ] }"#;
+    let rows = parse_model_list_json(out).expect("parsed");
+    assert_eq!(rows.len(), 3, "row without shortName is skipped");
+    assert_eq!(rows[0]["id"], "sonnet4.5");
+    assert_eq!(rows[0]["name"], "Sonnet 4.5");
+    assert_eq!(rows[0]["provider"], "auggie");
+    assert_eq!(rows[0]["description"], "Balanced general model");
+    assert_eq!(rows[0]["modelGroupPriority"], 1);
+    assert_eq!(rows[0]["costTier"], 2);
+    assert_eq!(rows[0]["badges"][0]["label"], "Auto");
+    assert_eq!(rows[0]["effortLevels"], json!(["low", "high"]));
+    assert_eq!(rows[0]["isDefault"], true);
+    assert_eq!(rows[0]["priority"], 1);
+    assert_eq!(rows[1]["isLegacyModel"], true);
+    // Empty description / empty arrays are omitted, not emitted as empties.
+    let haiku = rows[2].as_object().unwrap();
+    assert_eq!(haiku["id"], "haiku4.5");
+    assert!(!haiku.contains_key("description"));
+    assert!(!haiku.contains_key("badges"));
+    assert!(!haiku.contains_key("effortLevels"));
+}
+
+#[test]
+fn parse_model_list_json_rejects_non_catalog_payloads() {
+    assert!(parse_model_list_json("not json").is_none());
+    assert!(parse_model_list_json("{}").is_none());
+    assert!(parse_model_list_json(r#"{ "models": "nope" }"#).is_none());
+}
+
+#[test]
+fn finalize_model_rows_filters_legacy_and_sorts() {
+    let rows = vec![
+        json!({ "id": "z", "name": "Zeta", "provider": "auggie" }),
+        json!({ "id": "old", "name": "Old", "provider": "auggie", "isLegacyModel": true }),
+        json!({ "id": "b", "name": "Beta", "provider": "auggie",
+                "modelGroupPriority": 2, "priority": 1 }),
+        json!({ "id": "a", "name": "Alpha", "provider": "auggie",
+                "modelGroupPriority": 1, "priority": 2 }),
+        json!({ "id": "a2", "name": "Alpha2", "provider": "auggie",
+                "modelGroupPriority": 1, "priority": 1 }),
+    ];
+    let out = finalize_model_rows(rows);
+    let ids: Vec<&str> = out.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    // Group asc, then priority asc, then name; missing priorities sort last.
+    assert_eq!(ids, vec!["a2", "a", "b", "z"]);
+    assert!(out
+        .iter()
+        .all(|r| r.as_object().unwrap().get("isLegacyModel").is_none()));
+}
+
+#[tokio::test]
+async fn models_list_returns_non_empty_catalog_with_source() {
+    let (_t, svc, _ws) = setup().await;
+    let res = svc.models_list_op().await.expect("models.list");
+    let models = res["models"].as_array().unwrap();
+    assert!(!models.is_empty());
+    assert!(models[0].get("id").is_some());
+    assert!(models[0].get("name").is_some());
+    assert!(models[0].get("provider").is_some());
+    let source = res["source"].as_str().unwrap();
+    assert!(source == "auggie" || source == "static", "source: {source}");
+    // A second call is served from the cache (auggie) or recomputed statics —
+    // either way the result is stable within the TTL window.
+    let again = svc.models_list_op().await.expect("models.list again");
+    assert_eq!(res, again);
 }
 
 #[tokio::test]

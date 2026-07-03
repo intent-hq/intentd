@@ -139,6 +139,11 @@ pub struct Services {
     /// persisted, so this in-memory cache lets a refresh detect a change and push
     /// `agent:session-stats-changed` only when the rollup actually moved (§6.5).
     session_stats_cache: Arc<Mutex<HashMap<AgentId, SessionStats>>>,
+    /// 5-minute success cache for the `models.list` rich catalog (PROTOCOL
+    /// §5.30), porting the reference app's provider-model cache. Only a
+    /// successful auggie CLI fetch is cached; the static fallback is recomputed
+    /// per call. Shared across clones so every handle sees the same window.
+    models_cache: agent_ops::ModelsCache,
     /// Daemon-owned parent→child completion-watch registry (AS-2), keyed by
     /// workspace. A oneShot watch is registered when an agent delegates with
     /// `waitMode` `immediate` over the MCP front door; the delivery worker (AS-3)
@@ -237,6 +242,7 @@ impl Services {
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
+            models_cache: Arc::new(Mutex::new(None)),
             agent_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
@@ -5739,6 +5745,10 @@ impl WorkspaceApi for Services {
 
     fn agent_get_models(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.agent_get_models_op().await })
+    }
+
+    fn models_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.models_list_op().await })
     }
 
     fn agent_respond_permission(

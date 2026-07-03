@@ -918,6 +918,18 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `models.list`: the rich model catalog for FE model pickers —
+    /// `{ models: [ModelInfo…], source: "auggie" | "static" }` from
+    /// `auggie model list --json` (plain-text fallback) with the static tier
+    /// catalog when the CLI is unavailable; no `workspaceId` (PROTOCOL §5.30).
+    fn models_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::models_list not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.respondPermission`: resolve an outstanding interactive permission
     /// prompt by `requestId`, unblocking the agent with the §8 `outcome`
     /// (`{ outcome: "selected", optionId }` / `{ outcome: "cancelled" }`).
