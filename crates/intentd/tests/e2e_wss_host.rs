@@ -494,7 +494,10 @@ async fn seed_workspace_with_path(data_dir: &Path, root: &Path) -> String {
     ws_id.0
 }
 
-/// Read the id-matched error frame after sending `frame`.
+/// Read the id-matched error frame after sending `frame`. Handles server
+/// heartbeats by replying to `Ping` with `Pong` (matches the other WSS
+/// helpers in this file); otherwise a mid-wait heartbeat could close the
+/// connection and flake the test.
 async fn wss_expect_error<S>(ws: &mut WebSocketStream<S>, id: i64) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -505,11 +508,17 @@ where
             .expect("timed out")
             .unwrap()
             .unwrap();
-        if let Message::Text(t) = next {
-            let v: Value = serde_json::from_str(&t).unwrap();
-            if v["id"] == json!(id) {
-                return v;
+        match next {
+            Message::Text(t) => {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["id"] == json!(id) {
+                    return v;
+                }
             }
+            Message::Ping(p) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            _ => {}
         }
     }
 }
