@@ -720,7 +720,8 @@ async fn rename_skip_if_explicitly_set() {
 /// `agent.create` harvests the persistence-gap fields (P3-1.2b) from the
 /// `metadata` spawn hint / top-level params and re-serves them via
 /// `agent.get`/`agent.list`: `metadata.delegationDepth`, `metadata.initialMessage`,
-/// and session-level `contextReferences` / `imageBlocks`.
+/// session-level `contextReferences` / `imageBlocks`, and
+/// `metadata.isBackground` (G-A1/P3-1.2c).
 #[tokio::test]
 async fn create_persists_and_reserves_gap_fields() {
     let (_t, svc, ws) = setup().await;
@@ -729,6 +730,7 @@ async fn create_persists_and_reserves_gap_fields() {
             "delegationDepth": 2,
             "initialMessage": "start here",
             "contextReferences": [{ "type": "file", "path": "src/a.rs" }],
+            "isBackground": true,
         })),
         image_blocks: Some(json!([{ "type": "image", "data": "abc" }])),
         ..Default::default()
@@ -762,11 +764,65 @@ async fn create_persists_and_reserves_gap_fields() {
         v["imageBlocks"],
         json!([{ "type": "image", "data": "abc" }])
     );
+    assert_eq!(v["metadata"]["isBackground"], json!(true));
 
     // And on `agent.list`.
     let agents = svc.agent_list_op(ws).await.expect("list");
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0].metadata.delegation_depth, Some(2));
+    assert!(agents[0].metadata.is_background);
+}
+
+/// The top-level `isBackground` param wins over the `metadata` fallback, and
+/// an agent created with neither defaults to foreground (G-A1/P3-1.2c).
+#[tokio::test]
+async fn create_is_background_top_level_wins_and_defaults_false() {
+    let (_t, svc, ws) = setup().await;
+
+    // Top-level `false` beats `metadata.isBackground: true`.
+    let extra = intent_core::AgentCreateExtra {
+        metadata: Some(json!({ "isBackground": true })),
+        is_background: Some(false),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("FG".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            extra,
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let got = svc.agent_get_op(id).await.expect("get");
+    let v = serde_json::to_value(&got).expect("lite json");
+    assert_eq!(v["metadata"]["isBackground"], json!(false));
+
+    // Neither param nor metadata → defaults to foreground.
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Plain".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            intent_core::AgentCreateExtra::default(),
+        )
+        .await
+        .expect("create plain");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let got = svc.agent_get_op(id).await.expect("get plain");
+    let v = serde_json::to_value(&got).expect("lite json");
+    assert_eq!(v["metadata"]["isBackground"], json!(false));
 }
 
 /// `agent.create` / `agent.rename` / `agent.setModel` emit their `agent:*`
@@ -874,7 +930,8 @@ async fn report_to_parent_persists_completion_report() {
 
 /// `agent.delegate` persists the resolved first message as
 /// `metadata.initialMessage` and the child's `metadata.delegationDepth`
-/// (parent depth + 1) so a wake-up can resume (P3-1.2b).
+/// (parent depth + 1) so a wake-up can resume (P3-1.2b). Delegated children
+/// are background agents (G-A1/P3-1.2c).
 #[tokio::test]
 async fn delegate_persists_initial_message_and_delegation_depth() {
     let (_t, svc, ws) = setup().await;
@@ -895,6 +952,7 @@ async fn delegate_persists_initial_message_and_delegation_depth() {
     let v = serde_json::to_value(&got).expect("lite json");
     assert_eq!(v["metadata"]["initialMessage"], "Do the thing");
     assert_eq!(v["metadata"]["delegationDepth"], json!(1));
+    assert_eq!(v["metadata"]["isBackground"], json!(true));
 }
 
 #[tokio::test]

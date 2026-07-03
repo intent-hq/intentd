@@ -19,7 +19,8 @@ use crate::{enum_from_db, enum_to_db, Store};
 const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session_id, name, \
     name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, \
     parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, \
-    completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks";
+    completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
+    is_background";
 
 /// Encode an optional JSON payload column (`context_references` /
 /// `image_blocks`) as its TEXT form, `None` staying NULL.
@@ -47,7 +48,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&s.id.0)
@@ -73,6 +74,7 @@ impl Store {
             .bind(&s.initial_message)
             .bind(json_col_to_db(&s.context_references)?)
             .bind(json_col_to_db(&s.image_blocks)?)
+            .bind(s.is_background as i64)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
@@ -150,7 +152,7 @@ impl Store {
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
-             initial_message=?, context_references=?, image_blocks=? \
+             initial_message=?, context_references=?, image_blocks=?, is_background=? \
              WHERE id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
@@ -173,6 +175,7 @@ impl Store {
         .bind(&s.initial_message)
         .bind(json_col_to_db(&s.context_references)?)
         .bind(json_col_to_db(&s.image_blocks)?)
+        .bind(s.is_background as i64)
         .bind(&s.id.0)
         .execute(self.pool())
         .await
@@ -318,6 +321,7 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
             "context_references",
         )?,
         image_blocks: json_col_from_db(col(row, "image_blocks")?, "image_blocks")?,
+        is_background: col::<i64>(row, "is_background")? != 0,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
     })

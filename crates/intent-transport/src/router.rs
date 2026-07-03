@@ -753,6 +753,7 @@ async fn dispatch(
                 workspace_context: opt_value(params, "workspaceContext"),
                 context_references: opt_value(params, "contextReferences"),
                 image_blocks: opt_value(params, "imageBlocks"),
+                is_background: opt_bool(params, "isBackground"),
             };
             // FE/RPC front door: top-level creates stay parentless.
             let result = api

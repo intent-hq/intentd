@@ -429,16 +429,17 @@ async fn wss_agent_create_widened_params_round_trip() {
         .to_string();
     let requested = format!("agent-{}", uuid::Uuid::new_v4());
 
-    // Full-param create: exercise every new optional field. `provider`
-    // persists on the session; `agentType`/`metadata`/`workspacePath`/
-    // `workspaceContext` are accepted but deferred (per P2-12a audit).
+    // Full-param create: exercise every new optional field. `provider` and
+    // `isBackground` (G-A1/P3-1.2c) persist on the session;
+    // `agentType`/`workspacePath`/`workspaceContext` are accepted but
+    // deferred (per P2-12a audit).
     let params = format!(
         concat!(
             r#"{{"workspaceId":"{ws}","agentId":"{aid}","name":"WSS Wide","#,
             r#""model":"auggie:sonnet4.5","specialistId":"implementor","#,
             r#""provider":"auggie","agentType":"task-loop","#,
             r#""metadata":{{"tag":"unit"}},"workspacePath":"/tmp/wid","#,
-            r#""workspaceContext":{{"selection":"note:1"}}}}"#
+            r#""workspaceContext":{{"selection":"note:1"}},"isBackground":true}}"#
         ),
         ws = ws_id,
         aid = requested,
@@ -471,6 +472,11 @@ async fn wss_agent_create_widened_params_round_trip() {
     assert_eq!(created["provider"].as_str(), Some("auggie"));
     assert_eq!(created["workspaceId"].as_str(), Some(ws_id.as_str()));
     assert_eq!(created["metadata"]["specialist"], "implementor");
+    assert_eq!(
+        created["metadata"]["isBackground"], true,
+        "isBackground must persist and be served on the projection: {}",
+        sess[0]
+    );
     // Full-`AgentLite` shape check: `messageCount` is present on the projection.
     assert!(
         created.get("messageCount").is_some(),
@@ -486,6 +492,10 @@ async fn wss_agent_create_widened_params_round_trip() {
     assert_eq!(
         sess[1]["result"]["agent"]["provider"].as_str(),
         Some("auggie"),
+    );
+    assert_eq!(
+        sess[1]["result"]["agent"]["metadata"]["isBackground"], true,
+        "isBackground survives the persist → agent.get round-trip",
     );
 
     // Backward-compat: a create that omits every widened param still returns
@@ -508,6 +518,10 @@ async fn wss_agent_create_widened_params_round_trip() {
     assert!(
         minimal["result"]["agent"].get("createdAt").is_some(),
         "minimal create still returns full AgentLite: {minimal}",
+    );
+    assert_eq!(
+        minimal["result"]["agent"]["metadata"]["isBackground"], false,
+        "omitting isBackground defaults to foreground: {minimal}",
     );
 
     srv.ws.stop().await;

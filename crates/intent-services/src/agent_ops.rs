@@ -563,9 +563,10 @@ impl Services {
     /// `extra` carries the widened FE-facing spawn hints. `provider` lands on
     /// the persisted [`AgentSession`]; `metadata` is harvested for the
     /// persistence-gap fields (`delegationDepth`, `initialMessage`,
-    /// `contextReferences`, `imageBlocks`; P3-1.2b) with the top-level
-    /// `contextReferences`/`imageBlocks` params winning over the `metadata`
-    /// fallback. `agentType`/`workspacePath`/`workspaceContext` remain
+    /// `contextReferences`, `imageBlocks`; P3-1.2b — plus `isBackground`,
+    /// G-A1/P3-1.2c) with the top-level `contextReferences`/`imageBlocks`/
+    /// `isBackground` params winning over the `metadata` fallback.
+    /// `agentType`/`workspacePath`/`workspaceContext` remain
     /// accepted-but-unpersisted (P2-12a audit).
     ///
     /// Emits `agent:created` after the insert.
@@ -609,6 +610,7 @@ impl Services {
             workspace_context: _,
             context_references,
             image_blocks,
+            is_background,
         } = extra;
         // Harvest the persistence-gap fields the FE writer kept under
         // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
@@ -625,6 +627,9 @@ impl Services {
         let image_blocks = image_blocks
             .or_else(|| meta_get("imageBlocks"))
             .filter(|v| !v.is_null());
+        let is_background = is_background
+            .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
         let session = AgentSession {
             id,
             workspace_id,
@@ -649,6 +654,7 @@ impl Services {
             initial_message,
             context_references,
             image_blocks,
+            is_background,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -1113,6 +1119,9 @@ impl Services {
         if let Some(msg) = &message {
             extra_metadata.insert("initialMessage".to_string(), json!(msg));
         }
+        // Delegated agents are background agents (the TS `DelegateTaskTool`
+        // always sets `metadata.isBackground: true`; G-A1/P3-1.2c).
+        extra_metadata.insert("isBackground".to_string(), json!(true));
         let extra = AgentCreateExtra {
             metadata: (!extra_metadata.is_empty()).then_some(Value::Object(extra_metadata)),
             ..AgentCreateExtra::default()

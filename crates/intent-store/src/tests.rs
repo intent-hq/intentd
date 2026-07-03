@@ -85,11 +85,11 @@ async fn migration_status_reports_current_after_open() {
     assert!(status.is_current(), "fresh open must apply all migrations");
     assert_eq!(
         status.expected,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
     );
     assert_eq!(
         status.applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
     );
 }
 
@@ -1027,6 +1027,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        is_background: false,
         created_at: ts.clone(),
         updated_at: ts,
     }
@@ -1104,7 +1105,8 @@ async fn agent_session_round_trip_and_append_only_log() {
 
 /// The P3-1.2b persistence-gap fields round-trip through insert → get →
 /// update → get: `completion_report(_timestamp)`, `delegation_depth`,
-/// `initial_message`, and the JSON `context_references` / `image_blocks`.
+/// `initial_message`, the JSON `context_references` / `image_blocks`, and
+/// `is_background` (G-A1/P3-1.2c).
 #[tokio::test]
 async fn agent_session_gap_fields_round_trip() {
     let tmp = TempDb::new();
@@ -1121,6 +1123,7 @@ async fn agent_session_gap_fields_round_trip() {
     session.initial_message = Some("kick off".to_string());
     session.context_references = Some(json!([{ "type": "file", "path": "src/a.rs" }]));
     session.image_blocks = Some(json!([{ "type": "image", "data": "abc" }]));
+    session.is_background = true;
     store
         .insert_agent_session(&session)
         .await
@@ -1128,6 +1131,7 @@ async fn agent_session_gap_fields_round_trip() {
 
     let loaded = store.get_agent_session(&agent_id).await.expect("get");
     assert_eq!(loaded.delegation_depth, Some(2));
+    assert!(loaded.is_background, "is_background must round-trip");
     assert_eq!(loaded.initial_message.as_deref(), Some("kick off"));
     assert_eq!(
         loaded.context_references,
@@ -1150,6 +1154,7 @@ async fn agent_session_gap_fields_round_trip() {
     // The spawn-time fields survive the update untouched.
     assert_eq!(reloaded.delegation_depth, Some(2));
     assert_eq!(reloaded.initial_message.as_deref(), Some("kick off"));
+    assert!(reloaded.is_background, "is_background survives update");
 }
 
 /// Transient streaming flags are NEVER persisted (P3-1.2b; the daemon-side

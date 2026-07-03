@@ -178,6 +178,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        is_background: false,
         created_at: now_iso(),
         updated_at: now_iso(),
     };
@@ -4369,6 +4370,7 @@ mod search_adapters {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            is_background: false,
             created_at: ts.clone(),
             updated_at: ts.clone(),
         };
@@ -6499,6 +6501,7 @@ mod heal_stale_agent_sessions {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            is_background: false,
             created_at: ts.clone(),
             updated_at: ts,
         }

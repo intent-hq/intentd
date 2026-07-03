@@ -1363,6 +1363,14 @@ pub struct AgentSession {
     /// `imageBlocks`); an opaque JSON array persisted verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_blocks: Option<serde_json::Value>,
+    /// Whether the agent runs in the background (FE `metadata.isBackground`;
+    /// G-A1/P3-1.2c). Persisted at `agent.create`/`agent.delegate` and served
+    /// as `metadata.isBackground` in the [`AgentLite`] projection — the FE
+    /// branches rehydration/list-placement/retry behavior on it. Omitted from
+    /// the session wire form when `false` to preserve the TS `AgentSession`
+    /// shape for foreground sessions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_background: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1373,8 +1381,8 @@ pub struct AgentSession {
 /// and `taskNoteId` — plus the persistence-gap fields the FE writer stored
 /// under `metadata` (`completionReport`, `completionReportTimestamp`,
 /// `delegationDepth`, `initialMessage`; P3-1.2b). `isBackground` is always
-/// emitted (iOS reads it with a `false` default); the rest are omitted when
-/// absent.
+/// emitted (iOS reads it with a `false` default) and carries the persisted
+/// session value (G-A1/P3-1.2c); the rest are omitted when absent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentMetadata {
@@ -1491,7 +1499,7 @@ impl AgentLite {
         digest: Option<String>,
     ) -> Self {
         let metadata = AgentMetadata {
-            is_background: false,
+            is_background: session.is_background,
             specialist: session.specialist,
             created_by_agent_id: session.parent_agent_id.clone(),
             task_note_id: session.task_note_id.clone(),
@@ -1542,8 +1550,8 @@ impl AgentLite {
 /// `provider` is persisted on the created [`AgentSession`] (existing column).
 /// `metadata` is harvested for the persistence-gap fields (`delegationDepth`,
 /// `initialMessage`, `contextReferences`; P3-1.2b); `contextReferences` /
-/// `imageBlocks` also land as session-level fields (top-level params win over
-/// the `metadata` fallback). `agentType`, `workspacePath`, and
+/// `imageBlocks` / `isBackground` also land as session-level fields (top-level
+/// params win over the `metadata` fallback). `agentType`, `workspacePath`, and
 /// `workspaceContext` are accepted and currently forwarded no further
 /// (deferred per the P2-12a audit).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1556,6 +1564,7 @@ pub struct AgentCreateExtra {
     pub workspace_context: Option<serde_json::Value>,
     pub context_references: Option<serde_json::Value>,
     pub image_blocks: Option<serde_json::Value>,
+    pub is_background: Option<bool>,
 }
 
 /// Wire input for `agent.delegate` (PROTOCOL §5.5). `workspaceId` is passed
@@ -2390,13 +2399,16 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            is_background: true,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
         };
         let lite = AgentLite::from_session(session, 0, None, Some("hi".to_string()), None);
         let v = serde_json::to_value(&lite).unwrap();
         assert_eq!(v["metadata"]["specialist"], "implementor");
-        assert_eq!(v["metadata"]["isBackground"], false);
+        // The persisted session value is served, not a hard-coded `false`
+        // (G-A1/P3-1.2c).
+        assert_eq!(v["metadata"]["isBackground"], true);
         assert_eq!(v["metadata"]["createdByAgentId"], "agent-parent");
         assert_eq!(v["isStreaming"], false);
         assert_eq!(v["isProcessing"], false);
@@ -2446,6 +2458,7 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            is_background: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
         };
