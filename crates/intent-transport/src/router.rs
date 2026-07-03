@@ -384,6 +384,17 @@ async fn dispatch(
             let result = api.read_asset(ws, asset).await.map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        "note.saveAsset" => {
+            let ws = require_ws_note(params)?;
+            let data = require_str_param(params, "data")?;
+            let mime_type = require_str_param(params, "mimeType")?;
+            let original_name = opt_str(params, "originalName");
+            let result = api
+                .save_asset(ws, data, mime_type, original_name)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
         "note.listVersions" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
@@ -1167,6 +1178,16 @@ async fn dispatch(
             let (limit, page_token) = parse_page_params(params);
             let r = api
                 .git_commits(ws, limit, page_token)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "git.showFile" => {
+            let ws = require_ws_note(params)?;
+            let file_path = require_str_param(params, "filePath")?;
+            let git_ref = require_str_param(params, "ref")?;
+            let r = api
+                .git_show_file(ws, file_path, git_ref)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

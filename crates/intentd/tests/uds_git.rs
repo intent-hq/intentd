@@ -365,6 +365,28 @@ async fn uds_git_read_ops_round_trip() {
     .await;
     assert_eq!(resp["result"]["items"].as_array().expect("items").len(), 1);
 
+    // (d) git.showFile → committed content at HEAD (the worktree edit above is
+    // not visible at the ref), empty content for a path missing at the ref,
+    // and -32603 for an unresolvable ref (PROTOCOL §5.6 extensions).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":6,"method":"git.showFile","params":{"workspaceId":"ws-gitr","filePath":"seed.txt","ref":"HEAD"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["content"], json!("seed\n"));
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":7,"method":"git.showFile","params":{"workspaceId":"ws-gitr","filePath":"nope.txt","ref":"HEAD"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["content"], json!(""));
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":8,"method":"git.showFile","params":{"workspaceId":"ws-gitr","filePath":"seed.txt","ref":"no-such-ref"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32603));
+
     let _ = tx.send(());
     let _ = server.await;
     std::fs::remove_dir_all(&base).ok();

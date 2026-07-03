@@ -146,7 +146,8 @@ async fn make_services() -> (Arc<dyn WorkspaceApi>, EventBus, Store, std::path::
         .await
         .expect("open store");
     let bus = EventBus::new(store.clone());
-    let api: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store.clone()));
+    let api: Arc<dyn WorkspaceApi> =
+        Arc::new(Services::new(store.clone()).with_assets_root(dir.join("assets")));
     (api, bus, store, dir)
 }
 
@@ -1501,6 +1502,210 @@ async fn wss_note_version_history_round_trip() {
     assert_eq!(sess[6]["error"]["code"].as_i64(), Some(-32602));
     assert_eq!(sess[7]["error"]["code"].as_i64(), Some(-32602));
     assert_eq!(sess[7]["error"]["message"], "Missing required parameter: v");
+
+    srv.ws.stop().await;
+}
+
+/// `git.showFile` over WSS (PROTOCOL §5.6 extensions): file content at a
+/// revision (`HEAD` / `HEAD^`), the empty-content fallback for a path missing
+/// at the ref, and -32603 for an unresolvable ref.
+#[tokio::test]
+async fn wss_git_show_file_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed a real git repo with two commits so HEAD and HEAD^ differ.
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let repo = Path::new("/tmp").join(format!("intentd-wsssf-{}", &short[..8]));
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "seed"]);
+    std::fs::write(repo.join("seed.txt"), "seed\nadded\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "second"]);
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS showFile WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    // Content at HEAD and at the parent revision.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"seed.txt","ref":"HEAD"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["content"], "seed\nadded\n");
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"seed.txt","ref":"HEAD^"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["content"], "seed\n");
+
+    // Missing path at the ref → empty content, not an error.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"nope.txt","ref":"HEAD"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["content"], "");
+
+    // Unresolvable ref → -32603; missing ref param → -32602 (PROTOCOL §9).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"seed.txt","ref":"no-such-ref"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32603);
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"seed.txt"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// `note.saveAsset` over WSS (PROTOCOL §5.2 — additive asset write): the write
+/// returns `{ assetId, path, url }` and the asset round-trips back through
+/// `note.readAsset`; a missing `data` param is -32602.
+#[tokio::test]
+async fn wss_note_save_asset_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Save with a data-URL prefix (the FE sends FileReader.readAsDataURL output).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.saveAsset","params":{"workspaceId":"ws-asset","data":"data:image/png;base64,aGVsbG8=","mimeType":"image/png","originalName":"pasted.png"}}"#,
+    )
+    .await;
+    let asset_id = resp["result"]["assetId"].as_str().expect("assetId");
+    assert!(
+        asset_id.ends_with(".png"),
+        "mime-derived extension: {asset_id}"
+    );
+    assert_eq!(
+        resp["result"]["url"],
+        Value::from(format!("workspace-asset://ws-asset/{asset_id}"))
+    );
+    let path = resp["result"]["path"].as_str().expect("path");
+    assert!(path.ends_with(asset_id));
+    let url = resp["result"]["url"].as_str().unwrap().to_string();
+
+    // Round-trip through note.readAsset by workspace-asset:// URL.
+    let read_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"note.readAsset","params":{{"workspaceId":"ws-asset","asset":"{url}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &read_frame).await;
+    assert_eq!(resp["result"]["assetId"], Value::from(asset_id));
+    assert_eq!(resp["result"]["mimeType"], "image/png");
+    assert_eq!(resp["result"]["data"], "aGVsbG8=");
+
+    // Missing data → -32602 (PROTOCOL §9).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"note.saveAsset","params":{"workspaceId":"ws-asset","mimeType":"image/png"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(resp["error"]["message"], "Missing required parameter: data");
+
+    srv.ws.stop().await;
+}
+
+/// Client-called `host.openInEditor` over WSS (PROTOCOL §5.14): a WSS
+/// connection resolves as remote, so the daemon re-dispatches the intent to
+/// the connected client as the FE-served reverse RPC (`id: "rev-<n>"`) and
+/// echoes `{ ok: true }` back on the original request; missing params are
+/// -32602.
+#[tokio::test]
+async fn wss_host_open_in_editor_reverse_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+
+    let call = r#"{"jsonrpc":"2.0","id":1,"method":"host.openInEditor","params":{"editorId":"vscode","path":"/repo/src/main.rs","line":12,"column":3}}"#;
+    ws.send(Message::Text(call.to_string()))
+        .await
+        .expect("send");
+
+    // The daemon turns the trigger into a reverse request on the same socket.
+    let mut final_response = None;
+    while final_response.is_none() {
+        match ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "host.openInEditor" {
+                    let id = v["id"].as_str().expect("reverse id");
+                    assert!(id.starts_with("rev-"), "reverse ids use rev-: {id}");
+                    assert_eq!(v["params"]["editorId"], "vscode");
+                    assert_eq!(v["params"]["path"], "/repo/src/main.rs");
+                    assert_eq!(v["params"]["line"], 12);
+                    assert_eq!(v["params"]["column"], 3);
+                    let reply = serde_json::json!({
+                        "jsonrpc": "2.0", "id": id, "result": { "ok": true }
+                    });
+                    ws.send(Message::Text(reply.to_string()))
+                        .await
+                        .expect("send reverse reply");
+                } else if v["id"] == 1 {
+                    final_response = Some(v);
+                }
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    let resp = final_response.unwrap();
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    assert_eq!(resp["result"]["ok"], true);
+
+    // Missing editorId → -32602 without any reverse dispatch.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"host.openInEditor","params":{"path":"/repo/src/main.rs"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
 
     srv.ws.stop().await;
 }

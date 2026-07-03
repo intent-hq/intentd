@@ -28,8 +28,8 @@ use intent_core::{
     NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
     NoteEditLinesResult, NoteEditResult, NoteId, NoteRestoreVersionResult, NoteSetContentResult,
     NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor,
-    NoteVersionSummary, NoteVisibility, ProjectType, ReadAssetResult, ScriptCreateParams,
-    SessionStats, SetupScript, TaskAssignAgentResult, TaskConvertBlocksResult,
+    NoteVersionSummary, NoteVisibility, ProjectType, ReadAssetResult, SaveAssetResult,
+    ScriptCreateParams, SessionStats, SetupScript, TaskAssignAgentResult, TaskConvertBlocksResult,
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
     TaskMetadata, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult,
     TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
@@ -3784,6 +3784,53 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn save_asset(
+        &self,
+        workspace_id: WorkspaceId,
+        data: String,
+        mime_type: String,
+        original_name: Option<String>,
+    ) -> BoxFuture<'_, Result<SaveAssetResult>> {
+        let assets_root = self.assets_root.clone();
+        Box::pin(async move {
+            let root = assets_root
+                .ok_or_else(|| Error::Internal("asset storage is not configured".to_string()))?;
+            let base64_data = note_ops::strip_data_url_prefix(&data);
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(base64_data.as_bytes())
+                .map_err(|e| Error::Internal(format!("Failed to save asset: {e}")))?;
+            let asset_id = note_ops::new_asset_id(base64_data, &mime_type);
+
+            let dir = root.join(&workspace_id.0);
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| Error::Internal(format!("Failed to save asset: {e}")))?;
+            let path = dir.join(&asset_id);
+            std::fs::write(&path, &bytes)
+                .map_err(|e| Error::Internal(format!("Failed to save asset: {e}")))?;
+
+            // Metadata sidecar, TS-peer parity (`<assetId>.meta.json`).
+            let metadata = serde_json::json!({
+                "id": asset_id,
+                "originalName": original_name.unwrap_or_else(|| asset_id.clone()),
+                "mimeType": mime_type,
+                "size": bytes.len(),
+                "createdAt": now_iso(),
+            });
+            let meta_path = dir.join(format!("{asset_id}.meta.json"));
+            std::fs::write(
+                &meta_path,
+                serde_json::to_string_pretty(&metadata).unwrap_or_default(),
+            )
+            .map_err(|e| Error::Internal(format!("Failed to save asset metadata: {e}")))?;
+
+            Ok(SaveAssetResult {
+                url: format!("workspace-asset://{}/{}", workspace_id.0, asset_id),
+                path: path.to_string_lossy().into_owned(),
+                asset_id,
+            })
+        })
+    }
+
     fn list_note_versions(
         &self,
         workspace_id: WorkspaceId,
@@ -5474,6 +5521,37 @@ impl WorkspaceApi for Services {
                 serde_json::Value::Null
             };
             Ok(serde_json::json!({ "items": items, "nextToken": next_token }))
+        })
+    }
+
+    fn git_show_file(
+        &self,
+        workspace_id: WorkspaceId,
+        file_path: String,
+        git_ref: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Same empty fallbacks as the other `git.*` reads (unknown/remote/
+            // non-repo → empty content); a missing path at the ref is also
+            // empty (legacy `git:show-file` parity), while a bad ref errors.
+            let empty = serde_json::json!({ "content": "" });
+            let ws = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(Error::NotFound(_)) => return Ok(empty),
+                Err(e) => return Err(e),
+            };
+            if ws.is_remote {
+                return Ok(empty);
+            }
+            let Some(worktree) = git_ops::worktree_path(&ws) else {
+                return Ok(empty);
+            };
+            if !worktree.join(".git").exists() {
+                return Ok(empty);
+            }
+            let content = intent_git::show::show_file(&worktree, &git_ref, &file_path)?;
+            Ok(serde_json::json!({ "content": content }))
         })
     }
 

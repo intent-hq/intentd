@@ -16,8 +16,8 @@ use crate::model::{
     Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
     NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
-    NoteVersionSummary, ProjectType, ReadAssetResult, ScriptCreateParams, SetupScript,
-    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    NoteVersionSummary, ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
+    SetupScript, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
     TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskUpdateNoteStatusResult,
     TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
     WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
@@ -383,6 +383,25 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::read_asset not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.saveAsset`: write an image asset (base64 `data`, an optional
+    /// `data:` URL prefix is stripped) under the workspace assets root and
+    /// return `{ assetId, path, url }` (PROTOCOL §5.2 — additive asset write
+    /// behind note image paste/upload).
+    fn save_asset(
+        &self,
+        workspace_id: WorkspaceId,
+        data: String,
+        mime_type: String,
+        original_name: Option<String>,
+    ) -> BoxFuture<'_, Result<SaveAssetResult>> {
+        let _ = (workspace_id, data, mime_type, original_name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::save_asset not implemented".to_string(),
             ))
         })
     }
@@ -1608,6 +1627,25 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_commits not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.showFile`: raw file content at a revision (`git show <ref>:<path>`
+    /// semantics) as `{ content }`. `ref` accepts anything revparse-able plus
+    /// the index ref `":0"`; a path missing at the ref and remote/non-repo
+    /// workspaces return `{ content: "" }` (wire §7.7), while an unresolvable
+    /// `ref` is `-32603` (PROTOCOL §5.6 extensions).
+    fn git_show_file(
+        &self,
+        workspace_id: WorkspaceId,
+        file_path: String,
+        git_ref: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, file_path, git_ref);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_show_file not implemented".to_string(),
             ))
         })
     }

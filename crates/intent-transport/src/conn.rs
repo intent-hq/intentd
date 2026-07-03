@@ -121,7 +121,25 @@ pub(crate) async fn process_frame(
             }
         }
         if let Some(req) = host::classify(&value) {
-            return match host::handle(req, api.as_ref(), Some(bus), is_local).await {
+            // `openInEditor` may await an FE-served reverse RPC on this very
+            // connection (§5.14), so it must run off the read loop — handling
+            // it inline would block frame reads and the client's reverse reply
+            // could never be routed (deadlock until the reverse timeout).
+            if matches!(req.method, host::HostMethod::OpenInEditor) {
+                let api = Arc::clone(api);
+                let bus = bus.clone();
+                let out = out_tx.clone();
+                let reverse = reverse.clone();
+                tokio::spawn(async move {
+                    if let Some(frame) =
+                        host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse).await
+                    {
+                        let _ = out.send(frame).await;
+                    }
+                });
+                return true;
+            }
+            return match host::handle(req, api.as_ref(), Some(bus), is_local, reverse).await {
                 Some(frame) => out_tx.send(frame).await.is_ok(),
                 None => true,
             };

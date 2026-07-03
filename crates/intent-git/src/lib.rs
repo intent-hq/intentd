@@ -25,6 +25,7 @@ pub mod rebase;
 pub mod refs;
 pub mod remote;
 pub mod reset;
+pub mod show;
 pub mod squash;
 pub mod stage;
 pub mod stash;

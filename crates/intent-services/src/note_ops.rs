@@ -786,6 +786,69 @@ fn strip_leading_headers(s: &str) -> String {
         .join("\n")
 }
 
+/// File extension (with leading dot) for a mime type (default `.png`), the
+/// inverse of [`mime_from_extension`], per the TS `getExtensionFromMimeType`.
+pub fn extension_from_mime(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/png" => ".png",
+        "image/jpeg" | "image/jpg" => ".jpg",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        "image/svg+xml" => ".svg",
+        "image/bmp" => ".bmp",
+        "image/tiff" => ".tiff",
+        _ => ".png",
+    }
+}
+
+/// Strip an optional `data:<mime>;base64,` URL prefix from an asset payload,
+/// mirroring the TS `data.replace(/^data:[^;]+;base64,/, '')`.
+pub fn strip_data_url_prefix(data: &str) -> &str {
+    if let Some(rest) = data.strip_prefix("data:") {
+        if let Some((mime, payload)) = rest.split_once(";base64,") {
+            if !mime.contains(';') {
+                return payload;
+            }
+        }
+    }
+    data
+}
+
+/// Mint a unique asset id `<timestamp36>-<hash8><ext>`, the TS peer's
+/// `${Date.now().toString(36)}-${contentHash}${extension}` shape (the 8-char
+/// content-hash fragment is an opaque uniqueness hint, not a stable digest).
+pub fn new_asset_id(base64_data: &str, mime_type: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    base64_data.hash(&mut hasher);
+    let hash8 = format!("{:016x}", hasher.finish())[..8].to_string();
+    format!(
+        "{}-{}{}",
+        to_base36(millis),
+        hash8,
+        extension_from_mime(mime_type)
+    )
+}
+
+/// Lowercase base-36 rendering of `n` (JS `Number.prototype.toString(36)`).
+fn to_base36(mut n: u128) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
+}
+
 /// Mime type from an asset's extension (default `image/png`), per the TS map.
 pub fn mime_from_extension(asset_id: &str) -> String {
     let ext = asset_id
@@ -1048,5 +1111,24 @@ mod tests {
         assert_eq!(mime_from_extension("a.PNG"), "image/png");
         assert_eq!(mime_from_extension("a.jpeg"), "image/jpeg");
         assert_eq!(mime_from_extension("noext"), "image/png");
+    }
+
+    #[test]
+    fn save_asset_helpers() {
+        assert_eq!(extension_from_mime("image/jpeg"), ".jpg");
+        assert_eq!(extension_from_mime("image/webp"), ".webp");
+        assert_eq!(extension_from_mime("application/pdf"), ".png");
+
+        assert_eq!(strip_data_url_prefix("data:image/png;base64,AAAA"), "AAAA");
+        assert_eq!(strip_data_url_prefix("AAAA"), "AAAA");
+
+        let id = new_asset_id("AAAA", "image/png");
+        assert!(id.ends_with(".png"), "unexpected id: {id}");
+        let stem = id.strip_suffix(".png").unwrap();
+        let (ts, hash) = stem.split_once('-').expect("timestamp-hash shape");
+        assert!(!ts.is_empty() && ts.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_eq!(hash.len(), 8);
+        // Round-trips through the read-side mime mapping.
+        assert_eq!(mime_from_extension(&id), "image/png");
     }
 }

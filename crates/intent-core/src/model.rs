@@ -707,6 +707,18 @@ pub struct ReadAssetResult {
     pub size_kb: i64,
 }
 
+/// Result of `note.saveAsset` (PROTOCOL §5.2 — additive asset write). `path`
+/// is the absolute on-disk location under the workspace assets root; `url` is
+/// the `workspace-asset://<workspaceId>/<assetId>` form the FE embeds in note
+/// markdown and feeds back to `note.readAsset`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveAssetResult {
+    pub asset_id: String,
+    pub path: String,
+    pub url: String,
+}
+
 /// Author stamp on a stored note version (PROTOCOL §5.2 version-history
 /// extensions). Mirrors the FE `VersionAuthor` shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

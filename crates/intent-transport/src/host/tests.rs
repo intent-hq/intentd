@@ -227,7 +227,7 @@ fn status_json_remote_omits_absent_display_server() {
 #[tokio::test]
 async fn handle_status_returns_a_response_frame() {
     let req = classify(&json!({ "jsonrpc": "2.0", "id": 7, "method": "host.status" })).unwrap();
-    let frame = handle(req, &NoopApi, None, true)
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
         .await
         .expect("status has a response");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -242,7 +242,7 @@ async fn handle_status_returns_a_response_frame() {
 #[tokio::test]
 async fn handle_remote_reports_remote_locality() {
     let req = classify(&json!({ "jsonrpc": "2.0", "id": 8, "method": "host.status" })).unwrap();
-    let frame = handle(req, &NoopApi, None, false)
+    let frame = handle(req, &NoopApi, None, false, &idle_reverse())
         .await
         .expect("status has a response");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -253,7 +253,9 @@ async fn handle_remote_reports_remote_locality() {
 async fn handle_notification_gets_no_response() {
     let req = classify(&json!({ "jsonrpc": "2.0", "method": "host.status" })).unwrap();
     assert!(
-        handle(req, &NoopApi, None, true).await.is_none(),
+        handle(req, &NoopApi, None, true, &idle_reverse())
+            .await
+            .is_none(),
         "a notification gets no reply"
     );
 }
@@ -261,7 +263,7 @@ async fn handle_notification_gets_no_response() {
 #[tokio::test]
 async fn handle_check_git_returns_available_boolean() {
     let req = classify(&json!({ "jsonrpc": "2.0", "id": 10, "method": "host.checkGit" })).unwrap();
-    let frame = handle(req, &NoopApi, None, true)
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
         .await
         .expect("checkGit always replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -278,7 +280,7 @@ async fn handle_directory_status_requires_path() {
         &json!({ "jsonrpc": "2.0", "id": 11, "method": "host.directoryStatus", "params": {} }),
     )
     .unwrap();
-    let frame = handle(req, &NoopApi, None, true)
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
         .await
         .expect("missing path produces an error frame");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -297,7 +299,7 @@ async fn handle_directory_status_reports_existing_directory() {
         "params": { "path": cwd.to_string_lossy() }
     }))
     .unwrap();
-    let frame = handle(req, &NoopApi, None, true)
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
         .await
         .expect("directoryStatus replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -316,7 +318,7 @@ async fn handle_list_directory_returns_entries_for_cwd() {
         "params": { "path": cwd.to_string_lossy() }
     }))
     .unwrap();
-    let frame = handle(req, &NoopApi, None, true)
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
         .await
         .expect("listDirectory replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -332,7 +334,7 @@ async fn handle_check_auggie_uses_configured_path() {
     let api = AuggiePathApi("/definitely/does/not/exist/auggie-xyzzy".to_string());
     let req =
         classify(&json!({ "jsonrpc": "2.0", "id": 14, "method": "host.checkAuggie" })).unwrap();
-    let frame = handle(req, &api, None, true)
+    let frame = handle(req, &api, None, true, &idle_reverse())
         .await
         .expect("checkAuggie always replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -344,7 +346,9 @@ async fn handle_check_auggie_uses_configured_path() {
 async fn handle_check_auggie_notification_gets_no_response() {
     let req = classify(&json!({ "jsonrpc": "2.0", "method": "host.checkAuggie" })).unwrap();
     assert!(
-        handle(req, &NoopApi, None, true).await.is_none(),
+        handle(req, &NoopApi, None, true, &idle_reverse())
+            .await
+            .is_none(),
         "a notification gets no reply"
     );
 }
@@ -354,7 +358,7 @@ async fn handle_find_binary_requires_name() {
     let req =
         classify(&json!({ "jsonrpc": "2.0", "id": 20, "method": "host.findBinary", "params": {} }))
             .unwrap();
-    let frame = handle(req, &NoopApi, None, true)
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
         .await
         .expect("missing name produces an error frame");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -371,7 +375,7 @@ async fn handle_find_binary_returns_available_boolean() {
         "params": { "name": "git" }
     }))
     .unwrap();
-    let frame = handle(req, &NoopApi, None, true)
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
         .await
         .expect("findBinary always replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -386,7 +390,9 @@ async fn handle_find_binary_returns_available_boolean() {
 async fn handle_find_binary_notification_gets_no_response() {
     let req = classify(&json!({ "jsonrpc": "2.0", "method": "host.findBinary" })).unwrap();
     assert!(
-        handle(req, &NoopApi, None, true).await.is_none(),
+        handle(req, &NoopApi, None, true, &idle_reverse())
+            .await
+            .is_none(),
         "a missing-name notification gets no reply"
     );
 }
@@ -395,7 +401,7 @@ async fn handle_find_binary_notification_gets_no_response() {
 async fn handle_tool_availability_returns_default_tool_map() {
     let req = classify(&json!({ "jsonrpc": "2.0", "id": 22, "method": "host.toolAvailability" }))
         .unwrap();
-    let frame = handle(req, &NoopApi, None, true)
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
         .await
         .expect("toolAvailability always replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -408,7 +414,7 @@ async fn handle_tool_availability_returns_default_tool_map() {
 #[tokio::test]
 async fn handle_env_returns_path_and_var_names() {
     let req = classify(&json!({ "jsonrpc": "2.0", "id": 23, "method": "host.env" })).unwrap();
-    let frame = handle(req, &NoopApi, None, true)
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
         .await
         .expect("env always replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -424,7 +430,7 @@ async fn handle_find_app_requires_name() {
     let req =
         classify(&json!({ "jsonrpc": "2.0", "id": 30, "method": "host.findApp", "params": {} }))
             .unwrap();
-    let frame = handle(req, &NoopApi, None, true)
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
         .await
         .expect("missing name produces an error frame");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -436,7 +442,9 @@ async fn handle_find_app_requires_name() {
 async fn handle_find_app_notification_gets_no_response() {
     let req = classify(&json!({ "jsonrpc": "2.0", "method": "host.findApp" })).unwrap();
     assert!(
-        handle(req, &NoopApi, None, true).await.is_none(),
+        handle(req, &NoopApi, None, true, &idle_reverse())
+            .await
+            .is_none(),
         "a missing-name notification gets no reply"
     );
 }
@@ -452,7 +460,7 @@ async fn handle_find_app_returns_installed_boolean() {
         "params": { "name": "DefinitelyNotInstalledXyzzy" }
     }))
     .unwrap();
-    let frame = handle(req, &NoopApi, None, true)
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
         .await
         .expect("findApp always replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -468,7 +476,7 @@ async fn handle_list_installed_editors_returns_editor_array() {
     let req =
         classify(&json!({ "jsonrpc": "2.0", "id": 32, "method": "host.listInstalledEditors" }))
             .unwrap();
-    let frame = handle(req, &NoopApi, None, true)
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
         .await
         .expect("listInstalledEditors always replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -913,4 +921,77 @@ async fn pick_application_remote_client_failure_is_proxy_error() {
     let err = handle.await.unwrap().expect_err("client failure surfaces");
     assert!(matches!(err, PickApplicationError::Proxy(_)));
     assert_eq!(err.code(), -32603);
+}
+
+#[test]
+fn classify_matches_client_called_open_in_editor() {
+    assert!(classify(
+        &json!({ "jsonrpc": "2.0", "id": 1, "method": "host.openInEditor",
+                 "params": { "editorId": "vscode", "path": "/repo/a.rs" } })
+    )
+    .is_some());
+}
+
+#[tokio::test]
+async fn handle_open_in_editor_missing_params_are_invalid() {
+    // Missing editorId → -32602 (validated before any locality/display work).
+    let req =
+        classify(&json!({ "jsonrpc": "2.0", "id": 9, "method": "host.openInEditor" })).unwrap();
+    let frame = handle(req, &NoopApi, None, false, &idle_reverse())
+        .await
+        .expect("error response");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 9);
+    assert_eq!(parsed["error"]["code"], -32602);
+    assert!(parsed["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("editorId"));
+
+    // Missing path → -32602.
+    let req = classify(
+        &json!({ "jsonrpc": "2.0", "id": 10, "method": "host.openInEditor",
+                                 "params": { "editorId": "vscode" } }),
+    )
+    .unwrap();
+    let frame = handle(req, &NoopApi, None, false, &idle_reverse())
+        .await
+        .expect("error response");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["error"]["code"], -32602);
+    assert!(parsed["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("path"));
+}
+
+#[tokio::test]
+async fn handle_open_in_editor_remote_round_trips_reverse_rpc() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let reverse = ReverseChannel::new(out_tx);
+
+    let caller = reverse.clone();
+    let task = tokio::spawn(async move {
+        let req = classify(&json!({ "jsonrpc": "2.0", "id": 11, "method": "host.openInEditor",
+                                     "params": { "editorId": "vscode", "path": "/repo/a.rs", "line": 3 } }))
+        .unwrap();
+        handle(req, &NoopApi, None, false, &caller).await
+    });
+
+    // The mock FE receives the re-dispatched reverse request and replies.
+    let frame = out_rx.recv().await.unwrap();
+    let req: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(req["method"], "host.openInEditor");
+    assert_eq!(req["params"]["editorId"], "vscode");
+    assert_eq!(req["params"]["path"], "/repo/a.rs");
+    assert_eq!(req["params"]["line"], 3);
+    assert!(req["id"].as_str().unwrap().starts_with("rev-"));
+    let response = json!({ "jsonrpc": "2.0", "id": req["id"], "result": { "ok": true } });
+    assert!(reverse.route_response(&response));
+
+    // The client-called trigger resolves with the documented result.
+    let frame = task.await.unwrap().expect("response frame");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 11);
+    assert_eq!(parsed["result"]["ok"], true);
 }
