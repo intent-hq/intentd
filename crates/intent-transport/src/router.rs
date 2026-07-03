@@ -384,6 +384,36 @@ async fn dispatch(
             let result = api.read_asset(ws, asset).await.map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        "note.listVersions" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let versions = api
+                .list_note_versions(ws, note_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            // Bare array, like `note.listTasks`.
+            to_result_value(&versions)
+        }
+        "note.getVersion" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let v = require_int_param(params, "v")?;
+            let version = api
+                .get_note_version(ws, note_id, v)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&version)
+        }
+        "note.restoreVersion" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let v = require_int_param(params, "v")?;
+            let result = api
+                .restore_note_version(ws, note_id, v)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
         "task.updateStatus" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
@@ -2268,6 +2298,17 @@ fn require_str_param(params: &Map<String, Value>, name: &str) -> Result<String, 
     match params.get(name) {
         Some(Value::String(s)) => Ok(s.clone()),
         _ => Err(rpc(
+            INVALID_PARAMS,
+            format!("Missing required parameter: {name}"),
+        )),
+    }
+}
+
+/// Require an integer param (e.g. `v` on `note.getVersion`/`restoreVersion`).
+fn require_int_param(params: &Map<String, Value>, name: &str) -> Result<i64, RpcErr> {
+    match params.get(name).and_then(Value::as_i64) {
+        Some(v) => Ok(v),
+        None => Err(rpc(
             INVALID_PARAMS,
             format!("Missing required parameter: {name}"),
         )),

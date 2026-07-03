@@ -1186,3 +1186,107 @@ async fn wss_git_branch_status_round_trip() {
     srv.ws.stop().await;
     std::fs::remove_dir_all(&repo).ok();
 }
+
+/// Note version history over WSS (PROTOCOL §5.2 version-history extensions):
+/// every content mutation appends a full snapshot, `note.listVersions` returns
+/// summaries (no content blob), `note.getVersion` returns one snapshot with
+/// content, and `note.restoreVersion` resets the note to an old snapshot while
+/// appending a new version that captures the restored state.
+#[tokio::test]
+async fn wss_note_version_history_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Versions"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // v1: create; v2: full set; v3: append.
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"note.create","params":{{"workspaceId":"{ws_id}","title":"Versioned","content":"first draft"}}}}"#
+            ),
+        ],
+    )
+    .await;
+    let note_id = sess[0]["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"note.setContent","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}","content":"second draft"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"note.add","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}","content":"appended line"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":5,"method":"note.listVersions","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":6,"method":"note.getVersion","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}","v":2}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":7,"method":"note.restoreVersion","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}","v":2}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":8,"method":"note.get","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":9,"method":"note.getVersion","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}","v":99}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":10,"method":"note.getVersion","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}"}}}}"#
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(sess[0]["result"]["ok"], true, "setContent: {}", sess[0]);
+    assert_eq!(sess[1]["result"]["ok"], true, "add: {}", sess[1]);
+
+    // listVersions: bare ascending array of snapshot summaries, no content.
+    let versions = sess[2]["result"].as_array().expect("versions array");
+    assert_eq!(versions.len(), 3, "create+setContent+add: {}", sess[2]);
+    for (i, entry) in versions.iter().enumerate() {
+        assert_eq!(entry["v"].as_i64(), Some(i as i64 + 1));
+        assert_eq!(entry["type"], "snapshot");
+        assert_eq!(entry["author"]["type"], "system");
+        assert!(entry["date"].is_string());
+        assert!(entry["contentLength"].is_i64());
+        assert!(entry.get("content").is_none(), "summaries carry no content");
+    }
+    assert_eq!(versions[0]["title"], "Versioned");
+
+    // getVersion: one full snapshot with content.
+    assert_eq!(sess[3]["result"]["v"].as_i64(), Some(2));
+    assert_eq!(sess[3]["result"]["content"], "second draft");
+    assert_eq!(sess[3]["result"]["type"], "snapshot");
+
+    // restoreVersion: content reset to v2, new v4 appended.
+    assert_eq!(sess[4]["result"]["ok"], true, "restore: {}", sess[4]);
+    assert_eq!(sess[4]["result"]["restoredFrom"].as_i64(), Some(2));
+    assert_eq!(sess[4]["result"]["v"].as_i64(), Some(4));
+    assert_eq!(sess[4]["result"]["note"]["content"], "second draft");
+
+    // note.get confirms the persisted content matches the restored snapshot.
+    assert_eq!(sess[5]["result"]["note"]["content"], "second draft");
+
+    // Unknown version → -32602 (NotFound, PROTOCOL §9); missing `v` → -32602.
+    assert_eq!(sess[6]["error"]["code"].as_i64(), Some(-32602));
+    assert_eq!(sess[7]["error"]["code"].as_i64(), Some(-32602));
+    assert_eq!(sess[7]["error"]["message"], "Missing required parameter: v");
+
+    srv.ws.stop().await;
+}

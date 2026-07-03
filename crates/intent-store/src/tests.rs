@@ -6,12 +6,12 @@ use std::path::PathBuf;
 use intent_core::{
     events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientId, Comment,
     CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, EventActor, Note,
-    NoteId, NoteVisibility, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    NoteId, NoteVersionAuthor, NoteVisibility, TaskMetadata, TaskStatus, Workspace,
+    WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use serde_json::json;
 
-use crate::{EventQuery, NewEvent, Store};
+use crate::{EventQuery, NewEvent, Store, MAX_NOTE_VERSIONS};
 
 /// A unique temp DB path that cleans up its `.db`/`-wal`/`-shm` files on drop.
 struct TempDb {
@@ -85,11 +85,11 @@ async fn migration_status_reports_current_after_open() {
     assert!(status.is_current(), "fresh open must apply all migrations");
     assert_eq!(
         status.expected,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
     );
     assert_eq!(
         status.applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
     );
 }
 
@@ -240,6 +240,85 @@ async fn note_round_trip() {
 
     let fetched = store.get_note(&note.id).await.expect("get note");
     assert_eq!(fetched.id, note.id);
+}
+
+#[tokio::test]
+async fn note_version_append_list_get_and_prune() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let ts = now_iso();
+    let mut note = Note {
+        id: NoteId::new(),
+        workspace_id: ws_id.clone(),
+        title: "Versioned".to_string(),
+        content: String::new(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        task: None,
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts.clone(),
+    };
+    store.insert_note(&note).await.expect("insert note");
+
+    let author = NoteVersionAuthor {
+        id: "system".to_string(),
+        name: "intentd".to_string(),
+        author_type: "system".to_string(),
+    };
+    // Append MAX + 5 versions; only the newest MAX survive the prune.
+    let total = MAX_NOTE_VERSIONS + 5;
+    for i in 1..=total {
+        note.content = format!("content v{i}");
+        let v = store
+            .append_note_version(&note, &author, &ts)
+            .await
+            .expect("append version");
+        assert_eq!(v, i, "version numbers are strictly increasing");
+    }
+
+    let versions = store
+        .list_note_versions(&note.id)
+        .await
+        .expect("list versions");
+    assert_eq!(versions.len(), MAX_NOTE_VERSIONS as usize);
+    assert_eq!(versions.first().map(|e| e.v), Some(6), "oldest 5 pruned");
+    assert_eq!(versions.last().map(|e| e.v), Some(total));
+    assert!(versions.iter().all(|e| e.entry_type == "snapshot"));
+    assert_eq!(
+        versions.last().map(|e| e.content_length),
+        Some(note.content.len() as i64)
+    );
+
+    let got = store
+        .get_note_version(&note.id, 6)
+        .await
+        .expect("get version 6");
+    assert_eq!(got.content, "content v6");
+    assert_eq!(got.author.author_type, "system");
+    // Pruned and never-existing versions are NotFound.
+    assert!(store.get_note_version(&note.id, 5).await.is_err());
+    assert!(store.get_note_version(&note.id, total + 1).await.is_err());
+
+    // Deleting the note cascades to its versions.
+    store.delete_note(&note.id).await.expect("delete note");
+    let after = store
+        .list_note_versions(&note.id)
+        .await
+        .expect("list after delete");
+    assert!(after.is_empty(), "note delete cascades to note_version");
 }
 
 #[tokio::test]

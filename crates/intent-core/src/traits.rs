@@ -14,12 +14,12 @@ use crate::model::{
     EventSubscribeResult, EventUnsubscribeResult, FileActivity, GitAgentCommitResult,
     GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts, GitStatus, Note,
     NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
-    NoteEditLinesResult, NoteEditResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, ProjectType, ReadAssetResult, ScriptCreateParams, SetupScript,
-    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskUpdateNoteStatusResult,
-    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
-    WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult, NoteSetContentResult,
+    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary,
+    ProjectType, ReadAssetResult, ScriptCreateParams, SetupScript, TaskAssignAgentResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
+    TaskMarkAsTaskResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, Workspace, WorkspaceCreate, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -382,6 +382,54 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::read_asset not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.listVersions`: stored versions ascending by `v`, without content
+    /// blobs (PROTOCOL §5.2 version-history extensions).
+    fn list_note_versions(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<Vec<NoteVersionSummary>>> {
+        let _ = (workspace_id, note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::list_note_versions not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.getVersion`: one stored version with content (PROTOCOL §5.2
+    /// version-history extensions).
+    fn get_note_version(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        v: i64,
+    ) -> BoxFuture<'_, Result<NoteVersion>> {
+        let _ = (workspace_id, note_id, v);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::get_note_version not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.restoreVersion`: reset content to version `v` and append a new
+    /// version capturing the restored state (PROTOCOL §5.2 version-history
+    /// extensions).
+    fn restore_note_version(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        v: i64,
+    ) -> BoxFuture<'_, Result<NoteRestoreVersionResult>> {
+        let _ = (workspace_id, note_id, v);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::restore_note_version not implemented".to_string(),
             ))
         })
     }

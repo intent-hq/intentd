@@ -707,6 +707,59 @@ pub struct ReadAssetResult {
     pub size_kb: i64,
 }
 
+/// Author stamp on a stored note version (PROTOCOL §5.2 version-history
+/// extensions). Mirrors the FE `VersionAuthor` shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoteVersionAuthor {
+    pub id: String,
+    pub name: String,
+    /// `user` | `agent` | `system`.
+    #[serde(rename = "type")]
+    pub author_type: String,
+}
+
+/// One version-list entry returned by `note.listVersions` — the FE
+/// `VersionEntry` shape without the content blob (`contentLength` instead).
+/// `entry_type` is always `"snapshot"` (full-snapshot model).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteVersionSummary {
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    pub v: i64,
+    pub date: String,
+    pub author: NoteVersionAuthor,
+    pub title: String,
+    pub content_length: i64,
+}
+
+/// One full stored note version returned by `note.getVersion`. `entry_type`
+/// is always `"snapshot"` (full-snapshot model).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteVersion {
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    pub v: i64,
+    pub date: String,
+    pub author: NoteVersionAuthor,
+    pub title: String,
+    pub content: String,
+}
+
+/// Result of `note.restoreVersion` — the note's content is reset to version
+/// `restoredFrom` and a new version `v` capturing the restored state is
+/// appended.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteRestoreVersionResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    pub restored_from: i64,
+    pub v: i64,
+    pub note: Note,
+}
+
 // ---------------------------------------------------------------------------
 // task.* result DTOs (PROTOCOL §5.4). Field names/optionality match the TS
 // `ws.task.*` peer returns so the iOS client is unchanged.

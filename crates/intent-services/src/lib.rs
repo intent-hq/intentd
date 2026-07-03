@@ -26,9 +26,10 @@ use intent_core::{
     CommentStatus, CommentThreadSummary, CommentType, CommentWire, ContentType, Draft, Event,
     EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, Note,
     NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
-    NoteEditLinesResult, NoteEditResult, NoteId, NoteSetContentResult, NoteTaskRow,
-    NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ProjectType, ReadAssetResult,
-    ScriptCreateParams, SessionStats, SetupScript, TaskAssignAgentResult, TaskConvertBlocksResult,
+    NoteEditLinesResult, NoteEditResult, NoteId, NoteRestoreVersionResult, NoteSetContentResult,
+    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor,
+    NoteVersionSummary, NoteVisibility, ProjectType, ReadAssetResult, ScriptCreateParams,
+    SessionStats, SetupScript, TaskAssignAgentResult, TaskConvertBlocksResult,
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
     TaskMetadata, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult,
     TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
@@ -949,6 +950,26 @@ async fn fetch_note(store: &Store, workspace_id: &WorkspaceId, note_id: &NoteId)
         Ok(_) | Err(Error::NotFound(_)) => Err(Error::NotFound(format!("note {note_id}"))),
         Err(e) => Err(e),
     }
+}
+
+/// Author stamp for daemon-captured note versions. `note.*` writes carry no
+/// author context yet, so every version is attributed to the system author
+/// (documented in PROTOCOL §5.2 version-history extensions).
+fn system_version_author() -> NoteVersionAuthor {
+    NoteVersionAuthor {
+        id: "system".to_string(),
+        name: "intentd".to_string(),
+        author_type: "system".to_string(),
+    }
+}
+
+/// Append a full-snapshot version of `note`'s *current* (post-mutation) state,
+/// stamped with the note's `updated_at` (PROTOCOL §5.2 version-history
+/// extensions). The store prunes to the newest 50 on append.
+async fn capture_note_version(store: &Store, note: &Note) -> Result<i64> {
+    store
+        .append_note_version(note, &system_version_author(), &note.updated_at)
+        .await
 }
 
 /// Like [`fetch_note`] but surfaces the TS peer's `Note not found: <id>` message
@@ -3364,6 +3385,7 @@ impl WorkspaceApi for Services {
                         updated_at: now,
                     };
                     store.insert_note(&note).await?;
+                    capture_note_version(&store, &note).await?;
                     publish_event(
                         &bus,
                         note_change_event(
@@ -3394,6 +3416,7 @@ impl WorkspaceApi for Services {
             let expected_version = input.expected_version;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             // content present → raw full set; otherwise title/tags metadata.
+            let content_changed = input.content.is_some();
             if let Some(content) = input.content {
                 note.content = content;
             } else {
@@ -3406,6 +3429,9 @@ impl WorkspaceApi for Services {
             }
             note.updated_at = now_iso();
             store.update_note_versioned(&note, expected_version).await?;
+            if content_changed {
+                capture_note_version(&store, &note).await?;
+            }
             publish_event(
                 &bus,
                 note_change_event(
@@ -3441,6 +3467,7 @@ impl WorkspaceApi for Services {
             note.content = new_content.clone();
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            capture_note_version(&store, &note).await?;
             publish_event(
                 &bus,
                 note_change_event(
@@ -3487,6 +3514,7 @@ impl WorkspaceApi for Services {
             note.content = new_content.clone();
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            capture_note_version(&store, &note).await?;
             publish_event(
                 &bus,
                 note_change_event(
@@ -3534,6 +3562,7 @@ impl WorkspaceApi for Services {
             note.content = new_content.clone();
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            capture_note_version(&store, &note).await?;
             publish_event(
                 &bus,
                 note_change_event(
@@ -3592,6 +3621,7 @@ impl WorkspaceApi for Services {
             let now = now_iso();
             note.updated_at = now.clone();
             store.update_note_versioned(&note, expected_version).await?;
+            capture_note_version(&store, &note).await?;
             publish_event(
                 &bus,
                 note_change_event(
@@ -3744,6 +3774,71 @@ impl WorkspaceApi for Services {
                 mime_type,
                 data,
                 size_kb,
+            })
+        })
+    }
+
+    fn list_note_versions(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<Vec<NoteVersionSummary>>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Scope check: 404 if the note is missing or in another workspace.
+            fetch_note(&store, &workspace_id, &note_id).await?;
+            store.list_note_versions(&note_id).await
+        })
+    }
+
+    fn get_note_version(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        v: i64,
+    ) -> BoxFuture<'_, Result<NoteVersion>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            fetch_note(&store, &workspace_id, &note_id).await?;
+            store.get_note_version(&note_id, v).await
+        })
+    }
+
+    fn restore_note_version(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        v: i64,
+    ) -> BoxFuture<'_, Result<NoteRestoreVersionResult>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
+            let version = store.get_note_version(&note_id, v).await?;
+            note.title = version.title;
+            note.content = version.content;
+            note.updated_at = now_iso();
+            store.update_note(&note).await?;
+            let new_v = capture_note_version(&store, &note).await?;
+            publish_event(
+                &bus,
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
+            // Re-read so the returned note carries the post-update `rev`.
+            let note = fetch_note(&store, &workspace_id, &note_id).await?;
+            Ok(NoteRestoreVersionResult {
+                ok: true,
+                note_id: note.id.clone(),
+                restored_from: v,
+                v: new_v,
+                note,
             })
         })
     }
