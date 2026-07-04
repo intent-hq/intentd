@@ -1138,6 +1138,236 @@ async fn interrupt_priority_send_to_task_over_wss() {
     assert!(saw_interrupt_end, "interrupt turn completes cleanly");
 }
 
+/// Duplicate interrupt delivery (PROTOCOL §5.5): the SAME interrupt-priority
+/// message (same `messageId`) delivered twice in quick succession — the exact
+/// race that transitioned agents to `failed` in the reference app — preempts
+/// exactly ONE turn. The duplicate is acknowledged idempotently
+/// (`deduplicated: true`) without cancelling the interrupt turn it raced; the
+/// message is persisted once (not double-persisted); and the agent survives:
+/// the follow-up send runs `turn=3` on the SAME child (a double delivery
+/// would have burned a turn and reported `turn=4`; a killed/restarted child
+/// would report `turn=1`) and `agent.get` never shows an `error` status.
+#[tokio::test]
+async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
+    let Some(script) = gate("WSS duplicate interrupt-priority E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Park the first turn mid-stream.
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let mut saw_block_chunk = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+            && frame["params"]["event"]["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streaming-before-cancel")
+        {
+            saw_block_chunk = true;
+            break;
+        }
+    }
+    assert!(saw_block_chunk, "first turn streamed a chunk and parked");
+
+    // The SAME interrupt delivered twice back-to-back (stable messageId).
+    let dup_payload = json!({
+        "workspaceId": ws_id,
+        "agentId": agent_id,
+        "content": "duplicate interrupt payload",
+        "messageId": "user-msg-dup-e2e",
+        "priority": "interrupt",
+    });
+    let first = wss_rpc(&mut rpc, 12, "agent.sendMessage", dup_payload.clone()).await;
+    assert_eq!(first["success"], true, "first delivery ok: {first}");
+    assert_eq!(
+        first["queued"], false,
+        "first delivery preempts and streams immediately: {first}"
+    );
+    assert_eq!(first["messageId"], "user-msg-dup-e2e");
+
+    let second = wss_rpc(&mut rpc, 13, "agent.sendMessage", dup_payload).await;
+    assert_eq!(
+        second["success"], true,
+        "duplicate is not an error: {second}"
+    );
+    assert_eq!(
+        second["deduplicated"], true,
+        "duplicate is acknowledged idempotently, no second preemption: {second}"
+    );
+    assert_eq!(second["messageId"], "user-msg-dup-e2e");
+
+    // Exactly one preemption: terminal stream:end for the parked turn, then
+    // the interrupt runs turn=2 on the SAME child and completes.
+    let mut saw_preempt_end = false;
+    let mut saw_interrupt_chunk = false;
+    let mut saw_interrupt_end = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:stream:end") if !saw_preempt_end => saw_preempt_end = true,
+            Some("agent:stream:chunk") => {
+                if frame["params"]["event"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("turn=2")
+                {
+                    saw_interrupt_chunk = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                saw_interrupt_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_preempt_end,
+        "the single preemption emitted the terminal stream:end"
+    );
+    assert!(
+        saw_interrupt_chunk,
+        "the interrupt ran once on the SAME process (turn=2)"
+    );
+    assert!(saw_interrupt_end, "the interrupt turn completes cleanly");
+
+    // Not double-persisted: the conversation carries the interrupt content in
+    // exactly ONE user message.
+    let convo = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let dup_count = convo["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|m| {
+            m["role"] == "user"
+                && serde_json::to_string(&m["contentBlocks"])
+                    .unwrap_or_default()
+                    .contains("duplicate interrupt payload")
+        })
+        .count();
+    assert_eq!(
+        dup_count, 1,
+        "duplicate delivery must not double-persist: {convo}"
+    );
+
+    // Liveness + turn accounting: the follow-up send runs turn=3 on the SAME
+    // child. A double-delivered interrupt would have burned an extra turn
+    // (turn=4 here); a killed/restarted child would report turn=1.
+    let after = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "after dup" }),
+    )
+    .await;
+    assert_eq!(after["success"], true, "post-dup send ok: {after}");
+    let mut saw_third_chunk = false;
+    let mut saw_third_end = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:stream:chunk") => {
+                if frame["params"]["event"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("turn=3")
+                {
+                    saw_third_chunk = true;
+                }
+            }
+            Some("agent:stream:end") if saw_third_chunk => {
+                saw_third_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_third_chunk,
+        "exactly one interrupt turn ran — follow-up is turn=3 on the SAME live child"
+    );
+    assert!(saw_third_end, "post-dup turn completes cleanly");
+
+    // The agent never transitioned to a failed status across the duplicate.
+    let got = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_ne!(
+        got["agent"]["status"].as_str().unwrap_or_default(),
+        "error",
+        "the agent never reaches a failed status: {got}"
+    );
+}
+
 /// AUDIT-P1-3: the daemon-owned activity flags (`isResponding`/`isWaitingOnTool`/
 /// `isWaitingForOtherAgents`, PROTOCOL §5.5/§7.1) reflect a genuinely-active
 /// worker over the WSS wire. A `blockUntilCancel` agent parks mid-turn (a live
