@@ -958,6 +958,74 @@ async fn delegate_persists_initial_message_and_delegation_depth() {
     assert_eq!(v["metadata"]["isBackground"], json!(true));
 }
 
+/// Port of the reference `MAX_DELEGATION_DEPTH` guard: a caller already at the
+/// max depth cannot delegate further, and the error carries the depth in its
+/// message so downstream tools can render it verbatim.
+#[tokio::test]
+async fn delegate_rejects_when_parent_at_max_depth() {
+    let (_t, svc, ws) = setup().await;
+    // Create a parent already at depth 2 (MAX_DELEGATION_DEPTH).
+    let extra = intent_core::AgentCreateExtra {
+        metadata: Some(json!({ "delegationDepth": intent_core::MAX_DELEGATION_DEPTH })),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("MaxDepth".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            extra,
+        )
+        .await
+        .expect("create parent at max depth");
+    let parent = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("still trying".into()),
+                ..Default::default()
+            },
+            Some(parent),
+        )
+        .await
+        .expect_err("delegate must be refused at max depth");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("maximum delegation depth"),
+        "unexpected err: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("({})", intent_core::MAX_DELEGATION_DEPTH)),
+        "missing depth in err: {msg}"
+    );
+}
+
+/// The top-level (RPC / user) front door stays parentless and is never
+/// subject to the depth guard even when a foreground parent exists.
+#[tokio::test]
+async fn delegate_without_parent_bypasses_depth_guard() {
+    let (_t, svc, ws) = setup().await;
+    // No caller_agent_id: this is the top-level create path.
+    let out = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("user-initiated".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("parentless delegate succeeds");
+    assert!(out["agentId"].is_string());
+}
+
 #[tokio::test]
 async fn delete_removes_session() {
     let (_t, svc, ws) = setup().await;

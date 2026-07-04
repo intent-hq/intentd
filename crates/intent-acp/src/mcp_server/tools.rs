@@ -240,6 +240,82 @@ static ALL_TOOLS: &[ToolDef] = &[
         description: "Send a completion report to your parent agent (delegated agents only).",
         params: &[p("report", "string", true)],
     },
+    ToolDef {
+        name: "send_message_to_agent_workspace-mcp",
+        description: "Send a message to another agent; `priority: \"interrupt\"` stops the target mid-turn.",
+        params: &[
+            p("agentId", "string", true),
+            p("message", "string", true),
+            p("priority", "string", false),
+        ],
+    },
+    ToolDef {
+        name: "send_message_to_task_agent_workspace-mcp",
+        description: "Follow up with the agent assigned to a task note by ID.",
+        params: &[
+            p("taskNoteId", "string", true),
+            p("message", "string", true),
+            p("priority", "string", false),
+        ],
+    },
+    ToolDef {
+        name: "wake_or_create_task_agent_workspace-mcp",
+        description: "Ensure a task has a working agent: resume the assigned one or create a new agent for the task.",
+        params: &[
+            p("taskNoteId", "string", true),
+            p("contextMessage", "string", true),
+            p("model", "string", false),
+        ],
+    },
+    // ---- Agent read tools (never restricted) ----
+    ToolDef {
+        name: "list_agents_workspace-mcp",
+        description: "List agents in this workspace; completed agents are omitted unless requested.",
+        params: &[p("includeCompleted", "boolean", false)],
+    },
+    ToolDef {
+        name: "get_agent_status_workspace-mcp",
+        description: "Detailed status for one agent including task linkage and activity timestamps.",
+        params: &[p("agentId", "string", true)],
+    },
+    ToolDef {
+        name: "read_agent_conversation_workspace-mcp",
+        description: "Read another agent's conversation transcript.",
+        params: &[
+            p("agentId", "string", true),
+            p("lastN", "integer", false),
+            p("pageToken", "string", false),
+        ],
+    },
+    ToolDef {
+        name: "get_agent_summary_workspace-mcp",
+        description: "Quick summary of what another agent did.",
+        params: &[p("agentId", "string", true)],
+    },
+    ToolDef {
+        name: "get_agent_diagnostics_workspace-mcp",
+        description: "Sanitized snapshot of agent statuses, subscriptions, delegation groups, and stuck-risk signals.",
+        params: &[
+            p("agentId", "string", false),
+            p("taskNoteId", "string", false),
+            p("staleRespondingAfterMs", "integer", false),
+        ],
+    },
+    // ---- Event subscription tools ----
+    ToolDef {
+        name: "subscribe_to_events_workspace-mcp",
+        description: "Subscribe to batched workspace events (service-style; not the WSS streaming surface).",
+        params: &[
+            p("eventTypes", "array", true),
+            p("excludeSelf", "boolean", false),
+            p("batchWindow", "integer", false),
+        ],
+    },
+    ToolDef {
+        name: "unsubscribe_from_events_workspace-mcp",
+        description: "Cancel one event subscription by id.",
+        params: &[p("subscriptionId", "string", true)],
+    },
     // ---- Git write tools ----
     ToolDef {
         name: "git_commit_workspace-mcp",

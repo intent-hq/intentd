@@ -4,8 +4,8 @@
 
 use intent_core::model::AgentDelegateInput;
 use intent_core::{
-    Error, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId,
-    NoteUpdateMetadataResult, Result,
+    AgentId, Error, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId,
+    NoteUpdateMetadataResult, Result, MAX_DELEGATION_DEPTH,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -287,6 +287,113 @@ impl WorkspaceMcpServer {
                     .agent_report_to_parent(ws, report, self.caller_agent_id.clone())
                     .await)
             }
+            "send_message_to_agent_workspace-mcp" => {
+                let agent_id = AgentId::from(req_str(args, "agentId")?.as_str());
+                val(api
+                    .agent_send_message(
+                        ws,
+                        agent_id,
+                        req_str(args, "message")?,
+                        None,
+                        None,
+                        opt_str(args, "priority"),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await)
+            }
+            "send_message_to_task_agent_workspace-mcp" => val(api
+                .agent_send_to_task(
+                    ws,
+                    note_id(args, "taskNoteId")?,
+                    req_str(args, "message")?,
+                    opt_str(args, "priority"),
+                )
+                .await),
+            "wake_or_create_task_agent_workspace-mcp" => {
+                // Reference `WakeOrCreateTaskAgentTool` guards against the caller
+                // exceeding `MAX_DELEGATION_DEPTH` before the tool may create a
+                // new agent for the task (the depth-check on the delegate path
+                // lives inside `agent_delegate_op`). Fetch the caller's
+                // projection to read its persisted depth.
+                if let Some(caller) = self.caller_agent_id.clone() {
+                    if let Ok(caller_lite) = api.agent_get(caller.clone(), Some(ws.clone())).await {
+                        let depth = caller_lite.metadata.delegation_depth.unwrap_or(0);
+                        if depth >= MAX_DELEGATION_DEPTH {
+                            return Err(Error::InvalidParams(format!(
+                                "Cannot delegate task: maximum delegation depth ({MAX_DELEGATION_DEPTH}) reached. You are at depth {depth}. Please complete this task directly instead of delegating further."
+                            )));
+                        }
+                    }
+                }
+                val(api
+                    .agent_wake_or_create(
+                        ws,
+                        note_id(args, "taskNoteId")?,
+                        req_str(args, "contextMessage")?,
+                        opt_str(args, "model"),
+                    )
+                    .await)
+            }
+            // ---- Agent read tools (never restricted) ----
+            "list_agents_workspace-mcp" => {
+                // `includeCompleted` is accepted for wire parity with the
+                // reference `ListAgentsTool` (§18.4). Filtering completed
+                // agents lives in the services impl; the parameter is passed
+                // through but not yet consulted by the daemon-side projection.
+                let _include_completed = opt_bool(args, "includeCompleted").unwrap_or(false);
+                val(api.agent_list(ws).await)
+            }
+            "get_agent_status_workspace-mcp" => {
+                let agent_id = AgentId::from(req_str(args, "agentId")?.as_str());
+                val(api.agent_get(agent_id, Some(ws)).await)
+            }
+            "read_agent_conversation_workspace-mcp" => {
+                let agent_id = AgentId::from(req_str(args, "agentId")?.as_str());
+                val(api
+                    .agent_get_conversation(
+                        agent_id,
+                        opt_i64(args, "lastN"),
+                        Some(ws),
+                        opt_str(args, "pageToken"),
+                    )
+                    .await)
+            }
+            "get_agent_summary_workspace-mcp" => {
+                let agent_id = AgentId::from(req_str(args, "agentId")?.as_str());
+                val(api.agent_summary(ws, agent_id).await)
+            }
+            "get_agent_diagnostics_workspace-mcp" => {
+                let agent_id = opt_str(args, "agentId").map(|s| AgentId::from(s.as_str()));
+                let task_note_id = opt_str(args, "taskNoteId").map(NoteId::from_string);
+                val(api
+                    .agent_diagnostics(
+                        ws,
+                        agent_id,
+                        task_note_id,
+                        opt_i64(args, "staleRespondingAfterMs"),
+                    )
+                    .await)
+            }
+            // ---- Event subscription tools (deprecated aliases; the WSS
+            // streaming surface lives on `events.subscribe`) ----
+            "subscribe_to_events_workspace-mcp" => {
+                let event_types = opt_vec_str(args, "eventTypes").ok_or_else(|| {
+                    Error::InvalidParams("missing required parameter: eventTypes".to_string())
+                })?;
+                val(api
+                    .agent_subscribe(
+                        ws,
+                        event_types,
+                        opt_bool(args, "excludeSelf"),
+                        opt_i64(args, "batchWindow"),
+                    )
+                    .await)
+            }
+            "unsubscribe_from_events_workspace-mcp" => val(api
+                .agent_unsubscribe(ws, req_str(args, "subscriptionId")?)
+                .await),
             // ---- Git write tools ----
             "git_commit_workspace-mcp" => {
                 // Attribution is sourced from the MCP caller context (Option B,

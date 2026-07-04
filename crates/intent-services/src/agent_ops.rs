@@ -14,7 +14,7 @@ use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_QUEUE_U
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
     AgentSession, AgentStatus, Error, EventActor, NoteId, Result, SessionStats, WorkspaceApi,
-    WorkspaceId,
+    WorkspaceId, MAX_DELEGATION_DEPTH,
 };
 
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
@@ -1275,12 +1275,27 @@ impl Services {
             }
         }
         // Load the delegating parent once: it feeds the child's
-        // `delegationDepth` (parent depth + 1; P3-1.2b) and the completion-watch
-        // registration below.
+        // `delegationDepth` (parent depth + 1; P3-1.2b), the depth-limit guard
+        // below, and the completion-watch registration.
         let parent_session = match &parent_agent_id {
             Some(parent) => self.store.get_agent_session(parent).await.ok(),
             None => None,
         };
+        // Depth guard (port of `MAX_DELEGATION_DEPTH` in the reference
+        // `agent-interaction-tools.ts`): a caller already at the max depth
+        // cannot delegate further. Enforced only when a caller is present
+        // (MCP front door); RPC-level creates stay parentless and skip it.
+        if parent_agent_id.is_some() {
+            let parent_depth = parent_session
+                .as_ref()
+                .and_then(|s| s.delegation_depth)
+                .unwrap_or(0);
+            if parent_depth >= MAX_DELEGATION_DEPTH {
+                return Err(Error::InvalidParams(format!(
+                    "Cannot delegate task: maximum delegation depth ({MAX_DELEGATION_DEPTH}) reached. You are at depth {parent_depth}. Please complete this task directly instead of delegating further."
+                )));
+            }
+        }
         let delegation_depth = parent_agent_id.as_ref().map(|_| {
             parent_session
                 .as_ref()

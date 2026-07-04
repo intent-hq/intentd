@@ -19,6 +19,7 @@ pub use config::Config;
 pub use error::{Error, Result};
 pub use events::is_known_event_type;
 pub use ids::{AgentId, ClientId, NoteId, WorkspaceId};
+pub use model::MAX_DELEGATION_DEPTH;
 pub use model::{
     ActorType, AgentActivity, AgentCreateExtra, AgentDelegateInput, AgentLite, AgentMessage,
     AgentMetadata, AgentSession, AgentStatus, AnchorContext, AuthorType, Client, Comment,

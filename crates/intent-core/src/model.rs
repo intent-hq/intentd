@@ -1373,6 +1373,14 @@ pub struct AgentMessage {
     pub created_at: String,
 }
 
+/// Maximum delegation depth to prevent unbounded recursive agent creation
+/// (port of the TS `MAX_DELEGATION_DEPTH` in `agent-interaction-tools.ts`).
+/// Depth 0 = user-created agents, depth 1 = their children, depth 2 =
+/// grandchildren (max). A parent already at this depth cannot spawn further
+/// delegates. Lives in `intent-core` so both the service impl and the MCP tool
+/// dispatcher (which cannot depend on `intent-services`) share one policy value.
+pub const MAX_DELEGATION_DEPTH: i64 = 2;
+
 /// Agent runtime session (§9.1). Field names/casing match the TS `AgentSession`
 /// (`agent-session.ts`): `backendSessionId`, `acpSessionId` (write-once after
 /// the provider's `session:created`), `nameExplicitlySet`, `systemPrompt`, etc.

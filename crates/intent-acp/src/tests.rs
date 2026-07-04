@@ -1514,6 +1514,18 @@ mod tool_registry_tests {
             "delegate_task_workspace-mcp",
             "git_commit_workspace-mcp",
             "report_to_parent_workspace-mcp",
+            // Agent coordination surface (D-batch 3): send/wake/list/read tools
+            // that let agents cooperate over the MCP front door.
+            "send_message_to_agent_workspace-mcp",
+            "send_message_to_task_agent_workspace-mcp",
+            "wake_or_create_task_agent_workspace-mcp",
+            "list_agents_workspace-mcp",
+            "get_agent_status_workspace-mcp",
+            "read_agent_conversation_workspace-mcp",
+            "get_agent_summary_workspace-mcp",
+            "get_agent_diagnostics_workspace-mcp",
+            "subscribe_to_events_workspace-mcp",
+            "unsubscribe_from_events_workspace-mcp",
         ] {
             assert!(names.contains(&required), "missing {required}");
         }
@@ -1735,6 +1747,44 @@ mod dispatch_unit_tests {
             ),
             ("git_commit_workspace-mcp", json!({}), "agent"),
             ("report_to_parent_workspace-mcp", json!({}), "report"),
+            (
+                "send_message_to_agent_workspace-mcp",
+                json!({ "message": "hi" }),
+                "agentId",
+            ),
+            (
+                "send_message_to_agent_workspace-mcp",
+                json!({ "agentId": "agent-1" }),
+                "message",
+            ),
+            (
+                "send_message_to_task_agent_workspace-mcp",
+                json!({ "message": "hi" }),
+                "taskNoteId",
+            ),
+            (
+                "wake_or_create_task_agent_workspace-mcp",
+                json!({ "contextMessage": "ctx" }),
+                "taskNoteId",
+            ),
+            (
+                "wake_or_create_task_agent_workspace-mcp",
+                json!({ "taskNoteId": "n" }),
+                "contextMessage",
+            ),
+            ("get_agent_status_workspace-mcp", json!({}), "agentId"),
+            (
+                "read_agent_conversation_workspace-mcp",
+                json!({}),
+                "agentId",
+            ),
+            ("get_agent_summary_workspace-mcp", json!({}), "agentId"),
+            ("subscribe_to_events_workspace-mcp", json!({}), "eventTypes"),
+            (
+                "unsubscribe_from_events_workspace-mcp",
+                json!({}),
+                "subscriptionId",
+            ),
         ];
         for (tool, args, needle) in cases {
             let resp = call(&srv, tool, args.clone()).await;
@@ -1823,6 +1873,46 @@ mod dispatch_unit_tests {
             (
                 "report_to_parent_workspace-mcp",
                 json!({ "report": "all done" }),
+            ),
+            (
+                "send_message_to_agent_workspace-mcp",
+                json!({ "agentId": "agent-1", "message": "hi", "priority": "normal" }),
+            ),
+            (
+                "send_message_to_task_agent_workspace-mcp",
+                json!({ "taskNoteId": "tn", "message": "hi" }),
+            ),
+            (
+                "wake_or_create_task_agent_workspace-mcp",
+                json!({ "taskNoteId": "tn", "contextMessage": "ctx", "model": "opus" }),
+            ),
+            (
+                "list_agents_workspace-mcp",
+                json!({ "includeCompleted": true }),
+            ),
+            (
+                "get_agent_status_workspace-mcp",
+                json!({ "agentId": "agent-1" }),
+            ),
+            (
+                "read_agent_conversation_workspace-mcp",
+                json!({ "agentId": "agent-1", "lastN": 20 }),
+            ),
+            (
+                "get_agent_summary_workspace-mcp",
+                json!({ "agentId": "agent-1" }),
+            ),
+            (
+                "get_agent_diagnostics_workspace-mcp",
+                json!({ "agentId": "agent-1", "taskNoteId": "n", "staleRespondingAfterMs": 60000 }),
+            ),
+            (
+                "subscribe_to_events_workspace-mcp",
+                json!({ "eventTypes": ["agent:idle"], "excludeSelf": true, "batchWindow": 250 }),
+            ),
+            (
+                "unsubscribe_from_events_workspace-mcp",
+                json!({ "subscriptionId": "sub-1" }),
             ),
         ];
         for (tool, args) in valid_args {
