@@ -812,8 +812,9 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let message_id = opt_str(params, "messageId");
             let image_blocks = opt_value(params, "imageBlocks");
+            let priority = opt_str(params, "priority");
             let result = api
-                .agent_send_message(ws, agent_id, content, message_id, image_blocks)
+                .agent_send_message(ws, agent_id, content, message_id, image_blocks, priority)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

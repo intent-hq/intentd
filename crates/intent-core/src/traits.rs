@@ -796,6 +796,9 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `agent.sendMessage`: deliver a user message, auto-queuing when the agent
     /// is mid-stream; `{ success, queued, messageId? }` (PROTOCOL §5.5).
+    /// `priority: "interrupt"` preempts an in-flight turn instead of queueing:
+    /// the current turn is cancelled keep-alive (the agent process is never
+    /// killed) and the message is delivered immediately as a fresh turn.
     fn agent_send_message(
         &self,
         workspace_id: WorkspaceId,
@@ -803,8 +806,16 @@ pub trait WorkspaceApi: Send + Sync {
         content: String,
         message_id: Option<String>,
         image_blocks: Option<serde_json::Value>,
+        priority: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, agent_id, content, message_id, image_blocks);
+        let _ = (
+            workspace_id,
+            agent_id,
+            content,
+            message_id,
+            image_blocks,
+            priority,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_send_message not implemented".to_string(),

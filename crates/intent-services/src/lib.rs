@@ -5717,10 +5717,10 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
         message: String,
-        _priority: Option<String>,
+        priority: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_send_to_task_op(workspace_id, task_note_id, message)
+            self.agent_send_to_task_op(workspace_id, task_note_id, message, priority)
                 .await
         })
     }
@@ -5732,15 +5732,24 @@ impl WorkspaceApi for Services {
         content: String,
         message_id: Option<String>,
         _image_blocks: Option<serde_json::Value>,
+        priority: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             // When the runtime manager is attached, drive a real spawn/turn loop;
             // otherwise fall back to the store-only persist (read-only wiring).
+            // `priority: "interrupt"` preempts the in-flight turn keep-alive
+            // (the child is never killed) and streams the message immediately.
             match self.agent_manager() {
                 Some(manager) => {
-                    manager
-                        .send_message(agent_id, workspace_id, content, message_id)
-                        .await
+                    if crate::agent_ops::is_interrupt_priority(priority.as_deref()) {
+                        manager
+                            .interrupt_send_message(agent_id, workspace_id, content, message_id)
+                            .await
+                    } else {
+                        manager
+                            .send_message(agent_id, workspace_id, content, message_id)
+                            .await
+                    }
                 }
                 None => {
                     self.agent_send_message_op(agent_id, content, message_id)

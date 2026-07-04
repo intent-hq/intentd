@@ -492,6 +492,13 @@ pub(crate) fn new_message_id() -> String {
     format!("user-msg-{}", Uuid::new_v4())
 }
 
+/// Whether a wire `priority` requests interrupt delivery (PROTOCOL §5.5):
+/// `"interrupt"` preempts the in-flight turn keep-alive; anything else (or
+/// absent) is normal queue-vs-stream delivery.
+pub(crate) fn is_interrupt_priority(priority: Option<&str>) -> bool {
+    priority == Some("interrupt")
+}
+
 /// Validate a client-supplied `agent.create` `agentId` (PROTOCOL §5.5): the id
 /// must be the exact `agent-{uuid}` form (`agent-` prefix + a parsable UUID
 /// tail), matching the form the daemon mints. Anything else surfaces as
@@ -1848,21 +1855,33 @@ impl Services {
     }
 
     /// `agent.sendToTask`: deliver to the agent assigned to a task note (PROTOCOL §5.5).
+    /// `priority: "interrupt"` preempts the assignee's in-flight turn keep-alive
+    /// (never killing the child) and delivers immediately when the runtime
+    /// manager is attached; other priorities keep the existing delivery.
     pub(crate) async fn agent_send_to_task_op(
         &self,
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
         message: String,
+        priority: Option<String>,
     ) -> Result<Value> {
-        let task = self.get_my_task(workspace_id, task_note_id).await?;
+        let task = self.get_my_task(workspace_id.clone(), task_note_id).await?;
         let Some(agent) = task.assigned_agents.first().cloned() else {
             return Ok(
                 json!({ "ok": false, "delivered": false, "error": "No agent assigned to task" }),
             );
         };
-        let result = self
-            .agent_send_message_op(agent.clone(), message, None)
-            .await?;
+        let result = match self.agent_manager() {
+            Some(manager) if is_interrupt_priority(priority.as_deref()) => {
+                manager
+                    .interrupt_send_message(agent.clone(), workspace_id, message, None)
+                    .await?
+            }
+            _ => {
+                self.agent_send_message_op(agent.clone(), message, None)
+                    .await?
+            }
+        };
         Ok(json!({ "ok": true, "agentId": agent, "result": result }))
     }
 

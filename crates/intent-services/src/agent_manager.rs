@@ -1288,6 +1288,36 @@ impl AgentManager {
         Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
     }
 
+    /// `agent.sendMessage` with `priority: "interrupt"` (§5.5): preempt the
+    /// in-flight turn instead of queueing behind it, then deliver `content`
+    /// immediately as a fresh turn on the SAME live session. The preemption is
+    /// the keep-alive [`AgentManager::interrupt`] (`session/cancel` + worker
+    /// abort) — unlike [`AgentManager::force_message`], the child process is
+    /// never killed and the pending queue is preserved, so the interrupted
+    /// agent keeps processing (the queue drains after the interrupt turn). An
+    /// idle agent falls through to the normal [`AgentManager::send_message`]
+    /// path unchanged.
+    pub async fn interrupt_send_message(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        content: String,
+        message_id: Option<String>,
+    ) -> Result<Value> {
+        if self.is_busy(&agent_id) {
+            // Keep-alive: cancels the turn over the wire, aborts the draining
+            // worker, releases the in-flight slot, and emits the terminal
+            // `agent:stream:end` — the child + ACP session stay alive.
+            self.interrupt(&agent_id).await;
+        }
+        // The slot was just released (or was never held): the send path claims
+        // it and streams the interrupt message right away rather than queueing.
+        // If a concurrent send wins the race the message queues instead — it is
+        // still delivered by that worker's drain loop, never dropped.
+        self.send_message(agent_id, workspace_id, content, message_id)
+            .await
+    }
+
     /// Spawn (and track) the background turn worker for an agent. The caller must
     /// already hold the in-flight slot (`try_begin`).
     fn spawn_worker(

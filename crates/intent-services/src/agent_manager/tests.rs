@@ -787,6 +787,91 @@ async fn interrupt_emits_terminal_stream_end_but_no_idle() {
     );
 }
 
+/// `priority: "interrupt"` delivery to a BUSY agent preempts the turn
+/// keep-alive: the message streams immediately (`queued: false`) instead of
+/// queueing behind the turn, the preemption emits the terminal
+/// `agent:stream:end`, and the child handle survives — the agent is never
+/// killed (contrast `force_message`, which tears the child down).
+#[tokio::test]
+async fn interrupt_send_message_preempts_busy_turn_without_kill() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-send"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    // A live `acpSessionId` keeps the preemption on the keep-alive interrupt
+    // path (no session → `interrupt` would fall back to the kill path).
+    mgr.services
+        .store
+        .set_acp_session_id(&id, "acp-int-send")
+        .await
+        .unwrap();
+    // Claim the in-flight slot so the send sees a busy (mid-turn) agent.
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let result = mgr
+        .interrupt_send_message(id.clone(), ws.clone(), "urgent".to_string(), None)
+        .await
+        .expect("interrupt send");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(
+        result["queued"],
+        json!(false),
+        "interrupt priority streams immediately, never queues: {result}"
+    );
+    assert!(result["messageId"].is_string());
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"agent:stream:end"),
+        "preemption emits the terminal stream:end (got {types:?})"
+    );
+    assert!(
+        mgr.handles.lock().unwrap().contains_key(&id),
+        "the child handle survives the interrupt (never killed)"
+    );
+    // The interrupt message was persisted as the next user turn.
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let last = session.messages.last().expect("message persisted");
+    assert_eq!(last.role, "user");
+    assert!(serde_json::to_string(&last.content)
+        .unwrap()
+        .contains("urgent"));
+}
+
+/// Interrupt-priority delivery to an IDLE agent falls through to the plain
+/// `send_message` path unchanged: `{ success, queued: false, messageId }`.
+#[tokio::test]
+async fn interrupt_send_message_idle_agent_falls_through_to_send() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-idle"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&id, "acp-int-idle")
+        .await
+        .unwrap();
+
+    let result = mgr
+        .interrupt_send_message(id.clone(), ws.clone(), "hello".to_string(), None)
+        .await
+        .expect("idle interrupt send");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(result["queued"], json!(false));
+    assert!(result["messageId"].is_string());
+    assert!(
+        mgr.handles.lock().unwrap().contains_key(&id),
+        "idle fall-through never touches the handle"
+    );
+}
+
 // --- SP-B: spawn `agent_type` derived from the specialist's `agentType` -------
 
 /// Self-cleaning temp directory for hermetic specialist-file fixtures.
