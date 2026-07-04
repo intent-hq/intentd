@@ -759,6 +759,385 @@ async fn agent_stop_keep_alive_resume_over_wss() {
     );
 }
 
+/// Interrupt-priority delivery (PROTOCOL §5.5): `agent.sendMessage` with
+/// `priority: "interrupt"` preempts a mid-turn agent instead of queueing —
+/// the current turn is cancelled keep-alive (terminal `agent:stream:end`,
+/// child NEVER killed) and the message streams immediately as a fresh turn on
+/// the SAME session (mock reports `turn=2`; a killed/restarted child would
+/// report `turn=1`). A follow-up interrupt-priority send to the then-idle
+/// agent falls through to the plain send path (`turn=3`), proving the agent
+/// keeps processing across interrupts without failing or restarting.
+#[tokio::test]
+async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
+    let Some(script) = gate("WSS interrupt-priority sendMessage E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // First turn streams a chunk and parks at session/cancel.
+    let mut saw_block_chunk = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+            && frame["params"]["event"]["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streaming-before-cancel")
+        {
+            saw_block_chunk = true;
+            break;
+        }
+    }
+    assert!(saw_block_chunk, "first turn streamed a chunk and parked");
+
+    // Interrupt-priority send while mid-turn: NOT queued — the response shape
+    // is the immediate-stream `{ success, queued: false, messageId }` (a
+    // normal-priority send here would return `queued: true`).
+    let interrupted = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": "urgent interrupt",
+            "priority": "interrupt",
+        }),
+    )
+    .await;
+    assert_eq!(interrupted["success"], true, "interrupt ok: {interrupted}");
+    assert_eq!(
+        interrupted["queued"], false,
+        "interrupt priority streams immediately, never queues: {interrupted}"
+    );
+    assert!(
+        interrupted["messageId"].is_string(),
+        "immediate delivery carries a messageId: {interrupted}"
+    );
+
+    // Preemption ordering: terminal stream:end for the cancelled first turn →
+    // the interrupt message streams `turn=2` on the SAME child → its own end.
+    let mut saw_preempt_end = false;
+    let mut saw_interrupt_chunk = false;
+    let mut saw_interrupt_end = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:stream:end") if !saw_preempt_end => {
+                assert_eq!(
+                    frame["params"]["event"]["data"]["agentId"]
+                        .as_str()
+                        .unwrap_or_default(),
+                    agent_id,
+                    "terminal stream:end carries the agent id"
+                );
+                saw_preempt_end = true;
+            }
+            Some("agent:stream:chunk") => {
+                if frame["params"]["event"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("turn=2")
+                {
+                    assert!(
+                        saw_preempt_end,
+                        "the interrupt turn starts only after the preempted turn's stream:end"
+                    );
+                    saw_interrupt_chunk = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                saw_interrupt_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_preempt_end,
+        "preemption emitted the terminal stream:end"
+    );
+    assert!(
+        saw_interrupt_chunk,
+        "interrupt message ran on the SAME process (mock reported turn=2, not a turn=1 respawn)"
+    );
+    assert!(
+        saw_interrupt_end,
+        "interrupt turn emits its own terminal stream:end"
+    );
+
+    // Idle fall-through + liveness: another interrupt-priority send now behaves
+    // like a plain send and the SAME child answers turn=3 — the agent survived
+    // both interrupts (never killed, never failed, never restarted).
+    let idle_send = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": "after interrupt",
+            "priority": "interrupt",
+        }),
+    )
+    .await;
+    assert_eq!(idle_send["success"], true, "idle interrupt ok: {idle_send}");
+    assert_eq!(
+        idle_send["queued"], false,
+        "idle interrupt streams: {idle_send}"
+    );
+
+    let mut saw_third_chunk = false;
+    let mut saw_third_end = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:stream:chunk") => {
+                if frame["params"]["event"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("turn=3")
+                {
+                    saw_third_chunk = true;
+                }
+            }
+            Some("agent:stream:end") if saw_third_chunk => {
+                saw_third_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_third_chunk,
+        "post-interrupt send still reaches the SAME live child (turn=3)"
+    );
+    assert!(saw_third_end, "post-interrupt turn completes cleanly");
+}
+
+/// Interrupt-priority `agent.sendToTask` (PROTOCOL §5.5): a message addressed
+/// to the task note's assignee with `priority: "interrupt"` preempts the
+/// assignee's mid-turn stream keep-alive and delivers immediately — the same
+/// never-kill semantics as `agent.sendMessage`, resolved through the task
+/// assignment (`task.markAsTask` + `task.assignAgent`).
+#[tokio::test]
+async fn interrupt_priority_send_to_task_over_wss() {
+    let Some(script) = gate("WSS interrupt-priority sendToTask E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Make the seeded note a task and assign the agent to it.
+    let marked = wss_rpc(
+        &mut rpc,
+        11,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+    let assigned = wss_rpc(
+        &mut rpc,
+        12,
+        "task.assignAgent",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(assigned["ok"], true, "assignAgent ok: {assigned}");
+
+    // Park the assignee mid-turn.
+    let sent = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let mut saw_block_chunk = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+            && frame["params"]["event"]["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streaming-before-cancel")
+        {
+            saw_block_chunk = true;
+            break;
+        }
+    }
+    assert!(saw_block_chunk, "assignee streamed a chunk and parked");
+
+    // Interrupt via the task note: resolves the assignee and preempts its turn.
+    let result = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendToTask",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": note_id,
+            "message": "interrupt via task",
+            "priority": "interrupt",
+        }),
+    )
+    .await;
+    assert_eq!(result["ok"], true, "sendToTask ok: {result}");
+    assert_eq!(
+        result["agentId"].as_str().unwrap_or_default(),
+        agent_id,
+        "resolved the task assignee"
+    );
+    assert_eq!(
+        result["result"]["queued"], false,
+        "interrupt priority delivered immediately, not queued: {result}"
+    );
+
+    // Same keep-alive preemption as sendMessage: terminal stream:end, then the
+    // interrupt message runs turn=2 on the SAME (never-killed) child.
+    let mut saw_preempt_end = false;
+    let mut saw_interrupt_chunk = false;
+    let mut saw_interrupt_end = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:stream:end") if !saw_preempt_end => saw_preempt_end = true,
+            Some("agent:stream:chunk") => {
+                if frame["params"]["event"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("turn=2")
+                {
+                    saw_interrupt_chunk = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                saw_interrupt_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_preempt_end,
+        "preemption emitted the terminal stream:end"
+    );
+    assert!(
+        saw_interrupt_chunk,
+        "task interrupt ran on the SAME process (turn=2)"
+    );
+    assert!(saw_interrupt_end, "interrupt turn completes cleanly");
+}
+
 /// AUDIT-P1-3: the daemon-owned activity flags (`isResponding`/`isWaitingOnTool`/
 /// `isWaitingForOtherAgents`, PROTOCOL §5.5/§7.1) reflect a genuinely-active
 /// worker over the WSS wire. A `blockUntilCancel` agent parks mid-turn (a live
