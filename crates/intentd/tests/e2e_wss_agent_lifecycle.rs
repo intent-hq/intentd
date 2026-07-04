@@ -3261,3 +3261,142 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
         .count();
     assert_eq!(user_count, 1, "replay delivered no second prompt: {conv}");
 }
+
+/// Init a small local git repo (one commit) and return its on-disk path. Used
+/// by the WSS clone-orchestration e2e as a `file://` source. Skips the test
+/// when `git` is unavailable on `PATH` by returning `None`.
+fn seed_local_repo(prefix: &str) -> Option<PathBuf> {
+    intent_providers::resolve_on_path("git")?;
+    let id = Uuid::new_v4().simple().to_string();
+    let dir = PathBuf::from("/tmp").join(format!("{prefix}-{}", &id[..8]));
+    std::fs::create_dir_all(&dir).ok()?;
+    let run = |args: &[&str]| -> bool {
+        Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .env("GIT_AUTHOR_NAME", "Tester")
+            .env("GIT_AUTHOR_EMAIL", "t@e.dev")
+            .env("GIT_COMMITTER_NAME", "Tester")
+            .env("GIT_COMMITTER_EMAIL", "t@e.dev")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !run(&["init", "--quiet"]) {
+        return None;
+    }
+    std::fs::write(dir.join("README.md"), "init\n").ok()?;
+    if !run(&["add", "README.md"]) || !run(&["commit", "-q", "-m", "chore: init"]) {
+        return None;
+    }
+    Some(dir)
+}
+
+/// `workspace.create { githubUrl }` clones the URL inside the idempotent op
+/// and streams `git:clone:progress` + `git:clone:done` under the new workspace
+/// id before `workspace:created` publishes. The result's `workspace` carries
+/// the clone target as `repositoryPath`.
+#[tokio::test]
+async fn workspace_create_clones_github_url_over_wss() {
+    let Some(source) = seed_local_repo("itd-wss-clone-src") else {
+        eprintln!("skipping WSS clone E2E: git not available");
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let clone_target = data_dir.join("cloned-checkout");
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe unfiltered before creating so the clone
+    // frames land in the buffer.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:*", "git:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "Cloned via WSS",
+            "branch": "feat/wss-clone",
+            "githubUrl": format!("file://{}", source.display()),
+            "clonePath": clone_target.to_string_lossy(),
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"].as_str().expect("workspace id");
+    assert_eq!(
+        created["workspace"]["repositoryPath"],
+        clone_target.to_string_lossy().as_ref(),
+        "repositoryPath set from clone target: {created}"
+    );
+    assert!(
+        clone_target.join(".git").exists(),
+        "checkout materialized at {clone_target:?}"
+    );
+
+    let mut saw_progress = false;
+    let mut saw_done_ok = false;
+    let mut ws_created_after_clone = false;
+    let mut clone_done_first = false;
+    for _ in 0..60 {
+        let frame = wss_event(&mut sub, 15).await;
+        let ev = &frame["params"]["event"];
+        match ev["type"].as_str() {
+            Some("git:clone:progress") => {
+                assert_eq!(ev["workspaceId"], ws_id, "progress scoped to new ws: {ev}");
+                saw_progress = true;
+            }
+            Some("git:clone:done") => {
+                assert_eq!(ev["workspaceId"], ws_id);
+                assert_eq!(ev["data"]["ok"], true, "clone succeeded: {ev}");
+                saw_done_ok = true;
+                clone_done_first = !ws_created_after_clone;
+            }
+            Some("workspace:created") => {
+                assert_eq!(ev["data"]["workspaceId"], ws_id);
+                ws_created_after_clone = true;
+            }
+            _ => {}
+        }
+        if saw_progress && saw_done_ok && ws_created_after_clone {
+            break;
+        }
+    }
+    assert!(saw_progress, "git:clone:progress observed");
+    assert!(saw_done_ok, "git:clone:done ok observed");
+    assert!(
+        clone_done_first,
+        "git:clone:done precedes workspace:created"
+    );
+
+    // Cleanup the seed source (best-effort).
+    let _ = std::fs::remove_dir_all(&source);
+}

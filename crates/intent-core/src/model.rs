@@ -350,6 +350,15 @@ pub struct WorkspaceCreate {
     /// Git remote used to resolve `baseRef` when provisioning the worktree
     /// (default `origin`; e.g. `upstream` for forks). Not persisted.
     pub remote: Option<String>,
+    /// GitHub-style clone URL (https or ssh). When set and `repositoryPath` is
+    /// not already an existing local git repo, the daemon clones the URL into
+    /// `clonePath` (or a default derived from the workspaces root) *before*
+    /// worktree provisioning, and the resulting checkout becomes the
+    /// workspace's `repositoryPath` (PROTOCOL §5.1).
+    pub github_url: Option<String>,
+    /// Optional clone target directory used when `githubUrl` is set. Defaults
+    /// to `<workspaces_root>/clones/<repo-name>` when omitted.
+    pub clone_path: Option<String>,
     /// Initial agent payload (full shape; `prompt` also seeds the branch slug).
     pub initial_agent: Option<WorkspaceCreateInitialAgent>,
 }

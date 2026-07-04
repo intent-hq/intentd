@@ -3275,6 +3275,81 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let id = WorkspaceId::new();
+                    let mut input = input;
+                    // Clone orchestration (PROTOCOL §5.1): when `githubUrl` is
+                    // set and `repositoryPath` is not already a local git
+                    // repo, clone it *before* branch naming so the branch
+                    // uniquification and worktree provisioning downstream see
+                    // a real checkout. Progress is streamed under the newly
+                    // minted `workspaceId`; a failure fails the whole create
+                    // pre-insert (no row persisted, no partial state).
+                    let existing_repo = input
+                        .repository_path
+                        .as_deref()
+                        .filter(|p| !p.is_empty())
+                        .map(PathBuf::from)
+                        .filter(|p| p.join(".git").exists());
+                    if existing_repo.is_none() {
+                        if let Some(url) = input
+                            .github_url
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            let bus_ref = bus.clone().ok_or_else(|| {
+                                Error::Internal(
+                                    "event bus not wired; workspace.create clone requires streaming"
+                                        .to_string(),
+                                )
+                            })?;
+                            let target = match input.clone_path.as_deref() {
+                                Some(p) if !p.trim().is_empty() => PathBuf::from(p),
+                                _ => workspaces_root
+                                    .clone()
+                                    .unwrap_or_else(default_workspaces_root)
+                                    .join("clones")
+                                    .join(clone_ops::derive_default_target(url)),
+                            };
+                            if target.as_os_str().is_empty()
+                                || target
+                                    .file_name()
+                                    .map(|n| n.is_empty())
+                                    .unwrap_or(true)
+                            {
+                                return Err(Error::InvalidParams(
+                                    "clonePath must resolve to a non-empty target".to_string(),
+                                ));
+                            }
+                            if clone_ops::target_exists(&target) {
+                                return Err(Error::Internal(format!(
+                                    "clone target already exists: {}",
+                                    target.display()
+                                )));
+                            }
+                            let request_id = uuid::Uuid::new_v4().to_string();
+                            clone_ops::perform_clone(clone_ops::CloneJob {
+                                request_id,
+                                workspace_id: Some(id.clone()),
+                                url: url.to_string(),
+                                target_path: target.clone(),
+                                bus: bus_ref,
+                            })
+                            .await
+                            .map_err(|e| {
+                                Error::Internal(format!("workspace.create clone failed: {e}"))
+                            })?;
+                            input.repository_path =
+                                Some(target.to_string_lossy().to_string());
+                            if let Some((owner, name)) = clone_ops::parse_owner_repo(url) {
+                                if input.repository_owner.is_none() {
+                                    input.repository_owner = Some(owner);
+                                }
+                                if input.repository_name.is_none() {
+                                    input.repository_name = Some(name);
+                                }
+                            }
+                        }
+                    }
                     // Branch naming (TS parity): an explicit `branch` wins
                     // untouched; otherwise the branch is a friendly slug —
                     // extracted from `initialAgent.prompt` when possible

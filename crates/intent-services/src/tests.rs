@@ -7462,3 +7462,202 @@ mod initial_agent_orchestration {
         }
     }
 }
+
+/// Daemon-owned clone orchestration inside `workspace.create` (PROTOCOL §5.1):
+/// when `githubUrl` is set and no local repo is provided, the daemon clones
+/// first, sets `repositoryPath` from the clone target, derives owner/name
+/// from the URL, and streams `git:clone:*` under the new workspace id.
+/// Failures fail the whole create pre-insert.
+mod clone_orchestration {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use intent_core::{WorkspaceApi, WorkspaceCreate};
+    use intent_store::Store;
+
+    use super::TempDb;
+    use crate::{EventBus, Services, SubscriptionFilter};
+
+    /// Drop guard removing a temp directory tree.
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_dir(prefix: &str) -> TempDir {
+        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+
+    /// Init a small git repo with one commit; returns the guard.
+    fn seed_repo(prefix: &str) -> TempDir {
+        let dir = unique_dir(prefix);
+        let repo = git2::Repository::init(&dir.0).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Tester").unwrap();
+            cfg.set_str("user.email", "t@e.dev").unwrap();
+        }
+        std::fs::write(dir.0.join("README.md"), "init\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
+            .unwrap();
+        dir
+    }
+
+    async fn drain_event_types(sub: &mut crate::Subscription) -> Vec<String> {
+        let mut types = Vec::new();
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        {
+            for ev in batch {
+                types.push(ev.event_type);
+            }
+        }
+        types
+    }
+
+    /// `githubUrl` → daemon clones via `file://` (fast, hermetic), sets
+    /// `repositoryPath` to the clone target, and streams `git:clone:progress`
+    /// + `git:clone:done` under the new workspace id before the row insert
+    /// and `workspace:created`. Owner/name derivation from a real GitHub URL
+    /// is covered by `clone_ops::tests::parse_owner_repo_handles_https_and_ssh`.
+    #[tokio::test]
+    async fn create_clones_github_url_before_worktree() {
+        let source = seed_repo("intentd-clone-src");
+        let root = unique_dir("intentd-clone-root");
+        let clone_target = unique_dir("intentd-clone-target");
+        let clone_dir: PathBuf = clone_target.0.join("checkout");
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let res = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Cloned WS".to_string()),
+                    branch: Some("feat/clone-orch".to_string()),
+                    github_url: Some(url),
+                    clone_path: Some(clone_dir.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create");
+        let ws = res.workspace;
+        assert_eq!(
+            ws.repository_path.as_deref(),
+            Some(clone_dir.to_string_lossy().as_ref()),
+            "repositoryPath set from clone target"
+        );
+        assert!(clone_dir.join(".git").exists(), "clone actually happened");
+
+        // The clone streamed progress + a terminal ok done before the row
+        // insert and `workspace:created`.
+        let types = drain_event_types(&mut sub).await;
+        let starting_pos = types.iter().position(|t| t == "git:clone:progress");
+        let done_pos = types.iter().position(|t| t == "git:clone:done");
+        let ws_pos = types.iter().position(|t| t == "workspace:created");
+        assert!(
+            starting_pos.is_some(),
+            "git:clone:progress observed: {types:?}"
+        );
+        assert!(done_pos.is_some(), "git:clone:done observed: {types:?}");
+        assert!(
+            done_pos < ws_pos,
+            "clone completes before workspace insert: {types:?}"
+        );
+    }
+
+    /// A clone that cannot succeed (unreachable target under `file://`) fails
+    /// the whole `workspace.create` — no workspace row is persisted.
+    #[tokio::test]
+    async fn clone_failure_fails_create_no_row_persisted() {
+        let root = unique_dir("intentd-clone-fail-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let missing = format!("/does/not/exist/{}.git", uuid::Uuid::new_v4());
+        let target = unique_dir("intentd-clone-fail-target");
+        let clone_dir: PathBuf = target.0.join("checkout");
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Nope".to_string()),
+                    branch: Some("feat/clone-fail".to_string()),
+                    github_url: Some(format!("file://{missing}")),
+                    clone_path: Some(clone_dir.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("create must fail on clone failure");
+        assert!(
+            format!("{err}").contains("clone"),
+            "error mentions clone: {err}"
+        );
+        let list = store.list_workspaces(true).await.expect("list");
+        assert!(list.is_empty(), "no row persisted on clone failure");
+    }
+
+    /// A `githubUrl` alongside an existing local `repositoryPath` (a real git
+    /// repo on disk) is a no-op for clone: the daemon uses the local repo as
+    /// the workspace's `repositoryPath` and does not re-clone.
+    #[tokio::test]
+    async fn github_url_skipped_when_local_repo_is_present() {
+        let repo = seed_repo("intentd-clone-skip-src");
+        let root = unique_dir("intentd-clone-skip-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let res = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Skip clone".to_string()),
+                    branch: Some("feat/clone-skip".to_string()),
+                    repository_path: Some(repo.0.to_string_lossy().to_string()),
+                    github_url: Some("file:///does-not-matter/owner/name.git".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create");
+        assert_eq!(
+            res.workspace.repository_path.as_deref(),
+            Some(repo.0.to_string_lossy().as_ref()),
+            "existing local repo wins over githubUrl"
+        );
+        let types = drain_event_types(&mut sub).await;
+        assert!(
+            types.iter().all(|t| t != "git:clone:progress"),
+            "no clone attempted: {types:?}"
+        );
+    }
+}
