@@ -248,6 +248,46 @@ async fn uds_git_write_ops_round_trip() {
     assert_eq!(resp["result"]["ok"], json!(true));
     assert_eq!(resp["result"]["paths"], json!(["seed.txt"]));
 
+    // (h) git.agentCommit userRequested with no `files` commits only the
+    // already-staged paths — the unstaged edit stays in the worktree.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":11,"method":"git.stage","params":{"workspaceId":"ws-git","paths":["seed.txt"]}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    std::fs::write(repo.join("other.txt"), "unstaged\n").unwrap();
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":12,"method":"git.agentCommit","params":{"workspaceId":"ws-git","message":"user checkpoint","userRequested":true}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["files"], json!(["seed.txt"]));
+    assert_eq!(resp["result"]["fileCount"], json!(1));
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":13,"method":"git.status","params":{"workspaceId":"ws-git"}}"#,
+    )
+    .await;
+    let files = resp["result"]["files"].as_array().expect("files array");
+    assert!(
+        files.iter().any(|f| f["path"] == json!("other.txt")),
+        "unstaged file survives the userRequested commit: {files:?}"
+    );
+    assert!(
+        files.iter().all(|f| f["path"] != json!("seed.txt")),
+        "staged file was committed: {files:?}"
+    );
+
+    // (i) userRequested with a clean index → -32603 (nothing staged).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":14,"method":"git.agentCommit","params":{"workspaceId":"ws-git","message":"empty checkpoint","userRequested":true}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32603));
+
     let _ = tx.send(());
     let _ = server.await;
     std::fs::remove_dir_all(&base).ok();

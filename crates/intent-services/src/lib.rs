@@ -5601,18 +5601,24 @@ impl WorkspaceApi for Services {
             })?;
             // PARITY NOTE: TS filters to the agent's own unstaged changes via the
             // file-tracking attribution pipeline (deferred — not yet ported). Until
-            // it lands, an explicit `files` list is committed as-is; otherwise we
-            // fall back to every changed path in the worktree.
-            let to_commit = match files {
-                Some(f) if !f.is_empty() => f,
-                _ => intent_git::commit::all_changed_paths(&worktree)?,
+            // it lands, an explicit `files` list is committed as-is; without one, a
+            // `userRequested` checkpoint commits only the already-staged paths
+            // (plain `git commit` semantics — a user checkpoint must not sweep up
+            // other agents' worktree changes), while an agent-initiated commit
+            // falls back to every changed path in the worktree.
+            let (to_commit, needs_stage) = match files {
+                Some(f) if !f.is_empty() => (f, true),
+                _ if user_requested => (intent_git::commit::staged_paths(&worktree)?, false),
+                _ => (intent_git::commit::all_changed_paths(&worktree)?, true),
             };
             if to_commit.is_empty() {
                 return Err(Error::Internal(
                     "No uncommitted changes found for this agent".to_string(),
                 ));
             }
-            intent_git::stage::stage(&worktree, &to_commit)?;
+            if needs_stage {
+                intent_git::stage::stage(&worktree, &to_commit)?;
+            }
             let outcome = intent_git::commit::commit_with_trailers(
                 &worktree,
                 &message,
