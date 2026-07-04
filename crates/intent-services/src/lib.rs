@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use base64::Engine as _;
 use intent_core::events::{
     AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED,
-    COMMENT_ADDED, COMMENT_RESOLVED, GIT_COMMIT, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED,
-    PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED,
+    COMMENT_ADDED, COMMENT_RESOLVED, GIT_COMMIT, GIT_PULL, NOTE_CREATED, NOTE_DELETED,
+    NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED,
     TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
     WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
@@ -2040,6 +2040,30 @@ fn token_usage_changed_event(workspace_id: &WorkspaceId, usage: &TokenUsage) -> 
     }
 }
 
+/// Build a `git:pull` event for a completed pull inside a workspace worktree
+/// (§6.5). Payload `{ workspaceId, operation: "pull", branch }` mirrors the
+/// reserved `GitOperationEvent` shape in the FE `events/types.ts` so a client
+/// can render a pull marker without a follow-up read. Only emitted on success
+/// (the FE's structured `{ ok: false, error }` return already carries the
+/// failure detail — no event fires in that case).
+fn git_pull_event(workspace_id: &WorkspaceId, branch: &str) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: GIT_PULL.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "operation": "pull",
+            "branch": branch,
+        }),
+    }
+}
+
 /// Build a `changes:git-status` event carrying the refreshed `WorkspaceGitStatus`
 /// (§5.18, §6.5). Self-sufficient payload `{ workspaceId, status }`.
 fn changes_git_status_event(workspace_id: &WorkspaceId, status: serde_json::Value) -> NewEvent {
@@ -2155,6 +2179,25 @@ pub(crate) async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
     if let Err(e) = bus.publish(&event).await {
         tracing::warn!(error = %e, "failed to publish change event");
     }
+}
+
+/// Best-effort workspace lookup by worktree path (§6.5). Path-scoped git
+/// methods (e.g. `git.pull` during workspace-create auto-pull) reach this to
+/// resolve an owning workspace for change-event emission; missing rows are a
+/// normal path (auto-pull runs before workspace insert) so `None` is returned
+/// without an error. Compares canonicalized paths so trailing-slash / `.`
+/// segments don't cause a false miss. Includes archived rows so a pull inside
+/// an archived workspace's worktree still resolves.
+async fn find_workspace_by_worktree_path(store: &Store, repo_path: &str) -> Option<Workspace> {
+    let canon_target = std::fs::canonicalize(repo_path).ok()?;
+    let workspaces = store.list_workspaces(true).await.ok()?;
+    workspaces.into_iter().find(|ws| {
+        ws.worktree_path
+            .as_deref()
+            .and_then(|p| std::fs::canonicalize(p).ok())
+            .map(|p| p == canon_target)
+            .unwrap_or(false)
+    })
 }
 
 /// Idempotency wrapper for create/commit/PR-merge methods (design note TB-0 §5).
@@ -5808,6 +5851,8 @@ impl WorkspaceApi for Services {
         repo_path: String,
         branch_name: String,
     ) -> BoxFuture<'_, Result<intent_core::GitPullResult>> {
+        let store = self.store.clone();
+        let event_bus = self.event_bus.clone();
         Box::pin(async move {
             // Path-based like `git_get_branches`: the workspace-create auto-pull
             // runs *before* the repo is registered, so any existing local git
@@ -5817,7 +5862,28 @@ impl WorkspaceApi for Services {
             if branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams("branchName is required".to_string()));
             }
-            intent_git::pull::pull_branch(std::path::Path::new(&repo_path), &branch_name)
+            let outcome =
+                intent_git::pull::pull_branch(std::path::Path::new(&repo_path), &branch_name)?;
+            // Best-effort workspace resolution: `git.pull` is path-scoped (the
+            // workspace-create auto-pull runs before the workspace row exists),
+            // so we look up any workspace pointing at this worktree and skip
+            // event emission when none is found. Failing to find a workspace
+            // is a normal path — no error, no event.
+            if outcome.ok {
+                if let Some(ws) = find_workspace_by_worktree_path(&store, &repo_path).await {
+                    // `git:pull` mirrors the reserved `GitOperationEvent` FE
+                    // shape; `changes:git-status` feeds the FE bridge's
+                    // `git:status-changed` relay so the UI refreshes without a
+                    // follow-up `git.status` read.
+                    publish_event(&event_bus, git_pull_event(&ws.id, &branch_name)).await;
+                    let status = intent_git::status::status(std::path::Path::new(&repo_path))
+                        .unwrap_or_else(|_| intent_git::status::empty_status());
+                    let status_json =
+                        serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+                    publish_event(&event_bus, changes_git_status_event(&ws.id, status_json)).await;
+                }
+            }
+            Ok(outcome)
         })
     }
 
