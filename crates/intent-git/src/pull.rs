@@ -204,6 +204,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bare);
     }
 
+    /// Regression for the workspace-create auto-pull: a branch already level
+    /// with `origin/<branch>` (0 ahead / 0 behind, only untracked noise like
+    /// `.DS_Store`) must pull as a no-op `{ ok: true }` — never a rebase
+    /// failure — and the auto-stash bookends must leave no stash entry behind.
+    #[test]
+    fn pull_up_to_date_branch_is_noop_ok() {
+        let (dir, bare, branch) = setup_with_origin("pull-up-to-date");
+        write_file(dir.path(), ".DS_Store", "junk\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let head_before = repo.head().unwrap().target().unwrap();
+
+        let result = pull_branch(dir.path(), &branch).unwrap();
+        assert!(result.ok, "expected no-op pull to succeed, got {result:?}");
+        assert!(result.error.is_none());
+
+        let mut repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(repo.head().unwrap().target().unwrap(), head_before);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".DS_Store")).unwrap(),
+            "junk\n"
+        );
+        let mut stash_count = 0;
+        repo.stash_foreach(|_, _, _| {
+            stash_count += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(stash_count, 0, "no stash entry may leak from a no-op pull");
+
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
     #[test]
     fn pull_auto_stashes_dirty_worktree_and_restores_changes() {
         let (dir, bare, branch) = setup_with_origin("pull-stash");
