@@ -1957,6 +1957,83 @@ mod change_event_parity {
             .expect("seen again");
         assert_eq!(again.attention, WorkspaceAttention::None);
     }
+
+    /// `workspace.create` emits `workspace:created` after the row is inserted
+    /// (§6.5), with the self-sufficient `{ workspaceId, workspace }` payload
+    /// (§6.7). The new workspace mints its own id, so subscribe unfiltered.
+    #[tokio::test]
+    async fn workspace_created_payload() {
+        use intent_core::WorkspaceCreate;
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let created = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("New workspace".to_string()),
+                    branch: Some("feat/created-event".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &created.id.0, "workspace:created");
+        assert_eq!(ev["data"]["workspaceId"], created.id.0);
+        assert_eq!(
+            ev["data"]["workspace"],
+            serde_json::to_value(&created).expect("workspace json")
+        );
+    }
+
+    /// Idempotency replay (design note TB-0 §5.3): a second `workspace.create`
+    /// with the same key returns the ORIGINAL workspace without re-executing —
+    /// so no second row and no second `workspace:created` event.
+    #[tokio::test]
+    async fn idempotent_create_workspace_replay_no_second_event() {
+        use intent_core::WorkspaceCreate;
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let key = Some("ws-idem-1".to_string());
+        let first = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("First".to_string()),
+                    branch: Some("feat/idem-a".to_string()),
+                    ..Default::default()
+                },
+                key.clone(),
+            )
+            .await
+            .expect("first create");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &first.id.0, "workspace:created");
+
+        // Replay with the same key but different input still returns the
+        // original workspace (the body is never re-executed).
+        let second = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Second".to_string()),
+                    branch: Some("feat/idem-b".to_string()),
+                    ..Default::default()
+                },
+                key,
+            )
+            .await
+            .expect("replay create");
+        assert_eq!(
+            second.id.0, first.id.0,
+            "replay returns the original workspace"
+        );
+
+        // No second event is published (the replay short-circuits the op).
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(none.is_err(), "replay must not publish a second event");
+    }
 }
 
 /// End-to-end §6.8 "one impl, two front doors": an agent (via the in-process MCP
@@ -5932,6 +6009,7 @@ mod worktree_provisioning {
             base_ref: Some(head_branch.clone()),
             initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                 prompt: Some(prompt.to_string()),
+                ..Default::default()
             }),
             ..Default::default()
         };

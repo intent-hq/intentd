@@ -16,7 +16,7 @@ use intent_core::events::{
     COMMENT_ADDED, COMMENT_RESOLVED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED,
     PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED,
     TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
-    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_TOKEN_USAGE_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_TOKEN_USAGE_CHANGED,
 };
 use intent_core::{
     iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId, AgentLite,
@@ -1805,6 +1805,26 @@ fn comment_resolved_event(
     }
 }
 
+/// Build a `workspace:created` event for a freshly inserted workspace row
+/// (§6.5). Self-sufficient payload `{ workspaceId, workspace }` (§6.7) so a
+/// client can render the new workspace without a follow-up read.
+fn workspace_created_event(ws: &Workspace) -> NewEvent {
+    NewEvent {
+        workspace_id: ws.id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_CREATED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": ws.id.as_str(),
+            "workspace": ws,
+        }),
+    }
+}
+
 /// Build a `pr:linked` event for a workspace that just gained a PR link (§7.6).
 /// Self-sufficient payload `{ workspaceId, prNumber, prUrl, prStatus,
 /// activePullRequest }` so a client can render the link without a follow-up read.
@@ -3178,6 +3198,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let worktree_locks = self.worktree_locks.clone();
         let workspaces_root = self.workspaces_root.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             // workspace.create carries no workspaceId → "" sentinel scope (§5.1).
             let op_store = store.clone();
@@ -3374,6 +3395,10 @@ impl WorkspaceApi for Services {
                             tracing::warn!(error = %e, "failed to register repo in registry");
                         }
                     }
+                    // Inside the idempotency scope: a replayed create returns
+                    // the stored result without re-running the op, so the
+                    // event fires at most once per logical create (§6.5).
+                    publish_event(&bus, workspace_created_event(&ws)).await;
                     Ok(ws)
                 },
             )
