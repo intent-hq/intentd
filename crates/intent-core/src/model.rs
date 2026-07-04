@@ -347,6 +347,9 @@ pub struct WorkspaceCreate {
     pub setup_script: Option<String>,
     pub is_remote: Option<bool>,
     pub default_model: Option<String>,
+    /// Git remote used to resolve `baseRef` when provisioning the worktree
+    /// (default `origin`; e.g. `upstream` for forks). Not persisted.
+    pub remote: Option<String>,
 }
 
 /// Wire input for `workspace.update` (PROTOCOL §5.1). Every field is optional;

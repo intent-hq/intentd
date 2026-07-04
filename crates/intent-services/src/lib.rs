@@ -182,6 +182,11 @@ pub struct Services {
     /// `accept-changes.execute` commit/push path never races concurrent agents
     /// or operations on the same worktree.
     worktree_locks: intent_git::worktree::WorktreeLocks,
+    /// Root directory `workspace.create` provisions worktrees under
+    /// (`<root>/<workspaceId>/<repo-slug>`). `None` resolves the default at
+    /// call time: `$INTENTD_WORKSPACES_DIR`, else `~/intent/workspaces` (the
+    /// FE's `WorkspaceConfig.WORKSPACES_BASE`). Tests inject a temp dir.
+    workspaces_root: Option<PathBuf>,
     /// Per-request cancellation registry for `search.*` (§14.3). Keyed by
     /// `requestId`, it lets `search.cancel` abort an in-flight search. Shares
     /// its inner map across clones so a cancel observed by any handle reaches
@@ -256,6 +261,7 @@ impl Services {
             linear_engine: None,
             sentry_engine: None,
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
+            workspaces_root: None,
             search_cancels: intent_search::CancelRegistry::new(),
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
             pty: Arc::new(intent_pty::PtyHost::new()),
@@ -575,6 +581,14 @@ impl Services {
     /// Configure the note-asset root directory (for `note.readAsset`).
     pub fn with_assets_root(mut self, root: PathBuf) -> Self {
         self.assets_root = Some(root);
+        self
+    }
+
+    /// Override the root directory `workspace.create` provisions git worktrees
+    /// under. The composition root keeps the default (`$INTENTD_WORKSPACES_DIR`,
+    /// else `~/intent/workspaces`); tests inject a temp dir.
+    pub fn with_workspaces_root(mut self, root: PathBuf) -> Self {
+        self.workspaces_root = Some(root);
         self
     }
 
@@ -1411,6 +1425,44 @@ fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
         "Unknown".to_string()
     } else {
         base.to_string()
+    }
+}
+
+/// Default root for daemon-provisioned worktrees: `$INTENTD_WORKSPACES_DIR`
+/// override, else `~/intent/workspaces` — the FE's
+/// `WorkspaceConfig.WORKSPACES_BASE` layout (`<root>/<workspaceId>/<repo-slug>`).
+fn default_workspaces_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("INTENTD_WORKSPACES_DIR") {
+        return PathBuf::from(dir);
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("intent")
+        .join("workspaces")
+}
+
+/// Worktree folder name for a repo, porting the FE
+/// `WorkspaceConfigConstants.slugify` + `generateWorktreeFolderName`:
+/// lowercase, non-alphanumeric runs collapse to `-`, trimmed, ≤50 chars,
+/// `"repo"` fallback.
+fn worktree_folder_slug(repo_name: &str) -> String {
+    let mut slug = String::new();
+    for c in repo_name.chars().flat_map(char::to_lowercase) {
+        if slug.len() >= 50 {
+            break;
+        }
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() {
+        "repo".to_string()
+    } else {
+        slug.to_string()
     }
 }
 
@@ -3071,6 +3123,8 @@ impl WorkspaceApi for Services {
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
+        let worktree_locks = self.worktree_locks.clone();
+        let workspaces_root = self.workspaces_root.clone();
         Box::pin(async move {
             // workspace.create carries no workspaceId → "" sentinel scope (§5.1).
             let op_store = store.clone();
@@ -3085,7 +3139,7 @@ impl WorkspaceApi for Services {
                     let id = WorkspaceId::new();
                     // The branch defaults to the workspace id, mirroring the TS service.
                     let branch = input.branch.unwrap_or_else(|| id.0.clone());
-                    let ws = Workspace {
+                    let mut ws = Workspace {
                         id,
                         title: input.title.unwrap_or_default(),
                         branch,
@@ -3122,6 +3176,75 @@ impl WorkspaceApi for Services {
                         diff_summary: None,
                         token_usage: None,
                     };
+                    // Provision the git worktree (TS `createGitWorktree` parity):
+                    // a local workspace created off a local git repo gets a
+                    // linked worktree at `<root>/<workspaceId>/<repo-slug>` on
+                    // its branch, so agents spawn inside a real checkout instead
+                    // of falling back to a temp dir. Skipped for remote/
+                    // `skipWorktree` workspaces, callers supplying their own
+                    // `worktreePath`, and repository paths that are not a local
+                    // git repo (registry-only rows keep the prior behavior).
+                    let has_worktree = ws
+                        .worktree_path
+                        .as_deref()
+                        .is_some_and(|p| !p.is_empty());
+                    let repo_dir = ws
+                        .repository_path
+                        .as_deref()
+                        .filter(|p| !p.is_empty())
+                        .map(PathBuf::from);
+                    if let Some(repo_dir) = repo_dir {
+                        if !ws.is_remote && !ws.skip_worktree && !has_worktree {
+                            if repo_dir.join(".git").exists() {
+                                let root = workspaces_root
+                                    .unwrap_or_else(default_workspaces_root);
+                                let repo_name = known_repo_name(
+                                    ws.repository_name.as_deref(),
+                                    &repo_dir.to_string_lossy(),
+                                );
+                                let wt_path = root
+                                    .join(&ws.id.0)
+                                    .join(worktree_folder_slug(&repo_name));
+                                let name = ws.id.0.clone();
+                                let branch = ws.branch.clone();
+                                let base_ref = ws.base_ref.clone();
+                                let remote =
+                                    input.remote.unwrap_or_else(|| "origin".to_string());
+                                let repo = repo_dir.clone();
+                                let wt = wt_path.clone();
+                                let sha = worktree_locks
+                                    .with_lock(&repo_dir, move || async move {
+                                        tokio::task::spawn_blocking(move || {
+                                            intent_git::worktree::provision_worktree(
+                                                &repo,
+                                                &name,
+                                                &wt,
+                                                &branch,
+                                                base_ref.as_deref(),
+                                                &remote,
+                                            )
+                                        })
+                                        .await
+                                        .map_err(|e| {
+                                            Error::Internal(format!(
+                                                "worktree provisioning task failed: {e}"
+                                            ))
+                                        })?
+                                    })
+                                    .await?;
+                                ws.worktree_path =
+                                    Some(wt_path.to_string_lossy().to_string());
+                                if ws.base_commit_sha.is_none() {
+                                    ws.base_commit_sha = Some(sha);
+                                }
+                            } else {
+                                tracing::warn!(
+                                    repository_path = %repo_dir.display(),
+                                    "workspace.create: repositoryPath is not a local git repo; skipping worktree provisioning"
+                                );
+                            }
+                        }
+                    }
                     store.insert_workspace(&ws).await?;
                     // Register the repo in the persistent registry so it survives
                     // workspace deletion and appears in `repo.list` without a restart

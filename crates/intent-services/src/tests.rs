@@ -5790,6 +5790,223 @@ mod known_repo {
     }
 }
 
+mod worktree_provisioning {
+    use super::*;
+    use intent_core::WorkspaceCreate;
+
+    /// Drop guard removing a temp directory tree.
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_dir(prefix: &str) -> TempDir {
+        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+
+    /// Commit everything in the worktree on the current branch, returning the oid.
+    fn commit_all(repo: &git2::Repository, msg: &str) -> git2::Oid {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .and_then(|o| repo.find_commit(o).ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
+            .unwrap()
+    }
+
+    /// Init a git repo with one commit; returns (guard, head sha, head branch).
+    fn seed_repo(prefix: &str) -> (TempDir, String, String) {
+        let dir = unique_dir(prefix);
+        let repo = git2::Repository::init(&dir.0).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Tester").unwrap();
+            cfg.set_str("user.email", "t@e.dev").unwrap();
+        }
+        std::fs::write(dir.0.join("README.md"), "init\n").unwrap();
+        let sha = commit_all(&repo, "chore: init").to_string();
+        let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+        (dir, sha, branch)
+    }
+
+    /// Regression for "agent spawns in a temp dir": `workspace.create` off a
+    /// local git repo must provision a linked worktree at
+    /// `<root>/<workspaceId>/<repo-slug>` on the workspace branch and record
+    /// the base commit SHA.
+    #[tokio::test]
+    async fn create_provisions_worktree_from_local_repo() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, head_sha, head_branch) = seed_repo("intentd-wtprov-repo");
+        let root = unique_dir("intentd-wtprov-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    repository_name: Some("My Repo".to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create");
+
+        let wt = ws.worktree_path.as_deref().expect("worktree path set");
+        assert_eq!(
+            wt,
+            root.0
+                .join(&ws.id.0)
+                .join("my-repo")
+                .to_string_lossy()
+                .as_ref(),
+            "worktree lives at <root>/<workspaceId>/<repo-slug>"
+        );
+        let wt_repo = git2::Repository::open(wt).expect("worktree opens as a git repo");
+        assert!(wt_repo.is_worktree());
+        // The branch defaults to the workspace id and is checked out.
+        assert_eq!(ws.branch, ws.id.0);
+        assert_eq!(
+            wt_repo.head().unwrap().shorthand().expect("branch name"),
+            ws.branch.as_str()
+        );
+        assert_eq!(ws.base_commit_sha.as_deref(), Some(head_sha.as_str()));
+    }
+
+    /// `baseRef` selects the starting commit, and an explicit `branch` names
+    /// the checked-out branch.
+    #[tokio::test]
+    async fn create_provisions_worktree_at_requested_base_ref() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, first_sha, _) = seed_repo("intentd-wtbase-repo");
+        let repo = git2::Repository::open(&repo_dir.0).unwrap();
+        // Pin `base` at the first commit, then advance HEAD past it.
+        let first = repo
+            .find_commit(git2::Oid::from_str(&first_sha).unwrap())
+            .unwrap();
+        repo.branch("base", &first, false).unwrap();
+        std::fs::write(repo_dir.0.join("b.txt"), "y\n").unwrap();
+        commit_all(&repo, "feat: second");
+        let root = unique_dir("intentd-wtbase-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    branch: Some("my-feature".to_string()),
+                    base_ref: Some("base".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create");
+
+        assert_eq!(ws.branch, "my-feature");
+        assert_eq!(ws.base_commit_sha.as_deref(), Some(first_sha.as_str()));
+        let wt_repo =
+            git2::Repository::open(ws.worktree_path.as_deref().unwrap()).expect("worktree");
+        let head = wt_repo.head().unwrap();
+        assert_eq!(head.shorthand().expect("branch name"), "my-feature");
+        assert_eq!(head.target().unwrap().to_string(), first_sha);
+    }
+
+    /// An unresolvable `baseRef` on a valid repo fails creation loudly instead
+    /// of silently persisting a workspace without a checkout.
+    #[tokio::test]
+    async fn create_fails_on_unresolvable_base_ref() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, _) = seed_repo("intentd-wtbad-repo");
+        let root = unique_dir("intentd-wtbad-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some("no-such-ref".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("create must fail");
+        assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    /// `skipWorktree`, non-git `repositoryPath`, and a caller-supplied
+    /// `worktreePath` all skip provisioning (prior row-only behavior).
+    #[tokio::test]
+    async fn create_skips_provisioning_when_opted_out_or_not_a_repo() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, _) = seed_repo("intentd-wtskip-repo");
+        let root = unique_dir("intentd-wtskip-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    skip_worktree: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create");
+        assert!(ws.worktree_path.is_none(), "skipWorktree opts out");
+
+        let plain = unique_dir("intentd-wtskip-plain");
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(plain.0.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create");
+        assert!(ws.worktree_path.is_none(), "non-git path stays row-only");
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    worktree_path: Some("/tmp/custom-wt".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create");
+        assert_eq!(
+            ws.worktree_path.as_deref(),
+            Some("/tmp/custom-wt"),
+            "caller-supplied worktreePath is respected untouched"
+        );
+    }
+}
+
 mod file_ops_service {
     use super::*;
 
