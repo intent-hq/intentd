@@ -79,7 +79,8 @@ impl ScriptManager {
         }
     }
 
-    /// `script.create`: register a definition, persist it, and return it.
+    /// `script.create`: register (or upsert) a definition, persist it, and
+    /// return it.
     pub(crate) async fn create(
         &self,
         workspace_id: WorkspaceId,
@@ -89,6 +90,28 @@ impl ScriptManager {
             .script_id
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // Upsert of an existing id (`ws.script.create` with `scriptId`):
+        // the definition is replaced with `source`/`createdAt` preserved and
+        // `updatedAt` stamped (FE parity), and — unlike the FE, whose manager
+        // re-reads definitions from disk — the daemon must tear down the old
+        // supervisor/PTY here so a running replaced script is never orphaned.
+        let existing = self.scripts.lock().unwrap().remove(&id);
+        let (source, created_at, updated_at) = match &existing {
+            Some(old) => (
+                old.def.source.clone(),
+                old.def.created_at.clone(),
+                Some(now_iso()),
+            ),
+            None => ("user".to_string(), now_iso(), None),
+        };
+        if let Some(mut old) = existing {
+            if let Some(handle) = old.supervisor.take() {
+                handle.abort();
+            }
+            if let Some(pty_id) = old.pty_id {
+                self.pty.kill(pty_id).await;
+            }
+        }
         let def = Script {
             id: id.clone(),
             workspace_id: workspace_id.as_str().to_string(),
@@ -98,10 +121,10 @@ impl ScriptManager {
             env: params.env,
             mode: params.mode,
             category: params.category,
-            source: "user".to_string(),
+            source,
             auto_start: params.auto_start,
-            created_at: now_iso(),
-            updated_at: None,
+            created_at,
+            updated_at,
         };
         // Persist first (FE `upsertScript` parity — definitions survive a
         // daemon restart); the runtime registry only registers what is durable.
@@ -1393,6 +1416,83 @@ mod tests {
             0,
             "removed script is unpersisted"
         );
+    }
+
+    /// Regression: `script.create` upserting an id whose script is running
+    /// must stop the old supervisor/PTY (no orphaned process), preserve the
+    /// original `createdAt`/`source`, stamp `updatedAt`, and reset the
+    /// runtime state to idle.
+    #[tokio::test]
+    async fn script_create_upsert_stops_running_predecessor() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "svc".into(),
+                command: "sleep 30".into(),
+                mode: ScriptMode::Service,
+                script_id: Some("upsert-1".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let listed = h.services.script_list(h.ws.clone()).await.expect("list");
+        let created_at = listed["scripts"][0]["createdAt"]
+            .as_str()
+            .expect("createdAt")
+            .to_string();
+
+        h.services.script_start(id.clone()).await.expect("start");
+        let running = await_state(&mut sub, Duration::from_secs(5), |v| {
+            v["data"]["status"] == "running"
+        })
+        .await;
+        let pid = running["data"]["pid"].as_i64().expect("pid");
+
+        // Upsert the same id with a new command while the old one runs.
+        let v = create(
+            &h,
+            ScriptCreateParams {
+                name: "svc renamed".into(),
+                command: "echo hi".into(),
+                mode: ScriptMode::Command,
+                script_id: Some(id.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(v, id, "upsert keeps the id");
+
+        let listed = h.services.script_list(h.ws.clone()).await.expect("list");
+        let scripts = listed["scripts"].as_array().expect("array");
+        assert_eq!(scripts.len(), 1, "no duplicate entry");
+        let entry = &scripts[0];
+        assert_eq!(entry["name"], "svc renamed");
+        assert_eq!(entry["command"], "echo hi");
+        assert_eq!(entry["createdAt"].as_str(), Some(created_at.as_str()));
+        assert!(entry["updatedAt"].is_string(), "updatedAt stamped");
+        assert_eq!(entry["source"], "user", "source preserved");
+        assert_eq!(entry["runtime"]["status"], "idle", "runtime reset");
+
+        // The replaced PTY process must die — no orphan (kill -0 fails).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run kill -0")
+                .success();
+            if !alive {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "old script process {pid} is still alive after upsert"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]
