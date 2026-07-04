@@ -872,6 +872,148 @@ async fn interrupt_send_message_idle_agent_falls_through_to_send() {
     );
 }
 
+/// The SAME interrupt-priority message (same `messageId`) delivered twice in
+/// quick succession preempts exactly once: the duplicate is acknowledged
+/// idempotently (`deduplicated: true`) without cancelling the interrupt turn
+/// it raced and without re-persisting the message; the child handle survives
+/// and the agent never reaches a failed status. A DISTINCT `messageId` is a
+/// genuinely new interrupt and still preempts.
+#[tokio::test]
+async fn duplicate_interrupt_send_same_message_id_preempts_once() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-dup"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&id, "acp-int-dup")
+        .await
+        .unwrap();
+    // Claim the in-flight slot so the first delivery preempts a busy turn.
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let first = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "dup-urgent".to_string(),
+            Some("user-msg-dup".to_string()),
+        )
+        .await
+        .expect("first interrupt send");
+    assert_eq!(first["success"], json!(true));
+    assert_eq!(first["queued"], json!(false));
+    assert_eq!(first["messageId"], json!("user-msg-dup"));
+
+    // Duplicate delivery of the SAME message id, racing the interrupt turn the
+    // first delivery just started: acknowledged, no second preemption/persist.
+    let second = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "dup-urgent".to_string(),
+            Some("user-msg-dup".to_string()),
+        )
+        .await
+        .expect("duplicate interrupt send");
+    assert_eq!(second["success"], json!(true));
+    assert_eq!(
+        second["deduplicated"],
+        json!(true),
+        "duplicate is acknowledged idempotently: {second}"
+    );
+    assert_eq!(second["messageId"], json!("user-msg-dup"));
+
+    // Not double-persisted: exactly ONE user message carries the content.
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let dup_count = session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == "user"
+                && serde_json::to_string(&m.content)
+                    .unwrap()
+                    .contains("dup-urgent")
+        })
+        .count();
+    assert_eq!(dup_count, 1, "duplicate delivery must not double-persist");
+    assert!(
+        mgr.handles.lock().unwrap().contains_key(&id),
+        "the child handle survives the duplicate (never killed)"
+    );
+    assert_ne!(
+        session.status,
+        AgentStatus::Error,
+        "the agent never transitions to a failed status"
+    );
+
+    // A DISTINCT message id is a new interrupt, not a duplicate: it preempts
+    // (or claims the idle slot) and persists normally.
+    let third = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "next-urgent".to_string(),
+            Some("user-msg-next".to_string()),
+        )
+        .await
+        .expect("distinct interrupt send");
+    assert_eq!(third["success"], json!(true));
+    assert!(
+        third.get("deduplicated").is_none(),
+        "a new messageId is never deduplicated: {third}"
+    );
+}
+
+/// Interrupt-priority delivery during TURN STARTUP (busy slot claimed but no
+/// cancellable turn yet — no `acpSessionId` persisted, the spawn/`session/new`
+/// window): preemption is skipped (a keep-alive interrupt is impossible and
+/// falling back to `stop` would kill the child) and the message queues behind
+/// the starting turn instead. The child handle survives, the starting turn is
+/// left intact, and the agent never reaches a failed status.
+#[tokio::test]
+async fn interrupt_send_during_turn_startup_queues_keep_alive() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-startup"));
+    seed_agent(&mgr, &ws, &id).await;
+    // Child handle live but NO `acpSessionId` yet — `session/new` in flight.
+    let _agent = track_mock_agent(&mgr, &id, false);
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let result = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "early interrupt".to_string(),
+            Some("user-msg-early".to_string()),
+        )
+        .await
+        .expect("startup-window interrupt send");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(
+        result["queued"],
+        json!(true),
+        "startup window queues keep-alive instead of preempting: {result}"
+    );
+    assert_eq!(result["queuedMessage"]["content"], json!("early interrupt"));
+    assert!(
+        mgr.handles.lock().unwrap().contains_key(&id),
+        "the child handle survives (no stop-kill fallback)"
+    );
+    assert!(
+        mgr.is_busy(&id),
+        "the starting turn keeps its in-flight slot"
+    );
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_ne!(
+        session.status,
+        AgentStatus::Error,
+        "the agent never transitions to a failed status"
+    );
+}
+
 // --- SP-B: spawn `agent_type` derived from the specialist's `agentType` -------
 
 /// Self-cleaning temp directory for hermetic specialist-file fixtures.

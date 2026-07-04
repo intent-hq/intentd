@@ -540,6 +540,13 @@ pub struct AgentManager {
     /// `<supervisor>` XML so the fresh session has context, then clears the flag
     /// (parity: TS `sessionWasRecreated`).
     recreated: Arc<Mutex<HashSet<AgentId>>>,
+    /// Most recent interrupt-priority `messageId` delivered per agent
+    /// (PROTOCOL §5.5). [`AgentManager::interrupt_send_message`] records the
+    /// client-supplied id under this lock BEFORE preempting, so the SAME
+    /// interrupt delivered twice (client retry / event double-fire) preempts
+    /// exactly once — the duplicate is acknowledged idempotently instead of
+    /// cancelling the interrupt turn it raced and re-persisting the message.
+    interrupt_ids: Arc<Mutex<HashMap<AgentId, String>>>,
 }
 
 impl AgentManager {
@@ -562,6 +569,7 @@ impl AgentManager {
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             recreated: Arc::new(Mutex::new(HashSet::new())),
+            interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1297,6 +1305,22 @@ impl AgentManager {
     /// agent keeps processing (the queue drains after the interrupt turn). An
     /// idle agent falls through to the normal [`AgentManager::send_message`]
     /// path unchanged.
+    ///
+    /// Two crash timings from the reference app are guarded here:
+    /// - **Duplicate delivery.** The SAME interrupt (same client-supplied
+    ///   `messageId`) delivered twice in quick succession preempts exactly
+    ///   once: the id is recorded under [`AgentManager::interrupt_ids`] BEFORE
+    ///   preempting, so the duplicate returns an idempotent
+    ///   `{ success, queued: false, messageId, deduplicated: true }` ack
+    ///   without cancelling the interrupt turn it raced and without
+    ///   re-persisting the message. Dedup requires a stable `messageId`; a
+    ///   distinct id is a genuinely new interrupt and preempts normally.
+    /// - **Turn startup.** When the busy slot is claimed but there is no
+    ///   cancellable turn yet (child handle / `acpSessionId` not live — the
+    ///   spawn/`session/new` window), [`AgentManager::interrupt`] would fall
+    ///   back to the hard `stop` kill. Preemption is skipped instead and the
+    ///   message queues keep-alive behind the starting turn (`queued: true`),
+    ///   draining right after it — the agent is never killed.
     pub async fn interrupt_send_message(
         self: &Arc<Self>,
         agent_id: AgentId,
@@ -1304,11 +1328,41 @@ impl AgentManager {
         content: String,
         message_id: Option<String>,
     ) -> Result<Value> {
+        // Duplicate-delivery guard: check-and-record is atomic under the lock,
+        // so of two racing duplicates exactly one proceeds to preempt.
+        if let Some(mid) = message_id.as_deref() {
+            let mut ids = self.interrupt_ids.lock().unwrap();
+            if ids.get(&agent_id).map(String::as_str) == Some(mid) {
+                return Ok(json!({
+                    "success": true,
+                    "queued": false,
+                    "messageId": mid,
+                    "deduplicated": true,
+                }));
+            }
+            ids.insert(agent_id.clone(), mid.to_string());
+        }
         if self.is_busy(&agent_id) {
-            // Keep-alive: cancels the turn over the wire, aborts the draining
-            // worker, releases the in-flight slot, and emits the terminal
-            // `agent:stream:end` — the child + ACP session stay alive.
-            self.interrupt(&agent_id).await;
+            // Preempt only when a cancellable turn is live (handle +
+            // `acpSessionId`); during turn startup the keep-alive interrupt
+            // would fall back to the `stop` kill path, so skip it and let
+            // `send_message` queue behind the starting turn instead.
+            let cancellable = self.contains(&agent_id)
+                && self
+                    .services
+                    .store
+                    .get_agent_session(&agent_id)
+                    .await
+                    .ok()
+                    .and_then(|s| s.acp_session_id)
+                    .is_some();
+            if cancellable {
+                // Keep-alive: cancels the turn over the wire, aborts the
+                // draining worker, releases the in-flight slot, and emits the
+                // terminal `agent:stream:end` — the child + ACP session stay
+                // alive.
+                self.interrupt(&agent_id).await;
+            }
         }
         // The slot was just released (or was never held): the send path claims
         // it and streams the interrupt message right away rather than queueing.
