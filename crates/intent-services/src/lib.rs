@@ -13,10 +13,11 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use base64::Engine as _;
 use intent_core::events::{
     AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED,
-    COMMENT_ADDED, COMMENT_RESOLVED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED,
-    PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED,
+    COMMENT_ADDED, COMMENT_RESOLVED, GIT_COMMIT, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED,
+    PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED,
     TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
-    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_TOKEN_USAGE_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
+    WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::{
     iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId, AgentLite,
@@ -1888,6 +1889,77 @@ fn workspace_created_event(ws: &Workspace) -> NewEvent {
     }
 }
 
+/// Build a `workspace:updated` event for a workspace whose row was just
+/// mutated (§6.5). Payload `{ workspaceId, changes }` mirrors the reference
+/// FE emitter — `changes` is the caller-supplied `WorkspaceUpdate` diff (the
+/// applied delta, not the full row) so clients see exactly which fields
+/// moved.
+fn workspace_updated_event(workspace_id: &WorkspaceId, changes: serde_json::Value) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_UPDATED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "changes": changes,
+        }),
+    }
+}
+
+/// Build a `workspace:deleted` event for a workspace whose row was just
+/// removed (§6.5). Minimal payload `{ workspaceId }` matches the reference FE
+/// emitter — subscribers drop caches keyed on the id without needing more.
+fn workspace_deleted_event(workspace_id: &WorkspaceId) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_DELETED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+        }),
+    }
+}
+
+/// Build a `git:commit` event for a freshly-recorded git commit inside a
+/// workspace worktree (§6.5). Payload `{ workspaceId, operation: "commit",
+/// commit, message, files }` mirrors the reserved `GitOperationEvent` shape
+/// in the FE `events/types.ts` — clients can render a commit-created marker
+/// without a follow-up `git.log`.
+fn git_commit_event(
+    workspace_id: &WorkspaceId,
+    commit_hash: &str,
+    message: &str,
+    files: &[String],
+) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: GIT_COMMIT.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "operation": "commit",
+            "commit": commit_hash,
+            "message": message,
+            "files": files,
+        }),
+    }
+}
+
 /// Build a `pr:linked` event for a workspace that just gained a PR link (§7.6).
 /// Self-sufficient payload `{ workspaceId, prNumber, prUrl, prStatus,
 /// activePullRequest }` so a client can render the link without a follow-up read.
@@ -3649,6 +3721,11 @@ impl WorkspaceApi for Services {
         update: WorkspaceUpdate,
     ) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        // Snapshot the caller-supplied delta before it is consumed by the
+        // apply loop; the `workspace:updated` event carries `changes` as the
+        // applied delta (reference-parity FE emitter, §6.5).
+        let changes = serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
         Box::pin(async move {
             let mut ws = store.get_workspace(&id).await?;
             if let Some(v) = update.title {
@@ -3719,6 +3796,9 @@ impl WorkspaceApi for Services {
             }
             ws.updated_at = now_iso();
             store.update_workspace(&ws).await?;
+            // Self-sufficient `workspace:updated` payload (§6.5) so every
+            // client mirrors the delta without a follow-up read.
+            publish_event(&bus, workspace_updated_event(&ws.id, changes)).await;
             Ok(ws)
         })
     }
@@ -3726,6 +3806,7 @@ impl WorkspaceApi for Services {
     fn delete_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
         let store = self.store.clone();
         let worktree_locks = self.worktree_locks.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             // Port the TS `deleteWorkspace` worktree cleanup: under the per-repo
             // worktree lock, remove the linked worktree (+ the now-empty
@@ -3772,7 +3853,11 @@ impl WorkspaceApi for Services {
                     }
                 }
             }
-            store.delete_workspace(&id).await
+            store.delete_workspace(&id).await?;
+            // Minimal `workspace:deleted` payload (§6.5) — subscribers drop
+            // caches keyed on the id; reference-parity FE emitter.
+            publish_event(&bus, workspace_deleted_event(&id)).await;
+            Ok(())
         })
     }
 
@@ -5817,9 +5902,12 @@ impl WorkspaceApi for Services {
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<intent_core::GitCommitResult>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
+            let event_bus = bus.clone();
+            let event_message = message.clone();
             with_idempotency(
                 &store,
                 &ws_scope,
@@ -5839,6 +5927,23 @@ impl WorkspaceApi for Services {
                         Error::Internal("Failed to commit: workspace has no worktree".to_string())
                     })?;
                     let outcome = intent_git::commit::commit(&worktree, &message)?;
+                    // Emissions live inside the idempotency scope so a replayed
+                    // commit (same idempotencyKey) returns the cached result
+                    // without re-firing events (parity with `workspace:created`
+                    // §6.5). `git:commit` mirrors the reserved
+                    // `GitOperationEvent` FE shape; `changes:git-status` feeds
+                    // the FE bridge's `git:status-changed` relay so the UI
+                    // refreshes without a follow-up `git.status` read.
+                    publish_event(
+                        &event_bus,
+                        git_commit_event(&ws.id, &outcome.hash, &event_message, &outcome.files),
+                    )
+                    .await;
+                    let status = intent_git::status::status(&worktree)
+                        .unwrap_or_else(|_| intent_git::status::empty_status());
+                    let status_json =
+                        serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+                    publish_event(&event_bus, changes_git_status_event(&ws.id, status_json)).await;
                     Ok(intent_core::GitCommitResult {
                         hash: outcome.hash,
                         files: outcome.files,
@@ -5859,6 +5964,7 @@ impl WorkspaceApi for Services {
         user_requested: bool,
     ) -> BoxFuture<'_, Result<intent_core::GitAgentCommitResult>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             // userRequested bypasses the auto-commit gate (TS parity).
             git_ops::assert_agent_commit_allowed(&store, user_requested).await?;
@@ -5896,6 +6002,18 @@ impl WorkspaceApi for Services {
                 linked_note_id.as_ref().map(NoteId::as_str),
             )?;
             let file_count = to_commit.len() as i64;
+            // `git:commit` mirrors the reserved `GitOperationEvent` FE shape;
+            // `changes:git-status` feeds the FE bridge's `git:status-changed`
+            // relay so the UI refreshes without a follow-up `git.status` read.
+            publish_event(
+                &bus,
+                git_commit_event(&ws.id, &outcome.hash, &message, &to_commit),
+            )
+            .await;
+            let status = intent_git::status::status(&worktree)
+                .unwrap_or_else(|_| intent_git::status::empty_status());
+            let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+            publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
             Ok(intent_core::GitAgentCommitResult {
                 hash: outcome.hash,
                 files: to_commit,

@@ -371,8 +371,9 @@ async fn crud_mutations_emit_change_events_over_uds() {
         json!({ "noteId": note_id, "commentId": comment_id })
     );
 
-    // Raise then dismiss attention → workspace:attention-changed { workspaceId, attention }.
-    // workspace.update carries no change event, so only the dismissal is observed.
+    // Raise then dismiss attention. `workspace.update` now emits
+    // `workspace:updated` (§6.5) with the applied `WorkspaceUpdate` delta;
+    // `workspace.dismissAttention` follows with `workspace:attention-changed`.
     rpc(
         &mut rpc_write,
         &mut rpc_reader,
@@ -381,6 +382,15 @@ async fn crud_mutations_emit_change_events_over_uds() {
         json!({ "workspaceId": ws_id, "attention": "unread" }),
     )
     .await;
+    let ev = read_json(&mut sub_reader).await;
+    let e = &ev["params"]["event"];
+    assert_eq!(e["type"], "workspace:updated");
+    assert_eq!(e["workspaceId"], ws_id.as_str());
+    assert_eq!(
+        e["data"],
+        json!({ "workspaceId": ws_id, "changes": { "attention": "unread" } }),
+    );
+
     rpc(
         &mut rpc_write,
         &mut rpc_reader,
@@ -466,6 +476,169 @@ async fn workspace_create_emits_workspace_created() {
     // result returned, so clients render it without a follow-up read.
     assert_eq!(e["data"]["workspaceId"], ws_id.as_str());
     assert_eq!(e["data"]["workspace"], ws["workspace"]);
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// `workspace.update` emits `workspace:updated` (PROTOCOL §6.5): the payload
+/// carries the applied `WorkspaceUpdate` delta as `changes` (reference-parity
+/// FE emitter), so a subscriber can mirror the mutation without a follow-up
+/// `workspace.get` read.
+#[tokio::test]
+async fn workspace_update_emits_workspace_updated_with_delta() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services: Arc<dyn WorkspaceApi> =
+        Arc::new(Services::new(store).with_event_bus(bus.clone()));
+    let socket = std::env::temp_dir().join(format!("intentd-uds-{}.sock", Uuid::new_v4()));
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let bus = bus.clone();
+        let socket = socket.clone();
+        async move {
+            let _ = serve_uds(services, bus, &socket, None, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        }
+    });
+
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        1,
+        "workspace.create",
+        json!({ "title": "Original", "branch": "main" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+
+    // Subscribe after create so the pre-subscribe workspace:created is not
+    // observed here (covered by workspace_create_emits_workspace_created).
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "events.subscribe",
+            "params": { "eventTypes": ["workspace:updated"], "workspaceId": ws_id },
+        }))
+        .unwrap(),
+    )
+    .await;
+    let sub_resp = read_json(&mut sub_reader).await;
+    assert!(sub_resp["result"]["subscriptionId"].is_string());
+    wait_for_subscriber_count(&bus, 1).await;
+
+    rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        3,
+        "workspace.update",
+        json!({ "workspaceId": ws_id, "title": "Renamed", "tags": ["a", "b"] }),
+    )
+    .await;
+
+    let ev = read_json(&mut sub_reader).await;
+    assert_eq!(ev["method"], "events.event");
+    let e = &ev["params"]["event"];
+    assert_eq!(e["type"], "workspace:updated");
+    assert_eq!(e["workspaceId"], ws_id.as_str());
+    assert!(e["id"].is_string());
+    assert!(e["timestamp"].is_string());
+    assert_eq!(
+        e["actor"],
+        json!({ "type": "system", "id": "system", "name": "System" })
+    );
+    // `changes` is the applied WorkspaceUpdate delta only (Option::is_none
+    // fields are skipped in serialization), so absent fields do not leak.
+    assert_eq!(
+        e["data"],
+        json!({
+            "workspaceId": ws_id,
+            "changes": { "title": "Renamed", "tags": ["a", "b"] },
+        })
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// `workspace.delete` emits `workspace:deleted` (PROTOCOL §6.5): minimal
+/// `{ workspaceId }` payload (reference-parity FE emitter). The event fires
+/// only after the store row is actually removed.
+#[tokio::test]
+async fn workspace_delete_emits_workspace_deleted() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services: Arc<dyn WorkspaceApi> =
+        Arc::new(Services::new(store).with_event_bus(bus.clone()));
+    let socket = std::env::temp_dir().join(format!("intentd-uds-{}.sock", Uuid::new_v4()));
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let bus = bus.clone();
+        let socket = socket.clone();
+        async move {
+            let _ = serve_uds(services, bus, &socket, None, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        }
+    });
+
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        1,
+        "workspace.create",
+        json!({ "title": "ToDelete", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "events.subscribe",
+            "params": { "eventTypes": ["workspace:deleted"], "workspaceId": ws_id },
+        }))
+        .unwrap(),
+    )
+    .await;
+    let sub_resp = read_json(&mut sub_reader).await;
+    assert!(sub_resp["result"]["subscriptionId"].is_string());
+    wait_for_subscriber_count(&bus, 1).await;
+
+    rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        3,
+        "workspace.delete",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+
+    let ev = read_json(&mut sub_reader).await;
+    assert_eq!(ev["method"], "events.event");
+    let e = &ev["params"]["event"];
+    assert_eq!(e["type"], "workspace:deleted");
+    assert_eq!(e["workspaceId"], ws_id.as_str());
+    assert_eq!(e["data"], json!({ "workspaceId": ws_id }));
 
     let _ = shutdown_tx.send(());
     let _ = server.await;

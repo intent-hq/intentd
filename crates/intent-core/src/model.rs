@@ -399,30 +399,56 @@ pub struct WorkspaceCreateResult {
 /// Wire input for `workspace.update` (PROTOCOL §5.1). Every field is optional;
 /// an absent field leaves the stored value unchanged (`workspaceId` is supplied
 /// separately by the router).
-#[derive(Debug, Clone, Default, Deserialize)]
+///
+/// Serializes with `skip_serializing_if = "Option::is_none"` so the
+/// `workspace:updated` change event only carries the fields the caller
+/// actually asked to mutate.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspaceUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_commit_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<WorkspaceStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub repository_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub repository_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub repository_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub skip_worktree: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub setup_script: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub is_remote: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub attention: Option<WorkspaceAttention>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
 }
 
