@@ -20,7 +20,7 @@ use crate::model::{
     SetupScript, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
     TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskUpdateNoteStatusResult,
     TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
-    WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -56,7 +56,10 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// Create a workspace from wire input, filling ids/defaults (PROTOCOL §5.1).
+    /// Create a workspace from wire input, filling ids/defaults, and
+    /// orchestrate the optional initial agent — created and its prompt
+    /// delivered inside the same idempotency scope, so `initialAgent` is
+    /// present in the result iff an agent was created (PROTOCOL §5.1).
     ///
     /// `idempotency_key` is the optional `params.idempotencyKey` (design note TB-0
     /// §5): when present and previously recorded, the original result is returned
@@ -65,7 +68,7 @@ pub trait WorkspaceApi: Send + Sync {
         &self,
         input: WorkspaceCreate,
         idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<Workspace>> {
+    ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
         let _ = (input, idempotency_key);
         Box::pin(async {
             Err(Error::Internal(

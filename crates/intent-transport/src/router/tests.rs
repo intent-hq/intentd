@@ -100,13 +100,16 @@ impl WorkspaceApi for FakeApi {
         &self,
         input: WorkspaceCreate,
         _idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<Workspace>> {
+    ) -> BoxFuture<'_, Result<intent_core::WorkspaceCreateResult>> {
         Box::pin(async move {
             let mut ws = sample_ws();
             if let Some(t) = input.title {
                 ws.title = t;
             }
-            Ok(ws)
+            Ok(intent_core::WorkspaceCreateResult {
+                workspace: ws,
+                initial_agent: None,
+            })
         })
     }
     fn update_workspace(

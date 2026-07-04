@@ -1977,7 +1977,8 @@ mod change_event_parity {
                 None,
             )
             .await
-            .expect("create");
+            .expect("create")
+            .workspace;
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &created.id.0, "workspace:created");
         assert_eq!(ev["data"]["workspaceId"], created.id.0);
@@ -2007,7 +2008,8 @@ mod change_event_parity {
                 key.clone(),
             )
             .await
-            .expect("first create");
+            .expect("first create")
+            .workspace;
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &first.id.0, "workspace:created");
 
@@ -2024,7 +2026,8 @@ mod change_event_parity {
                 key,
             )
             .await
-            .expect("replay create");
+            .expect("replay create")
+            .workspace;
         assert_eq!(
             second.id.0, first.id.0,
             "replay returns the original workspace"
@@ -5942,7 +5945,8 @@ mod worktree_provisioning {
                 None,
             )
             .await
-            .expect("create");
+            .expect("create")
+            .workspace;
 
         let wt = ws.worktree_path.as_deref().expect("worktree path set");
         assert_eq!(
@@ -6017,14 +6021,16 @@ mod worktree_provisioning {
         let ws = svc
             .create_workspace(create("fix the auth flow"), None)
             .await
-            .expect("create");
+            .expect("create")
+            .workspace;
         assert_eq!(ws.branch, "aw/auth-fix");
 
         // Same prompt again: the branch now exists, so a suffix is appended.
         let ws2 = svc
             .create_workspace(create("fix the auth flow"), None)
             .await
-            .expect("create second");
+            .expect("create second")
+            .workspace;
         assert_eq!(ws2.branch, "aw/auth-fix-2");
     }
 
@@ -6050,7 +6056,8 @@ mod worktree_provisioning {
                 None,
             )
             .await
-            .expect("create");
+            .expect("create")
+            .workspace;
         assert_eq!(ws.branch, "exact/name");
     }
 
@@ -6083,7 +6090,8 @@ mod worktree_provisioning {
                 None,
             )
             .await
-            .expect("create");
+            .expect("create")
+            .workspace;
 
         assert_eq!(ws.branch, "my-feature");
         assert_eq!(ws.base_commit_sha.as_deref(), Some(first_sha.as_str()));
@@ -6138,7 +6146,8 @@ mod worktree_provisioning {
                 None,
             )
             .await
-            .expect("create");
+            .expect("create")
+            .workspace;
         assert!(ws.worktree_path.is_none(), "skipWorktree opts out");
 
         let plain = unique_dir("intentd-wtskip-plain");
@@ -6151,7 +6160,8 @@ mod worktree_provisioning {
                 None,
             )
             .await
-            .expect("create");
+            .expect("create")
+            .workspace;
         assert!(ws.worktree_path.is_none(), "non-git path stays row-only");
 
         let ws = svc
@@ -6164,7 +6174,8 @@ mod worktree_provisioning {
                 None,
             )
             .await
-            .expect("create");
+            .expect("create")
+            .workspace;
         assert_eq!(
             ws.worktree_path.as_deref(),
             Some("/tmp/custom-wt"),
@@ -6194,7 +6205,8 @@ mod worktree_provisioning {
                 None,
             )
             .await
-            .expect("create");
+            .expect("create")
+            .workspace;
         let wt = PathBuf::from(ws.worktree_path.as_deref().expect("worktree path"));
         assert!(wt.exists());
         assert!(
@@ -6246,7 +6258,8 @@ mod worktree_provisioning {
                 None,
             )
             .await
-            .expect("create");
+            .expect("create")
+            .workspace;
         let wt = PathBuf::from(ws.worktree_path.as_deref().expect("worktree path"));
         assert!(
             !store
@@ -6285,7 +6298,8 @@ mod worktree_provisioning {
                 None,
             )
             .await
-            .expect("create");
+            .expect("create")
+            .workspace;
         let branch = ws.branch.clone();
         svc.delete_workspace(ws.id.clone()).await.expect("delete");
         assert!(matches!(
@@ -7109,5 +7123,188 @@ mod heal_stale_agent_sessions {
             .await
             .expect("heal sweep (idempotent)");
         assert_eq!(healed_again, 0);
+    }
+}
+
+/// Daemon-owned initial-agent orchestration inside `workspace.create`
+/// (PROTOCOL §5.1): agent row + exactly-once prompt delivery inside the
+/// idempotency scope. No `AgentManager` is attached here, so delivery takes
+/// the store-only `agent_send_message_op` fallback (same persist the runtime
+/// path starts from).
+mod initial_agent_orchestration {
+    use std::time::Duration;
+
+    use intent_core::{AgentId, WorkspaceApi, WorkspaceCreate, WorkspaceCreateInitialAgent};
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use super::TempDb;
+    use crate::{EventBus, Services, SubscriptionFilter};
+
+    fn create_input(agent: Option<WorkspaceCreateInitialAgent>) -> WorkspaceCreate {
+        WorkspaceCreate {
+            title: Some("WS".to_string()),
+            branch: Some("feat/initial-agent".to_string()),
+            initial_agent: agent,
+            ..Default::default()
+        }
+    }
+
+    /// Drain published events (unfiltered subscription) until the bus goes
+    /// quiet, flattening batches into one ordered list of event types.
+    async fn drain_event_types(sub: &mut crate::Subscription) -> Vec<String> {
+        let mut types = Vec::new();
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        {
+            for ev in batch {
+                types.push(ev.event_type);
+            }
+        }
+        types
+    }
+
+    #[tokio::test]
+    async fn creates_agent_and_delivers_prompt_once() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let requested = format!("agent-{}", uuid::Uuid::new_v4());
+        let res = services
+            .create_workspace(
+                create_input(Some(WorkspaceCreateInitialAgent {
+                    agent_id: Some(requested.clone()),
+                    prompt: Some("fix the auth flow".to_string()),
+                    name: Some("Auth fixer".to_string()),
+                    model: Some("opus".to_string()),
+                    specialist: Some("implementor".to_string()),
+                    ..Default::default()
+                })),
+                None,
+            )
+            .await
+            .expect("create");
+
+        // Result carries the AgentLite (client-supplied agentId honored).
+        let agent = res.initial_agent.expect("initialAgent in result");
+        assert_eq!(agent["id"], Value::from(requested.as_str()));
+        assert_eq!(agent["name"], "Auth fixer");
+
+        // Session row: parentless, non-background, specialist/model persisted,
+        // prompt kept as `initialMessage` (resume source).
+        let session = store
+            .get_agent_session(&AgentId::from(requested.as_str()))
+            .await
+            .expect("session");
+        assert_eq!(session.workspace_id, res.workspace.id);
+        assert!(session.parent_agent_id.is_none());
+        assert!(!session.is_background);
+        assert_eq!(session.specialist.as_deref(), Some("implementor"));
+        assert_eq!(session.model.as_deref(), Some("opus"));
+        assert_eq!(
+            session.initial_message.as_deref(),
+            Some("fix the auth flow")
+        );
+
+        // Exactly one persisted message: the user prompt.
+        let messages = store
+            .get_agent_messages(&AgentId::from(requested.as_str()), None)
+            .await
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "exactly one delivered prompt");
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(
+            messages[0].content,
+            json!([{ "type": "text", "text": "fix the auth flow" }])
+        );
+
+        // workspace:created precedes agent:created.
+        let types = drain_event_types(&mut sub).await;
+        let ws_pos = types.iter().position(|t| t == "workspace:created");
+        let agent_pos = types.iter().position(|t| t == "agent:created");
+        assert!(ws_pos.is_some(), "workspace:created published: {types:?}");
+        assert!(agent_pos.is_some(), "agent:created published: {types:?}");
+        assert!(ws_pos < agent_pos, "workspace:created first: {types:?}");
+    }
+
+    /// Idempotency replay: the stored result is returned without re-running
+    /// the op — no duplicate agent row and no second prompt delivery.
+    #[tokio::test]
+    async fn idempotent_replay_no_duplicate_agent_or_message() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let services = Services::new(store.clone());
+        let key = Some("ws-agent-idem-1".to_string());
+
+        let input = || {
+            create_input(Some(WorkspaceCreateInitialAgent {
+                prompt: Some("fix the auth flow".to_string()),
+                ..Default::default()
+            }))
+        };
+        let first = services
+            .create_workspace(input(), key.clone())
+            .await
+            .expect("first create");
+        let agent_id = first.initial_agent.as_ref().unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let second = services
+            .create_workspace(input(), key)
+            .await
+            .expect("replay create");
+        assert_eq!(second.workspace.id, first.workspace.id);
+        assert_eq!(
+            second.initial_agent.as_ref().unwrap()["id"]
+                .as_str()
+                .unwrap(),
+            agent_id,
+            "replay returns the original agent"
+        );
+
+        let sessions = store
+            .list_agent_sessions(&first.workspace.id)
+            .await
+            .expect("sessions");
+        assert_eq!(sessions.len(), 1, "no duplicate agent row");
+        let messages = store
+            .get_agent_messages(&AgentId::from(agent_id.as_str()), None)
+            .await
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "no second prompt delivery");
+    }
+
+    /// No (or blank) prompt → no agent: the result has no `initialAgent` and
+    /// no session row is created.
+    #[tokio::test]
+    async fn no_prompt_no_agent() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let services = Services::new(store.clone());
+
+        for prompt in [None, Some("   ".to_string())] {
+            let res = services
+                .create_workspace(
+                    create_input(Some(WorkspaceCreateInitialAgent {
+                        prompt,
+                        name: Some("Never created".to_string()),
+                        ..Default::default()
+                    })),
+                    None,
+                )
+                .await
+                .expect("create");
+            assert!(res.initial_agent.is_none(), "no agent in result");
+            let sessions = store
+                .list_agent_sessions(&res.workspace.id)
+                .await
+                .expect("sessions");
+            assert!(sessions.is_empty(), "no session row created");
+        }
     }
 }

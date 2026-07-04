@@ -33,9 +33,9 @@ use intent_core::{
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
     TaskMetadata, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult,
     TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
-    WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceDiffSummary,
-    WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
-    WorkspaceUpdate,
+    WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceCreateResult,
+    WorkspaceDiffSummary, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceTask,
+    WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -3194,11 +3194,12 @@ impl WorkspaceApi for Services {
         &self,
         input: WorkspaceCreate,
         idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<Workspace>> {
+    ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
         let store = self.store.clone();
         let worktree_locks = self.worktree_locks.clone();
         let workspaces_root = self.workspaces_root.clone();
         let bus = self.event_bus.clone();
+        let services = self.clone();
         Box::pin(async move {
             // workspace.create carries no workspaceId → "" sentinel scope (§5.1).
             let op_store = store.clone();
@@ -3399,7 +3400,100 @@ impl WorkspaceApi for Services {
                     // the stored result without re-running the op, so the
                     // event fires at most once per logical create (§6.5).
                     publish_event(&bus, workspace_created_event(&ws)).await;
-                    Ok(ws)
+                    // Daemon-owned initial-agent orchestration (§5.1): when the
+                    // request carries an `initialAgent` with a non-empty prompt,
+                    // create the agent row (delegate parity: `agent_create_op`,
+                    // parentless, non-background) and deliver the prompt exactly
+                    // once — all inside the idempotency scope, so a client retry
+                    // replays the stored result instead of re-sending.
+                    let mut initial_agent = None;
+                    if let Some(agent) = input.initial_agent {
+                        let prompt = agent
+                            .prompt
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        if let Some(prompt) = prompt {
+                            fn nonempty(s: Option<String>) -> Option<String> {
+                                s.filter(|v| !v.trim().is_empty())
+                            }
+                            // Persist the prompt as `metadata.initialMessage`
+                            // (delegate parity: a wake-up can resume from it).
+                            // The caller's metadata object is forwarded as-is;
+                            // like agent.create, only the harvested gap fields
+                            // persist today (P2-12a) — `behaviorPrompt` has no
+                            // session column and the behavior derives from the
+                            // persisted `specialist`.
+                            let mut metadata = match agent.metadata {
+                                Some(serde_json::Value::Object(m)) => m,
+                                _ => serde_json::Map::new(),
+                            };
+                            metadata.insert(
+                                "initialMessage".to_string(),
+                                serde_json::json!(prompt.clone()),
+                            );
+                            let extra = intent_core::AgentCreateExtra {
+                                provider: nonempty(agent.provider),
+                                agent_type: nonempty(agent.agent_type),
+                                metadata: Some(serde_json::Value::Object(metadata)),
+                                context_references: agent
+                                    .context_references
+                                    .filter(|v| !v.is_null()),
+                                image_blocks: agent.image_blocks.filter(|v| !v.is_null()),
+                                // The initial agent is the workspace's
+                                // foreground agent (top-level wins over any
+                                // metadata.isBackground copy).
+                                is_background: Some(false),
+                                ..Default::default()
+                            };
+                            let requested = nonempty(agent.agent_id)
+                                .map(|id| AgentId::from(id.as_str()));
+                            let created = services
+                                .agent_create_op(
+                                    ws.id.clone(),
+                                    nonempty(agent.name),
+                                    nonempty(agent.model),
+                                    nonempty(agent.specialist),
+                                    None,
+                                    None,
+                                    false,
+                                    requested,
+                                    extra,
+                                )
+                                .await?;
+                            // Deliver the prompt and start the first turn
+                            // (delegate parity): the runtime `AgentManager`
+                            // when attached, else the store-only persist.
+                            // Best-effort like the delegate path — the agent
+                            // holds `metadata.initialMessage` for resume.
+                            let child = AgentId::from(
+                                created["agent"]["id"].as_str().unwrap_or_default(),
+                            );
+                            let send = match services.agent_manager() {
+                                Some(manager) => {
+                                    manager
+                                        .send_message(child, ws.id.clone(), prompt, None)
+                                        .await
+                                }
+                                None => {
+                                    services.agent_send_message_op(child, prompt, None).await
+                                }
+                            };
+                            if let Err(e) = send {
+                                tracing::warn!(
+                                    workspace = %ws.id.as_str(),
+                                    error = %e,
+                                    "workspace.create: failed to start initial agent turn"
+                                );
+                            }
+                            initial_agent = created.get("agent").cloned();
+                        }
+                    }
+                    Ok(WorkspaceCreateResult {
+                        workspace: ws,
+                        initial_agent,
+                    })
                 },
             )
             .await

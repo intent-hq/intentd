@@ -3061,3 +3061,184 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
         "queue is empty post-save-drain",
     );
 }
+
+/// Daemon-owned initial-agent orchestration over WSS (PROTOCOL §5.1):
+/// `workspace.create` with an `initialAgent` creates the workspace AND the
+/// agent, delivers the prompt exactly once, and starts the first turn — the
+/// subscriber sees `workspace:created` → `agent:created` → stream frames keyed
+/// to the agent. A replay with the same `idempotencyKey` returns the stored
+/// result without re-sending (still exactly one user message).
+#[tokio::test]
+async fn workspace_create_orchestrates_initial_agent_over_wss() {
+    let Some(script) = gate("WSS workspace.create initial-agent E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let behavior = json!({ "response": "initial agent ran" }).to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — the workspace id is minted by the create, so subscribe
+    // unfiltered across both families BEFORE creating.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:*", "agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // RPC conn — one workspace.create carrying the full initialAgent payload.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let agent_id = format!("agent-{}", Uuid::new_v4());
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "Orchestrated WS",
+            "branch": "feat/initial-agent-e2e",
+            "idempotencyKey": "wss-create-idem-1",
+            "initialAgent": {
+                "agentId": agent_id,
+                "prompt": "build the initial feature",
+                "name": "Initial agent",
+                "model": "mock:default",
+                "specialist": "implementor",
+            },
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"].as_str().expect("workspace id");
+    assert_eq!(
+        created["initialAgent"]["id"], agent_id,
+        "result carries the created agent: {created}"
+    );
+    assert_eq!(created["initialAgent"]["name"], "Initial agent");
+
+    // Event flow: workspace:created for the new id, agent:created for the
+    // initial agent, ≥1 stream chunk keyed to it, exactly one stream:end.
+    let mut saw_ws_created = false;
+    let mut saw_agent_created = false;
+    let mut chunks = 0u32;
+    let mut ends = 0u32;
+    for _ in 0..120 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        match ev["type"].as_str() {
+            Some("workspace:created") => {
+                assert_eq!(ev["data"]["workspaceId"], ws_id, "created for the new ws");
+                assert_eq!(ev["data"]["workspace"]["id"], ws_id);
+                saw_ws_created = true;
+            }
+            Some("agent:created") => {
+                assert!(saw_ws_created, "workspace:created precedes agent:created");
+                assert_eq!(ev["data"]["agentId"], agent_id.as_str());
+                saw_agent_created = true;
+            }
+            Some("agent:stream:chunk") => {
+                assert_eq!(
+                    ev["data"]["agentId"],
+                    agent_id.as_str(),
+                    "chunk scoped to the initial agent: {ev}"
+                );
+                chunks += 1;
+            }
+            Some("agent:stream:end") => {
+                assert_eq!(ev["data"]["agentId"], agent_id.as_str());
+                ends += 1;
+            }
+            _ => {}
+        }
+        if saw_ws_created && saw_agent_created && ends >= 1 {
+            break;
+        }
+    }
+    assert!(saw_ws_created, "workspace:created observed");
+    assert!(saw_agent_created, "agent:created observed");
+    assert!(chunks >= 1, "initial agent streamed ≥1 chunk");
+    assert_eq!(ends, 1, "exactly one terminal stream:end");
+
+    // Transcript: exactly ONE user message (the prompt, delivered once) and an
+    // assistant reply — the double-send bug class is structurally impossible.
+    let conv = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let user_count = messages.iter().filter(|m| m["role"] == "user").count();
+    assert_eq!(user_count, 1, "exactly one delivered prompt: {conv}");
+    assert!(
+        messages.iter().any(|m| m["role"] == "user"
+            && serde_json::to_string(&m["contentBlocks"])
+                .unwrap_or_default()
+                .contains("build the initial feature")),
+        "the user message carries the prompt: {conv}"
+    );
+    assert!(
+        messages.iter().any(|m| m["role"] == "assistant"),
+        "initial agent produced an assistant reply: {conv}"
+    );
+
+    // Replay with the same idempotencyKey: the stored result comes back (same
+    // workspace + agent) and no second prompt is delivered.
+    let replay = wss_rpc(
+        &mut rpc,
+        12,
+        "workspace.create",
+        json!({
+            "title": "Different title",
+            "branch": "feat/other-branch",
+            "idempotencyKey": "wss-create-idem-1",
+            "initialAgent": {
+                "prompt": "some other prompt",
+                "model": "mock:default",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(replay["workspace"]["id"], ws_id, "replay returns original");
+    assert_eq!(replay["initialAgent"]["id"], agent_id.as_str());
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let user_count = conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .count();
+    assert_eq!(user_count, 1, "replay delivered no second prompt: {conv}");
+}

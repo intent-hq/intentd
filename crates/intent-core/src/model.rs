@@ -375,6 +375,18 @@ pub struct WorkspaceCreateInitialAgent {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// Result of `workspace.create` (PROTOCOL §5.1): the created workspace plus,
+/// when the request carried an `initialAgent` with a prompt, the created
+/// agent's `AgentLite` wire projection (the same shape as the `agent.create`
+/// result's `agent`). Serialized verbatim as the RPC result object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceCreateResult {
+    pub workspace: Workspace,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_agent: Option<serde_json::Value>,
+}
+
 /// Wire input for `workspace.update` (PROTOCOL §5.1). Every field is optional;
 /// an absent field leaves the stored value unchanged (`workspaceId` is supplied
 /// separately by the router).

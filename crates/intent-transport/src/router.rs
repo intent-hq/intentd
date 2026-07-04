@@ -166,11 +166,15 @@ async fn dispatch(
             let idempotency_key = opt_str(params, "idempotencyKey");
             let input: WorkspaceCreate = serde_json::from_value(Value::Object(params.clone()))
                 .map_err(|e| rpc(INVALID_PARAMS, format!("invalid params: {e}")))?;
-            let ws = api
+            let res = api
                 .create_workspace(input, idempotency_key)
                 .await
                 .map_err(workspace_err)?;
-            Ok(json!({ "workspace": ws }))
+            let mut result = json!({ "workspace": res.workspace });
+            if let Some(agent) = res.initial_agent {
+                result["initialAgent"] = agent;
+            }
+            Ok(result)
         }
         "workspace.update" => {
             let id = require_workspace_id(params)?;
