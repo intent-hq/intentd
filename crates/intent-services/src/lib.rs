@@ -3137,8 +3137,49 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let id = WorkspaceId::new();
-                    // The branch defaults to the workspace id, mirroring the TS service.
-                    let branch = input.branch.unwrap_or_else(|| id.0.clone());
+                    // Branch naming (TS parity): an explicit `branch` wins
+                    // untouched; otherwise the branch is a friendly slug —
+                    // extracted from `initialAgent.prompt` when possible
+                    // (`generateLocalSlug`), else a random adjective-animal
+                    // pair (`generateWorkspaceSlug`) — under the optional
+                    // `workspace.branchPrefix` setting, uniquified against
+                    // existing local/remote branches with a `-N` suffix.
+                    let branch = match input.branch.clone().filter(|b| !b.is_empty()) {
+                        Some(explicit) => explicit,
+                        None => {
+                            let slug = input
+                                .initial_agent
+                                .as_ref()
+                                .and_then(|a| a.prompt.as_deref())
+                                .and_then(intent_core::slug::extract_local_slug)
+                                .unwrap_or_else(intent_core::slug::generate_workspace_slug);
+                            let prefix = settings::branch_prefix(&store).await;
+                            let desired = format!("{prefix}{slug}");
+                            let git_repo = input
+                                .repository_path
+                                .as_deref()
+                                .filter(|p| !p.is_empty())
+                                .map(PathBuf::from)
+                                .filter(|p| p.join(".git").exists());
+                            match git_repo {
+                                Some(repo) => {
+                                    let want = desired;
+                                    tokio::task::spawn_blocking(move || {
+                                        intent_git::branches::ensure_unique_branch_name(
+                                            &repo, &want,
+                                        )
+                                    })
+                                    .await
+                                    .map_err(|e| {
+                                        Error::Internal(format!(
+                                            "branch uniquification task failed: {e}"
+                                        ))
+                                    })??
+                                }
+                                None => desired,
+                            }
+                        }
+                    };
                     let mut ws = Workspace {
                         id,
                         title: input.title.unwrap_or_default(),

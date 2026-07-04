@@ -11,6 +11,7 @@ pub mod error;
 pub mod events;
 pub mod ids;
 pub mod model;
+pub mod slug;
 pub mod traits;
 
 pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso};
@@ -38,8 +39,8 @@ pub use model::{
     TaskMetadata, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult,
     TaskUpdateStatusResult, TokenUsage, TokenUsageTotals, TopChangedFile, Workspace,
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceDiffSummary, WorkspaceDiffSummaryFile, WorkspaceEventSummary,
-    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceDiffSummary, WorkspaceDiffSummaryFile,
+    WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 pub use traits::{
     BoxFuture, ContextEngine, ContextError, EngineAvailability, RetrieveRequest, RetrieveResult,

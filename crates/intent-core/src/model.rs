@@ -325,9 +325,10 @@ pub struct WorkspaceDiffSummary {
 }
 
 /// Wire input for `workspace.create` (PROTOCOL §5.1). All fields are optional;
-/// the service fills ids/timestamps/defaults. Unknown fields (e.g.
-/// `initialAgent`) are ignored — initial-agent activation is fire-and-forget and
-/// not part of this persistence slice.
+/// the service fills ids/timestamps/defaults. Of `initialAgent`, only `prompt`
+/// is read (it seeds the auto-generated branch slug, TS `generateLocalSlug`
+/// parity) — initial-agent activation is fire-and-forget and not part of this
+/// persistence slice.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspaceCreate {
@@ -350,6 +351,17 @@ pub struct WorkspaceCreate {
     /// Git remote used to resolve `baseRef` when provisioning the worktree
     /// (default `origin`; e.g. `upstream` for forks). Not persisted.
     pub remote: Option<String>,
+    /// Initial agent payload; only `prompt` is consumed here (branch slug).
+    pub initial_agent: Option<WorkspaceCreateInitialAgent>,
+}
+
+/// The `initialAgent` sub-object of `workspace.create` (PROTOCOL §5.1). Only
+/// `prompt` is modeled — the other fields belong to the (async, fire-and-forget)
+/// agent-activation slice and are ignored by workspace persistence.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WorkspaceCreateInitialAgent {
+    pub prompt: Option<String>,
 }
 
 /// Wire input for `workspace.update` (PROTOCOL §5.1). Every field is optional;

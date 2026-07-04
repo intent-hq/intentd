@@ -653,6 +653,19 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
     ]
 }
 
+/// Read the effective `workspace.branchPrefix` (default empty) — prepended to
+/// auto-generated workspace branch names (TS `getBranchPrefix` parity). A
+/// missing/garbled row means "no prefix".
+pub(crate) async fn branch_prefix(store: &Store) -> String {
+    match store.get_setting("workspace.branchPrefix").await {
+        Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// Read the effective `git.autoCommit` flag (default `true`) — the gate behind
 /// `assert_agent_commit_allowed` (§9.8 OQ#2). A missing/garbled row defaults to
 /// the permissive `true` so the established auto-commit behavior is preserved.

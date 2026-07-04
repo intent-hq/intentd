@@ -306,7 +306,9 @@ async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
 /// `workspace.create` with a local `repositoryPath` + `baseRef` provisions a
 /// linked worktree: the result's `worktreePath` is on disk under
 /// `<root>/<workspaceId>/<repo-slug>`, checked out on the workspace branch at
-/// the base tip, and `baseCommitSha` records that SHA.
+/// the base tip, and `baseCommitSha` records that SHA. The auto-generated
+/// branch is a friendly slug derived from `initialAgent.prompt` (never the
+/// raw workspace UUID).
 #[tokio::test]
 async fn workspace_create_provisions_worktree_over_wss() {
     if !gate() {
@@ -326,6 +328,7 @@ async fn workspace_create_provisions_worktree_over_wss() {
             "repositoryPath": repo.to_string_lossy(),
             "repositoryName": "source-repo",
             "baseRef": "main",
+            "initialAgent": { "prompt": "fix the auth flow" },
             "idempotencyKey": Uuid::new_v4().to_string(),
         }),
     )
@@ -340,6 +343,12 @@ async fn workspace_create_provisions_worktree_over_wss() {
         "worktree lives at <root>/<workspaceId>/<repo-slug>"
     );
     assert_eq!(workspace["baseCommitSha"], json!(head_sha));
+
+    // Branch naming: prompt-derived slug ("fix the auth flow" → `auth-fix`,
+    // TS `generateLocalSlug` parity), not the raw workspace UUID.
+    let branch = workspace["branch"].as_str().expect("branch");
+    assert_eq!(branch, "auth-fix");
+    assert_ne!(branch, id, "branch must not be the workspace UUID");
 
     // The worktree is a real checkout on the workspace branch at the base tip.
     let wt_path = PathBuf::from(wt);

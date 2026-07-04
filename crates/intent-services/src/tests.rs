@@ -5879,13 +5879,101 @@ mod worktree_provisioning {
         );
         let wt_repo = git2::Repository::open(wt).expect("worktree opens as a git repo");
         assert!(wt_repo.is_worktree());
-        // The branch defaults to the workspace id and is checked out.
-        assert_eq!(ws.branch, ws.id.0);
+        // Auto-generated branches are friendly `word-word` slugs (never the
+        // raw workspace UUID) and are checked out.
+        assert_slug_branch(&ws.branch);
+        assert_ne!(ws.branch, ws.id.0, "branch must not be the raw UUID");
         assert_eq!(
             wt_repo.head().unwrap().shorthand().expect("branch name"),
             ws.branch.as_str()
         );
         assert_eq!(ws.base_commit_sha.as_deref(), Some(head_sha.as_str()));
+    }
+
+    /// Assert a `word-word` slug branch, optionally with a `-N` collision
+    /// suffix (e.g. `auth-fix`, `amber-forest`, `auth-fix-2`).
+    fn assert_slug_branch(branch: &str) {
+        let parts: Vec<&str> = branch.split('-').collect();
+        assert!(
+            (2..=3).contains(&parts.len()),
+            "branch '{branch}' must be word-word(-N)"
+        );
+        for part in &parts[..2] {
+            assert!(
+                (2..=15).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_lowercase()),
+                "branch '{branch}': segment '{part}' must be 2-15 lowercase letters"
+            );
+        }
+        if let Some(suffix) = parts.get(2) {
+            assert!(
+                suffix.bytes().all(|b| b.is_ascii_digit()),
+                "branch '{branch}': trailing segment must be numeric"
+            );
+        }
+    }
+
+    /// The initial-agent prompt seeds the branch slug, the
+    /// `workspace.branchPrefix` setting is prepended, and a second workspace
+    /// with the same prompt gets a `-2` collision suffix.
+    #[tokio::test]
+    async fn create_names_branch_from_prompt_with_prefix_and_suffix() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store
+            .set_setting("workspace.branchPrefix", "\"aw/\"")
+            .await
+            .expect("set prefix");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-wtslug-repo");
+        let root = unique_dir("intentd-wtslug-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let create = |prompt: &str| WorkspaceCreate {
+            repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+            base_ref: Some(head_branch.clone()),
+            initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                prompt: Some(prompt.to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let ws = svc
+            .create_workspace(create("fix the auth flow"), None)
+            .await
+            .expect("create");
+        assert_eq!(ws.branch, "aw/auth-fix");
+
+        // Same prompt again: the branch now exists, so a suffix is appended.
+        let ws2 = svc
+            .create_workspace(create("fix the auth flow"), None)
+            .await
+            .expect("create second");
+        assert_eq!(ws2.branch, "aw/auth-fix-2");
+    }
+
+    /// An explicit `branch` wins untouched — no slug, prefix, or suffix.
+    #[tokio::test]
+    async fn create_keeps_explicit_branch_untouched() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store
+            .set_setting("workspace.branchPrefix", "\"aw/\"")
+            .await
+            .expect("set prefix");
+        let root = unique_dir("intentd-wtexpl-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    branch: Some("exact/name".to_string()),
+                    skip_worktree: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create");
+        assert_eq!(ws.branch, "exact/name");
     }
 
     /// `baseRef` selects the starting commit, and an explicit `branch` names

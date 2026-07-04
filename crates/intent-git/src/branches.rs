@@ -1,10 +1,14 @@
-//! Branch listing (`git.getBranches`).
+//! Branch listing (`git.getBranches`) and branch-name uniquification.
 //!
 //! Ports the TS `git.getBranches` handler: local branches, optional
 //! `origin/*` remote branches, current branch, and the default branch
 //! (`origin/HEAD`, falling back to `master`/`main`). The "known repo"
 //! authorization check is wire policy and lives in `intent-services`.
+//! [`ensure_unique_branch_name`] ports the collision suffixing used by the
+//! reference's workspace-branch generation (`workspace-slug.ts` +
+//! `workspace.service.ts`): `-2`, `-3`, … until the name is free.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use git2::{BranchType, Repository, Status, StatusOptions};
@@ -93,6 +97,52 @@ fn has_any_changes(repo: &Repository) -> Result<bool> {
     Ok(statuses
         .iter()
         .any(|e| !e.status().contains(Status::IGNORED) && !e.status().is_empty()))
+}
+
+/// Return `desired` if no local or remote-tracking branch already uses it,
+/// else the first free `desired-N` (N starting at 2) — TS parity with the
+/// reference's collision handling when auto-naming workspace branches.
+/// Remote-tracking names are compared by their short name (`origin/foo` ⇒
+/// `foo`) so a branch that only exists on the remote still forces a suffix.
+pub fn ensure_unique_branch_name(repo_path: &Path, desired: &str) -> Result<String> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let taken = existing_branch_names(&repo)?;
+    if !taken.contains(desired) {
+        return Ok(desired.to_string());
+    }
+    let mut n: u32 = 2;
+    loop {
+        let candidate = format!("{desired}-{n}");
+        if !taken.contains(candidate.as_str()) {
+            return Ok(candidate);
+        }
+        n += 1;
+    }
+}
+
+/// All branch names occupied in the repo: local names plus the short names of
+/// remote-tracking branches (any remote, `remote/` prefix stripped).
+fn existing_branch_names(repo: &Repository) -> Result<HashSet<String>> {
+    let mut names = HashSet::new();
+    for branch in repo.branches(None).map_err(map_git_err)? {
+        let (branch, kind) = branch.map_err(map_git_err)?;
+        let Some(name) = branch.name().map_err(map_git_err)? else {
+            continue;
+        };
+        match kind {
+            BranchType::Local => {
+                names.insert(name.to_string());
+            }
+            BranchType::Remote => {
+                if name.ends_with("/HEAD") {
+                    continue;
+                }
+                let short = name.split_once('/').map_or(name, |(_, s)| s);
+                names.insert(short.to_string());
+            }
+        }
+    }
+    Ok(names)
 }
 
 fn local_branches(repo: &Repository) -> Result<Vec<String>> {
@@ -275,5 +325,66 @@ mod tests {
         assert_eq!(result.branch, "feature");
         assert!(!result.is_current_branch);
         assert_ne!(result.current_branch, "feature");
+    }
+
+    /// Create a remote-tracking ref `refs/remotes/origin/<name>` at HEAD.
+    fn create_remote_tracking(path: &Path, name: &str) {
+        let repo = git2::Repository::open(path).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.reference(
+            &format!("refs/remotes/origin/{name}"),
+            head,
+            true,
+            "test remote-tracking ref",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unique_branch_name_free_name_is_unchanged() {
+        let dir = init_repo("unique-free");
+        commit_file(dir.path(), "a.txt", "x\n");
+        assert_eq!(
+            ensure_unique_branch_name(dir.path(), "auth-fix").unwrap(),
+            "auth-fix"
+        );
+    }
+
+    #[test]
+    fn unique_branch_name_suffixes_on_local_collision() {
+        let dir = init_repo("unique-local");
+        commit_file(dir.path(), "a.txt", "x\n");
+        create_branch(dir.path(), "auth-fix");
+        assert_eq!(
+            ensure_unique_branch_name(dir.path(), "auth-fix").unwrap(),
+            "auth-fix-2"
+        );
+        create_branch(dir.path(), "auth-fix-2");
+        assert_eq!(
+            ensure_unique_branch_name(dir.path(), "auth-fix").unwrap(),
+            "auth-fix-3"
+        );
+    }
+
+    #[test]
+    fn unique_branch_name_suffixes_on_remote_only_collision() {
+        let dir = init_repo("unique-remote");
+        commit_file(dir.path(), "a.txt", "x\n");
+        create_remote_tracking(dir.path(), "feature/auth-fix");
+        assert_eq!(
+            ensure_unique_branch_name(dir.path(), "feature/auth-fix").unwrap(),
+            "feature/auth-fix-2"
+        );
+    }
+
+    #[test]
+    fn unique_branch_name_ignores_origin_head() {
+        let dir = init_repo("unique-origin-head");
+        commit_file(dir.path(), "a.txt", "x\n");
+        create_remote_tracking(dir.path(), "HEAD");
+        assert_eq!(
+            ensure_unique_branch_name(dir.path(), "HEAD").unwrap(),
+            "HEAD"
+        );
     }
 }
