@@ -373,6 +373,14 @@ impl Services {
         )
     }
 
+    /// Hydrate the in-memory script registry from the persisted definitions
+    /// (§5.8; FE `.workspace/scripts.json` parity). Called once by the
+    /// composition root on boot so `script.*` survives daemon restarts; runtime
+    /// state always starts fresh (idle). Returns the number of scripts loaded.
+    pub async fn hydrate_scripts(&self) -> Result<usize> {
+        self.script_manager().hydrate().await
+    }
+
     /// Derive the read-only [`WorkspaceActivity`] for a workspace from the live
     /// in-flight agent count (§9.9): `AgentRunning` iff any session is in flight.
     pub(crate) fn workspace_activity(&self, workspace_id: &WorkspaceId) -> WorkspaceActivity {

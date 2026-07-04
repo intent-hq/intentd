@@ -85,11 +85,17 @@ async fn migration_status_reports_current_after_open() {
     assert!(status.is_current(), "fresh open must apply all migrations");
     assert_eq!(
         status.expected,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25
+        ]
     );
     assert_eq!(
         status.applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25
+        ]
     );
 }
 
@@ -1652,6 +1658,69 @@ async fn known_repo_remove_deletes_by_path_and_tolerates_missing() {
     let removed = store.remove_known_repo("/src/a").await.expect("remove");
     assert!(!removed, "missing path reports removed=false");
     assert_eq!(store.list_known_repos().await.expect("list").len(), 1);
+}
+
+#[tokio::test]
+async fn script_upsert_list_remove_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let mut env = std::collections::BTreeMap::new();
+    env.insert("PORT".to_string(), "3000".to_string());
+    let script = intent_core::Script {
+        id: "s-1".to_string(),
+        workspace_id: "ws-1".to_string(),
+        name: "dev server".to_string(),
+        command: "npm run dev".to_string(),
+        cwd: Some("web".to_string()),
+        env: Some(env),
+        mode: intent_core::ScriptMode::Service,
+        category: Some("dev".to_string()),
+        source: "user".to_string(),
+        auto_start: Some(true),
+        created_at: now_iso(),
+        updated_at: None,
+    };
+    store.upsert_script(&script).await.expect("insert");
+
+    // Every field round-trips, including the JSON env map and optionals.
+    let listed = store.list_all_scripts().await.expect("list");
+    assert_eq!(listed, vec![script.clone()]);
+
+    // Upsert on the same id replaces the row (no duplicate).
+    let mut renamed = script.clone();
+    renamed.name = "dev server 2".to_string();
+    renamed.updated_at = Some(now_iso());
+    store.upsert_script(&renamed).await.expect("replace");
+    let listed = store.list_all_scripts().await.expect("list");
+    assert_eq!(listed, vec![renamed]);
+
+    // Sparse optionals persist as NULL and read back as None.
+    let sparse = intent_core::Script {
+        id: "s-2".to_string(),
+        workspace_id: "ws-2".to_string(),
+        name: "build".to_string(),
+        command: "make".to_string(),
+        cwd: None,
+        env: None,
+        mode: intent_core::ScriptMode::Command,
+        category: None,
+        source: "user".to_string(),
+        auto_start: None,
+        created_at: now_iso(),
+        updated_at: None,
+    };
+    store.upsert_script(&sparse).await.expect("insert sparse");
+    let listed = store.list_all_scripts().await.expect("list");
+    assert_eq!(listed.len(), 2);
+    assert!(listed.contains(&sparse));
+
+    // Remove deletes exactly the targeted row; a missing id is not an error.
+    assert!(store.remove_script("s-1").await.expect("remove"));
+    assert!(!store.remove_script("s-1").await.expect("remove again"));
+    let listed = store.list_all_scripts().await.expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, "s-2");
 }
 
 #[tokio::test]

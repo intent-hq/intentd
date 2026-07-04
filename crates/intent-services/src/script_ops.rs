@@ -79,7 +79,7 @@ impl ScriptManager {
         }
     }
 
-    /// `script.create`: register a definition and return it.
+    /// `script.create`: register a definition, persist it, and return it.
     pub(crate) async fn create(
         &self,
         workspace_id: WorkspaceId,
@@ -103,6 +103,9 @@ impl ScriptManager {
             created_at: now_iso(),
             updated_at: None,
         };
+        // Persist first (FE `upsertScript` parity — definitions survive a
+        // daemon restart); the runtime registry only registers what is durable.
+        self.store.upsert_script(&def).await?;
         self.scripts.lock().unwrap().insert(
             id,
             ManagedScript {
@@ -114,6 +117,28 @@ impl ScriptManager {
             },
         );
         Ok(serde_json::to_value(def).unwrap_or_else(|_| json!({})))
+    }
+
+    /// Boot-time hydration: load every persisted definition into the runtime
+    /// registry with a fresh idle state (runtime state is never persisted).
+    /// Ids already registered are left untouched. Returns the number loaded.
+    pub(crate) async fn hydrate(&self) -> Result<usize> {
+        let defs = self.store.list_all_scripts().await?;
+        let mut guard = self.scripts.lock().unwrap();
+        let mut loaded = 0;
+        for def in defs {
+            guard.entry(def.id.clone()).or_insert_with(|| {
+                loaded += 1;
+                ManagedScript {
+                    def,
+                    state: ScriptRuntimeState::default(),
+                    pty_id: None,
+                    stopped_by_user: false,
+                    supervisor: None,
+                }
+            });
+        }
+        Ok(loaded)
     }
 
     /// `script.list`: the workspace's scripts with merged runtime state.
@@ -129,7 +154,7 @@ impl ScriptManager {
         Ok(json!({ "scripts": scripts }))
     }
 
-    /// `script.remove`: stop (if running) and forget a script.
+    /// `script.remove`: stop (if running), forget, and unpersist a script.
     pub(crate) async fn remove(&self, script_id: &str) -> Result<Value> {
         let removed = self.scripts.lock().unwrap().remove(script_id);
         let Some(mut managed) = removed else {
@@ -141,6 +166,7 @@ impl ScriptManager {
         if let Some(pty_id) = managed.pty_id {
             self.pty.kill(pty_id).await;
         }
+        self.store.remove_script(script_id).await?;
         Ok(json!({ "ok": true, "scriptId": script_id }))
     }
 
@@ -1306,6 +1332,67 @@ mod tests {
         let mut names: Vec<&str> = scripts.iter().filter_map(|s| s["name"].as_str()).collect();
         names.sort();
         assert_eq!(names, vec!["a", "b"], "workspace-scoped");
+    }
+
+    #[tokio::test]
+    async fn scripts_persist_across_service_restart() {
+        let h = harness().await;
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("PORT".to_string(), "3000".to_string());
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "dev".into(),
+                command: "npm run dev".into(),
+                mode: ScriptMode::Service,
+                cwd: Some("web".into()),
+                env: Some(env),
+                category: Some("dev".into()),
+                auto_start: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Simulate a daemon restart: a fresh Services over the same store has
+        // an empty registry until the boot-time hydration runs.
+        let svc2 = Services::new(h.services.store().clone());
+        let listed = svc2.script_list(h.ws.clone()).await.expect("list");
+        assert!(
+            listed["scripts"].as_array().expect("array").is_empty(),
+            "registry starts empty pre-hydration"
+        );
+        assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
+        let listed = svc2.script_list(h.ws.clone()).await.expect("list");
+        let entry = &listed["scripts"].as_array().expect("array")[0];
+        assert_eq!(entry["id"].as_str(), Some(id.as_str()));
+        assert_eq!(entry["name"], "dev");
+        assert_eq!(entry["command"], "npm run dev");
+        assert_eq!(entry["cwd"], "web");
+        assert_eq!(entry["env"]["PORT"], "3000");
+        assert_eq!(entry["category"], "dev");
+        assert_eq!(entry["autoStart"], true);
+        assert_eq!(
+            entry["runtime"]["status"], "idle",
+            "runtime state starts fresh, never persisted"
+        );
+
+        // Hydration is idempotent — already-registered ids are untouched.
+        assert_eq!(svc2.hydrate_scripts().await.expect("re-hydrate"), 0);
+    }
+
+    #[tokio::test]
+    async fn script_remove_unpersists_definition() {
+        let h = harness().await;
+        let id = create_simple(&h, "gone", "echo bye", ScriptMode::Command).await;
+        h.services.script_remove(id).await.expect("remove");
+
+        let svc2 = Services::new(h.services.store().clone());
+        assert_eq!(
+            svc2.hydrate_scripts().await.expect("hydrate"),
+            0,
+            "removed script is unpersisted"
+        );
     }
 
     #[tokio::test]

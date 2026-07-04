@@ -24,6 +24,7 @@ mod memories_repo;
 mod metrics_repo;
 mod note_repo;
 mod note_version_repo;
+mod script_repo;
 mod settings_repo;
 mod tracked_changes_repo;
 mod workspace_repo;

@@ -276,6 +276,14 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
         Ok(healed) => tracing::info!(healed, "healed stale in-flight agent sessions on startup"),
         Err(e) => tracing::warn!(error = %e, "stale agent session heal sweep failed"),
     }
+    // Hydrate the script registry from the persisted definitions (§5.8) so
+    // `script.*` survives daemon restarts. Best-effort: a failure is logged
+    // but never aborts startup (scripts can still be re-created live).
+    match services.hydrate_scripts().await {
+        Ok(0) => {}
+        Ok(loaded) => tracing::info!(loaded, "hydrated persisted script definitions"),
+        Err(e) => tracing::warn!(error = %e, "script registry hydration failed"),
+    }
     // Background PR refresh (§7.6): periodically re-fetch every linked PR,
     // persist any change, and emit `pr:*` events so clients update without
     // polling. Safe when source control is unconfigured (each refresh logs and
