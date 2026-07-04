@@ -1990,7 +1990,8 @@ mod change_event_parity {
 
     /// Idempotency replay (design note TB-0 §5.3): a second `workspace.create`
     /// with the same key returns the ORIGINAL workspace without re-executing —
-    /// so no second row and no second `workspace:created` event.
+    /// so no second row, and neither the `workspace:created` nor the seeded
+    /// spec's `note:created` is republished on the replay.
     #[tokio::test]
     async fn idempotent_create_workspace_replay_no_second_event() {
         use intent_core::WorkspaceCreate;
@@ -2010,8 +2011,13 @@ mod change_event_parity {
             .await
             .expect("first create")
             .workspace;
+        // The first create publishes `workspace:created` and the spec seed's
+        // `note:created`; drain both before checking replay is silent.
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &first.id.0, "workspace:created");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &first.id.0, "note:created");
+        assert_eq!(ev["data"]["noteId"], "spec");
 
         // Replay with the same key but different input still returns the
         // original workspace (the body is never re-executed).
@@ -2033,9 +2039,157 @@ mod change_event_parity {
             "replay returns the original workspace"
         );
 
-        // No second event is published (the replay short-circuits the op).
+        // No further events are published (the replay short-circuits the op).
         let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(none.is_err(), "replay must not publish a second event");
+    }
+
+    /// `workspace.create` seeds the well-known `spec` note (reference parity
+    /// with `notes.service.ts ensureSpecExists`): default Spec — empty
+    /// markdown, `spec` tag, pinned, default, workspace visibility — with a
+    /// v1 version snapshot and a `note:created` event carrying `noteId=spec`.
+    #[tokio::test]
+    async fn workspace_create_seeds_spec_note() {
+        use intent_core::{NoteId, NoteVisibility, WorkspaceCreate};
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let created = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Seeded WS".to_string()),
+                    branch: Some("feat/seed-spec".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        // Persisted spec matches the reference default.
+        let spec = h
+            .store
+            .get_note(&NoteId::from("spec"))
+            .await
+            .expect("spec exists");
+        assert_eq!(spec.workspace_id, created.id);
+        assert_eq!(spec.title, "Spec");
+        assert_eq!(spec.content, "");
+        assert_eq!(spec.tags, vec!["spec".to_string()]);
+        assert!(spec.is_pinned);
+        assert!(spec.is_default);
+        assert!(!spec.is_archived);
+        assert_eq!(spec.visibility, NoteVisibility::Workspace);
+        assert!(spec.task.is_none());
+
+        // Initial version snapshot captured.
+        let versions = h
+            .store
+            .list_note_versions(&NoteId::from("spec"))
+            .await
+            .expect("versions");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].v, 1);
+
+        // `workspace:created` first, then the spec seed's `note:created`.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &created.id.0, "workspace:created");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &created.id.0, "note:created");
+        assert_eq!(ev["data"]["noteId"], "spec");
+        assert_eq!(ev["data"]["title"], "Spec");
+    }
+
+    /// Spec seeding is idempotent inside the create scope: a replay with the
+    /// same `idempotencyKey` short-circuits and does not attempt to reinsert.
+    /// (Cross-workspace collision under the current globally-unique `note.id`
+    /// schema is exercised in `spec_seed_skips_when_owned_by_another_workspace`.)
+    #[tokio::test]
+    async fn workspace_create_spec_seed_replay_no_duplicate() {
+        use intent_core::{NoteId, WorkspaceCreate};
+        let h = harness().await;
+        let key = Some("spec-seed-idem".to_string());
+        let first = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("First".to_string()),
+                    branch: Some("feat/spec-seed-a".to_string()),
+                    ..Default::default()
+                },
+                key.clone(),
+            )
+            .await
+            .expect("first create")
+            .workspace;
+        let _ = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Second".to_string()),
+                    branch: Some("feat/spec-seed-b".to_string()),
+                    ..Default::default()
+                },
+                key,
+            )
+            .await
+            .expect("replay create");
+        let spec = h
+            .store
+            .get_note(&NoteId::from("spec"))
+            .await
+            .expect("spec exists");
+        assert_eq!(spec.workspace_id, first.id);
+        let versions = h
+            .store
+            .list_note_versions(&NoteId::from("spec"))
+            .await
+            .expect("versions");
+        assert_eq!(versions.len(), 1, "replay must not append a second version");
+    }
+
+    /// Under the current schema (`note.id` is globally unique), a second
+    /// workspace's spec seed is skipped with a warning rather than failing
+    /// `workspace.create`. Documents the known limitation exercised by this
+    /// path so a future schema fix has a regression anchor.
+    #[tokio::test]
+    async fn spec_seed_skips_when_owned_by_another_workspace() {
+        use intent_core::{NoteId, WorkspaceCreate};
+        let h = harness().await;
+        let first = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("First".to_string()),
+                    branch: Some("feat/spec-owner-a".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("first create")
+            .workspace;
+        let second = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Second".to_string()),
+                    branch: Some("feat/spec-owner-b".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("second create")
+            .workspace;
+        assert_ne!(second.id, first.id);
+        let spec = h
+            .store
+            .get_note(&NoteId::from("spec"))
+            .await
+            .expect("spec exists");
+        assert_eq!(spec.workspace_id, first.id, "spec stays with first ws");
     }
 }
 

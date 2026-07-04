@@ -1015,6 +1015,69 @@ async fn capture_note_version(store: &Store, note: &Note) -> Result<i64> {
         .await
 }
 
+/// Seed the well-known `spec` note on `workspace.create` (reference parity with
+/// `notes.service.ts ensureSpecExists`). Idempotent: if a spec note already
+/// exists in this workspace, this is a no-op; otherwise it inserts the default
+/// Spec (empty markdown, pinned, default, workspace visibility), captures the
+/// initial version, and publishes `note:created`.
+///
+/// The `note` table's primary key is globally unique, so if a spec row already
+/// exists under a *different* workspace the insert is skipped with a warning:
+/// per-workspace scoping of well-known ids is a pre-existing store limitation
+/// (tracked separately) and must not fail the workspace create.
+async fn ensure_spec_note(
+    store: &Store,
+    bus: &Option<EventBus>,
+    workspace_id: &WorkspaceId,
+) -> Result<()> {
+    let spec_id = NoteId::from("spec");
+    match fetch_note(store, workspace_id, &spec_id).await {
+        Ok(_) => return Ok(()),
+        Err(Error::NotFound(_)) => {}
+        Err(e) => return Err(e),
+    }
+    if let Ok(existing) = store.get_note(&spec_id).await {
+        tracing::warn!(
+            workspace = %workspace_id.as_str(),
+            other_workspace = %existing.workspace_id.as_str(),
+            "workspace.create: spec note already owned by another workspace; skipping seed"
+        );
+        return Ok(());
+    }
+    let now = now_iso();
+    let note = Note {
+        id: spec_id,
+        workspace_id: workspace_id.clone(),
+        title: "Spec".to_string(),
+        content: String::new(),
+        content_type: ContentType::Markdown,
+        tags: vec!["spec".to_string()],
+        is_pinned: true,
+        is_archived: false,
+        is_default: true,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        task: None,
+        created_at: now.clone(),
+        rev: 0,
+        updated_at: now,
+    };
+    store.insert_note(&note).await?;
+    capture_note_version(store, &note).await?;
+    publish_event(
+        bus,
+        note_change_event(
+            &note.workspace_id,
+            &note.id,
+            &note.title,
+            NOTE_CREATED,
+            "create",
+        ),
+    )
+    .await;
+    Ok(())
+}
+
 /// Like [`fetch_note`] but surfaces the TS peer's `Note not found: <id>` message
 /// as [`Error::Internal`] (→ `-32603`), matching the `ws.note.*` edit peers.
 async fn fetch_note_peer(
@@ -3400,6 +3463,11 @@ impl WorkspaceApi for Services {
                     // the stored result without re-running the op, so the
                     // event fires at most once per logical create (§6.5).
                     publish_event(&bus, workspace_created_event(&ws)).await;
+                    // Seed the well-known `spec` note (reference parity with
+                    // `notes.service.ts ensureSpecExists`). Idempotent under
+                    // the replay guard: on retry the stored result comes back
+                    // and this branch never re-runs.
+                    ensure_spec_note(&store, &bus, &ws.id).await?;
                     // Daemon-owned initial-agent orchestration (§5.1): when the
                     // request carries an `initialAgent` with a non-empty prompt,
                     // create the agent row (delegate parity: `agent_create_op`,

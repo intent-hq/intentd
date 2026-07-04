@@ -3184,6 +3184,25 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
     assert!(chunks >= 1, "initial agent streamed ≥1 chunk");
     assert_eq!(ends, 1, "exactly one terminal stream:end");
 
+    // Spec seed: workspace.create seeded the well-known `spec` note and it is
+    // addressable through the wire (`note.get`) with the reference-parity
+    // defaults (title "Spec", empty body, `spec` tag, pinned + default).
+    let spec = wss_rpc(
+        &mut rpc,
+        14,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": "spec" }),
+    )
+    .await;
+    let note = &spec["note"];
+    assert_eq!(note["id"], "spec", "spec note addressable by id: {spec}");
+    assert_eq!(note["workspaceId"], ws_id);
+    assert_eq!(note["title"], "Spec");
+    assert_eq!(note["content"], "");
+    assert_eq!(note["tags"], json!(["spec"]));
+    assert_eq!(note["isPinned"], true);
+    assert_eq!(note["isDefault"], true);
+
     // Transcript: exactly ONE user message (the prompt, delivered once) and an
     // assistant reply — the double-send bug class is structurally impossible.
     let conv = wss_rpc(
