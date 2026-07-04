@@ -1384,7 +1384,13 @@ impl Services {
             let send = match self.agent_manager() {
                 Some(manager) => {
                     manager
-                        .send_message(child, workspace_id, message, None)
+                        .send_message(
+                            child,
+                            workspace_id,
+                            message,
+                            None,
+                            crate::agent_manager::TurnOptions::default(),
+                        )
                         .await
                 }
                 None => self.agent_send_message_op(child, message, None).await,
@@ -1874,7 +1880,13 @@ impl Services {
         let result = match self.agent_manager() {
             Some(manager) if is_interrupt_priority(priority.as_deref()) => {
                 manager
-                    .interrupt_send_message(agent.clone(), workspace_id, message, None)
+                    .interrupt_send_message(
+                        agent.clone(),
+                        workspace_id,
+                        message,
+                        None,
+                        crate::agent_manager::TurnOptions::default(),
+                    )
                     .await?
             }
             _ => {

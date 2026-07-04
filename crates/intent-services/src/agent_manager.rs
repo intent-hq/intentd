@@ -48,6 +48,24 @@ mod tests;
 
 const GB: u64 = 1024 * 1024 * 1024;
 
+/// Per-turn prompt-assembly hints threaded through `agent.sendMessage` /
+/// `agent.forceMessage` (PROTOCOL §5.5). `stdin_context` is prepended
+/// verbatim to the outbound prompt as a `Context:` block (reference-parity
+/// `acp-provider.ts`); `note_ids` and `context_references` are carried
+/// forward for downstream note-image / context-reference resolution and are
+/// otherwise inert today.
+///
+/// Only the FIRST turn triggered by a `sendMessage` / `forceMessage` call
+/// carries these options; queue-drained follow-up turns run with
+/// [`TurnOptions::default`] since a `QueuedMessage` has no per-turn hints of
+/// its own.
+#[derive(Debug, Default, Clone)]
+pub struct TurnOptions {
+    pub stdin_context: Option<String>,
+    pub note_ids: Option<serde_json::Value>,
+    pub context_references: Option<serde_json::Value>,
+}
+
 /// Conservative cap used when total system memory cannot be determined.
 const DEFAULT_PROCESS_CAP: usize = 8;
 
@@ -905,7 +923,17 @@ impl AgentManager {
     /// the fresh session has context, then clear the flag (parity: TS
     /// `sessionWasRecreated` → `formatHistoryAsXml`). The just-persisted current
     /// user message is excluded from the rendered history.
-    async fn build_turn_prompt(&self, agent_id: &AgentId, content: &str) -> Vec<ContentBlock> {
+    ///
+    /// When `options.stdin_context` is set the prompt is prefixed with a
+    /// `Context:\n<stdin>\n\n---\n\n` block, reference-parity with
+    /// `acp-provider.ts`; other [`TurnOptions`] fields are reserved for
+    /// downstream note-image / context-reference resolution.
+    async fn build_turn_prompt(
+        &self,
+        agent_id: &AgentId,
+        content: &str,
+        options: &TurnOptions,
+    ) -> Vec<ContentBlock> {
         // Role reminder is rebuilt every turn (interval = 1, port of
         // acp-provider.ts) and prepended to the outbound prompt for specialist
         // agents; absent for non-specialist agents. Because it fires every turn
@@ -915,6 +943,14 @@ impl AgentManager {
         let prompt_text = match reminder {
             Some(r) => format!("{r}\n\n{body}"),
             None => body,
+        };
+        // `stdinContext` is prepended verbatim as a `Context:` block; the
+        // trailing separator matches the reference `acp-provider.ts` so
+        // downstream consumers see the same shape whether the prompt
+        // originates from the daemon or the legacy Electron main path.
+        let prompt_text = match options.stdin_context.as_deref() {
+            Some(ctx) if !ctx.is_empty() => format!("Context:\n{ctx}\n\n---\n\n{prompt_text}"),
+            _ => prompt_text,
         };
         text_prompt(&prompt_text)
     }
@@ -1190,6 +1226,7 @@ impl AgentManager {
         workspace_id: WorkspaceId,
         content: String,
         message_id: Option<String>,
+        options: TurnOptions,
     ) -> Result<Value> {
         if !self.try_begin(&agent_id, &workspace_id).await {
             let (queued, position) = self.services.enqueue_message(&agent_id, content, None);
@@ -1225,7 +1262,7 @@ impl AgentManager {
             self.clone().try_drain_queue(agent_id, workspace_id).await;
             return Ok(result);
         }
-        self.spawn_worker(agent_id, workspace_id, content);
+        self.spawn_worker(agent_id, workspace_id, content, options);
         Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
     }
 
@@ -1267,7 +1304,8 @@ impl AgentManager {
             )
             .await;
         persist_user(&self, &agent_id, &next.content).await;
-        self.spawn_worker(agent_id, workspace_id, next.content);
+        // Queue-drained turns carry no per-turn prompt hints of their own.
+        self.spawn_worker(agent_id, workspace_id, next.content, TurnOptions::default());
     }
 
     /// `agent.forceMessage` runtime path (§5.5): stop the current stream (abort
@@ -1279,6 +1317,7 @@ impl AgentManager {
         workspace_id: WorkspaceId,
         message_id: String,
         content: String,
+        options: TurnOptions,
     ) -> Result<Value> {
         self.stop(&agent_id).await;
         if self.services.clear_queue(&agent_id) {
@@ -1292,7 +1331,7 @@ impl AgentManager {
             .append_agent_message(&agent_id, "user", &blocks, &now_iso())
             .await?;
         self.try_begin(&agent_id, &workspace_id).await;
-        self.spawn_worker(agent_id, workspace_id, content);
+        self.spawn_worker(agent_id, workspace_id, content, options);
         Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
     }
 
@@ -1327,6 +1366,7 @@ impl AgentManager {
         workspace_id: WorkspaceId,
         content: String,
         message_id: Option<String>,
+        options: TurnOptions,
     ) -> Result<Value> {
         // Duplicate-delivery guard: check-and-record is atomic under the lock,
         // so of two racing duplicates exactly one proceeds to preempt.
@@ -1368,7 +1408,7 @@ impl AgentManager {
         // it and streams the interrupt message right away rather than queueing.
         // If a concurrent send wins the race the message queues instead — it is
         // still delivered by that worker's drain loop, never dropped.
-        self.send_message(agent_id, workspace_id, content, message_id)
+        self.send_message(agent_id, workspace_id, content, message_id, options)
             .await
     }
 
@@ -1379,11 +1419,12 @@ impl AgentManager {
         agent_id: AgentId,
         workspace_id: WorkspaceId,
         content: String,
+        options: TurnOptions,
     ) {
         let mgr = self.clone();
         let id = agent_id.clone();
         let handle = tokio::spawn(async move {
-            run_message_worker(mgr, id, workspace_id, content).await;
+            run_message_worker(mgr, id, workspace_id, content, options).await;
         });
         self.workers.lock().unwrap().insert(agent_id, handle);
     }
@@ -1640,12 +1681,17 @@ async fn run_message_worker(
     agent_id: AgentId,
     workspace_id: WorkspaceId,
     initial_content: String,
+    initial_options: TurnOptions,
 ) {
     let mut content = initial_content;
+    // Only the first turn carries the caller's per-turn hints; queue-drained
+    // follow-up turns run with the default (no `stdinContext` prefix, no
+    // note/context-reference bindings) since a `QueuedMessage` has none.
+    let mut options = initial_options;
     'outer: loop {
         match mgr.ensure_started(&agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
-                let prompt = mgr.build_turn_prompt(&agent_id, &content).await;
+                let prompt = mgr.build_turn_prompt(&agent_id, &content, &options).await;
                 if let Err(e) = mgr
                     .run_turn(&agent_id, &workspace_id, &acp_session_id, prompt)
                     .await
@@ -1668,6 +1714,7 @@ async fn run_message_worker(
                 .await;
             persist_user(&mgr, &agent_id, &next.content).await;
             content = next.content;
+            options = TurnOptions::default();
             continue;
         }
         // Queue drained: release the slot, then re-check for a message that
@@ -1689,6 +1736,7 @@ async fn run_message_worker(
                 .await;
             persist_user(&mgr, &agent_id, &next.content).await;
             content = next.content;
+            options = TurnOptions::default();
             continue 'outer;
         }
         // A concurrent send won the slot; hand the message back to it and
@@ -1860,7 +1908,9 @@ mod role_reminder_tests {
         let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
         // Interval = 1 → every turn carries the prefix.
         for _ in 0..2 {
-            let prompt = mgr.build_turn_prompt(&agent_id, "do the thing").await;
+            let prompt = mgr
+                .build_turn_prompt(&agent_id, "do the thing", &TurnOptions::default())
+                .await;
             let text = prompt_text(&prompt);
             assert!(
                 text.starts_with("[Role Reminder: You are a Implementor. Stay in scope.]\n\n"),
@@ -1879,7 +1929,9 @@ mod role_reminder_tests {
         let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
         // Flag the agent's session as recreated; the reminder must still prepend.
         mgr.recreated.lock().unwrap().insert(agent_id.clone());
-        let prompt = mgr.build_turn_prompt(&agent_id, "resume work").await;
+        let prompt = mgr
+            .build_turn_prompt(&agent_id, "resume work", &TurnOptions::default())
+            .await;
         let text = prompt_text(&prompt);
         assert!(
             text.starts_with("[Role Reminder: You are a Implementor. Stay in scope.]\n\n"),
@@ -1892,7 +1944,61 @@ mod role_reminder_tests {
     #[tokio::test]
     async fn no_injection_without_specialist() {
         let (mgr, agent_id) = manager_with(None, None).await;
-        let prompt = mgr.build_turn_prompt(&agent_id, "plain message").await;
+        let prompt = mgr
+            .build_turn_prompt(&agent_id, "plain message", &TurnOptions::default())
+            .await;
         assert_eq!(prompt_text(&prompt), "plain message");
+    }
+
+    #[tokio::test]
+    async fn stdin_context_is_prepended_as_context_block() {
+        // Reference-parity `acp-provider.ts` §5.5: `stdinContext` is prepended
+        // to the outbound prompt as `Context:\n<ctx>\n\n---\n\n<body>` before
+        // any role reminder. Applies to both plain and specialist agents.
+        let (mgr, agent_id) = manager_with(None, None).await;
+        let opts = TurnOptions {
+            stdin_context: Some("hello ctx".to_string()),
+            ..TurnOptions::default()
+        };
+        let prompt = mgr
+            .build_turn_prompt(&agent_id, "user says hi", &opts)
+            .await;
+        let text = prompt_text(&prompt);
+        assert_eq!(text, "Context:\nhello ctx\n\n---\n\nuser says hi");
+    }
+
+    #[tokio::test]
+    async fn stdin_context_empty_string_is_not_prepended() {
+        // An empty `stdinContext` is treated as absent so we do not emit a
+        // stray `Context:` header with nothing under it.
+        let (mgr, agent_id) = manager_with(None, None).await;
+        let opts = TurnOptions {
+            stdin_context: Some(String::new()),
+            ..TurnOptions::default()
+        };
+        let prompt = mgr.build_turn_prompt(&agent_id, "body", &opts).await;
+        assert_eq!(prompt_text(&prompt), "body");
+    }
+
+    #[tokio::test]
+    async fn stdin_context_precedes_role_reminder() {
+        // Ordering: `Context:` block first, then the role reminder, then the
+        // body — matching the reference `acp-provider.ts` prompt-assembly.
+        let dir = write_specialist(
+            "implementor",
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
+        );
+        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let opts = TurnOptions {
+            stdin_context: Some("ctx".to_string()),
+            ..TurnOptions::default()
+        };
+        let prompt = mgr.build_turn_prompt(&agent_id, "do it", &opts).await;
+        let text = prompt_text(&prompt);
+        assert!(
+            text.starts_with("Context:\nctx\n\n---\n\n[Role Reminder:"),
+            "unexpected ordering: {text:?}"
+        );
+        assert!(text.ends_with("do it"));
     }
 }

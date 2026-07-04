@@ -817,8 +817,26 @@ async fn dispatch(
             let message_id = opt_str(params, "messageId");
             let image_blocks = opt_value(params, "imageBlocks");
             let priority = opt_str(params, "priority");
+            // Per-turn prompt-assembly hints (PROTOCOL §5.5): `stdinContext`
+            // is prepended verbatim to the outbound prompt as a `Context:`
+            // block (reference-parity `acp-provider.ts`); `noteIds` and
+            // `contextReferences` are threaded to the prompt builder for
+            // downstream note-image / context-reference resolution.
+            let note_ids = opt_value(params, "noteIds");
+            let stdin_context = opt_str(params, "stdinContext");
+            let context_references = opt_value(params, "contextReferences");
             let result = api
-                .agent_send_message(ws, agent_id, content, message_id, image_blocks, priority)
+                .agent_send_message(
+                    ws,
+                    agent_id,
+                    content,
+                    message_id,
+                    image_blocks,
+                    priority,
+                    note_ids,
+                    stdin_context,
+                    context_references,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -830,8 +848,21 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let image_blocks = opt_value(params, "imageBlocks");
             let note_ids = opt_value(params, "noteIds");
+            // Per-turn prompt-assembly hints (PROTOCOL §5.5); same shape as
+            // `agent.sendMessage`.
+            let stdin_context = opt_str(params, "stdinContext");
+            let context_references = opt_value(params, "contextReferences");
             let result = api
-                .agent_force_message(ws, agent_id, message_id, content, image_blocks, note_ids)
+                .agent_force_message(
+                    ws,
+                    agent_id,
+                    message_id,
+                    content,
+                    image_blocks,
+                    note_ids,
+                    stdin_context,
+                    context_references,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

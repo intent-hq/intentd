@@ -3624,3 +3624,178 @@ async fn github_missing_required_params_are_minus_32602() {
         assert_eq!(err_code(&v), -32602, "msg={msg}");
     }
 }
+
+/// FIX 1 parity: `agent.sendMessage` / `agent.forceMessage` must forward the
+/// FE-side per-turn prompt-assembly hints (`noteIds`, `stdinContext`,
+/// `contextReferences`) verbatim to the [`WorkspaceApi`] call — the daemon
+/// previously dropped them (see FE audit).
+mod send_message_payload_forwarding {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{AgentId, BoxFuture, Result, WorkspaceApi, WorkspaceId};
+    use serde_json::{json, Value};
+
+    use super::super::handle_message;
+
+    /// Recorded snapshot of a single `agent_send_message` / `agent_force_message`
+    /// call. Only the fields the FIX widens are asserted; the rest are captured
+    /// so the tests document the full observed shape.
+    #[derive(Default, Debug, Clone)]
+    #[allow(dead_code)]
+    struct Capture {
+        workspace_id: Option<WorkspaceId>,
+        agent_id: Option<AgentId>,
+        content: Option<String>,
+        message_id: Option<String>,
+        image_blocks: Option<Value>,
+        priority: Option<String>,
+        note_ids: Option<Value>,
+        stdin_context: Option<String>,
+        context_references: Option<Value>,
+    }
+
+    #[derive(Default)]
+    struct RecordingApi {
+        send: Arc<Mutex<Capture>>,
+        force: Arc<Mutex<Capture>>,
+    }
+
+    impl WorkspaceApi for RecordingApi {
+        #[allow(clippy::too_many_arguments)]
+        fn agent_send_message(
+            &self,
+            workspace_id: WorkspaceId,
+            agent_id: AgentId,
+            content: String,
+            message_id: Option<String>,
+            image_blocks: Option<Value>,
+            priority: Option<String>,
+            note_ids: Option<Value>,
+            stdin_context: Option<String>,
+            context_references: Option<Value>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let slot = self.send.clone();
+            Box::pin(async move {
+                *slot.lock().unwrap() = Capture {
+                    workspace_id: Some(workspace_id),
+                    agent_id: Some(agent_id),
+                    content: Some(content),
+                    message_id,
+                    image_blocks,
+                    priority,
+                    note_ids,
+                    stdin_context,
+                    context_references,
+                };
+                Ok(json!({ "success": true, "queued": false, "messageId": "m-1" }))
+            })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn agent_force_message(
+            &self,
+            workspace_id: WorkspaceId,
+            agent_id: AgentId,
+            message_id: String,
+            content: String,
+            image_blocks: Option<Value>,
+            note_ids: Option<Value>,
+            stdin_context: Option<String>,
+            context_references: Option<Value>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let slot = self.force.clone();
+            Box::pin(async move {
+                *slot.lock().unwrap() = Capture {
+                    workspace_id: Some(workspace_id),
+                    agent_id: Some(agent_id),
+                    content: Some(content),
+                    message_id: Some(message_id),
+                    image_blocks,
+                    priority: None,
+                    note_ids,
+                    stdin_context,
+                    context_references,
+                };
+                Ok(json!({ "success": true, "queued": false, "messageId": "m-2" }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn send_message_forwards_note_ids_stdin_context_and_context_references() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":1,"method":"agent.sendMessage",
+            "params":{
+                "workspaceId":"ws-1",
+                "agentId":"agent-1",
+                "content":"hi",
+                "messageId":"m-1",
+                "priority":"interrupt",
+                "noteIds":["note-a","note-b"],
+                "stdinContext":"ctx text",
+                "contextReferences":[{"path":"src/a.rs"}]
+            }
+        }"#;
+        let out = handle_message(&api, msg).await.expect("response");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["result"]["success"], Value::Bool(true));
+
+        let cap = api.send.lock().unwrap().clone();
+        assert_eq!(cap.workspace_id.as_ref().map(|w| w.as_str()), Some("ws-1"));
+        assert_eq!(cap.agent_id.as_ref().map(|a| a.as_str()), Some("agent-1"));
+        assert_eq!(cap.content.as_deref(), Some("hi"));
+        assert_eq!(cap.message_id.as_deref(), Some("m-1"));
+        assert_eq!(cap.priority.as_deref(), Some("interrupt"));
+        assert_eq!(cap.stdin_context.as_deref(), Some("ctx text"));
+        assert_eq!(
+            cap.note_ids,
+            Some(json!(["note-a", "note-b"])),
+            "noteIds must be forwarded verbatim"
+        );
+        assert_eq!(
+            cap.context_references,
+            Some(json!([{"path": "src/a.rs"}])),
+            "contextReferences must be forwarded verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_omitted_hints_are_none() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":2,"method":"agent.sendMessage",
+            "params":{"workspaceId":"ws-1","agentId":"agent-1","content":"hi"}
+        }"#;
+        handle_message(&api, msg).await.expect("response");
+        let cap = api.send.lock().unwrap().clone();
+        assert!(cap.note_ids.is_none());
+        assert!(cap.stdin_context.is_none());
+        assert!(cap.context_references.is_none());
+        assert!(cap.priority.is_none());
+    }
+
+    #[tokio::test]
+    async fn force_message_forwards_stdin_context_and_context_references() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":3,"method":"agent.forceMessage",
+            "params":{
+                "workspaceId":"ws-1",
+                "agentId":"agent-1",
+                "messageId":"m-force",
+                "content":"stop",
+                "noteIds":["note-x"],
+                "stdinContext":"forced ctx",
+                "contextReferences":[{"symbol":"Foo"}]
+            }
+        }"#;
+        handle_message(&api, msg).await.expect("response");
+        let cap = api.force.lock().unwrap().clone();
+        assert_eq!(cap.message_id.as_deref(), Some("m-force"));
+        assert_eq!(cap.content.as_deref(), Some("stop"));
+        assert_eq!(cap.stdin_context.as_deref(), Some("forced ctx"));
+        assert_eq!(cap.note_ids, Some(json!(["note-x"])));
+        assert_eq!(cap.context_references, Some(json!([{"symbol": "Foo"}])));
+    }
+}

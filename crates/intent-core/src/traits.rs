@@ -802,6 +802,14 @@ pub trait WorkspaceApi: Send + Sync {
     /// `priority: "interrupt"` preempts an in-flight turn instead of queueing:
     /// the current turn is cancelled keep-alive (the agent process is never
     /// killed) and the message is delivered immediately as a fresh turn.
+    ///
+    /// `note_ids` / `stdin_context` / `context_references` are the FE-side
+    /// per-turn prompt-assembly hints (PROTOCOL §5.5). `stdin_context` is
+    /// prepended verbatim to the outbound prompt as a `Context:` block
+    /// (reference-parity `acp-provider.ts`); the other two are threaded
+    /// through to the prompt builder for downstream note-image /
+    /// context-reference resolution.
+    #[allow(clippy::too_many_arguments)]
     fn agent_send_message(
         &self,
         workspace_id: WorkspaceId,
@@ -810,6 +818,9 @@ pub trait WorkspaceApi: Send + Sync {
         message_id: Option<String>,
         image_blocks: Option<serde_json::Value>,
         priority: Option<String>,
+        note_ids: Option<serde_json::Value>,
+        stdin_context: Option<String>,
+        context_references: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
@@ -818,6 +829,9 @@ pub trait WorkspaceApi: Send + Sync {
             message_id,
             image_blocks,
             priority,
+            note_ids,
+            stdin_context,
+            context_references,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -827,7 +841,8 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.forceMessage`: stop the current stream then deliver immediately
-    /// (PROTOCOL §5.5).
+    /// (PROTOCOL §5.5). Accepts the same per-turn prompt-assembly hints
+    /// (`stdin_context`, `note_ids`, `context_references`) as `sendMessage`.
     #[allow(clippy::too_many_arguments)]
     fn agent_force_message(
         &self,
@@ -837,6 +852,8 @@ pub trait WorkspaceApi: Send + Sync {
         content: String,
         image_blocks: Option<serde_json::Value>,
         note_ids: Option<serde_json::Value>,
+        stdin_context: Option<String>,
+        context_references: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
@@ -845,6 +862,8 @@ pub trait WorkspaceApi: Send + Sync {
             content,
             image_blocks,
             note_ids,
+            stdin_context,
+            context_references,
         );
         Box::pin(async {
             Err(Error::Internal(

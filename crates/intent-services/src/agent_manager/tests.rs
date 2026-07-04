@@ -722,7 +722,9 @@ async fn build_turn_prompt_prepends_history_once_after_recreate() {
     }
     mgr.recreated.lock().unwrap().insert(id.clone());
 
-    let prompt = mgr.build_turn_prompt(&id, "current message").await;
+    let prompt = mgr
+        .build_turn_prompt(&id, "current message", &super::TurnOptions::default())
+        .await;
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -740,7 +742,9 @@ async fn build_turn_prompt_prepends_history_once_after_recreate() {
     );
 
     // The flag is consumed: a follow-up turn sends only the message text.
-    let plain = mgr.build_turn_prompt(&id, "next message").await;
+    let plain = mgr
+        .build_turn_prompt(&id, "next message", &super::TurnOptions::default())
+        .await;
     let plain_text = serde_json::to_value(&plain).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -811,7 +815,13 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
 
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let result = mgr
-        .interrupt_send_message(id.clone(), ws.clone(), "urgent".to_string(), None)
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "urgent".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
         .await
         .expect("interrupt send");
     assert_eq!(result["success"], json!(true));
@@ -860,7 +870,13 @@ async fn interrupt_send_message_idle_agent_falls_through_to_send() {
         .unwrap();
 
     let result = mgr
-        .interrupt_send_message(id.clone(), ws.clone(), "hello".to_string(), None)
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "hello".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
         .await
         .expect("idle interrupt send");
     assert_eq!(result["success"], json!(true));
@@ -899,6 +915,7 @@ async fn duplicate_interrupt_send_same_message_id_preempts_once() {
             ws.clone(),
             "dup-urgent".to_string(),
             Some("user-msg-dup".to_string()),
+            super::TurnOptions::default(),
         )
         .await
         .expect("first interrupt send");
@@ -914,6 +931,7 @@ async fn duplicate_interrupt_send_same_message_id_preempts_once() {
             ws.clone(),
             "dup-urgent".to_string(),
             Some("user-msg-dup".to_string()),
+            super::TurnOptions::default(),
         )
         .await
         .expect("duplicate interrupt send");
@@ -956,6 +974,7 @@ async fn duplicate_interrupt_send_same_message_id_preempts_once() {
             ws.clone(),
             "next-urgent".to_string(),
             Some("user-msg-next".to_string()),
+            super::TurnOptions::default(),
         )
         .await
         .expect("distinct interrupt send");
@@ -988,6 +1007,7 @@ async fn interrupt_send_during_turn_startup_queues_keep_alive() {
             ws.clone(),
             "early interrupt".to_string(),
             Some("user-msg-early".to_string()),
+            super::TurnOptions::default(),
         )
         .await
         .expect("startup-window interrupt send");
@@ -1454,7 +1474,13 @@ async fn send_message_queues_when_already_busy() {
     assert!(mgr.try_begin(&id, &ws).await);
 
     let result = mgr
-        .send_message(id.clone(), ws.clone(), "queued".to_string(), None)
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "queued".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
         .await
         .expect("send_message returns the queued envelope");
     assert_eq!(result["success"], json!(true));

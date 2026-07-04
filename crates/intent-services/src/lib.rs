@@ -3616,7 +3616,7 @@ impl WorkspaceApi for Services {
                             let send = match services.agent_manager() {
                                 Some(manager) => {
                                     manager
-                                        .send_message(child, ws.id.clone(), prompt, None)
+                                        .send_message(child, ws.id.clone(), prompt, None, crate::agent_manager::TurnOptions::default())
                                         .await
                                 }
                                 None => {
@@ -6289,21 +6289,35 @@ impl WorkspaceApi for Services {
         message_id: Option<String>,
         _image_blocks: Option<serde_json::Value>,
         priority: Option<String>,
+        note_ids: Option<serde_json::Value>,
+        stdin_context: Option<String>,
+        context_references: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             // When the runtime manager is attached, drive a real spawn/turn loop;
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive
             // (the child is never killed) and streams the message immediately.
+            let options = crate::agent_manager::TurnOptions {
+                stdin_context,
+                note_ids,
+                context_references,
+            };
             match self.agent_manager() {
                 Some(manager) => {
                     if crate::agent_ops::is_interrupt_priority(priority.as_deref()) {
                         manager
-                            .interrupt_send_message(agent_id, workspace_id, content, message_id)
+                            .interrupt_send_message(
+                                agent_id,
+                                workspace_id,
+                                content,
+                                message_id,
+                                options,
+                            )
                             .await
                     } else {
                         manager
-                            .send_message(agent_id, workspace_id, content, message_id)
+                            .send_message(agent_id, workspace_id, content, message_id, options)
                             .await
                     }
                 }
@@ -6322,13 +6336,20 @@ impl WorkspaceApi for Services {
         message_id: String,
         content: String,
         _image_blocks: Option<serde_json::Value>,
-        _note_ids: Option<serde_json::Value>,
+        note_ids: Option<serde_json::Value>,
+        stdin_context: Option<String>,
+        context_references: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            let options = crate::agent_manager::TurnOptions {
+                stdin_context,
+                note_ids,
+                context_references,
+            };
             match self.agent_manager() {
                 Some(manager) => {
                     manager
-                        .force_message(agent_id, workspace_id, message_id, content)
+                        .force_message(agent_id, workspace_id, message_id, content, options)
                         .await
                 }
                 None => {
