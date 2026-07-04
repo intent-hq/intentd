@@ -1634,6 +1634,27 @@ async fn known_repo_list_orders_by_last_used_desc() {
 }
 
 #[tokio::test]
+async fn known_repo_remove_deletes_by_path_and_tolerates_missing() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    store.upsert_known_repo("/src/a", "a", None).await.unwrap();
+    store.upsert_known_repo("/src/b", "b", None).await.unwrap();
+
+    // Removing a registered path deletes exactly that row.
+    let removed = store.remove_known_repo("/src/a").await.expect("remove");
+    assert!(removed, "existing path reports removed=true");
+    let repos = store.list_known_repos().await.expect("list");
+    let paths: Vec<&str> = repos.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(paths, vec!["/src/b"], "only the targeted repo is deleted");
+
+    // Removing an unregistered path is a no-op, not an error.
+    let removed = store.remove_known_repo("/src/a").await.expect("remove");
+    assert!(!removed, "missing path reports removed=false");
+    assert_eq!(store.list_known_repos().await.expect("list").len(), 1);
+}
+
+#[tokio::test]
 async fn idempotency_get_put_round_trips_and_dedupes() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");

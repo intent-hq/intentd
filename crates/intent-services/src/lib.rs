@@ -5260,6 +5260,14 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn repo_remove(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let removed = store.remove_known_repo(&path).await?;
+            Ok(serde_json::json!({ "removed": removed }))
+        })
+    }
+
     fn git_commit(
         &self,
         workspace_id: WorkspaceId,

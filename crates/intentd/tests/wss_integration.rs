@@ -1851,3 +1851,70 @@ async fn wss_host_open_in_editor_reverse_round_trip() {
 
     srv.ws.stop().await;
 }
+
+/// `repo.remove` over WSS (PROTOCOL §5.11): removing a registered path deletes
+/// it from the known-repo registry (`removed: true`, gone from `repo.list`);
+/// removing an unknown path is `removed: false`; missing `path` is -32602.
+#[tokio::test]
+async fn wss_repo_remove_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed two known repos directly in the store (repo.list is read-only).
+    srv.store
+        .upsert_known_repo("/src/keep", "keep", None)
+        .await
+        .expect("seed keep");
+    srv.store
+        .upsert_known_repo("/src/gone", "gone", Some("owner"))
+        .await
+        .expect("seed gone");
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"repo.list","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["repos"].as_array().unwrap().len(), 2);
+
+    // Remove one; the response carries `{ removed: true }`.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"repo.remove","params":{"path":"/src/gone"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"], serde_json::json!({ "removed": true }));
+
+    // The registry no longer lists it — this is what the FE re-reads.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"repo.list","params":{}}"#,
+    )
+    .await;
+    let repos = resp["result"]["repos"].as_array().unwrap();
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0]["path"], "/src/keep");
+
+    // Removing it again is a no-op, not an error.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"repo.remove","params":{"path":"/src/gone"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"], serde_json::json!({ "removed": false }));
+
+    // Missing path → -32602 (PROTOCOL §9).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":5,"method":"repo.remove","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(resp["error"]["message"], "Missing required parameter: path");
+
+    srv.ws.stop().await;
+}

@@ -1714,6 +1714,18 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `repo.remove`: delete one entry from the persistent known-repository
+    /// registry by `path`, as `{ removed: bool }` (PROTOCOL §5.11). Removing a
+    /// path that is not registered is not an error — `removed` is `false`.
+    fn repo_remove(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = path;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::repo_remove not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `pr.status`: the active PR's state, mergeability, and summary. Requires an
     /// active PR; otherwise `-32603` (PROTOCOL §5.7).
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {

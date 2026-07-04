@@ -52,6 +52,17 @@ impl Store {
         .map_err(|e| Error::Internal(format!("upsert known repo failed: {e}")))?;
         Ok(())
     }
+
+    /// Delete a known repo by `path` (TS `removeRepo`). Returns whether a row
+    /// was actually removed; removing an unregistered path is not an error.
+    pub async fn remove_known_repo(&self, path: &str) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM known_repo WHERE path = ?")
+            .bind(path)
+            .execute(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("remove known repo failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
 }
 
 fn map_known_repo_row(r: &SqliteRow) -> Result<KnownRepo> {

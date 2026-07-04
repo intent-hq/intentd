@@ -788,6 +788,10 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn repo_remove(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!({ "removed": path == "/src/intent" })) })
+    }
+
     fn github_repos_list(
         &self,
         limit: Option<i64>,
@@ -2622,6 +2626,28 @@ async fn repo_list_returns_repos_with_camelcase_keys() {
     assert_eq!(repo["owner"], serde_json::json!("cloudlands-ai"));
     assert_eq!(repo["addedAt"], serde_json::json!("t0"));
     assert_eq!(repo["lastUsedAt"], serde_json::json!("t1"));
+}
+
+#[tokio::test]
+async fn repo_remove_routes_path_and_returns_removed_flag() {
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"repo.remove","params":{"path":"/src/intent"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(v["result"], serde_json::json!({ "removed": true }));
+
+    let v = call(r#"{"jsonrpc":"2.0","id":2,"method":"repo.remove","params":{"path":"/other"}}"#)
+        .await
+        .unwrap();
+    assert_eq!(v["result"], serde_json::json!({ "removed": false }));
+}
+
+#[tokio::test]
+async fn repo_remove_requires_path_param() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"repo.remove","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
 }
 
 // ---- github.* browse / auth / identity routing (PROTOCOL §5.27) --------

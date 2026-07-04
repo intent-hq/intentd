@@ -1119,6 +1119,13 @@ async fn dispatch(
             let r = api.repo_list().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "repo.remove" => {
+            // Delete one known-repo registry entry by path; returns
+            // `{ removed: bool }` (false when the path was not registered).
+            let path = require_str_param(params, "path")?;
+            let r = api.repo_remove(path).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "git.clone" => {
             let url = require_str_param(params, "url")?;
             let parent_dir = require_str_param(params, "parentDir")?;
