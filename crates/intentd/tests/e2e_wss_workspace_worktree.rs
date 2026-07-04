@@ -366,3 +366,92 @@ async fn workspace_create_provisions_worktree_over_wss() {
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
+
+/// `workspace.delete` cleans up the provisioned checkout over the wire: the
+/// worktree directory (and its `<root>/<workspaceId>` parent) is removed, the
+/// registration is pruned from the source repo, and the auto-generated
+/// workspace branch is deleted — while an explicitly-named branch survives its
+/// workspace (TS `removeGitWorktree` guard parity).
+#[tokio::test]
+async fn workspace_delete_cleans_worktree_and_branch_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("delroot");
+    let (daemon, port, cfg) = boot(&root).await;
+    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // Auto-generated branch: deleted with the workspace.
+    let created = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "Delete E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "initialAgent": { "prompt": "fix the auth flow" },
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let id = created["workspace"]["id"].as_str().expect("id").to_string();
+    let branch = created["workspace"]["branch"]
+        .as_str()
+        .expect("branch")
+        .to_string();
+    let wt = PathBuf::from(
+        created["workspace"]["worktreePath"]
+            .as_str()
+            .expect("worktreePath"),
+    );
+    assert!(wt.exists());
+
+    let deleted = wss_rpc(&mut ws, 3, "workspace.delete", json!({ "workspaceId": id })).await;
+    assert_eq!(deleted, json!({ "success": true }));
+    assert!(!wt.exists(), "worktree directory removed");
+    assert!(
+        !root.join(&id).exists(),
+        "empty <root>/<workspaceId> parent removed"
+    );
+    let branches = run_git(&["branch", "--list", &branch], &repo);
+    assert!(
+        branches.is_empty(),
+        "auto-generated branch deleted, got: {branches}"
+    );
+
+    // Explicit branch: the worktree goes, the branch stays.
+    let created = wss_rpc(
+        &mut ws,
+        4,
+        "workspace.create",
+        json!({
+            "title": "Delete E2E explicit",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "branch": "keep-me",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let id = created["workspace"]["id"].as_str().expect("id").to_string();
+    let wt = PathBuf::from(
+        created["workspace"]["worktreePath"]
+            .as_str()
+            .expect("worktreePath"),
+    );
+    let deleted = wss_rpc(&mut ws, 5, "workspace.delete", json!({ "workspaceId": id })).await;
+    assert_eq!(deleted, json!({ "success": true }));
+    assert!(!wt.exists(), "worktree directory removed");
+    let branches = run_git(&["branch", "--list", "keep-me"], &repo);
+    assert!(
+        branches.contains("keep-me"),
+        "explicit branch preserved, got: {branches}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}

@@ -1466,6 +1466,51 @@ fn worktree_folder_slug(repo_name: &str) -> String {
     }
 }
 
+/// Blocking `workspace.delete` cleanup (ports the TS `removeGitWorktree`
+/// body): capture the checked-out branch, remove the linked worktree (with
+/// the manual-rm fallback and prune inside [`intent_git::worktree::remove_worktree`]),
+/// drop the now-empty `<root>/<workspaceId>` parent directory, and delete the
+/// workspace branch only when it passes every guard — it must be the branch
+/// currently checked out there, it must be the branch the daemon
+/// auto-generated at create time (never a caller-supplied branch), and never
+/// `main`/`master` or a detached HEAD. Best-effort throughout.
+fn cleanup_workspace_worktree(
+    repo: &Path,
+    worktree: &Path,
+    branch: &str,
+    branch_auto_generated: bool,
+) {
+    let checked_out = intent_git::worktree::worktree_branch(worktree);
+    if let Err(e) = intent_git::worktree::remove_worktree(repo, worktree) {
+        tracing::warn!(
+            error = %e,
+            worktree = %worktree.display(),
+            "failed to remove git worktree"
+        );
+    }
+    // The provisioned layout is `<root>/<workspaceId>/<repo-slug>`; removing
+    // the worktree leaves an empty `<workspaceId>` dir behind. `remove_dir`
+    // only deletes empty directories, so a caller-supplied path shared with
+    // other content is never destroyed.
+    if let Some(parent) = worktree.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+    let deletable = branch_auto_generated
+        && checked_out.as_deref() == Some(branch)
+        && branch != "main"
+        && branch != "master";
+    if deletable {
+        if let Err(e) = intent_git::branches::delete_local_branch(repo, branch) {
+            tracing::debug!(error = %e, branch, "could not delete workspace branch");
+        }
+    } else if let Some(checked_out) = checked_out {
+        tracing::info!(
+            branch = %checked_out,
+            "skipping branch deletion - not the auto-generated workspace branch"
+        );
+    }
+}
+
 /// Upsert into the registry every workspace that carries a `repository_path`
 /// (TS `repo.list` one-time sync). Best-effort: callers ignore the result so a
 /// sync failure never blocks/fails the `repo.list` response.
@@ -3144,6 +3189,8 @@ impl WorkspaceApi for Services {
                     // pair (`generateWorkspaceSlug`) — under the optional
                     // `workspace.branchPrefix` setting, uniquified against
                     // existing local/remote branches with a `-N` suffix.
+                    let branch_auto_generated =
+                        !input.branch.as_deref().is_some_and(|b| !b.is_empty());
                     let branch = match input.branch.clone().filter(|b| !b.is_empty()) {
                         Some(explicit) => explicit,
                         None => {
@@ -3287,6 +3334,19 @@ impl WorkspaceApi for Services {
                         }
                     }
                     store.insert_workspace(&ws).await?;
+                    // Record branch provenance for the delete-cleanup guard:
+                    // only an auto-generated branch is ever deleted alongside
+                    // the worktree (TS `removeGitWorktree` parity, where the
+                    // guard is `branchName === workspaceId`). Best-effort — a
+                    // failure leaves the conservative default (never delete).
+                    if branch_auto_generated {
+                        if let Err(e) = store
+                            .set_workspace_branch_auto_generated(&ws.id, true)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "failed to record branch provenance");
+                        }
+                    }
                     // Register the repo in the persistent registry so it survives
                     // workspace deletion and appears in `repo.list` without a restart
                     // (TS `workspace.service` `addRepo` hook). Best-effort: a registry
@@ -3395,7 +3455,55 @@ impl WorkspaceApi for Services {
 
     fn delete_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
         let store = self.store.clone();
-        Box::pin(async move { store.delete_workspace(&id).await })
+        let worktree_locks = self.worktree_locks.clone();
+        Box::pin(async move {
+            // Port the TS `deleteWorkspace` worktree cleanup: under the per-repo
+            // worktree lock, remove the linked worktree (+ the now-empty
+            // `<root>/<workspaceId>` parent) and delete the workspace branch —
+            // but only when it is the branch the daemon auto-generated at
+            // create time (guard parity with `removeGitWorktree`'s
+            // `branchName === workspaceId`). Cleanup is best-effort throughout:
+            // a git failure never blocks the row deletion (TS parity).
+            if let Ok(ws) = store.get_workspace(&id).await {
+                let repo_dir = ws
+                    .repository_path
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .map(PathBuf::from);
+                let wt = ws
+                    .worktree_path
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .map(PathBuf::from);
+                if let (Some(repo_dir), Some(wt)) = (repo_dir, wt) {
+                    if !ws.skip_worktree && !ws.is_remote {
+                        let branch_auto_generated = store
+                            .workspace_branch_auto_generated(&id)
+                            .await
+                            .unwrap_or(false);
+                        let branch = ws.branch.clone();
+                        let repo = repo_dir.clone();
+                        worktree_locks
+                            .with_lock(&repo_dir, move || async move {
+                                let task = tokio::task::spawn_blocking(move || {
+                                    cleanup_workspace_worktree(
+                                        &repo,
+                                        &wt,
+                                        &branch,
+                                        branch_auto_generated,
+                                    );
+                                })
+                                .await;
+                                if let Err(e) = task {
+                                    tracing::warn!(error = %e, "worktree cleanup task failed");
+                                }
+                            })
+                            .await;
+                    }
+                }
+            }
+            store.delete_workspace(&id).await
+        })
     }
 
     fn archive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {

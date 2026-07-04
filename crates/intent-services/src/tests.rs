@@ -6093,6 +6093,131 @@ mod worktree_provisioning {
             "caller-supplied worktreePath is respected untouched"
         );
     }
+
+    /// `workspace.delete` cleans up the provisioned checkout (TS
+    /// `removeGitWorktree` parity): the worktree directory and its
+    /// `<root>/<workspaceId>` parent are removed, the registration is pruned,
+    /// and the auto-generated workspace branch is deleted from the source repo.
+    #[tokio::test]
+    async fn delete_removes_worktree_and_auto_generated_branch() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-wtdel-repo");
+        let root = unique_dir("intentd-wtdel-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create");
+        let wt = PathBuf::from(ws.worktree_path.as_deref().expect("worktree path"));
+        assert!(wt.exists());
+        assert!(
+            store
+                .workspace_branch_auto_generated(&ws.id)
+                .await
+                .expect("flag readable"),
+            "auto-generated branch is recorded as workspace-owned"
+        );
+
+        svc.delete_workspace(ws.id.clone()).await.expect("delete");
+
+        assert!(!wt.exists(), "worktree directory removed");
+        assert!(
+            !root.0.join(&ws.id.0).exists(),
+            "empty <root>/<workspaceId> parent removed"
+        );
+        let repo = git2::Repository::open(&repo_dir.0).unwrap();
+        assert!(
+            repo.find_branch(&ws.branch, git2::BranchType::Local)
+                .is_err(),
+            "auto-generated workspace branch deleted"
+        );
+        assert!(
+            matches!(svc.get_workspace(ws.id).await, Err(Error::NotFound(_))),
+            "workspace row deleted"
+        );
+    }
+
+    /// The branch-deletion guard: a caller-supplied (explicit) branch is never
+    /// deleted on `workspace.delete`, even though the worktree itself is
+    /// cleaned up — mirroring the reference's "pre-existing branch" skip.
+    #[tokio::test]
+    async fn delete_preserves_explicit_branch() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-wtdelex-repo");
+        let root = unique_dir("intentd-wtdelex-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    branch: Some("keep-me".to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create");
+        let wt = PathBuf::from(ws.worktree_path.as_deref().expect("worktree path"));
+        assert!(
+            !store
+                .workspace_branch_auto_generated(&ws.id)
+                .await
+                .expect("flag readable"),
+            "explicit branch is not workspace-owned"
+        );
+
+        svc.delete_workspace(ws.id).await.expect("delete");
+
+        assert!(!wt.exists(), "worktree directory still removed");
+        let repo = git2::Repository::open(&repo_dir.0).unwrap();
+        assert!(
+            repo.find_branch("keep-me", git2::BranchType::Local).is_ok(),
+            "explicit branch preserved"
+        );
+    }
+
+    /// A workspace without a provisioned checkout (`skipWorktree`) deletes its
+    /// row without touching the repository.
+    #[tokio::test]
+    async fn delete_without_worktree_only_removes_row() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, _) = seed_repo("intentd-wtdelskip-repo");
+        let svc = Services::new(store);
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    skip_worktree: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create");
+        let branch = ws.branch.clone();
+        svc.delete_workspace(ws.id.clone()).await.expect("delete");
+        assert!(matches!(
+            svc.get_workspace(ws.id).await,
+            Err(Error::NotFound(_))
+        ));
+        // No checkout was provisioned, so nothing in the repo changed.
+        let repo = git2::Repository::open(&repo_dir.0).unwrap();
+        assert!(repo.find_branch(&branch, git2::BranchType::Local).is_err());
+    }
 }
 
 mod file_ops_service {

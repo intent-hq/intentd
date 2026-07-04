@@ -120,6 +120,17 @@ pub fn ensure_unique_branch_name(repo_path: &Path, desired: &str) -> Result<Stri
     }
 }
 
+/// Force-delete a local branch (`git branch -D` parity). Used by the
+/// `workspace.delete` cleanup after its worktree is removed; the caller owns
+/// the guard deciding *whether* the branch may be deleted.
+pub fn delete_local_branch(repo_path: &Path, branch: &str) -> Result<()> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let mut b = repo
+        .find_branch(branch, BranchType::Local)
+        .map_err(map_git_err)?;
+    b.delete().map_err(map_git_err)
+}
+
 /// All branch names occupied in the repo: local names plus the short names of
 /// remote-tracking branches (any remote, `remote/` prefix stripped).
 fn existing_branch_names(repo: &Repository) -> Result<HashSet<String>> {
