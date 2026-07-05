@@ -192,7 +192,7 @@ pub(crate) async fn enable_user_servers(store: &Store) -> bool {
 }
 
 /// Read the `mcp.disabledServers` list (ids that stay stopped, default `[]`).
-async fn disabled_servers(store: &Store) -> Vec<String> {
+pub(crate) async fn disabled_servers(store: &Store) -> Vec<String> {
     match store.get_setting("mcp.disabledServers").await {
         Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
             .ok()
@@ -216,7 +216,7 @@ async fn set_disabled_servers(store: &Store, list: &[String]) -> Result<()> {
 
 /// Read the configured external servers from the sensitive `mcp.servers` secret,
 /// keyed by id. A missing/garbled secret yields an empty map.
-fn read_configs(secrets: &dyn SecretStore) -> Map<String, Value> {
+pub(crate) fn read_configs(secrets: &dyn SecretStore) -> Map<String, Value> {
     match secrets.load(SETTING_KEY) {
         Some(raw) => serde_json::from_str::<Value>(&raw)
             .ok()

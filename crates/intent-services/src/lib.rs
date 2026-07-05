@@ -319,6 +319,14 @@ impl Services {
         self
     }
 
+    /// Borrow the configured [`SecretStore`] (§9.8) for sibling services that
+    /// need to read sensitive settings without going through the wire-facing
+    /// [`SettingsService`] — e.g. the agent-manager's `--mcp-config` builder
+    /// which merges the `mcp.servers` catalog into a spawned agent's config.
+    pub(crate) fn secret_store(&self) -> &dyn settings::SecretStore {
+        self.secrets.as_ref()
+    }
+
     /// Override the **user** and **bundled** specialist directory roots (§18.2).
     /// The composition root keeps the env/HOME defaults; tests inject temp dirs
     /// so the 3-tier resolution is hermetic. The project tier always comes from

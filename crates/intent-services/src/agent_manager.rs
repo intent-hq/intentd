@@ -20,11 +20,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use intent_acp::handshake::try_bypass_permissions_mode;
 use intent_acp::session::{ContentBlock, StopReason};
 use intent_acp::{
-    build_baseline_mcp_env_from_process, handshake, serve_workspace_mcp_tcp, spawn_provider,
-    to_auggie_mcp_config, ClientRequestHandler, Connection, ConnectionHooks, EventSink,
-    FileService, IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer,
-    NormalizedMcpServers, PermissionOutcome, PermissionPolicy, PermissionRegistry,
-    PermissionRequestData, SinkEvent, SpawnOptions, WorkspaceMcpServer,
+    apply_baseline_env_to_stdio_servers, build_baseline_mcp_env_from_process, handshake,
+    normalize_mcp_servers, serve_workspace_mcp_tcp, spawn_provider, to_auggie_mcp_config,
+    ClientRequestHandler, Connection, ConnectionHooks, EnvMap, EventSink, FileService,
+    IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer, NormalizedMcpServers,
+    PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData, SinkEvent,
+    SpawnOptions, WorkspaceMcpServer,
 };
 use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
@@ -46,6 +47,21 @@ use crate::Services;
 
 #[cfg(test)]
 mod tests;
+
+/// Capitalize the leading ASCII byte of `s` (leaves the rest of the string
+/// untouched). Used to normalize OAuth `token_type` values into the
+/// conventional `Bearer` header form when a bag stores the RFC 6749 lower-case
+/// spelling.
+fn title_case_ascii(s: &str) -> String {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = String::with_capacity(s.len());
+    out.push(first.to_ascii_uppercase());
+    out.push_str(chars.as_str());
+    out
+}
 
 const GB: u64 = 1024 * 1024 * 1024;
 
@@ -700,7 +716,7 @@ impl AgentManager {
         let mut mcp_config: Option<TempConfigFile> = None;
         let mut mcp_config_path: Option<String> = None;
         if opts.provider.supports_mcp_config {
-            let config = self.generate_mcp_config(&bridge);
+            let config = self.generate_mcp_config(&bridge).await?;
             let path = std::env::temp_dir().join(format!("intentd-mcp-{}.json", Uuid::new_v4()));
             let bytes = serde_json::to_vec_pretty(&config)
                 .map_err(|e| Error::Internal(format!("serialize mcp config failed: {e}")))?;
@@ -812,8 +828,14 @@ impl AgentManager {
 
     /// Build the generated `--mcp-config` (auggie `{ mcpServers }` shape): the
     /// `workspace-mcp` server is the `intentd mcp-bridge --connect <addr>`
-    /// subcommand, with the safe baseline env injected (§6.8).
-    fn generate_mcp_config(&self, bridge: &McpBridge) -> serde_json::Value {
+    /// subcommand, with the user's `mcp.servers` catalog merged in and the safe
+    /// baseline env injected across every stdio entry (§6.8, §18.4). Mirrors
+    /// the FE `mergeUserMcpServersWithAuth` path: honours the
+    /// `mcp.enableUserServers` gate, filters out globally-disabled servers, and
+    /// — for http/sse transports — injects an `Authorization` header from the
+    /// persisted OAuth token bag when the catalog entry does not already set
+    /// one. `workspace-mcp` is reserved and never overridden.
+    async fn generate_mcp_config(&self, bridge: &McpBridge) -> Result<serde_json::Value> {
         let mut servers = NormalizedMcpServers::new();
         servers.insert(
             "workspace-mcp".to_string(),
@@ -824,10 +846,155 @@ impl AgentManager {
                     "--connect".to_string(),
                     bridge.connect_addr(),
                 ],
-                env: build_baseline_mcp_env_from_process(),
+                env: EnvMap::new(),
             },
         );
-        to_auggie_mcp_config(&servers)
+        self.merge_user_mcp_servers(&mut servers).await?;
+        let baseline = build_baseline_mcp_env_from_process();
+        let servers = apply_baseline_env_to_stdio_servers(&servers, &baseline);
+        Ok(to_auggie_mcp_config(&servers))
+    }
+
+    /// Fold user-configured MCP servers (sensitive `mcp.servers` secret) into
+    /// `out`, honouring the `mcp.enableUserServers` gate and the global
+    /// `mcp.disabledServers` list, and injecting an `Authorization` header from
+    /// the persisted OAuth bag on http/sse entries when the catalog does not
+    /// already set one. Any config that collides with a reserved built-in name
+    /// (e.g. `workspace-mcp`) is skipped so the bridge cannot be shadowed.
+    async fn merge_user_mcp_servers(&self, out: &mut NormalizedMcpServers) -> Result<()> {
+        if !crate::mcp_servers::enable_user_servers(&self.services.store).await {
+            return Ok(());
+        }
+        let configs = crate::mcp_servers::read_configs(self.services.secret_store());
+        if configs.is_empty() {
+            return Ok(());
+        }
+        let disabled = crate::mcp_servers::disabled_servers(&self.services.store).await;
+        let disabled: HashSet<&str> = disabled.iter().map(String::as_str).collect();
+
+        let mut reshaped = serde_json::Map::new();
+        for (id, cfg) in &configs {
+            let Some(obj) = cfg.as_object() else { continue };
+            if !obj.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
+                continue;
+            }
+            if disabled.contains(id.as_str()) {
+                continue;
+            }
+            let name = obj
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(id.as_str())
+                .to_string();
+            if out.contains_key(&name) {
+                tracing::debug!(server = %name, "user MCP server collides with reserved name; skipping");
+                continue;
+            }
+            let Some(entry) = self.reshape_user_mcp_config(id, obj).await? else {
+                continue;
+            };
+            reshaped.insert(name, entry);
+        }
+        if reshaped.is_empty() {
+            return Ok(());
+        }
+        let normalized = normalize_mcp_servers(&Value::Object(reshaped));
+        for (name, server) in normalized {
+            out.entry(name).or_insert(server);
+        }
+        Ok(())
+    }
+
+    /// Reshape one `mcp.servers` entry into the shape [`normalize_mcp_servers`]
+    /// expects — stdio entries stay untouched (`command`/`args`/`env`), remote
+    /// entries get a `type` tag plus an `Authorization` header sourced from the
+    /// persisted OAuth bag when the config does not already set one. Returns
+    /// `None` for malformed entries (missing `command`/`url`) so they drop out
+    /// of the merge silently.
+    async fn reshape_user_mcp_config(
+        &self,
+        id: &str,
+        obj: &serde_json::Map<String, Value>,
+    ) -> Result<Option<Value>> {
+        let transport = obj
+            .get("transport")
+            .and_then(Value::as_str)
+            .unwrap_or("stdio");
+        let mut out = serde_json::Map::new();
+        match transport {
+            "http" | "sse" => {
+                let Some(url) = obj
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                else {
+                    return Ok(None);
+                };
+                out.insert("type".into(), Value::String(transport.to_string()));
+                out.insert("url".into(), Value::String(url.to_string()));
+                let mut headers = obj
+                    .get("headers")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                let has_auth = headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("authorization"));
+                if !has_auth {
+                    if let Some(auth) = self.oauth_authorization_header(id).await? {
+                        headers.insert("Authorization".to_string(), Value::String(auth));
+                    }
+                }
+                if !headers.is_empty() {
+                    out.insert("headers".into(), Value::Object(headers));
+                }
+            }
+            _ => {
+                let Some(command) = obj
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                else {
+                    return Ok(None);
+                };
+                out.insert("command".into(), Value::String(command.to_string()));
+                if let Some(a) = obj.get("args") {
+                    out.insert("args".into(), a.clone());
+                }
+                if let Some(e) = obj.get("env") {
+                    out.insert("env".into(), e.clone());
+                }
+            }
+        }
+        Ok(Some(Value::Object(out)))
+    }
+
+    /// Build the `Authorization: <token_type> <access_token>` header value from
+    /// the persisted OAuth bag for `server_id`, or `None` when no bag is
+    /// stored / the bag is malformed / `access_token` is missing. `token_type`
+    /// defaults to `Bearer` and is title-cased so a bag storing the RFC 6749
+    /// lower-case `bearer` still produces the conventional header form.
+    async fn oauth_authorization_header(&self, server_id: &str) -> Result<Option<String>> {
+        let Some(raw) = self.services.store.get_mcp_oauth_token(server_id).await? else {
+            return Ok(None);
+        };
+        let Ok(bag) = serde_json::from_str::<Value>(&raw) else {
+            return Ok(None);
+        };
+        let Some(access) = bag
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        let token_type = bag
+            .get("token_type")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Bearer");
+        Ok(Some(format!("{} {}", title_case_ascii(token_type), access)))
     }
 
     /// Complete the connection handshake and establish an ACP session for a

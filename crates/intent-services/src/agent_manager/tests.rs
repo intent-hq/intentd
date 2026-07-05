@@ -2258,3 +2258,234 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
     let arr = arr_json.as_array().unwrap();
     assert_eq!(arr.len(), 1, "only text; stray URL is skipped");
 }
+
+/// A10 — daemon-side merge of user MCP servers into the agent spawn config.
+/// Directly exercises [`AgentManager::merge_user_mcp_servers`] against an
+/// [`InMemorySecretStore`] and a fresh store so the tests stay hermetic (no
+/// keychain / real bridge involved).
+mod merge_user_mcp_servers_tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use intent_acp::{NormalizedMcpServer, NormalizedMcpServers};
+    use serde_json::json;
+
+    use super::{manager, TempDb};
+    use crate::agent_manager::AgentManager;
+    use crate::agent_manager::BusEventSink;
+    use crate::events::EventBus;
+    use crate::settings::{InMemorySecretStore, SecretStore};
+    use crate::Services;
+    use intent_acp::EventSink;
+    use intent_store::Store;
+
+    async fn manager_with_secrets() -> (TempDb, AgentManager, Arc<InMemorySecretStore>) {
+        let tmp = super::TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let secrets = Arc::new(InMemorySecretStore::default());
+        let services = Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_secret_store(secrets.clone() as Arc<dyn SecretStore>);
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+        (tmp, AgentManager::new(services, sink, 8), secrets)
+    }
+
+    fn write_servers(secrets: &InMemorySecretStore, servers: serde_json::Value) {
+        secrets
+            .store("mcp.servers", &serde_json::to_string(&servers).unwrap())
+            .expect("write mcp.servers");
+    }
+
+    #[tokio::test]
+    async fn skips_when_enable_user_servers_disabled() {
+        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        write_servers(
+            &secrets,
+            json!({ "srv-1": { "id": "srv-1", "name": "u", "transport": "stdio",
+                                 "command": "node", "enabled": true } }),
+        );
+        mgr.services
+            .store
+            .set_setting("mcp.enableUserServers", "false")
+            .await
+            .unwrap();
+        let mut out = NormalizedMcpServers::new();
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        assert!(out.is_empty(), "gate off → nothing merged: {:?}", out);
+    }
+
+    #[tokio::test]
+    async fn merges_enabled_stdio_server_by_name() {
+        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        write_servers(
+            &secrets,
+            json!({
+                "srv-1": {
+                    "id": "srv-1", "name": "my-tool", "transport": "stdio",
+                    "command": "node", "args": ["srv.js"], "enabled": true,
+                    "env": { "A": "1" }
+                }
+            }),
+        );
+        let mut out = NormalizedMcpServers::new();
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        let entry = out.get("my-tool").expect("keyed by name, not id");
+        match entry {
+            NormalizedMcpServer::Stdio { command, args, env } => {
+                assert_eq!(command, "node");
+                assert_eq!(args, &vec!["srv.js".to_string()]);
+                assert_eq!(env.get("A").map(String::as_str), Some("1"));
+            }
+            other => panic!("expected stdio, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_disabled_and_globally_disabled_servers() {
+        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        write_servers(
+            &secrets,
+            json!({
+                "srv-off": { "id": "srv-off", "name": "off", "transport": "stdio",
+                              "command": "node", "enabled": false },
+                "srv-glo": { "id": "srv-glo", "name": "glo", "transport": "stdio",
+                              "command": "node", "enabled": true },
+                "srv-on":  { "id": "srv-on",  "name": "on",  "transport": "stdio",
+                              "command": "node", "enabled": true }
+            }),
+        );
+        mgr.services
+            .store
+            .set_setting(
+                "mcp.disabledServers",
+                &serde_json::to_string(&json!(["srv-glo"])).unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut out = NormalizedMcpServers::new();
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        let names: HashSet<_> = out.keys().cloned().collect();
+        assert!(names.contains("on"), "enabled+not-disabled kept: {names:?}");
+        assert!(!names.contains("off"), "enabled=false dropped");
+        assert!(!names.contains("glo"), "globally-disabled dropped");
+    }
+
+    #[tokio::test]
+    async fn injects_oauth_authorization_header_for_http() {
+        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        write_servers(
+            &secrets,
+            json!({
+                "srv-remote": {
+                    "id": "srv-remote", "name": "remote", "transport": "http",
+                    "url": "https://example.test/mcp", "enabled": true
+                }
+            }),
+        );
+        mgr.services
+            .store
+            .set_mcp_oauth_token(
+                "srv-remote",
+                &serde_json::to_string(
+                    &json!({ "access_token": "tok-xyz", "token_type": "bearer" }),
+                )
+                .unwrap(),
+                "2026-07-05T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let mut out = NormalizedMcpServers::new();
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        match out.get("remote").expect("http server merged") {
+            NormalizedMcpServer::Http { url, headers } => {
+                assert_eq!(url, "https://example.test/mcp");
+                let headers = headers.as_ref().expect("auth header written");
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer tok-xyz"),
+                    "token_type title-cased, access_token appended",
+                );
+            }
+            other => panic!("expected http, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn preserves_existing_authorization_header() {
+        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        write_servers(
+            &secrets,
+            json!({
+                "srv-remote": {
+                    "id": "srv-remote", "name": "remote", "transport": "sse",
+                    "url": "https://example.test/sse", "enabled": true,
+                    "headers": { "Authorization": "Basic user:pass" }
+                }
+            }),
+        );
+        mgr.services
+            .store
+            .set_mcp_oauth_token(
+                "srv-remote",
+                &serde_json::to_string(&json!({ "access_token": "tok-xyz" })).unwrap(),
+                "2026-07-05T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let mut out = NormalizedMcpServers::new();
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        match out.get("remote").unwrap() {
+            NormalizedMcpServer::Sse { headers, .. } => {
+                let headers = headers.as_ref().unwrap();
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Basic user:pass"),
+                );
+            }
+            other => panic!("expected sse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn does_not_overwrite_reserved_workspace_mcp() {
+        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        write_servers(
+            &secrets,
+            json!({
+                "srv-x": { "id": "srv-x", "name": "workspace-mcp", "transport": "stdio",
+                             "command": "evil", "enabled": true }
+            }),
+        );
+        let mut out = NormalizedMcpServers::new();
+        out.insert(
+            "workspace-mcp".to_string(),
+            NormalizedMcpServer::Stdio {
+                command: "bridge".into(),
+                args: vec![],
+                env: Default::default(),
+            },
+        );
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        match out.get("workspace-mcp").unwrap() {
+            NormalizedMcpServer::Stdio { command, .. } => {
+                assert_eq!(command, "bridge", "reserved entry left intact");
+            }
+            other => panic!("expected stdio, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_secret_is_a_noop() {
+        let (_tmp, mgr, _secrets) = manager_with_secrets().await;
+        let mut out = NormalizedMcpServers::new();
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        assert!(out.is_empty());
+    }
+
+    // Prevent dead-code warnings for `manager` when this module compiles alone.
+    #[allow(dead_code)]
+    async fn _use_manager() {
+        let _ = manager().await;
+    }
+}
