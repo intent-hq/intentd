@@ -6773,6 +6773,46 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_get_session(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<AgentSession>> {
+        Box::pin(async move { self.agent_get_session_op(agent_id).await })
+    }
+
+    fn agent_update(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+        changes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_update_op(agent_id, changes).await })
+    }
+
+    fn agent_append_message(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+        role: String,
+        content: serde_json::Value,
+        metadata: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_append_message_op(agent_id, role, content, metadata)
+                .await
+        })
+    }
+
+    fn agent_replace_messages(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+        messages: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_replace_messages_op(agent_id, messages).await })
+    }
+
     fn agent_live_turn(&self, agent_id: AgentId) -> Option<serde_json::Value> {
         let live = self.live_turn(&agent_id)?;
         // An empty (just-begun) turn has nothing to reconstruct yet; surfacing it

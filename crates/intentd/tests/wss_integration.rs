@@ -541,6 +541,155 @@ async fn wss_agent_create_widened_params_round_trip() {
     srv.ws.stop().await;
 }
 
+/// A8: the four session-shape RPCs unblocking the FE agent-backend-handler
+/// retirement (C1d/C1e) — `agent.getSession`, `agent.update`,
+/// `agent.appendMessage`, `agent.replaceMessages` — over the real WSS
+/// transport. Asserts the wire contract PROTOCOL §5.5 documents: full
+/// `AgentSession` projection (superset of `AgentLite`), whitelisted partial
+/// updates round-tripping through `agent.getSession`, append-then-swap
+/// transcript mutations under freshly-minted `seq: 0..n`, and the `-32602`
+/// error codes for unknown agents / unknown fields.
+#[tokio::test]
+async fn wss_agent_session_shape_rpcs_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"A8"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            // 1) create an agent to operate on.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"A8"}}}}"#
+            ),
+        ],
+    )
+    .await;
+    let agent_id = sess[0]["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // 2) drive the four new RPCs on one long-lived WSS session so the wire
+    //    contract is exercised end-to-end (upgrade → JSON-RPC → services →
+    //    store, and back). All four ids are unique so a session-level replay
+    //    would fail loudly.
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            // agent.getSession — full projection (has `messages` array).
+            format!(
+                r#"{{"jsonrpc":"2.0","id":10,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
+            ),
+            // agent.update — patch systemPrompt + isBackground.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":11,"method":"agent.update","params":{{"agentId":"{agent_id}","changes":{{"systemPrompt":"be helpful","isBackground":true}}}}}}"#
+            ),
+            // agent.getSession — verify patch persisted.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":12,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
+            ),
+            // agent.update — unknown field → -32602.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":13,"method":"agent.update","params":{{"agentId":"{agent_id}","changes":{{"nope":"x"}}}}}}"#
+            ),
+            // agent.appendMessage — append one user message.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":14,"method":"agent.appendMessage","params":{{"agentId":"{agent_id}","role":"user","contentBlocks":[{{"type":"text","text":"wake"}}]}}}}"#
+            ),
+            // agent.replaceMessages — atomic swap → seq 0/1.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":15,"method":"agent.replaceMessages","params":{{"agentId":"{agent_id}","messages":[{{"role":"user","contentBlocks":[{{"type":"text","text":"edit"}}]}},{{"role":"assistant","contentBlocks":[{{"type":"text","text":"ok"}}]}}]}}}}"#
+            ),
+            // agent.getSession unknown → -32602 "Agent not found".
+            r#"{"jsonrpc":"2.0","id":16,"method":"agent.getSession","params":{"agentId":"agent-00000000-0000-0000-0000-000000000000"}}"#.to_string(),
+        ],
+    )
+    .await;
+
+    // agent.getSession returns the full `AgentSession` shape.
+    assert_eq!(
+        sess[0]["result"]["session"]["id"].as_str(),
+        Some(agent_id.as_str()),
+        "getSession returns session: {}",
+        sess[0]
+    );
+    assert!(
+        sess[0]["result"]["session"]["messages"].is_array(),
+        "getSession carries messages array (AgentSession, not AgentLite): {}",
+        sess[0]
+    );
+
+    // agent.update returns { success, agent: AgentLite }.
+    assert_eq!(
+        sess[1]["result"]["success"],
+        Value::Bool(true),
+        "update: {}",
+        sess[1]
+    );
+    assert_eq!(
+        sess[1]["result"]["agent"]["id"].as_str(),
+        Some(agent_id.as_str())
+    );
+
+    // The patch round-trips through getSession.
+    assert_eq!(
+        sess[2]["result"]["session"]["systemPrompt"].as_str(),
+        Some("be helpful"),
+        "update persisted: {}",
+        sess[2]
+    );
+    assert_eq!(
+        sess[2]["result"]["session"]["isBackground"].as_bool(),
+        Some(true)
+    );
+
+    // Unknown fields in `changes` → -32602.
+    assert_eq!(
+        sess[3]["error"]["code"].as_i64(),
+        Some(-32602),
+        "unknown field must be -32602: {}",
+        sess[3]
+    );
+
+    // appendMessage persists one row.
+    assert_eq!(sess[4]["result"]["success"], Value::Bool(true));
+    assert_eq!(sess[4]["result"]["message"]["role"].as_str(), Some("user"));
+
+    // replaceMessages atomically swaps under fresh seq.
+    assert_eq!(sess[5]["result"]["success"], Value::Bool(true));
+    let swapped = sess[5]["result"]["messages"]
+        .as_array()
+        .expect("messages array");
+    assert_eq!(swapped.len(), 2);
+    assert_eq!(swapped[0]["seq"].as_i64(), Some(0));
+    assert_eq!(swapped[1]["seq"].as_i64(), Some(1));
+
+    // Unknown-agent lookups surface as -32602 "Agent not found".
+    assert_eq!(
+        sess[6]["error"]["code"].as_i64(),
+        Some(-32602),
+        "unknown agent must be -32602: {}",
+        sess[6]
+    );
+    assert_eq!(
+        sess[6]["error"]["message"].as_str(),
+        Some("Agent not found")
+    );
+
+    srv.ws.stop().await;
+}
+
 #[tokio::test]
 async fn health_reports_ok_and_client_count() {
     let srv = start(WsOptions::default()).await;

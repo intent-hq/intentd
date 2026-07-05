@@ -772,6 +772,60 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "agent.getSession" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            match api.agent_get_session(agent_id, ws).await {
+                Ok(session) => Ok(json!({ "session": session })),
+                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "agent.update" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let changes = params
+                .get("changes")
+                .cloned()
+                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: changes"))?;
+            match api.agent_update(agent_id, ws, changes).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "agent.appendMessage" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let role = require_str_param(params, "role")?;
+            let content = params
+                .get("contentBlocks")
+                .or_else(|| params.get("content"))
+                .cloned()
+                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: contentBlocks"))?;
+            let metadata = opt_value(params, "metadata");
+            match api
+                .agent_append_message(agent_id, ws, role, content, metadata)
+                .await
+            {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "agent.replaceMessages" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let messages = params
+                .get("messages")
+                .cloned()
+                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: messages"))?;
+            match api.agent_replace_messages(agent_id, ws, messages).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "agent.create" => {
             let ws = require_ws_note(params)?;
             let name = opt_str(params, "name");

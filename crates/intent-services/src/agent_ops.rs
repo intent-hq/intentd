@@ -10,7 +10,9 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_QUEUE_UPDATED};
+use intent_core::events::{
+    AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE, AGENT_QUEUE_UPDATED, AGENT_UPDATED,
+};
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
     AgentSession, AgentStatus, Error, EventActor, NoteId, Result, SessionStats, WorkspaceApi,
@@ -908,6 +910,328 @@ impl Services {
             .await;
         }
         Ok(json!({ "success": true }))
+    }
+
+    /// `agent.getSession` (PROTOCOL §5.5). Full [`AgentSession`] projection —
+    /// the superset that `agent.get`/[`AgentLite`] strips (`systemPrompt`,
+    /// `specialist`, persisted metadata block, full `messages` log). Used by
+    /// the FE-side agent-backend-handler retirement (C1d/C1e) so a `loadAgent`
+    /// caller can rehydrate the full session shape from the daemon. Emits no
+    /// events (a pure read). `NotFound` when the session is unknown.
+    pub(crate) async fn agent_get_session_op(&self, agent_id: AgentId) -> Result<AgentSession> {
+        self.store.get_agent_session(&agent_id).await
+    }
+
+    /// `agent.update` (PROTOCOL §5.5). Partial update from a `changes` object —
+    /// only listed fields are touched; omitted fields are preserved. The store
+    /// enforces the write-once (`acpSessionId`) and immutable (`provider`)
+    /// invariants; malformed values in `changes` surface as `InvalidParams`.
+    /// Emits `agent:updated` (or `agent:renamed` when `name` is the only field
+    /// mutated) so subscribed clients invalidate their cached projection.
+    pub(crate) async fn agent_update_op(&self, agent_id: AgentId, changes: Value) -> Result<Value> {
+        let obj = match changes {
+            Value::Object(m) => m,
+            _ => {
+                return Err(Error::InvalidParams(
+                    "agent.update: `changes` must be an object".to_string(),
+                ))
+            }
+        };
+        let mut session = self.store.get_agent_session(&agent_id).await?;
+        let allowed = [
+            "status",
+            "isActive",
+            "acpSessionId",
+            "backendSessionId",
+            "name",
+            "nameExplicitlySet",
+            "model",
+            "provider",
+            "systemPrompt",
+            "specialist",
+            "taskNoteId",
+            "skipAutoCommit",
+            "completionReport",
+            "completionReportTimestamp",
+            "delegationDepth",
+            "initialMessage",
+            "contextReferences",
+            "imageBlocks",
+            "isBackground",
+        ];
+        for key in obj.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(Error::InvalidParams(format!(
+                    "agent.update: unknown field `{key}` in `changes`"
+                )));
+            }
+        }
+        let mut mutated_only_name = obj.contains_key("name");
+        for (key, value) in obj.iter() {
+            if key != "name" {
+                mutated_only_name = false;
+            }
+            match key.as_str() {
+                "status" => {
+                    session.status = serde_json::from_value(value.clone()).map_err(|e| {
+                        Error::InvalidParams(format!("agent.update: invalid status: {e}"))
+                    })?;
+                }
+                "isActive" => {
+                    session.is_active = value.as_bool().ok_or_else(|| {
+                        Error::InvalidParams(
+                            "agent.update: `isActive` must be a boolean".to_string(),
+                        )
+                    })?;
+                }
+                "acpSessionId" => {
+                    session.acp_session_id = update_optional_string(value, "acpSessionId")?;
+                }
+                "backendSessionId" => {
+                    session.backend_session_id = update_optional_string(value, "backendSessionId")?
+                        .map(|s| AgentId::from(s.as_str()));
+                }
+                "name" => {
+                    session.name = value
+                        .as_str()
+                        .ok_or_else(|| {
+                            Error::InvalidParams(
+                                "agent.update: `name` must be a string".to_string(),
+                            )
+                        })?
+                        .to_string();
+                    session.name_explicitly_set = true;
+                }
+                "nameExplicitlySet" => {
+                    session.name_explicitly_set = value.as_bool().ok_or_else(|| {
+                        Error::InvalidParams(
+                            "agent.update: `nameExplicitlySet` must be a boolean".to_string(),
+                        )
+                    })?;
+                }
+                "model" => {
+                    session.model = update_optional_string(value, "model")?;
+                }
+                "provider" => {
+                    session.provider = update_optional_string(value, "provider")?;
+                }
+                "systemPrompt" => {
+                    session.system_prompt = update_optional_string(value, "systemPrompt")?;
+                }
+                "specialist" => {
+                    session.specialist = update_optional_string(value, "specialist")?;
+                }
+                "taskNoteId" => {
+                    session.task_note_id =
+                        update_optional_string(value, "taskNoteId")?.map(NoteId::from);
+                }
+                "skipAutoCommit" => {
+                    session.skip_auto_commit = value.as_bool().ok_or_else(|| {
+                        Error::InvalidParams(
+                            "agent.update: `skipAutoCommit` must be a boolean".to_string(),
+                        )
+                    })?;
+                }
+                "completionReport" => {
+                    session.completion_report = update_optional_string(value, "completionReport")?;
+                }
+                "completionReportTimestamp" => {
+                    session.completion_report_timestamp =
+                        update_optional_string(value, "completionReportTimestamp")?;
+                }
+                "delegationDepth" => {
+                    session.delegation_depth = if value.is_null() {
+                        None
+                    } else {
+                        Some(value.as_i64().ok_or_else(|| {
+                            Error::InvalidParams(
+                                "agent.update: `delegationDepth` must be an integer".to_string(),
+                            )
+                        })?)
+                    };
+                }
+                "initialMessage" => {
+                    session.initial_message = update_optional_string(value, "initialMessage")?;
+                }
+                "contextReferences" => {
+                    session.context_references = if value.is_null() {
+                        None
+                    } else {
+                        Some(value.clone())
+                    };
+                }
+                "imageBlocks" => {
+                    session.image_blocks = if value.is_null() {
+                        None
+                    } else {
+                        Some(value.clone())
+                    };
+                }
+                "isBackground" => {
+                    session.is_background = value.as_bool().ok_or_else(|| {
+                        Error::InvalidParams(
+                            "agent.update: `isBackground` must be a boolean".to_string(),
+                        )
+                    })?;
+                }
+                _ => unreachable!("guarded by allow-list above"),
+            }
+        }
+        session.updated_at = now_iso();
+        self.store.update_agent_session(&session).await?;
+        let event_type = if mutated_only_name {
+            intent_core::events::AGENT_RENAMED
+        } else {
+            AGENT_UPDATED
+        };
+        let mut event_data = serde_json::Map::new();
+        event_data.insert("agentId".into(), json!(agent_id.0));
+        for (k, v) in obj.iter() {
+            event_data.insert(k.clone(), v.clone());
+        }
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            &agent_id,
+            event_type,
+            Value::Object(event_data),
+        )
+        .await;
+        let lite = self.project_lite_with_flags(session);
+        Ok(json!({ "success": true, "agent": lite }))
+    }
+
+    /// `agent.appendMessage` (PROTOCOL §5.5). Append a single message to the
+    /// transcript. Rejected with `InvalidParams` when the agent is mid-turn
+    /// (message-log mutation must not race the daemon's streaming writer).
+    /// `metadata` is persisted verbatim on the row. Emits `agent:message`.
+    pub(crate) async fn agent_append_message_op(
+        &self,
+        agent_id: AgentId,
+        role: String,
+        content: Value,
+        metadata: Option<Value>,
+    ) -> Result<Value> {
+        let session = self.store.get_agent_session(&agent_id).await?;
+        if self.agent_is_busy(agent_id.clone()) {
+            return Err(Error::InvalidParams(format!(
+                "agent.appendMessage: session {} is busy — cannot mutate transcript during an active turn",
+                agent_id.0
+            )));
+        }
+        validate_message_role(&role)?;
+        let created_at = now_iso();
+        let message = self
+            .store
+            .append_agent_message_with_metadata(
+                &agent_id,
+                &role,
+                &content,
+                metadata.as_ref(),
+                &created_at,
+            )
+            .await?;
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            &agent_id,
+            AGENT_MESSAGE,
+            json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+        )
+        .await;
+        Ok(json!({ "success": true, "message": message }))
+    }
+
+    /// `agent.replaceMessages` (PROTOCOL §5.5). Atomically swap the transcript
+    /// with `messages`. Rejected with `InvalidParams` when the agent is mid-turn
+    /// (same rationale as [`Services::agent_append_message_op`]). Row ids are
+    /// minted by the store — callers cannot smuggle stale ids across the swap.
+    /// Emits `agent:updated` with `{ replacedCount }`.
+    pub(crate) async fn agent_replace_messages_op(
+        &self,
+        agent_id: AgentId,
+        messages: Value,
+    ) -> Result<Value> {
+        let session = self.store.get_agent_session(&agent_id).await?;
+        if self.agent_is_busy(agent_id.clone()) {
+            return Err(Error::InvalidParams(format!(
+                "agent.replaceMessages: session {} is busy — cannot mutate transcript during an active turn",
+                agent_id.0
+            )));
+        }
+        let raw = messages.as_array().ok_or_else(|| {
+            Error::InvalidParams("agent.replaceMessages: `messages` must be an array".to_string())
+        })?;
+        struct Parsed {
+            role: String,
+            content: Value,
+            metadata: Option<Value>,
+            created_at: String,
+        }
+        let mut parsed: Vec<Parsed> = Vec::with_capacity(raw.len());
+        let fallback_ts = now_iso();
+        for (i, entry) in raw.iter().enumerate() {
+            let obj = entry.as_object().ok_or_else(|| {
+                Error::InvalidParams(format!(
+                    "agent.replaceMessages: `messages[{i}]` must be an object"
+                ))
+            })?;
+            let role = obj
+                .get("role")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Error::InvalidParams(format!(
+                        "agent.replaceMessages: `messages[{i}].role` is required"
+                    ))
+                })?
+                .to_string();
+            validate_message_role(&role)?;
+            let content = obj
+                .get("contentBlocks")
+                .or_else(|| obj.get("content"))
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InvalidParams(format!(
+                        "agent.replaceMessages: `messages[{i}].contentBlocks` is required"
+                    ))
+                })?;
+            let metadata = match obj.get("metadata") {
+                Some(Value::Null) | None => None,
+                Some(v) => Some(v.clone()),
+            };
+            let created_at = match obj.get("timestamp").or_else(|| obj.get("createdAt")) {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Null) | None => fallback_ts.clone(),
+                Some(_) => {
+                    return Err(Error::InvalidParams(format!(
+                        "agent.replaceMessages: `messages[{i}].timestamp` must be a string"
+                    )))
+                }
+            };
+            parsed.push(Parsed {
+                role,
+                content,
+                metadata,
+                created_at,
+            });
+        }
+        let batch: Vec<intent_store::ReplaceMessage<'_>> = parsed
+            .iter()
+            .map(|p| intent_store::ReplaceMessage {
+                role: p.role.as_str(),
+                content: &p.content,
+                metadata: p.metadata.as_ref(),
+                created_at: p.created_at.as_str(),
+            })
+            .collect();
+        let inserted = self.store.replace_agent_messages(&agent_id, &batch).await?;
+        let replaced_count = inserted.len();
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            &agent_id,
+            AGENT_UPDATED,
+            json!({ "agentId": agent_id.0, "replacedCount": replaced_count }),
+        )
+        .await;
+        Ok(json!({ "success": true, "messages": inserted }))
     }
 
     /// `agent.getModels`: auggie CLI with the static-tier fallback (PROTOCOL §5.5).
@@ -2215,4 +2539,32 @@ fn tool_call_counts(messages: &[AgentMessage]) -> Value {
         }
     }
     json!(counts)
+}
+
+/// Parse an optional string field in an `agent.update` `changes` object. A JSON
+/// `null` clears the underlying `Option<String>`; a JSON string sets it to
+/// `Some(_)`; any other value type is `-32602` (matching the trait's
+/// [`Error::InvalidParams`] contract). Reused by every optional-string field in
+/// [`Services::agent_update_op`] so the diagnostic wording stays uniform.
+fn update_optional_string(value: &Value, field: &str) -> Result<Option<String>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(s) => Ok(Some(s.clone())),
+        _ => Err(Error::InvalidParams(format!(
+            "agent.update: `{field}` must be a string or null"
+        ))),
+    }
+}
+
+/// Reject transcript entries whose `role` is not one of the four wire values
+/// (`user` | `assistant` | `tool` | `system`). Shared by `agent.appendMessage`
+/// and `agent.replaceMessages` so callers cannot smuggle bogus roles that would
+/// break the message-log invariant.
+fn validate_message_role(role: &str) -> Result<()> {
+    match role {
+        "user" | "assistant" | "tool" | "system" => Ok(()),
+        _ => Err(Error::InvalidParams(format!(
+            "invalid message role `{role}` (expected one of user|assistant|tool|system)"
+        ))),
+    }
 }

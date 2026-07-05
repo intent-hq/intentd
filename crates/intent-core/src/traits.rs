@@ -9,19 +9,19 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId};
 use crate::model::{
-    AgentDelegateInput, AgentLite, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
-    CommentListResult, CommentResolveThreadResult, CommentRespondResult, Draft, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, FileActivity, GitAgentCommitResult,
-    GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts, GitPullResult, GitStatus,
-    LineAttributionComputeResult, LineAttributionData, Note, NoteAddInput, NoteAddResult,
-    NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
-    NoteEditResult, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, ReadAssetResult,
-    SaveAssetResult, ScriptCreateParams, SetupScript, TaskAssignAgentResult,
-    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
-    TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult, TaskUpdateNoteStatusResult,
-    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
-    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    AgentDelegateInput, AgentLite, AgentSession, CommentAddResult, CommentDeleteResult,
+    CommentGetThreadResult, CommentListResult, CommentResolveThreadResult, CommentRespondResult,
+    Draft, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity,
+    GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts,
+    GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData, Note,
+    NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
+    NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult, NoteSetContentResult,
+    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary,
+    ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams, SetupScript,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
+    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -733,6 +733,91 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_get_conversation not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.getSession`: full [`AgentSession`] projection including
+    /// `systemPrompt`, `specialist`, and the persisted metadata block —
+    /// the superset that `agent.get`/`AgentLite` strips (PROTOCOL §5.5).
+    /// `messages` is loaded from the append-only log (chronological order).
+    /// Used by the FE-side agent-backend-handler retirement to rehydrate the
+    /// full `AgentSession` shape from the daemon (C1d/C1e). `NotFound` when
+    /// the session is unknown.
+    fn agent_get_session(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<AgentSession>> {
+        let _ = (agent_id, workspace_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_get_session not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.update`: partial update of the persisted [`AgentSession`] from
+    /// a `changes` object (PROTOCOL §5.5). Only the listed fields are touched;
+    /// omitted fields are preserved. Write-once (`acpSessionId`) and immutable
+    /// (`provider`) invariants are enforced by the store. Emits `agent:updated`
+    /// (or `agent:renamed` when `name` is the only mutated field). Returns
+    /// `{ success: true, agent: AgentLite }` on success. `NotFound` when the
+    /// session is unknown; `InvalidParams` when `changes` carries an unknown
+    /// field or a malformed value.
+    fn agent_update(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        changes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, workspace_id, changes);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.appendMessage`: append a raw [`AgentMessage`] to the transcript
+    /// (PROTOCOL §5.5). Used by the FE for wake-message insert and the
+    /// `saveMessage` renderer path — mutations that carry the persisted role
+    /// and pre-composed `contentBlocks` verbatim. Rejected with
+    /// `InvalidParams` when the agent is mid-turn (message-log mutation must
+    /// not race the daemon's streaming writer). Returns `{ success: true,
+    /// message: AgentMessage }` on success. Emits `agent:message`.
+    fn agent_append_message(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        role: String,
+        content: serde_json::Value,
+        metadata: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, workspace_id, role, content, metadata);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_append_message not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.replaceMessages`: atomically swap the entire transcript with
+    /// `messages` (PROTOCOL §5.5). Used by the FE's edit-truncate path so a
+    /// re-generated turn does not leave orphaned rows. Rejected with
+    /// `InvalidParams` when the agent is mid-turn (same rationale as
+    /// [`WorkspaceApi::agent_append_message`]). Returns `{ success: true,
+    /// messages: AgentMessage[] }` with the freshly-minted ids/`seq`s.
+    fn agent_replace_messages(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        messages: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, workspace_id, messages);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_replace_messages not implemented".to_string(),
             ))
         })
     }

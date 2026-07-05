@@ -17,7 +17,7 @@ use serde_json::json;
 use tokio::time::timeout;
 
 use intent_core::events::{
-    AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RENAMED,
+    AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE, AGENT_RENAMED,
     AGENT_SESSION_STATS_CHANGED, AGENT_UPDATED,
 };
 use intent_core::{ActorType, Event, EventActor, SessionStats};
@@ -2758,4 +2758,259 @@ async fn get_session_stats_unknown_session_is_not_found() {
         .await
         .expect_err("unknown session");
     assert!(matches!(err, Error::NotFound(_)));
+}
+
+// -- A8: agent.getSession / agent.update / agent.appendMessage / agent.replaceMessages --
+
+/// `agent.getSession` returns the full [`AgentSession`] projection, including
+/// the `systemPrompt`/`specialist`/persisted-metadata fields that [`AgentLite`]
+/// strips (PROTOCOL §5.5, C1d/C1e). Also round-trips the `messages` log so a
+/// `loadAgent` caller does not need a second `agent.getConversation` call.
+#[tokio::test]
+async fn agent_get_session_projects_full_session_shape() {
+    let (_t, svc, ws) = setup().await;
+    // Create with a `specialistId` so the session carries a persisted specialist
+    // (the projection field `agent.get`/AgentLite strips into `metadata`).
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Full".into()),
+            Some("auggie:sonnet4.5".into()),
+            Some("implementor".into()),
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    // Directly set a systemPrompt via the update op so we can then read it back
+    // via getSession (systemPrompt is stripped from AgentLite).
+    svc.agent_update_op(
+        id.clone(),
+        json!({ "systemPrompt": "you are a helpful agent" }),
+    )
+    .await
+    .expect("update systemPrompt");
+    let session = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("getSession");
+    assert_eq!(session.id, id);
+    assert_eq!(session.name, "Full");
+    assert_eq!(session.specialist.as_deref(), Some("implementor"));
+    assert_eq!(
+        session.system_prompt.as_deref(),
+        Some("you are a helpful agent")
+    );
+    assert!(session.messages.is_empty());
+}
+
+#[tokio::test]
+async fn agent_get_session_unknown_agent_is_not_found() {
+    let (_t, svc, _ws) = setup().await;
+    let err = svc
+        .agent_get_session_op(AgentId::from("agent-00000000-0000-0000-0000-00000missing0"))
+        .await
+        .expect_err("unknown agent");
+    assert!(matches!(err, Error::NotFound(_)));
+}
+
+/// `agent.update` patches only listed fields; omitted fields survive the write.
+/// Emits `agent:updated` with the payload the client sent.
+#[tokio::test]
+async fn agent_update_patches_listed_fields_and_emits_updated() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Patch").await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    let r = svc
+        .agent_update_op(
+            id.clone(),
+            json!({
+                "systemPrompt": "patched",
+                "isBackground": true,
+                "delegationDepth": 2,
+            }),
+        )
+        .await
+        .expect("update");
+    assert_eq!(r["success"], json!(true));
+
+    let session = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("getSession");
+    assert_eq!(session.system_prompt.as_deref(), Some("patched"));
+    assert!(session.is_background);
+    assert_eq!(session.delegation_depth, Some(2));
+    // Name (unmutated) survives.
+    assert_eq!(session.name, "Patch");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv")
+        .expect("open");
+    assert!(batch.iter().any(
+        |e| e.event_type == AGENT_UPDATED && e.data["agentId"].as_str() == Some(id.0.as_str())
+    ));
+}
+
+/// Name-only updates fold into `agent:renamed` (not `agent:updated`), matching
+/// the existing `agent.rename` semantics.
+#[tokio::test]
+async fn agent_update_name_only_emits_agent_renamed() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "OldName").await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_RENAMED.to_string()],
+        ..Default::default()
+    });
+
+    svc.agent_update_op(id.clone(), json!({ "name": "NewName" }))
+        .await
+        .expect("update");
+
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    assert_eq!(session.name, "NewName");
+    assert!(session.name_explicitly_set);
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv")
+        .expect("open");
+    assert!(batch.iter().any(|e| e.event_type == AGENT_RENAMED));
+}
+
+/// Unknown fields in `changes` surface as `-32602` so callers cannot smuggle
+/// stray keys that would silently no-op.
+#[tokio::test]
+async fn agent_update_rejects_unknown_field() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Strict").await;
+    let err = svc
+        .agent_update_op(id, json!({ "unknownKey": "x" }))
+        .await
+        .expect_err("unknown field");
+    assert!(matches!(err, Error::InvalidParams(_)));
+}
+
+/// The immutable/write-once invariants on `provider`/`acpSessionId` are still
+/// enforced by the store; `agent.update` surfaces them verbatim.
+#[tokio::test]
+async fn agent_update_respects_store_invariants() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Locked").await;
+    svc.agent_update_op(id.clone(), json!({ "acpSessionId": "sess-first" }))
+        .await
+        .expect("first set");
+    let err = svc
+        .agent_update_op(id, json!({ "acpSessionId": "sess-second" }))
+        .await
+        .expect_err("write-once");
+    assert!(matches!(err, Error::Internal(_)));
+}
+
+/// `agent.appendMessage` inserts one row and emits `agent:message`.
+#[tokio::test]
+async fn agent_append_message_persists_and_emits() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Appender").await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_MESSAGE.to_string()],
+        ..Default::default()
+    });
+
+    let r = svc
+        .agent_append_message_op(
+            id.clone(),
+            "user".into(),
+            json!([{ "type": "text", "text": "hello" }]),
+            None,
+        )
+        .await
+        .expect("append");
+    assert_eq!(r["success"], json!(true));
+    assert_eq!(r["message"]["role"], json!("user"));
+    assert_eq!(r["message"]["seq"], json!(0));
+
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    assert_eq!(session.messages.len(), 1);
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv")
+        .expect("open");
+    assert!(batch.iter().any(|e| e.event_type == AGENT_MESSAGE));
+}
+
+#[tokio::test]
+async fn agent_append_message_rejects_bad_role() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "RoleGuard").await;
+    let err = svc
+        .agent_append_message_op(id, "bogus".into(), json!([]), None)
+        .await
+        .expect_err("bad role");
+    assert!(matches!(err, Error::InvalidParams(_)));
+}
+
+/// `agent.replaceMessages` atomically swaps the transcript with fresh
+/// `seq: 0..n` values under freshly-minted row ids.
+#[tokio::test]
+async fn agent_replace_messages_swaps_transcript_atomically() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Swapper").await;
+    // Prime with two messages so we can prove the swap replaces rather than
+    // appends.
+    for i in 0..2 {
+        svc.agent_append_message_op(
+            id.clone(),
+            "user".into(),
+            json!([{ "type": "text", "text": format!("old {i}") }]),
+            None,
+        )
+        .await
+        .expect("append");
+    }
+
+    let r = svc
+        .agent_replace_messages_op(
+            id.clone(),
+            json!([
+                { "role": "user", "contentBlocks": [{ "type": "text", "text": "new0" }] },
+                { "role": "assistant", "contentBlocks": [{ "type": "text", "text": "new1" }] },
+            ]),
+        )
+        .await
+        .expect("replace");
+    assert_eq!(r["success"], json!(true));
+
+    let session = svc.agent_get_session_op(id).await.expect("get");
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.messages[0].seq, 0);
+    assert_eq!(session.messages[1].seq, 1);
+    assert_eq!(session.messages[0].role, "user");
+    assert_eq!(session.messages[1].role, "assistant");
+}
+
+#[tokio::test]
+async fn agent_replace_messages_rejects_non_array_and_bad_entries() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "ReplaceGuard").await;
+    let err = svc
+        .agent_replace_messages_op(id.clone(), json!({ "not": "array" }))
+        .await
+        .expect_err("non-array");
+    assert!(matches!(err, Error::InvalidParams(_)));
+    let err = svc
+        .agent_replace_messages_op(id, json!([{ "role": "user" }]))
+        .await
+        .expect_err("missing content");
+    assert!(matches!(err, Error::InvalidParams(_)));
 }

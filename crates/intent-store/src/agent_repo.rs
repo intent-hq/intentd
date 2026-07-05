@@ -454,6 +454,81 @@ impl Store {
             .get::<i64, _>("n");
         Ok(n)
     }
+
+    /// Atomically clear the agent's message log and reinsert `messages` under
+    /// fresh 0-based monotonic `seq` values. Row ids are minted here (UUIDv7)
+    /// so callers cannot smuggle stale ids across the swap; the returned
+    /// [`AgentMessage`]s carry the new id/`seq` pairing. Used by the FE's
+    /// edit-truncate transcript-mutation path (`agent.replaceMessages`,
+    /// PROTOCOL §5.5). Callers are expected to reject busy sessions before
+    /// invoking this (message-log mutations must not race an in-flight turn).
+    pub async fn replace_agent_messages(
+        &self,
+        agent_id: &AgentId,
+        messages: &[ReplaceMessage<'_>],
+    ) -> Result<Vec<AgentMessage>> {
+        let mut tx =
+            self.pool().begin().await.map_err(|e| {
+                Error::Internal(format!("replace agent messages begin failed: {e}"))
+            })?;
+        sqlx::query("DELETE FROM agent_message WHERE agent_id = ?")
+            .bind(&agent_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("replace agent messages clear failed: {e}")))?;
+        let mut inserted = Vec::with_capacity(messages.len());
+        let insert_sql =
+            format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
+        for (idx, m) in messages.iter().enumerate() {
+            let seq = idx as i64;
+            let id = Uuid::now_v7().to_string();
+            let content_json = serde_json::to_string(&m.content).map_err(|e| {
+                Error::Internal(format!("encode replaced message content failed: {e}"))
+            })?;
+            let metadata_json = match m.metadata {
+                Some(md) => Some(serde_json::to_string(md).map_err(|e| {
+                    Error::Internal(format!("encode replaced message metadata failed: {e}"))
+                })?),
+                None => None,
+            };
+            sqlx::query(&insert_sql)
+                .bind(&id)
+                .bind(&agent_id.0)
+                .bind(seq)
+                .bind(m.role)
+                .bind(&content_json)
+                .bind(metadata_json.as_deref())
+                .bind(m.created_at)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("replace agent messages insert failed: {e}"))
+                })?;
+            inserted.push(AgentMessage {
+                id,
+                agent_id: agent_id.clone(),
+                seq,
+                role: m.role.to_string(),
+                content: m.content.clone(),
+                metadata: m.metadata.cloned(),
+                created_at: m.created_at.to_string(),
+            });
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("replace agent messages commit failed: {e}")))?;
+        Ok(inserted)
+    }
+}
+
+/// Input row for [`Store::replace_agent_messages`]: borrowed refs to the
+/// caller-supplied `role`/`content`/`metadata`/`created_at`, so the service
+/// layer can build the batch without cloning the transcript twice.
+pub struct ReplaceMessage<'a> {
+    pub role: &'a str,
+    pub content: &'a serde_json::Value,
+    pub metadata: Option<&'a serde_json::Value>,
+    pub created_at: &'a str,
 }
 
 fn map_message_row(row: &SqliteRow) -> Result<AgentMessage> {
