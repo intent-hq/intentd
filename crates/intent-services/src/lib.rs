@@ -871,6 +871,30 @@ impl Services {
         })
     }
 
+    /// Spawn the CRDT session-sweeper loop (A5, reference parity with the
+    /// `CRDTNotesService` idle sweep): every [`crdt_notes::SESSION_SWEEP_INTERVAL`]
+    /// tick, drop cached `yrs` docs whose last access is older than
+    /// [`crdt_notes::SESSION_IDLE_TIMEOUT`] so long-lived daemons do not hold
+    /// per-note session state indefinitely. The first sweep runs after one
+    /// interval; missed ticks are skipped (no pile-up). Returns the task handle
+    /// so the composition root can hold/abort it.
+    pub fn spawn_crdt_session_sweep_loop(&self) -> tokio::task::JoinHandle<()> {
+        let crdt_notes = self.crdt_notes.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(crdt_notes::SESSION_SWEEP_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Consume the immediate first tick so the loop waits one interval.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let removed = crdt_notes.sweep_stale(crdt_notes::SESSION_IDLE_TIMEOUT);
+                if removed > 0 {
+                    tracing::info!(removed, "crdt session sweep evicted stale sessions");
+                }
+            }
+        })
+    }
+
     /// Recompute one workspace's durable `tokenUsage` by tallying its agent
     /// sessions per agent and per model (§5.23 / §19.1), persisting the snapshot
     /// and emitting `workspace:tokenUsage-changed` only when the materialized
@@ -4958,6 +4982,8 @@ impl WorkspaceApi for Services {
             note.updated_at = now_iso();
             store.update_note(&note).await?;
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
+            services
+                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             publish_event(
                 &bus,
                 note_change_event(
@@ -5086,6 +5112,8 @@ impl WorkspaceApi for Services {
             note.updated_at = now_iso();
             store.update_note(&note).await?;
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
+            services
+                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             publish_event(
                 &bus,
                 note_change_event(
@@ -5324,6 +5352,8 @@ impl WorkspaceApi for Services {
             note.updated_at = now_iso();
             store.update_note(&note).await?;
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
+            services
+                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             Ok(TaskConvertBlocksResult {
                 ok: true,
                 converted_count: created_note_ids.len() as i64,
@@ -5501,6 +5531,8 @@ impl WorkspaceApi for Services {
             note.updated_at = now_iso();
             store.update_note(&note).await?;
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
+            services
+                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             let now = now_iso();
             let new_comment = Comment {
                 id: comment_id.clone(),

@@ -25,15 +25,13 @@ use intent_core::{NoteId, WorkspaceId};
 use yrs::{Doc, GetString, Text, Transact, TransactionMut};
 
 /// Reference parity (`SESSION_TIMEOUT_MS = 24 * 60 * 60 * 1000`): sweep sessions
-/// idle for more than a day. Exposed for a future composition-root sweeper;
-/// unused at the crate boundary for now.
-#[allow(dead_code)]
+/// idle for more than a day. Wired from the composition root via
+/// [`crate::Services::spawn_crdt_session_sweep_loop`].
 pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Reference parity (`updateContent` cadence): the yrs-side sweep runs once
-/// per hour. Exposed for a future composition-root sweeper; unused at the
-/// crate boundary for now.
-#[allow(dead_code)]
+/// per hour. Wired from the composition root via
+/// [`crate::Services::spawn_crdt_session_sweep_loop`].
 pub const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Name of the `yrs::Text` container that mirrors the note's markdown content.
@@ -110,10 +108,9 @@ impl CrdtNoteManager {
     }
 
     /// Sweep sessions idle beyond `timeout` (reference: `cleanupStaleSessions`).
-    /// Exposed for a future composition-root sweeper (see
-    /// [`SESSION_SWEEP_INTERVAL`] / [`SESSION_IDLE_TIMEOUT`]); currently only
-    /// exercised by unit tests.
-    #[allow(dead_code)]
+    /// Driven by the composition-root sweeper spawned in
+    /// [`crate::Services::spawn_crdt_session_sweep_loop`] using
+    /// [`SESSION_SWEEP_INTERVAL`] / [`SESSION_IDLE_TIMEOUT`].
     pub fn sweep_stale(&self, timeout: Duration) -> usize {
         let now = Instant::now();
         let mut sessions = self.sessions.lock().expect("crdt sessions poisoned");

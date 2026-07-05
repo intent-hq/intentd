@@ -7795,3 +7795,80 @@ mod clone_orchestration {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// A6 verifier hooks: surgical mutations schedule line-attribution recompute;
+// composition-root sweeper spawns as an abortable task.
+// ---------------------------------------------------------------------------
+mod line_attribution_hooks {
+    use super::*;
+
+    fn assert_debouncer_scheduled(svc: &Services, ws: &WorkspaceId, id: &NoteId) {
+        let map = svc
+            .line_attribution_debouncers
+            .lock()
+            .expect("debouncer lock");
+        assert!(
+            map.contains_key(&(ws.clone(), id.clone())),
+            "schedule_line_attribution_recompute must register a debounced timer",
+        );
+    }
+
+    #[tokio::test]
+    async fn task_update_status_schedules_recompute() {
+        let (_tmp, svc, ws, id) = setup("- [ ] alpha\n- [ ] beta").await;
+        svc.task_update_status(ws.clone(), id.clone(), "beta".into(), "in-progress".into())
+            .await
+            .expect("updateStatus");
+        assert_debouncer_scheduled(&svc, &ws, &id);
+    }
+
+    #[tokio::test]
+    async fn task_update_schedules_recompute() {
+        let (_tmp, svc, ws, id) = setup("- [ ] alpha").await;
+        svc.task_update(ws.clone(), id.clone(), 1, None, Some("done".into()), None)
+            .await
+            .expect("task.update");
+        assert_debouncer_scheduled(&svc, &ws, &id);
+    }
+
+    #[tokio::test]
+    async fn convert_task_blocks_schedules_recompute() {
+        let content = "intro\n@@@task\n# Build API\nBuild the thing.\n@@@\ntail";
+        let (_tmp, svc, ws, id) = setup(content).await;
+        svc.convert_task_blocks(ws.clone(), id.clone())
+            .await
+            .expect("convertBlocks");
+        assert_debouncer_scheduled(&svc, &ws, &id);
+    }
+
+    #[tokio::test]
+    async fn comment_add_schedules_recompute() {
+        let (_tmp, svc, ws, id) = setup("Hello world, this is a test sentence.").await;
+        svc.comment_add(
+            ws.clone(),
+            id.clone(),
+            "this is a test sentence".into(),
+            "test".into(),
+            "nice".into(),
+            None,
+            None,
+        )
+        .await
+        .expect("comment.add");
+        assert_debouncer_scheduled(&svc, &ws, &id);
+    }
+
+    #[tokio::test]
+    async fn spawn_crdt_session_sweep_loop_returns_abortable_handle() {
+        let (_tmp, svc, _ws, _id) = setup("").await;
+        let handle = svc.spawn_crdt_session_sweep_loop();
+        assert!(!handle.is_finished(), "sweep loop should stay running");
+        handle.abort();
+        let joined = handle.await;
+        assert!(
+            matches!(&joined, Err(e) if e.is_cancelled()),
+            "aborted sweep loop must join with a cancellation error: {joined:?}",
+        );
+    }
+}

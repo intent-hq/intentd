@@ -308,6 +308,11 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
     // `Linked-Note-Id:` trailers via `git_agent_commit`. No-op-safe without an
     // event bus. Aborted on clean shutdown.
     let auto_commit_loop = services.spawn_auto_commit_loop();
+    // CRDT session sweeper (A5, §5.2 CRDT): every hour, drop cached yrs docs
+    // for `(workspace, note)` pairs whose last access is older than 24h so
+    // long-lived daemons do not accumulate per-note session state. Aborted on
+    // clean shutdown.
+    let crdt_session_sweep = services.spawn_crdt_session_sweep_loop();
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group. Disabled entirely
     // when `agents.idleReapMinutes == 0`.
@@ -400,6 +405,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
     token_usage_scan.abort();
     completion_delivery.abort();
     auto_commit_loop.abort();
+    crdt_session_sweep.abort();
     if let Some(reap_task) = reap_task {
         reap_task.abort();
     }
