@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use intent_acp::handshake::try_bypass_permissions_mode;
 use intent_acp::session::{ContentBlock, StopReason};
 use intent_acp::{
     build_baseline_mcp_env_from_process, handshake, serve_workspace_mcp_tcp, spawn_provider,
@@ -593,11 +594,16 @@ impl AgentManager {
             handles: Arc::new(Mutex::new(HashMap::new())),
             sink,
             permissions: Arc::new(PermissionRegistry::new()),
-            // Headless default (§6.7/M3.5): auto-allow low-risk reads, auto-deny
-            // medium/high-risk prompts. An FE-attached deployment selects
-            // `Interactive` via `with_policy()` (wired from `INTENTD_PERMISSION_POLICY`)
-            // to drive the `agent.respondPermission`/`agent.pendingPermissions` RPCs.
-            policy: PermissionPolicy::AutoByRisk,
+            // Shipped default (§6.7/M3.5): `AllowAll` for reference parity with
+            // the TS acp-provider — [`start_session`] additionally attempts
+            // `session/set_mode bypassPermissions` on providers that advertise
+            // set-mode (auggie today), and the local `AllowAll` auto-approve
+            // handles anything the provider still surfaces. An FE-attached
+            // deployment selects `Interactive` via `with_policy()` (wired from
+            // `INTENTD_PERMISSION_POLICY`) to drive the
+            // `agent.respondPermission` / `agent.pendingPermissions` RPCs;
+            // `AutoByRisk` / `DenyAll` remain selectable via the same env var.
+            policy: PermissionPolicy::AllowAll,
             mcp_bridge_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("intentd")),
             busy: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
@@ -895,6 +901,8 @@ impl AgentManager {
                     let mut guard = notes.lock().await;
                     Services::drain_replay_notifications(&mut guard).await;
                 }
+                self.maybe_bypass_permissions(conn.as_ref(), provider, &acp_session_id)
+                    .await;
                 return Ok(acp_session_id);
             }
             Ok(None) => {}
@@ -917,13 +925,37 @@ impl AgentManager {
                 .recreate_acp_session(conn.as_ref(), agent_id, &expected_old, cwd, Vec::new())
                 .await?;
             self.recreated.lock().unwrap().insert(agent_id.clone());
+            self.maybe_bypass_permissions(conn.as_ref(), provider, &acp_session_id)
+                .await;
             return Ok(acp_session_id);
         }
 
         // 3) Brand-new agent → open and persist the first session (write-once).
-        self.services
+        let acp_session_id = self
+            .services
             .open_acp_session(conn.as_ref(), agent_id, cwd, Vec::new())
-            .await
+            .await?;
+        self.maybe_bypass_permissions(conn.as_ref(), provider, &acp_session_id)
+            .await;
+        Ok(acp_session_id)
+    }
+
+    /// Under the shipped `AllowAll` policy, best-effort ask the provider to run
+    /// in its own bypass mode via `session/set_mode bypassPermissions` (parity
+    /// with the TS acp-provider). Unsupported or failed attempts fall back to
+    /// the local `AllowAll` auto-approve inside [`ClientRequestHandler`]; every
+    /// other policy is a no-op so the Interactive round-trip and `AutoByRisk` /
+    /// `DenyAll` decisions stay authoritative.
+    async fn maybe_bypass_permissions(
+        &self,
+        conn: &Connection,
+        provider: &ProviderConfig,
+        acp_session_id: &str,
+    ) {
+        if self.policy != PermissionPolicy::AllowAll {
+            return;
+        }
+        try_bypass_permissions_mode(conn, provider, acp_session_id).await;
     }
 
     /// Take (clear) the recreate flag for `agent_id`: `true` when the agent's ACP

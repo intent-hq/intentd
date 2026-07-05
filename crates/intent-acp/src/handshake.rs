@@ -23,6 +23,11 @@ const CLIENT_NAME: &str = "Intent";
 /// Auth method id used when no interactive auth is required (parity: TS sends
 /// `methodId: "none"`).
 const NO_AUTH_METHOD_ID: &str = "none";
+/// Session mode id that asks the provider to skip its own permission prompts
+/// (parity: TS acp-provider sends `session/set_mode { modeId: "bypassPermissions" }`
+/// on session setup when the provider advertises set-mode support; the backend
+/// then locally auto-approves anything the provider still surfaces).
+pub const BYPASS_PERMISSIONS_MODE: &str = "bypassPermissions";
 
 /// Outcome of a completed handshake.
 #[derive(Debug)]
@@ -100,4 +105,46 @@ pub async fn set_session_mode(conn: &Connection, session_id: &str, mode_id: &str
     let params = serde_json::to_value(&request)?;
     conn.request("session/set_mode", params).await?;
     Ok(())
+}
+
+/// Best-effort `session/set_mode bypassPermissions` (parity with the reference
+/// acp-provider). Only attempts the call when the provider advertises set-mode
+/// support; a provider failure is logged and swallowed so the local `AllowAll`
+/// auto-approve path remains authoritative. Returns `true` when the provider
+/// accepted the mode change, `false` when the provider does not support
+/// `session/set_mode` or the request failed.
+pub async fn try_bypass_permissions_mode(
+    conn: &Connection,
+    provider: &ProviderConfig,
+    session_id: &str,
+) -> bool {
+    if !provider.supports_set_mode {
+        tracing::debug!(
+            provider = provider.id,
+            session_id,
+            "provider does not advertise session/set_mode; local AllowAll will auto-approve prompts"
+        );
+        return false;
+    }
+    match set_session_mode(conn, session_id, BYPASS_PERMISSIONS_MODE).await {
+        Ok(()) => {
+            tracing::debug!(
+                provider = provider.id,
+                session_id,
+                mode = BYPASS_PERMISSIONS_MODE,
+                "session/set_mode accepted; provider running in bypass mode"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                provider = provider.id,
+                session_id,
+                mode = BYPASS_PERMISSIONS_MODE,
+                error = %e,
+                "session/set_mode failed; falling back to local AllowAll auto-approve"
+            );
+            false
+        }
+    }
 }

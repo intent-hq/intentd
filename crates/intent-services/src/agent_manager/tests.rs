@@ -479,10 +479,22 @@ async fn agent_file_change_records_tracked_change_and_diff() {
 
 const MGR_ACP_SID: &str = "mgr-acp-new";
 
+/// Shared capture of `(method, params)` for every request the manager sends to
+/// a mock agent; opt-in per [`spawn_cfg_mock_agent`] so tests that need it can
+/// assert on the exact request sequence.
+type MockCallLog = Arc<Mutex<Vec<(String, Value)>>>;
+
 /// Configurable mock agent: `initialize` advertises `loadSession` per `load_cap`;
 /// `session/new` mints [`MGR_ACP_SID`]; `session/load` succeeds; everything else
-/// (e.g. `authenticate`) resolves with `{}`.
-fn spawn_cfg_mock_agent<R, W>(read: R, write: W, load_cap: bool) -> JoinHandle<()>
+/// (e.g. `authenticate`) resolves with `{}`. When `log` is `Some`, every request
+/// method (and its params) is recorded so tests can assert what the manager sent
+/// after handshake / session setup.
+fn spawn_cfg_mock_agent<R, W>(
+    read: R,
+    write: W,
+    load_cap: bool,
+    log: Option<MockCallLog>,
+) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -500,6 +512,10 @@ where
             else {
                 continue;
             };
+            if let Some(log) = &log {
+                let params = value.get("params").cloned().unwrap_or(Value::Null);
+                log.lock().unwrap().push((method.to_string(), params));
+            }
             let result = match method {
                 "initialize" => {
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": load_cap } })
@@ -521,9 +537,32 @@ where
 /// Track a handle wired to a configurable mock agent (parity with `create_agent`
 /// minus a real child), returning the agent task handle.
 fn track_mock_agent(mgr: &AgentManager, id: &AgentId, load_cap: bool) -> JoinHandle<()> {
+    track_mock_agent_inner(mgr, id, load_cap, None).0
+}
+
+/// Like [`track_mock_agent`] but also returns a shared log capturing every
+/// request the manager sent to the mock (method + params), so tests can assert
+/// e.g. that `session/set_mode bypassPermissions` was attempted after session
+/// setup.
+fn track_mock_agent_with_log(
+    mgr: &AgentManager,
+    id: &AgentId,
+    load_cap: bool,
+) -> (JoinHandle<()>, MockCallLog) {
+    let log: MockCallLog = Arc::new(Mutex::new(Vec::new()));
+    let (handle, _) = track_mock_agent_inner(mgr, id, load_cap, Some(log.clone()));
+    (handle, log)
+}
+
+fn track_mock_agent_inner(
+    mgr: &AgentManager,
+    id: &AgentId,
+    load_cap: bool,
+    log: Option<MockCallLog>,
+) -> (JoinHandle<()>, ()) {
     let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
     let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
-    let agent = spawn_cfg_mock_agent(c2a_agent, a2c_agent, load_cap);
+    let agent = spawn_cfg_mock_agent(c2a_agent, a2c_agent, load_cap, log);
     let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
     let connection = Arc::new(Connection::new(
         c2a_client,
@@ -547,7 +586,7 @@ fn track_mock_agent(mgr: &AgentManager, id: &AgentId, load_cap: bool) -> JoinHan
         },
     );
     mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
-    agent
+    (agent, ())
 }
 
 /// A test provider that skips `authenticate` (deterministic handshake).
@@ -696,6 +735,143 @@ async fn start_session_recreates_and_flags_when_load_unsupported() {
     // The recreate flag is set so the next turn resends history; take() clears it.
     assert!(mgr.take_recreated(&id), "recreate flags a history resend");
     assert!(!mgr.take_recreated(&id), "flag is cleared once taken");
+}
+
+/// Under the shipped `AllowAll` default, `start_session` best-effort asks the
+/// provider to run in `bypassPermissions` mode (parity with the TS acp-provider)
+/// once a session id is minted. Providers that don't advertise `set_mode` skip
+/// the call; providers that do (auggie today) see it after `session/new`,
+/// `session/load`, or the recreate path.
+#[tokio::test]
+async fn start_session_sends_bypass_permissions_under_allow_all() {
+    let (_tmp, mgr) = manager().await;
+    // `manager()` builds an AllowAll manager (the shipped default), which is
+    // what wires `maybe_bypass_permissions` on the three session paths.
+    assert_eq!(mgr.policy(), PermissionPolicy::AllowAll);
+
+    // 1) Brand-new session: bypass follows `session/new`.
+    let new_id = AgentId::from("a-bypass-new");
+    seed_agent(&mgr, &WorkspaceId::from("ws-bypass-new"), &new_id).await;
+    let (_agent_new, new_log) = track_mock_agent_with_log(&mgr, &new_id, false);
+    let sid = mgr
+        .start_session(&new_id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect("first session");
+    assert_eq!(sid, MGR_ACP_SID);
+    let new_calls = new_log.lock().unwrap().clone();
+    let set_mode = new_calls
+        .iter()
+        .find(|(m, _)| m == "session/set_mode")
+        .expect("session/set_mode called after session/new");
+    assert_eq!(set_mode.1["sessionId"], MGR_ACP_SID);
+    assert_eq!(set_mode.1["modeId"], "bypassPermissions");
+    // Ordering: `session/new` precedes the bypass attempt.
+    let new_idx = new_calls
+        .iter()
+        .position(|(m, _)| m == "session/new")
+        .expect("session/new in log");
+    let set_idx = new_calls
+        .iter()
+        .position(|(m, _)| m == "session/set_mode")
+        .expect("session/set_mode in log");
+    assert!(new_idx < set_idx, "bypass attempted after session/new");
+
+    // 2) Resume path: bypass follows `session/load`.
+    let resume_id = AgentId::from("a-bypass-resume");
+    seed_agent(&mgr, &WorkspaceId::from("ws-bypass-resume"), &resume_id).await;
+    mgr.services
+        .store
+        .set_acp_session_id(&resume_id, "existing-id")
+        .await
+        .unwrap();
+    let (_agent_r, resume_log) = track_mock_agent_with_log(&mgr, &resume_id, true);
+    let sid = mgr
+        .start_session(&resume_id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect("resume");
+    assert_eq!(sid, "existing-id");
+    let resume_calls = resume_log.lock().unwrap().clone();
+    let set_mode = resume_calls
+        .iter()
+        .find(|(m, _)| m == "session/set_mode")
+        .expect("session/set_mode called after session/load");
+    assert_eq!(set_mode.1["sessionId"], "existing-id");
+    assert_eq!(set_mode.1["modeId"], "bypassPermissions");
+
+    // 3) Recreate path: bypass follows the fallback `session/new`.
+    let recreate_id = AgentId::from("a-bypass-recreate");
+    seed_agent(&mgr, &WorkspaceId::from("ws-bypass-recreate"), &recreate_id).await;
+    mgr.services
+        .store
+        .set_acp_session_id(&recreate_id, "stale-id")
+        .await
+        .unwrap();
+    let (_agent_rc, recreate_log) = track_mock_agent_with_log(&mgr, &recreate_id, false);
+    let sid = mgr
+        .start_session(&recreate_id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect("recreate");
+    assert_eq!(sid, MGR_ACP_SID);
+    let recreate_calls = recreate_log.lock().unwrap().clone();
+    let set_mode = recreate_calls
+        .iter()
+        .find(|(m, _)| m == "session/set_mode")
+        .expect("session/set_mode called on recreate path");
+    assert_eq!(set_mode.1["sessionId"], MGR_ACP_SID);
+    assert_eq!(set_mode.1["modeId"], "bypassPermissions");
+}
+
+/// Every non-`AllowAll` policy leaves the provider alone: `Interactive` drives
+/// the FE round-trip, `AutoByRisk` / `DenyAll` apply local decisions, and none
+/// of them should ask the provider to disable its own prompts.
+#[tokio::test]
+async fn start_session_skips_bypass_under_non_allow_all_policies() {
+    for policy in [
+        PermissionPolicy::Interactive,
+        PermissionPolicy::AutoByRisk,
+        PermissionPolicy::DenyAll,
+    ] {
+        let (_tmp, mgr) = manager().await;
+        let mgr = mgr.with_policy(policy);
+        let (ws, id) = (
+            WorkspaceId::from("ws-1"),
+            AgentId::from(format!("a-no-bypass-{policy:?}").as_str()),
+        );
+        seed_agent(&mgr, &ws, &id).await;
+        let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+        mgr.start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+            .await
+            .expect("session");
+        let calls = log.lock().unwrap().clone();
+        assert!(
+            calls.iter().all(|(m, _)| m != "session/set_mode"),
+            "policy {policy:?} must not attempt bypassPermissions; got {calls:?}"
+        );
+    }
+}
+
+/// A provider that doesn't advertise `session/set_mode` is left alone under
+/// `AllowAll`: the local auto-approve carries the parity contract by itself.
+#[tokio::test]
+async fn start_session_skips_bypass_when_provider_lacks_set_mode() {
+    let (_tmp, mgr) = manager().await;
+    assert_eq!(mgr.policy(), PermissionPolicy::AllowAll);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-no-bypass-cap"));
+    seed_agent(&mgr, &ws, &id).await;
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    let provider = intent_providers::ProviderConfig {
+        supports_authenticate: false,
+        supports_set_mode: false,
+        ..*intent_providers::provider_config(intent_providers::default_provider_id())
+    };
+    mgr.start_session(&id, PathBuf::from("/tmp/ws"), &provider)
+        .await
+        .expect("session");
+    let calls = log.lock().unwrap().clone();
+    assert!(
+        calls.iter().all(|(m, _)| m != "session/set_mode"),
+        "no session/set_mode when provider lacks the capability; got {calls:?}"
+    );
 }
 
 #[tokio::test]
@@ -1273,10 +1449,13 @@ fn prompt(request_id: &str, session_id: &str) -> PermissionRequestData {
 }
 
 #[tokio::test]
-async fn default_policy_is_auto_by_risk_and_overridable() {
+async fn default_policy_is_allow_all_and_overridable() {
     let (_tmp, mgr) = manager().await;
-    // Headless default per §6.7/M3.5.
-    assert_eq!(mgr.policy(), PermissionPolicy::AutoByRisk);
+    // Shipped default (§6.7/M3.5): reference parity with the TS acp-provider —
+    // `start_session` best-effort sets `bypassPermissions` on providers that
+    // advertise set-mode, and `AllowAll` auto-approves anything the provider
+    // still surfaces.
+    assert_eq!(mgr.policy(), PermissionPolicy::AllowAll);
     // `with_policy` selects an FE-driven interactive deployment.
     let (_tmp2, mgr2, _bus) = manager_with_bus().await;
     let mgr2 = mgr2.with_policy(PermissionPolicy::Interactive);

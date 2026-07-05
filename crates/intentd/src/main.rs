@@ -242,11 +242,16 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming
     // router (M3.4); a global process cap + LRU registry bound concurrency.
-    // Headless deployments default to `AutoByRisk` (auto-allow reads, auto-deny
-    // destructive prompts). An FE-attached deployment sets
+    // The shipped default is `AllowAll` for reference parity with the TS
+    // acp-provider: the manager first tries `session/set_mode bypassPermissions`
+    // on providers that advertise it (auggie today) and then unconditionally
+    // auto-approves any `session/request_permission` the provider still sends.
+    // The previous `AutoByRisk` default silently denied medium/high prompts,
+    // which diverged from the reference. An FE-attached deployment sets
     // `INTENTD_PERMISSION_POLICY=interactive` to surface every prompt over
     // `agent.pendingPermissions` and resolve it via `agent.respondPermission`;
-    // `allow`/`deny` force a uniform headless decision (§6.7/M3.5).
+    // `auto` / `deny` remain selectable for headless-with-guardrails deployments
+    // (§6.7/M3.5).
     let permission_policy = resolve_permission_policy();
     tracing::info!(?permission_policy, "agent permission policy");
     let manager = Arc::new(
@@ -521,19 +526,24 @@ fn env_flag(name: &str) -> bool {
 
 /// Map the `INTENTD_PERMISSION_POLICY` value to a [`PermissionPolicy`]
 /// (`interactive`|`auto`|`allow`|`deny`, case-insensitive). Absent/blank or an
-/// unrecognized value falls back to the headless `AutoByRisk` default.
+/// unrecognized value falls back to `AllowAll` — reference parity with the TS
+/// acp-provider, which unconditionally auto-approves (`AutoByRisk`'s
+/// silent-deny of medium/high prompts diverged from that behavior).
+/// `interactive` remains available via this env var and is what an FE-attached
+/// deployment selects to drive the `agent.respondPermission` /
+/// `agent.pendingPermissions` round-trip.
 fn parse_permission_policy(raw: Option<&str>) -> PermissionPolicy {
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("interactive") => PermissionPolicy::Interactive,
         Some("auto") => PermissionPolicy::AutoByRisk,
         Some("allow") => PermissionPolicy::AllowAll,
         Some("deny") => PermissionPolicy::DenyAll,
-        _ => PermissionPolicy::AutoByRisk,
+        _ => PermissionPolicy::AllowAll,
     }
 }
 
 /// Resolve the permission policy from `INTENTD_PERMISSION_POLICY`, defaulting to
-/// the headless `AutoByRisk` when unset or unrecognized.
+/// `AllowAll` when unset or unrecognized (see [`parse_permission_policy`]).
 fn resolve_permission_policy() -> PermissionPolicy {
     parse_permission_policy(std::env::var("INTENTD_PERMISSION_POLICY").ok().as_deref())
 }
@@ -1575,17 +1585,17 @@ mod tests {
     }
 
     #[test]
-    fn permission_policy_defaults_to_auto_by_risk() {
-        // Absent, blank, and unrecognized values all fall back to the headless
-        // default rather than failing startup.
-        assert_eq!(parse_permission_policy(None), PermissionPolicy::AutoByRisk);
+    fn permission_policy_defaults_to_allow_all() {
+        // Absent, blank, and unrecognized values all fall back to the reference
+        // default (AllowAll) rather than failing startup or silently denying.
+        assert_eq!(parse_permission_policy(None), PermissionPolicy::AllowAll);
         assert_eq!(
             parse_permission_policy(Some("   ")),
-            PermissionPolicy::AutoByRisk
+            PermissionPolicy::AllowAll
         );
         assert_eq!(
             parse_permission_policy(Some("bogus")),
-            PermissionPolicy::AutoByRisk
+            PermissionPolicy::AllowAll
         );
     }
 }
