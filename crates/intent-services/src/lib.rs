@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use base64::Engine as _;
 use intent_core::events::{
     AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED,
-    COMMENT_ADDED, COMMENT_RESOLVED, GIT_COMMIT, GIT_PULL, NOTE_CREATED, NOTE_DELETED,
-    NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED,
-    TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
+    COMMENT_ADDED, COMMENT_RESOLVED, GIT_COMMIT, GIT_PULL, LINE_ATTRIBUTION_UPDATED, NOTE_CREATED,
+    NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT,
+    SETTINGS_CHANGED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
     WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
 };
@@ -25,14 +25,15 @@ use intent_core::{
     CommentAnchorType, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
     CommentLocation, CommentResolveThreadResult, CommentRespondResult, CommentRespondThread,
     CommentStatus, CommentThreadSummary, CommentType, CommentWire, ContentType, Draft, Event,
-    EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, Note,
-    NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
-    NoteEditLinesResult, NoteEditResult, NoteId, NoteRestoreVersionResult, NoteSetContentResult,
-    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor,
-    NoteVersionSummary, NoteVisibility, ProjectType, ReadAssetResult, SaveAssetResult,
-    ScriptCreateParams, SessionStats, SetupScript, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
+    EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity,
+    LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData, LineAttributionInfo,
+    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteRestoreVersionResult,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
+    NoteVersionAuthor, NoteVersionSummary, NoteVisibility, ProjectType, ReadAssetResult,
+    SaveAssetResult, ScriptCreateParams, SessionStats, SetupScript, TaskAssignAgentResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
+    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceEventSummary,
@@ -62,6 +63,7 @@ mod github_ops;
 mod github_browse_ops;
 
 mod history_xml;
+mod line_attribution;
 mod linear_ops;
 mod note_ops;
 mod pagination;
@@ -242,6 +244,15 @@ pub struct Services {
     /// reads through it; this set is empty there. Shared across clones so a
     /// `set_test_busy` on one handle is visible to every other handle.
     test_busy: Arc<Mutex<HashSet<AgentId>>>,
+    /// Per-note debouncers for `attribute_lines` recomputes (PROTOCOL §5.2.1,
+    /// FE parity with `LineAttributionService.scheduleComputation`). Every
+    /// content-changing `note.*` mutation schedules a delayed recompute
+    /// (`LINE_ATTRIBUTION_DEBOUNCE`); a fresh mutation cancels the previous
+    /// timer so bursts coalesce into one persist + one
+    /// `line-attribution:updated` emit. Shared across clones so every
+    /// service handle observes the same in-flight timers.
+    line_attribution_debouncers:
+        Arc<Mutex<HashMap<(WorkspaceId, NoteId), tokio::task::AbortHandle>>>,
 }
 
 impl Services {
@@ -274,6 +285,7 @@ impl Services {
             context_engine: Arc::new(intent_context::AuggieContextEngine::new()),
             live_turns: Arc::new(Mutex::new(HashMap::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
+            line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1077,6 +1089,131 @@ async fn capture_note_version(store: &Store, note: &Note) -> Result<i64> {
     store
         .append_note_version(note, &system_version_author(), &note.updated_at)
         .await
+}
+
+/// FE `LineAttributionService.DEBOUNCE_MS`. Coalesces bursts of note
+/// mutations into a single recompute + `line-attribution:updated` emit.
+const LINE_ATTRIBUTION_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Convert an RFC-3339 timestamp to milliseconds since the Unix epoch, matching
+/// the FE `new Date(version.createdAt).getTime()` used for the gutter age.
+fn iso_to_epoch_ms(iso: &str) -> i64 {
+    parse_iso(iso)
+        .and_then(|dt| i64::try_from(dt.unix_timestamp_nanos() / 1_000_000).ok())
+        .unwrap_or(0)
+}
+
+/// Build a `line-attribution:updated` change event with the FE-parity payload
+/// `{ workspaceId, noteId, attributions }` (`line-attribution.service.ts`
+/// `mainDispatch(lineAttributionUpdated(...))`).
+fn line_attribution_updated_event(data: &LineAttributionData) -> NewEvent {
+    NewEvent {
+        workspace_id: data.workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: LINE_ATTRIBUTION_UPDATED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": data.workspace_id.as_str(),
+            "noteId": data.note_id.as_str(),
+            "attributions": data.attributions,
+        }),
+    }
+}
+
+impl Services {
+    /// Run `attribute_lines` over the note's current content + full version
+    /// history, persist the result, and emit `line-attribution:updated`.
+    /// The write is idempotent (upsert), so a race between two computes leaves
+    /// the store consistent with the *latest* one to complete.
+    async fn compute_and_persist_line_attribution(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+    ) -> Result<LineAttributionData> {
+        let note = fetch_note(&self.store, workspace_id, note_id).await?;
+        let summaries = self.store.list_note_versions(note_id).await?;
+        let mut versions: Vec<NoteVersion> = Vec::with_capacity(summaries.len());
+        for summary in &summaries {
+            versions.push(self.store.get_note_version(note_id, summary.v).await?);
+        }
+        let attributions = line_attribution::attribute_lines(&note.content, &versions);
+        let mut map: std::collections::BTreeMap<String, LineAttributionInfo> =
+            std::collections::BTreeMap::new();
+        for attr in &attributions {
+            let Some(version) = &attr.version else {
+                continue;
+            };
+            let timestamp = iso_to_epoch_ms(&version.date);
+            let author = Some(LineAttributionAuthor {
+                id: version.author.id.clone(),
+                name: version.author.name.clone(),
+                author_type: version.author.author_type.clone(),
+                // The daemon does not yet carry per-turn context on note
+                // versions (§5.2 version-history extensions still stamps every
+                // version with the system author); wired through on future
+                // author-aware mutations.
+                turn_number: None,
+            });
+            map.insert(
+                attr.line_number.to_string(),
+                LineAttributionInfo { timestamp, author },
+            );
+        }
+        let data = LineAttributionData {
+            note_id: note.id.clone(),
+            workspace_id: note.workspace_id.clone(),
+            computed_at: now_iso(),
+            attributions: map,
+        };
+        self.store.upsert_note_line_attribution(&data).await?;
+        publish_event(&self.event_bus, line_attribution_updated_event(&data)).await;
+        Ok(data)
+    }
+
+    /// Schedule a debounced recompute of `note_id` attributions (FE
+    /// `LineAttributionService.scheduleComputation`). A subsequent call for
+    /// the same key cancels the prior timer, so a burst of mutations settles
+    /// into a single recompute + emit after [`LINE_ATTRIBUTION_DEBOUNCE`].
+    pub(crate) fn schedule_line_attribution_recompute(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) {
+        let key = (workspace_id.clone(), note_id.clone());
+        let services = self.clone();
+        let key_for_task = key.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(LINE_ATTRIBUTION_DEBOUNCE).await;
+            let (ws, nid) = key_for_task;
+            if let Err(err) = services
+                .compute_and_persist_line_attribution(&ws, &nid)
+                .await
+            {
+                tracing::warn!(
+                    workspace = %ws.as_str(),
+                    note = %nid.as_str(),
+                    error = %err,
+                    "line-attribution recompute failed",
+                );
+            }
+            if let Ok(mut map) = services.line_attribution_debouncers.lock() {
+                let existing = map.get(&(ws.clone(), nid.clone()));
+                if existing.map(|h| h.is_finished()).unwrap_or(false) {
+                    map.remove(&(ws, nid));
+                }
+            }
+        });
+        let abort = handle.abort_handle();
+        if let Ok(mut map) = self.line_attribution_debouncers.lock() {
+            if let Some(prev) = map.insert(key, abort) {
+                prev.abort();
+            }
+        }
+    }
 }
 
 /// Seed the well-known `spec` note on `workspace.create` (reference parity with
@@ -4154,6 +4291,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Note>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let services = self.clone();
         Box::pin(async move {
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
@@ -4184,6 +4322,10 @@ impl WorkspaceApi for Services {
                     };
                     store.insert_note(&note).await?;
                     capture_note_version(&store, &note).await?;
+                    services.schedule_line_attribution_recompute(
+                        note.workspace_id.clone(),
+                        note.id.clone(),
+                    );
                     publish_event(
                         &bus,
                         note_change_event(
@@ -4210,6 +4352,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Note>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let services = self.clone();
         Box::pin(async move {
             let expected_version = input.expected_version;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
@@ -4229,6 +4372,10 @@ impl WorkspaceApi for Services {
             store.update_note_versioned(&note, expected_version).await?;
             if content_changed {
                 capture_note_version(&store, &note).await?;
+                services.schedule_line_attribution_recompute(
+                    note.workspace_id.clone(),
+                    note.id.clone(),
+                );
             }
             publish_event(
                 &bus,
@@ -4253,6 +4400,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<NoteAddResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let services = self.clone();
         Box::pin(async move {
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let old_content = note.content.clone();
@@ -4266,6 +4414,8 @@ impl WorkspaceApi for Services {
             note.updated_at = now_iso();
             store.update_note(&note).await?;
             capture_note_version(&store, &note).await?;
+            services
+                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             publish_event(
                 &bus,
                 note_change_event(
@@ -4299,6 +4449,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<NoteEditResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let services = self.clone();
         Box::pin(async move {
             if input.old.is_empty() {
                 return Err(Error::Internal(
@@ -4313,6 +4464,8 @@ impl WorkspaceApi for Services {
             note.updated_at = now_iso();
             store.update_note(&note).await?;
             capture_note_version(&store, &note).await?;
+            services
+                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             publish_event(
                 &bus,
                 note_change_event(
@@ -4350,6 +4503,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<NoteEditLinesResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let services = self.clone();
         Box::pin(async move {
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let old_content = note.content.clone();
@@ -4361,6 +4515,8 @@ impl WorkspaceApi for Services {
             note.updated_at = now_iso();
             store.update_note(&note).await?;
             capture_note_version(&store, &note).await?;
+            services
+                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             publish_event(
                 &bus,
                 note_change_event(
@@ -4397,6 +4553,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let services = self.clone();
         Box::pin(async move {
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let old_content = note.content.clone();
@@ -4420,6 +4577,8 @@ impl WorkspaceApi for Services {
             note.updated_at = now.clone();
             store.update_note_versioned(&note, expected_version).await?;
             capture_note_version(&store, &note).await?;
+            services
+                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             publish_event(
                 &bus,
                 note_change_event(
@@ -4657,6 +4816,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<NoteRestoreVersionResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let services = self.clone();
         Box::pin(async move {
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             let version = store.get_note_version(&note_id, v).await?;
@@ -4665,6 +4825,8 @@ impl WorkspaceApi for Services {
             note.updated_at = now_iso();
             store.update_note(&note).await?;
             let new_v = capture_note_version(&store, &note).await?;
+            services
+                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             publish_event(
                 &bus,
                 note_change_event(
@@ -4678,6 +4840,7 @@ impl WorkspaceApi for Services {
             .await;
             // Re-read so the returned note carries the post-update `rev`.
             let note = fetch_note(&store, &workspace_id, &note_id).await?;
+
             Ok(NoteRestoreVersionResult {
                 ok: true,
                 note_id: note.id.clone(),
@@ -4685,6 +4848,35 @@ impl WorkspaceApi for Services {
                 v: new_v,
                 note,
             })
+        })
+    }
+
+    fn line_attribution_load(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<Option<LineAttributionData>>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Scope check: 404 if the note is missing or in another workspace.
+            fetch_note(&store, &workspace_id, &note_id).await?;
+            store
+                .get_note_line_attribution(&workspace_id, &note_id)
+                .await
+        })
+    }
+
+    fn line_attribution_compute_now(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<LineAttributionComputeResult>> {
+        let services = self.clone();
+        Box::pin(async move {
+            services
+                .compute_and_persist_line_attribution(&workspace_id, &note_id)
+                .await?;
+            Ok(LineAttributionComputeResult { ok: true })
         })
     }
 

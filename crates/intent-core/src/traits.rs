@@ -13,14 +13,15 @@ use crate::model::{
     CommentListResult, CommentResolveThreadResult, CommentRespondResult, Draft, EventQueryParams,
     EventSubscribeResult, EventUnsubscribeResult, FileActivity, GitAgentCommitResult,
     GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts, GitPullResult, GitStatus,
-    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
-    NoteVersionSummary, ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
-    SetupScript, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
-    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    LineAttributionComputeResult, LineAttributionData, Note, NoteAddInput, NoteAddResult,
+    NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
+    NoteEditResult, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, ReadAssetResult,
+    SaveAssetResult, ScriptCreateParams, SetupScript, TaskAssignAgentResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
+    TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
+    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -453,6 +454,39 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::restore_note_version not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.lineAttribution.load`: return the most recently persisted
+    /// per-line attribution snapshot for `note_id`, or `None` when the
+    /// daemon has not yet computed one (PROTOCOL §5.2.1). Payload shape is
+    /// FE-parity with what the `line-attribution:load` IPC handler served.
+    fn line_attribution_load(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<Option<LineAttributionData>>> {
+        let _ = (workspace_id, note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::line_attribution_load not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.lineAttribution.computeNow`: force an immediate recompute of
+    /// `note_id`’s attributions (PROTOCOL §5.2.1). Persists the fresh
+    /// snapshot and emits `line-attribution:updated` before returning.
+    fn line_attribution_compute_now(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<LineAttributionComputeResult>> {
+        let _ = (workspace_id, note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::line_attribution_compute_now not implemented".to_string(),
             ))
         })
     }

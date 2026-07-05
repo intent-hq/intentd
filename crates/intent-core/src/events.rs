@@ -106,6 +106,13 @@ pub const NOTE_CREATED: &str = "note:created";
 pub const NOTE_UPDATED: &str = "note:updated";
 pub const NOTE_DELETED: &str = "note:deleted";
 
+// Line-attribution events (new in intentd; PROTOCOL §5.2.1). Emitted after the
+// daemon recomputes per-line attributions for a note (post-mutation,
+// debounced). The self-sufficient payload `{ workspaceId, noteId,
+// attributions: { <lineNumber>: { timestamp, author? } } }` lets the FE
+// gutter re-render without a follow-up `note.lineAttribution.load`.
+pub const LINE_ATTRIBUTION_UPDATED: &str = "line-attribution:updated";
+
 // Task events.
 pub const TASK_STATUS_CHANGED: &str = "task:status-changed";
 pub const TASK_READY_TASKS_CHANGED: &str = "task:ready-tasks-changed";
@@ -289,6 +296,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     NOTE_CREATED,
     NOTE_UPDATED,
     NOTE_DELETED,
+    LINE_ATTRIBUTION_UPDATED,
     TASK_STATUS_CHANGED,
     TASK_READY_TASKS_CHANGED,
     TERMINAL_COMMAND,

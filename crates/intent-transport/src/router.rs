@@ -429,6 +429,26 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        "note.lineAttribution.load" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let data = api
+                .line_attribution_load(ws, note_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            // Bare LineAttributionData | null so the FE gutter’s
+            // `line-attribution:load` decoder round-trips as-is.
+            to_result_value(&data)
+        }
+        "note.lineAttribution.computeNow" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let result = api
+                .line_attribution_compute_now(ws, note_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
         "task.updateStatus" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;

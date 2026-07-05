@@ -846,6 +846,58 @@ pub struct NoteRestoreVersionResult {
 }
 
 // ---------------------------------------------------------------------------
+// Line-attribution wire types (new in intentd; PROTOCOL §5.2.1). Ported from
+// the FE `LineAttributionData` / `LineAttributionInfo` / `LineAuthor` shapes
+// so the `line-attribution:load` + `line-attribution:updated` payloads stay
+// drop-in-compatible with what `LineAttributionGutter.svelte` consumes.
+// ---------------------------------------------------------------------------
+
+/// Author info stamped on an attributed line (FE `LineAuthor`).
+/// `author_type` is one of `user` / `agent` / `system`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineAttributionAuthor {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub author_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_number: Option<i64>,
+}
+
+/// Attribution info for a single line (FE `LineAttributionInfo`).
+/// `timestamp` is milliseconds since Unix epoch (JS `Date.now()`-compatible)
+/// so the FE gutter’s age math works unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineAttributionInfo {
+    pub timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<LineAttributionAuthor>,
+}
+
+/// Serialized attribution payload for a note (FE `LineAttributionData`).
+/// Keys of `attributions` are stringified 1-based line numbers so the JSON
+/// shape matches the FE `Record<number, AttributionInfo>` decoder.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineAttributionData {
+    pub note_id: NoteId,
+    pub workspace_id: WorkspaceId,
+    pub computed_at: String,
+    pub attributions: std::collections::BTreeMap<String, LineAttributionInfo>,
+}
+
+/// Result of `note.lineAttribution.computeNow`. Mirrors the FE IPC handler’s
+/// inner `{ success: true }` — `success` is IPC-transport-level and dropped
+/// on the wire; the RPC result carries only `ok`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineAttributionComputeResult {
+    pub ok: bool,
+}
+
+// ---------------------------------------------------------------------------
 // task.* result DTOs (PROTOCOL §5.4). Field names/optionality match the TS
 // `ws.task.*` peer returns so the iOS client is unchanged.
 // ---------------------------------------------------------------------------
