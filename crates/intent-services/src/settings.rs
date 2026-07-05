@@ -3,11 +3,13 @@
 //! Owns the [`SettingDefinition`] schema (groups A + B of §9.8), type/enum/
 //! min/max validation, and the redaction rule for **sensitive** settings.
 //! Non-secret values persist in the `settings` table (`intent-store`); sensitive
-//! values (`workspace.sshKeyPath`, `mcp.servers`, `server.auth.token`,
-//! `sourceControl.github.token`, `linear.token`, `accounts.sentry.token`,
-//! `ai.apiToken`) live in the OS keychain via the [`SecretStore`] seam and are
-//! **never** returned in plaintext over the wire — list/get redact them to
-//! presence/placeholder only, and `server.auth.token` is read-only.
+//! values (`mcp.servers`, `server.auth.token`, `sourceControl.github.token`,
+//! `linear.token`, `accounts.sentry.token`, `ai.apiToken`) live in the OS
+//! keychain via the [`SecretStore`] seam and are **never** returned in
+//! plaintext over the wire — list/get redact them to presence/placeholder
+//! only, and `server.auth.token` is read-only. `workspace.sshKeyPath` is a
+//! plain non-secret **path** setting (the real secret is the key file on
+//! disk); the FE `git`-env consumer must read the value back verbatim.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -442,11 +444,12 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "workspace",
             None,
         ),
-        secret(
+        string(
             "workspace.sshKeyPath",
             "SSH key path",
             "Path to the SSH key used for git",
             "workspace",
+            None,
         ),
         string(
             "workspace.defaultShell",
@@ -977,6 +980,25 @@ mod tests {
             assert!(matches!(def.ty, SettingType::String));
             assert!(def.default_value.is_none(), "{path} default is null");
         }
+    }
+
+    /// `workspace.sshKeyPath` is a **plain non-secret** path setting: the value
+    /// is a filesystem path pointing at the key, not key material — the real
+    /// secret is the key file on disk. Marking the catalog entry as sensitive
+    /// makes `settings.get` return the redaction placeholder, which
+    /// permanently breaks the FE `git`-env consumer (`app-settings.service.ts`
+    /// `getSshKeyPath` must read the real path back to hand it to `git`).
+    #[test]
+    fn ssh_key_path_is_a_plain_non_secret_string() {
+        let def = find_definition("workspace.sshKeyPath").expect("workspace.sshKeyPath missing");
+        assert!(
+            !def.sensitive,
+            "workspace.sshKeyPath is a path setting, not key material"
+        );
+        assert!(!def.read_only);
+        assert_eq!(def.category, "workspace");
+        assert!(matches!(def.ty, SettingType::String));
+        assert!(def.default_value.is_none());
     }
 
     /// The non-secret companion of `accounts.sentry.token` lives beside it in

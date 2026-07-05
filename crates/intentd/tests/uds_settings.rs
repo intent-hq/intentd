@@ -354,6 +354,52 @@ async fn settings_round_trip_redaction_validation_and_event() {
         json!({ "path": "linear.token", "value": null })
     );
 
+    // `workspace.sshKeyPath` is a **plain non-secret** path setting: the value
+    // is the filesystem path to the key (not key material), so `settings.list`
+    // must expose `sensitive: false` and `settings.update`/`get` must round-trip
+    // the string verbatim — the FE `git`-env consumer needs to read it back to
+    // hand it to `git`.
+    let ssh_path = "/tmp/id_ed25519_for_agents";
+    let list = rpc(&mut w, &mut r, 14, "settings.list", json!({})).await;
+    let ssh_entry = entry(&list, "workspace.sshKeyPath");
+    // `sensitive` is only emitted for sensitive definitions, so a path setting
+    // omits the field entirely (see `SettingDefinition::definition_json`).
+    assert!(
+        ssh_entry.get("sensitive").is_none(),
+        "workspace.sshKeyPath is a path, not a secret"
+    );
+    assert_eq!(ssh_entry["type"], "string");
+    assert_eq!(ssh_entry["value"], Value::Null, "unset path reads as null");
+    let applied = rpc(
+        &mut w,
+        &mut r,
+        15,
+        "settings.update",
+        json!({ "changes": [{ "path": "workspace.sshKeyPath", "value": ssh_path }] }),
+    )
+    .await;
+    assert_eq!(
+        applied["applied"][0],
+        json!({ "path": "workspace.sshKeyPath", "value": ssh_path }),
+        "path setting round-trips in plaintext"
+    );
+    let _ = read_json(&mut sr).await; // drain the settings:changed event.
+    let got = rpc(
+        &mut w,
+        &mut r,
+        16,
+        "settings.get",
+        json!({ "path": "workspace.sshKeyPath" }),
+    )
+    .await;
+    assert_eq!(got["value"], json!(ssh_path), "get returns plaintext path");
+    let list = rpc(&mut w, &mut r, 17, "settings.list", json!({})).await;
+    assert_eq!(
+        entry(&list, "workspace.sshKeyPath")["value"],
+        json!(ssh_path),
+        "list returns plaintext path"
+    );
+
     let _ = shutdown_tx.send(());
     let _ = server.await;
 }
