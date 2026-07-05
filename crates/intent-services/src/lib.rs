@@ -588,6 +588,61 @@ impl Services {
     }
 
     /// Configure the note-asset root directory (for `note.readAsset`).
+    /// Resolve `noteIds` (PROTOCOL §5.5) to ACP `image` content-block
+    /// payloads. Port of the FE extraction in
+    /// `agent-backend-handler.service.ts`: for each note, scan the raw
+    /// markdown for `![alt](url)` images whose URL is a
+    /// `workspace-asset://<workspaceId>/<assetId>` reference in the
+    /// requesting workspace, load the asset bytes from disk, and return a
+    /// list of `{ data: base64, mimeType }` tuples in document order.
+    /// Missing notes, missing assets, and non-workspace-asset URLs are
+    /// silently skipped so a partial `noteIds` array never breaks the
+    /// turn. External HTTP(S) image URLs are NOT fetched here — that path
+    /// is deferred (the FE variant would fetch via `fetch()`).
+    pub(crate) async fn load_note_image_blocks(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_ids: &[String],
+    ) -> Vec<(String, String)> {
+        let Some(root) = self.assets_root.clone() else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, String)> = Vec::new();
+        for note_id in note_ids {
+            let note = match self.store.get_note(&NoteId::from(note_id.as_str())).await {
+                Ok(n) if &n.workspace_id == workspace_id => n,
+                _ => continue,
+            };
+            for url in extract_markdown_image_urls(&note.content) {
+                if !url.starts_with("workspace-asset://") {
+                    continue;
+                }
+                let rest = &url["workspace-asset://".len()..];
+                let Some((ws_from_url, asset_id)) = rest.split_once('/') else {
+                    continue;
+                };
+                if ws_from_url != workspace_id.0 || asset_id.is_empty() {
+                    continue;
+                }
+                let asset_path = root.join(&workspace_id.0).join(asset_id);
+                let bytes = match tokio::fs::read(&asset_path).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            note = %note_id, asset = %asset_id, error = %e,
+                            "failed to read note-referenced asset"
+                        );
+                        continue;
+                    }
+                };
+                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let mime = crate::note_ops::mime_from_extension(asset_id);
+                out.push((data, mime));
+            }
+        }
+        out
+    }
+
     pub fn with_assets_root(mut self, root: PathBuf) -> Self {
         self.assets_root = Some(root);
         self
@@ -6477,6 +6532,7 @@ impl WorkspaceApi for Services {
         note_ids: Option<serde_json::Value>,
         stdin_context: Option<String>,
         context_references: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             // When the runtime manager is attached, drive a real spawn/turn loop;
@@ -6489,6 +6545,7 @@ impl WorkspaceApi for Services {
                 context_references,
                 image_blocks,
                 file_blocks,
+                message_metadata: message_metadata.clone(),
             };
             match self.agent_manager() {
                 Some(manager) => {
@@ -6509,6 +6566,14 @@ impl WorkspaceApi for Services {
                     }
                 }
                 None => {
+                    // Read-only fallback (no `agent_manager` wired): the
+                    // router has already extracted `messageMetadata`, but
+                    // the store-only op keeps its unchanged 3-arg signature
+                    // since none of its internal callers carry metadata;
+                    // the payload is dropped on this fallback path
+                    // (metadata IS preserved on the production
+                    // `AgentManager::send_message` path above).
+                    let _ = message_metadata;
                     self.agent_send_message_op(agent_id, content, message_id)
                         .await
                 }
@@ -6527,6 +6592,7 @@ impl WorkspaceApi for Services {
         note_ids: Option<serde_json::Value>,
         stdin_context: Option<String>,
         context_references: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             let options = crate::agent_manager::TurnOptions {
@@ -6535,6 +6601,7 @@ impl WorkspaceApi for Services {
                 context_references,
                 image_blocks,
                 file_blocks,
+                message_metadata: message_metadata.clone(),
             };
             match self.agent_manager() {
                 Some(manager) => {
@@ -6543,6 +6610,10 @@ impl WorkspaceApi for Services {
                         .await
                 }
                 None => {
+                    // See `agent_send_message` above: metadata is dropped
+                    // on the read-only fallback and preserved on the
+                    // production `AgentManager::force_message` path.
+                    let _ = message_metadata;
                     self.agent_force_message_op(agent_id, message_id, content)
                         .await
                 }
@@ -10259,4 +10330,45 @@ pub mod setup_scripts {
             assert_eq!(s.script, "echo hi");
         }
     }
+}
+
+/// Iterate `![alt](url)` matches in `content` (markdown image syntax) and
+/// return the URL portion of each match in document order. Malformed
+/// syntax is skipped rather than raised so a note with mixed markdown
+/// cannot break note-image resolution.
+fn extract_markdown_image_urls(content: &str) -> Vec<String> {
+    // Hand-rolled scan (avoids pulling in the `regex` crate here): match
+    // literal `![`, read the alt text up to the closing `]`, require an
+    // immediate `(`, then capture up to the matching `)`.
+    let bytes = content.as_bytes();
+    let mut urls: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] == b'!' && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b']' {
+                j += 1;
+            }
+            if j >= bytes.len() || j + 1 >= bytes.len() || bytes[j + 1] != b'(' {
+                i += 1;
+                continue;
+            }
+            let mut k = j + 2;
+            while k < bytes.len() && bytes[k] != b')' {
+                k += 1;
+            }
+            if k >= bytes.len() {
+                break;
+            }
+            if let Ok(url) = std::str::from_utf8(&bytes[j + 2..k]) {
+                if !url.is_empty() {
+                    urls.push(url.to_string());
+                }
+            }
+            i = k + 1;
+        } else {
+            i += 1;
+        }
+    }
+    urls
 }

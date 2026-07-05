@@ -1369,6 +1369,13 @@ pub struct AgentMessage {
     pub role: String,
     #[serde(rename = "contentBlocks")]
     pub content: serde_json::Value,
+    /// Opaque per-message payload the FE attaches to `agent.sendMessage` /
+    /// `agent.forceMessage` as `messageMetadata` (PROTOCOL §5.5): e.g.
+    /// `{ source: "system" }` for daemon-initiated turns. Persisted verbatim
+    /// on the user message row and round-tripped on transcript reads; `None`
+    /// for messages without caller-supplied metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
     #[serde(rename = "timestamp")]
     pub created_at: String,
 }
@@ -2553,6 +2560,7 @@ mod tests {
                 seq: 0,
                 role: "user".to_string(),
                 content: json!([{ "type": "text", "text": "hi" }]),
+                metadata: None,
                 created_at: "t0".to_string(),
             }],
             stats: None,
@@ -2609,6 +2617,7 @@ mod tests {
             seq: 0,
             role: "user".to_string(),
             content: json!([{ "type": "text", "text": "hi" }]),
+            metadata: None,
             created_at: "t0".to_string(),
         };
         let value = serde_json::to_value(&message).unwrap();

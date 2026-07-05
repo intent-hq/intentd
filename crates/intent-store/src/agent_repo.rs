@@ -327,7 +327,7 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
     })
 }
 
-const MESSAGE_COLUMNS: &str = "id, agent_id, seq, role, content, created_at";
+const MESSAGE_COLUMNS: &str = "id, agent_id, seq, role, content, metadata, created_at";
 
 impl Store {
     /// Append a message to an agent's insert-only log, minting a UUIDv7 id and
@@ -340,7 +340,25 @@ impl Store {
         created_at: &str,
     ) -> Result<AgentMessage> {
         let id = Uuid::now_v7().to_string();
-        self.append_agent_message_with_id(agent_id, &id, role, content, created_at)
+        self.append_agent_message_with_id(agent_id, &id, role, content, None, created_at)
+            .await
+    }
+
+    /// Append a message with a caller-supplied `metadata` payload (`agent.sendMessage`
+    /// / `agent.forceMessage`'s `messageMetadata`, PROTOCOL §5.5). The metadata is
+    /// stored verbatim as JSON on the row and round-trips on transcript reads;
+    /// callers with no per-message metadata continue to use
+    /// [`Store::append_agent_message`] which stores `NULL`.
+    pub async fn append_agent_message_with_metadata(
+        &self,
+        agent_id: &AgentId,
+        role: &str,
+        content: &serde_json::Value,
+        metadata: Option<&serde_json::Value>,
+        created_at: &str,
+    ) -> Result<AgentMessage> {
+        let id = Uuid::now_v7().to_string();
+        self.append_agent_message_with_id(agent_id, &id, role, content, metadata, created_at)
             .await
     }
 
@@ -354,6 +372,7 @@ impl Store {
         id: &str,
         role: &str,
         content: &serde_json::Value,
+        metadata: Option<&serde_json::Value>,
         created_at: &str,
     ) -> Result<AgentMessage> {
         let seq: i64 = sqlx::query(
@@ -366,13 +385,21 @@ impl Store {
         .get::<i64, _>("next");
         let content_json = serde_json::to_string(content)
             .map_err(|e| Error::Internal(format!("encode message content failed: {e}")))?;
-        let sql = format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?)");
+        let metadata_json = match metadata {
+            Some(m) => Some(
+                serde_json::to_string(m)
+                    .map_err(|e| Error::Internal(format!("encode message metadata failed: {e}")))?,
+            ),
+            None => None,
+        };
+        let sql = format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
         sqlx::query(&sql)
             .bind(id)
             .bind(&agent_id.0)
             .bind(seq)
             .bind(role)
             .bind(&content_json)
+            .bind(metadata_json.as_deref())
             .bind(created_at)
             .execute(self.pool())
             .await
@@ -383,6 +410,7 @@ impl Store {
             seq,
             role: role.to_string(),
             content: content.clone(),
+            metadata: metadata.cloned(),
             created_at: created_at.to_string(),
         })
     }
@@ -431,12 +459,20 @@ impl Store {
 fn map_message_row(row: &SqliteRow) -> Result<AgentMessage> {
     let content: serde_json::Value = serde_json::from_str(&col::<String>(row, "content")?)
         .map_err(|e| Error::Internal(format!("decode message content failed: {e}")))?;
+    let metadata: Option<serde_json::Value> = match col::<Option<String>>(row, "metadata")? {
+        Some(raw) => Some(
+            serde_json::from_str(&raw)
+                .map_err(|e| Error::Internal(format!("decode message metadata failed: {e}")))?,
+        ),
+        None => None,
+    };
     Ok(AgentMessage {
         id: col(row, "id")?,
         agent_id: AgentId(col(row, "agent_id")?),
         seq: col(row, "seq")?,
         role: col(row, "role")?,
         content,
+        metadata,
         created_at: col(row, "created_at")?,
     })
 }

@@ -367,7 +367,7 @@ async fn seed_conversation(data_dir: &Path) -> (String, String, Vec<Value>) {
     for (seq, (role, blocks)) in turns.iter().enumerate() {
         let ts = now_iso();
         store
-            .append_agent_message_with_id(&agent_id, &m[seq], role, blocks, &ts)
+            .append_agent_message_with_id(&agent_id, &m[seq], role, blocks, None, &ts)
             .await
             .expect("append message");
         expected.push(json!({

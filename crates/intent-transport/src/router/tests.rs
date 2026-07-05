@@ -3653,6 +3653,7 @@ mod send_message_payload_forwarding {
         note_ids: Option<Value>,
         stdin_context: Option<String>,
         context_references: Option<Value>,
+        message_metadata: Option<Value>,
     }
 
     #[derive(Default)]
@@ -3675,6 +3676,7 @@ mod send_message_payload_forwarding {
             note_ids: Option<Value>,
             stdin_context: Option<String>,
             context_references: Option<Value>,
+            message_metadata: Option<Value>,
         ) -> BoxFuture<'_, Result<Value>> {
             let slot = self.send.clone();
             Box::pin(async move {
@@ -3689,6 +3691,7 @@ mod send_message_payload_forwarding {
                     note_ids,
                     stdin_context,
                     context_references,
+                    message_metadata,
                 };
                 Ok(json!({ "success": true, "queued": false, "messageId": "m-1" }))
             })
@@ -3706,6 +3709,7 @@ mod send_message_payload_forwarding {
             note_ids: Option<Value>,
             stdin_context: Option<String>,
             context_references: Option<Value>,
+            message_metadata: Option<Value>,
         ) -> BoxFuture<'_, Result<Value>> {
             let slot = self.force.clone();
             Box::pin(async move {
@@ -3720,6 +3724,7 @@ mod send_message_payload_forwarding {
                     note_ids,
                     stdin_context,
                     context_references,
+                    message_metadata,
                 };
                 Ok(json!({ "success": true, "queued": false, "messageId": "m-2" }))
             })
@@ -3829,6 +3834,69 @@ mod send_message_payload_forwarding {
             Some(json!([{"data": "Zm9v", "mimeType": "text/plain", "fileName": "notes.txt"}])),
             "fileBlocks must be forwarded verbatim"
         );
+    }
+
+    /// `messageMetadata` (PROTOCOL §5.5) is the opaque per-message payload
+    /// the FE attaches to distinguish daemon-initiated turns; both
+    /// `agent.sendMessage` and `agent.forceMessage` must forward it
+    /// verbatim to [`WorkspaceApi`] so the store can persist it on the
+    /// user row (Fidelity B).
+    #[tokio::test]
+    async fn send_and_force_message_forward_message_metadata_verbatim() {
+        let api = RecordingApi::default();
+        let send = r#"{
+            "jsonrpc":"2.0","id":10,"method":"agent.sendMessage",
+            "params":{
+                "workspaceId":"ws-1","agentId":"agent-1","content":"hi",
+                "messageMetadata":{"source":"system","tag":"restart"}
+            }
+        }"#;
+        handle_message(&api, send).await.expect("send response");
+        let cap = api.send.lock().unwrap().clone();
+        assert_eq!(
+            cap.message_metadata,
+            Some(json!({"source": "system", "tag": "restart"})),
+            "sendMessage must forward messageMetadata verbatim"
+        );
+
+        let force = r#"{
+            "jsonrpc":"2.0","id":11,"method":"agent.forceMessage",
+            "params":{
+                "workspaceId":"ws-1","agentId":"agent-1",
+                "messageId":"m-force","content":"stop",
+                "messageMetadata":{"kind":"queue-drain"}
+            }
+        }"#;
+        handle_message(&api, force).await.expect("force response");
+        let cap = api.force.lock().unwrap().clone();
+        assert_eq!(
+            cap.message_metadata,
+            Some(json!({"kind": "queue-drain"})),
+            "forceMessage must forward messageMetadata verbatim"
+        );
+    }
+
+    /// Omitted `messageMetadata` collapses to `None` on both arms (same
+    /// contract as the other opaque payloads).
+    #[tokio::test]
+    async fn omitted_message_metadata_is_none() {
+        let api = RecordingApi::default();
+        let send = r#"{
+            "jsonrpc":"2.0","id":12,"method":"agent.sendMessage",
+            "params":{"workspaceId":"ws-1","agentId":"agent-1","content":"hi"}
+        }"#;
+        handle_message(&api, send).await.expect("send response");
+        assert!(api.send.lock().unwrap().message_metadata.is_none());
+
+        let force = r#"{
+            "jsonrpc":"2.0","id":13,"method":"agent.forceMessage",
+            "params":{
+                "workspaceId":"ws-1","agentId":"agent-1",
+                "messageId":"m-x","content":"stop"
+            }
+        }"#;
+        handle_message(&api, force).await.expect("force response");
+        assert!(api.force.lock().unwrap().message_metadata.is_none());
     }
 
     #[tokio::test]

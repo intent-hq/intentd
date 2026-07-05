@@ -458,6 +458,7 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
             &user_id,
             "user",
             &json!([{ "type": "text", "id": format!("{user_id}:0"), "text": "Run the tests" }]),
+            None,
             &now_iso(),
         )
         .await
@@ -560,6 +561,7 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
                   "output": "12 passed", "is_error": false },
                 { "type": "text", "id": format!("{mid}:3"), "text": "Done." },
             ]),
+            None,
             &now_iso(),
         )
         .await
@@ -670,6 +672,7 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
             &user_id,
             "user",
             &json!([{ "type": "text", "id": format!("{user_id}:0"), "text": "Run the tests" }]),
+            None,
             &now_iso(),
         )
         .await
@@ -789,6 +792,7 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
                   "output": "12 passed", "is_error": false },
                 { "type": "text", "id": format!("{mid}:3"), "text": "Done." },
             ]),
+            None,
             &now_iso(),
         )
         .await
@@ -883,6 +887,7 @@ async fn chat_snapshot_does_not_merge_live_turn_when_agent_is_not_busy() {
             &user_id,
             "user",
             &json!([{ "type": "text", "id": format!("{user_id}:0"), "text": "Run the tests" }]),
+            None,
             &now_iso(),
         )
         .await
@@ -1185,6 +1190,7 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
             &user_id,
             "user",
             &json!([{ "type": "text", "id": format!("{user_id}:0"), "text": "Run the tests" }]),
+            None,
             &now_iso(),
         )
         .await
@@ -1293,6 +1299,7 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
                 { "type": "tool_result", "id": format!("{mid}:3"), "tool_use_id": "call_abc",
                   "output": "12 passed", "is_error": false },
             ]),
+            None,
             &now_iso(),
         )
         .await

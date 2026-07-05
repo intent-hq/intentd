@@ -723,7 +723,7 @@ async fn build_turn_prompt_prepends_history_once_after_recreate() {
     mgr.recreated.lock().unwrap().insert(id.clone());
 
     let prompt = mgr
-        .build_turn_prompt(&id, "current message", &super::TurnOptions::default())
+        .build_turn_prompt(&id, &ws, "current message", &super::TurnOptions::default())
         .await;
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
@@ -743,7 +743,7 @@ async fn build_turn_prompt_prepends_history_once_after_recreate() {
 
     // The flag is consumed: a follow-up turn sends only the message text.
     let plain = mgr
-        .build_turn_prompt(&id, "next message", &super::TurnOptions::default())
+        .build_turn_prompt(&id, &ws, "next message", &super::TurnOptions::default())
         .await;
     let plain_text = serde_json::to_value(&plain).unwrap()[0]["text"]
         .as_str()
@@ -770,7 +770,7 @@ async fn build_turn_prompt_appends_image_blocks_after_text() {
         ])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, "hi", &options).await;
+    let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
     assert_eq!(arr.len(), 3, "text + 2 image blocks");
@@ -800,7 +800,7 @@ async fn build_turn_prompt_appends_file_blocks_after_text_and_images() {
         ])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, "hi", &options).await;
+    let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
     assert_eq!(arr.len(), 4, "text + 1 image + 2 file blocks");
@@ -840,7 +840,7 @@ async fn build_turn_prompt_skips_malformed_attachments() {
         ])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, "hi", &options).await;
+    let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
     // text + 1 well-formed image + 1 well-formed file.
@@ -1874,4 +1874,208 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
     );
 
     let _ = std::fs::remove_dir_all(&ws_dir);
+}
+
+// --- Context references → stdinContext builder (Fidelity B) ---------------
+
+/// Port parity: the builder emits one entry per reference in order, with
+/// the reference labels (`Selected text:`, `Task:`, `Code:`, `File <p>:`,
+/// `Linear Issue:`, `GitHub Issue:`, `Sentry Issue:`, `Terminal ...`,
+/// `Note: <id>`) and joins them with `\n\n`.
+#[test]
+fn build_stdin_context_from_context_references_ports_reference_shapes() {
+    let refs = json!([
+        {"type": "selection", "content": "hello"},
+        {"type": "task", "taskText": "do the thing"},
+        {"type": "code_chunk", "codeChunk": "fn foo() {}"},
+        {"type": "file", "path": "src/a.rs", "content": "pub fn a() {}"},
+        {"type": "file", "filePath": "src/only-path.rs"},
+        {"type": "linear-issue", "content": "XYZ-1 title"},
+        {"type": "github-issue", "content": "#42 title"},
+        {"type": "sentry-issue", "content": "issue text"},
+        {
+            "type": "terminal",
+            "content": "$ ls",
+            "metadata": {"terminalId": "t1", "terminalName": "build"}
+        },
+        {"type": "note", "noteId": "note-1"},
+        {"type": "note", "metadata": {"noteId": "note-2"}},
+    ]);
+    let out =
+        super::build_stdin_context_from_context_references(Some(&refs)).expect("non-empty context");
+    let parts: Vec<&str> = out.split("\n\n").collect();
+    assert_eq!(parts.len(), 11);
+    assert_eq!(parts[0], "Selected text:\nhello");
+    assert_eq!(parts[1], "Task:\ndo the thing");
+    assert_eq!(parts[2], "Code:\nfn foo() {}");
+    assert_eq!(parts[3], "File src/a.rs:\npub fn a() {}");
+    assert_eq!(parts[4], "File: src/only-path.rs");
+    assert_eq!(parts[5], "Linear Issue:\nXYZ-1 title");
+    assert_eq!(parts[6], "GitHub Issue:\n#42 title");
+    assert_eq!(parts[7], "Sentry Issue:\nissue text");
+    assert_eq!(parts[8], "Terminal \"build\" (terminal_id: t1):\n$ ls");
+    assert_eq!(parts[9], "Note: note-1");
+    assert_eq!(parts[10], "Note: note-2");
+}
+
+/// Empty / absent inputs collapse to `None` so the prompt is left unchanged.
+#[test]
+fn build_stdin_context_from_context_references_empty_is_none() {
+    assert!(super::build_stdin_context_from_context_references(None).is_none());
+    assert!(super::build_stdin_context_from_context_references(Some(&json!([]))).is_none());
+    // Only-unsupported entries also collapse to None.
+    assert!(
+        super::build_stdin_context_from_context_references(Some(&json!([
+            {"type": "note"}, {"type": "file"}
+        ])))
+        .is_none()
+    );
+}
+
+/// End-to-end prompt shape: when `stdin_context` is absent but
+/// `context_references` yield content, `build_turn_prompt` prepends a
+/// `Context:` block synthesised by the builder; an explicit
+/// `stdin_context` still wins over the fallback.
+#[tokio::test]
+async fn build_turn_prompt_uses_context_references_when_stdin_context_is_absent() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-ctx"), AgentId::from("a-ctx"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    // Synthesised path.
+    let options = super::TurnOptions {
+        context_references: Some(json!([
+            {"type": "selection", "content": "selected"},
+            {"type": "file", "path": "a.rs", "content": "pub fn a() {}"},
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr.build_turn_prompt(&id, &ws, "do it", &options).await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        text.starts_with(
+            "Context:\nSelected text:\nselected\n\nFile a.rs:\npub fn a() {}\n\n---\n\n"
+        ),
+        "unexpected prompt: {text:?}"
+    );
+    assert!(text.ends_with("do it"));
+
+    // Explicit stdin_context wins over the synthesised fallback.
+    let options = super::TurnOptions {
+        stdin_context: Some("explicit".to_string()),
+        context_references: Some(json!([
+            {"type": "selection", "content": "ignored"}
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr.build_turn_prompt(&id, &ws, "do it", &options).await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(text.starts_with("Context:\nexplicit\n\n---\n\n"));
+    assert!(!text.contains("ignored"));
+}
+
+/// `noteIds` (PROTOCOL §5.5): the resolver loads workspace-asset
+/// images referenced by each note's markdown content, appends them as
+/// ACP `image` content blocks, and adds a system text notice so the
+/// agent knows the images are inlined (parity with the FE extraction
+/// in `agent-backend-handler.service.ts`).
+#[tokio::test]
+async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
+    use base64::Engine as _;
+    use intent_core::{ContentType, Note, NoteId, NoteVisibility};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let assets_dir =
+        std::env::temp_dir().join(format!("intentd-note-img-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&assets_dir).expect("assets tempdir");
+    let services = Services::new(store.clone())
+        .with_event_bus(bus.clone())
+        .with_assets_root(assets_dir.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = AgentManager::new(services, sink, 8);
+
+    let ws = WorkspaceId::from("ws-note-img");
+    let id = AgentId::from("a-note-img");
+    seed_agent(&mgr, &ws, &id).await;
+
+    // Write an on-disk asset the note will reference.
+    let asset_id = "asset-abc.png";
+    let asset_bytes: &[u8] = b"pretend-png";
+    let ws_dir = assets_dir.join(&ws.0);
+    std::fs::create_dir_all(&ws_dir).expect("asset dir");
+    std::fs::write(ws_dir.join(asset_id), asset_bytes).expect("write asset");
+
+    // Persist a note whose markdown references the asset URL.
+    let note_id = NoteId::new();
+    let ts = now_iso();
+    let note = Note {
+        id: note_id.clone(),
+        workspace_id: ws.clone(),
+        title: "Spec".to_string(),
+        content: format!(
+            "# Screenshot\n\n![shot](workspace-asset://{ws}/{asset})\n",
+            ws = ws.0,
+            asset = asset_id,
+        ),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        task: None,
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts,
+    };
+    store.insert_note(&note).await.expect("insert note");
+
+    let options = super::TurnOptions {
+        note_ids: Some(json!([note_id.to_string()])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr.build_turn_prompt(&id, &ws, "look", &options).await;
+    let wire = serde_json::to_value(&prompt).unwrap();
+    let arr = wire.as_array().unwrap();
+    // Expect: original text prompt, image block, system notice.
+    assert_eq!(arr.len(), 3, "text + image + notice");
+    assert_eq!(arr[0]["type"], json!("text"));
+    assert!(arr[0]["text"].as_str().unwrap().contains("look"));
+    assert_eq!(arr[1]["type"], json!("image"));
+    let expected_b64 = base64::engine::general_purpose::STANDARD.encode(asset_bytes);
+    assert_eq!(arr[1]["data"], json!(expected_b64));
+    assert_eq!(arr[1]["mimeType"], json!("image/png"));
+    assert_eq!(arr[2]["type"], json!("text"));
+    assert!(arr[2]["text"].as_str().unwrap().contains("1 image(s)"));
+
+    // A cross-workspace URL is silently skipped (no image, no notice).
+    let stray_id = NoteId::new();
+    let stray = Note {
+        id: stray_id.clone(),
+        content: format!(
+            "![x](workspace-asset://other-ws/{asset})\n",
+            asset = asset_id
+        ),
+        ..note.clone()
+    };
+    let mut stray = stray;
+    stray.id = stray_id.clone();
+    store.insert_note(&stray).await.expect("insert stray");
+    let options = super::TurnOptions {
+        note_ids: Some(json!([stray_id.to_string()])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr.build_turn_prompt(&id, &ws, "look", &options).await;
+    let arr_json = serde_json::to_value(&prompt).unwrap();
+    let arr = arr_json.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "only text; stray URL is skipped");
 }

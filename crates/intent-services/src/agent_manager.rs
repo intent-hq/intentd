@@ -74,6 +74,12 @@ pub struct TurnOptions {
     /// blocks; the `fileName` becomes the resource `uri` as `file:///<name>`
     /// so downstream consumers can reference it.
     pub file_blocks: Option<serde_json::Value>,
+    /// Opaque per-message payload from `agent.sendMessage` / `agent.forceMessage`
+    /// `messageMetadata` (PROTOCOL §5.5). Persisted verbatim on the user
+    /// message row (via [`Store::append_agent_message_with_metadata`]) for the
+    /// FIRST turn only; queue-drained follow-up turns run with
+    /// [`TurnOptions::default`] and therefore carry no metadata of their own.
+    pub message_metadata: Option<serde_json::Value>,
 }
 
 /// Conservative cap used when total system memory cannot be determined.
@@ -941,6 +947,7 @@ impl AgentManager {
     async fn build_turn_prompt(
         &self,
         agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
         content: &str,
         options: &TurnOptions,
     ) -> Vec<ContentBlock> {
@@ -958,12 +965,64 @@ impl AgentManager {
         // trailing separator matches the reference `acp-provider.ts` so
         // downstream consumers see the same shape whether the prompt
         // originates from the daemon or the legacy Electron main path.
+        // When `stdinContext` is absent/empty we synthesise one from
+        // `contextReferences` (port of the FE reference builder in
+        // `agent-backend-handler.service.ts`); an explicit `stdinContext`
+        // always wins.
+        let synthesised = match options.stdin_context.as_deref() {
+            Some(ctx) if !ctx.is_empty() => None,
+            _ => build_stdin_context_from_context_references(options.context_references.as_ref()),
+        };
         let prompt_text = match options.stdin_context.as_deref() {
             Some(ctx) if !ctx.is_empty() => format!("Context:\n{ctx}\n\n---\n\n{prompt_text}"),
-            _ => prompt_text,
+            _ => match synthesised.as_deref() {
+                Some(ctx) if !ctx.is_empty() => {
+                    format!("Context:\n{ctx}\n\n---\n\n{prompt_text}")
+                }
+                _ => prompt_text,
+            },
         };
         let mut blocks = text_prompt(&prompt_text);
         append_attachment_blocks(&mut blocks, options);
+        // Resolve `noteIds` to `workspace-asset://` image content blocks
+        // (Fidelity B, PROTOCOL §5.5): each note is scanned for markdown
+        // image references whose URL is a workspace-asset in the current
+        // workspace; the referenced bytes are loaded and appended as ACP
+        // `image` content blocks. A single system text block is added when
+        // any images are resolved so the agent knows they are inlined for
+        // direct viewing (parity with the FE notice).
+        if let Some(ids_json) = options.note_ids.as_ref() {
+            let ids: Vec<String> = ids_json
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !ids.is_empty() {
+                let images = self
+                    .services
+                    .load_note_image_blocks(workspace_id, &ids)
+                    .await;
+                if !images.is_empty() {
+                    for (data, mime) in &images {
+                        if let Ok(img) = serde_json::from_value::<ContentBlock>(json!({
+                            "type": "image",
+                            "data": data,
+                            "mimeType": mime,
+                        })) {
+                            blocks.push(img);
+                        }
+                    }
+                    let notice = format!(
+                        "[System: {n} image(s) from the referenced note(s) are attached to this message.]",
+                        n = images.len(),
+                    );
+                    blocks.extend(text_prompt(&notice));
+                }
+            }
+        }
         blocks
     }
 
@@ -1260,7 +1319,13 @@ impl AgentManager {
         if self
             .services
             .store
-            .append_agent_message(&agent_id, "user", &blocks, &now_iso())
+            .append_agent_message_with_metadata(
+                &agent_id,
+                "user",
+                &blocks,
+                options.message_metadata.as_ref(),
+                &now_iso(),
+            )
             .await
             .is_err()
         {
@@ -1357,7 +1422,13 @@ impl AgentManager {
         let blocks = user_text_blocks(&content);
         self.services
             .store
-            .append_agent_message(&agent_id, "user", &blocks, &now_iso())
+            .append_agent_message_with_metadata(
+                &agent_id,
+                "user",
+                &blocks,
+                options.message_metadata.as_ref(),
+                &now_iso(),
+            )
             .await?;
         self.try_begin(&agent_id, &workspace_id).await;
         self.spawn_worker(agent_id, workspace_id, content, options);
@@ -1588,6 +1659,94 @@ fn text_prompt(content: &str) -> Vec<ContentBlock> {
     serde_json::from_value(json!([{ "type": "text", "text": content }])).unwrap_or_default()
 }
 
+/// Port of the FE `contextReferences` → `stdinContext` builder
+/// (`agent-backend-handler.service.ts` — the ~3170–3248 block). Iterates the
+/// raw JSON array in order and emits one context entry per reference,
+/// joined by `\n\n`. Only entries the reference supports today are
+/// materialised: type-specific labels for `selection` / `task` /
+/// `code_chunk` / `file` (with content) / `linear-issue` / `github-issue` /
+/// `sentry-issue` / `terminal`, a `Note: <id>` line for `note`, a bare
+/// `File: <path>` line for a file reference whose content was not inlined
+/// on the wire (the FE variant would try to read from disk here — that
+/// on-disk fallback is deferred), and a fall-through that emits the raw
+/// content when no `type` matches. Returns `None` when nothing produces a
+/// non-empty entry so the caller can leave the prompt untouched.
+fn build_stdin_context_from_context_references(refs: Option<&Value>) -> Option<String> {
+    let arr = refs?.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for r in arr {
+        let obj = match r.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        // Content resolution mirrors the FE: `content` → `selectedText` →
+        // `taskText` → `codeChunk` (first non-empty wins).
+        let content = ["content", "selectedText", "taskText", "codeChunk"]
+            .iter()
+            .find_map(|k| obj.get(*k).and_then(Value::as_str))
+            .filter(|s| !s.is_empty());
+        // Same aliasing rule for the path field.
+        let file_path = obj
+            .get("path")
+            .or_else(|| obj.get("filePath"))
+            .and_then(Value::as_str);
+        let ref_type = obj.get("type").and_then(Value::as_str);
+        if let Some(content) = content {
+            let entry = match ref_type {
+                Some("selection") => format!("Selected text:\n{content}"),
+                Some("task") => format!("Task:\n{content}"),
+                Some("code_chunk") => format!("Code:\n{content}"),
+                Some("file") => match file_path {
+                    Some(p) => format!("File {p}:\n{content}"),
+                    None => content.to_string(),
+                },
+                Some("linear-issue") => format!("Linear Issue:\n{content}"),
+                Some("github-issue") => format!("GitHub Issue:\n{content}"),
+                Some("sentry-issue") => format!("Sentry Issue:\n{content}"),
+                Some("terminal") => {
+                    let meta = obj.get("metadata").and_then(Value::as_object);
+                    let terminal_id = meta
+                        .and_then(|m| m.get("terminalId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let terminal_name = meta
+                        .and_then(|m| m.get("terminalName"))
+                        .and_then(Value::as_str)
+                        .or_else(|| obj.get("title").and_then(Value::as_str))
+                        .unwrap_or("Terminal");
+                    format!("Terminal \"{terminal_name}\" (terminal_id: {terminal_id}):\n{content}")
+                }
+                _ => content.to_string(),
+            };
+            parts.push(entry);
+        } else if ref_type == Some("file") {
+            if let Some(p) = file_path {
+                // Reference builds a bare `File: <path>` line when content is
+                // not inlined and disk read is skipped/unavailable.
+                parts.push(format!("File: {p}"));
+            }
+        } else if ref_type == Some("note") {
+            let note_id = obj.get("noteId").and_then(Value::as_str).or_else(|| {
+                obj.get("metadata")
+                    .and_then(Value::as_object)
+                    .and_then(|m| m.get("noteId"))
+                    .and_then(Value::as_str)
+            });
+            if let Some(id) = note_id {
+                parts.push(format!("Note: {id}"));
+            }
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
 /// Append one ACP content block per FE-supplied attachment to `blocks`
 /// (reference-parity `acp-provider.ts`): image entries `{ data, mimeType }`
 /// become `image` content blocks; file entries `{ data, mimeType, fileName }`
@@ -1766,7 +1925,9 @@ async fn run_message_worker(
     'outer: loop {
         match mgr.ensure_started(&agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
-                let prompt = mgr.build_turn_prompt(&agent_id, &content, &options).await;
+                let prompt = mgr
+                    .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
+                    .await;
                 if let Err(e) = mgr
                     .run_turn(&agent_id, &workspace_id, &acp_session_id, prompt)
                     .await
@@ -1996,7 +2157,12 @@ mod role_reminder_tests {
         // Interval = 1 → every turn carries the prefix.
         for _ in 0..2 {
             let prompt = mgr
-                .build_turn_prompt(&agent_id, "do the thing", &TurnOptions::default())
+                .build_turn_prompt(
+                    &agent_id,
+                    &WorkspaceId::from("ws-role"),
+                    "do the thing",
+                    &TurnOptions::default(),
+                )
                 .await;
             let text = prompt_text(&prompt);
             assert!(
@@ -2017,7 +2183,12 @@ mod role_reminder_tests {
         // Flag the agent's session as recreated; the reminder must still prepend.
         mgr.recreated.lock().unwrap().insert(agent_id.clone());
         let prompt = mgr
-            .build_turn_prompt(&agent_id, "resume work", &TurnOptions::default())
+            .build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-role"),
+                "resume work",
+                &TurnOptions::default(),
+            )
             .await;
         let text = prompt_text(&prompt);
         assert!(
@@ -2032,7 +2203,12 @@ mod role_reminder_tests {
     async fn no_injection_without_specialist() {
         let (mgr, agent_id) = manager_with(None, None).await;
         let prompt = mgr
-            .build_turn_prompt(&agent_id, "plain message", &TurnOptions::default())
+            .build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-role"),
+                "plain message",
+                &TurnOptions::default(),
+            )
             .await;
         assert_eq!(prompt_text(&prompt), "plain message");
     }
@@ -2048,7 +2224,12 @@ mod role_reminder_tests {
             ..TurnOptions::default()
         };
         let prompt = mgr
-            .build_turn_prompt(&agent_id, "user says hi", &opts)
+            .build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-role"),
+                "user says hi",
+                &opts,
+            )
             .await;
         let text = prompt_text(&prompt);
         assert_eq!(text, "Context:\nhello ctx\n\n---\n\nuser says hi");
@@ -2063,7 +2244,9 @@ mod role_reminder_tests {
             stdin_context: Some(String::new()),
             ..TurnOptions::default()
         };
-        let prompt = mgr.build_turn_prompt(&agent_id, "body", &opts).await;
+        let prompt = mgr
+            .build_turn_prompt(&agent_id, &WorkspaceId::from("ws-role"), "body", &opts)
+            .await;
         assert_eq!(prompt_text(&prompt), "body");
     }
 
@@ -2080,7 +2263,9 @@ mod role_reminder_tests {
             stdin_context: Some("ctx".to_string()),
             ..TurnOptions::default()
         };
-        let prompt = mgr.build_turn_prompt(&agent_id, "do it", &opts).await;
+        let prompt = mgr
+            .build_turn_prompt(&agent_id, &WorkspaceId::from("ws-role"), "do it", &opts)
+            .await;
         let text = prompt_text(&prompt);
         assert!(
             text.starts_with("Context:\nctx\n\n---\n\n[Role Reminder:"),

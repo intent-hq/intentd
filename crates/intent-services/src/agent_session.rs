@@ -464,6 +464,7 @@ impl Services {
                     &message_id,
                     "assistant",
                     &Value::Array(blocks),
+                    None,
                     &now_iso(),
                 )
                 .await?;

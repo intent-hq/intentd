@@ -301,6 +301,7 @@ impl WorkspaceMcpServer {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await)
             }

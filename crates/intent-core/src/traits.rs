@@ -827,6 +827,7 @@ pub trait WorkspaceApi: Send + Sync {
         note_ids: Option<serde_json::Value>,
         stdin_context: Option<String>,
         context_references: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
@@ -839,6 +840,7 @@ pub trait WorkspaceApi: Send + Sync {
             note_ids,
             stdin_context,
             context_references,
+            message_metadata,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -863,6 +865,7 @@ pub trait WorkspaceApi: Send + Sync {
         note_ids: Option<serde_json::Value>,
         stdin_context: Option<String>,
         context_references: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
@@ -874,6 +877,7 @@ pub trait WorkspaceApi: Send + Sync {
             note_ids,
             stdin_context,
             context_references,
+            message_metadata,
         );
         Box::pin(async {
             Err(Error::Internal(

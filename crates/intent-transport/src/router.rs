@@ -826,6 +826,18 @@ async fn dispatch(
             let note_ids = opt_value(params, "noteIds");
             let stdin_context = opt_str(params, "stdinContext");
             let context_references = opt_value(params, "contextReferences");
+            // Opaque per-message payload (PROTOCOL §5.5): the FE attaches
+            // arbitrary JSON to distinguish daemon-initiated turns (e.g.
+            // `{ source: "system" }`). Passed through unmodified and persisted
+            // on the user message row via the store's metadata-aware append.
+            let message_metadata = opt_value(params, "messageMetadata");
+            // App-ID trio (`userAppMessageId` / `assistantMessageId` /
+            // `assistantAppMessageId`) is a client-side identity/dedupe layer
+            // that the daemon does NOT consume: the transcript is keyed on
+            // the server-minted UUIDv7 `id` (see `Store::append_agent_message*`)
+            // and the FE round-trips its ids through the arbitrary
+            // `messageMetadata` payload above. Any future daemon-side dedupe
+            // would surface as an explicit field on the request envelope.
             let result = api
                 .agent_send_message(
                     ws,
@@ -838,6 +850,7 @@ async fn dispatch(
                     note_ids,
                     stdin_context,
                     context_references,
+                    message_metadata,
                 )
                 .await
                 .map_err(domain_to_rpc)?;
@@ -855,6 +868,10 @@ async fn dispatch(
             // `agent.sendMessage`.
             let stdin_context = opt_str(params, "stdinContext");
             let context_references = opt_value(params, "contextReferences");
+            // Opaque per-message payload (PROTOCOL §5.5); see the
+            // `agent.sendMessage` extraction site above for the app-ID trio
+            // rationale and metadata semantics.
+            let message_metadata = opt_value(params, "messageMetadata");
             let result = api
                 .agent_force_message(
                     ws,
@@ -866,6 +883,7 @@ async fn dispatch(
                     note_ids,
                     stdin_context,
                     context_references,
+                    message_metadata,
                 )
                 .await
                 .map_err(domain_to_rpc)?;

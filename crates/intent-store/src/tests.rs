@@ -87,14 +87,14 @@ async fn migration_status_reports_current_after_open() {
         status.expected,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25
+            25, 26
         ]
     );
     assert_eq!(
         status.applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25
+            25, 26
         ]
     );
 }
@@ -1107,6 +1107,70 @@ async fn agent_session_round_trip_and_append_only_log() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, agent_id);
     assert_eq!(listed[0].messages.len(), 2);
+}
+
+/// `append_agent_message_with_metadata` persists the opaque per-message
+/// `messageMetadata` payload (PROTOCOL §5.5) verbatim on the row and
+/// round-trips it on transcript reads; the plain `append_agent_message`
+/// path continues to store `NULL` for messages without metadata.
+#[tokio::test]
+async fn agent_message_metadata_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::from("agent-aaaaaaaa-1111-2222-3333-444444444444");
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+
+    let metadata = json!({ "source": "system", "tag": "restart" });
+    let stored = store
+        .append_agent_message_with_metadata(
+            &agent_id,
+            "user",
+            &json!([{ "type": "text", "text": "hi" }]),
+            Some(&metadata),
+            "t0",
+        )
+        .await
+        .expect("append with metadata");
+    assert_eq!(stored.metadata.as_ref(), Some(&metadata));
+
+    // Plain append leaves metadata as NULL.
+    let plain = store
+        .append_agent_message(
+            &agent_id,
+            "assistant",
+            &json!([{ "type": "text", "text": "yo" }]),
+            "t1",
+        )
+        .await
+        .expect("append plain");
+    assert!(
+        plain.metadata.is_none(),
+        "plain append persists NULL metadata"
+    );
+
+    // Both survive the read path in order.
+    let messages = store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].metadata.as_ref(), Some(&metadata));
+    assert!(messages[1].metadata.is_none());
+
+    // The metadata payload also round-trips through the get_agent_session
+    // aggregate loader (transcript embedded on the session).
+    let session = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.messages[0].metadata.as_ref(), Some(&metadata));
+    assert!(session.messages[1].metadata.is_none());
 }
 
 /// The P3-1.2b persistence-gap fields round-trip through insert → get →
