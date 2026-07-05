@@ -3648,6 +3648,7 @@ mod send_message_payload_forwarding {
         content: Option<String>,
         message_id: Option<String>,
         image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
         priority: Option<String>,
         note_ids: Option<Value>,
         stdin_context: Option<String>,
@@ -3669,6 +3670,7 @@ mod send_message_payload_forwarding {
             content: String,
             message_id: Option<String>,
             image_blocks: Option<Value>,
+            file_blocks: Option<Value>,
             priority: Option<String>,
             note_ids: Option<Value>,
             stdin_context: Option<String>,
@@ -3682,6 +3684,7 @@ mod send_message_payload_forwarding {
                     content: Some(content),
                     message_id,
                     image_blocks,
+                    file_blocks,
                     priority,
                     note_ids,
                     stdin_context,
@@ -3699,6 +3702,7 @@ mod send_message_payload_forwarding {
             message_id: String,
             content: String,
             image_blocks: Option<Value>,
+            file_blocks: Option<Value>,
             note_ids: Option<Value>,
             stdin_context: Option<String>,
             context_references: Option<Value>,
@@ -3711,6 +3715,7 @@ mod send_message_payload_forwarding {
                     content: Some(content),
                     message_id: Some(message_id),
                     image_blocks,
+                    file_blocks,
                     priority: None,
                     note_ids,
                     stdin_context,
@@ -3797,5 +3802,60 @@ mod send_message_payload_forwarding {
         assert_eq!(cap.stdin_context.as_deref(), Some("forced ctx"));
         assert_eq!(cap.note_ids, Some(json!(["note-x"])));
         assert_eq!(cap.context_references, Some(json!([{"symbol": "Foo"}])));
+    }
+
+    #[tokio::test]
+    async fn send_message_forwards_image_and_file_blocks() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":4,"method":"agent.sendMessage",
+            "params":{
+                "workspaceId":"ws-1",
+                "agentId":"agent-1",
+                "content":"hi",
+                "imageBlocks":[{"data":"aGVsbG8=","mimeType":"image/png"}],
+                "fileBlocks":[{"data":"Zm9v","mimeType":"text/plain","fileName":"notes.txt"}]
+            }
+        }"#;
+        handle_message(&api, msg).await.expect("response");
+        let cap = api.send.lock().unwrap().clone();
+        assert_eq!(
+            cap.image_blocks,
+            Some(json!([{"data": "aGVsbG8=", "mimeType": "image/png"}])),
+            "imageBlocks must be forwarded verbatim"
+        );
+        assert_eq!(
+            cap.file_blocks,
+            Some(json!([{"data": "Zm9v", "mimeType": "text/plain", "fileName": "notes.txt"}])),
+            "fileBlocks must be forwarded verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_message_forwards_image_and_file_blocks() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":5,"method":"agent.forceMessage",
+            "params":{
+                "workspaceId":"ws-1",
+                "agentId":"agent-1",
+                "messageId":"m-force",
+                "content":"stop",
+                "imageBlocks":[{"data":"YWFh","mimeType":"image/jpeg"}],
+                "fileBlocks":[{"data":"YmJi","mimeType":"application/pdf","fileName":"spec.pdf"}]
+            }
+        }"#;
+        handle_message(&api, msg).await.expect("response");
+        let cap = api.force.lock().unwrap().clone();
+        assert_eq!(
+            cap.image_blocks,
+            Some(json!([{"data": "YWFh", "mimeType": "image/jpeg"}])),
+            "imageBlocks must be forwarded verbatim"
+        );
+        assert_eq!(
+            cap.file_blocks,
+            Some(json!([{"data": "YmJi", "mimeType": "application/pdf", "fileName": "spec.pdf"}])),
+            "fileBlocks must be forwarded verbatim"
+        );
     }
 }

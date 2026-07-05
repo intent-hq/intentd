@@ -816,6 +816,7 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let message_id = opt_str(params, "messageId");
             let image_blocks = opt_value(params, "imageBlocks");
+            let file_blocks = opt_value(params, "fileBlocks");
             let priority = opt_str(params, "priority");
             // Per-turn prompt-assembly hints (PROTOCOL §5.5): `stdinContext`
             // is prepended verbatim to the outbound prompt as a `Context:`
@@ -832,6 +833,7 @@ async fn dispatch(
                     content,
                     message_id,
                     image_blocks,
+                    file_blocks,
                     priority,
                     note_ids,
                     stdin_context,
@@ -847,6 +849,7 @@ async fn dispatch(
             let content = require_str_param(params, "content")?;
             let ws = require_ws_note(params)?;
             let image_blocks = opt_value(params, "imageBlocks");
+            let file_blocks = opt_value(params, "fileBlocks");
             let note_ids = opt_value(params, "noteIds");
             // Per-turn prompt-assembly hints (PROTOCOL §5.5); same shape as
             // `agent.sendMessage`.
@@ -859,6 +862,7 @@ async fn dispatch(
                     message_id,
                     content,
                     image_blocks,
+                    file_blocks,
                     note_ids,
                     stdin_context,
                     context_references,
@@ -871,8 +875,9 @@ async fn dispatch(
             let agent_id = require_agent_id(params)?;
             let content = require_str_param(params, "content")?;
             let image_blocks = opt_value(params, "imageBlocks");
+            let file_blocks = opt_value(params, "fileBlocks");
             let result = api
-                .agent_queue_message(agent_id, content, image_blocks)
+                .agent_queue_message(agent_id, content, image_blocks, file_blocks)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

@@ -752,6 +752,103 @@ async fn build_turn_prompt_prepends_history_once_after_recreate() {
     assert_eq!(plain_text, "next message");
 }
 
+// --- Attachment blocks (image + file) ----------------------------------------
+
+/// FE-supplied `imageBlocks` become ACP `image` content blocks appended after
+/// the text prompt (reference-parity `acp-provider.ts`), preserving `data`
+/// and `mimeType` verbatim in the camelCase wire shape.
+#[tokio::test]
+async fn build_turn_prompt_appends_image_blocks_after_text() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-img"), AgentId::from("a-img"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let options = super::TurnOptions {
+        image_blocks: Some(json!([
+            {"data": "AAAA", "mimeType": "image/png"},
+            {"data": "BBBB", "mimeType": "image/jpeg"},
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr.build_turn_prompt(&id, "hi", &options).await;
+    let wire = serde_json::to_value(&prompt).unwrap();
+    let arr = wire.as_array().unwrap();
+    assert_eq!(arr.len(), 3, "text + 2 image blocks");
+    assert_eq!(arr[0]["type"], json!("text"));
+    assert_eq!(arr[1]["type"], json!("image"));
+    assert_eq!(arr[1]["data"], json!("AAAA"));
+    assert_eq!(arr[1]["mimeType"], json!("image/png"));
+    assert_eq!(arr[2]["type"], json!("image"));
+    assert_eq!(arr[2]["data"], json!("BBBB"));
+    assert_eq!(arr[2]["mimeType"], json!("image/jpeg"));
+}
+
+/// FE-supplied `fileBlocks` become ACP `resource` content blocks with a
+/// `BlobResourceContents` carrying the file name lifted into the resource
+/// `uri` (`file:///<fileName>`), appended after any image blocks.
+#[tokio::test]
+async fn build_turn_prompt_appends_file_blocks_after_text_and_images() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-file"), AgentId::from("a-file"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let options = super::TurnOptions {
+        image_blocks: Some(json!([{"data": "IMG", "mimeType": "image/png"}])),
+        file_blocks: Some(json!([
+            {"data": "Zm9v", "mimeType": "text/plain", "fileName": "notes.txt"},
+            {"data": "YmFy", "mimeType": "application/pdf", "fileName": "spec.pdf"},
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr.build_turn_prompt(&id, "hi", &options).await;
+    let wire = serde_json::to_value(&prompt).unwrap();
+    let arr = wire.as_array().unwrap();
+    assert_eq!(arr.len(), 4, "text + 1 image + 2 file blocks");
+    assert_eq!(arr[0]["type"], json!("text"));
+    assert_eq!(arr[1]["type"], json!("image"));
+    // Images come before files, files come in caller order.
+    assert_eq!(arr[2]["type"], json!("resource"));
+    assert_eq!(arr[2]["resource"]["blob"], json!("Zm9v"));
+    assert_eq!(arr[2]["resource"]["mimeType"], json!("text/plain"));
+    assert_eq!(arr[2]["resource"]["uri"], json!("file:///notes.txt"));
+    assert_eq!(arr[3]["type"], json!("resource"));
+    assert_eq!(arr[3]["resource"]["blob"], json!("YmFy"));
+    assert_eq!(arr[3]["resource"]["mimeType"], json!("application/pdf"));
+    assert_eq!(arr[3]["resource"]["uri"], json!("file:///spec.pdf"));
+}
+
+/// Malformed attachment entries (missing required fields, wrong types) are
+/// silently dropped so a partial array can never poison the whole turn — only
+/// the well-formed sibling blocks reach the prompt.
+#[tokio::test]
+async fn build_turn_prompt_skips_malformed_attachments() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-bad"), AgentId::from("a-bad"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let options = super::TurnOptions {
+        image_blocks: Some(json!([
+            {"data": "OK"},                        // missing mimeType
+            {"data": 42, "mimeType": "image/png"}, // wrong type
+            {"data": "GOOD", "mimeType": "image/png"},
+        ])),
+        file_blocks: Some(json!([
+            {"mimeType": "text/plain", "fileName": "x.txt"},   // missing data
+            {"data": "d", "fileName": "x.txt"},                 // missing mimeType
+            {"data": "d", "mimeType": "text/plain"},            // missing fileName
+            {"data": "d", "mimeType": "text/plain", "fileName": "keep.txt"},
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr.build_turn_prompt(&id, "hi", &options).await;
+    let wire = serde_json::to_value(&prompt).unwrap();
+    let arr = wire.as_array().unwrap();
+    // text + 1 well-formed image + 1 well-formed file.
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[1]["data"], json!("GOOD"));
+    assert_eq!(arr[2]["resource"]["uri"], json!("file:///keep.txt"));
+}
+
 /// The keep-alive interrupt path emits ONLY the terminal `agent:stream:end` and
 /// deliberately NOT `agent:idle`: an interrupted agent is about to resume, so
 /// waking parents on idle would be premature (mirrors the TS interrupt
@@ -1440,7 +1537,7 @@ async fn try_drain_queue_no_op_when_already_busy() {
     let (ws, id) = (WorkspaceId::from("ws-drain"), AgentId::from("a-drain"));
     // Queue a ready message so the only barrier is the busy flag.
     mgr.services
-        .enqueue_message(&id, "queued".to_string(), None);
+        .enqueue_message(&id, "queued".to_string(), None, None);
     assert!(mgr.try_begin(&id, &ws).await);
 
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -1488,6 +1585,67 @@ async fn send_message_queues_when_already_busy() {
     assert_eq!(result["queuedMessage"]["content"], json!("queued"));
     assert_eq!(result["queuedMessage"]["position"], json!(0));
     assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+}
+
+/// When `send_message` hits the busy auto-queue fallback, the caller's
+/// image + file blocks are preserved on the queued entry (the wire snapshot
+/// includes both) so the eventual drain turn reaches the agent with the same
+/// ACP content blocks.
+#[tokio::test]
+async fn send_message_auto_queue_preserves_image_and_file_blocks() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-q-blocks"),
+        AgentId::from("a-q-blocks"),
+    );
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let options = super::TurnOptions {
+        image_blocks: Some(json!([{"data": "IMG", "mimeType": "image/png"}])),
+        file_blocks: Some(json!([
+            {"data": "FILE", "mimeType": "text/plain", "fileName": "n.txt"}
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let result = mgr
+        .send_message(id.clone(), ws.clone(), "hi".to_string(), None, options)
+        .await
+        .expect("queued");
+    assert_eq!(result["queued"], json!(true));
+    let snap = mgr.services.queue_snapshot(&id);
+    assert_eq!(snap.len(), 1);
+    assert_eq!(
+        snap[0]["imageBlocks"],
+        json!([{"data": "IMG", "mimeType": "image/png"}]),
+        "image blocks land on the queued entry"
+    );
+    assert_eq!(
+        snap[0]["fileBlocks"],
+        json!([{"data": "FILE", "mimeType": "text/plain", "fileName": "n.txt"}]),
+        "file blocks land on the queued entry"
+    );
+}
+
+/// enqueue → dequeue round-trip preserves both attachment arrays so the drain
+/// path can pipe them into the next turn's `TurnOptions`.
+#[tokio::test]
+async fn queue_dequeue_round_trip_preserves_image_and_file_blocks() {
+    let (_tmp, mgr) = manager().await;
+    let id = AgentId::from("a-rt");
+    let images = Some(json!([{"data": "I", "mimeType": "image/png"}]));
+    let files = Some(json!([
+        {"data": "F", "mimeType": "text/plain", "fileName": "r.txt"}
+    ]));
+    mgr.services
+        .enqueue_message(&id, "msg".to_string(), images.clone(), files.clone());
+    let drained = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("dequeue returns the head");
+    assert_eq!(drained.content, "msg");
+    assert_eq!(drained.image_blocks, images);
+    assert_eq!(drained.file_blocks, files);
 }
 
 // --- Recreate flag + history rendering ---------------------------------------

@@ -803,6 +803,11 @@ pub trait WorkspaceApi: Send + Sync {
     /// the current turn is cancelled keep-alive (the agent process is never
     /// killed) and the message is delivered immediately as a fresh turn.
     ///
+    /// `image_blocks` / `file_blocks` are FE-supplied attachment arrays that
+    /// reach the agent as ACP content blocks appended after the text prompt
+    /// (reference-parity `acp-provider.ts`); a queued message preserves them
+    /// so the drained turn carries the same blocks.
+    ///
     /// `note_ids` / `stdin_context` / `context_references` are the FE-side
     /// per-turn prompt-assembly hints (PROTOCOL §5.5). `stdin_context` is
     /// prepended verbatim to the outbound prompt as a `Context:` block
@@ -817,6 +822,7 @@ pub trait WorkspaceApi: Send + Sync {
         content: String,
         message_id: Option<String>,
         image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
         priority: Option<String>,
         note_ids: Option<serde_json::Value>,
         stdin_context: Option<String>,
@@ -828,6 +834,7 @@ pub trait WorkspaceApi: Send + Sync {
             content,
             message_id,
             image_blocks,
+            file_blocks,
             priority,
             note_ids,
             stdin_context,
@@ -841,8 +848,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.forceMessage`: stop the current stream then deliver immediately
-    /// (PROTOCOL §5.5). Accepts the same per-turn prompt-assembly hints
-    /// (`stdin_context`, `note_ids`, `context_references`) as `sendMessage`.
+    /// (PROTOCOL §5.5). Accepts the same attachment (`image_blocks`,
+    /// `file_blocks`) and per-turn prompt-assembly (`stdin_context`,
+    /// `note_ids`, `context_references`) hints as `sendMessage`.
     #[allow(clippy::too_many_arguments)]
     fn agent_force_message(
         &self,
@@ -851,6 +859,7 @@ pub trait WorkspaceApi: Send + Sync {
         message_id: String,
         content: String,
         image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
         note_ids: Option<serde_json::Value>,
         stdin_context: Option<String>,
         context_references: Option<serde_json::Value>,
@@ -861,6 +870,7 @@ pub trait WorkspaceApi: Send + Sync {
             message_id,
             content,
             image_blocks,
+            file_blocks,
             note_ids,
             stdin_context,
             context_references,
@@ -874,14 +884,17 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `agent.queueMessage`: explicitly enqueue a message; `{ success,
     /// queuedMessage }` where `queuedMessage` is `{ id, content, queuedAt,
-    /// position, imageBlocks? }` (PROTOCOL §5.5).
+    /// position, imageBlocks?, fileBlocks? }` (PROTOCOL §5.5). Attachment
+    /// arrays are preserved on the queued entry so the drained turn carries
+    /// the same blocks.
     fn agent_queue_message(
         &self,
         agent_id: AgentId,
         content: String,
         image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, content, image_blocks);
+        let _ = (agent_id, content, image_blocks, file_blocks);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_queue_message not implemented".to_string(),
@@ -924,7 +937,7 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.getQueue`: the agent's pending message queue; `{ success, queue:
-    /// [{ id, content, queuedAt, position, imageBlocks? }] }` (PROTOCOL §5.5).
+    /// [{ id, content, queuedAt, position, imageBlocks?, fileBlocks? }] }` (PROTOCOL §5.5).
     fn agent_get_queue(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = agent_id;
         Box::pin(async {

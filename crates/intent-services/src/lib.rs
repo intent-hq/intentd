@@ -6471,7 +6471,8 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         content: String,
         message_id: Option<String>,
-        _image_blocks: Option<serde_json::Value>,
+        image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
         priority: Option<String>,
         note_ids: Option<serde_json::Value>,
         stdin_context: Option<String>,
@@ -6486,6 +6487,8 @@ impl WorkspaceApi for Services {
                 stdin_context,
                 note_ids,
                 context_references,
+                image_blocks,
+                file_blocks,
             };
             match self.agent_manager() {
                 Some(manager) => {
@@ -6519,7 +6522,8 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         message_id: String,
         content: String,
-        _image_blocks: Option<serde_json::Value>,
+        image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
         note_ids: Option<serde_json::Value>,
         stdin_context: Option<String>,
         context_references: Option<serde_json::Value>,
@@ -6529,6 +6533,8 @@ impl WorkspaceApi for Services {
                 stdin_context,
                 note_ids,
                 context_references,
+                image_blocks,
+                file_blocks,
             };
             match self.agent_manager() {
                 Some(manager) => {
@@ -6549,9 +6555,10 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         content: String,
         image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_queue_message_op(agent_id, content, image_blocks)
+            self.agent_queue_message_op(agent_id, content, image_blocks, file_blocks)
                 .await
         })
     }

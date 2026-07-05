@@ -46,6 +46,7 @@ pub(crate) struct QueuedMessage {
     pub id: String,
     pub content: String,
     pub image_blocks: Option<Value>,
+    pub file_blocks: Option<Value>,
     pub queued_at: String,
     pub editing: bool,
 }
@@ -53,10 +54,10 @@ pub(crate) struct QueuedMessage {
 impl QueuedMessage {
     /// The camelCase wire shape for `agent.getQueue` / queue results, matching the
     /// TS `QueuedMessage` and the iOS decoder (`{id, content, queuedAt, position,
-    /// imageBlocks?, editing?}`). `position` is the entry's 0-based index in the
-    /// queue (0 = next to be sent) and is supplied by the caller since it is
-    /// positional. `editing` is only present when `true` (a client that hasn't
-    /// migrated still sees the legacy shape unchanged).
+    /// imageBlocks?, fileBlocks?, editing?}`). `position` is the entry's 0-based
+    /// index in the queue (0 = next to be sent) and is supplied by the caller
+    /// since it is positional. `editing` is only present when `true` (a client
+    /// that hasn't migrated still sees the legacy shape unchanged).
     pub(crate) fn to_value(&self, position: usize) -> Value {
         let mut v = json!({
             "id": self.id,
@@ -66,6 +67,9 @@ impl QueuedMessage {
         });
         if let Some(blocks) = &self.image_blocks {
             v["imageBlocks"] = blocks.clone();
+        }
+        if let Some(blocks) = &self.file_blocks {
+            v["fileBlocks"] = blocks.clone();
         }
         if self.editing {
             v["editing"] = Value::Bool(true);
@@ -955,8 +959,10 @@ impl Services {
         agent_id: AgentId,
         content: String,
         image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
     ) -> Result<Value> {
-        let (queued, position) = self.enqueue_message(&agent_id, content, image_blocks);
+        let (queued, position) =
+            self.enqueue_message(&agent_id, content, image_blocks, file_blocks);
         let result = json!({ "success": true, "queuedMessage": queued.to_value(position) });
         self.publish_queue_updated(&agent_id).await;
         if let Some(manager) = self.agent_manager() {
@@ -1076,7 +1082,7 @@ impl Services {
         {
             Ok(_) => Ok(json!({ "success": true, "queued": false, "messageId": message_id })),
             Err(_) => {
-                let (queued, position) = self.enqueue_message(&agent_id, content, None);
+                let (queued, position) = self.enqueue_message(&agent_id, content, None, None);
                 let result = json!({
                     "success": true,
                     "queued": true,
@@ -1978,11 +1984,13 @@ impl Services {
         agent_id: &AgentId,
         content: String,
         image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
     ) -> (QueuedMessage, usize) {
         let queued = QueuedMessage {
             id: new_message_id(),
             content,
             image_blocks,
+            file_blocks,
             queued_at: now_iso(),
             editing: false,
         };
@@ -2050,7 +2058,7 @@ impl Services {
     }
 
     /// Snapshot the current queue contents as wire-shape `QueuedMessage` JSON
-    /// (the §5.5 `{id, content, queuedAt, position, imageBlocks?}` shape) for
+    /// (the §5.5 `{id, content, queuedAt, position, imageBlocks?, fileBlocks?}` shape) for
     /// `agent.getQueue` and the `agent:queue:updated` payload (§6).
     pub(crate) fn queue_snapshot(&self, agent_id: &AgentId) -> Vec<Value> {
         self.agent_queues

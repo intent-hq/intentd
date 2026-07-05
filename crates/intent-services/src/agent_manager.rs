@@ -64,6 +64,16 @@ pub struct TurnOptions {
     pub stdin_context: Option<String>,
     pub note_ids: Option<serde_json::Value>,
     pub context_references: Option<serde_json::Value>,
+    /// FE-supplied image attachments: each `{ data, mimeType }` becomes an ACP
+    /// `Image` content block appended after the text prompt (reference-parity
+    /// `acp-provider.ts`).
+    pub image_blocks: Option<serde_json::Value>,
+    /// FE-supplied file attachments: each `{ data, mimeType, fileName }`
+    /// becomes an ACP `Resource` content block (`EmbeddedResource` with
+    /// `BlobResourceContents`) appended after the text prompt and any image
+    /// blocks; the `fileName` becomes the resource `uri` as `file:///<name>`
+    /// so downstream consumers can reference it.
+    pub file_blocks: Option<serde_json::Value>,
 }
 
 /// Conservative cap used when total system memory cannot be determined.
@@ -952,7 +962,9 @@ impl AgentManager {
             Some(ctx) if !ctx.is_empty() => format!("Context:\n{ctx}\n\n---\n\n{prompt_text}"),
             _ => prompt_text,
         };
-        text_prompt(&prompt_text)
+        let mut blocks = text_prompt(&prompt_text);
+        append_attachment_blocks(&mut blocks, options);
+        blocks
     }
 
     /// Build the user-turn body: normally just `content`, but when the ACP
@@ -1229,7 +1241,12 @@ impl AgentManager {
         options: TurnOptions,
     ) -> Result<Value> {
         if !self.try_begin(&agent_id, &workspace_id).await {
-            let (queued, position) = self.services.enqueue_message(&agent_id, content, None);
+            let (queued, position) = self.services.enqueue_message(
+                &agent_id,
+                content,
+                options.image_blocks.clone(),
+                options.file_blocks.clone(),
+            );
             let result = json!({
                 "success": true,
                 "queued": true,
@@ -1252,7 +1269,12 @@ impl AgentManager {
             // the slot we just released will be reclaimed below if the queue is
             // ready and the agent is otherwise free.
             self.end_turn(&agent_id).await;
-            let (queued, position) = self.services.enqueue_message(&agent_id, content, None);
+            let (queued, position) = self.services.enqueue_message(
+                &agent_id,
+                content,
+                options.image_blocks.clone(),
+                options.file_blocks.clone(),
+            );
             let result = json!({
                 "success": true,
                 "queued": true,
@@ -1304,8 +1326,15 @@ impl AgentManager {
             )
             .await;
         persist_user(&self, &agent_id, &next.content).await;
-        // Queue-drained turns carry no per-turn prompt hints of their own.
-        self.spawn_worker(agent_id, workspace_id, next.content, TurnOptions::default());
+        // Queue-drained turns carry no per-turn prompt hints of their own,
+        // but the FE-supplied attachments captured at enqueue time do ride
+        // along so the drained turn receives the same image + file blocks.
+        let options = TurnOptions {
+            image_blocks: next.image_blocks.clone(),
+            file_blocks: next.file_blocks.clone(),
+            ..TurnOptions::default()
+        };
+        self.spawn_worker(agent_id, workspace_id, next.content, options);
     }
 
     /// `agent.forceMessage` runtime path (§5.5): stop the current stream (abort
@@ -1559,6 +1588,50 @@ fn text_prompt(content: &str) -> Vec<ContentBlock> {
     serde_json::from_value(json!([{ "type": "text", "text": content }])).unwrap_or_default()
 }
 
+/// Append one ACP content block per FE-supplied attachment to `blocks`
+/// (reference-parity `acp-provider.ts`): image entries `{ data, mimeType }`
+/// become `image` content blocks; file entries `{ data, mimeType, fileName }`
+/// become `resource` blocks carrying a `BlobResourceContents` with the file
+/// name lifted into the resource URI (`file:///<fileName>`). Malformed entries
+/// (missing required fields, wrong types) are silently skipped so a partial
+/// attachment array can never break the turn.
+fn append_attachment_blocks(blocks: &mut Vec<ContentBlock>, options: &TurnOptions) {
+    if let Some(imgs) = options.image_blocks.as_ref().and_then(Value::as_array) {
+        for img in imgs {
+            let data = img.get("data").and_then(Value::as_str);
+            let mime = img.get("mimeType").and_then(Value::as_str);
+            if let (Some(data), Some(mime)) = (data, mime) {
+                if let Ok(block) = serde_json::from_value::<ContentBlock>(json!({
+                    "type": "image",
+                    "data": data,
+                    "mimeType": mime,
+                })) {
+                    blocks.push(block);
+                }
+            }
+        }
+    }
+    if let Some(files) = options.file_blocks.as_ref().and_then(Value::as_array) {
+        for file in files {
+            let data = file.get("data").and_then(Value::as_str);
+            let mime = file.get("mimeType").and_then(Value::as_str);
+            let name = file.get("fileName").and_then(Value::as_str);
+            if let (Some(data), Some(mime), Some(name)) = (data, mime, name) {
+                if let Ok(block) = serde_json::from_value::<ContentBlock>(json!({
+                    "type": "resource",
+                    "resource": {
+                        "blob": data,
+                        "mimeType": mime,
+                        "uri": format!("file:///{name}"),
+                    },
+                })) {
+                    blocks.push(block);
+                }
+            }
+        }
+    }
+}
+
 /// Resolved spawn inputs for an agent: the provider config plus the owned model,
 /// cwd, and extra env the borrowing [`SpawnOptions`] reference during a spawn.
 struct ResolvedSpawn {
@@ -1684,9 +1757,11 @@ async fn run_message_worker(
     initial_options: TurnOptions,
 ) {
     let mut content = initial_content;
-    // Only the first turn carries the caller's per-turn hints; queue-drained
-    // follow-up turns run with the default (no `stdinContext` prefix, no
-    // note/context-reference bindings) since a `QueuedMessage` has none.
+    // Only the first turn carries the caller's per-turn prompt-assembly hints
+    // (`stdinContext` / `noteIds` / `contextReferences`) — a `QueuedMessage`
+    // has none. Attachment blocks (`imageBlocks` / `fileBlocks`) are captured
+    // at enqueue time and DO ride along on drain, so a queued turn reaches the
+    // agent with the same ACP content blocks as if it had run inline.
     let mut options = initial_options;
     'outer: loop {
         match mgr.ensure_started(&agent_id, &workspace_id).await {
@@ -1712,9 +1787,15 @@ async fn run_message_worker(
                     mgr.services.queue_snapshot(&agent_id),
                 )
                 .await;
+            let next_image_blocks = next.image_blocks.clone();
+            let next_file_blocks = next.file_blocks.clone();
             persist_user(&mgr, &agent_id, &next.content).await;
             content = next.content;
-            options = TurnOptions::default();
+            options = TurnOptions {
+                image_blocks: next_image_blocks,
+                file_blocks: next_file_blocks,
+                ..TurnOptions::default()
+            };
             continue;
         }
         // Queue drained: release the slot, then re-check for a message that
@@ -1734,9 +1815,15 @@ async fn run_message_worker(
                     mgr.services.queue_snapshot(&agent_id),
                 )
                 .await;
+            let next_image_blocks = next.image_blocks.clone();
+            let next_file_blocks = next.file_blocks.clone();
             persist_user(&mgr, &agent_id, &next.content).await;
             content = next.content;
-            options = TurnOptions::default();
+            options = TurnOptions {
+                image_blocks: next_image_blocks,
+                file_blocks: next_file_blocks,
+                ..TurnOptions::default()
+            };
             continue 'outer;
         }
         // A concurrent send won the slot; hand the message back to it and

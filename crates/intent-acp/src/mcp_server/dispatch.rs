@@ -296,6 +296,7 @@ impl WorkspaceMcpServer {
                         req_str(args, "message")?,
                         None,
                         None,
+                        None,
                         opt_str(args, "priority"),
                         None,
                         None,
