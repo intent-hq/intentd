@@ -32,11 +32,11 @@ use intent_core::{
     NoteVersionSummary, NoteVisibility, ProjectType, ReadAssetResult, SaveAssetResult,
     ScriptCreateParams, SessionStats, SetupScript, TaskAssignAgentResult, TaskConvertBlocksResult,
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult,
-    TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
-    WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceCreateResult,
-    WorkspaceDiffSummary, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceTask,
-    WorkspaceTaskStats, WorkspaceUpdate,
+    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
+    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    WorkspaceCreate, WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceEventSummary,
+    WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -5121,6 +5121,36 @@ impl WorkspaceApi for Services {
                 ok: true,
                 note_id,
                 agent_id: agent,
+            })
+        })
+    }
+
+    fn remove_agent_from_all_tasks(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<TaskRemoveAgentFromAllTasksResult>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let notes = store.list_notes(&workspace_id).await?;
+            let now = now_iso();
+            let mut updated_count: u32 = 0;
+            for mut note in notes {
+                let Some(mut task) = note.task.clone() else {
+                    continue;
+                };
+                if !task.assigned_agent_ids.contains(&agent_id) {
+                    continue;
+                }
+                task.assigned_agent_ids.retain(|id| id != &agent_id);
+                note.task = Some(task);
+                note.updated_at = now.clone();
+                store.update_note(&note).await?;
+                updated_count += 1;
+            }
+            Ok(TaskRemoveAgentFromAllTasksResult {
+                ok: true,
+                updated_count,
             })
         })
     }

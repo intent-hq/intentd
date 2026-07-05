@@ -18,9 +18,9 @@ use crate::model::{
     NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
     NoteVersionSummary, ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
     SetupScript, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskUpdateNoteStatusResult,
-    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
-    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
+    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -616,6 +616,24 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::assign_agent not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `task.removeAgentFromAllTasks` (§5.4 extension): strip `agent_id` from
+    /// every task-note's `assignedAgentIds` in the workspace. Called from the
+    /// agent teardown path (delete-agent, wake-or-create stale-assignment
+    /// cleanup) so those callers do not need to enumerate tasks and issue
+    /// per-note updates.
+    fn remove_agent_from_all_tasks(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<TaskRemoveAgentFromAllTasksResult>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::remove_agent_from_all_tasks not implemented".to_string(),
             ))
         })
     }

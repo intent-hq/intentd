@@ -520,6 +520,15 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        "task.removeAgentFromAllTasks" => {
+            let ws = require_ws_note(params)?;
+            let agent_id = require_str_param(params, "agentId").map(AgentId::from)?;
+            let result = api
+                .remove_agent_from_all_tasks(ws, agent_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
         "task.list" => {
             let ws = require_ws_note(params)?;
             let status = opt_str(params, "status");

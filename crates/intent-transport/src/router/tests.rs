@@ -2093,6 +2093,42 @@ async fn task_comment_methods_missing_note_id_is_minus_32602() {
 }
 
 #[tokio::test]
+async fn task_remove_agent_from_all_tasks_param_validation_and_routing() {
+    // Missing workspaceId → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"task.removeAgentFromAllTasks","params":{"agentId":"a1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("workspaceId is required")
+    );
+
+    // Missing agentId → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"task.removeAgentFromAllTasks","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: agentId")
+    );
+
+    // Both present routes past param validation into the trait default
+    // (`Internal` → `-32603`), proving the arm is wired.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"task.removeAgentFromAllTasks","params":{"workspaceId":"ws-1","agentId":"a1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+}
+
+#[tokio::test]
 async fn event_query_methods_route_and_pass_params() {
     // recentFiles passes `limit` through.
     let v = call(

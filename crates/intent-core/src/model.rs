@@ -972,6 +972,17 @@ pub struct TaskAssignAgentResult {
     pub agent_id: AgentId,
 }
 
+/// Result of `task.removeAgentFromAllTasks` (§5.4 extension). Bulk-sweep helper
+/// called during agent teardown: strips the given agent from every task-note's
+/// `assignedAgentIds` in the workspace and reports how many task-notes were
+/// mutated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRemoveAgentFromAllTasksResult {
+    pub ok: bool,
+    pub updated_count: u32,
+}
+
 // ---------------------------------------------------------------------------
 // comment.* wire DTOs (PROTOCOL §5.3). The stored [`Comment`] keeps anchor and
 // suggestion fields flat; on the wire they nest into `anchorContext` /

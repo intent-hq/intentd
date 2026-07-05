@@ -918,6 +918,84 @@ async fn assign_agent_validates_and_starts_task() {
 }
 
 #[tokio::test]
+async fn remove_agent_from_all_tasks_strips_id_only_from_matching_tasks() {
+    use intent_core::{AgentId, TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+    let victim = AgentId::from("agent-victim");
+    let other = AgentId::from("agent-other");
+
+    // Task A: assigned to both `victim` and `other`.
+    let mut a = note(&ws, "task-a", "a");
+    a.task = Some(TaskMetadata {
+        status: TaskStatus::InProgress,
+        assigned_agent_ids: vec![victim.clone(), other.clone()],
+        ..Default::default()
+    });
+    store.insert_note(&a).await.unwrap();
+
+    // Task B: assigned only to `other` (must be left untouched).
+    let mut b = note(&ws, "task-b", "b");
+    b.task = Some(TaskMetadata {
+        status: TaskStatus::NotStarted,
+        assigned_agent_ids: vec![other.clone()],
+        ..Default::default()
+    });
+    store.insert_note(&b).await.unwrap();
+
+    // Task C: assigned only to `victim`.
+    let mut c = note(&ws, "task-c", "c");
+    c.task = Some(TaskMetadata {
+        status: TaskStatus::NotStarted,
+        assigned_agent_ids: vec![victim.clone()],
+        ..Default::default()
+    });
+    store.insert_note(&c).await.unwrap();
+
+    // Non-task note: must be skipped.
+    store
+        .insert_note(&note(&ws, "plain", "not a task"))
+        .await
+        .unwrap();
+
+    let svc = Services::new(store);
+    let r = svc
+        .remove_agent_from_all_tasks(ws.clone(), victim.clone())
+        .await
+        .expect("removeAgentFromAllTasks");
+    assert!(r.ok);
+    assert_eq!(r.updated_count, 2);
+
+    let a = svc
+        .get_note(ws.clone(), NoteId::from("task-a"))
+        .await
+        .unwrap();
+    assert_eq!(a.task.unwrap().assigned_agent_ids, vec![other.clone()]);
+    let b = svc
+        .get_note(ws.clone(), NoteId::from("task-b"))
+        .await
+        .unwrap();
+    assert_eq!(b.task.unwrap().assigned_agent_ids, vec![other]);
+    let c = svc
+        .get_note(ws.clone(), NoteId::from("task-c"))
+        .await
+        .unwrap();
+    assert!(c.task.unwrap().assigned_agent_ids.is_empty());
+
+    // Idempotent: replaying with the now-absent id updates nothing.
+    let r2 = svc
+        .remove_agent_from_all_tasks(ws, victim)
+        .await
+        .expect("removeAgentFromAllTasks-replay");
+    assert!(r2.ok);
+    assert_eq!(r2.updated_count, 0);
+}
+
+#[tokio::test]
 async fn convert_blocks_creates_children_idempotently() {
     let content = "intro\n@@@task\n# Build API\nBuild the thing.\n@@@\ntail";
     let (_tmp, svc, ws, id) = setup(content).await;

@@ -1143,6 +1143,110 @@ async fn wss_task_list_empty_workspace_emits_zero_stats() {
     srv.ws.stop().await;
 }
 
+/// `task.removeAgentFromAllTasks` (PROTOCOL §5.4 extension) over the real WSS
+/// wire: strips the target agent from every task-note's `assignedAgentIds` in
+/// the workspace and reports the number of task-notes touched. The response
+/// envelope is `{ ok: true, updatedCount: <n> }` and the mutation persists
+/// through the shared store so subsequent `note.get` reads see the stripped
+/// arrays. Non-target agents and non-task notes are left untouched. Replay is
+/// idempotent — a second call with the same agent id updates zero notes.
+#[tokio::test]
+async fn wss_task_remove_agent_from_all_tasks_round_trip() {
+    use intent_core::AgentId;
+
+    let srv = start(WsOptions::default()).await;
+
+    let ws = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws))
+        .await
+        .expect("insert workspace");
+
+    let victim = AgentId::from("agent-victim");
+    let other = AgentId::from("agent-other");
+
+    let mk_task = |id: &str, agents: Vec<AgentId>| {
+        let mut n = fixture_note(&ws, id, "body");
+        n.task = Some(TaskMetadata {
+            status: TaskStatus::InProgress,
+            assigned_agent_ids: agents,
+            ..Default::default()
+        });
+        n
+    };
+    for n in [
+        mk_task("task-a", vec![victim.clone(), other.clone()]),
+        mk_task("task-b", vec![other.clone()]),
+        mk_task("task-c", vec![victim.clone()]),
+    ] {
+        srv.store.insert_note(&n).await.expect("insert task");
+    }
+    // A plain (non-task) note is left alone even if it shares an id shape.
+    srv.store
+        .insert_note(&fixture_note(&ws, "plain", "not a task"))
+        .await
+        .expect("insert plain");
+
+    let req = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"task.removeAgentFromAllTasks","params":{{"workspaceId":"{}","agentId":"{}"}}}}"#,
+        ws.0, victim.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &req).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 1);
+    assert!(resp["error"].is_null(), "unexpected error envelope: {resp}");
+    let result = &resp["result"];
+    assert_eq!(result["ok"], true, "envelope: {resp}");
+    assert_eq!(result["updatedCount"], 2, "two matching tasks: {resp}");
+
+    // Post-condition: victim is stripped from A and C; B is untouched.
+    let a = srv
+        .api
+        .get_note(ws.clone(), NoteId::from("task-a"))
+        .await
+        .expect("get_note task-a");
+    assert_eq!(
+        a.task.as_ref().unwrap().assigned_agent_ids,
+        vec![other.clone()]
+    );
+    let b = srv
+        .api
+        .get_note(ws.clone(), NoteId::from("task-b"))
+        .await
+        .expect("get_note task-b");
+    assert_eq!(b.task.as_ref().unwrap().assigned_agent_ids, vec![other]);
+    let c = srv
+        .api
+        .get_note(ws.clone(), NoteId::from("task-c"))
+        .await
+        .expect("get_note task-c");
+    assert!(c.task.as_ref().unwrap().assigned_agent_ids.is_empty());
+
+    // Replay is idempotent — the second call touches zero notes.
+    let req2 = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"task.removeAgentFromAllTasks","params":{{"workspaceId":"{}","agentId":"{}"}}}}"#,
+        ws.0, victim.0
+    );
+    let resp2 = wss_call(srv.port, srv.cfg.clone(), &req2).await;
+    let result2 = &resp2["result"];
+    assert_eq!(result2["ok"], true);
+    assert_eq!(result2["updatedCount"], 0);
+
+    // Param validation still routes through `-32602` on the wire.
+    let missing_agent = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"task.removeAgentFromAllTasks","params":{{"workspaceId":"{}"}}}}"#,
+        ws.0
+    );
+    let resp3 = wss_call(srv.port, srv.cfg.clone(), &missing_agent).await;
+    assert_eq!(resp3["error"]["code"], -32602);
+    assert_eq!(
+        resp3["error"]["message"],
+        "Missing required parameter: agentId"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `git.commitDetails` + `git.diffs` (with `commitHash`) round-trip over WSS:
 /// proves the daemon's per-commit reads reach a pinned-TLS WebSocket client
 /// with the documented PROTOCOL §5.6 wire shape.
