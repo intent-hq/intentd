@@ -26,6 +26,7 @@ notify = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
+time = { workspace = true, features = ["formatting"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

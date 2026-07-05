@@ -2138,6 +2138,16 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        "file.exists" => {
+            let ws = require_ws_note(params)?;
+            let path = require_str_param(params, "path")?;
+            api.file_exists(ws, path).await.map_err(domain_to_rpc)
+        }
+        "file.stat" => {
+            let ws = require_ws_note(params)?;
+            let path = require_str_param(params, "path")?;
+            api.file_stat(ws, path).await.map_err(domain_to_rpc)
+        }
         "primitive.addReference" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;

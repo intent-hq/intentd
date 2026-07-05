@@ -3140,6 +3140,30 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn file_exists(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            file_ops::exists(&root, &path)
+        })
+    }
+
+    fn file_stat(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            file_ops::stat(&root, &path)
+        })
+    }
+
     fn primitive_add_reference(
         &self,
         workspace_id: WorkspaceId,

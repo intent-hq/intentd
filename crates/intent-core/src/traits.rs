@@ -3767,6 +3767,41 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `file.exists`: existence + type probe returning
+    /// `{ exists, isFile, isDirectory }` (PROTOCOL §5.9). Mirrors the legacy
+    /// `FileExistsResult` shape so retirement-wave consumers swap over 1:1;
+    /// lookup errors collapse to `{ exists: false, isFile: false, isDirectory: false }`.
+    fn file_exists(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_exists not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.stat`: file/directory metadata as
+    /// `{ size, mtime, isFile, isDirectory, isSymlink, permissions }`
+    /// (PROTOCOL §5.9). Mirrors the legacy `StatResult` shape. Symlinks are
+    /// followed for size/type reporting; `permissions` is the octal mode
+    /// string (`"0644"`).
+    fn file_stat(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_stat not implemented".to_string(),
+            ))
+        })
+    }
+
     // ------------------------------------------------------------------------
     // primitive.* — append a fenced ```ws-block:<type>``` JSON primitive to a
     // note. Each returns `{ ok: true, primitiveId, noteId, content }` where

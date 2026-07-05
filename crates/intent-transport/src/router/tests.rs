@@ -1161,6 +1161,33 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn file_exists(
+        &self,
+        _workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "exists": !path.is_empty(),
+                "isFile": true,
+                "isDirectory": false,
+            }))
+        })
+    }
+
+    fn file_stat(&self, _workspace_id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "size": path.len() as u64,
+                "mtime": "1970-01-01T00:00:00.000Z",
+                "isFile": true,
+                "isDirectory": false,
+                "isSymlink": false,
+                "permissions": "0644",
+            }))
+        })
+    }
+
     fn primitive_add_reference(
         &self,
         _workspace_id: WorkspaceId,
@@ -3306,6 +3333,33 @@ async fn file_methods_dispatch_with_exact_wire_shapes() {
             "renamed": true, "isDirectory": false
         })
     );
+
+    // file.exists → { exists, isFile, isDirectory }.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.exists","params":{"workspaceId":"ws-1","path":"a.txt"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "exists": true, "isFile": true, "isDirectory": false })
+    );
+
+    // file.stat → { size, mtime, isFile, isDirectory, isSymlink, permissions }.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.stat","params":{"workspaceId":"ws-1","path":"a.txt"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["size"], serde_json::json!(5u64));
+    assert_eq!(
+        v["result"]["mtime"],
+        serde_json::json!("1970-01-01T00:00:00.000Z")
+    );
+    assert_eq!(v["result"]["isFile"], serde_json::json!(true));
+    assert_eq!(v["result"]["isDirectory"], serde_json::json!(false));
+    assert_eq!(v["result"]["isSymlink"], serde_json::json!(false));
+    assert_eq!(v["result"]["permissions"], serde_json::json!("0644"));
 }
 
 #[tokio::test]
@@ -3337,6 +3391,18 @@ async fn file_methods_require_params() {
     )
     .await
     .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // file.exists / file.stat missing path → -32602.
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"file.exists","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"file.stat","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
     assert_eq!(err_code(&v), -32602);
 }
 
