@@ -3049,6 +3049,56 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `mcp.oauth.list` → `{ tokens: [{ serverId, value }] }` — one entry per
+    /// stored OAuth bag, `value` always the redaction placeholder. The bag
+    /// itself never crosses the wire (PROTOCOL §5.22 companion).
+    fn mcp_oauth_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_oauth_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.oauth.get` → `{ serverId, value }`; `value` is the redaction
+    /// placeholder when a bag exists and `null` when it does not (PROTOCOL
+    /// §5.22 companion).
+    fn mcp_oauth_get(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = server_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_oauth_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.oauth.set` → persist `tokenBag` for `serverId` and return
+    /// `{ serverId, value }` with the redaction placeholder as `value` (the
+    /// bag itself is never echoed). PROTOCOL §5.22 companion.
+    fn mcp_oauth_set(
+        &self,
+        server_id: String,
+        token_bag: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (server_id, token_bag);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_oauth_set not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.oauth.delete` → drop the persisted bag for `serverId`; idempotent
+    /// `{ success: true }` (PROTOCOL §5.22 companion).
+    fn mcp_oauth_delete(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = server_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_oauth_delete not implemented".to_string(),
+            ))
+        })
+    }
+
     // ------------------------------------------------------------------------
     // accept-changes.* — commit→push→PR→merge orchestration (PROTOCOL §5.18).
     // ------------------------------------------------------------------------

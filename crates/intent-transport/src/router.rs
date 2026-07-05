@@ -2397,6 +2397,39 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "mcp.oauth.list" => api.mcp_oauth_list().await.map_err(domain_to_rpc),
+        "mcp.oauth.get" => {
+            let server_id = require_str_param(params, "serverId")?;
+            match api.mcp_oauth_get(server_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.oauth.set" => {
+            let server_id = require_str_param(params, "serverId")?;
+            require_present(params, "tokenBag")?;
+            let token_bag = params.get("tokenBag").cloned().unwrap_or(Value::Null);
+            match api.mcp_oauth_set(server_id, token_bag).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.oauth.delete" => {
+            let server_id = require_str_param(params, "serverId")?;
+            match api.mcp_oauth_delete(server_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }

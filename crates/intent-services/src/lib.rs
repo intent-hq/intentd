@@ -692,6 +692,14 @@ impl Services {
         mcp_servers::McpServersService::new(&self.store, self.secrets.as_ref(), &self.mcp_hub)
     }
 
+    /// Build an [`McpOauthService`](mcp_oauth::McpOauthService) view over the
+    /// store for one `mcp.oauth.*` call. Per-server OAuth token bags live in
+    /// their own `mcp_oauth_tokens` table (§9.4); wire reads are presence-only,
+    /// so no secret store or hub dependency is needed here.
+    fn mcp_oauth_service(&self) -> mcp_oauth::McpOauthService<'_> {
+        mcp_oauth::McpOauthService::new(&self.store)
+    }
+
     /// Borrow the underlying store (composition-root / diagnostics use).
     pub fn store(&self) -> &Store {
         &self.store
@@ -2689,6 +2697,26 @@ impl WorkspaceApi for Services {
         server_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.mcp_servers_service().get_status(&server_id).await })
+    }
+
+    fn mcp_oauth_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_oauth_service().list().await })
+    }
+
+    fn mcp_oauth_get(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_oauth_service().get(&server_id).await })
+    }
+
+    fn mcp_oauth_set(
+        &self,
+        server_id: String,
+        token_bag: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_oauth_service().set(&server_id, token_bag).await })
+    }
+
+    fn mcp_oauth_delete(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_oauth_service().delete(&server_id).await })
     }
 
     fn search_in_files(
@@ -10198,6 +10226,7 @@ pub mod event {}
 
 // Agent-Ecosystem modules (§18).
 mod instructions;
+mod mcp_oauth;
 mod mcp_servers;
 mod memories;
 mod rules;
