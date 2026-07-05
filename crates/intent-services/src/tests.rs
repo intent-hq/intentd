@@ -440,6 +440,62 @@ async fn set_content_reduction_guard_requires_confirmation() {
     assert_eq!(ok.new_content, "x");
 }
 
+/// A5 (CRDT note-merge, PROTOCOL §5.2): two `note.setContent` calls whose new
+/// content each observes the other's write survive in the merged result. The
+/// second write's `oldContent` still points at the persisted state before it
+/// ran, but the CRDT diff against the yrs doc's *current* text preserves the
+/// first write's characters — the FE parity signal that the daemon no longer
+/// last-write-wins on concurrent full-content writes.
+#[tokio::test]
+async fn set_content_merges_concurrent_writes() {
+    let (_tmp, svc, ws, id) = setup("BODY").await;
+
+    // Author A appends a line at the end.
+    let a = svc
+        .set_note_content(ws.clone(), id.clone(), "BODY\nA-line".into(), true, None)
+        .await
+        .expect("A write");
+    assert_eq!(a.new_content, "BODY\nA-line");
+
+    // Author B prepends a line, having read the post-A content as baseline —
+    // the yrs merge stitches both edits together.
+    let b = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "B-line\nBODY\nA-line".into(),
+            true,
+            None,
+        )
+        .await
+        .expect("B write");
+    assert_eq!(b.new_content, "B-line\nBODY\nA-line");
+
+    // A surgical mutation invalidates the CRDT session so the next
+    // `setContent` reseeds from the fresh persisted content.
+    svc.edit_note(
+        ws.clone(),
+        id.clone(),
+        NoteEditInput {
+            old: "A-line".into(),
+            new: "A-line (edited)".into(),
+        },
+    )
+    .await
+    .expect("edit");
+    let c = svc
+        .set_note_content(
+            ws,
+            id,
+            "B-line\nBODY\nA-line (edited)\nC-line".into(),
+            true,
+            None,
+        )
+        .await
+        .expect("C write");
+    assert_eq!(c.new_content, "B-line\nBODY\nA-line (edited)\nC-line");
+}
+
 #[tokio::test]
 async fn update_note_expected_version_gate_hit_miss_absent() {
     let (_tmp, svc, ws, id) = setup("v0").await;

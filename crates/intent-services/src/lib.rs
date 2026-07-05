@@ -49,6 +49,7 @@ mod agent_session;
 mod agent_subscriptions;
 mod auto_commit;
 mod clone_ops;
+mod crdt_notes;
 mod drafts;
 mod enhance_ops;
 mod event_ops;
@@ -253,6 +254,17 @@ pub struct Services {
     /// service handle observes the same in-flight timers.
     line_attribution_debouncers:
         Arc<Mutex<HashMap<(WorkspaceId, NoteId), tokio::task::AbortHandle>>>,
+    /// Session-only CRDT merge engine for note full-content writes (PROTOCOL
+    /// `note.setContent` / `note.update` with content, §5.2). Ported from the
+    /// reference `CRDTDocumentManager` / `CRDTNotesService` — a yrs `Doc` is
+    /// seeded from the note's stored content on first touch and subsequent
+    /// full-content writes apply a char-level diff inside a yrs transaction;
+    /// the merged text is what the daemon persists, so concurrent writes
+    /// converge instead of last-write-wins. Surgical `note.*` / `task.*`
+    /// mutations invalidate the cached session so the next full-content write
+    /// reseeds from disk. Shared across clones like the other in-memory
+    /// registries.
+    crdt_notes: Arc<crdt_notes::CrdtNoteManager>,
 }
 
 impl Services {
@@ -286,6 +298,7 @@ impl Services {
             live_turns: Arc::new(Mutex::new(HashMap::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
+            crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
         }
     }
 
@@ -1213,6 +1226,16 @@ impl Services {
                 prev.abort();
             }
         }
+    }
+
+    /// Drop any cached CRDT session for `(workspace, note)` after a surgical
+    /// content mutation (`note.add` / `note.edit` / `note.editLines`,
+    /// `task.updateStatus` / `task.update`, `note.restoreVersion`,
+    /// `note.convertBlocks`, `comment.add`) writes directly to storage. The
+    /// next full-content write (`note.setContent`) will reseed the yrs doc
+    /// from the fresh persisted content so the merge baseline stays coherent.
+    pub(crate) fn invalidate_crdt_note(&self, workspace_id: &WorkspaceId, note_id: &NoteId) {
+        self.crdt_notes.invalidate(workspace_id, note_id);
     }
 }
 
@@ -4359,7 +4382,17 @@ impl WorkspaceApi for Services {
             // content present → raw full set; otherwise title/tags metadata.
             let content_changed = input.content.is_some();
             if let Some(content) = input.content {
-                note.content = content;
+                // Route the full-content write through the CRDT merge engine
+                // so concurrent writers converge (§5.2 / A5 parity with
+                // `CRDTNotesService.applyContentUpdate`).
+                let old_content = note.content.clone();
+                let merged = services.crdt_notes.apply_full_content(
+                    &workspace_id,
+                    &note_id,
+                    &old_content,
+                    &content,
+                );
+                note.content = merged;
             } else {
                 if let Some(title) = input.title {
                     note.title = title;
@@ -4416,6 +4449,7 @@ impl WorkspaceApi for Services {
             capture_note_version(&store, &note).await?;
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
+            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             publish_event(
                 &bus,
                 note_change_event(
@@ -4466,6 +4500,7 @@ impl WorkspaceApi for Services {
             capture_note_version(&store, &note).await?;
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
+            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             publish_event(
                 &bus,
                 note_change_event(
@@ -4517,6 +4552,7 @@ impl WorkspaceApi for Services {
             capture_note_version(&store, &note).await?;
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
+            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             publish_event(
                 &bus,
                 note_change_event(
@@ -4571,7 +4607,20 @@ impl WorkspaceApi for Services {
                     )));
                 }
             }
-            let clean = note_ops::clean_set_content(&content)?;
+            // Route the full-content write through the CRDT merge engine
+            // (`CRDTNotesService.applyContentUpdate`): the yrs `Doc` is seeded
+            // from `old_content` on first touch and subsequent writes diff
+            // against the doc's current text, so concurrent full-content
+            // writes converge instead of last-write-wins. The merged text is
+            // what we then clean + persist through the normal mutation flow,
+            // so the line-attribution recompute still fires downstream.
+            let merged = services.crdt_notes.apply_full_content(
+                &workspace_id,
+                &note_id,
+                &old_content,
+                &content,
+            );
+            let clean = note_ops::clean_set_content(&merged)?;
             note.content = clean.clone();
             let now = now_iso();
             note.updated_at = now.clone();
@@ -4679,12 +4728,14 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<NoteDeleteResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let services = self.clone();
         Box::pin(async move {
             // Scope-check first so a foreign/absent note yields the peer message.
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             store
                 .delete_note_versioned(&note_id, expected_version)
                 .await?;
+            services.crdt_notes.remove(&workspace_id, &note_id);
             publish_event(
                 &bus,
                 note_change_event(&workspace_id, &note_id, &note.title, NOTE_DELETED, "delete"),
@@ -4827,6 +4878,7 @@ impl WorkspaceApi for Services {
             let new_v = capture_note_version(&store, &note).await?;
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
+            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             publish_event(
                 &bus,
                 note_change_event(
@@ -4889,6 +4941,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<TaskUpdateStatusResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let services = self.clone();
         Box::pin(async move {
             if task_text.is_empty() {
                 return Err(Error::Internal(
@@ -4904,6 +4957,7 @@ impl WorkspaceApi for Services {
             note.content = updated;
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             publish_event(
                 &bus,
                 note_change_event(
@@ -5001,6 +5055,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<TaskUpdateResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let services = self.clone();
         Box::pin(async move {
             if text.is_none() && status.is_none() {
                 return Err(Error::Internal(
@@ -5030,6 +5085,7 @@ impl WorkspaceApi for Services {
             note.content = update.content;
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             publish_event(
                 &bus,
                 note_change_event(
@@ -5267,6 +5323,7 @@ impl WorkspaceApi for Services {
             note.content = working;
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             Ok(TaskConvertBlocksResult {
                 ok: true,
                 converted_count: created_note_ids.len() as i64,
@@ -5412,6 +5469,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<CommentAddResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let services = self.clone();
         Box::pin(async move {
             if comment.trim().is_empty() {
                 return Err(Error::Internal(
@@ -5442,6 +5500,7 @@ impl WorkspaceApi for Services {
             );
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let now = now_iso();
             let new_comment = Comment {
                 id: comment_id.clone(),
