@@ -4,9 +4,10 @@
 //! min/max validation, and the redaction rule for **sensitive** settings.
 //! Non-secret values persist in the `settings` table (`intent-store`); sensitive
 //! values (`workspace.sshKeyPath`, `mcp.servers`, `server.auth.token`,
-//! `sourceControl.github.token`, `linear.token`) live in the OS keychain via the [`SecretStore`]
-//! seam and are **never** returned in plaintext over the wire — list/get redact
-//! them to presence/placeholder only, and `server.auth.token` is read-only.
+//! `sourceControl.github.token`, `linear.token`, `accounts.sentry.token`,
+//! `ai.apiToken`) live in the OS keychain via the [`SecretStore`] seam and are
+//! **never** returned in plaintext over the wire — list/get redact them to
+//! presence/placeholder only, and `server.auth.token` is read-only.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -587,6 +588,114 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "API key used by the Linear integration",
             "linear",
         ),
+        // --- Group A: Sentry account -----------------------------------------
+        secret(
+            "accounts.sentry.token",
+            "Sentry API token",
+            "API token used by the Sentry integration",
+            "accounts",
+        ),
+        string(
+            "accounts.sentry.organization",
+            "Sentry organization",
+            "Sentry organization slug (non-secret companion of accounts.sentry.token)",
+            "accounts",
+            None,
+        ),
+        // --- Group A: primary AI provider config ------------------------------
+        // Ports the FE `workspace-config` `config.ai.*` blob so the daemon owns
+        // the provider knobs the FE previously stored in electron-store.
+        // `ai.apiToken` is a **secret**; the rest are plain settings.
+        secret(
+            "ai.apiToken",
+            "AI provider API token",
+            "Bearer token used by the primary AI provider",
+            "ai",
+        ),
+        string(
+            "ai.apiUrl",
+            "AI provider API URL",
+            "Base URL for the primary AI provider",
+            "ai",
+            None,
+        ),
+        string("ai.model", "AI model", "Default AI model", "ai", None),
+        number(
+            "ai.temperature",
+            "AI temperature",
+            "Sampling temperature for the primary AI provider",
+            "ai",
+            Some(0.0),
+            Some(2.0),
+            0.7,
+        ),
+        number(
+            "ai.maxTokens",
+            "AI max tokens",
+            "Maximum tokens per completion for the primary AI provider",
+            "ai",
+            Some(1.0),
+            None,
+            4096.0,
+        ),
+        number(
+            "ai.streamingSpeed",
+            "AI streaming speed",
+            "Streaming pacing hint (tokens per second; 0 = no throttle)",
+            "ai",
+            Some(0.0),
+            None,
+            0.0,
+        ),
+        // --- Group A: persisted permission rules ------------------------------
+        // Port of the FE `ConfigManager` `config.permissions.rules` bag: an array
+        // of command allow/deny/ask entries with optional expiries. Structure is
+        // opaque here; the runtime enforcement path validates entries.
+        object(
+            "permissions.rules",
+            "Command permission rules",
+            "Persisted command allow/deny/ask rules",
+            "permissions",
+            Some(json!([])),
+        ),
+        // --- Group A: user + workspace prompt-rules ---------------------------
+        // Ports of `ConfigManager` `config.userRules` and `config.workspaceRules`:
+        // free-form content injected into agent system prompts. Kept as opaque
+        // objects here; the prompt-assembly pipeline validates internal shape.
+        object(
+            "userRules",
+            "User rules",
+            "Global user prompt-rule content injected into agent system prompts",
+            "rules",
+            Some(json!({})),
+        ),
+        object(
+            "workspaceRules",
+            "Workspace rules",
+            "Workspace-scoped prompt-rule content injected into agent system prompts",
+            "rules",
+            Some(json!({})),
+        ),
+        // --- Group A: cross-workspace known repos -----------------------------
+        // Port of the FE `repo-registry` electron-store: the ordered list of
+        // recently used repositories the FE surfaces in "recent repos" UI.
+        object(
+            "repos.known",
+            "Known repositories",
+            "Recently used repositories tracked across workspaces",
+            "repos",
+            Some(json!([])),
+        ),
+        // --- Group A: persisted workspace change history ----------------------
+        // Port of the FE default `config.json` `changeHistory` bag: per-workspace
+        // durable diff summaries the FE renders in the change-history UI.
+        object(
+            "workspace.changeHistory",
+            "Workspace change history",
+            "Per-workspace persisted diff summaries",
+            "workspace",
+            Some(json!({})),
+        ),
         // --- Group B: context engine ----------------------------------------
         boolean(
             "context.enabled",
@@ -816,5 +925,100 @@ mod tests {
         assert_eq!(def.category, "linear");
         assert!(matches!(def.ty, SettingType::String));
         assert!(def.default_value.is_none());
+    }
+
+    /// `accounts.sentry.token` and `ai.apiToken` — the two secret catalog gaps
+    /// closed for R0-4 — must be sensitive so `settings.update` persists them to
+    /// the keychain under service `intentd` / account = setting path (never the
+    /// DB) and every wire read (`settings.list` / `settings.get`) redacts them
+    /// to a placeholder or `null` when unset.
+    #[test]
+    fn new_secret_catalog_entries_are_sensitive() {
+        for path in ["accounts.sentry.token", "ai.apiToken"] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert_eq!(def.path, path);
+            assert!(def.sensitive, "{path} must be a sensitive catalog entry");
+            assert!(!def.read_only, "{path} must not be read-only");
+            assert!(matches!(def.ty, SettingType::String));
+            assert!(def.default_value.is_none(), "{path} default is null");
+        }
+    }
+
+    /// The non-secret companion of `accounts.sentry.token` lives beside it in
+    /// the `accounts` category with no default (the FE opts in per install).
+    #[test]
+    fn sentry_organization_is_a_plain_string_setting() {
+        let def =
+            find_definition("accounts.sentry.organization").expect("sentry organization missing");
+        assert!(!def.sensitive);
+        assert!(matches!(def.ty, SettingType::String));
+        assert_eq!(def.category, "accounts");
+        assert!(def.default_value.is_none());
+    }
+
+    /// The non-secret half of the `ai.*` group (URL / model / temperature /
+    /// maxTokens / streamingSpeed) ports the FE `workspace-config` `config.ai.*`
+    /// blob one-to-one; `temperature` carries the documented 0..=2 clamp and
+    /// `maxTokens` / `streamingSpeed` refuse negative values.
+    #[test]
+    fn ai_non_secret_group_matches_fe_shape() {
+        for (path, default_present) in [
+            ("ai.apiUrl", false),
+            ("ai.model", false),
+            ("ai.temperature", true),
+            ("ai.maxTokens", true),
+            ("ai.streamingSpeed", true),
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(!def.sensitive, "{path} is non-secret");
+            assert_eq!(def.category, "ai");
+            assert_eq!(
+                def.default_value.is_some(),
+                default_present,
+                "{path} default presence"
+            );
+        }
+        let temp = find_definition("ai.temperature").unwrap();
+        assert!(matches!(
+            temp.ty,
+            SettingType::Number {
+                min: Some(0.0),
+                max: Some(2.0),
+            }
+        ));
+        for path in ["ai.maxTokens", "ai.streamingSpeed"] {
+            let def = find_definition(path).unwrap();
+            let min = match def.ty {
+                SettingType::Number { min, .. } => min,
+                _ => panic!("{path} must be a Number"),
+            };
+            assert!(
+                min.map(|m| m >= 0.0).unwrap_or(false),
+                "{path} must reject negative values"
+            );
+        }
+    }
+
+    /// The five non-secret gap entries live in the catalog as opaque `Object`
+    /// settings with a documented default. Each is validated by shape only;
+    /// downstream consumers own the internal schema (permission rules, prompt
+    /// rules, known repos, change-history bags).
+    #[test]
+    fn non_secret_object_gap_entries_have_defaults() {
+        for path in [
+            "permissions.rules",
+            "userRules",
+            "workspaceRules",
+            "repos.known",
+            "workspace.changeHistory",
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(!def.sensitive, "{path} must be non-secret");
+            assert!(
+                matches!(def.ty, SettingType::Object),
+                "{path} must be Object"
+            );
+            assert!(def.default_value.is_some(), "{path} has a default");
+        }
     }
 }
