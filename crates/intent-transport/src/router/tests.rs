@@ -2398,6 +2398,40 @@ async fn agent_methods_validate_required_params() {
         v["error"]["message"],
         serde_json::json!("timeoutMs must be a positive integer")
     );
+
+    // agent.completeOnce (§5.32) without prompt.
+    let v = call(r#"{"jsonrpc":"2.0","id":12,"method":"agent.completeOnce","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: prompt")
+    );
+
+    // agent.completeOnce with a blank prompt.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":13,"method":"agent.completeOnce","params":{"prompt":"   "}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("prompt cannot be empty")
+    );
+
+    // agent.completeOnce with a non-positive timeoutMs.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":14,"method":"agent.completeOnce","params":{"prompt":"hi","timeoutMs":0}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("timeoutMs must be a positive integer")
+    );
 }
 
 #[tokio::test]
@@ -2426,6 +2460,15 @@ async fn agent_methods_are_routed_not_method_not_found() {
     // default impl yields -32603, never -32601).
     let v = call(
         r#"{"jsonrpc":"2.0","id":9,"method":"agent.enhancePrompt","params":{"prompt":"improve me","mode":"layout","model":"haiku4.5","timeoutMs":5000}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+
+    // agent.completeOnce (§5.32) with valid params routes past dispatch (the
+    // default impl yields -32603, never -32601).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":10,"method":"agent.completeOnce","params":{"prompt":"pick a slug","systemPrompt":"be terse","model":"haiku4.5","timeoutMs":5000}}"#,
     )
     .await
     .unwrap();

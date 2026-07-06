@@ -49,6 +49,7 @@ mod agent_session;
 mod agent_subscriptions;
 mod auto_commit;
 mod clone_ops;
+mod complete_ops;
 mod crdt_notes;
 mod drafts;
 mod enhance_ops;
@@ -149,10 +150,11 @@ pub struct Services {
     /// successful auggie CLI fetch is cached; the static fallback is recomputed
     /// per call. Shared across clones so every handle sees the same window.
     models_cache: agent_ops::ModelsCache,
-    /// Test-only override for the auggie binary `agent.enhancePrompt` (§5.31)
-    /// spawns. Production composition leaves this `None` and the op resolves
-    /// the CLI via `intent_context::discovery::find_auggie`; tests point it at
-    /// a deterministic fixture script.
+    /// Test-only override for the auggie binary the one-shot CLI RPCs
+    /// (`agent.enhancePrompt` §5.31, `agent.completeOnce` §5.32) spawn.
+    /// Production composition leaves this `None` and the ops resolve the CLI
+    /// via `intent_context::discovery::find_auggie`; tests point it at a
+    /// deterministic fixture script.
     auggie_bin: Option<PathBuf>,
     /// Daemon-owned parent→child completion-watch registry (AS-2), keyed by
     /// workspace. A oneShot watch is registered when an agent delegates with
@@ -689,9 +691,10 @@ impl Services {
         self
     }
 
-    /// Override the auggie binary `agent.enhancePrompt` (§5.31) spawns. The
-    /// composition root keeps the discovery default (`find_auggie`); tests
-    /// inject a fixture script so the one-shot CLI path is deterministic.
+    /// Override the auggie binary the one-shot CLI RPCs (`agent.enhancePrompt`
+    /// §5.31, `agent.completeOnce` §5.32) spawn. The composition root keeps
+    /// the discovery default (`find_auggie`); tests inject a fixture script
+    /// so the one-shot CLI path is deterministic.
     pub fn with_auggie_bin(mut self, bin: PathBuf) -> Self {
         self.auggie_bin = Some(bin);
         self
@@ -7115,6 +7118,20 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.agent_enhance_prompt_op(prompt, mode, model, workspace_id, timeout_ms)
+                .await
+        })
+    }
+
+    fn agent_complete_once(
+        &self,
+        prompt: String,
+        system_prompt: Option<String>,
+        model: Option<String>,
+        workspace_id: Option<WorkspaceId>,
+        timeout_ms: Option<u64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_complete_once_op(prompt, system_prompt, model, workspace_id, timeout_ms)
                 .await
         })
     }

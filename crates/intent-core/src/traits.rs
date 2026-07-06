@@ -1155,6 +1155,27 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.completeOnce`: stateless one-shot prompt→completion via the
+    /// auggie CLI — `{ text }`. Optional `system_prompt` is composed with
+    /// `prompt` before dispatch; `workspace_id` optionally pins the CLI's cwd
+    /// (PROTOCOL §5.32). Daemon owns the full lifecycle including reap on
+    /// timeout/failure; no session or agent state is created.
+    fn agent_complete_once(
+        &self,
+        prompt: String,
+        system_prompt: Option<String>,
+        model: Option<String>,
+        workspace_id: Option<WorkspaceId>,
+        timeout_ms: Option<u64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (prompt, system_prompt, model, workspace_id, timeout_ms);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_complete_once not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.respondPermission`: resolve an outstanding interactive permission
     /// prompt by `requestId`, unblocking the agent with the §8 `outcome`
     /// (`{ outcome: "selected", optionId }` / `{ outcome: "cancelled" }`).

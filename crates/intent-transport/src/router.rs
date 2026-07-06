@@ -1060,6 +1060,33 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.completeOnce" => {
+            // Stateless one-shot prompt→completion RPC (PROTOCOL §5.32). Ports
+            // the FE `background-request.service.ts` slug-generation +
+            // note-status callers so no ACPProvider / ephemeral session is
+            // needed. The daemon reaps the CLI on any failure path — no
+            // session/agent state is created, so there is nothing to
+            // garbage-collect on error.
+            let prompt = require_str_param(params, "prompt")?;
+            if prompt.trim().is_empty() {
+                return Err(rpc(INVALID_PARAMS, "prompt cannot be empty"));
+            }
+            let system_prompt = opt_str(params, "systemPrompt");
+            let model = opt_str(params, "model");
+            let ws = opt_workspace_id(params);
+            let timeout_ms =
+                match params.get("timeoutMs") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
+                        rpc(INVALID_PARAMS, "timeoutMs must be a positive integer")
+                    })?),
+                };
+            let result = api
+                .agent_complete_once(prompt, system_prompt, model, ws, timeout_ms)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.respondPermission" => {
             // Resolve an outstanding interactive prompt (PROTOCOL §8). `requestId`
             // is required; the §8 `outcome` object is validated in the handler so

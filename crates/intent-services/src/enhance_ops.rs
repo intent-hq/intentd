@@ -187,8 +187,9 @@ pub(crate) fn clean_agent_message(content: &str) -> String {
 /// Spawn `auggie --print` with MCP disabled, pipe `prompt` over stdin, and
 /// collect stdout under a hard timeout. `kill_on_drop` (plus a unix
 /// process-group SIGKILL on timeout) keeps a hung CLI from outliving the
-/// request.
-async fn run_auggie_print(
+/// request. Shared with `agent.completeOnce` (§5.32) so both one-shot RPCs
+/// use the same reap-on-failure discipline.
+pub(crate) async fn run_auggie_print(
     bin: &Path,
     model: Option<&str>,
     cwd: Option<&Path>,

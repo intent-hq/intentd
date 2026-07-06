@@ -975,6 +975,115 @@ async fn wss_agent_enhance_prompt_validates_params() {
     srv.ws.stop().await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_round_trip() {
+    // agent.completeOnce (§5.32) — stateless one-shot prompt→completion.
+    // `{ prompt }` returns `{ text }` with the cleaned CLI reply verbatim,
+    // over the real pinned-TLS WSS transport.
+    let bin = fake_auggie_script(
+        "complete-ok",
+        "printf '\u{1b}[32m🔧 Tool call: noise\u{1b}[0m\\n🤖\\nfix-login-flow\\n'",
+    );
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":41,"method":"agent.completeOnce","params":{"prompt":"slug for login fix"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 41);
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["result"]["text"], "fix-login-flow");
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn wss_agent_complete_once_cli_missing_is_internal_error() {
+    // A missing/unspawnable auggie binary surfaces as -32603 rather than
+    // hanging — the daemon reaps and returns a JSON-RPC error (§5.32).
+    let srv = start_with_auggie(
+        WsOptions::default(),
+        Some(std::path::PathBuf::from("/nonexistent/intentd-wss/auggie")),
+    )
+    .await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":42,"method":"agent.completeOnce","params":{"prompt":"hi"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 42);
+    assert_eq!(resp["error"]["code"], -32603);
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_timeout_reaps_and_errors() {
+    // A hung CLI is reaped when the client-provided timeout elapses; the
+    // response is a -32603 whose `data` carries the timeout message. Proves
+    // the standing design principle — the daemon owns cleanup on in-flight
+    // failure, no session/agent state is leaked.
+    let bin = fake_auggie_script("complete-slow", "sleep 30");
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":43,"method":"agent.completeOnce","params":{"prompt":"hi","timeoutMs":200}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 43);
+    assert_eq!(resp["error"]["code"], -32603);
+    let data = resp["error"]["data"].as_str().unwrap_or_default();
+    assert!(
+        data.contains("timed out after 200ms"),
+        "unexpected data: {data}"
+    );
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn wss_agent_complete_once_validates_params() {
+    // Router-side -32602s (§5.32): missing prompt, blank prompt, non-positive
+    // timeoutMs — all rejected before any CLI spawn.
+    let srv = start(WsOptions::default()).await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":44,"method":"agent.completeOnce","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["message"],
+        "Missing required parameter: prompt"
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":45,"method":"agent.completeOnce","params":{"prompt":"   "}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(resp["error"]["message"], "prompt cannot be empty");
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":46,"method":"agent.completeOnce","params":{"prompt":"hi","timeoutMs":0}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["message"],
+        "timeoutMs must be a positive integer"
+    );
+    srv.ws.stop().await;
+}
+
 #[tokio::test]
 async fn wss_host_status_reports_remote_locality() {
     // host.status is answered on the WSS transport (§5.14) and reports `remote`
