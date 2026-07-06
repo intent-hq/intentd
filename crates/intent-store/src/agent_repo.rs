@@ -20,7 +20,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, \
     parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, \
     completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
-    is_background";
+    is_background, metadata";
 
 /// Encode an optional JSON payload column (`context_references` /
 /// `image_blocks`) as its TEXT form, `None` staying NULL.
@@ -48,7 +48,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&s.id.0)
@@ -75,6 +75,7 @@ impl Store {
             .bind(json_col_to_db(&s.context_references)?)
             .bind(json_col_to_db(&s.image_blocks)?)
             .bind(s.is_background as i64)
+            .bind(encode_metadata(s.metadata.as_ref())?)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
@@ -152,8 +153,8 @@ impl Store {
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
-             initial_message=?, context_references=?, image_blocks=?, is_background=? \
-             WHERE id=?",
+             initial_message=?, context_references=?, image_blocks=?, is_background=?, \
+             metadata=? WHERE id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.acp_session_id)
@@ -176,6 +177,7 @@ impl Store {
         .bind(json_col_to_db(&s.context_references)?)
         .bind(json_col_to_db(&s.image_blocks)?)
         .bind(s.is_background as i64)
+        .bind(encode_metadata(s.metadata.as_ref())?)
         .bind(&s.id.0)
         .execute(self.pool())
         .await
@@ -293,6 +295,15 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
     let backend: Option<String> = col(row, "backend_session_id")?;
     let parent: Option<String> = col(row, "parent_agent_id")?;
     let task_note: Option<String> = col(row, "task_note_id")?;
+    let metadata_raw: Option<String> = col(row, "metadata")?;
+    let metadata = match metadata_raw {
+        Some(raw) if !raw.is_empty() => Some(
+            serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
+                Error::Internal(format!("decode agent session metadata failed: {e}"))
+            })?,
+        ),
+        _ => None,
+    };
     Ok(AgentSession {
         id: AgentId(col(row, "id")?),
         workspace_id: WorkspaceId(col(row, "workspace_id")?),
@@ -322,13 +333,25 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         )?,
         image_blocks: json_col_from_db(col(row, "image_blocks")?, "image_blocks")?,
         is_background: col::<i64>(row, "is_background")? != 0,
+        metadata,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
     })
 }
 
-const MESSAGE_COLUMNS: &str = "id, agent_id, seq, role, content, metadata, created_at";
+/// Encode `agent_session.metadata` for persistence: `None` → SQL `NULL`,
+/// `Some(value)` → the JSON-serialized string. Kept local to this module so
+/// `insert_agent_session` and `update_agent_session` share the same shape.
+fn encode_metadata(value: Option<&serde_json::Value>) -> Result<Option<String>> {
+    match value {
+        None => Ok(None),
+        Some(v) => Ok(Some(serde_json::to_string(v).map_err(|e| {
+            Error::Internal(format!("encode agent session metadata failed: {e}"))
+        })?)),
+    }
+}
 
+const MESSAGE_COLUMNS: &str = "id, agent_id, seq, role, content, metadata, created_at";
 impl Store {
     /// Append a message to an agent's insert-only log, minting a UUIDv7 id and
     /// the next monotonic `seq`, and return the persisted [`AgentMessage`].

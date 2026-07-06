@@ -87,18 +87,17 @@ async fn migration_status_reports_current_after_open() {
         status.expected,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28
+            25, 26, 27, 28, 29
         ]
     );
     assert_eq!(
         status.applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28
+            25, 26, 27, 28, 29
         ]
     );
 }
-
 #[tokio::test]
 async fn workspace_round_trip_and_archive_filter() {
     let tmp = TempDb::new();
@@ -1034,11 +1033,11 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         context_references: None,
         image_blocks: None,
         is_background: false,
+        metadata: None,
         created_at: ts.clone(),
         updated_at: ts,
     }
 }
-
 #[tokio::test]
 async fn agent_session_round_trip_and_append_only_log() {
     let tmp = TempDb::new();

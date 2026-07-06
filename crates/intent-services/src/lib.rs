@@ -7368,10 +7368,10 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
         context_message: String,
-        model: Option<String>,
+        input: intent_core::AgentWakeOrCreateInput,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_wake_or_create_op(workspace_id, task_note_id, context_message, model)
+            self.agent_wake_or_create_op(workspace_id, task_note_id, context_message, input)
                 .await
         })
     }

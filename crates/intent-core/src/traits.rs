@@ -1239,16 +1239,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `agent.wakeOrCreate`: resume/create the agent assigned to a task note
-    /// (PROTOCOL §5.5).
+    /// `agent.wakeOrCreate` (PROTOCOL §5.5, widened by C1d-10a): resume the
+    /// newest live/resumable agent assigned to the task, or create + assign a
+    /// new one — inheriting specialist/model from the most-recent previous
+    /// session and honoring the FE `WakeOrCreateTaskAgentTool` create payload
+    /// (name/contextReferences/metadata/skipAutoCommit) — then deliver the
+    /// context message (optionally tagged with `input.messageMetadata`).
+    /// `input.callerAgentId`/`input.delegationDepth` gate the
+    /// delegation-depth guard. All fields on [`crate::AgentWakeOrCreateInput`]
+    /// are optional so the pre-widening 3-required-params callers stay green.
     fn agent_wake_or_create(
         &self,
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
         context_message: String,
-        model: Option<String>,
+        input: crate::model::AgentWakeOrCreateInput,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, task_note_id, context_message, model);
+        let _ = (workspace_id, task_note_id, context_message, input);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_wake_or_create not implemented".to_string(),

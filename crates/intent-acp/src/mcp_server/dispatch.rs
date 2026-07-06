@@ -417,7 +417,10 @@ impl WorkspaceMcpServer {
                         ws,
                         note_id(args, "taskNoteId")?,
                         req_str(args, "contextMessage")?,
-                        opt_str(args, "model"),
+                        intent_core::AgentWakeOrCreateInput {
+                            model: opt_str(args, "model"),
+                            ..Default::default()
+                        },
                     )
                     .await)
             }

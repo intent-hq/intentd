@@ -1540,6 +1540,15 @@ pub struct AgentSession {
     /// shape for foreground sessions.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_background: bool,
+    /// Free-form `metadata` object persisted with the session (C1d-10a). Closes
+    /// the metadata half of the P2-12a deferral for `agent_create_op` so the
+    /// widened `agent.wakeOrCreate` composite can read back
+    /// `delegationDepth` / `createdByAgentId` / `taskNoteId` / `isBackground`
+    /// / `source` / `skipAutoCommit` from a parent's session without a
+    /// follow-up round-trip. `None` for pre-existing rows and for creates
+    /// that omit the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1751,6 +1760,45 @@ pub struct AgentDelegateInput {
     pub behavior_prompt: Option<String>,
     pub wait_mode: Option<String>,
     pub skip_auto_commit: Option<bool>,
+}
+
+/// Optional `create.*` payload on [`AgentWakeOrCreateInput`] — the fields the
+/// widened `agent.wakeOrCreate` (C1d-10a) forwards into `agent.create` when the
+/// task has no live/resumable assigned agent. Mirrors the FE
+/// `WakeOrCreateTaskAgentTool` create payload: `name`, `specialist`,
+/// `provider`, `agentType`, `model`, `contextReferences`, `metadata`, and
+/// `skipAutoCommit`. All optional so the pre-widening wire shape stays valid;
+/// specialist/model inheritance from a previous assigned session wins over
+/// these when both are present.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AgentWakeCreateOptions {
+    pub name: Option<String>,
+    pub specialist: Option<String>,
+    pub provider: Option<String>,
+    pub agent_type: Option<String>,
+    pub model: Option<String>,
+    pub context_references: Option<serde_json::Value>,
+    pub metadata: Option<serde_json::Value>,
+    pub skip_auto_commit: Option<bool>,
+}
+
+/// Wire input for `agent.wakeOrCreate` (PROTOCOL §5.5, widened by C1d-10a).
+/// `workspaceId`, `taskNoteId`, `contextMessage` are passed separately (the
+/// existing 3-required-params shape). Everything here is optional so the
+/// pre-widening callers stay green: `model` is the wake-branch model override;
+/// `callerAgentId`/`delegationDepth` drive the delegation-depth guard;
+/// `messageMetadata` is threaded onto the delivered context message on both
+/// branches; `create` carries the rich `agent.create` payload used when no
+/// live/resumable assigned agent is found.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AgentWakeOrCreateInput {
+    pub model: Option<String>,
+    pub caller_agent_id: Option<AgentId>,
+    pub delegation_depth: Option<i64>,
+    pub message_metadata: Option<serde_json::Value>,
+    pub create: Option<AgentWakeCreateOptions>,
 }
 
 /// A single file's status line, mirroring the TS `GitFileStatus` enum
@@ -2582,6 +2630,7 @@ mod tests {
             context_references: None,
             image_blocks: None,
             is_background: true,
+            metadata: None,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
         };
@@ -2642,6 +2691,7 @@ mod tests {
             context_references: None,
             image_blocks: None,
             is_background: false,
+            metadata: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
         };

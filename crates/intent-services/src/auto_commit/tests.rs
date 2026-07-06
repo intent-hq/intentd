@@ -157,6 +157,7 @@ fn session(
         context_references: None,
         image_blocks: None,
         is_background: false,
+        metadata: None,
         created_at: ts.clone(),
         updated_at: ts,
     }

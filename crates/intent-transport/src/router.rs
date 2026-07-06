@@ -7,9 +7,10 @@
 //! transport (UDS today, WS/TLS later) shares one code path.
 
 use intent_core::{
-    AgentCreateExtra, AgentDelegateInput, AgentId, Error, EventQueryParams, NoteAddInput,
-    NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams,
-    ScriptMode, WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
+    AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
+    Error, EventQueryParams, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId,
+    NoteUpdateInput, ScriptCreateParams, ScriptMode, WorkspaceApi, WorkspaceCreate, WorkspaceId,
+    WorkspaceUpdate,
 };
 use serde_json::{json, Map, Value};
 
@@ -1140,9 +1141,32 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let task_note_id = require_str_param(params, "taskNoteId").map(NoteId::from)?;
             let context_message = require_str_param(params, "contextMessage")?;
-            let model = opt_str(params, "model");
+            // Widened wire input (C1d-10a). All fields optional so the
+            // pre-widening 3-required-params call shape stays green;
+            // `create.*` is parsed via serde (a missing `create` object
+            // collapses to `None`, empty subfields collapse to `None`).
+            let create = params
+                .get("create")
+                .filter(|v| !v.is_null())
+                .cloned()
+                .map(serde_json::from_value::<AgentWakeCreateOptions>)
+                .transpose()
+                .map_err(|e| {
+                    rpc(
+                        INVALID_PARAMS,
+                        format!("agent.wakeOrCreate: invalid `create` payload: {e}"),
+                    )
+                })?;
+            let input = AgentWakeOrCreateInput {
+                model: opt_nonempty_str(params, "model"),
+                caller_agent_id: opt_nonempty_str(params, "callerAgentId")
+                    .map(|s| AgentId::from(s.as_str())),
+                delegation_depth: params.get("delegationDepth").and_then(Value::as_i64),
+                message_metadata: opt_value(params, "messageMetadata"),
+                create,
+            };
             let result = api
-                .agent_wake_or_create(ws, task_note_id, context_message, model)
+                .agent_wake_or_create(ws, task_note_id, context_message, input)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

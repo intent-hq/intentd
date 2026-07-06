@@ -15,10 +15,9 @@ use intent_core::events::{
 };
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
-    AgentSession, AgentStatus, Error, EventActor, NoteId, Result, SessionStats, WorkspaceApi,
-    WorkspaceId, MAX_DELEGATION_DEPTH,
+    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput, Error, EventActor,
+    NoteId, Result, SessionStats, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
 };
-
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
 const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
@@ -28,6 +27,11 @@ use crate::agent_subscriptions::CompletionWatch;
 /// `waitMode` value that defers the completion watch into an `after_all`
 /// delegation group (AS-4) rather than registering a standalone oneShot here.
 const WAIT_MODE_AFTER_ALL: &str = "after_all";
+
+/// Marker `metadata.source` written on new agents created by
+/// `agent.wakeOrCreate` (C1d-10a). Mirrors the FE tool's own tag so downstream
+/// consumers (activity feeds, filters) can trace provenance.
+const WAKE_OR_CREATE_SOURCE: &str = "wake_or_create_task_agent";
 use intent_providers::models::PROVIDER_MODEL_TIERS;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -528,6 +532,91 @@ fn user_content_blocks(content: &str) -> Value {
     json!([{ "type": "text", "text": content }])
 }
 
+/// Build the persisted `agent_session.metadata` blob for the create branch of
+/// `agent.wakeOrCreate` (C1d-10a). Starts from any caller-supplied
+/// `create.metadata` object (or `{}`), overlays the FE provenance fields the
+/// tool guarantees (`createdByAgentId`, `delegationDepth`, `taskNoteId`,
+/// `isBackground`, `source`), and folds `create.contextReferences` /
+/// `create.agentType` in when present so a child's `agent.wakeOrCreate` can
+/// read them back without a follow-up round-trip. Caller-supplied fields for
+/// `taskNoteId`/`source`/`delegationDepth`/`createdByAgentId` are honored
+/// verbatim only when the wake input did not supply the corresponding hint.
+fn build_create_metadata(
+    create_opts: &AgentWakeCreateOptions,
+    input: &AgentWakeOrCreateInput,
+    task_note_id: &NoteId,
+    parent_depth: Option<i64>,
+    agent_type: Option<String>,
+) -> Option<Value> {
+    let mut obj = create_opts
+        .metadata
+        .clone()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    if !obj.contains_key("taskNoteId") {
+        obj.insert("taskNoteId".to_string(), json!(task_note_id.0));
+    }
+    if !obj.contains_key("source") {
+        obj.insert("source".to_string(), json!(WAKE_OR_CREATE_SOURCE));
+    }
+    if !obj.contains_key("isBackground") {
+        obj.insert("isBackground".to_string(), json!(true));
+    }
+    let child_depth = parent_depth.map(|d| d + 1).unwrap_or(0);
+    obj.entry("delegationDepth".to_string())
+        .or_insert(json!(child_depth));
+    if let Some(caller) = input.caller_agent_id.as_ref() {
+        obj.entry("createdByAgentId".to_string())
+            .or_insert(json!(caller.0));
+    }
+    if let Some(refs) = create_opts.context_references.as_ref() {
+        obj.entry("contextReferences".to_string())
+            .or_insert(refs.clone());
+    }
+    if let Some(agent_type) = agent_type {
+        obj.entry("agentType".to_string())
+            .or_insert(json!(agent_type));
+    }
+    if let Some(skip) = create_opts.skip_auto_commit {
+        obj.entry("skipAutoCommit".to_string())
+            .or_insert(json!(skip));
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(Value::Object(obj))
+    }
+}
+
+/// Build the `agent.wakeOrCreate` response envelope (C1d-10a). `action` is one
+/// of `message_queued_to_active_agent` / `woke_existing` / `created_new` — the
+/// 3-way discriminator the FE tool exposes. `cleanedUpAgentIds` is omitted
+/// when empty so pre-widening callers that only inspect `ok`/`agentId`/
+/// `created`/`result` stay wire-compatible.
+fn build_wake_response(
+    agent_id: AgentId,
+    agent_name: String,
+    created: bool,
+    action: &str,
+    task_title: String,
+    result: Value,
+    cleaned_up: Vec<AgentId>,
+) -> Value {
+    let mut out = json!({
+        "ok": true,
+        "agentId": agent_id,
+        "agentName": agent_name,
+        "created": created,
+        "action": action,
+        "taskTitle": task_title,
+        "result": result,
+    });
+    if !cleaned_up.is_empty() {
+        out["cleanedUpAgentIds"] = json!(cleaned_up);
+    }
+    out
+}
+
 /// Project an [`AgentSession`] (with its loaded messages) into [`AgentLite`].
 fn project_lite(session: AgentSession) -> AgentLite {
     let (last_response, digest) = last_response_and_digest(&session.messages);
@@ -751,9 +840,11 @@ impl Services {
             }
             None => AgentId(format!("agent-{}", Uuid::new_v4())),
         };
-        // `agent_type`, `workspace_path`, `workspace_context` are accepted for
-        // the widened wire shape but have no session-column home today; the
-        // P2-12a audit records that persistence is deferred.
+        // `metadata` is persisted (C1d-10a, closes the metadata half of the
+        // P2-12a deferral) so `agent.wakeOrCreate` chains can read back the
+        // parent's `delegationDepth`/`createdByAgentId`/`taskNoteId`/
+        // `isBackground`/`source`/`skipAutoCommit` without a follow-up round-trip.
+        // `agent_type`, `workspace_path`, `workspace_context` remain deferred.
         let AgentCreateExtra {
             provider,
             agent_type: _,
@@ -807,6 +898,7 @@ impl Services {
             context_references,
             image_blocks,
             is_background,
+            metadata,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -2242,49 +2334,288 @@ impl Services {
         Ok(json!({ "ok": true, "agentId": agent, "result": result }))
     }
 
-    /// `agent.wakeOrCreate`: resume the assigned agent or create + assign a new
-    /// one, then deliver the context message (PROTOCOL §5.5).
+    /// `agent.wakeOrCreate` (PROTOCOL §5.5, widened by C1d-10a): resume the
+    /// newest live/resumable agent assigned to the task, or — when none is
+    /// found — create a new one with specialist/model inheritance from the
+    /// most-recent previous session and the FE `WakeOrCreateTaskAgentTool`
+    /// create payload (name, contextReferences, metadata, skipAutoCommit),
+    /// then deliver the context message (optionally tagged with
+    /// `messageMetadata`). Prunes stale assignments (`cleanedUpAgentIds`) and
+    /// enforces `MAX_DELEGATION_DEPTH` when the caller provides
+    /// `callerAgentId`/`delegationDepth`.
     pub(crate) async fn agent_wake_or_create_op(
         &self,
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
         context_message: String,
-        model: Option<String>,
+        input: AgentWakeOrCreateInput,
     ) -> Result<Value> {
+        // B3: delegation-depth guard. `parent_depth` mirrors the FE constant
+        // (`MAX_DELEGATION_DEPTH = 2`, "error if parent >= 2" per the C1d-10
+        // fence report). When neither `callerAgentId` nor `delegationDepth` is
+        // provided the guard is a no-op (backward-compatible with the
+        // pre-widening 3-param callers).
+        let parent_depth = self.resolve_parent_delegation_depth(&input).await?;
+        if let Some(depth) = parent_depth {
+            if depth >= MAX_DELEGATION_DEPTH {
+                return Err(Error::InvalidParams(format!(
+                    "agent.wakeOrCreate: delegation depth {depth} exceeds \
+                     MAX_DELEGATION_DEPTH ({MAX_DELEGATION_DEPTH})"
+                )));
+            }
+        }
+
         let task = self
             .get_my_task(workspace_id.clone(), task_note_id.clone())
             .await?;
-        if let Some(agent) = task.assigned_agents.first().cloned() {
-            let result = self
-                .agent_send_message_op(agent.clone(), context_message, None)
-                .await?;
-            return Ok(json!({ "ok": true, "agentId": agent, "created": false, "result": result }));
+        let task_title = task.title.clone();
+
+        // B1 + B2: iterate assigned_agent_ids newest-first (Vec::push
+        // append-order means newest is the tail). Probe each session:
+        //   * NotFound / Deleted → stale, queue for cleanup.
+        //   * Otherwise → treat as resumable; the newest live session wins.
+        // `inheritance_source` captures the newest **known** previous session
+        // (live or deleted) so the create branch can still inherit
+        // specialist/model when no live agent is available.
+        let mut cleaned_up: Vec<AgentId> = Vec::new();
+        let mut live_session: Option<AgentSession> = None;
+        let mut inheritance_source: Option<AgentSession> = None;
+        for candidate in task.assigned_agents.iter().rev().cloned() {
+            match self.store.get_agent_session(&candidate).await {
+                Ok(session) if session.status != AgentStatus::Deleted => {
+                    if inheritance_source.is_none() {
+                        inheritance_source = Some(session.clone());
+                    }
+                    live_session = Some(session);
+                    break;
+                }
+                Ok(deleted_session) => {
+                    if inheritance_source.is_none() {
+                        inheritance_source = Some(deleted_session);
+                    }
+                    cleaned_up.push(candidate);
+                }
+                Err(Error::NotFound(_)) => cleaned_up.push(candidate),
+                Err(e) => return Err(e),
+            }
         }
+
+        // B7: `messageMetadata` is applied to the delivered context message on
+        // BOTH branches via `deliver_wake_message`.
+        if let Some(session) = live_session {
+            let agent_id = session.id.clone();
+            let agent_name = session.name.clone();
+            let result = self
+                .deliver_wake_message(&agent_id, &context_message, input.message_metadata.as_ref())
+                .await?;
+            self.remove_agent_ids_from_workspace_tasks(&workspace_id, &cleaned_up)
+                .await?;
+            // B8: `action` distinguishes queued-to-active-agent from woke-existing
+            // via the delivery's `queued` flag.
+            let action = if result
+                .get("queued")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "message_queued_to_active_agent"
+            } else {
+                "woke_existing"
+            };
+            return Ok(build_wake_response(
+                agent_id, agent_name, false, action, task_title, result, cleaned_up,
+            ));
+        }
+
+        // Create branch: no live session. Purge stale assignments first so the
+        // subsequent `assign_agent` starts from a clean list, then build the
+        // rich create payload.
+        self.remove_agent_ids_from_workspace_tasks(&workspace_id, &cleaned_up)
+            .await?;
+        let create_opts = input.create.clone().unwrap_or_default();
+
+        // B4: specialist/model inheritance — the previous session's specialist
+        // wins; the wake-level `model` override wins over both the previous
+        // session's model and the `create.model` fallback.
+        let specialist = inheritance_source
+            .as_ref()
+            .and_then(|s| s.specialist.clone())
+            .or(create_opts.specialist.clone());
+        let model = input
+            .model
+            .clone()
+            .or_else(|| inheritance_source.as_ref().and_then(|s| s.model.clone()))
+            .or(create_opts.model.clone());
+        let provider = create_opts.provider.clone();
+        let agent_type = create_opts.agent_type.clone();
+
+        // B5: rich create payload (`name` default `Task: {title}`,
+        // `contextReferences` + provenance metadata folded into the persisted
+        // metadata blob so the daemon-side session read-back retains them).
+        let name = Some(
+            create_opts
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Task: {task_title}")),
+        );
+        // B6: honor `create.skipAutoCommit` from the request; default `false`
+        // preserves the pre-widening behavior.
+        let skip_auto_commit = create_opts.skip_auto_commit.unwrap_or(false);
+        let metadata = build_create_metadata(
+            &create_opts,
+            &input,
+            &task_note_id,
+            parent_depth,
+            agent_type.clone(),
+        );
+        let extra = AgentCreateExtra {
+            provider,
+            agent_type,
+            metadata,
+            workspace_path: None,
+            workspace_context: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: None,
+        };
         let created = self
             .agent_create_op(
                 workspace_id.clone(),
-                None,
+                name,
                 model,
-                None,
+                specialist,
                 None,
                 Some(task_note_id.clone()),
-                false,
+                skip_auto_commit,
                 None,
-                AgentCreateExtra::default(),
+                extra,
             )
             .await?;
-        let agent_id = created["agent"]["id"]
-            .as_str()
+        let agent_lite = &created["agent"];
+        let agent_id_str = agent_lite
+            .get("id")
+            .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let agent_name = agent_lite
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let agent = AgentId::from(agent_id_str.as_str());
         let _ = self
-            .assign_agent(workspace_id, task_note_id, agent_id.clone())
+            .assign_agent(workspace_id, task_note_id, agent_id_str)
             .await;
-        let agent = AgentId::from(agent_id.as_str());
         let result = self
-            .agent_send_message_op(agent.clone(), context_message, None)
+            .deliver_wake_message(&agent, &context_message, input.message_metadata.as_ref())
             .await?;
-        Ok(json!({ "ok": true, "agentId": agent, "created": true, "result": result }))
+        Ok(build_wake_response(
+            agent,
+            agent_name,
+            true,
+            "created_new",
+            task_title,
+            result,
+            cleaned_up,
+        ))
+    }
+
+    /// Resolve the effective **parent** delegation depth for the
+    /// `agent.wakeOrCreate` guard. `delegation_depth` on the wire wins when
+    /// present (the FE surfaces it explicitly). Otherwise, when
+    /// `caller_agent_id` is provided, read the caller's persisted
+    /// `session.metadata.delegationDepth` (default `0`). Missing caller
+    /// context → `None` (no guard).
+    async fn resolve_parent_delegation_depth(
+        &self,
+        input: &AgentWakeOrCreateInput,
+    ) -> Result<Option<i64>> {
+        if let Some(depth) = input.delegation_depth {
+            return Ok(Some(depth));
+        }
+        let Some(caller) = input.caller_agent_id.as_ref() else {
+            return Ok(None);
+        };
+        match self.store.get_agent_session(caller).await {
+            Ok(session) => Ok(Some(
+                session
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("delegationDepth"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+            )),
+            Err(Error::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `agent.wakeOrCreate` context-message delivery (both branches). When
+    /// `message_metadata` is `Some`, it is folded onto the persisted text
+    /// block as `messageMetadata` so subscribers/`agent.getConversation`
+    /// consumers see the FE tag (`{type:'task_wake', source, taskNoteId,
+    /// callerAgentId}`) verbatim; when `None`, the block matches the plain
+    /// `agent.sendMessage` shape. Auto-queue-on-store-failure mirrors
+    /// [`Services::agent_send_message_op`].
+    async fn deliver_wake_message(
+        &self,
+        agent_id: &AgentId,
+        content: &str,
+        message_metadata: Option<&Value>,
+    ) -> Result<Value> {
+        let message_id = new_message_id();
+        let block = match message_metadata {
+            Some(md) => json!({ "type": "text", "text": content, "messageMetadata": md }),
+            None => json!({ "type": "text", "text": content }),
+        };
+        let blocks = json!([block]);
+        match self
+            .store
+            .append_agent_message(agent_id, "user", &blocks, &now_iso())
+            .await
+        {
+            Ok(_) => Ok(json!({ "success": true, "queued": false, "messageId": message_id })),
+            Err(_) => {
+                let (queued, position) =
+                    self.enqueue_message(agent_id, content.to_string(), None, None);
+                let result = json!({
+                    "success": true,
+                    "queued": true,
+                    "queuedMessage": queued.to_value(position),
+                });
+                self.publish_queue_updated(agent_id).await;
+                Ok(result)
+            }
+        }
+    }
+
+    /// Daemon-side equivalent of the FE `task.removeAgentFromAllTasks`: strip
+    /// the given agent ids from every task note in the workspace. Silent on
+    /// notes/tasks that never referenced the ids so it is safe to call with an
+    /// empty or partially-stale list.
+    async fn remove_agent_ids_from_workspace_tasks(
+        &self,
+        workspace_id: &WorkspaceId,
+        stale: &[AgentId],
+    ) -> Result<()> {
+        if stale.is_empty() {
+            return Ok(());
+        }
+        let notes = self.store.list_notes(workspace_id).await?;
+        for mut note in notes {
+            let Some(mut task) = note.task.clone() else {
+                continue;
+            };
+            let before = task.assigned_agent_ids.len();
+            task.assigned_agent_ids.retain(|a| !stale.contains(a));
+            if task.assigned_agent_ids.len() == before {
+                continue;
+            }
+            let now = now_iso();
+            note.task = Some(task);
+            note.updated_at = now;
+            self.store.update_note(&note).await?;
+        }
+        Ok(())
     }
 
     /// Load a session, mapping `NotFound` to `-32603` for the methods whose TS

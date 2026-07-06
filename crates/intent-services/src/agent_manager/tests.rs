@@ -726,6 +726,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         context_references: None,
         image_blocks: None,
         is_background: false,
+        metadata: None,
         created_at: ts.clone(),
         updated_at: ts,
     };
@@ -1559,6 +1560,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         context_references: None,
         image_blocks: None,
         is_background: false,
+        metadata: None,
         created_at: now_iso(),
         updated_at: now_iso(),
     }

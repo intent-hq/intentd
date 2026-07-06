@@ -29,6 +29,7 @@ use crate::agent_ops::{
     parse_session_stats_output, static_models,
 };
 use crate::Services;
+use intent_core::MAX_DELEGATION_DEPTH;
 
 struct TempDb {
     path: PathBuf,
@@ -3013,4 +3014,354 @@ async fn agent_replace_messages_rejects_non_array_and_bad_entries() {
         .await
         .expect_err("missing content");
     assert!(matches!(err, Error::InvalidParams(_)));
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// `agent.wakeOrCreate` widening (C1d-10a) — behaviors B1-B8 + backward compat.
+// Each test seeds a task note via `mark_as_task` and drives the widened
+// service op directly so it doesn't depend on the runtime `AgentManager`.
+// ────────────────────────────────────────────────────────────────────────────
+
+use intent_core::{AgentCreateExtra, AgentWakeCreateOptions, AgentWakeOrCreateInput, NoteId};
+
+async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: title.into(),
+                content: Some(format!("{title} body")),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    svc.mark_as_task(
+        ws.clone(),
+        note.id.clone(),
+        "not_started".into(),
+        vec![],
+        None,
+    )
+    .await
+    .expect("markAsTask");
+    note.id
+}
+
+fn wake_input(model: Option<&str>) -> AgentWakeOrCreateInput {
+    AgentWakeOrCreateInput {
+        model: model.map(str::to_string),
+        ..Default::default()
+    }
+}
+
+/// The pre-widening 3-required-params shape (`model` only) still creates and
+/// assigns when the task has no prior agent; response carries the widened
+/// `action`/`agentName`/`taskTitle` fields and `created: true`.
+#[tokio::test]
+async fn wake_or_create_backcompat_create_branch_widened_response() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Ship it").await;
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "go".into(), wake_input(None))
+        .await
+        .expect("wake");
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["created"], true);
+    assert_eq!(resp["action"], "created_new");
+    assert_eq!(resp["taskTitle"], "Ship it");
+    assert_eq!(resp["agentName"], "Task: Ship it");
+    assert!(resp.get("cleanedUpAgentIds").is_none());
+}
+
+/// B1: newest-first. When the task has an older assignment plus a newer live
+/// one, the newer one is woken (not the oldest) and `created: false`.
+#[tokio::test]
+async fn wake_or_create_wakes_newest_of_multiple_assignments() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Multi").await;
+    // Two live sessions assigned in order: old first, then new.
+    let old = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("old".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create old");
+    let new = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("new".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create new");
+    let old_id = old["agent"]["id"].as_str().unwrap().to_string();
+    let new_id = new["agent"]["id"].as_str().unwrap().to_string();
+    svc.assign_agent(ws.clone(), note_id.clone(), old_id.clone())
+        .await
+        .expect("assign old");
+    svc.assign_agent(ws.clone(), note_id.clone(), new_id.clone())
+        .await
+        .expect("assign new");
+
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "wake".into(), wake_input(None))
+        .await
+        .expect("wake");
+    assert_eq!(resp["created"], false);
+    assert_eq!(resp["agentId"], new_id);
+    assert_eq!(resp["agentName"], "new");
+    assert_eq!(resp["action"], "woke_existing");
+}
+
+/// B2: stale earlier assignment (session gone) is skipped, cleaned up from
+/// the task's `assigned_agent_ids`, and reported in `cleanedUpAgentIds`; the
+/// older-but-live agent is woken.
+#[tokio::test]
+async fn wake_or_create_skips_stale_and_reports_cleanup() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Stale").await;
+    // A live agent + a stale (deleted) agent assigned later so the reverse
+    // iteration hits the stale one first and falls through to the live one.
+    let live = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("live".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create live");
+    let stale = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("stale".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create stale");
+    let live_id = live["agent"]["id"].as_str().unwrap().to_string();
+    let stale_id = stale["agent"]["id"].as_str().unwrap().to_string();
+    svc.assign_agent(ws.clone(), note_id.clone(), live_id.clone())
+        .await
+        .expect("assign live");
+    svc.assign_agent(ws.clone(), note_id.clone(), stale_id.clone())
+        .await
+        .expect("assign stale");
+    // Wipe the stale session so its assignment becomes NotFound-stale.
+    svc.agent_delete_op(AgentId::from(stale_id.as_str()))
+        .await
+        .expect("delete stale");
+
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id.clone(), "hi".into(), wake_input(None))
+        .await
+        .expect("wake");
+    assert_eq!(resp["created"], false);
+    assert_eq!(resp["agentId"], live_id);
+    assert_eq!(
+        resp["cleanedUpAgentIds"],
+        json!([AgentId::from(stale_id.as_str())])
+    );
+
+    // Stale id is stripped from the task's assigned_agent_ids.
+    let note = svc.get_note(ws, note_id).await.expect("note");
+    let task = note.task.expect("task");
+    assert!(task
+        .assigned_agent_ids
+        .iter()
+        .all(|a| a.as_str() != stale_id));
+}
+
+/// B3: delegation-depth guard rejects when the explicit `delegationDepth`
+/// meets or exceeds `MAX_DELEGATION_DEPTH` with an `InvalidParams` error.
+#[tokio::test]
+async fn wake_or_create_depth_guard_rejects_at_cap() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Deep").await;
+    let input = AgentWakeOrCreateInput {
+        delegation_depth: Some(MAX_DELEGATION_DEPTH),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_wake_or_create_op(ws, note_id, "go".into(), input)
+        .await
+        .expect_err("must reject");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("MAX_DELEGATION_DEPTH")),
+        "expected InvalidParams MAX_DELEGATION_DEPTH, got {err:?}",
+    );
+}
+
+/// B3 (compute path): when `delegationDepth` is omitted but `callerAgentId`
+/// is provided, the guard reads the caller session's `metadata.delegationDepth`.
+#[tokio::test]
+async fn wake_or_create_depth_guard_reads_caller_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Caller").await;
+    // Seed a caller session at depth == MAX_DELEGATION_DEPTH so the guard
+    // trips through the caller lookup path.
+    let caller = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("caller".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            AgentCreateExtra {
+                metadata: Some(json!({ "delegationDepth": MAX_DELEGATION_DEPTH })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create caller");
+    let caller_id = caller["agent"]["id"].as_str().unwrap().to_string();
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(AgentId::from(caller_id.as_str())),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_wake_or_create_op(ws, note_id, "go".into(), input)
+        .await
+        .expect_err("must reject");
+    assert!(matches!(err, Error::InvalidParams(_)));
+}
+
+/// B4 + B5 + B6: specialist inherits from the newest previous session; the
+/// rich create payload (name / contextReferences / metadata / skipAutoCommit)
+/// lands on the persisted session row so a child wake can read it back.
+#[tokio::test]
+async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Inherit").await;
+    // Previous session with a specialist that should be inherited.
+    let prev = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("prev".into()),
+            Some("gpt-4".into()),
+            Some("implementor".into()),
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create prev");
+    let prev_id = prev["agent"]["id"].as_str().unwrap().to_string();
+    svc.assign_agent(ws.clone(), note_id.clone(), prev_id.clone())
+        .await
+        .expect("assign prev");
+    // Flip the previous session to `Deleted` (row stays, marked as
+    // non-resumable) so wake falls through to the create branch while the
+    // inheritance source can still read specialist/model from the row.
+    let mut prev_session = svc
+        .store()
+        .get_agent_session(&AgentId::from(prev_id.as_str()))
+        .await
+        .expect("load prev");
+    prev_session.status = intent_core::AgentStatus::Deleted;
+    prev_session.updated_at = intent_core::now_iso();
+    svc.store()
+        .update_agent_session(&prev_session)
+        .await
+        .expect("mark prev deleted");
+
+    let input = AgentWakeOrCreateInput {
+        create: Some(AgentWakeCreateOptions {
+            name: Some("Explicit Name".into()),
+            context_references: Some(json!([{ "type": "note", "id": "note-1" }])),
+            metadata: Some(json!({ "custom": "field" })),
+            skip_auto_commit: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "go".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["created"], true);
+    assert_eq!(resp["action"], "created_new");
+    assert_eq!(resp["agentName"], "Explicit Name");
+
+    // Verify the new session persisted the rich payload.
+    let new_id = resp["agentId"].as_str().unwrap();
+    let session = svc
+        .store()
+        .get_agent_session(&AgentId::from(new_id))
+        .await
+        .expect("load new session");
+    assert_eq!(session.name, "Explicit Name");
+    assert!(session.skip_auto_commit, "skipAutoCommit honored");
+    let md = session.metadata.as_ref().expect("metadata persisted");
+    assert_eq!(md["custom"], "field");
+    assert_eq!(md["source"], "wake_or_create_task_agent");
+    assert_eq!(md["isBackground"], true);
+    assert_eq!(md["contextReferences"][0]["id"], "note-1");
+    assert_eq!(md["skipAutoCommit"], true);
+    // Specialist was inherited from the previous (now-deleted) session.
+    assert_eq!(session.specialist.as_deref(), Some("implementor"));
+    // Depth defaults to `0` when neither caller nor explicit depth was given.
+    assert_eq!(md["delegationDepth"], 0);
+    assert!(!md["taskNoteId"].as_str().unwrap().is_empty());
+}
+
+/// B7: `messageMetadata` is folded onto the delivered content block on the
+/// create branch (and by construction the wake branch shares the same helper).
+#[tokio::test]
+async fn wake_or_create_delivers_message_metadata_on_block() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Tag").await;
+    let input = AgentWakeOrCreateInput {
+        message_metadata: Some(json!({ "type": "task_wake", "source": "wake" })),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws, note_id, "hello".into(), input)
+        .await
+        .expect("wake");
+    let new_id = AgentId::from(resp["agentId"].as_str().unwrap());
+    let conv = svc
+        .agent_get_conversation_op(new_id, None, None)
+        .await
+        .expect("conv");
+    // The delivered message is the first user message; its content block
+    // carries `messageMetadata` verbatim.
+    let msg = &conv["messages"][0];
+    assert_eq!(msg["role"], "user");
+    let block = &msg["contentBlocks"][0];
+    assert_eq!(block["text"], "hello");
+    assert_eq!(block["messageMetadata"]["type"], "task_wake");
 }
