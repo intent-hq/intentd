@@ -93,6 +93,15 @@ impl ProviderConfig {
 /// All available ACP providers, in the same definition order as
 /// `ACP_PROVIDERS` (`provider-config.ts`).
 pub static ACP_PROVIDERS: &[ProviderConfig] = &[
+    // NOTE (auggie modes): auggie advertises `session/set_mode` support but its
+    // `availableModes` today are `default` + `ask` — it does NOT offer a
+    // `bypassPermissions` (or otherwise-permissive) mode. We keep
+    // `supports_set_mode: true` because the method itself is implemented, but
+    // deliberately leave `mode_map: None` so `select_preferred_mode` finds no
+    // advertised bypass-equivalent and `try_bypass_permissions_mode` skips the
+    // call rather than triggering a `-32602` invalid-params error. Under the
+    // shipped `AllowAll` policy the local auto-approve path in
+    // `ClientRequestHandler` remains authoritative for auggie sessions.
     ProviderConfig {
         base_args: &["--acp", "--allow-indexing"],
         model_flag: Some("--model"),

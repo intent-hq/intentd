@@ -484,16 +484,60 @@ const MGR_ACP_SID: &str = "mgr-acp-new";
 /// assert on the exact request sequence.
 type MockCallLog = Arc<Mutex<Vec<(String, Value)>>>;
 
+/// The `availableModes` list a mock agent advertises in its `session/new` /
+/// `session/load` response. Defaults to a set that includes `bypassPermissions`
+/// so tests exercising the "set_mode was attempted" assertions keep working;
+/// tests can substitute a bypass-free set (e.g. `default`+`ask`, matching
+/// auggie today) to exercise the skip path.
+#[derive(Clone)]
+struct MockModes {
+    current_mode_id: &'static str,
+    available_modes: &'static [&'static str],
+}
+
+impl MockModes {
+    const fn with_bypass() -> Self {
+        Self {
+            current_mode_id: "default",
+            available_modes: &["default", "bypassPermissions"],
+        }
+    }
+
+    const fn no_bypass() -> Self {
+        // Matches auggie's real advertised set today: no bypass-equivalent, so
+        // the manager must skip `session/set_mode` rather than trigger `-32602`.
+        Self {
+            current_mode_id: "default",
+            available_modes: &["default", "ask"],
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let available: Vec<Value> = self
+            .available_modes
+            .iter()
+            .map(|id| json!({ "id": id, "name": id }))
+            .collect();
+        json!({
+            "currentModeId": self.current_mode_id,
+            "availableModes": available,
+        })
+    }
+}
+
 /// Configurable mock agent: `initialize` advertises `loadSession` per `load_cap`;
-/// `session/new` mints [`MGR_ACP_SID`]; `session/load` succeeds; everything else
+/// `session/new` mints [`MGR_ACP_SID`] and advertises the caller-chosen
+/// `availableModes` (so tests can flip between the bypass-advertised and
+/// bypass-absent shapes); `session/load` echoes the same modes; everything else
 /// (e.g. `authenticate`) resolves with `{}`. When `log` is `Some`, every request
 /// method (and its params) is recorded so tests can assert what the manager sent
 /// after handshake / session setup.
-fn spawn_cfg_mock_agent<R, W>(
+fn spawn_cfg_mock_agent_with_modes<R, W>(
     read: R,
     write: W,
     load_cap: bool,
     log: Option<MockCallLog>,
+    modes: MockModes,
 ) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -520,8 +564,10 @@ where
                 "initialize" => {
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": load_cap } })
                 }
-                "session/new" => json!({ "sessionId": MGR_ACP_SID }),
-                "session/load" => json!({}),
+                "session/new" => {
+                    json!({ "sessionId": MGR_ACP_SID, "modes": modes.to_json() })
+                }
+                "session/load" => json!({ "modes": modes.to_json() }),
                 _ => json!({}),
             };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -537,7 +583,7 @@ where
 /// Track a handle wired to a configurable mock agent (parity with `create_agent`
 /// minus a real child), returning the agent task handle.
 fn track_mock_agent(mgr: &AgentManager, id: &AgentId, load_cap: bool) -> JoinHandle<()> {
-    track_mock_agent_inner(mgr, id, load_cap, None).0
+    track_mock_agent_inner(mgr, id, load_cap, None, MockModes::with_bypass()).0
 }
 
 /// Like [`track_mock_agent`] but also returns a shared log capturing every
@@ -550,7 +596,27 @@ fn track_mock_agent_with_log(
     load_cap: bool,
 ) -> (JoinHandle<()>, MockCallLog) {
     let log: MockCallLog = Arc::new(Mutex::new(Vec::new()));
-    let (handle, _) = track_mock_agent_inner(mgr, id, load_cap, Some(log.clone()));
+    let (handle, _) = track_mock_agent_inner(
+        mgr,
+        id,
+        load_cap,
+        Some(log.clone()),
+        MockModes::with_bypass(),
+    );
+    (handle, log)
+}
+
+/// Like [`track_mock_agent_with_log`] but with a caller-chosen advertised-modes
+/// set (e.g. `MockModes::no_bypass()` to exercise the "provider offers no
+/// bypass-equivalent" skip path).
+fn track_mock_agent_with_log_modes(
+    mgr: &AgentManager,
+    id: &AgentId,
+    load_cap: bool,
+    modes: MockModes,
+) -> (JoinHandle<()>, MockCallLog) {
+    let log: MockCallLog = Arc::new(Mutex::new(Vec::new()));
+    let (handle, _) = track_mock_agent_inner(mgr, id, load_cap, Some(log.clone()), modes);
     (handle, log)
 }
 
@@ -559,10 +625,11 @@ fn track_mock_agent_inner(
     id: &AgentId,
     load_cap: bool,
     log: Option<MockCallLog>,
+    modes: MockModes,
 ) -> (JoinHandle<()>, ()) {
     let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
     let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
-    let agent = spawn_cfg_mock_agent(c2a_agent, a2c_agent, load_cap, log);
+    let agent = spawn_cfg_mock_agent_with_modes(c2a_agent, a2c_agent, load_cap, log, modes);
     let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
     let connection = Arc::new(Connection::new(
         c2a_client,
@@ -850,27 +917,25 @@ async fn start_session_skips_bypass_under_non_allow_all_policies() {
     }
 }
 
-/// A provider that doesn't advertise `session/set_mode` is left alone under
-/// `AllowAll`: the local auto-approve carries the parity contract by itself.
+/// A provider that doesn't advertise a bypass-equivalent in `availableModes`
+/// (auggie today: `default`+`ask`) is left alone under `AllowAll` rather than
+/// being hit with `session/set_mode bypassPermissions` and getting `-32602`.
+/// The local `AllowAll` auto-approve carries the parity contract by itself.
 #[tokio::test]
-async fn start_session_skips_bypass_when_provider_lacks_set_mode() {
+async fn start_session_skips_bypass_when_provider_doesnt_advertise_bypass_mode() {
     let (_tmp, mgr) = manager().await;
     assert_eq!(mgr.policy(), PermissionPolicy::AllowAll);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-no-bypass-cap"));
     seed_agent(&mgr, &ws, &id).await;
-    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
-    let provider = intent_providers::ProviderConfig {
-        supports_authenticate: false,
-        supports_set_mode: false,
-        ..*intent_providers::provider_config(intent_providers::default_provider_id())
-    };
-    mgr.start_session(&id, PathBuf::from("/tmp/ws"), &provider)
+    // Mock advertises `default`+`ask` only, mirroring what auggie returns today.
+    let (_agent, log) = track_mock_agent_with_log_modes(&mgr, &id, false, MockModes::no_bypass());
+    mgr.start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
         .await
         .expect("session");
     let calls = log.lock().unwrap().clone();
     assert!(
         calls.iter().all(|(m, _)| m != "session/set_mode"),
-        "no session/set_mode when provider lacks the capability; got {calls:?}"
+        "no session/set_mode when provider doesn't advertise a bypass-equivalent; got {calls:?}"
     );
 }
 

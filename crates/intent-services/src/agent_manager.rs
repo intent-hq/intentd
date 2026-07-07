@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use intent_acp::handshake::try_bypass_permissions_mode;
-use intent_acp::session::{ContentBlock, StopReason};
+use intent_acp::session::{ContentBlock, SessionModeState, StopReason};
 use intent_acp::{
     apply_baseline_env_to_stdio_servers, build_baseline_mcp_env_from_process, handshake,
     normalize_mcp_servers, serve_workspace_mcp_tcp, spawn_provider, to_auggie_mcp_config,
@@ -1051,7 +1051,7 @@ impl AgentManager {
             )
             .await
         {
-            Ok(Some(acp_session_id)) => {
+            Ok(Some(opened)) => {
                 // `session/load` replays the prior conversation as a buffered
                 // `session/update` burst; discard it before the first turn so it
                 // is neither re-published as events nor re-accumulated into the
@@ -1068,9 +1068,14 @@ impl AgentManager {
                     let mut guard = notes.lock().await;
                     Services::drain_replay_notifications(&mut guard).await;
                 }
-                self.maybe_bypass_permissions(conn.as_ref(), provider, &acp_session_id)
-                    .await;
-                return Ok(acp_session_id);
+                self.maybe_bypass_permissions(
+                    conn.as_ref(),
+                    provider,
+                    &opened.session_id,
+                    opened.modes.as_ref(),
+                )
+                .await;
+                return Ok(opened.session_id);
             }
             Ok(None) => {}
             // `session/load` was attempted but failed → fall through to recreate.
@@ -1087,42 +1092,55 @@ impl AgentManager {
         // replace keeps the id canonical, swapping only the exact id we failed to
         // load.
         if let Some(expected_old) = stored_id {
-            let acp_session_id = self
+            let opened = self
                 .services
                 .recreate_acp_session(conn.as_ref(), agent_id, &expected_old, cwd, Vec::new())
                 .await?;
             self.recreated.lock().unwrap().insert(agent_id.clone());
-            self.maybe_bypass_permissions(conn.as_ref(), provider, &acp_session_id)
-                .await;
-            return Ok(acp_session_id);
+            self.maybe_bypass_permissions(
+                conn.as_ref(),
+                provider,
+                &opened.session_id,
+                opened.modes.as_ref(),
+            )
+            .await;
+            return Ok(opened.session_id);
         }
 
         // 3) Brand-new agent → open and persist the first session (write-once).
-        let acp_session_id = self
+        let opened = self
             .services
             .open_acp_session(conn.as_ref(), agent_id, cwd, Vec::new())
             .await?;
-        self.maybe_bypass_permissions(conn.as_ref(), provider, &acp_session_id)
-            .await;
-        Ok(acp_session_id)
+        self.maybe_bypass_permissions(
+            conn.as_ref(),
+            provider,
+            &opened.session_id,
+            opened.modes.as_ref(),
+        )
+        .await;
+        Ok(opened.session_id)
     }
 
     /// Under the shipped `AllowAll` policy, best-effort ask the provider to run
-    /// in its own bypass mode via `session/set_mode bypassPermissions` (parity
-    /// with the TS acp-provider). Unsupported or failed attempts fall back to
-    /// the local `AllowAll` auto-approve inside [`ClientRequestHandler`]; every
-    /// other policy is a no-op so the Interactive round-trip and `AutoByRisk` /
-    /// `DenyAll` decisions stay authoritative.
+    /// in a permissive mode via `session/set_mode` (parity with the TS
+    /// acp-provider). The mode id is picked by
+    /// [`try_bypass_permissions_mode`] from the modes the provider actually
+    /// advertised in `session/new` / `session/load`, so agents that don't
+    /// offer a bypass-equivalent (auggie today) are left alone rather than
+    /// triggering a `-32602`; every other policy is a no-op so Interactive /
+    /// `AutoByRisk` / `DenyAll` decisions stay authoritative.
     async fn maybe_bypass_permissions(
         &self,
         conn: &Connection,
         provider: &ProviderConfig,
         acp_session_id: &str,
+        modes: Option<&SessionModeState>,
     ) {
         if self.policy != PermissionPolicy::AllowAll {
             return;
         }
-        try_bypass_permissions_mode(conn, provider, acp_session_id).await;
+        try_bypass_permissions_mode(conn, provider, acp_session_id, modes).await;
     }
 
     /// Take (clear) the recreate flag for `agent_id`: `true` when the agent's ACP
