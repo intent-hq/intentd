@@ -99,11 +99,23 @@ fn spawn_serve(data_dir: &PathBuf, listen: &str, env: &[(&str, &str)]) -> Child 
 
 /// Run an `intentd <args>` control subcommand against `data_dir` to completion.
 fn run_cli(data_dir: &PathBuf, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(args)
-        .env("INTENTD_DATA_DIR", data_dir)
-        .output()
-        .expect("run intentd subcommand")
+    run_cli_with_env(data_dir, args, &[])
+}
+
+/// [`run_cli`] with additional environment variables applied to the child.
+/// Used by `doctor` invocations that need `INTENTD_TCP_PORT` so the port-free
+/// probe stays hermetic (see [`check_ports_free`] in the binary).
+fn run_cli_with_env(
+    data_dir: &PathBuf,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd.args(args).env("INTENTD_DATA_DIR", data_dir);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("run intentd subcommand")
 }
 
 /// Wait (up to 10s) for the daemon's UDS to accept connections.
@@ -437,7 +449,10 @@ async fn e2e_transport_full() {
     assert!(out.contains("transports: uds, tcp"), "status stdout: {out}");
 
     // --- `intentd doctor` against the healthy live data dir (⇒ exit 0) ---
-    let doctor = run_cli(&data_dir, &["doctor"]);
+    // Pass `INTENTD_TCP_PORT=0` so the port-free probe skips the fixed default
+    // port (which may be legitimately bound by a live daemon on the developer's
+    // machine) — hermeticity via the same env seam `serve` uses.
+    let doctor = run_cli_with_env(&data_dir, &["doctor"], &[("INTENTD_TCP_PORT", "0")]);
     let dout = String::from_utf8_lossy(&doctor.stdout);
     assert!(doctor.status.success(), "doctor failed: {dout}");
     assert!(dout.contains("migrations current"), "doctor stdout: {dout}");

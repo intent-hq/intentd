@@ -558,7 +558,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "server",
             Some(1024.0),
             Some(65535.0),
-            5180.0,
+            5181.0,
         ),
         boolean(
             "server.tls.enabled",

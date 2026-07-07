@@ -2,8 +2,10 @@
 //!
 //! Drives a real [`WsApiServer`] over TLS: `/health`, the upgrade auth gate,
 //! a JSON-RPC round-trip that must be byte-identical to the UDS transport, and
-//! the §5.6 hardening guarantees (port backoff, graceful-shutdown restart,
-//! heartbeat termination). The client pins the M5.1 self-signed fingerprint.
+//! the §5.6 hardening guarantees (fail-fast bind on an occupied port,
+//! graceful-shutdown restart, heartbeat termination). The client pins the
+//! M5.1 self-signed fingerprint. A separate insecure-mode test proves the
+//! plain-`ws://` accept path serves JSON-RPC with no TLS and no bearer token.
 
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
 use std::path::Path;
@@ -1119,28 +1121,80 @@ async fn wss_host_status_override_forces_local() {
 }
 
 #[tokio::test]
-async fn port_backoff_picks_next_port() {
+async fn bind_fails_fast_on_occupied_port() {
+    // Fixed-port fail-fast (§5.6): a busy configured port must surface the OS
+    // bind error immediately — no port walking, no retry. Occupy the port for
+    // the whole test so the listener has no chance to bind, then assert
+    // `start()` returns an `AddrInUse` error on the SAME port it was asked for.
     let base = free_port();
-    // Occupy the base port for the whole test so the listener must advance.
     let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, base)).unwrap();
-    let srv = start(WsOptions {
+    let (api, bus, _store, dir) = make_services(None).await;
+    let tls = ensure_tls_certificate(&dir).expect("cert");
+    let token_store = Arc::new(MemTokenStore::default());
+    token_store.store_token(TOKEN).unwrap();
+    let mut opts = WsOptions {
         base_port: base,
         ..WsOptions::default()
-    })
-    .await;
-    // `free_port()` discovers a number by binding port 0 then releasing it, so
-    // any concurrently-running test may grab `base + 1` before this listener's
-    // backoff reaches it — a TOCTOU that is fundamental to OS port assignment.
-    // The guarantee under test is "a busy base port makes the listener walk
-    // forward within the attempt window", so assert that range rather than one
-    // exact port (which is inherently racy under default parallelism).
-    let max = base + intent_transport::lifecycle::MAX_PORT_ATTEMPTS;
-    assert!(
-        srv.port > base && srv.port < max,
-        "should walk forward past the busy base {base} within the attempt window, got {}",
-        srv.port
+    };
+    opts.bind_address = Ipv4Addr::LOCALHOST.into();
+    let ws = WsApiServer::new(api, bus, &tls, token_store, opts).expect("server");
+    let err = ws
+        .start()
+        .await
+        .expect_err("start must fail when the configured port is occupied");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::AddrInUse,
+        "expected AddrInUse for busy port {base}, got {err:?}"
     );
-    srv.ws.stop().await;
+    // The bound-port accessor must stay `None` — a failed bind never records a
+    // port, so a subsequent restart can retry cleanly on the same configured
+    // port (proven by the graceful_shutdown_allows_immediate_restart test).
+    assert_eq!(ws.bound_port().await, None);
+    ws.stop().await;
+}
+
+#[tokio::test]
+async fn insecure_mode_serves_plain_ws_without_token() {
+    // Insecure dev mode: no TLS acceptor, no bearer-token enforcement. A plain
+    // TCP client must be able to open `ws://.../ws` with NO `Authorization`
+    // header and complete a JSON-RPC round-trip. The listener's `fingerprint()`
+    // is `None` and `is_insecure()` reports `true` so `system.status` surfaces
+    // the real posture.
+    let (api, bus, _store, _dir) = make_services(None).await;
+    let mut opts = WsOptions::default();
+    opts.base_port = free_port();
+    opts.bind_address = Ipv4Addr::LOCALHOST.into();
+    let ws = WsApiServer::new_insecure(api, bus, opts);
+    assert!(ws.is_insecure(), "constructor selects insecure posture");
+    assert!(ws.fingerprint().is_none(), "no TLS cert ⇒ no fingerprint");
+    let port = ws.start().await.expect("start");
+    // Open a plain WebSocket (no TLS wrapping) to the listener with NO token
+    // in either the query string or the `Authorization` header.
+    let url = format!("ws://127.0.0.1:{port}/ws");
+    let (mut sock, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("plain ws handshake");
+    sock.send(Message::Text(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list"}"#.to_string(),
+    ))
+    .await
+    .expect("send");
+    let resp = loop {
+        match sock.next().await {
+            Some(Ok(Message::Text(text))) => {
+                break serde_json::from_str::<Value>(&text).expect("json");
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    };
+    assert_eq!(resp["id"], 1, "id echoed");
+    assert!(
+        resp.get("result").is_some(),
+        "insecure ws:// round-trip returns a result: {resp}"
+    );
+    ws.stop().await;
 }
 
 #[tokio::test]

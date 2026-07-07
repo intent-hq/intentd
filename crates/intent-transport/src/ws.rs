@@ -1,14 +1,18 @@
 //! HTTPS + WebSocket listener (§5.2).
 //!
 //! Ports `src/main/websocket-api-server.ts`: a TLS listener on
-//! `<bindAddress>:<port>` (default `0.0.0.0:5180`) serving a WebSocket endpoint
+//! `<bindAddress>:<port>` (default `0.0.0.0:5181`) serving a WebSocket endpoint
 //! at `/ws` and a plain `GET /health` → `{ "status":"ok", "clients":<n> }`.
 //! Bearer auth + the origin allow-list are enforced during the HTTP upgrade
 //! (401 bad token / 403 disabled or bad origin, socket destroyed). The accepted
 //! WebSocket reuses the SAME JSON-RPC router + event bus as the UDS listener
 //! (via [`crate::conn`]), so the wire result is transport-identical. Lifecycle
-//! hardening (single-flight start/stop, port backoff, graceful shutdown) lives
-//! in [`crate::lifecycle`].
+//! hardening (single-flight start/stop, fail-fast bind, graceful shutdown)
+//! lives in [`crate::lifecycle`].
+//!
+//! An **insecure dev mode** (constructed via [`WsApiServer::new_insecure`])
+//! serves plain `ws://` with no TLS acceptor and no bearer-token enforcement;
+//! it is the only path in this module that ever bypasses those checks.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -20,11 +24,10 @@ use futures_util::{SinkExt, StreamExt};
 use intent_core::{Error, Result, WorkspaceApi};
 use intent_services::EventBus;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
-use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -42,14 +45,19 @@ use crate::tls::TlsCertificate;
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 
 /// Tuning for a [`WsApiServer`]. [`Default`] mirrors the production posture:
-/// bind `0.0.0.0:5180`, WS API enabled, bearer auth on (TCP), 30s/60s heartbeat.
+/// bind `0.0.0.0:5181`, WS API enabled, bearer auth on (TCP), 30s/60s heartbeat.
+///
+/// The TLS + auth posture is picked by the constructor: [`WsApiServer::new`]
+/// uses TLS + bearer auth; [`WsApiServer::new_insecure`] disables both and
+/// forces `discovery_enabled = false` (no fingerprint to advertise).
 #[derive(Debug, Clone)]
 pub struct WsOptions {
     pub bind_address: IpAddr,
     pub base_port: u16,
     pub enabled: bool,
     pub auth_enabled: bool,
-    /// Advertise the bound port + fingerprint over mDNS (§5.4). Default off.
+    /// Advertise the bound port + fingerprint over mDNS (§5.4). Default off,
+    /// and forced off in insecure mode (there is no fingerprint to publish).
     pub discovery_enabled: bool,
     /// Force the connection locality (§5.14) regardless of transport:
     /// `Some(true)` = local (`--mode local`/`server.locality=local`),
@@ -94,8 +102,12 @@ pub(crate) struct ClientHandle {
 pub(crate) struct WsInner {
     pub api: Arc<dyn WorkspaceApi>,
     pub bus: EventBus,
-    pub acceptor: TlsAcceptor,
-    pub token_store: Arc<dyn TokenStore>,
+    /// TLS acceptor for secure listeners; `None` puts the listener in the
+    /// insecure dev-mode plain-`ws://` accept path.
+    pub acceptor: Option<TlsAcceptor>,
+    /// Bearer-token store consulted only when `auth_enabled` is set; `None` in
+    /// insecure mode where auth is unconditionally off.
+    pub token_store: Option<Arc<dyn TokenStore>>,
     pub enabled: bool,
     pub auth_enabled: bool,
     pub discovery_enabled: bool,
@@ -105,7 +117,8 @@ pub(crate) struct WsInner {
     pub locality_is_local: bool,
     pub bind_address: IpAddr,
     pub base_port: u16,
-    pub fingerprint: String,
+    /// Pinned SHA-256 cert fingerprint; `None` in insecure mode (no TLS cert).
+    pub fingerprint: Option<String>,
     pub heartbeat_interval: Duration,
     pub heartbeat_timeout: Duration,
     pub clients: Mutex<HashMap<u64, ClientHandle>>,
@@ -136,8 +149,8 @@ impl WsApiServer {
         let inner = WsInner {
             api,
             bus,
-            acceptor,
-            token_store,
+            acceptor: Some(acceptor),
+            token_store: Some(token_store),
             enabled: options.enabled,
             auth_enabled: options.auth_enabled,
             discovery_enabled: options.discovery_enabled,
@@ -146,7 +159,7 @@ impl WsApiServer {
             locality_is_local: crate::host::resolve_is_local(false, options.locality_override),
             bind_address: options.bind_address,
             base_port: options.base_port,
-            fingerprint: tls.fingerprint256.clone(),
+            fingerprint: Some(tls.fingerprint256.clone()),
             heartbeat_interval: options.heartbeat_interval,
             heartbeat_timeout: options.heartbeat_timeout,
             clients: Mutex::new(HashMap::new()),
@@ -157,6 +170,36 @@ impl WsApiServer {
         Ok(Self {
             inner: Arc::new(inner),
         })
+    }
+
+    /// Build an **insecure** listener that serves plain `ws://` with no TLS and
+    /// no bearer-token enforcement. Intended for the local dev seat (`make
+    /// run-intentd` / `intentd serve --insecure`), never for production. mDNS
+    /// discovery is unconditionally disabled — there is no fingerprint to
+    /// publish — and `WsOptions::auth_enabled` is ignored.
+    pub fn new_insecure(api: Arc<dyn WorkspaceApi>, bus: EventBus, options: WsOptions) -> Self {
+        let inner = WsInner {
+            api,
+            bus,
+            acceptor: None,
+            token_store: None,
+            enabled: options.enabled,
+            auth_enabled: false,
+            discovery_enabled: false,
+            locality_is_local: crate::host::resolve_is_local(false, options.locality_override),
+            bind_address: options.bind_address,
+            base_port: options.base_port,
+            fingerprint: None,
+            heartbeat_interval: options.heartbeat_interval,
+            heartbeat_timeout: options.heartbeat_timeout,
+            clients: Mutex::new(HashMap::new()),
+            next_client_id: AtomicU64::new(0),
+            external_stop_generation: AtomicU64::new(0),
+            state: tokio::sync::Mutex::new(StartState::default()),
+        };
+        Self {
+            inner: Arc::new(inner),
+        }
     }
 
     /// Start the listener, returning the bound port (single-flight).
@@ -183,16 +226,27 @@ impl WsApiServer {
             .len()
     }
 
-    /// The pinned SHA-256 certificate fingerprint (colon-separated hex).
-    pub fn fingerprint(&self) -> &str {
-        &self.inner.fingerprint
+    /// The pinned SHA-256 certificate fingerprint (colon-separated hex), or
+    /// `None` when running in insecure dev mode without a TLS certificate.
+    pub fn fingerprint(&self) -> Option<&str> {
+        self.inner.fingerprint.as_deref()
+    }
+
+    /// Whether the listener is running in insecure (plain-`ws://`, no bearer
+    /// auth) dev mode. Used by `system.status` so remote clients see the
+    /// real TLS posture rather than a phantom fingerprint.
+    pub fn is_insecure(&self) -> bool {
+        self.inner.acceptor.is_none()
     }
 }
 
 impl WsInner {
-    /// Accept TLS connections until `shutdown` fires. A failed accept is logged,
-    /// never fatal (post-bind durable error handler). Dropping the listener on
-    /// exit frees the port before `stop()` returns.
+    /// Accept TCP connections until `shutdown` fires. When a TLS acceptor is
+    /// configured the raw TCP stream is first wrapped in TLS (production posture,
+    /// `wss://`); in insecure dev mode the plain TCP stream drives the HTTP
+    /// upgrade directly (`ws://`). A failed accept is logged, never fatal
+    /// (post-bind durable error handler). Dropping the listener on exit frees
+    /// the port before `stop()` returns.
     pub(crate) async fn accept_loop(
         self: Arc<Self>,
         listener: TcpListener,
@@ -205,7 +259,15 @@ impl WsInner {
                     Ok((tcp, _peer)) => {
                         let me = self.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = me.handle_tls_conn(tcp).await {
+                            let _ = tcp.set_nodelay(true);
+                            let result = match me.acceptor.clone() {
+                                Some(acceptor) => match acceptor.accept(tcp).await {
+                                    Ok(tls) => me.handle_conn(tls).await,
+                                    Err(e) => Err(e),
+                                },
+                                None => me.handle_conn(tcp).await,
+                            };
+                            if let Err(e) = result {
                                 tracing::debug!(error = %e, "ws connection setup failed");
                             }
                         });
@@ -251,18 +313,19 @@ impl WsInner {
         }
     }
 
-    /// Complete the TLS handshake, parse the HTTP head, and either answer
-    /// `/health`, reject a bad `/ws` upgrade (401/403/404), or perform the
-    /// WebSocket handshake and start the connection loop.
-    async fn handle_tls_conn(self: Arc<Self>, tcp: TcpStream) -> std::io::Result<()> {
-        let _ = tcp.set_nodelay(true);
-        let mut tls = self.acceptor.accept(tcp).await?;
-        let head = read_request_head(&mut tls).await?;
+    /// Parse the HTTP head from an established stream (TLS or plain TCP), and
+    /// either answer `/health`, reject a bad `/ws` upgrade (401/403/404), or
+    /// perform the WebSocket handshake and start the connection loop.
+    async fn handle_conn<S>(self: Arc<Self>, mut stream: S) -> std::io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let head = read_request_head(&mut stream).await?;
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
         match req.parse(&head) {
             Ok(httparse::Status::Complete(_)) => {}
-            _ => return reject(&mut tls, 400, "Bad Request").await,
+            _ => return reject(&mut stream, 400, "Bad Request").await,
         }
         let method = req.method.unwrap_or("");
         let target = req.path.unwrap_or("");
@@ -278,56 +341,67 @@ impl WsInner {
             }
         }
         if method.eq_ignore_ascii_case("GET") && path == "/health" {
-            return self.write_health(&mut tls).await;
+            return self.write_health(&mut stream).await;
         }
         if path != "/ws" {
-            return reject(&mut tls, 404, "Not Found").await;
+            return reject(&mut stream, 404, "Not Found").await;
         }
         // §5.3 upgrade gate: enable flag, origin allow-list, then bearer token.
         if !self.enabled {
-            return reject(&mut tls, 403, "Forbidden").await;
+            return reject(&mut stream, 403, "Forbidden").await;
         }
         if !is_allowed_origin(origin.as_deref()) {
-            return reject(&mut tls, 403, "Forbidden").await;
+            return reject(&mut stream, 403, "Forbidden").await;
         }
         if self.auth_enabled {
-            let ok = extract_token(authorization.as_deref(), target)
-                .map(|t| validate_token(&*self.token_store, &t))
+            let ok = self
+                .token_store
+                .as_ref()
+                .and_then(|store| {
+                    extract_token(authorization.as_deref(), target)
+                        .map(|t| validate_token(store.as_ref(), &t))
+                })
                 .unwrap_or(false);
             if !ok {
-                return reject(&mut tls, 401, "Unauthorized").await;
+                return reject(&mut stream, 401, "Unauthorized").await;
             }
         }
         let Some(key) = ws_key else {
-            return reject(&mut tls, 400, "Bad Request").await;
+            return reject(&mut stream, 400, "Bad Request").await;
         };
         let accept = derive_accept_key(key.as_bytes());
         let response = format!(
             "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
         );
-        tls.write_all(response.as_bytes()).await?;
-        tls.flush().await?;
-        let ws = WebSocketStream::from_raw_socket(tls, Role::Server, None).await;
+        stream.write_all(response.as_bytes()).await?;
+        stream.flush().await?;
+        let ws = WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
         self.spawn_connection(ws);
         Ok(())
     }
 
     /// Write the plain `GET /health` response and close.
-    async fn write_health(&self, tls: &mut TlsStream<TcpStream>) -> std::io::Result<()> {
+    async fn write_health<W>(&self, stream: &mut W) -> std::io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let count = self.clients.lock().expect("ws clients poisoned").len();
         let body = format!("{{\"status\":\"ok\",\"clients\":{count}}}");
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
-        tls.write_all(response.as_bytes()).await?;
-        tls.flush().await?;
-        let _ = tls.shutdown().await;
+        stream.write_all(response.as_bytes()).await?;
+        stream.flush().await?;
+        let _ = stream.shutdown().await;
         Ok(())
     }
 
     /// Register a new client and spawn its connection loop.
-    fn spawn_connection(self: &Arc<Self>, ws: WebSocketStream<TlsStream<TcpStream>>) {
+    fn spawn_connection<S>(self: &Arc<Self>, ws: WebSocketStream<S>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ConnCmd>(8);
         let last_pong = Arc::new(AtomicI64::new(now_ms()));
@@ -357,13 +431,15 @@ impl WsInner {
     /// Drive one WebSocket connection: dispatch incoming text via the shared
     /// router, push outbound frames, answer pings, and honour control commands.
     /// On exit, subscriptions are dropped and the socket is closed.
-    async fn connection_loop(
+    async fn connection_loop<S>(
         self: Arc<Self>,
         id: u64,
-        ws: WebSocketStream<TlsStream<TcpStream>>,
+        ws: WebSocketStream<S>,
         mut cmd_rx: mpsc::Receiver<ConnCmd>,
         last_pong: Arc<AtomicI64>,
-    ) {
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (mut sink, mut stream) = ws.split();
         let (app_tx, mut app_rx) = mpsc::channel::<String>(OUTBOUND_CAPACITY);
         let mut subs = ConnSubs::default();
@@ -459,11 +535,14 @@ fn parse_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
 
 /// Read an HTTP request head up to and including the terminating `\r\n\r\n`,
 /// without consuming any following bytes (the client waits for `101`).
-async fn read_request_head(tls: &mut TlsStream<TcpStream>) -> std::io::Result<Vec<u8>> {
+async fn read_request_head<S>(stream: &mut S) -> std::io::Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
     let mut buf = Vec::with_capacity(1024);
     let mut byte = [0u8; 1];
     loop {
-        let n = tls.read(&mut byte).await?;
+        let n = stream.read(&mut byte).await?;
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -485,12 +564,15 @@ async fn read_request_head(tls: &mut TlsStream<TcpStream>) -> std::io::Result<Ve
 }
 
 /// Write a bodyless HTTP error status line and destroy the socket.
-async fn reject(tls: &mut TlsStream<TcpStream>, code: u16, reason: &str) -> std::io::Result<()> {
+async fn reject<W>(stream: &mut W, code: u16, reason: &str) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let response =
         format!("HTTP/1.1 {code} {reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-    tls.write_all(response.as_bytes()).await?;
-    tls.flush().await?;
-    let _ = tls.shutdown().await;
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    let _ = stream.shutdown().await;
     Ok(())
 }
 

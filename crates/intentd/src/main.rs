@@ -37,7 +37,10 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start the daemon and serve JSON-RPC. `--listen` selects the transport(s):
-    /// `uds` (default), `tcp` (HTTPS+WSS on 0.0.0.0:5180), or `both`.
+    /// `uds` (default), `tcp` (HTTPS+WSS on 0.0.0.0:5181), or `both`. The TCP
+    /// listener binds exactly that port and exits non-zero on any bind error
+    /// (no port walking). `--insecure` (or `INTENTD_INSECURE=1`) serves plain
+    /// `ws://` on the TCP path with no TLS and no bearer-token auth — dev only.
     Serve {
         /// Transport to listen on: `uds`, `tcp`, or `both`.
         #[arg(long, default_value = "uds")]
@@ -47,6 +50,10 @@ enum Command {
         /// and the mDNS TXT record. Omit to infer from the transport.
         #[arg(long)]
         mode: Option<String>,
+        /// Dev-only: serve plain `ws://` with no TLS and no bearer-token
+        /// enforcement on the TCP path. Also enabled by `INTENTD_INSECURE=1`.
+        #[arg(long)]
+        insecure: bool,
     },
     /// One-shot JSON-RPC call to a running daemon; prints the JSON result.
     Call {
@@ -111,7 +118,11 @@ enum ServiceAction {
 async fn main() -> ExitCode {
     init_tracing();
     match Cli::parse().command {
-        Command::Serve { listen, mode } => to_exit(cmd_serve(&listen, mode.as_deref()).await),
+        Command::Serve {
+            listen,
+            mode,
+            insecure,
+        } => to_exit(cmd_serve(&listen, mode.as_deref(), insecure).await),
         Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
         Command::Status => cmd_status().await,
         Command::Stop => cmd_stop().await,
@@ -198,13 +209,17 @@ fn resolve_config() -> anyhow::Result<Config> {
     Config::resolve().map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
-async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
+async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::Result<()> {
     let (serve_uds_enabled, serve_tcp_enabled) = match listen {
         "uds" => (true, false),
         "tcp" => (false, true),
         "both" => (true, true),
         other => anyhow::bail!("unsupported --listen '{other}'; expected uds|tcp|both"),
     };
+    // Insecure dev mode: `--insecure` OR `INTENTD_INSECURE=1` disables TLS and
+    // bearer-token enforcement on the TCP path (plain `ws://`), and skips cert
+    // provisioning entirely. Dev-only; loudly warned at startup.
+    let insecure = insecure || env_flag("INTENTD_INSECURE");
     // Resolve the optional locality override (§5.14): `--mode local|remote`
     // forces the value reported over `host.status` + mDNS regardless of
     // transport; absent ⇒ infer from the transport (UDS local, TCP/WSS remote).
@@ -340,19 +355,34 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
 
     // Start the HTTPS+WSS listener when requested. TLS and bearer auth are
     // auto-on for TCP (§5.2/§5.3): the self-signed cert (M5.1) is reused across
-    // restarts and the persisted token (M5.2) gates upgrades. The listener runs
-    // in the background and is gracefully stopped after the shutdown signal.
+    // restarts and the persisted token (M5.2) gates upgrades. In insecure dev
+    // mode the listener serves plain `ws://` on the same port with no TLS and
+    // no bearer-token enforcement; certificate provisioning is skipped. Any
+    // bind failure propagates and aborts the whole serve process (no port
+    // walking, all listen modes — the UDS listener dies with it).
     let (ws_server, ws_port) = if serve_tcp_enabled {
-        let tls =
-            ensure_tls_certificate(&config.data_dir).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        let token_store = resolve_token_store();
-        get_or_create_token(&*token_store).map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let mut ws_options = ws_options_from_env();
         ws_options.locality_override = locality_override;
-        let server = WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, ws_options)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let server = if insecure {
+            tracing::warn!(
+                "intentd INSECURE dev mode: TLS disabled, bearer-token auth disabled, plain ws:// on {}:{} — do NOT use outside local dev",
+                ws_options.bind_address,
+                ws_options.base_port
+            );
+            WsApiServer::new_insecure(api.clone(), bus.clone(), ws_options)
+        } else {
+            let tls = ensure_tls_certificate(&config.data_dir)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let token_store = resolve_token_store();
+            get_or_create_token(&*token_store).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, ws_options)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        };
         let port = server.start().await?;
-        tracing::info!(port, fingerprint = %server.fingerprint(), "intentd WSS listening");
+        match server.fingerprint() {
+            Some(fp) => tracing::info!(port, fingerprint = %fp, "intentd WSS listening"),
+            None => tracing::info!(port, "intentd WS listening (insecure, no TLS)"),
+        }
         (Some(server), Some(port))
     } else {
         (None, None)
@@ -368,7 +398,9 @@ async fn cmd_serve(listen: &str, mode: Option<&str>) -> anyhow::Result<()> {
         uds: serve_uds_enabled,
         tcp: serve_tcp_enabled,
         port: ws_port,
-        fingerprint: ws_server.as_ref().map(|s| s.fingerprint().to_string()),
+        fingerprint: ws_server
+            .as_ref()
+            .and_then(|s| s.fingerprint().map(str::to_string)),
         ws_server: ws_server.clone(),
         manager: manager.clone(),
         shutdown: shutdown_notify.clone(),
@@ -1177,29 +1209,32 @@ async fn cmd_doctor() -> ExitCode {
     }
 }
 
-/// §5.7 ports-free check: count bindable ports in the WSS bind window
-/// (`DEFAULT_PORT ..= +MAX_PORT_ATTEMPTS`). Fails only when the entire window is
-/// occupied (no TCP listener could start); a busy base port alone is reported.
+/// §5.7 ports-free check: probe the WSS listen port `serve` will actually bind.
+/// Honours the same `INTENTD_TCP_PORT` seam the daemon reads (§13.1 E2E), and
+/// falls back to `DEFAULT_PORT` otherwise. Fails when the port cannot be bound
+/// — the listener would exit immediately with the same error, so surface it
+/// here before `serve` is attempted.
 fn check_ports_free() -> bool {
-    use intent_transport::lifecycle::{DEFAULT_PORT, MAX_PORT_ATTEMPTS};
-    let mut free = 0u16;
-    for offset in 0..MAX_PORT_ATTEMPTS {
-        let Some(port) = DEFAULT_PORT.checked_add(offset) else {
-            break;
-        };
-        if std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_ok() {
-            free += 1;
-        }
+    use intent_transport::lifecycle::DEFAULT_PORT;
+    let port = std::env::var("INTENTD_TCP_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .unwrap_or(DEFAULT_PORT);
+    // Port 0 is the "OS-assigned ephemeral" seam — always bindable, do not
+    // probe it (there is no fixed port to reserve).
+    if port == 0 {
+        println!("[ok] WSS port ephemeral (INTENTD_TCP_PORT=0)");
+        return true;
     }
-    let last = DEFAULT_PORT + MAX_PORT_ATTEMPTS - 1;
-    if free == 0 {
-        println!("[FAIL] no free port in WSS window {DEFAULT_PORT}..={last}");
-        false
-    } else {
-        println!(
-            "[ok] {free}/{MAX_PORT_ATTEMPTS} ports free in WSS window {DEFAULT_PORT}..={last}"
-        );
-        true
+    match std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)) {
+        Ok(_) => {
+            println!("[ok] WSS port {port} bindable");
+            true
+        }
+        Err(e) => {
+            println!("[FAIL] WSS port {port} not bindable: {e}");
+            false
+        }
     }
 }
 
