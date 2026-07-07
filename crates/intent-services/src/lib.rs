@@ -388,9 +388,11 @@ impl Services {
     }
 
     /// Build a [`SettingsService`](settings::SettingsService) view over the store
-    /// and secret store for one `settings.*` call.
+    /// and secret store for one `settings.*` call. The secret store is cloned
+    /// as an `Arc` so `SettingsService` can move it into `spawn_blocking` for
+    /// non-blocking, timeout-guarded keychain access.
     fn settings_service(&self) -> settings::SettingsService<'_> {
-        settings::SettingsService::new(&self.store, self.secrets.as_ref())
+        settings::SettingsService::new(&self.store, Arc::clone(&self.secrets))
     }
 
     /// Borrow the shared PTY host (composition root / ACP terminal-adapter use).

@@ -13,9 +13,12 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use intent_core::{Error, Result};
 use serde_json::{json, Map, Value};
+use tokio::task;
+use tokio::time::timeout;
 
 use intent_store::Store;
 
@@ -27,6 +30,14 @@ const KEYRING_SERVICE: &str = "intentd";
 /// Placeholder returned for a sensitive setting that **has** a stored value, so
 /// the wire conveys presence without ever leaking the plaintext (§9.8).
 pub(crate) const REDACTED_PLACEHOLDER: &str = "********";
+
+/// Per-secret keychain-call timeout. The [`KeyringSecretStore`] wraps blocking
+/// OS-keychain FFI (`Security.framework` / `libsecret` / `wincred`), which can
+/// stall indefinitely — e.g. a locked/prompting keychain — and would otherwise
+/// hang the transport task servicing `settings.list` / `get` / `update` /
+/// `reset`. On timeout the operation is treated as "absent" for reads and
+/// surfaces `-32603` for writes so the response is never silently dropped.
+const SECRET_OP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Abstraction over secret persistence (the sensitive-setting analog of the
 /// transport's `TokenStore`). Production uses [`KeyringSecretStore`]; tests
@@ -828,14 +839,80 @@ pub(crate) async fn auto_commit_enabled(store: &Store) -> bool {
 
 /// Stateless executor for the `settings.*` namespace over a [`Store`] +
 /// [`SecretStore`]. Construct one per call from the long-lived `Services`.
+///
+/// The [`SecretStore`] is held as an `Arc` so its blocking keychain FFI calls
+/// can be moved into [`tokio::task::spawn_blocking`] with a timeout — without
+/// that offload a stalling keychain (locked, prompting, or otherwise) would
+/// hang the transport task servicing `settings.*` and the response would never
+/// reach the wire.
 pub(crate) struct SettingsService<'a> {
     store: &'a Store,
-    secrets: &'a dyn SecretStore,
+    secrets: Arc<dyn SecretStore>,
 }
 
 impl<'a> SettingsService<'a> {
-    pub(crate) fn new(store: &'a Store, secrets: &'a dyn SecretStore) -> Self {
+    pub(crate) fn new(store: &'a Store, secrets: Arc<dyn SecretStore>) -> Self {
         Self { store, secrets }
+    }
+
+    /// Probe the keychain for `path` without blocking the runtime.
+    ///
+    /// Runs [`SecretStore::load`] on a blocking thread with a
+    /// [`SECRET_OP_TIMEOUT`] budget: on timeout or panic the setting is
+    /// treated as absent (returns `false`) so `settings.list` / `get` still
+    /// respond promptly — a stalled OS keychain must never silently drop a
+    /// well-formed JSON-RPC response.
+    async fn secret_present(&self, path: &'static str) -> bool {
+        let secrets = Arc::clone(&self.secrets);
+        let handle = task::spawn_blocking(move || secrets.load(path).is_some());
+        match timeout(SECRET_OP_TIMEOUT, handle).await {
+            Ok(Ok(present)) => present,
+            Ok(Err(e)) => {
+                tracing::warn!(setting = path, error = %e, "secret load panicked");
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    setting = path,
+                    timeout_ms = SECRET_OP_TIMEOUT.as_millis() as u64,
+                    "secret load timed out — reporting absent",
+                );
+                false
+            }
+        }
+    }
+
+    /// Persist `value` for the given sensitive `path` via [`SecretStore::store`]
+    /// off the runtime, subject to [`SECRET_OP_TIMEOUT`]. A timeout or panic
+    /// surfaces as [`Error::Internal`] → `-32603` so callers always get a
+    /// terminal JSON-RPC response instead of silence.
+    async fn secret_store(&self, path: &'static str, value: String) -> Result<()> {
+        let secrets = Arc::clone(&self.secrets);
+        let handle = task::spawn_blocking(move || secrets.store(path, &value));
+        match timeout(SECRET_OP_TIMEOUT, handle).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(e)) => Err(Error::Internal(format!("secret store panicked: {e}"))),
+            Err(_) => Err(Error::Internal(format!(
+                "keychain write timed out after {}ms",
+                SECRET_OP_TIMEOUT.as_millis()
+            ))),
+        }
+    }
+
+    /// Delete the secret at `path` via [`SecretStore::delete`] off the runtime,
+    /// subject to [`SECRET_OP_TIMEOUT`]. Timeout / panic surfaces as
+    /// [`Error::Internal`] so `settings.reset` never hangs the transport.
+    async fn secret_delete(&self, path: &'static str) -> Result<()> {
+        let secrets = Arc::clone(&self.secrets);
+        let handle = task::spawn_blocking(move || secrets.delete(path));
+        match timeout(SECRET_OP_TIMEOUT, handle).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(e)) => Err(Error::Internal(format!("secret delete panicked: {e}"))),
+            Err(_) => Err(Error::Internal(format!(
+                "keychain delete timed out after {}ms",
+                SECRET_OP_TIMEOUT.as_millis()
+            ))),
+        }
     }
 
     /// The current value for a definition: sensitive settings are **redacted**
@@ -843,7 +920,7 @@ impl<'a> SettingsService<'a> {
     /// non-secret settings come from the DB, falling back to the default.
     async fn current_value(&self, def: &SettingDefinition) -> Value {
         if def.sensitive {
-            if self.secrets.load(def.path).is_some() {
+            if self.secret_present(def.path).await {
                 json!(REDACTED_PLACEHOLDER)
             } else {
                 Value::Null
@@ -857,11 +934,62 @@ impl<'a> SettingsService<'a> {
     }
 
     /// `settings.list` → `{ settings: SettingDefinitionWithValue[] }` (§5.12).
+    ///
+    /// Sensitive-setting presence probes are launched **concurrently** so the
+    /// worst-case latency is one [`SECRET_OP_TIMEOUT`], not `N × timeout`. A
+    /// stalled OS keychain therefore bounds the whole call to a single budget
+    /// instead of accumulating across every sensitive definition.
     pub(crate) async fn list(&self) -> Result<Value> {
         let defs = definitions();
+        // Launch each sensitive probe first so their timeouts run in parallel.
+        let mut sensitive: Vec<(&'static str, tokio::task::JoinHandle<bool>)> = Vec::new();
+        for def in &defs {
+            if def.sensitive {
+                let secrets = Arc::clone(&self.secrets);
+                let path = def.path;
+                let handle = task::spawn(async move {
+                    let inner = task::spawn_blocking(move || secrets.load(path).is_some());
+                    match timeout(SECRET_OP_TIMEOUT, inner).await {
+                        Ok(Ok(present)) => present,
+                        Ok(Err(e)) => {
+                            tracing::warn!(setting = path, error = %e, "secret load panicked");
+                            false
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                setting = path,
+                                timeout_ms = SECRET_OP_TIMEOUT.as_millis() as u64,
+                                "secret load timed out — reporting absent",
+                            );
+                            false
+                        }
+                    }
+                });
+                sensitive.push((def.path, handle));
+            }
+        }
+        // Collect all sensitive results — panics fall back to "absent" so the
+        // wire response is always well-formed.
+        let mut presence: HashMap<&'static str, bool> = HashMap::with_capacity(sensitive.len());
+        for (path, handle) in sensitive {
+            let present = handle.await.unwrap_or(false);
+            presence.insert(path, present);
+        }
+
         let mut out = Vec::with_capacity(defs.len());
         for def in &defs {
-            let value = self.current_value(def).await;
+            let value = if def.sensitive {
+                if presence.get(def.path).copied().unwrap_or(false) {
+                    json!(REDACTED_PLACEHOLDER)
+                } else {
+                    Value::Null
+                }
+            } else {
+                match self.store.get_setting(def.path).await {
+                    Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or(Value::Null),
+                    _ => def.default_value.clone().unwrap_or(Value::Null),
+                }
+            };
             let mut obj = def.definition_json();
             if let Some(map) = obj.as_object_mut() {
                 map.insert("value".into(), value);
@@ -916,7 +1044,7 @@ impl<'a> SettingsService<'a> {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                self.secrets.store(def.path, &secret_value)?;
+                self.secret_store(def.path, secret_value).await?;
                 applied.push(json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }));
             } else {
                 let raw = serde_json::to_string(&value)
@@ -934,7 +1062,7 @@ impl<'a> SettingsService<'a> {
         let def = find_definition(path)
             .ok_or_else(|| Error::InvalidParams(format!("unknown setting: {path}")))?;
         if def.sensitive {
-            self.secrets.delete(def.path)?;
+            self.secret_delete(def.path).await?;
         } else {
             self.store.delete_setting(def.path).await?;
         }
@@ -1113,6 +1241,128 @@ mod tests {
                     "{path} must be a Number clamped to 0..=1"
                 );
             }
+        }
+    }
+
+    /// A [`SecretStore`] whose `load` blocks the calling thread for `hang_for`
+    /// before returning `None` — models a locked / prompting OS keychain that
+    /// used to hang `settings.list` indefinitely.
+    #[derive(Debug)]
+    struct HangingSecretStore {
+        hang_for: Duration,
+    }
+    impl SecretStore for HangingSecretStore {
+        fn load(&self, _account: &str) -> Option<String> {
+            std::thread::sleep(self.hang_for);
+            None
+        }
+        fn store(&self, _account: &str, _value: &str) -> Result<()> {
+            std::thread::sleep(self.hang_for);
+            Ok(())
+        }
+        fn delete(&self, _account: &str) -> Result<()> {
+            std::thread::sleep(self.hang_for);
+            Ok(())
+        }
+    }
+
+    /// Regression: a stalled OS keychain (e.g. locked, prompting) MUST NOT hang
+    /// `settings.list`. Each sensitive setting is bounded by
+    /// [`SECRET_OP_TIMEOUT`] and, on timeout, reads as `null` (absent) so the
+    /// response reaches the wire — never a silent drop over WS/UDS.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settings_list_survives_a_hung_keychain() {
+        let tmp =
+            std::env::temp_dir().join(format!("intentd-settings-hang-{}.db", uuid::Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("open store");
+        // Hang for well over the per-op budget so a naive implementation would
+        // stall for `N_sensitive * hang_for` seconds and blow past the test's
+        // outer timeout.
+        let secrets: Arc<dyn SecretStore> = Arc::new(HangingSecretStore {
+            hang_for: Duration::from_secs(30),
+        });
+        let svc = SettingsService::new(&store, secrets);
+
+        let started = std::time::Instant::now();
+        // Outer cap: sensitive probes fan out concurrently, so total latency
+        // is bounded by ONE `SECRET_OP_TIMEOUT` — well under the 30-second
+        // per-call stall the store models. A small slack absorbs task-spawn
+        // overhead on cold runners.
+        let cap = SECRET_OP_TIMEOUT + Duration::from_secs(2);
+        let list = timeout(cap, svc.list())
+            .await
+            .expect("settings.list must not hang when the keychain stalls")
+            .expect("settings.list must not return a domain error");
+        let elapsed = started.elapsed();
+
+        // Every sensitive entry MUST redact to `null` (absent) — the timed-out
+        // load is treated as "not present" so the response is well-formed.
+        let arr = list["settings"].as_array().expect("settings array");
+        let mut sensitive_seen = 0;
+        for entry in arr {
+            if entry["sensitive"] == json!(true) {
+                sensitive_seen += 1;
+                assert_eq!(
+                    entry["value"],
+                    Value::Null,
+                    "hung keychain must read as absent for {}: {entry}",
+                    entry["path"],
+                );
+            }
+        }
+        assert!(sensitive_seen > 0, "catalog must contain sensitive entries");
+        assert!(
+            elapsed < cap,
+            "settings.list took {elapsed:?} — timeout cap was {cap:?}",
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// Regression: `settings.update` on a sensitive path with a stalled
+    /// keychain MUST surface `Error::Internal` (→ `-32603`) instead of hanging
+    /// the transport task — the write path is symmetric with the read path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settings_update_secret_times_out_on_hung_keychain() {
+        let tmp = std::env::temp_dir().join(format!(
+            "intentd-settings-hang-update-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&tmp).await.expect("open store");
+        let secrets: Arc<dyn SecretStore> = Arc::new(HangingSecretStore {
+            hang_for: Duration::from_secs(30),
+        });
+        let svc = SettingsService::new(&store, secrets);
+
+        let started = std::time::Instant::now();
+        let cap = SECRET_OP_TIMEOUT + Duration::from_secs(2);
+        let err = timeout(
+            cap,
+            svc.update(&json!([{ "path": "linear.token", "value": "irrelevant" }])),
+        )
+        .await
+        .expect("settings.update must not hang past the budget")
+        .expect_err("hung keychain must surface an error, not success");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, Error::Internal(_)),
+            "expected Error::Internal, got {err:?}",
+        );
+        assert!(
+            elapsed < cap,
+            "settings.update took {elapsed:?}, cap {cap:?}"
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
         }
     }
 }
