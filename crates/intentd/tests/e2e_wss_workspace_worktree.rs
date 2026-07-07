@@ -456,3 +456,122 @@ async fn workspace_delete_cleans_worktree_and_branch_over_wss() {
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
+
+/// `workspace.delete` is idempotent over the wire: a second delete of the
+/// same id after the row is gone succeeds with `{ success: true }` instead of
+/// bubbling up the store's `NotFound` — the renderer retries the daemon after
+/// its own local cleanup and must not surface `"Failed to delete space"`.
+#[tokio::test]
+async fn workspace_delete_is_idempotent_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("idem");
+    let (daemon, port, cfg) = boot(&root).await;
+    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+    let mut ws = connect_ws(port, cfg).await;
+
+    let created = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "Idempotent delete",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "initialAgent": { "prompt": "fix the auth flow" },
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let id = created["workspace"]["id"].as_str().expect("id").to_string();
+
+    let first = wss_rpc(&mut ws, 3, "workspace.delete", json!({ "workspaceId": id })).await;
+    assert_eq!(first, json!({ "success": true }));
+    assert!(!root.join(&id).exists(), "workspace directory removed");
+
+    // Row is gone; a repeat delete must still succeed.
+    let second = wss_rpc(&mut ws, 4, "workspace.delete", json!({ "workspaceId": id })).await;
+    assert_eq!(second, json!({ "success": true }));
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// `workspace.delete` sweeps the whole `<workspaces_root>/<id>/` directory —
+/// not just the git worktree and the `.workspace/` metadata dir. The FE
+/// writes ancillary files (agent sessions, event caches, etc.) into the same
+/// workspace directory, and leaving them behind re-surfaces the deleted id in
+/// `FileSystemWorkspaceRepository.findAll`'s scan (ENOENT WARN spam every PR
+/// refresh tick).
+#[tokio::test]
+async fn workspace_delete_sweeps_residual_workspace_directory_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("resid");
+    let (daemon, port, cfg) = boot(&root).await;
+    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+    let mut ws = connect_ws(port, cfg).await;
+
+    let created = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "Residual sweep",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "initialAgent": { "prompt": "fix the auth flow" },
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let id = created["workspace"]["id"].as_str().expect("id").to_string();
+    let ws_dir = root.join(&id);
+    // Drop a stray file into `<root>/<id>/` alongside the worktree and
+    // `.workspace/`; the pre-fix `remove_dir` (empty-only) cleanup left this
+    // behind and the id kept re-appearing in FE scans.
+    std::fs::write(ws_dir.join("residual.log"), b"leftover renderer artefact\n").unwrap();
+
+    let deleted = wss_rpc(&mut ws, 3, "workspace.delete", json!({ "workspaceId": id })).await;
+    assert_eq!(deleted, json!({ "success": true }));
+    assert!(
+        !ws_dir.exists(),
+        "<root>/<id>/ (with residual content) fully removed"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// `workspace.delete` cleans up an orphan `<workspaces_root>/<id>/` directory
+/// that the daemon has no DB row for (legacy pre-daemon workspaces with a
+/// UUID directory and no `.workspace/workspace.json`). The RPC must succeed
+/// and remove the directory so the FE stops warning about it on every scan.
+#[tokio::test]
+async fn workspace_delete_cleans_orphan_directory_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("orphan");
+    let (daemon, port, cfg) = boot(&root).await;
+    let mut ws = connect_ws(port, cfg).await;
+
+    // Fabricate a legacy directory (UUID name, no metadata) directly on disk;
+    // the daemon has no row for it.
+    let id = format!("7d274735-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let orphan = root.join(&id);
+    std::fs::create_dir_all(orphan.join("some-repo")).unwrap();
+    std::fs::write(orphan.join("some-repo").join("README.md"), b"legacy\n").unwrap();
+    assert!(orphan.exists());
+
+    let deleted = wss_rpc(&mut ws, 2, "workspace.delete", json!({ "workspaceId": id })).await;
+    assert_eq!(deleted, json!({ "success": true }));
+    assert!(!orphan.exists(), "orphan workspace directory removed");
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}

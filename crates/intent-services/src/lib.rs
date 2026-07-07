@@ -4236,6 +4236,10 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let worktree_locks = self.worktree_locks.clone();
         let bus = self.event_bus.clone();
+        let workspaces_root = self
+            .workspaces_root
+            .clone()
+            .unwrap_or_else(default_workspaces_root);
         Box::pin(async move {
             // Port the TS `deleteWorkspace` worktree cleanup: under the per-repo
             // worktree lock, remove the linked worktree (+ the now-empty
@@ -4282,10 +4286,54 @@ impl WorkspaceApi for Services {
                     }
                 }
             }
-            store.delete_workspace(&id).await?;
-            // Minimal `workspace:deleted` payload (§6.5) — subscribers drop
-            // caches keyed on the id; reference-parity FE emitter.
-            publish_event(&bus, workspace_deleted_event(&id)).await;
+            // Final sweep of the daemon-owned workspace directory
+            // (`<workspaces_root>/<id>/`, matching FE
+            // `WorkspaceConfig.WORKSPACES_BASE`): the worktree cleanup's
+            // best-effort `remove_dir` (empty-only) leaves any residual
+            // content behind, and legacy pre-daemon workspaces have a
+            // directory but no worktree path at all. Recursive best-effort
+            // removal keeps the FE `FileSystemWorkspaceRepository.findAll`
+            // scan from re-surfacing the deleted id (ENOENT WARN spam) and
+            // makes the delete idempotent for orphaned directories.
+            let dir = workspaces_root.join(id.as_str());
+            let cleanup =
+                tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&dir) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e),
+                })
+                .await;
+            match cleanup {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    workspace = %id.as_str(),
+                    error = %e,
+                    "workspace.delete: failed to remove workspace directory"
+                ),
+                Err(join_err) => tracing::warn!(
+                    workspace = %id.as_str(),
+                    error = %join_err,
+                    "workspace.delete: workspace-dir cleanup task failed"
+                ),
+            }
+            // Idempotent DB delete: swallow `NotFound` so retries and
+            // orphan-dir-only cleanups don't surface as `"Failed to delete
+            // space"` on the FE. Any other error still propagates. Publish
+            // `workspace:deleted` only when we actually removed a row —
+            // subscribers dedup by id but a spurious event confuses UIs
+            // that treat it as a state transition.
+            match store.delete_workspace(&id).await {
+                Ok(()) => {
+                    publish_event(&bus, workspace_deleted_event(&id)).await;
+                }
+                Err(Error::NotFound(_)) => {
+                    tracing::debug!(
+                        workspace = %id.as_str(),
+                        "workspace.delete: row already gone; treating as idempotent success"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
             Ok(())
         })
     }
