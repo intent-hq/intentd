@@ -1774,6 +1774,57 @@ fn default_workspaces_root() -> PathBuf {
         .join("workspaces")
 }
 
+/// Resolve a workspace-id slug for `workspace.create`, porting the TS
+/// `generateLocalSlug` behavior (`workspace.service.ts`): extract from the
+/// `initialAgent.prompt` when possible, else fall back to a random
+/// adjective-animal pair. Uniquified against existing workspace rows with a
+/// `-N` suffix on collision (mirrors `ensure_unique_branch_name`).
+async fn derive_workspace_id(store: &Store, input: &WorkspaceCreate) -> WorkspaceId {
+    let base = input
+        .initial_agent
+        .as_ref()
+        .and_then(|a| a.prompt.as_deref())
+        .and_then(intent_core::slug::extract_local_slug)
+        .unwrap_or_else(intent_core::slug::generate_workspace_slug);
+    let candidate = WorkspaceId::from_string(base.clone());
+    if store.get_workspace(&candidate).await.is_err() {
+        return candidate;
+    }
+    let mut n: u32 = 2;
+    loop {
+        let candidate = WorkspaceId::from_string(format!("{base}-{n}"));
+        if store.get_workspace(&candidate).await.is_err() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Write the legacy `<workspaces_root>/<id>/.workspace/workspace.json` file
+/// that renderer code paths (FE `FileSystemWorkspaceRepository.findById`)
+/// still read for per-workspace metadata. Adds the FE-only
+/// `changesets`/`timeline`/`conversationInfo` arrays required by the FE
+/// `WorkspaceSchema`; every other field flows from the serialized `Workspace`.
+fn write_workspace_metadata_file(root: &Path, ws: &Workspace) -> Result<()> {
+    let dir = root.join(&ws.id.0).join(".workspace");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| Error::Internal(format!("create metadata dir failed: {e}")))?;
+    let mut value = serde_json::to_value(ws)
+        .map_err(|e| Error::Internal(format!("serialize workspace failed: {e}")))?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.entry("changesets").or_insert(serde_json::json!([]));
+        obj.entry("timeline").or_insert(serde_json::json!([]));
+        obj.entry("conversationInfo")
+            .or_insert(serde_json::json!([]));
+    }
+    let bytes = serde_json::to_vec_pretty(&value)
+        .map_err(|e| Error::Internal(format!("serialize workspace failed: {e}")))?;
+    let path = dir.join("workspace.json");
+    std::fs::write(&path, &bytes)
+        .map_err(|e| Error::Internal(format!("write workspace.json failed: {e}")))?;
+    Ok(())
+}
+
 /// Worktree folder name for a repo, porting the FE
 /// `WorkspaceConfigConstants.slugify` + `generateWorktreeFolderName`:
 /// lowercase, non-alphanumeric runs collapse to `-`, trimmed, ≤50 chars,
@@ -1820,11 +1871,13 @@ fn cleanup_workspace_worktree(
             "failed to remove git worktree"
         );
     }
-    // The provisioned layout is `<root>/<workspaceId>/<repo-slug>`; removing
-    // the worktree leaves an empty `<workspaceId>` dir behind. `remove_dir`
-    // only deletes empty directories, so a caller-supplied path shared with
-    // other content is never destroyed.
+    // The provisioned layout is `<root>/<workspaceId>/<repo-slug>` alongside
+    // the daemon-written `<root>/<workspaceId>/.workspace/` metadata dir.
+    // Remove the metadata dir first so the subsequent parent `remove_dir`
+    // (which only deletes empty directories) can succeed. A caller-supplied
+    // path shared with other content is still never destroyed.
     if let Some(parent) = worktree.parent() {
+        let _ = std::fs::remove_dir_all(parent.join(".workspace"));
         let _ = std::fs::remove_dir(parent);
     }
     let deletable = branch_auto_generated
@@ -3693,8 +3746,13 @@ impl WorkspaceApi for Services {
                 move || async move {
                     let store = op_store;
                     let now = now_iso();
-                    let id = WorkspaceId::new();
                     let mut input = input;
+                    // Workspace id derivation (TS `generateLocalSlug` parity):
+                    // slug from the initial-agent prompt when possible, else a
+                    // random adjective-animal pair; uniquified against
+                    // existing rows with a `-N` suffix on collision so the
+                    // on-disk directory reflects intent, not opaque UUIDs.
+                    let id = derive_workspace_id(&store, &input).await;
                     // Clone orchestration (PROTOCOL §5.1): when `githubUrl` is
                     // set and `repositoryPath` is not already a local git
                     // repo, clone it *before* branch naming so the branch
@@ -3814,9 +3872,19 @@ impl WorkspaceApi for Services {
                             }
                         }
                     };
+                    // Seed the title with the derived id (slug) when the caller
+                    // omits one, so the FE header shows a readable name (e.g.
+                    // 'auth-fix') immediately instead of 'Untitled'. The FE's
+                    // isWorkspaceSlug() still treats it as a placeholder, so
+                    // the initial agent's workspace.setTitle flow renames it
+                    // to a human title on the first turn (TS parity).
+                    let title = input
+                        .title
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or_else(|| id.0.clone());
                     let mut ws = Workspace {
                         id,
-                        title: input.title.unwrap_or_default(),
+                        title,
                         branch,
                         base_ref: input.base_ref,
                         base_commit_sha: input.base_commit_sha,
@@ -3868,16 +3936,17 @@ impl WorkspaceApi for Services {
                         .as_deref()
                         .filter(|p| !p.is_empty())
                         .map(PathBuf::from);
+                    let workspaces_root_pathbuf = workspaces_root
+                        .clone()
+                        .unwrap_or_else(default_workspaces_root);
                     if let Some(repo_dir) = repo_dir {
                         if !ws.is_remote && !ws.skip_worktree && !has_worktree {
                             if repo_dir.join(".git").exists() {
-                                let root = workspaces_root
-                                    .unwrap_or_else(default_workspaces_root);
                                 let repo_name = known_repo_name(
                                     ws.repository_name.as_deref(),
                                     &repo_dir.to_string_lossy(),
                                 );
-                                let wt_path = root
+                                let wt_path = workspaces_root_pathbuf
                                     .join(&ws.id.0)
                                     .join(worktree_folder_slug(&repo_name));
                                 let name = ws.id.0.clone();
@@ -3921,6 +3990,19 @@ impl WorkspaceApi for Services {
                         }
                     }
                     store.insert_workspace(&ws).await?;
+                    // Write the legacy `<root>/<id>/.workspace/workspace.json`
+                    // file so renderer paths (FE `FileSystemWorkspaceRepository`)
+                    // find their per-workspace metadata without ENOENT spam.
+                    // Best-effort — a failure warns and continues.
+                    if let Err(e) =
+                        write_workspace_metadata_file(&workspaces_root_pathbuf, &ws)
+                    {
+                        tracing::warn!(
+                            workspace = %ws.id.as_str(),
+                            error = %e,
+                            "workspace.create: failed to write .workspace/workspace.json"
+                        );
+                    }
                     // Record branch provenance for the delete-cleanup guard:
                     // only an auto-generated branch is ever deleted alongside
                     // the worktree (TS `removeGitWorktree` parity, where the

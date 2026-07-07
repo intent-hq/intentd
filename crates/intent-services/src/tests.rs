@@ -6598,6 +6598,200 @@ mod worktree_provisioning {
         let repo = git2::Repository::open(&repo_dir.0).unwrap();
         assert!(repo.find_branch(&branch, git2::BranchType::Local).is_err());
     }
+
+    /// `workspace.create` derives the workspace id from the initial-agent
+    /// prompt via `extract_local_slug` (TS `generateLocalSlug` parity), so the
+    /// on-disk directory is human-readable (e.g. `auth-fix`) instead of an
+    /// opaque UUID. A second create with the same prompt collides and yields
+    /// `<slug>-2`, mirroring the branch collision suffix.
+    #[tokio::test]
+    async fn create_derives_slug_id_from_prompt_and_uniquifies() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-idslug-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let make = |prompt: &str| WorkspaceCreate {
+            skip_worktree: Some(true),
+            initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                prompt: Some(prompt.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let first = svc
+            .create_workspace(make("fix the auth flow"), None)
+            .await
+            .expect("first create")
+            .workspace;
+        assert_eq!(first.id.0, "auth-fix");
+
+        let second = svc
+            .create_workspace(make("fix the auth flow"), None)
+            .await
+            .expect("second create")
+            .workspace;
+        assert_eq!(second.id.0, "auth-fix-2");
+    }
+
+    /// When no initial-agent prompt is supplied, `workspace.create` falls back
+    /// to a random adjective-animal slug (never a raw UUID). The resulting id
+    /// must satisfy the FE `word-word` shape (`isValidWorkspaceId`).
+    #[tokio::test]
+    async fn create_falls_back_to_random_slug_id_without_prompt() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-idrand-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    skip_worktree: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let parts: Vec<&str> = ws.id.0.split('-').collect();
+        assert_eq!(parts.len(), 2, "id '{}' must be word-word", ws.id.0);
+        for part in &parts {
+            assert!(
+                (2..=15).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_lowercase()),
+                "id '{}': segment '{}' must be 2-15 lowercase letters",
+                ws.id.0,
+                part
+            );
+        }
+    }
+
+    /// `workspace.create` also writes the legacy
+    /// `<root>/<id>/.workspace/workspace.json` metadata file so renderer paths
+    /// (FE `FileSystemWorkspaceRepository.findById`) find it without ENOENT.
+    /// The file matches the FE `WorkspaceSchema`: id/title/branch/status plus
+    /// the empty `changesets`/`timeline`/`conversationInfo` arrays it requires.
+    #[tokio::test]
+    async fn create_writes_workspace_json_metadata_file() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-wsjson-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("My workspace".to_string()),
+                    branch: Some("feat/wsjson".to_string()),
+                    skip_worktree: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let metadata_path = root
+            .0
+            .join(&ws.id.0)
+            .join(".workspace")
+            .join("workspace.json");
+        assert!(
+            metadata_path.exists(),
+            "workspace.json must exist at {}",
+            metadata_path.display()
+        );
+        let contents = std::fs::read_to_string(&metadata_path).expect("read workspace.json");
+        let value: serde_json::Value =
+            serde_json::from_str(&contents).expect("parse workspace.json");
+        assert_eq!(value["id"], ws.id.0);
+        assert_eq!(value["title"], "My workspace");
+        assert_eq!(value["branch"], "feat/wsjson");
+        assert_eq!(value["status"], "Active");
+        // FE schema requires these three arrays; the daemon does not model
+        // them so `write_workspace_metadata_file` fills empty arrays.
+        assert!(value["changesets"].is_array());
+        assert!(value["timeline"].is_array());
+        assert!(value["conversationInfo"].is_array());
+        assert_eq!(value["changesets"].as_array().unwrap().len(), 0);
+    }
+
+    /// When the caller passes an empty (or missing) title, `workspace.create`
+    /// seeds the workspace title with the derived id (slug) so the FE header
+    /// shows a readable name (e.g. `auth-fix`) immediately instead of
+    /// "Untitled". The FE recognizes this shape via `isWorkspaceSlug()` and
+    /// still prompts the initial agent to rename via `workspace.setTitle`.
+    #[tokio::test]
+    async fn create_seeds_title_from_slug_when_title_omitted() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-titleslug-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    // Onboarding sends `title: ''` today; simulate that.
+                    title: Some(String::new()),
+                    skip_worktree: Some(true),
+                    initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                        prompt: Some("fix the auth flow".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.id.0, "auth-fix");
+        assert_eq!(ws.title, "auth-fix", "title falls back to the derived slug");
+
+        // The metadata file mirrors the seeded title so FE reads see it too.
+        let metadata_path = root
+            .0
+            .join(&ws.id.0)
+            .join(".workspace")
+            .join("workspace.json");
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
+        assert_eq!(value["title"], "auth-fix");
+    }
+
+    /// An explicit non-empty title from the caller wins over the slug
+    /// fallback (the reference-app path still allows explicit titles).
+    #[tokio::test]
+    async fn create_preserves_explicit_title_over_slug_fallback() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-titleexpl-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("My Explicit Title".to_string()),
+                    skip_worktree: Some(true),
+                    initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                        prompt: Some("fix the auth flow".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.title, "My Explicit Title");
+    }
 }
 
 mod file_ops_service {

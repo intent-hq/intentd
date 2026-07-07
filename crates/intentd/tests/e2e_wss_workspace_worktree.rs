@@ -345,10 +345,11 @@ async fn workspace_create_provisions_worktree_over_wss() {
     assert_eq!(workspace["baseCommitSha"], json!(head_sha));
 
     // Branch naming: prompt-derived slug ("fix the auth flow" → `auth-fix`,
-    // TS `generateLocalSlug` parity), not the raw workspace UUID.
+    // TS `generateLocalSlug` parity). The workspace id itself is now the
+    // same slug (human-readable directory names replace opaque UUIDs).
     let branch = workspace["branch"].as_str().expect("branch");
     assert_eq!(branch, "auth-fix");
-    assert_ne!(branch, id, "branch must not be the workspace UUID");
+    assert_eq!(id, "auth-fix", "workspace id must be a slug, not a UUID");
 
     // The worktree is a real checkout on the workspace branch at the base tip.
     let wt_path = PathBuf::from(wt);
