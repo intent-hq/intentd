@@ -1451,6 +1451,12 @@ pub struct AgentMessage {
 /// dispatcher (which cannot depend on `intent-services`) share one policy value.
 pub const MAX_DELEGATION_DEPTH: i64 = 2;
 
+/// Maximum length (chars) of a workspace `statusMessage` (port of the TS
+/// `WORKSPACE_STATUS_MESSAGE_MAX_LENGTH` in `src/shared/types.ts`). The MCP
+/// `set_workspace_status_message` tool enforces this cap before calling
+/// `update_workspace`, matching the reference `ws.workspace.setStatusMessage`.
+pub const WORKSPACE_STATUS_MESSAGE_MAX_LENGTH: usize = 500;
+
 /// Agent runtime session (§9.1). Field names/casing match the TS `AgentSession`
 /// (`agent-session.ts`): `backendSessionId`, `acpSessionId` (write-once after
 /// the provider's `session:created`), `nameExplicitlySet`, `systemPrompt`, etc.

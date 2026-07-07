@@ -74,6 +74,11 @@ static ALL_TOOLS: &[ToolDef] = &[
         description: "List checkbox tasks parsed from a note.",
         params: &[p("noteId", "string", true)],
     },
+    ToolDef {
+        name: "get_workspace_details_workspace-mcp",
+        description: "Read workspace metadata (id, title, hasTitle, status, statusMessage,                       branch, repositoryName, tags).",
+        params: &[],
+    },
     // ---- Note write tools ----
     ToolDef {
         name: "create_note_workspace-mcp",
@@ -130,6 +135,17 @@ static ALL_TOOLS: &[ToolDef] = &[
             p("title", "string", false),
             p("tags", "array", false),
         ],
+    },
+    // ---- Workspace metadata write tools ----
+    ToolDef {
+        name: "set_workspace_title_workspace-mcp",
+        description: "Set the workspace title (1-5 words describing the task). Skips when                       the workspace already has a custom title (title different from its id).",
+        params: &[p("title", "string", true)],
+    },
+    ToolDef {
+        name: "set_workspace_status_message_workspace-mcp",
+        description: "Set or clear the workspace status message (1-2 sentence user-facing                       work summary). Pass an empty string to clear.",
+        params: &[p("statusMessage", "string", false)],
     },
     ToolDef {
         name: "delete_note_workspace-mcp",

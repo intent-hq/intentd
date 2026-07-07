@@ -49,6 +49,8 @@ Keep the workspace `statusMessage` current when the high-level work status chang
 - `ws.workspace.details()` — Get workspace metadata, including lifecycle `status` and user-facing `statusMessage`
 - `ws.workspace.setStatusMessage(message)` — Update or clear the 1–2 sentence high-level work status message
 
+**Rename the workspace (only if untitled)** — On your first turn, call `ws.workspace.details()`. If `hasTitle` is `false` (the workspace title still looks like its auto-generated id / slug), call `ws.workspace.setTitle(...)` early with a short 3–5 word sentence-case human title describing the task (e.g. "Add dark mode support"). Do NOT rename if the workspace already has a meaningful custom title — `setTitle` will short-circuit and return `{ ok: true, skipped: true }` in that case.
+
 ## Agent Collaboration
 
 - `ws.agent.delegate({ taskNoteId, specialist?, waitMode?, ... })` — Delegate a task to a new agent

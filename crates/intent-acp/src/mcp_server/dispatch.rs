@@ -5,7 +5,8 @@
 use intent_core::model::AgentDelegateInput;
 use intent_core::{
     AgentId, Error, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId,
-    NoteUpdateMetadataResult, Result, MAX_DELEGATION_DEPTH,
+    NoteUpdateMetadataResult, Result, WorkspaceUpdate, MAX_DELEGATION_DEPTH,
+    WORKSPACE_STATUS_MESSAGE_MAX_LENGTH,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -64,6 +65,88 @@ impl WorkspaceMcpServer {
             "get_note_workspace-mcp" => val(api.get_note(ws, note_id(args, "noteId")?).await),
             "list_note_tasks_workspace-mcp" => {
                 val(api.list_note_tasks(ws, note_id(args, "noteId")?).await)
+            }
+            // ---- Workspace metadata tools ----
+            "get_workspace_details_workspace-mcp" => {
+                let ws_row = api.get_workspace(ws).await?;
+                let title = ws_row.title.trim();
+                let has_title = !title.is_empty() && title != ws_row.id.as_str();
+                let display_title = if title.is_empty() {
+                    "(untitled)".to_string()
+                } else {
+                    title.to_string()
+                };
+                val::<serde_json::Value>(Ok(serde_json::json!({
+                    "id": ws_row.id,
+                    "title": display_title,
+                    "hasTitle": has_title,
+                    "status": ws_row.status,
+                    "statusMessage": ws_row.status_message,
+                    "branch": ws_row.branch,
+                    "repositoryName": ws_row.repository_name,
+                    "tags": ws_row.tags,
+                })))
+            }
+            "set_workspace_title_workspace-mcp" => {
+                // Skip-if-custom-titled: mirrors `ws-workspace-api.ts` — a
+                // workspace whose stored `title` is non-empty and different
+                // from its id already carries a human title, so the initial
+                // agent's rename call is a no-op. Branch renaming when the
+                // branch is still auto-generated is deferred: the daemon does
+                // not yet own an equivalent branch-rename path (no
+                // `intent_git::rename_branch`), so this tool is title-only.
+                let title = req_str(args, "title")?;
+                let trimmed = title.trim().to_string();
+                if trimmed.is_empty() {
+                    return Err(Error::InvalidParams("title must not be empty".to_string()));
+                }
+                let existing = api.get_workspace(ws.clone()).await?;
+                let existing_title = existing.title.trim();
+                if !existing_title.is_empty() && existing_title != existing.id.as_str() {
+                    return val::<serde_json::Value>(Ok(serde_json::json!({
+                        "ok": true,
+                        "skipped": true,
+                        "title": existing_title,
+                        "branch": existing.branch,
+                    })));
+                }
+                let update = WorkspaceUpdate {
+                    title: Some(trimmed.clone()),
+                    ..Default::default()
+                };
+                let updated = api.update_workspace(ws, update).await?;
+                val::<serde_json::Value>(Ok(serde_json::json!({
+                    "ok": true,
+                    "title": updated.title,
+                    "branch": updated.branch,
+                })))
+            }
+            "set_workspace_status_message_workspace-mcp" => {
+                // Optional `statusMessage`: empty string / whitespace clears
+                // it, matching the reference `setStatusMessage(null)` clear
+                // semantics. Over-length input surfaces InvalidParams per the
+                // FE's `WORKSPACE_STATUS_MESSAGE_MAX_LENGTH` guard.
+                let raw = opt_str(args, "statusMessage").unwrap_or_default();
+                let trimmed = raw.trim();
+                if trimmed.len() > WORKSPACE_STATUS_MESSAGE_MAX_LENGTH {
+                    return Err(Error::InvalidParams(format!(
+                        "statusMessage must be {WORKSPACE_STATUS_MESSAGE_MAX_LENGTH} characters or fewer"
+                    )));
+                }
+                let update = WorkspaceUpdate {
+                    status_message: Some(trimmed.to_string()),
+                    ..Default::default()
+                };
+                let updated = api.update_workspace(ws, update).await?;
+                let out = if trimmed.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(updated.status_message.unwrap_or_default())
+                };
+                val::<serde_json::Value>(Ok(serde_json::json!({
+                    "ok": true,
+                    "statusMessage": out,
+                })))
             }
             // ---- Note write tools ----
             // `note.create` is an idempotent method (TB-0 §5): the daemon is the
