@@ -3,7 +3,8 @@
 //! allow-list matrix. The keychain is replaced by an in-memory [`MemoryStore`]
 //! so tests never touch the real OS keychain.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::*;
 
@@ -258,6 +259,89 @@ fn discovery_disabled_by_default() {
     assert!(!is_discovery_enabled(None));
     assert!(is_discovery_enabled(Some(true)));
     assert!(!is_discovery_enabled(Some(false)));
+}
+
+/// [`TokenStore`] whose `load_token` sleeps for `hang_for` before answering —
+/// models a locked / prompting OS keychain that would otherwise wedge the WS
+/// upgrade path.
+struct SleepingTokenStore {
+    hang_for: Duration,
+}
+
+impl TokenStore for SleepingTokenStore {
+    fn load_token(&self) -> Option<String> {
+        std::thread::sleep(self.hang_for);
+        Some("a".repeat(64))
+    }
+    fn store_token(&self, _token: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Regression: a stalled OS keychain MUST NOT hang the WS upgrade path.
+/// `validate_token_bounded` returns [`ValidateOutcome::Unavailable`] within
+/// one [`TOKEN_OP_TIMEOUT`] so the caller can reject the connection cleanly
+/// and the accept loop keeps flowing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_token_bounded_times_out_on_hung_store() {
+    let store: Arc<dyn TokenStore> = Arc::new(SleepingTokenStore {
+        hang_for: Duration::from_secs(30),
+    });
+    let started = Instant::now();
+    let outcome = validate_token_bounded(store, "a".repeat(64)).await;
+    let elapsed = started.elapsed();
+    assert_eq!(outcome, ValidateOutcome::Unavailable);
+    let cap = TOKEN_OP_TIMEOUT + Duration::from_secs(2);
+    assert!(
+        elapsed < cap,
+        "validate_token_bounded took {elapsed:?}, cap {cap:?}",
+    );
+}
+
+/// A concurrent hung validation MUST NOT block a second, healthy validation:
+/// each call has its own blocking task + timeout budget, so the accept loop
+/// stays responsive while one connection is waiting on the keychain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn validate_token_bounded_isolates_a_hung_call() {
+    let hung: Arc<dyn TokenStore> = Arc::new(SleepingTokenStore {
+        hang_for: Duration::from_secs(30),
+    });
+    let fast: Arc<dyn TokenStore> = Arc::new(MemoryStore::with(&"a".repeat(64)));
+
+    let hung_task = tokio::spawn(validate_token_bounded(hung, "a".repeat(64)));
+    // Give the hung call a moment to start on its blocking thread.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let started = Instant::now();
+    let ok = validate_token_bounded(fast, "a".repeat(64)).await;
+    let elapsed = started.elapsed();
+    assert_eq!(ok, ValidateOutcome::Ok);
+    assert!(
+        elapsed < TOKEN_OP_TIMEOUT,
+        "healthy validation was delayed by hung call: {elapsed:?}",
+    );
+
+    let hung_outcome = hung_task.await.expect("hung task must resolve");
+    assert_eq!(hung_outcome, ValidateOutcome::Unavailable);
+}
+
+/// A rejected token (store answers but the value mismatches) is
+/// [`ValidateOutcome::Invalid`], distinct from [`ValidateOutcome::Unavailable`].
+#[tokio::test]
+async fn validate_token_bounded_returns_invalid_on_mismatch() {
+    let store: Arc<dyn TokenStore> = Arc::new(MemoryStore::with(&"a".repeat(64)));
+    let outcome = validate_token_bounded(store, "b".repeat(64)).await;
+    assert_eq!(outcome, ValidateOutcome::Invalid);
+}
+
+/// The happy path: the store answers, the candidate matches, `Ok` returns
+/// well within the timeout budget.
+#[tokio::test]
+async fn validate_token_bounded_returns_ok_on_match() {
+    let token = "a".repeat(64);
+    let store: Arc<dyn TokenStore> = Arc::new(MemoryStore::with(&token));
+    let outcome = validate_token_bounded(store, token).await;
+    assert_eq!(outcome, ValidateOutcome::Ok);
 }
 
 #[test]

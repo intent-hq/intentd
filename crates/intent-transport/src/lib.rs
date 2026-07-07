@@ -10,7 +10,8 @@ pub use intent_services::Services;
 
 pub use auth::{
     extract_bearer_token, extract_token, generate_token, get_or_create_token, is_allowed_origin,
-    is_auth_enabled, is_discovery_enabled, validate_token, KeyringTokenStore, TokenStore,
+    is_auth_enabled, is_discovery_enabled, validate_token, validate_token_bounded,
+    KeyringTokenStore, TokenStore, ValidateOutcome, TOKEN_OP_TIMEOUT,
 };
 pub use control::{SystemControl, SystemStatus};
 pub use discovery::{detect_display_server, detect_has_display, Discovery, SERVICE_TYPE};

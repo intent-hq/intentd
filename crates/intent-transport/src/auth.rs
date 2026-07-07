@@ -8,7 +8,12 @@
 //! first then compared in constant time. The HTTP-upgrade wiring that *uses*
 //! these helpers (401 bad token, 403 when disabled, socket destroy) is M5.3.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use subtle::ConstantTimeEq;
+use tokio::task;
+use tokio::time::timeout;
 
 use intent_core::{Error, Result};
 
@@ -18,6 +23,15 @@ const KEYRING_SERVICE: &str = "intentd";
 const KEYRING_ACCOUNT: &str = "server.auth.token";
 /// Token length in raw bytes; hex-encoded this yields a 64-char token.
 const TOKEN_BYTES: usize = 32;
+
+/// Per-call budget for keychain-backed token reads on the WS upgrade path.
+/// [`KeyringTokenStore::load_token`] is synchronous FFI into the OS keychain
+/// (`Security.framework` / `libsecret` / `wincred`) and can stall indefinitely
+/// — locked, prompting, or otherwise unresponsive. [`validate_token_bounded`]
+/// moves the load onto a blocking thread and caps it by this budget so the
+/// accept task can never wedge a hung upgrade behind a Keychain prompt: on
+/// timeout the connection is rejected cleanly and other accepts keep flowing.
+pub const TOKEN_OP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Abstraction over secret token persistence. The production implementation is
 /// [`KeyringTokenStore`]; tests use an in-memory store so they never touch the
@@ -60,6 +74,12 @@ pub fn generate_token(store: &dyn TokenStore) -> Result<String> {
 
 /// Return the persisted token, creating and persisting one only when missing.
 /// Port of `getOrCreateToken` / `ensureWebSocketApiToken`.
+///
+/// This runs synchronously — the underlying [`KeyringTokenStore`] can block on
+/// the OS keychain. That is acceptable at startup because the daemon has not
+/// begun serving yet: a hung keychain prompt fails startup loudly rather than
+/// silently wedging in-flight WS upgrades. The async accept path uses
+/// [`validate_token_bounded`], which offloads and bounds the read.
 pub fn get_or_create_token(store: &dyn TokenStore) -> Result<String> {
     match store.load_token() {
         Some(existing) if !existing.is_empty() => Ok(existing),
@@ -74,6 +94,49 @@ pub fn validate_token(store: &dyn TokenStore, candidate: &str) -> bool {
         return false;
     };
     token_matches(&stored, candidate)
+}
+
+/// Outcome of an async, bounded token validation. The WS upgrade path maps
+/// `Invalid` and `Unavailable` to the same `401 Unauthorized` reject (never
+/// leak whether the keychain stalled to an unauthenticated caller), while
+/// logging distinguishes the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidateOutcome {
+    /// The candidate matched the stored token.
+    Ok,
+    /// The candidate did not match, or nothing was stored / no candidate.
+    Invalid,
+    /// The token store did not answer within [`TOKEN_OP_TIMEOUT`] (or the
+    /// blocking task panicked). Treated as a rejection at the upgrade gate.
+    Unavailable,
+}
+
+/// Async, timeout-bounded variant of [`validate_token`] for the WS upgrade
+/// path. The store's synchronous keychain FFI runs on a blocking thread via
+/// [`tokio::task::spawn_blocking`], capped by [`TOKEN_OP_TIMEOUT`], so a
+/// stalled/prompting OS keychain cannot wedge the accept loop. On timeout or
+/// panic the outcome is [`ValidateOutcome::Unavailable`] — callers reject the
+/// connection cleanly, other in-flight connections keep working.
+pub async fn validate_token_bounded(
+    store: Arc<dyn TokenStore>,
+    candidate: String,
+) -> ValidateOutcome {
+    let handle = task::spawn_blocking(move || validate_token(store.as_ref(), &candidate));
+    match timeout(TOKEN_OP_TIMEOUT, handle).await {
+        Ok(Ok(true)) => ValidateOutcome::Ok,
+        Ok(Ok(false)) => ValidateOutcome::Invalid,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "ws token validation panicked; rejecting");
+            ValidateOutcome::Unavailable
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = TOKEN_OP_TIMEOUT.as_millis() as u64,
+                "ws token validation timed out; rejecting",
+            );
+            ValidateOutcome::Unavailable
+        }
+    }
 }
 
 /// 32 cryptographically-random bytes, lowercase hex-encoded (64 chars).

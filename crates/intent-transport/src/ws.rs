@@ -34,7 +34,9 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role};
 use tokio_tungstenite::WebSocketStream;
 
-use crate::auth::{extract_token, is_allowed_origin, validate_token, TokenStore};
+use crate::auth::{
+    extract_token, is_allowed_origin, validate_token_bounded, TokenStore, ValidateOutcome,
+};
 use crate::conn::{self, ConnSubs, OUTBOUND_CAPACITY};
 use crate::forward::ForwardRegistry;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
@@ -354,16 +356,31 @@ impl WsInner {
             return reject(&mut stream, 403, "Forbidden").await;
         }
         if self.auth_enabled {
-            let ok = self
-                .token_store
-                .as_ref()
-                .and_then(|store| {
-                    extract_token(authorization.as_deref(), target)
-                        .map(|t| validate_token(store.as_ref(), &t))
-                })
-                .unwrap_or(false);
-            if !ok {
-                return reject(&mut stream, 401, "Unauthorized").await;
+            // Keychain-backed token reads can stall on a locked/prompting OS
+            // keychain; `validate_token_bounded` offloads to a blocking thread
+            // with a fixed timeout so a hung upgrade never wedges the accept
+            // loop or delays other connections. Timeout and mismatch both map
+            // to `401` on the wire — logging distinguishes them.
+            let outcome = match (
+                self.token_store.as_ref(),
+                extract_token(authorization.as_deref(), target),
+            ) {
+                (Some(store), Some(candidate)) => {
+                    validate_token_bounded(Arc::clone(store), candidate).await
+                }
+                _ => ValidateOutcome::Invalid,
+            };
+            match outcome {
+                ValidateOutcome::Ok => {}
+                ValidateOutcome::Invalid => {
+                    return reject(&mut stream, 401, "Unauthorized").await;
+                }
+                ValidateOutcome::Unavailable => {
+                    tracing::warn!(
+                        "ws upgrade rejected: token store unavailable (keychain timeout or panic)",
+                    );
+                    return reject(&mut stream, 401, "Unauthorized").await;
+                }
             }
         }
         let Some(key) = ws_key else {
