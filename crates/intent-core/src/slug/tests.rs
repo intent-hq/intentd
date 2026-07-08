@@ -90,3 +90,17 @@ fn suffix_helpers_round_trip() {
         "eeb596bd-85cd-4771-813c-bc38db13329b"
     );
 }
+
+#[test]
+fn is_workspace_slug_matches_dictionary_pairs() {
+    assert!(is_workspace_slug("amber-fox"));
+    assert!(is_workspace_slug("amber-fox-2"));
+    assert!(!is_workspace_slug("amber"));
+    assert!(!is_workspace_slug(""));
+    // Custom human titles are not slugs.
+    assert!(!is_workspace_slug("Add dark mode support"));
+    assert!(!is_workspace_slug("Refactor auth"));
+    // Prompt-derived word-word pairs are not dictionary slugs.
+    assert!(!is_workspace_slug("auth-fix"));
+    assert!(!is_workspace_slug("auth-fix-2"));
+}

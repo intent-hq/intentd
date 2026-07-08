@@ -1090,6 +1090,132 @@ async fn build_turn_prompt_skips_malformed_attachments() {
     assert_eq!(arr[2]["resource"]["uri"], json!("file:///keep.txt"));
 }
 
+// --- First-turn workspace-naming instruction ---------------------------------
+
+/// Seed an agent whose workspace already carries `title` (used by naming-instruction
+/// tests to distinguish slug-shaped vs custom titles).
+async fn seed_agent_with_title(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId, title: &str) {
+    seed_agent(mgr, ws, id).await;
+    let mut workspace = mgr.services.store.get_workspace(ws).await.unwrap();
+    workspace.title = title.to_string();
+    mgr.services
+        .store
+        .update_workspace(&workspace)
+        .await
+        .expect("update ws title");
+}
+
+/// Slug-shaped workspace title on an agent's first turn → the naming instruction
+/// is prepended as a `<system>` block naming the daemon MCP tool
+/// (`set_workspace_title_workspace-mcp`), not the FE `workspace_api` surface.
+#[tokio::test]
+async fn build_turn_prompt_injects_naming_instruction_for_slug_title() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-slug"), AgentId::from("a-slug"));
+    seed_agent_with_title(&mgr, &ws, &id, "amber-fox").await;
+    // Persist the current user turn so `build_turn_prompt` sees the "first
+    // turn" shape (one user message, zero assistant messages).
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "hello" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        text.starts_with("<system>"),
+        "naming instruction prepends the prompt: {text:?}"
+    );
+    assert!(
+        text.contains("`set_workspace_title_workspace-mcp`"),
+        "instruction names the daemon MCP tool: {text:?}"
+    );
+    assert!(
+        !text.contains("workspace_api"),
+        "instruction must not reference the FE workspace_api surface: {text:?}"
+    );
+    assert!(text.trim_end().ends_with("hello"));
+}
+
+/// Custom workspace title on an agent's first turn → no naming instruction is
+/// injected (the reference `needsWorkspaceRename` guard skips already-titled
+/// workspaces).
+#[tokio::test]
+async fn build_turn_prompt_skips_naming_instruction_for_custom_title() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-custom"), AgentId::from("a-custom"));
+    seed_agent_with_title(&mgr, &ws, &id, "Add dark mode support").await;
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "hi" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hi", &super::TurnOptions::default())
+        .await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(text, "hi", "no naming block for already-titled workspaces");
+}
+
+/// Slug-shaped title but an assistant message already exists → the naming
+/// instruction fires only on the FIRST turn and stays absent for every turn
+/// after (reference `!messages.some(m => m.role === 'assistant')`).
+#[tokio::test]
+async fn build_turn_prompt_skips_naming_instruction_after_first_turn() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-second"), AgentId::from("a-second"));
+    seed_agent_with_title(&mgr, &ws, &id, "amber-fox").await;
+    for (role, text) in [
+        ("user", "first question"),
+        ("assistant", "first answer"),
+        ("user", "follow-up"),
+    ] {
+        mgr.services
+            .store
+            .append_agent_message(
+                &id,
+                role,
+                &json!([{ "type": "text", "text": text }]),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "follow-up", &super::TurnOptions::default())
+        .await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !text.contains("<system>"),
+        "second-turn prompt carries no naming instruction: {text:?}"
+    );
+    assert_eq!(text, "follow-up");
+}
+
 /// The keep-alive interrupt path emits ONLY the terminal `agent:stream:end` and
 /// deliberately NOT `agent:idle`: an interrupted agent is about to resume, so
 /// waking parents on idle would be premature (mirrors the TS interrupt

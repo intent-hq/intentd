@@ -29,8 +29,8 @@ use intent_acp::{
 };
 use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
-    now_iso, ActorType, AgentId, AgentSession, AgentStatus, BoxFuture, Error, EventActor, Result,
-    WorkspaceApi, WorkspaceAttention, WorkspaceId,
+    now_iso, slug::is_workspace_slug, ActorType, AgentId, AgentSession, AgentStatus, BoxFuture,
+    Error, EventActor, Result, WorkspaceApi, WorkspaceAttention, WorkspaceId,
 };
 use intent_providers::ProviderConfig;
 use intent_store::{NewEvent, NewTrackedChange};
@@ -1149,6 +1149,47 @@ impl AgentManager {
     fn take_recreated(&self, agent_id: &AgentId) -> bool {
         self.recreated.lock().unwrap().remove(agent_id)
     }
+    /// Compute the fire-once workspace-naming instruction for the outbound
+    /// prompt, or `None` when it should be omitted. Ported from the reference
+    /// `agent-backend-handler.service.ts` (`namingInstructions` block):
+    ///
+    /// * Fires only on the agent's **first** turn — detected by the absence of
+    ///   any prior `assistant` message in the persisted transcript.
+    /// * Fires only when the workspace lookup succeeds AND the current title
+    ///   is empty/whitespace OR still shaped like an auto-generated slug
+    ///   ([`intent_core::slug::is_workspace_slug`]).
+    /// * Names the concrete daemon tool the agent must call
+    ///   (`set_workspace_title_workspace-mcp`), not the FE `workspace_api`
+    ///   JS surface (which daemon-spawned agents do not have).
+    ///
+    /// The agent-rename half of the reference block is intentionally SKIPPED:
+    /// the daemon currently exposes no `set_agent_name` tool. Restore that
+    /// branch once such a tool exists.
+    async fn build_workspace_naming_instruction(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Option<String> {
+        let messages = self
+            .services
+            .store
+            .get_agent_messages(agent_id, None)
+            .await
+            .ok()?;
+        if messages.iter().any(|m| m.role == "assistant") {
+            return None;
+        }
+        let workspace = self.services.store.get_workspace(workspace_id).await.ok()?;
+        let title = workspace.title.trim();
+        let needs_rename = title.is_empty() || is_workspace_slug(title);
+        if !needs_rename {
+            return None;
+        }
+        Some(
+            "<system>\nThis workspace needs a title. As your first action, call the `set_workspace_title_workspace-mcp` tool with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering.\n</system>"
+                .to_string(),
+        )
+    }
 
     /// Build the prompt blocks for an agent's next turn. Normally just the user
     /// `content`; but when the ACP session was recreated (the resume-impossible
@@ -1177,6 +1218,20 @@ impl AgentManager {
         let prompt_text = match reminder {
             Some(r) => format!("{r}\n\n{body}"),
             None => body,
+        };
+        // Fire-once workspace-naming instruction (port of
+        // `agent-backend-handler.service.ts` `namingInstructions`): on the
+        // first turn of an agent in a still-untitled / slug-titled workspace,
+        // prepend a `<system>` block asking the agent to set the workspace
+        // title as its first action. Never mutates the persisted user
+        // message; agent-rename half is deferred until the daemon exposes a
+        // `set_agent_name` tool.
+        let naming = self
+            .build_workspace_naming_instruction(agent_id, workspace_id)
+            .await;
+        let prompt_text = match naming {
+            Some(sys) => format!("{sys}\n\n{prompt_text}"),
+            None => prompt_text,
         };
         // `stdinContext` is prepended verbatim as a `Context:` block; the
         // trailing separator matches the reference `acp-provider.ts` so

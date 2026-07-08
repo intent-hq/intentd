@@ -48,6 +48,23 @@ pub fn extract_base_slug(slug: &str) -> &str {
     slug
 }
 
+/// Check whether a string looks like an auto-generated workspace slug — a
+/// `word-word` (or `word-word-N` collision-suffixed) pair drawn from the
+/// [`ADJECTIVES`]/[`ANIMALS`] dictionaries used by [`generate_workspace_slug`]
+/// (TS `isWorkspaceSlug`). Used by callers that decide whether the workspace
+/// still needs a human title — a slug-shaped title is treated as untitled.
+pub fn is_workspace_slug(s: &str) -> bool {
+    let base = extract_base_slug(s);
+    let (adj, animal) = match base.split_once('-') {
+        Some(pair) => pair,
+        None => return false,
+    };
+    if animal.contains('-') || !is_valid_slug_word(adj) || !is_valid_slug_word(animal) {
+        return false;
+    }
+    ADJECTIVES.contains(&adj) && ANIMALS.contains(&animal)
+}
+
 /// Extract a `word-word` slug from a user prompt using local heuristics (TS
 /// `extractLocalSlug` / `generateLocalSlug`; fast, no LLM). Returns `None`
 /// when nothing meaningful can be extracted — the caller falls back to
