@@ -89,7 +89,13 @@ async fn boot(
     let socket = std::env::temp_dir().join(format!("intentd-uds-{}.sock", Uuid::new_v4()));
     // Keep a typed handle so tests can drive the live-turn slot directly (the
     // server is handed the same handle coerced to `Arc<dyn WorkspaceApi>`).
-    let services = Arc::new(Services::new(bus.store().clone()).with_event_bus(bus.clone()));
+    let services = Arc::new(
+        Services::new(bus.store().clone())
+            .with_workspaces_root(
+                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+            )
+            .with_event_bus(bus.clone()),
+    );
     let api: Arc<dyn intent_core::WorkspaceApi> = services.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server = tokio::spawn({

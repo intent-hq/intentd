@@ -32,6 +32,31 @@ impl Drop for TempDb {
     }
 }
 
+/// Drop-cleanup wrapper around a per-test workspaces root, paired with the
+/// intent-services hermetic-tests guard (see `default_workspaces_root`). Every
+/// test that constructs a `Services` reachable from workspace provisioning
+/// **must** attach one via `.with_workspaces_root(root.path().to_path_buf())`;
+/// otherwise the guard panics rather than writing under `~/intent/workspaces`.
+struct WorkspacesRoot(PathBuf);
+
+impl WorkspacesRoot {
+    fn new() -> Self {
+        let p = std::env::temp_dir().join(format!("intentd-wss-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).expect("mkdir hermetic workspaces root");
+        Self(p)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for WorkspacesRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn workspace(id: &WorkspaceId) -> Workspace {
     let ts = now_iso();
     Workspace {
@@ -1638,11 +1663,12 @@ mod change_event_parity {
     use intent_store::Store;
     use serde_json::{json, Value};
 
-    use super::{note, workspace, TempDb};
+    use super::{note, workspace, TempDb, WorkspacesRoot};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
     struct Harness {
         _tmp: TempDb,
+        _ws_root: WorkspacesRoot,
         store: Store,
         services: Services,
         bus: EventBus,
@@ -1655,9 +1681,13 @@ mod change_event_parity {
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        let ws_root = WorkspacesRoot::new();
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone());
         Harness {
             _tmp: tmp,
+            _ws_root: ws_root,
             store,
             services,
             bus,
@@ -6133,7 +6163,8 @@ mod known_repo {
     async fn create_workspace_registers_repo_visible_in_repo_list() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let svc = Services::new(store);
+        let ws_root = WorkspacesRoot::new();
+        let svc = Services::new(store).with_workspaces_root(ws_root.path().to_path_buf());
 
         svc.create_workspace(
             WorkspaceCreate {
@@ -6574,7 +6605,8 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-wtdelskip-repo");
-        let svc = Services::new(store);
+        let root = unique_dir("intentd-wtdelskip-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
 
         let ws = svc
             .create_workspace(
@@ -7620,7 +7652,7 @@ mod initial_agent_orchestration {
     use intent_store::Store;
     use serde_json::{json, Value};
 
-    use super::TempDb;
+    use super::{TempDb, WorkspacesRoot};
     use crate::{EventBus, Services, SubscriptionFilter};
 
     fn create_input(agent: Option<WorkspaceCreateInitialAgent>) -> WorkspaceCreate {
@@ -7651,7 +7683,10 @@ mod initial_agent_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        let ws_root = WorkspacesRoot::new();
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
 
         let requested = format!("agent-{}", uuid::Uuid::new_v4());
@@ -7718,7 +7753,9 @@ mod initial_agent_orchestration {
     async fn idempotent_replay_no_duplicate_agent_or_message() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let services = Services::new(store.clone());
+        let ws_root = WorkspacesRoot::new();
+        let services =
+            Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
         let key = Some("ws-agent-idem-1".to_string());
 
         let input = || {
@@ -7767,7 +7804,9 @@ mod initial_agent_orchestration {
     async fn no_prompt_no_agent() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let services = Services::new(store.clone());
+        let ws_root = WorkspacesRoot::new();
+        let services =
+            Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
 
         for prompt in [None, Some("   ".to_string())] {
             let res = services

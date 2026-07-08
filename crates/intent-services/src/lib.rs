@@ -1763,15 +1763,45 @@ fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
 /// Default root for daemon-provisioned worktrees: `$INTENTD_WORKSPACES_DIR`
 /// override, else `~/intent/workspaces` — the FE's
 /// `WorkspaceConfig.WORKSPACES_BASE` layout (`<root>/<workspaceId>/<repo-slug>`).
+///
+/// The `$HOME` fallback is guarded by [`assert_hermetic_root_absent`] so
+/// `cargo test` can never leak workspace dirs into the developer's real
+/// `~/intent/workspaces` (crate unit tests panic unconditionally; the intentd
+/// binary panics only when spawned with `INTENTD_ASSERT_HERMETIC_ROOT=1`).
 fn default_workspaces_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("INTENTD_WORKSPACES_DIR") {
         return PathBuf::from(dir);
     }
+    assert_hermetic_root_absent();
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("intent")
         .join("workspaces")
+}
+
+/// Structural guard against `~/intent/workspaces` leaks from tests. Fires only
+/// inside crate unit tests (`cfg(test)`) or when the harness explicitly opts
+/// in via `INTENTD_ASSERT_HERMETIC_ROOT`; production `intentd` binaries never
+/// see it.
+#[cfg(test)]
+fn assert_hermetic_root_absent() {
+    panic!(
+        "hermetic-tests: intent-services unit test reached default_workspaces_root() \
+         with no INTENTD_WORKSPACES_DIR or .with_workspaces_root(); tests must never \
+         provision under $HOME/intent/workspaces"
+    );
+}
+
+#[cfg(not(test))]
+fn assert_hermetic_root_absent() {
+    if std::env::var_os("INTENTD_ASSERT_HERMETIC_ROOT").is_some() {
+        panic!(
+            "hermetic-tests: intentd process reached default_workspaces_root() with \
+             INTENTD_ASSERT_HERMETIC_ROOT set but no INTENTD_WORKSPACES_DIR — the \
+             spawning test harness must set INTENTD_WORKSPACES_DIR to a tempdir"
+        );
+    }
 }
 
 /// Resolve a workspace-id slug for `workspace.create`, porting the TS

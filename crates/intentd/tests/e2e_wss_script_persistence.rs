@@ -50,11 +50,15 @@ fn spawn_serve(data_dir: &Path, port: u16) -> Child {
         .append(true)
         .open(data_dir.join("daemon.log"))
         .expect("open daemon log");
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("serve")
         .arg("--listen")
         .arg("both")
         .env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", port.to_string())
         .stdout(Stdio::null())

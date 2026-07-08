@@ -104,8 +104,13 @@ async fn next_line_attribution_event(reader: &mut BufReader<OwnedReadHalf>) -> V
 
 async fn boot(bus: &EventBus) -> (PathBuf, tokio::task::JoinHandle<()>, oneshot::Sender<()>) {
     let socket = std::env::temp_dir().join(format!("intentd-uds-{}.sock", Uuid::new_v4()));
-    let services: Arc<dyn intent_core::WorkspaceApi> =
-        Arc::new(Services::new(bus.store().clone()).with_event_bus(bus.clone()));
+    let services: Arc<dyn intent_core::WorkspaceApi> = Arc::new(
+        Services::new(bus.store().clone())
+            .with_workspaces_root(
+                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+            )
+            .with_event_bus(bus.clone()),
+    );
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server = tokio::spawn({
         let bus = bus.clone();

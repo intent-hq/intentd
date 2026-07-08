@@ -66,11 +66,15 @@ fn temp_data_dir() -> PathBuf {
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
         .arg("--listen")
         .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     for (k, v) in env {
@@ -1841,7 +1845,9 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
     use intent_store::Store;
     let db_path = data_dir.join("intentd.db");
     let store = Store::open(&db_path).await.expect("open store");
-    let services = Services::new(store.clone());
+    let services = Services::new(store.clone()).with_workspaces_root(
+        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+    );
     let ws = WorkspaceId::new();
     store
         .insert_workspace(&workspace_seed(&ws))

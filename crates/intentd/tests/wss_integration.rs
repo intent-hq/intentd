@@ -152,7 +152,11 @@ async fn make_services(
         .await
         .expect("open store");
     let bus = EventBus::new(store.clone());
-    let mut services = Services::new(store.clone()).with_assets_root(dir.join("assets"));
+    let workspaces_root = dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
+    let mut services = Services::new(store.clone())
+        .with_assets_root(dir.join("assets"))
+        .with_workspaces_root(workspaces_root);
     if let Some(bin) = auggie_bin {
         services = services.with_auggie_bin(bin);
     }

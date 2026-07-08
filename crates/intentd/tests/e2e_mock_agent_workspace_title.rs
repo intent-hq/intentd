@@ -89,7 +89,11 @@ async fn mock_agent_renames_workspace_via_mcp_set_title_tool() {
     let db = std::env::temp_dir().join(format!("intentd-e2e-{}.db", uuid::Uuid::new_v4()));
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone()).with_event_bus(bus.clone());
+    let services = Services::new(store.clone())
+        .with_workspaces_root(
+            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+        )
+        .with_event_bus(bus.clone());
 
     // A fresh workspace whose title still matches its id — the initial-agent
     // rename branch under `set_workspace_title`.

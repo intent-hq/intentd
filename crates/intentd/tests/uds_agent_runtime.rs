@@ -117,9 +117,13 @@ async fn read_json(reader: &mut BufReader<OwnedReadHalf>, secs: u64) -> Value {
 async fn launch_daemon(data_dir: &PathBuf, script: &str, behavior: &str) -> (Daemon, PathBuf) {
     let log_path = data_dir.join("daemon.log");
     let log = std::fs::File::create(&log_path).expect("create daemon log");
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let child = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("serve")
         .env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("MOCK_AGENT_SCRIPT_PATH", script)
         .env("MOCK_AGENT_BEHAVIOR", behavior)
         .stdout(Stdio::null())
@@ -198,7 +202,9 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
     let ws = WorkspaceId::new();
     let note_id = {
         let store = Store::open(&db_path).await.expect("open store");
-        let services = Services::new(store.clone());
+        let services = Services::new(store.clone()).with_workspaces_root(
+            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+        );
         store
             .insert_workspace(&workspace(&ws))
             .await
@@ -230,9 +236,13 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
     // to the spawned child; its own `intentd` binary backs the MCP bridge.
     let log_path = data_dir.join("daemon.log");
     let log = std::fs::File::create(&log_path).expect("create daemon log");
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let child = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("serve")
         .env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("MOCK_AGENT_SCRIPT_PATH", &script)
         .env("MOCK_AGENT_BEHAVIOR", &behavior)
         .stdout(Stdio::null())

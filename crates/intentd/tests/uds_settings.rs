@@ -124,6 +124,9 @@ async fn settings_round_trip_redaction_validation_and_event() {
     // store so sensitive settings never touch the real keychain.
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
+            .with_workspaces_root(
+                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+            )
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),
     );

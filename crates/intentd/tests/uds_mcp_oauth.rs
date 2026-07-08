@@ -106,8 +106,13 @@ async fn mcp_oauth_round_trip_never_echoes_bag_and_validates_params() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_event_bus(bus.clone()));
+    let services: Arc<dyn WorkspaceApi> = Arc::new(
+        Services::new(store)
+            .with_workspaces_root(
+                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+            )
+            .with_event_bus(bus.clone()),
+    );
     // Shortened prefix so the full path stays under the macOS UDS 104-char cap.
     let socket = std::env::temp_dir().join(format!("id-oa-{}.sock", Uuid::new_v4()));
 
