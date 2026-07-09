@@ -61,8 +61,12 @@ pub const NOTE_WRITE_TOOLS: &[&str] = &[
 ];
 
 /// Workspace modification tools.
-pub const WORKSPACE_WRITE_TOOLS: &[&str] =
-    &["rename_space_workspace-mcp", "rename_agent_workspace-mcp"];
+pub const WORKSPACE_WRITE_TOOLS: &[&str] = &[
+    "rename_space_workspace-mcp",
+    "rename_agent_workspace-mcp",
+    "set_workspace_title_workspace-mcp",
+    "set_workspace_status_message_workspace-mcp",
+];
 
 /// Unified workspace JS API tool (bare + server-suffixed). It can perform any
 /// workspace mutation, so pure-text background agents must deny it.

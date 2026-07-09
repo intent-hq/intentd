@@ -9,7 +9,7 @@ use intent_core::Error;
 
 pub use intent_core::{
     FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
-    GitMergeConflicts, GitStatus, Result,
+    GitMergeConflicts, GitPullResult, GitStatus, Result,
 };
 
 pub mod auth;
@@ -19,11 +19,13 @@ pub mod conflicts;
 pub mod diff;
 pub mod fetch;
 pub mod history;
+pub mod pull;
 pub mod push;
 pub mod rebase;
 pub mod refs;
 pub mod remote;
 pub mod reset;
+pub mod show;
 pub mod squash;
 pub mod stage;
 pub mod stash;
@@ -36,6 +38,14 @@ mod testutil;
 /// Map a libgit2 error into the domain [`Error::Internal`] (`-32603`).
 pub(crate) fn map_git_err(e: git2::Error) -> Error {
     Error::Internal(e.message().to_string())
+}
+
+/// Whether `path` points at a git repository (a repo root or a linked
+/// worktree). Read-only probe backing the `repoPath` validation of the
+/// path-based branch reads (`git.getBranches`, `git.branchStatus`) in
+/// `intent-services`.
+pub fn is_repository(path: &std::path::Path) -> bool {
+    git2::Repository::open(path).is_ok()
 }
 
 /// Whether a libgit2 error represents a merge/checkout conflict, mirroring the TS

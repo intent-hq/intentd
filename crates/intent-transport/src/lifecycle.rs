@@ -1,11 +1,13 @@
-//! Single-flight start/stop, race guards, port backoff (§5.6).
+//! Single-flight start/stop, race guards, fail-fast bind (§5.6).
 //!
 //! Ports the robustness guarantees of `websocket-api-server.ts` that prevent
-//! the EADDRINUSE / double-start / shutdown-race bugs the TS code was hardened
-//! against. Concurrent `start()` callers share one in-flight future (a
+//! the double-start / shutdown-race bugs the TS code was hardened against.
+//! Concurrent `start()` callers share one in-flight future (a
 //! `Shared<BoxFuture>`); a `stop()` during an in-flight `start()` bumps a
-//! monotonic `external_stop_generation`, which the bind loop re-checks and
-//! unwinds on. `stop()` then runs the canonical shutdown ordering so a
+//! monotonic `external_stop_generation`, which the bind path re-checks and
+//! unwinds on. The listener performs exactly one bind attempt on the configured
+//! port and surfaces the OS error verbatim if that port is not available —
+//! there is no port walking. `stop()` runs the canonical shutdown ordering so a
 //! subsequent `start()` cannot race the freed listen port.
 
 use std::io;
@@ -22,12 +24,9 @@ use tokio::task::JoinHandle;
 use crate::discovery::{advertise_if_enabled, Discovery};
 use crate::ws::{ConnCmd, WsInner};
 
-/// Default base listen port (PROTOCOL §1). If busy, the listener walks forward.
-pub const DEFAULT_PORT: u16 = 5180;
-/// Maximum number of distinct ports to try (`WS_API_MAX_PORT_ATTEMPTS`).
-pub const MAX_PORT_ATTEMPTS: u16 = 10;
-/// Same-port EADDRINUSE backoff before advancing to the next port (ms).
-pub const SAME_PORT_BACKOFF_MS: [u64; 3] = [100, 200, 400];
+/// Default listen port (PROTOCOL §1). The listener binds exactly this port; if
+/// it is busy, `start()` returns the bind error immediately (no port walking).
+pub const DEFAULT_PORT: u16 = 5181;
 /// Heartbeat ping cadence (`HEARTBEAT_INTERVAL_MS`).
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// No-pong deadline before a client is terminated (`HEARTBEAT_TIMEOUT_MS`).
@@ -85,24 +84,22 @@ impl WsInner {
             .map_err(|e| io::Error::new(e.kind(), e.to_string()))
     }
 
-    /// Bind (with port backoff), then spawn the accept + heartbeat loops and
-    /// record their handles. Re-checks the stop generation before each bind.
+    /// Bind once, then spawn the accept + heartbeat loops and record their
+    /// handles. Re-checks the stop generation before binding.
     async fn do_start(self: Arc<Self>, generation: u64) -> Result<u16, Arc<io::Error>> {
-        let (listener, port) = self.bind_with_backoff(generation).await?;
+        let (listener, port) = self.bind_once(generation).await?;
         tracing::info!(port, "intentd WSS listening");
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let accept_task = tokio::spawn(self.clone().accept_loop(listener, shutdown_rx));
         let heartbeat_task = tokio::spawn(self.clone().heartbeat_loop());
-        // Advertise the real, post-backoff port over mDNS (§5.4); a no-op (and
-        // `None`) when discovery is disabled or registration fails. The TXT
-        // record carries the resolved locality (§5.14): remote for a plain
-        // TCP/WSS listener, local when forced via `--mode`/`server.locality`.
-        let discovery = advertise_if_enabled(
-            self.discovery_enabled,
-            port,
-            &self.fingerprint,
-            self.locality_is_local,
-        );
+        // Advertise the bound port over mDNS (§5.4); a no-op (and `None`) when
+        // discovery is disabled, no fingerprint is available (insecure mode), or
+        // registration fails. The TXT record carries the resolved locality
+        // (§5.14): remote for a plain TCP/WSS listener, local when forced via
+        // `--mode`/`server.locality`.
+        let discovery = self.fingerprint.as_deref().and_then(|fp| {
+            advertise_if_enabled(self.discovery_enabled, port, fp, self.locality_is_local)
+        });
         let mut st = self.state.lock().await;
         st.started = true;
         st.port = Some(port);
@@ -116,46 +113,30 @@ impl WsInner {
         Ok(port)
     }
 
-    /// Walk forward up to [`MAX_PORT_ATTEMPTS`] ports; on each, try once then
-    /// retry with [`SAME_PORT_BACKOFF_MS`] on EADDRINUSE before advancing.
-    async fn bind_with_backoff(
+    /// One TCP bind attempt on the configured port; any failure (including
+    /// `EADDRINUSE`) is returned to the caller as-is. Re-checks the stop
+    /// generation so a concurrent `stop()` unwinds instead of binding.
+    async fn bind_once(
         self: &Arc<Self>,
         generation: u64,
     ) -> Result<(TcpListener, u16), Arc<io::Error>> {
-        let mut last_err: Option<io::Error> = None;
-        for attempt in 0..MAX_PORT_ATTEMPTS {
-            let Some(port) = self.base_port.checked_add(attempt) else {
-                break;
-            };
-            for delay in std::iter::once(0).chain(SAME_PORT_BACKOFF_MS) {
-                if delay > 0 {
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                }
-                if self.external_stop_generation.load(Ordering::SeqCst) != generation {
-                    return Err(Arc::new(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "ws start aborted by concurrent stop",
-                    )));
-                }
-                match TcpListener::bind((self.bind_address, port)).await {
-                    Ok(listener) => return Ok((listener, port)),
-                    Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-                        last_err = Some(e);
-                    }
-                    Err(e) => return Err(Arc::new(e)),
-                }
-            }
+        if self.external_stop_generation.load(Ordering::SeqCst) != generation {
+            return Err(Arc::new(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "ws start aborted by concurrent stop",
+            )));
         }
-        Err(Arc::new(last_err.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::AddrInUse, "no free port for WSS listener")
-        })))
+        match TcpListener::bind((self.bind_address, self.base_port)).await {
+            Ok(listener) => Ok((listener, self.base_port)),
+            Err(e) => Err(Arc::new(e)),
+        }
     }
 
     /// Graceful shutdown in the canonical order (port of `stop()`): bump the
     /// stop generation (cancels an in-flight start), stop the heartbeat, close
     /// every client with `1001`, drop their subscriptions, stop accepting and
     /// drop the listener, then await the accept loop so a subsequent `start()`
-    /// cannot hit EADDRINUSE.
+    /// cannot hit `EADDRINUSE`.
     pub(crate) async fn stop(self: &Arc<Self>) {
         self.external_stop_generation.fetch_add(1, Ordering::SeqCst);
         let (running, start_task) = {

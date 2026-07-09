@@ -262,6 +262,14 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         stats: None,
         task_note_id: None,
         skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        is_background: false,
+        metadata: None,
         created_at: ts.clone(),
         updated_at: ts,
     }
@@ -590,51 +598,46 @@ async fn tool_call_then_update_persists_use_and_result_blocks() {
 async fn open_acp_session_persists_id() {
     let (_tmp, services, bus, agent_id, _ws) = setup().await;
     let (conn, _rx, _agent) = connect();
-    let sid = services
+    let opened = services
         .open_acp_session(&conn, &agent_id, "/tmp/ws", Vec::new())
         .await
         .expect("open session");
-    assert_eq!(sid, ACP_SID);
+    assert_eq!(opened.session_id, ACP_SID);
     let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
     assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
 }
 
 #[tokio::test]
 async fn resume_requires_capability_and_stored_id() {
-    let (_tmp, services, bus, agent_id, _ws) = setup().await;
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
     let (conn, _rx, _agent) = connect();
 
     // No stored acpSessionId yet → None even with the capability.
-    assert_eq!(
-        services
-            .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
-            .await
-            .unwrap(),
-        None
-    );
+    assert!(services
+        .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
+        .await
+        .unwrap()
+        .is_none());
 
     bus.store()
-        .set_acp_session_id(&agent_id, ACP_SID)
+        .set_acp_session_id(&ws, &agent_id, ACP_SID)
         .await
         .unwrap();
 
     // Stored id but the agent lacks loadSession → None.
-    assert_eq!(
-        services
-            .resume_acp_session(&conn, &init_caps(false), &agent_id, "/tmp/ws", Vec::new())
-            .await
-            .unwrap(),
-        None
-    );
+    assert!(services
+        .resume_acp_session(&conn, &init_caps(false), &agent_id, "/tmp/ws", Vec::new())
+        .await
+        .unwrap()
+        .is_none());
 
     // Stored id + capability → resumes.
-    assert_eq!(
-        services
-            .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
-            .await
-            .unwrap(),
-        Some(ACP_SID.to_string())
-    );
+    let opened = services
+        .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
+        .await
+        .unwrap()
+        .expect("resume yields opened session");
+    assert_eq!(opened.session_id, ACP_SID);
 
     // A successful resume keeps the stored id canonical (no overwrite).
     let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
@@ -643,32 +646,41 @@ async fn resume_requires_capability_and_stored_id() {
 
 #[tokio::test]
 async fn recreate_acp_session_replaces_stored_id() {
-    let (_tmp, services, bus, agent_id, _ws) = setup().await;
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
     let (conn, _rx, _agent) = connect();
 
     // A stale id is persisted (the resume-impossible fallback case).
     bus.store()
-        .set_acp_session_id(&agent_id, "stale-id")
+        .set_acp_session_id(&ws, &agent_id, "stale-id")
         .await
         .unwrap();
 
     // recreate opens a fresh session and CAS-swaps the lost id for the new one.
-    let sid = services
+    let opened = services
         .recreate_acp_session(&conn, &agent_id, "stale-id", "/tmp/ws", Vec::new())
         .await
         .expect("recreate session");
-    assert_eq!(sid, ACP_SID);
+    assert_eq!(opened.session_id, ACP_SID);
     let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
     assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
 
     // No-clobber: recreating again with a stale expected-old reuses the stored
     // canonical id rather than overwriting it (a second session/new is opened
     // but the CAS declines to swap).
-    let sid = services
+    let opened = services
         .recreate_acp_session(&conn, &agent_id, "stale-id", "/tmp/ws", Vec::new())
         .await
         .expect("recreate session");
-    assert_eq!(sid, ACP_SID, "diverged expected-old keeps the canonical id");
+    assert_eq!(
+        opened.session_id, ACP_SID,
+        "diverged expected-old keeps the canonical id"
+    );
+    // CAS loss: the new session's modes must not be surfaced (they belong to a
+    // session we didn't open).
+    assert!(
+        opened.modes.is_none(),
+        "CAS loss must not surface modes captured from a session we didn't own"
+    );
     let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
     assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
 }

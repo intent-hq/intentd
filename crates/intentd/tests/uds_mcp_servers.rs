@@ -139,6 +139,9 @@ async fn mcp_servers_lifecycle_redaction_and_status_event() {
     let bus = EventBus::new(store.clone());
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
+            .with_workspaces_root(
+                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+            )
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),
     );

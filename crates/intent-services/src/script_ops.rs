@@ -49,8 +49,10 @@ pub(crate) struct ManagedScript {
     supervisor: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// The shared registry of scripts, keyed by script id, across all workspaces.
-pub(crate) type ScriptRegistry = Arc<Mutex<HashMap<String, ManagedScript>>>;
+/// The shared registry of scripts, keyed by `(workspace_id, script_id)` so a
+/// client-supplied `scriptId` (`"dev"`, `"build"`, …) can be minted concurrently
+/// by any number of workspaces without collision or cross-workspace mutation.
+pub(crate) type ScriptRegistry = Arc<Mutex<HashMap<(WorkspaceId, String), ManagedScript>>>;
 
 /// Thin service over the unified host: holds the shared PTY host, the event bus,
 /// the store (for workspace-root resolution), and the script registry. Cheap to
@@ -79,7 +81,8 @@ impl ScriptManager {
         }
     }
 
-    /// `script.create`: register a definition and return it.
+    /// `script.create`: register (or upsert) a definition, persist it, and
+    /// return it.
     pub(crate) async fn create(
         &self,
         workspace_id: WorkspaceId,
@@ -89,6 +92,32 @@ impl ScriptManager {
             .script_id
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // Upsert of an existing id (`ws.script.create` with `scriptId`):
+        // the definition is replaced with `source`/`createdAt` preserved and
+        // `updatedAt` stamped (FE parity), and — unlike the FE, whose manager
+        // re-reads definitions from disk — the daemon must tear down the old
+        // supervisor/PTY here so a running replaced script is never orphaned.
+        let existing = self
+            .scripts
+            .lock()
+            .unwrap()
+            .remove(&(workspace_id.clone(), id.clone()));
+        let (source, created_at, updated_at) = match &existing {
+            Some(old) => (
+                old.def.source.clone(),
+                old.def.created_at.clone(),
+                Some(now_iso()),
+            ),
+            None => ("user".to_string(), now_iso(), None),
+        };
+        if let Some(mut old) = existing {
+            if let Some(handle) = old.supervisor.take() {
+                handle.abort();
+            }
+            if let Some(pty_id) = old.pty_id {
+                self.pty.kill(pty_id).await;
+            }
+        }
         let def = Script {
             id: id.clone(),
             workspace_id: workspace_id.as_str().to_string(),
@@ -98,13 +127,16 @@ impl ScriptManager {
             env: params.env,
             mode: params.mode,
             category: params.category,
-            source: "user".to_string(),
+            source,
             auto_start: params.auto_start,
-            created_at: now_iso(),
-            updated_at: None,
+            created_at,
+            updated_at,
         };
+        // Persist first (FE `upsertScript` parity — definitions survive a
+        // daemon restart); the runtime registry only registers what is durable.
+        self.store.upsert_script(&def).await?;
         self.scripts.lock().unwrap().insert(
-            id,
+            (workspace_id.clone(), id),
             ManagedScript {
                 def: def.clone(),
                 state: ScriptRuntimeState::default(),
@@ -116,22 +148,55 @@ impl ScriptManager {
         Ok(serde_json::to_value(def).unwrap_or_else(|_| json!({})))
     }
 
+    /// Boot-time hydration: load every persisted definition into the runtime
+    /// registry with a fresh idle state (runtime state is never persisted).
+    /// Ids already registered are left untouched. Returns the number loaded.
+    pub(crate) async fn hydrate(&self) -> Result<usize> {
+        let defs = self.store.list_all_scripts().await?;
+        let mut guard = self.scripts.lock().unwrap();
+        let mut loaded = 0;
+        for def in defs {
+            let key = (WorkspaceId::from(def.workspace_id.as_str()), def.id.clone());
+            guard.entry(key).or_insert_with(|| {
+                loaded += 1;
+                ManagedScript {
+                    def,
+                    state: ScriptRuntimeState::default(),
+                    pty_id: None,
+                    stopped_by_user: false,
+                    supervisor: None,
+                }
+            });
+        }
+        Ok(loaded)
+    }
+
     /// `script.list`: the workspace's scripts with merged runtime state.
     pub(crate) fn list(&self, workspace_id: &WorkspaceId) -> Result<Value> {
         let guard = self.scripts.lock().unwrap();
         let mut scripts: Vec<(String, Value)> = guard
-            .values()
-            .filter(|m| m.def.workspace_id == workspace_id.as_str())
-            .map(|m| (m.def.created_at.clone(), with_runtime(&m.def, &m.state)))
+            .iter()
+            .filter(|((ws, _), _)| ws == workspace_id)
+            .map(|(_, m)| (m.def.created_at.clone(), with_runtime(&m.def, &m.state)))
             .collect();
         scripts.sort_by(|a, b| a.0.cmp(&b.0));
         let scripts: Vec<Value> = scripts.into_iter().map(|(_, v)| v).collect();
         Ok(json!({ "scripts": scripts }))
     }
 
-    /// `script.remove`: stop (if running) and forget a script.
-    pub(crate) async fn remove(&self, script_id: &str) -> Result<Value> {
-        let removed = self.scripts.lock().unwrap().remove(script_id);
+    /// `script.remove`: stop (if running), forget, and unpersist a script.
+    /// Scoped to `workspace_id`: an id owned by a different workspace surfaces
+    /// as `NotFound` (no cross-workspace takeover).
+    pub(crate) async fn remove(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+    ) -> Result<Value> {
+        let removed = self
+            .scripts
+            .lock()
+            .unwrap()
+            .remove(&(workspace_id.clone(), script_id.to_string()));
         let Some(mut managed) = removed else {
             return Err(Error::NotFound(format!("script {script_id}")));
         };
@@ -141,14 +206,15 @@ impl ScriptManager {
         if let Some(pty_id) = managed.pty_id {
             self.pty.kill(pty_id).await;
         }
+        self.store.remove_script(script_id).await?;
         Ok(json!({ "ok": true, "scriptId": script_id }))
     }
 
-    /// `script.status`: the script's runtime state.
-    pub(crate) fn status(&self, script_id: &str) -> Result<Value> {
+    /// `script.status`: the script's runtime state. Scoped to `workspace_id`.
+    pub(crate) fn status(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
         let guard = self.scripts.lock().unwrap();
         let m = guard
-            .get(script_id)
+            .get(&(workspace_id.clone(), script_id.to_string()))
             .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
         Ok(serde_json::to_value(&m.state).unwrap_or_else(|_| json!({})))
     }
@@ -165,6 +231,7 @@ impl ScriptManager {
     /// of the legacy bare string.
     pub(crate) fn output(
         &self,
+        workspace_id: &WorkspaceId,
         script_id: &str,
         max_lines: Option<i64>,
         paginate: bool,
@@ -173,7 +240,7 @@ impl ScriptManager {
         let pty_id = {
             let guard = self.scripts.lock().unwrap();
             let m = guard
-                .get(script_id)
+                .get(&(workspace_id.clone(), script_id.to_string()))
                 .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
             m.pty_id
         };
@@ -206,12 +273,14 @@ impl ScriptManager {
     }
 
     /// `script.start`: spawn the script and run its supervisor loop. A script
-    /// already running is a no-op (mirrors the TS warn-and-return).
-    pub(crate) async fn start(&self, script_id: &str) -> Result<Value> {
+    /// already running is a no-op (mirrors the TS warn-and-return). Scoped to
+    /// `workspace_id`.
+    pub(crate) async fn start(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
+        let key = (workspace_id.clone(), script_id.to_string());
         let def = {
             let mut guard = self.scripts.lock().unwrap();
             let m = guard
-                .get_mut(script_id)
+                .get_mut(&key)
                 .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
             if m.state.status == ScriptStatus::Running {
                 return Ok(json!({ "ok": true, "scriptId": script_id }));
@@ -220,9 +289,10 @@ impl ScriptManager {
             m.def.clone()
         };
         let mgr = self.clone();
+        let ws = workspace_id.clone();
         let sid = script_id.to_string();
-        let handle = tokio::spawn(async move { mgr.supervise(sid, def).await });
-        if let Some(m) = self.scripts.lock().unwrap().get_mut(script_id) {
+        let handle = tokio::spawn(async move { mgr.supervise(ws, sid, def).await });
+        if let Some(m) = self.scripts.lock().unwrap().get_mut(&key) {
             m.supervisor = Some(handle);
         } else {
             handle.abort();
@@ -231,12 +301,13 @@ impl ScriptManager {
     }
 
     /// `script.stop`: flag user-stop, kill the PTY (cancelling auto-restart), and
-    /// await the supervisor's teardown.
-    pub(crate) async fn stop(&self, script_id: &str) -> Result<Value> {
+    /// await the supervisor's teardown. Scoped to `workspace_id`.
+    pub(crate) async fn stop(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
+        let key = (workspace_id.clone(), script_id.to_string());
         let (handle, pty_id, was_running) = {
             let mut guard = self.scripts.lock().unwrap();
             let m = guard
-                .get_mut(script_id)
+                .get_mut(&key)
                 .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
             m.stopped_by_user = true;
             (
@@ -253,7 +324,7 @@ impl ScriptManager {
         }
         if !was_running {
             let mut guard = self.scripts.lock().unwrap();
-            if let Some(m) = guard.get_mut(script_id) {
+            if let Some(m) = guard.get_mut(&key) {
                 if m.state.status != ScriptStatus::Running {
                     m.state.status = ScriptStatus::Idle;
                 }
@@ -262,25 +333,31 @@ impl ScriptManager {
         Ok(json!({ "ok": true, "scriptId": script_id }))
     }
 
-    /// `script.restart`: stop, reset the restart counter, then start.
-    pub(crate) async fn restart(&self, script_id: &str) -> Result<Value> {
-        self.stop(script_id).await?;
+    /// `script.restart`: stop, reset the restart counter, then start. Scoped to
+    /// `workspace_id`.
+    pub(crate) async fn restart(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+    ) -> Result<Value> {
+        self.stop(workspace_id, script_id).await?;
         {
             let mut guard = self.scripts.lock().unwrap();
             let m = guard
-                .get_mut(script_id)
+                .get_mut(&(workspace_id.clone(), script_id.to_string()))
                 .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
             m.state.restart_count = 0;
             m.stopped_by_user = false;
         }
-        self.start(script_id).await
+        self.start(workspace_id, script_id).await
     }
 
     /// `script.run`: run a command-mode script to completion (optional timeout),
     /// returning its captured output + exit code; service scripts return a
-    /// `warning` directing callers to `script.start`.
+    /// `warning` directing callers to `script.start`. Scoped to `workspace_id`.
     pub(crate) async fn run(
         &self,
+        workspace_id: &WorkspaceId,
         script_id: &str,
         max_lines: Option<i64>,
         timeout_seconds: Option<i64>,
@@ -289,7 +366,7 @@ impl ScriptManager {
             .scripts
             .lock()
             .unwrap()
-            .get(script_id)
+            .get(&(workspace_id.clone(), script_id.to_string()))
             .map(|m| m.def.clone())
             .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
         if def.mode == ScriptMode::Service {
@@ -298,10 +375,10 @@ impl ScriptManager {
                 "warning": "Script is a service; use script.start instead of script.run.",
             }));
         }
-        let ws = WorkspaceId::from(def.workspace_id.as_str());
+        let ws = workspace_id.clone();
         let cwd = self.resolve_cwd(&ws, &def).await?;
         let pty_id = self.pty.spawn(self.build_spec(&ws, &def, &cwd))?;
-        self.mark_running(script_id, &ws, pty_id).await;
+        self.mark_running(&ws, script_id, pty_id).await;
         let timed_out = match timeout_seconds.filter(|s| *s > 0) {
             Some(s) => {
                 let fut = self.run_one(&ws, script_id, pty_id, false);
@@ -319,7 +396,7 @@ impl ScriptManager {
             }
         };
         let exit = self.pty.try_exit(pty_id).ok().flatten();
-        self.mark_exited(script_id, &ws, exit.clone()).await;
+        self.mark_exited(&ws, script_id, exit.clone()).await;
         let bytes = self.pty.scrollback(pty_id).unwrap_or_default();
         let mut output = String::from_utf8_lossy(&bytes).into_owned();
         if let Some(n) = max_lines.filter(|n| *n > 0) {
@@ -334,13 +411,13 @@ impl ScriptManager {
 
     /// The per-script supervisor: spawn → stream → (service) auto-restart per the
     /// ported backoff policy, until a user-stop, a command-mode exit, a too-fast
-    /// crash, or the retry cap.
-    async fn supervise(self, script_id: String, def: Script) {
-        let ws = WorkspaceId::from(def.workspace_id.as_str());
+    /// crash, or the retry cap. Scoped to `workspace_id` so registry lookups use
+    /// the composite `(workspace_id, script_id)` key.
+    async fn supervise(self, ws: WorkspaceId, script_id: String, def: Script) {
         let cwd = match self.resolve_cwd(&ws, &def).await {
             Ok(c) => c,
             Err(e) => {
-                self.fail(&script_id, &ws, &e.to_string()).await;
+                self.fail(&ws, &script_id, &e.to_string()).await;
                 return;
             }
         };
@@ -353,19 +430,19 @@ impl ScriptManager {
             let pty_id = match self.pty.spawn(self.build_spec(&ws, &def, &cwd)) {
                 Ok(id) => id,
                 Err(e) => {
-                    self.fail(&script_id, &ws, &e.to_string()).await;
+                    self.fail(&ws, &script_id, &e.to_string()).await;
                     return;
                 }
             };
             prev = Some(pty_id);
             let started = Instant::now();
-            if !self.mark_running(&script_id, &ws, pty_id).await {
+            if !self.mark_running(&ws, &script_id, pty_id).await {
                 self.pty.kill(pty_id).await;
                 return;
             }
             let exit = self.run_one(&ws, &script_id, pty_id, detect).await;
             let (stopped_by_user, restart_count) =
-                match self.mark_exited(&script_id, &ws, exit).await {
+                match self.mark_exited(&ws, &script_id, exit).await {
                     Some(v) => v,
                     None => return,
                 };
@@ -387,9 +464,10 @@ impl ScriptManager {
             if restart_count >= AUTO_RESTART_MAX_RETRIES {
                 break;
             }
+            let key = (ws.clone(), script_id.clone());
             let attempt = {
                 let mut guard = self.scripts.lock().unwrap();
-                let Some(m) = guard.get_mut(&script_id) else {
+                let Some(m) = guard.get_mut(&key) else {
                     return;
                 };
                 m.state.restart_count += 1;
@@ -398,7 +476,7 @@ impl ScriptManager {
             tokio::time::sleep(AUTO_RESTART_DELAY).await;
             {
                 let guard = self.scripts.lock().unwrap();
-                match guard.get(&script_id) {
+                match guard.get(&key) {
                     Some(m) if m.stopped_by_user => break,
                     Some(_) => {}
                     None => return,
@@ -483,7 +561,7 @@ impl ScriptManager {
         };
         let state = {
             let mut guard = self.scripts.lock().unwrap();
-            let Some(m) = guard.get_mut(script_id) else {
+            let Some(m) = guard.get_mut(&(ws.clone(), script_id.to_string())) else {
                 return true;
             };
             if m.state.detected_url.is_some() {
@@ -498,11 +576,11 @@ impl ScriptManager {
 
     /// Flip a script to `running` and emit `script:state`. Returns `false` if the
     /// script was removed concurrently (caller should reap the PTY).
-    async fn mark_running(&self, script_id: &str, ws: &WorkspaceId, pty_id: PtyId) -> bool {
+    async fn mark_running(&self, ws: &WorkspaceId, script_id: &str, pty_id: PtyId) -> bool {
         let pid = self.pty.pid(pty_id);
         let state = {
             let mut guard = self.scripts.lock().unwrap();
-            let Some(m) = guard.get_mut(script_id) else {
+            let Some(m) = guard.get_mut(&(ws.clone(), script_id.to_string())) else {
                 return false;
             };
             m.pty_id = Some(pty_id);
@@ -523,13 +601,13 @@ impl ScriptManager {
     /// Returns `(stopped_by_user, restart_count)` for the restart decision.
     async fn mark_exited(
         &self,
-        script_id: &str,
         ws: &WorkspaceId,
+        script_id: &str,
         exit: Option<PtyExit>,
     ) -> Option<(bool, u32)> {
         let (state, flags) = {
             let mut guard = self.scripts.lock().unwrap();
-            let m = guard.get_mut(script_id)?;
+            let m = guard.get_mut(&(ws.clone(), script_id.to_string()))?;
             m.state.status = ScriptStatus::Exited;
             m.state.exit_code = exit.as_ref().map(|e| e.exit_code as i64);
             m.state.stopped_at = Some(now_iso());
@@ -540,10 +618,10 @@ impl ScriptManager {
     }
 
     /// Record a spawn/cwd failure on the runtime state and emit `script:state`.
-    async fn fail(&self, script_id: &str, ws: &WorkspaceId, err: &str) {
+    async fn fail(&self, ws: &WorkspaceId, script_id: &str, err: &str) {
         let state = {
             let mut guard = self.scripts.lock().unwrap();
-            let Some(m) = guard.get_mut(script_id) else {
+            let Some(m) = guard.get_mut(&(ws.clone(), script_id.to_string())) else {
                 return;
             };
             m.state.status = ScriptStatus::Exited;
@@ -1184,28 +1262,44 @@ mod tests {
     #[tokio::test]
     async fn script_status_returns_not_found_for_missing_id() {
         let h = harness().await;
-        let err = h.services.script_status("nope".into()).await.unwrap_err();
+        let err = h
+            .services
+            .script_status(h.ws.clone(), "nope".into())
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
     }
 
     #[tokio::test]
     async fn script_remove_returns_not_found_for_missing_id() {
         let h = harness().await;
-        let err = h.services.script_remove("nope".into()).await.unwrap_err();
+        let err = h
+            .services
+            .script_remove(h.ws.clone(), "nope".into())
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
     }
 
     #[tokio::test]
     async fn script_start_returns_not_found_for_missing_id() {
         let h = harness().await;
-        let err = h.services.script_start("nope".into()).await.unwrap_err();
+        let err = h
+            .services
+            .script_start(h.ws.clone(), "nope".into())
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
     }
 
     #[tokio::test]
     async fn script_stop_returns_not_found_for_missing_id() {
         let h = harness().await;
-        let err = h.services.script_stop("nope".into()).await.unwrap_err();
+        let err = h
+            .services
+            .script_stop(h.ws.clone(), "nope".into())
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
     }
 
@@ -1214,7 +1308,7 @@ mod tests {
         let h = harness().await;
         let err = h
             .services
-            .script_output("nope".into(), None, None, None)
+            .script_output(h.ws.clone(), "nope".into(), None, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
@@ -1225,7 +1319,7 @@ mod tests {
         let h = harness().await;
         let err = h
             .services
-            .script_run("nope".into(), None, None)
+            .script_run(h.ws.clone(), "nope".into(), None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
@@ -1309,11 +1403,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scripts_persist_across_service_restart() {
+        let h = harness().await;
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("PORT".to_string(), "3000".to_string());
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "dev".into(),
+                command: "npm run dev".into(),
+                mode: ScriptMode::Service,
+                cwd: Some("web".into()),
+                env: Some(env),
+                category: Some("dev".into()),
+                auto_start: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Simulate a daemon restart: a fresh Services over the same store has
+        // an empty registry until the boot-time hydration runs.
+        let svc2 = Services::new(h.services.store().clone());
+        let listed = svc2.script_list(h.ws.clone()).await.expect("list");
+        assert!(
+            listed["scripts"].as_array().expect("array").is_empty(),
+            "registry starts empty pre-hydration"
+        );
+        assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
+        let listed = svc2.script_list(h.ws.clone()).await.expect("list");
+        let entry = &listed["scripts"].as_array().expect("array")[0];
+        assert_eq!(entry["id"].as_str(), Some(id.as_str()));
+        assert_eq!(entry["name"], "dev");
+        assert_eq!(entry["command"], "npm run dev");
+        assert_eq!(entry["cwd"], "web");
+        assert_eq!(entry["env"]["PORT"], "3000");
+        assert_eq!(entry["category"], "dev");
+        assert_eq!(entry["autoStart"], true);
+        assert_eq!(
+            entry["runtime"]["status"], "idle",
+            "runtime state starts fresh, never persisted"
+        );
+
+        // Hydration is idempotent — already-registered ids are untouched.
+        assert_eq!(svc2.hydrate_scripts().await.expect("re-hydrate"), 0);
+    }
+
+    #[tokio::test]
+    async fn script_remove_unpersists_definition() {
+        let h = harness().await;
+        let id = create_simple(&h, "gone", "echo bye", ScriptMode::Command).await;
+        h.services
+            .script_remove(h.ws.clone(), id)
+            .await
+            .expect("remove");
+
+        let svc2 = Services::new(h.services.store().clone());
+        assert_eq!(
+            svc2.hydrate_scripts().await.expect("hydrate"),
+            0,
+            "removed script is unpersisted"
+        );
+    }
+
+    /// Regression: `script.create` upserting an id whose script is running
+    /// must stop the old supervisor/PTY (no orphaned process), preserve the
+    /// original `createdAt`/`source`, stamp `updatedAt`, and reset the
+    /// runtime state to idle.
+    #[tokio::test]
+    async fn script_create_upsert_stops_running_predecessor() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "svc".into(),
+                command: "sleep 30".into(),
+                mode: ScriptMode::Service,
+                script_id: Some("upsert-1".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let listed = h.services.script_list(h.ws.clone()).await.expect("list");
+        let created_at = listed["scripts"][0]["createdAt"]
+            .as_str()
+            .expect("createdAt")
+            .to_string();
+
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let running = await_state(&mut sub, Duration::from_secs(5), |v| {
+            v["data"]["status"] == "running"
+        })
+        .await;
+        let pid = running["data"]["pid"].as_i64().expect("pid");
+
+        // Upsert the same id with a new command while the old one runs.
+        let v = create(
+            &h,
+            ScriptCreateParams {
+                name: "svc renamed".into(),
+                command: "echo hi".into(),
+                mode: ScriptMode::Command,
+                script_id: Some(id.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(v, id, "upsert keeps the id");
+
+        let listed = h.services.script_list(h.ws.clone()).await.expect("list");
+        let scripts = listed["scripts"].as_array().expect("array");
+        assert_eq!(scripts.len(), 1, "no duplicate entry");
+        let entry = &scripts[0];
+        assert_eq!(entry["name"], "svc renamed");
+        assert_eq!(entry["command"], "echo hi");
+        assert_eq!(entry["createdAt"].as_str(), Some(created_at.as_str()));
+        assert!(entry["updatedAt"].is_string(), "updatedAt stamped");
+        assert_eq!(entry["source"], "user", "source preserved");
+        assert_eq!(entry["runtime"]["status"], "idle", "runtime reset");
+
+        // The replaced PTY process must die — no orphan (kill -0 fails).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run kill -0")
+                .success();
+            if !alive {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "old script process {pid} is still alive after upsert"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn script_start_is_noop_when_already_running() {
         let h = harness().await;
         let mut sub = subscribe(&h);
         let id = create_simple(&h, "svc", "sleep 5", ScriptMode::Service).await;
-        h.services.script_start(id.clone()).await.expect("start");
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
         await_state(&mut sub, Duration::from_secs(5), |v| {
             v["data"]["status"] == "running"
         })
@@ -1321,7 +1562,7 @@ mod tests {
         // Second start while already running is a no-op (returns Ok, no extra `running` event).
         let v = h
             .services
-            .script_start(id.clone())
+            .script_start(h.ws.clone(), id.clone())
             .await
             .expect("noop start");
         assert_eq!(v["ok"], true);
@@ -1346,16 +1587,27 @@ mod tests {
                 }
             }
         }
-        h.services.script_stop(id).await.expect("stop");
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
     }
 
     #[tokio::test]
     async fn script_stop_on_idle_keeps_idle_state() {
         let h = harness().await;
         let id = create_simple(&h, "idle", "echo nope", ScriptMode::Command).await;
-        let v = h.services.script_stop(id.clone()).await.expect("stop");
+        let v = h
+            .services
+            .script_stop(h.ws.clone(), id.clone())
+            .await
+            .expect("stop");
         assert_eq!(v["ok"], true);
-        let st = h.services.script_status(id).await.expect("status");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id)
+            .await
+            .expect("status");
         assert_eq!(st["status"], "idle");
     }
 
@@ -1364,14 +1616,17 @@ mod tests {
         let h = harness().await;
         let mut sub = subscribe(&h);
         let id = create_simple(&h, "svc", "sleep 5", ScriptMode::Service).await;
-        h.services.script_start(id.clone()).await.expect("start");
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
         await_state(&mut sub, Duration::from_secs(5), |v| {
             v["data"]["status"] == "running"
         })
         .await;
         let v = h
             .services
-            .script_restart(id.clone())
+            .script_restart(h.ws.clone(), id.clone())
             .await
             .expect("restart");
         assert_eq!(v["ok"], true);
@@ -1379,10 +1634,17 @@ mod tests {
             v["data"]["status"] == "running"
         })
         .await;
-        let st = h.services.script_status(id.clone()).await.expect("status");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
         assert_eq!(st["restartCount"], 0);
         assert_eq!(st["status"], "running");
-        h.services.script_stop(id).await.expect("stop");
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
     }
 
     #[tokio::test]
@@ -1391,7 +1653,7 @@ mod tests {
         let id = create_simple(&h, "svc", "sleep 5", ScriptMode::Service).await;
         let out = h
             .services
-            .script_run(id, None, None)
+            .script_run(h.ws.clone(), id, None, None)
             .await
             .expect("run service");
         assert_eq!(out["output"], "");
@@ -1408,7 +1670,11 @@ mod tests {
     async fn script_run_with_timeout_marks_timed_out() {
         let h = harness().await;
         let id = create_simple(&h, "long", "sleep 10", ScriptMode::Command).await;
-        let out = h.services.script_run(id, None, Some(1)).await.expect("run");
+        let out = h
+            .services
+            .script_run(h.ws.clone(), id, None, Some(1))
+            .await
+            .expect("run");
         assert_eq!(out["timedOut"], true);
     }
 
@@ -1424,7 +1690,7 @@ mod tests {
         .await;
         let out = h
             .services
-            .script_run(id, Some(2), Some(10))
+            .script_run(h.ws.clone(), id, Some(2), Some(10))
             .await
             .expect("run");
         let text = out["output"].as_str().unwrap_or("");
@@ -1437,12 +1703,12 @@ mod tests {
         let h = harness().await;
         let id = create_simple(&h, "echo", "echo hello-pag", ScriptMode::Command).await;
         h.services
-            .script_run(id.clone(), None, Some(10))
+            .script_run(h.ws.clone(), id.clone(), None, Some(10))
             .await
             .expect("run");
         let out = h
             .services
-            .script_output(id, Some(50), Some(true), None)
+            .script_output(h.ws.clone(), id, Some(50), Some(true), None)
             .await
             .expect("output");
         assert!(out.get("items").is_some(), "envelope shape: {out:?}");
@@ -1459,12 +1725,12 @@ mod tests {
         )
         .await;
         h.services
-            .script_run(id.clone(), None, Some(10))
+            .script_run(h.ws.clone(), id.clone(), None, Some(10))
             .await
             .expect("run");
         let out = h
             .services
-            .script_output(id, Some(2), None, None)
+            .script_output(h.ws.clone(), id, Some(2), None, None)
             .await
             .expect("output");
         let text = out.as_str().expect("string");
@@ -1479,14 +1745,99 @@ mod tests {
         let h = harness().await;
         let mut sub = subscribe(&h);
         let id = create_simple(&h, "svc", "sleep 30", ScriptMode::Service).await;
-        h.services.script_start(id.clone()).await.expect("start");
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
         await_state(&mut sub, Duration::from_secs(5), |v| {
             v["data"]["status"] == "running"
         })
         .await;
-        let res = h.services.script_remove(id.clone()).await.expect("remove");
+        let res = h
+            .services
+            .script_remove(h.ws.clone(), id.clone())
+            .await
+            .expect("remove");
         assert_eq!(res["ok"], true);
-        let err = h.services.script_status(id).await.unwrap_err();
+        let err = h
+            .services
+            .script_status(h.ws.clone(), id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    /// Two workspaces mint the same client-supplied `scriptId` concurrently
+    /// (`"dev"`) — the registry is composite-keyed by `(workspace_id, script_id)`,
+    /// so both survive, `script.list` is workspace-partitioned, and
+    /// `script.status` / `script.remove` from workspace A never touches workspace
+    /// B's script (no cross-workspace takeover).
+    #[tokio::test]
+    async fn same_script_id_across_workspaces_does_not_collide() {
+        let h = harness().await;
+        let ws_b = WorkspaceId::new();
+        h.services
+            .store()
+            .insert_workspace(&workspace(&ws_b, None))
+            .await
+            .expect("ws-b");
+        let params = |name: &str| ScriptCreateParams {
+            name: name.to_string(),
+            command: "echo hi".into(),
+            mode: ScriptMode::Command,
+            script_id: Some("dev".to_string()),
+            ..Default::default()
+        };
+        h.services
+            .script_create(h.ws.clone(), params("dev-a"))
+            .await
+            .expect("create a");
+        h.services
+            .script_create(ws_b.clone(), params("dev-b"))
+            .await
+            .expect("create b");
+        // Each list is workspace-partitioned and sees exactly its own `dev`.
+        let list_a = h.services.script_list(h.ws.clone()).await.expect("list a");
+        let list_b = h.services.script_list(ws_b.clone()).await.expect("list b");
+        let names_a: Vec<&str> = list_a["scripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        let names_b: Vec<&str> = list_b["scripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        assert_eq!(names_a, vec!["dev-a"]);
+        assert_eq!(names_b, vec!["dev-b"]);
+        // Removing from workspace A leaves workspace B's `dev` intact.
+        h.services
+            .script_remove(h.ws.clone(), "dev".into())
+            .await
+            .expect("remove a");
+        let list_a = h.services.script_list(h.ws.clone()).await.expect("list a");
+        assert!(list_a["scripts"].as_array().unwrap().is_empty());
+        let st_b = h
+            .services
+            .script_status(ws_b.clone(), "dev".into())
+            .await
+            .expect("status b survives");
+        assert_eq!(st_b["status"], "idle");
+        // Workspace A can no longer see or mutate workspace B's `dev`.
+        let err = h
+            .services
+            .script_status(h.ws.clone(), "dev".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+        let err = h
+            .services
+            .script_remove(h.ws.clone(), "dev".into())
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)));
     }
 
@@ -1505,7 +1856,10 @@ mod tests {
             },
         )
         .await;
-        h.services.script_start(id.clone()).await.expect("start");
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
         let ev = await_state(&mut sub, Duration::from_secs(5), |v| {
             v["data"]["status"] == "exited" && v["data"].get("error").is_some()
         })
@@ -1515,7 +1869,11 @@ mod tests {
             err.contains("escapes workspace root"),
             "fail() error surfaces cwd escape: {err:?}"
         );
-        let st = h.services.script_status(id).await.expect("status");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id)
+            .await
+            .expect("status");
         assert_eq!(st["status"], "exited");
         assert_eq!(st["error"], err);
     }

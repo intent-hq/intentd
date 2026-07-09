@@ -432,8 +432,8 @@ mod mcp_tests {
     use std::sync::{Arc, Mutex};
 
     use intent_core::{
-        AgentId, BoxFuture, GitAgentCommitResult, Note, NoteAddInput, NoteAddResult, NoteId,
-        Result, WorkspaceApi, WorkspaceId,
+        AgentId, BoxFuture, GitAgentCommitResult, Note, NoteAddInput, NoteAddResult, NoteCreate,
+        NoteId, Result, WorkspaceApi, WorkspaceId,
     };
     use serde_json::{json, Value};
 
@@ -460,9 +460,42 @@ mod mcp_tests {
     pub(super) struct MockApi {
         pub(super) added: Mutex<Vec<(String, String)>>,
         pub(super) committed: Mutex<Vec<CommitRecord>>,
+        /// Recorded `create_note` calls: (title, idempotency_key).
+        pub(super) created: Mutex<Vec<(String, Option<String>)>>,
     }
 
     impl WorkspaceApi for MockApi {
+        fn create_note(
+            &self,
+            workspace_id: WorkspaceId,
+            input: NoteCreate,
+            idempotency_key: Option<String>,
+        ) -> BoxFuture<'_, Result<Note>> {
+            self.created
+                .lock()
+                .unwrap()
+                .push((input.title.clone(), idempotency_key));
+            Box::pin(async move {
+                Ok(Note {
+                    id: NoteId::from_string("n-created"),
+                    workspace_id,
+                    title: input.title,
+                    content: input.content.unwrap_or_default(),
+                    content_type: Default::default(),
+                    tags: input.tags.unwrap_or_default(),
+                    is_pinned: false,
+                    is_archived: false,
+                    is_default: false,
+                    parent_id: None,
+                    visibility: Default::default(),
+                    task: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    rev: 0,
+                    updated_at: "2026-01-01T00:00:00Z".to_string(),
+                })
+            })
+        }
+
         fn list_notes<'a>(
             &'a self,
             _workspace_id: &'a WorkspaceId,
@@ -1481,6 +1514,22 @@ mod tool_registry_tests {
             "delegate_task_workspace-mcp",
             "git_commit_workspace-mcp",
             "report_to_parent_workspace-mcp",
+            // Agent coordination surface (D-batch 3): send/wake/list/read tools
+            // that let agents cooperate over the MCP front door.
+            "send_message_to_agent_workspace-mcp",
+            "send_message_to_task_agent_workspace-mcp",
+            "wake_or_create_task_agent_workspace-mcp",
+            "list_agents_workspace-mcp",
+            "get_agent_status_workspace-mcp",
+            "read_agent_conversation_workspace-mcp",
+            "get_agent_summary_workspace-mcp",
+            "get_agent_diagnostics_workspace-mcp",
+            "subscribe_to_events_workspace-mcp",
+            "unsubscribe_from_events_workspace-mcp",
+            // Workspace metadata surface (TS parity for `ws.workspace.*`).
+            "get_workspace_details_workspace-mcp",
+            "set_workspace_title_workspace-mcp",
+            "set_workspace_status_message_workspace-mcp",
         ] {
             assert!(names.contains(&required), "missing {required}");
         }
@@ -1702,6 +1751,45 @@ mod dispatch_unit_tests {
             ),
             ("git_commit_workspace-mcp", json!({}), "agent"),
             ("report_to_parent_workspace-mcp", json!({}), "report"),
+            (
+                "send_message_to_agent_workspace-mcp",
+                json!({ "message": "hi" }),
+                "agentId",
+            ),
+            (
+                "send_message_to_agent_workspace-mcp",
+                json!({ "agentId": "agent-1" }),
+                "message",
+            ),
+            (
+                "send_message_to_task_agent_workspace-mcp",
+                json!({ "message": "hi" }),
+                "taskNoteId",
+            ),
+            (
+                "wake_or_create_task_agent_workspace-mcp",
+                json!({ "contextMessage": "ctx" }),
+                "taskNoteId",
+            ),
+            (
+                "wake_or_create_task_agent_workspace-mcp",
+                json!({ "taskNoteId": "n" }),
+                "contextMessage",
+            ),
+            ("get_agent_status_workspace-mcp", json!({}), "agentId"),
+            (
+                "read_agent_conversation_workspace-mcp",
+                json!({}),
+                "agentId",
+            ),
+            ("get_agent_summary_workspace-mcp", json!({}), "agentId"),
+            ("subscribe_to_events_workspace-mcp", json!({}), "eventTypes"),
+            (
+                "unsubscribe_from_events_workspace-mcp",
+                json!({}),
+                "subscriptionId",
+            ),
+            ("set_workspace_title_workspace-mcp", json!({}), "title"),
         ];
         for (tool, args, needle) in cases {
             let resp = call(&srv, tool, args.clone()).await;
@@ -1728,7 +1816,6 @@ mod dispatch_unit_tests {
         let valid_args: &[(&str, serde_json::Value)] = &[
             ("get_note_workspace-mcp", json!({ "noteId": "n" })),
             ("list_note_tasks_workspace-mcp", json!({ "noteId": "n" })),
-            ("create_note_workspace-mcp", json!({ "title": "t" })),
             (
                 "set_note_content_workspace-mcp",
                 json!({ "noteId": "n", "content": "c", "confirmReplacement": true, "expectedVersion": 3 }),
@@ -1792,6 +1879,51 @@ mod dispatch_unit_tests {
                 "report_to_parent_workspace-mcp",
                 json!({ "report": "all done" }),
             ),
+            (
+                "send_message_to_agent_workspace-mcp",
+                json!({ "agentId": "agent-1", "message": "hi", "priority": "normal" }),
+            ),
+            (
+                "send_message_to_task_agent_workspace-mcp",
+                json!({ "taskNoteId": "tn", "message": "hi" }),
+            ),
+            (
+                "wake_or_create_task_agent_workspace-mcp",
+                json!({ "taskNoteId": "tn", "contextMessage": "ctx", "model": "opus" }),
+            ),
+            (
+                "list_agents_workspace-mcp",
+                json!({ "includeCompleted": true }),
+            ),
+            (
+                "get_agent_status_workspace-mcp",
+                json!({ "agentId": "agent-1" }),
+            ),
+            (
+                "read_agent_conversation_workspace-mcp",
+                json!({ "agentId": "agent-1", "lastN": 20 }),
+            ),
+            (
+                "get_agent_summary_workspace-mcp",
+                json!({ "agentId": "agent-1" }),
+            ),
+            (
+                "get_agent_diagnostics_workspace-mcp",
+                json!({ "agentId": "agent-1", "taskNoteId": "n", "staleRespondingAfterMs": 60000 }),
+            ),
+            (
+                "subscribe_to_events_workspace-mcp",
+                json!({ "eventTypes": ["agent:idle"], "excludeSelf": true, "batchWindow": 250 }),
+            ),
+            (
+                "unsubscribe_from_events_workspace-mcp",
+                json!({ "subscriptionId": "sub-1" }),
+            ),
+            ("get_workspace_details_workspace-mcp", json!({})),
+            (
+                "set_workspace_status_message_workspace-mcp",
+                json!({ "statusMessage": "current progress" }),
+            ),
         ];
         for (tool, args) in valid_args {
             let resp = call(&srv, tool, args.clone()).await;
@@ -1801,6 +1933,45 @@ mod dispatch_unit_tests {
                 "{tool}: expected Internal default, got {resp}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn create_note_mints_idempotency_key_when_absent() {
+        // Daemon-internal `note.create`: agents do not pass an idempotencyKey,
+        // so the dispatch arm mints one — the services soft-launch warn
+        // ("idempotencyKey missing on idempotent method") must never fire for
+        // MCP tool calls.
+        let (srv, api) = server();
+        let resp = call(&srv, "create_note_workspace-mcp", json!({ "title": "t" })).await;
+        assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+        let created = api.created.lock().unwrap();
+        assert_eq!(created.len(), 1);
+        let (title, key) = &created[0];
+        assert_eq!(title, "t");
+        let key = key
+            .as_deref()
+            .expect("dispatch must mint an idempotencyKey");
+        assert!(
+            uuid::Uuid::parse_str(key).is_ok(),
+            "minted key {key:?} is not a UUID"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_note_passes_caller_idempotency_key_through() {
+        // A caller-supplied key is adopted verbatim (no re-mint), preserving
+        // dedupe across retries of the same tool call.
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "create_note_workspace-mcp",
+            json!({ "title": "t", "idempotencyKey": "key-from-caller" }),
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+        let created = api.created.lock().unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].1.as_deref(), Some("key-from-caller"));
     }
 
     #[tokio::test]
@@ -2013,5 +2184,297 @@ mod mcp_bridge_tests {
             last_err.is_some(),
             "listener still accepting after McpBridge drop"
         );
+    }
+}
+
+/// Workspace-metadata tool arms: `get_workspace_details` / `set_workspace_title` /
+/// `set_workspace_status_message` — TS parity with `ws-workspace-api.ts`.
+///
+/// A dedicated mock is used here because [`super::mcp_tests::MockApi`] deliberately
+/// keeps `get_workspace` / `update_workspace` at their trait-default `Internal`
+/// so the coverage-sweep test can prove every dispatch arm reaches the API. The
+/// mock below records `update_workspace` calls and lets tests seed the starting
+/// workspace row (title/branch) so both the "skip when custom-titled" branch
+/// and the "apply update when still a slug" branch can be exercised.
+#[cfg(test)]
+mod workspace_metadata_tool_tests {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{
+        BoxFuture, Result, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
+        WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    };
+    use serde_json::{json, Value};
+
+    use crate::WorkspaceMcpServer;
+
+    struct WorkspaceMockApi {
+        ws: Mutex<Workspace>,
+        updates: Mutex<Vec<WorkspaceUpdate>>,
+    }
+
+    impl WorkspaceMockApi {
+        fn new(id: &str, title: &str, branch: &str) -> Arc<Self> {
+            let now = "2026-01-01T00:00:00Z".to_string();
+            let ws = Workspace {
+                id: WorkspaceId::from_string(id),
+                title: title.to_string(),
+                branch: branch.to_string(),
+                base_ref: None,
+                base_commit_sha: None,
+                status: WorkspaceStatus::Active,
+                status_message: None,
+                activity: WorkspaceActivity::Idle,
+                attention: WorkspaceAttention::None,
+                created_at: now.clone(),
+                updated_at: now,
+                last_activity: None,
+                tags: vec!["demo".to_string()],
+                path: None,
+                repository_path: None,
+                repository_owner: None,
+                repository_name: Some("cloudlands-ai/intentd".to_string()),
+                worktree_path: None,
+                scope: None,
+                skip_worktree: false,
+                setup_script: None,
+                is_remote: false,
+                default_model: None,
+                pr_number: None,
+                pr_url: None,
+                pr_status: None,
+                active_pull_request: None,
+                archived: false,
+                archived_at: None,
+                task_stats: None,
+                agent_summary: None,
+                diff_summary: None,
+                token_usage: None,
+            };
+            Arc::new(Self {
+                ws: Mutex::new(ws),
+                updates: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl WorkspaceApi for WorkspaceMockApi {
+        fn get_workspace(&self, _id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            let snapshot = self.ws.lock().unwrap().clone();
+            Box::pin(async move { Ok(snapshot) })
+        }
+
+        fn update_workspace(
+            &self,
+            _id: WorkspaceId,
+            update: WorkspaceUpdate,
+        ) -> BoxFuture<'_, Result<Workspace>> {
+            self.updates.lock().unwrap().push(update.clone());
+            let mut ws = self.ws.lock().unwrap();
+            if let Some(t) = update.title {
+                ws.title = t;
+            }
+            if let Some(m) = update.status_message {
+                ws.status_message = Some(m);
+            }
+            let snapshot = ws.clone();
+            Box::pin(async move { Ok(snapshot) })
+        }
+    }
+
+    async fn call(srv: &WorkspaceMcpServer, name: &str, args: Value) -> Value {
+        srv.handle_message(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": name, "arguments": args }
+        }))
+        .await
+        .expect("tools/call must produce a response")
+    }
+
+    fn parse_content(resp: &Value) -> Value {
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_workspace_details_returns_reduced_metadata() {
+        // `title == id` is the daemon's "still a slug" marker (created via
+        // `create_workspace` when no title is supplied); `hasTitle` reflects
+        // this by treating the placeholder as still-untitled.
+        let api = WorkspaceMockApi::new("amber-forest", "amber-forest", "amber-forest");
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
+        let resp = call(&srv, "get_workspace_details_workspace-mcp", json!({})).await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body = parse_content(&resp);
+        assert_eq!(body["id"], json!("amber-forest"));
+        assert_eq!(body["title"], json!("amber-forest"));
+        assert_eq!(body["hasTitle"], json!(false));
+        assert_eq!(body["status"], json!("Active"));
+        assert_eq!(body["statusMessage"], Value::Null);
+        assert_eq!(body["branch"], json!("amber-forest"));
+        assert_eq!(body["repositoryName"], json!("cloudlands-ai/intentd"));
+        assert_eq!(body["tags"], json!(["demo"]));
+    }
+
+    #[tokio::test]
+    async fn get_workspace_details_reports_has_title_for_custom_titles() {
+        let api = WorkspaceMockApi::new("amber-forest", "Add dark mode", "amber-forest");
+        let srv = WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"));
+        let body =
+            parse_content(&call(&srv, "get_workspace_details_workspace-mcp", json!({})).await);
+        assert_eq!(body["hasTitle"], json!(true));
+        assert_eq!(body["title"], json!("Add dark mode"));
+    }
+
+    #[tokio::test]
+    async fn set_workspace_title_updates_when_title_still_matches_id() {
+        // Fresh workspace where the seeded title equals the id — a
+        // still-untitled slug per the reference `setTitle` guard.
+        let api = WorkspaceMockApi::new("amber-forest", "amber-forest", "amber-forest");
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
+        let resp = call(
+            &srv,
+            "set_workspace_title_workspace-mcp",
+            json!({ "title": "  Add dark mode support  " }),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body = parse_content(&resp);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["title"], json!("Add dark mode support"));
+        assert_eq!(body["branch"], json!("amber-forest"));
+        assert!(body.get("skipped").is_none(), "should not skip: {body}");
+        // Underlying update_workspace was called with only the title populated
+        // (branch rename is deferred until the daemon owns a rename path).
+        let updates = api.updates.lock().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].title.as_deref(), Some("Add dark mode support"));
+        assert!(updates[0].branch.is_none());
+        assert!(updates[0].status_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_workspace_title_skips_when_custom_title_already_set() {
+        let api = WorkspaceMockApi::new("amber-forest", "Add dark mode", "auth-refactor");
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
+        let resp = call(
+            &srv,
+            "set_workspace_title_workspace-mcp",
+            json!({ "title": "Something else" }),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body = parse_content(&resp);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["skipped"], json!(true));
+        assert_eq!(body["title"], json!("Add dark mode"));
+        assert_eq!(body["branch"], json!("auth-refactor"));
+        // No update reached the API on the skip path.
+        assert!(api.updates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_workspace_title_rejects_empty_title() {
+        let api = WorkspaceMockApi::new("amber-forest", "amber-forest", "amber-forest");
+        let srv = WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"));
+        let resp = call(
+            &srv,
+            "set_workspace_title_workspace-mcp",
+            json!({ "title": "   " }),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], json!(-32602));
+    }
+
+    #[tokio::test]
+    async fn set_workspace_status_message_updates_and_serializes_string() {
+        let api = WorkspaceMockApi::new("amber-forest", "Add dark mode", "amber-forest");
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
+        let resp = call(
+            &srv,
+            "set_workspace_status_message_workspace-mcp",
+            json!({ "statusMessage": " Implementing dark mode toggle " }),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body = parse_content(&resp);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(
+            body["statusMessage"],
+            json!("Implementing dark mode toggle")
+        );
+        let updates = api.updates.lock().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].status_message.as_deref(),
+            Some("Implementing dark mode toggle")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_workspace_status_message_clears_on_empty_string() {
+        let api = WorkspaceMockApi::new("amber-forest", "Add dark mode", "amber-forest");
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
+        let resp = call(
+            &srv,
+            "set_workspace_status_message_workspace-mcp",
+            json!({ "statusMessage": "" }),
+        )
+        .await;
+        let body = parse_content(&resp);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["statusMessage"], Value::Null);
+        let updates = api.updates.lock().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status_message.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn set_workspace_status_message_enforces_length_cap() {
+        let api = WorkspaceMockApi::new("amber-forest", "Add dark mode", "amber-forest");
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
+        let too_long = "x".repeat(intent_core::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH + 1);
+        let resp = call(
+            &srv,
+            "set_workspace_status_message_workspace-mcp",
+            json!({ "statusMessage": too_long }),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("statusMessage")
+                && msg.contains(&intent_core::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH.to_string()),
+            "unexpected error message: {msg}",
+        );
+        assert!(api.updates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn workspace_metadata_tools_are_registered_in_tools_list() {
+        // Sanity check that the three tools appear in `tools/list` — agents
+        // discover them via the standard MCP handshake.
+        let api = WorkspaceMockApi::new("amber-forest", "amber-forest", "amber-forest");
+        let srv = WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"));
+        let resp = srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let names: Vec<String> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        for required in [
+            "get_workspace_details_workspace-mcp",
+            "set_workspace_title_workspace-mcp",
+            "set_workspace_status_message_workspace-mcp",
+        ] {
+            assert!(
+                names.contains(&required.to_string()),
+                "tools/list missing {required}: {names:?}"
+            );
+        }
     }
 }

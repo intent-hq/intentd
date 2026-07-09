@@ -13,8 +13,8 @@
 use intent_core::events::{
     AGENT_COMPLETED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RENAMED,
     AGENT_RESTORED, AGENT_STARTED, AGENT_STATUS_CHANGED, AGENT_STREAM_CHUNK, AGENT_STREAM_END,
-    AGENT_TOOL_CALL, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED,
-    PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
+    AGENT_TOOL_CALL, AGENT_UPDATED, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED,
+    PR_LINKED, PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_UPDATED,
 };
 use intent_core::{now_iso, AgentId, Event, NoteId, WorkspaceApi, WorkspaceId};
@@ -318,6 +318,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             AGENT_IDLE,
             AGENT_STATUS_CHANGED,
             AGENT_RENAMED,
+            AGENT_UPDATED,
             AGENT_RESTORED,
             AGENT_DELETED,
         ],
@@ -607,17 +608,18 @@ impl ChatDeltaState {
         self.message_id = Some(message_id.clone());
         let tool_call_id = d.get("toolCallId").and_then(Value::as_str)?.to_string();
         let status = d.get("status").and_then(Value::as_str).unwrap_or("started");
-        let use_block = json!({
-            "type": "tool_use",
-            "id": block_id,
-            "name": d.get("toolName").cloned().unwrap_or(Value::Null),
-            "input": d.get("input").cloned().unwrap_or(Value::Null),
-            "toolCallId": tool_call_id,
-            "metadata": {
-                "toolKind": d.get("toolKind").cloned().unwrap_or(Value::Null),
-                "status": status,
-            },
-        });
+        // Synthesize the `tool_use` block via the shared factory so the live
+        // delta stays byte-identical to the persisted block that `record_tool`
+        // writes on `agent:stream:end` — the invariant chat.subscribe relies
+        // on for its terminal reconcile.
+        let use_block = intent_services::tool_block::build_tool_use_block(
+            &block_id,
+            d.get("toolName").and_then(Value::as_str).unwrap_or(""),
+            d.get("input").cloned().unwrap_or(Value::Null),
+            &tool_call_id,
+            d.get("toolKind").and_then(Value::as_str).unwrap_or(""),
+            status,
+        );
         let use_added = self.note_block(&block_id);
         let mut added = Vec::new();
         let mut updated = Vec::new();
@@ -797,8 +799,10 @@ pub(crate) async fn channel_delta(
 
 /// Map a `task` channel event by re-reading the note and keeping only task
 /// notes. `note:created` → `added`, `note:updated`/`task:status-changed` →
-/// `updated`, `note:deleted` → `removedIds` (the delete is idempotent on the
-/// client even when the removed note was not a task).
+/// `updated` when the note still projects a task or `removedIds` when the note
+/// has been demoted (task block removed), `note:deleted` → `removedIds` (the
+/// delete is idempotent on the client even when the removed note was not a
+/// task).
 pub(crate) async fn task_delta(
     api: &dyn WorkspaceApi,
     workspace_id: &WorkspaceId,
@@ -820,7 +824,9 @@ pub(crate) async fn task_delta(
                 .get_note(workspace_id.clone(), NoteId::from(note_id))
                 .await
                 .ok()?;
-            note.task.as_ref()?;
+            if note.task.is_none() {
+                return Some(json!({ "removedIds": [note_id] }));
+            }
             Some(json!({ "updated": [serde_json::to_value(note).ok()?] }))
         }
         _ => None,
@@ -844,7 +850,7 @@ pub(crate) async fn agent_delta(api: &dyn WorkspaceApi, event: &Event) -> Option
             Some(json!({ "added": [serde_json::to_value(agent).ok()?] }))
         }
         AGENT_STARTED | AGENT_COMPLETED | AGENT_FAILED | AGENT_IDLE | AGENT_STATUS_CHANGED
-        | AGENT_RENAMED | AGENT_RESTORED => {
+        | AGENT_RENAMED | AGENT_UPDATED | AGENT_RESTORED => {
             let agent = api.agent_get(AgentId::from(agent_id), None).await.ok()?;
             Some(json!({ "updated": [serde_json::to_value(agent).ok()?] }))
         }

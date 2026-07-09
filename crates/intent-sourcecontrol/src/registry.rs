@@ -58,12 +58,13 @@ pub struct SourceControlRegistry;
 impl SourceControlRegistry {
     /// Construct the active provider, or a typed error when the provider is
     /// unknown ([`Error::Config`]) or no token is available
-    /// ([`Error::NotConfigured`]).
-    pub fn from_settings(settings: &SourceControlSettings) -> Result<Arc<dyn SourceControl>> {
+    /// ([`Error::NotConfigured`]). Async because the keychain / `gh` lookups
+    /// run on the blocking pool with bounded timeouts (see [`token::resolve`]).
+    pub async fn from_settings(settings: &SourceControlSettings) -> Result<Arc<dyn SourceControl>> {
         match settings.active_provider.as_str() {
             "github" => {
                 let gh = GitHubSourceControl::new(
-                    &resolve_github_token(&settings.github)?,
+                    &resolve_github_token(&settings.github).await?,
                     settings.github.api_base_url.as_deref(),
                 )?;
                 Ok(Arc::new(gh))
@@ -76,13 +77,13 @@ impl SourceControlRegistry {
 }
 
 /// Resolve the GitHub token from inline settings or the configured source.
-fn resolve_github_token(github: &GithubSettings) -> Result<String> {
+async fn resolve_github_token(github: &GithubSettings) -> Result<String> {
     if let Some(token) = github.token.as_deref() {
         if !token.trim().is_empty() {
             return Ok(token.trim().to_string());
         }
     }
-    token::resolve(&github.token_source).ok_or_else(|| {
+    token::resolve(&github.token_source).await.ok_or_else(|| {
         Error::NotConfigured(
             "github: no token found (set sourceControl.github.token, GITHUB_TOKEN/GH_TOKEN, \
              or authenticate with `gh auth token`)"
@@ -95,13 +96,13 @@ fn resolve_github_token(github: &GithubSettings) -> Result<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn unknown_provider_is_config_error() {
+    #[tokio::test]
+    async fn unknown_provider_is_config_error() {
         let settings = SourceControlSettings {
             active_provider: "gitlab".to_string(),
             github: GithubSettings::default(),
         };
-        let result = SourceControlRegistry::from_settings(&settings);
+        let result = SourceControlRegistry::from_settings(&settings).await;
         assert!(matches!(result, Err(Error::Config(_))));
     }
 
@@ -114,34 +115,24 @@ mod tests {
                 ..GithubSettings::default()
             },
         };
-        let sc = SourceControlRegistry::from_settings(&settings).expect("should build");
+        let sc = SourceControlRegistry::from_settings(&settings)
+            .await
+            .expect("should build");
         assert_eq!(sc.provider_id(), "github");
         assert!(sc.capabilities().check_runs);
     }
 
-    #[test]
-    fn missing_token_is_not_configured() {
-        // `Explicit` reads the keychain only; no `intentd` entry exists in CI,
-        // so resolution yields `None` regardless of ambient env vars.
-        let settings = SourceControlSettings {
-            active_provider: "github".to_string(),
-            github: GithubSettings {
-                token: None,
-                token_source: TokenSource::Explicit,
-                api_base_url: None,
-            },
-        };
-        let result = SourceControlRegistry::from_settings(&settings);
-        assert!(matches!(result, Err(Error::NotConfigured(_))));
-    }
-
-    #[test]
-    fn blank_inline_token_falls_through_to_not_configured() {
+    #[tokio::test]
+    async fn blank_inline_token_falls_through_to_not_configured() {
+        // Use the `Env` source so the test does not touch the OS keychain or
+        // shell out to `gh`; a blank inline token must still yield the same
+        // `NotConfigured` outcome the wire relies on.
         let token = resolve_github_token(&GithubSettings {
             token: Some("   ".to_string()),
-            token_source: TokenSource::Explicit,
+            token_source: TokenSource::Env,
             api_base_url: None,
-        });
+        })
+        .await;
         assert!(matches!(token, Err(Error::NotConfigured(_))));
     }
 }

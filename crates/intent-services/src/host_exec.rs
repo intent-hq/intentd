@@ -204,25 +204,27 @@ fn normalize_lexical(p: &Path) -> PathBuf {
 }
 
 /// Node-style `path.resolve(base, rel)` (mirrors `file_ops::node_resolve`):
-/// absolute `rel` wins; otherwise join onto `base` (or CWD when `base` empty).
-fn node_resolve(base: &str, rel: &str) -> PathBuf {
+/// absolute `rel` wins; otherwise join onto an absolute `base`. Unlike Node's
+/// `path.resolve`, an empty or non-absolute `base` is an explicit error rather
+/// than a silent rebase onto the daemon's CWD — the containment guard cannot
+/// be honoured against a base we didn't choose, and quietly falling back to
+/// `std::env::current_dir()` is the same archetype as the fixed terminal-cwd
+/// escape (a caller thinks it constrained the exec to a workspace root; the
+/// daemon-CWD fallback lets it escape).
+fn node_resolve(base: &str, rel: &str) -> Result<PathBuf, HostExecError> {
     let rel_path = Path::new(rel);
     let combined = if rel_path.is_absolute() {
         PathBuf::from(rel)
     } else {
         let base_path = Path::new(base);
-        if base.is_empty() {
-            std::env::current_dir().unwrap_or_default().join(rel)
-        } else if base_path.is_absolute() {
-            base_path.join(rel)
-        } else {
-            std::env::current_dir()
-                .unwrap_or_default()
-                .join(base)
-                .join(rel)
+        if !base_path.is_absolute() {
+            return Err(HostExecError::internal(
+                "cwd resolution requires an absolute workspace root",
+            ));
         }
+        base_path.join(rel)
     };
-    normalize_lexical(&combined)
+    Ok(normalize_lexical(&combined))
 }
 
 /// Resolve the workspace filesystem root, then apply the same lexical
@@ -245,7 +247,7 @@ pub async fn resolve_cwd_within_workspace(
             "Access denied: workspace has no filesystem root",
         ));
     }
-    let full = node_resolve(&root, cwd);
+    let full = node_resolve(&root, cwd)?;
     if !cwd_within_root(Path::new(&root), &full) {
         return Err(HostExecError::internal(
             "Access denied: cwd outside workspace",
@@ -468,5 +470,31 @@ mod tests {
         assert!(cwd_within_root(root, Path::new("/tmp/ws")));
         assert!(cwd_within_root(root, Path::new("/tmp/ws/sub")));
         assert!(cwd_within_root(root, Path::new("/tmp/ws/sub/nested")));
+    }
+
+    #[test]
+    fn node_resolve_rejects_empty_base() {
+        let err = node_resolve("", "sub").unwrap_err();
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert!(err.message.contains("absolute workspace root"));
+    }
+
+    #[test]
+    fn node_resolve_rejects_relative_base() {
+        let err = node_resolve("relative/base", "sub").unwrap_err();
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert!(err.message.contains("absolute workspace root"));
+    }
+
+    #[test]
+    fn node_resolve_joins_absolute_base() {
+        let full = node_resolve("/tmp/ws", "sub/nested").unwrap();
+        assert_eq!(full, PathBuf::from("/tmp/ws/sub/nested"));
+    }
+
+    #[test]
+    fn node_resolve_absolute_rel_wins() {
+        let full = node_resolve("/tmp/ws", "/other/abs").unwrap();
+        assert_eq!(full, PathBuf::from("/other/abs"));
     }
 }

@@ -9,17 +9,19 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId};
 use crate::model::{
-    AgentDelegateInput, AgentLite, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
-    CommentListResult, CommentResolveThreadResult, CommentRespondResult, Draft, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, FileActivity, GitAgentCommitResult,
-    GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts, GitStatus, Note,
+    AgentDelegateInput, AgentLite, AgentSession, CommentAddResult, CommentDeleteResult,
+    CommentGetThreadResult, CommentListResult, CommentResolveThreadResult, CommentRespondResult,
+    Draft, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity,
+    GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts,
+    GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData, Note,
     NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
-    NoteEditLinesResult, NoteEditResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, ProjectType, ReadAssetResult, ScriptCreateParams, SetupScript,
+    NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult, NoteSetContentResult,
+    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary,
+    ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams, SetupScript,
     TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskUpdateNoteStatusResult,
-    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
-    WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
+    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -55,7 +57,10 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// Create a workspace from wire input, filling ids/defaults (PROTOCOL §5.1).
+    /// Create a workspace from wire input, filling ids/defaults, and
+    /// orchestrate the optional initial agent — created and its prompt
+    /// delivered inside the same idempotency scope, so `initialAgent` is
+    /// present in the result iff an agent was created (PROTOCOL §5.1).
     ///
     /// `idempotency_key` is the optional `params.idempotencyKey` (design note TB-0
     /// §5): when present and previously recorded, the original result is returned
@@ -64,7 +69,7 @@ pub trait WorkspaceApi: Send + Sync {
         &self,
         input: WorkspaceCreate,
         idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<Workspace>> {
+    ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
         let _ = (input, idempotency_key);
         Box::pin(async {
             Err(Error::Internal(
@@ -386,6 +391,106 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `note.saveAsset`: write an image asset (base64 `data`, an optional
+    /// `data:` URL prefix is stripped) under the workspace assets root and
+    /// return `{ assetId, path, url }` (PROTOCOL §5.2 — additive asset write
+    /// behind note image paste/upload).
+    fn save_asset(
+        &self,
+        workspace_id: WorkspaceId,
+        data: String,
+        mime_type: String,
+        original_name: Option<String>,
+    ) -> BoxFuture<'_, Result<SaveAssetResult>> {
+        let _ = (workspace_id, data, mime_type, original_name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::save_asset not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.listVersions`: stored versions ascending by `v`, without content
+    /// blobs (PROTOCOL §5.2 version-history extensions).
+    fn list_note_versions(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<Vec<NoteVersionSummary>>> {
+        let _ = (workspace_id, note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::list_note_versions not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.getVersion`: one stored version with content (PROTOCOL §5.2
+    /// version-history extensions).
+    fn get_note_version(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        v: i64,
+    ) -> BoxFuture<'_, Result<NoteVersion>> {
+        let _ = (workspace_id, note_id, v);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::get_note_version not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.restoreVersion`: reset content to version `v` and append a new
+    /// version capturing the restored state (PROTOCOL §5.2 version-history
+    /// extensions).
+    fn restore_note_version(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        v: i64,
+    ) -> BoxFuture<'_, Result<NoteRestoreVersionResult>> {
+        let _ = (workspace_id, note_id, v);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::restore_note_version not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.lineAttribution.load`: return the most recently persisted
+    /// per-line attribution snapshot for `note_id`, or `None` when the
+    /// daemon has not yet computed one (PROTOCOL §5.2.1). Payload shape is
+    /// FE-parity with what the `line-attribution:load` IPC handler served.
+    fn line_attribution_load(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<Option<LineAttributionData>>> {
+        let _ = (workspace_id, note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::line_attribution_load not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.lineAttribution.computeNow`: force an immediate recompute of
+    /// `note_id`’s attributions (PROTOCOL §5.2.1). Persists the fresh
+    /// snapshot and emits `line-attribution:updated` before returning.
+    fn line_attribution_compute_now(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<LineAttributionComputeResult>> {
+        let _ = (workspace_id, note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::line_attribution_compute_now not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `task.updateStatus`: flip a checkbox by exact task text (PROTOCOL §5.4).
     fn task_update_status(
         &self,
@@ -549,6 +654,24 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `task.removeAgentFromAllTasks` (§5.4 extension): strip `agent_id` from
+    /// every task-note's `assignedAgentIds` in the workspace. Called from the
+    /// agent teardown path (delete-agent, wake-or-create stale-assignment
+    /// cleanup) so those callers do not need to enumerate tasks and issue
+    /// per-note updates.
+    fn remove_agent_from_all_tasks(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<TaskRemoveAgentFromAllTasksResult>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::remove_agent_from_all_tasks not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.delegate`: delegate a task to a new agent (PROTOCOL §5.5). Part of
     /// the shared MCP surface agents call back into; the runtime wiring
     /// (spawn/ACP) lands in a later milestone, so the default returns an
@@ -610,6 +733,91 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_get_conversation not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.getSession`: full [`AgentSession`] projection including
+    /// `systemPrompt`, `specialist`, and the persisted metadata block —
+    /// the superset that `agent.get`/`AgentLite` strips (PROTOCOL §5.5).
+    /// `messages` is loaded from the append-only log (chronological order).
+    /// Used by the FE-side agent-backend-handler retirement to rehydrate the
+    /// full `AgentSession` shape from the daemon (C1d/C1e). `NotFound` when
+    /// the session is unknown.
+    fn agent_get_session(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<AgentSession>> {
+        let _ = (agent_id, workspace_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_get_session not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.update`: partial update of the persisted [`AgentSession`] from
+    /// a `changes` object (PROTOCOL §5.5). Only the listed fields are touched;
+    /// omitted fields are preserved. Write-once (`acpSessionId`) and immutable
+    /// (`provider`) invariants are enforced by the store. Emits `agent:updated`
+    /// (or `agent:renamed` when `name` is the only mutated field). Returns
+    /// `{ success: true, agent: AgentLite }` on success. `NotFound` when the
+    /// session is unknown; `InvalidParams` when `changes` carries an unknown
+    /// field or a malformed value.
+    fn agent_update(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        changes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, workspace_id, changes);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.appendMessage`: append a raw [`AgentMessage`] to the transcript
+    /// (PROTOCOL §5.5). Used by the FE for wake-message insert and the
+    /// `saveMessage` renderer path — mutations that carry the persisted role
+    /// and pre-composed `contentBlocks` verbatim. Rejected with
+    /// `InvalidParams` when the agent is mid-turn (message-log mutation must
+    /// not race the daemon's streaming writer). Returns `{ success: true,
+    /// message: AgentMessage }` on success. Emits `agent:message`.
+    fn agent_append_message(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        role: String,
+        content: serde_json::Value,
+        metadata: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, workspace_id, role, content, metadata);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_append_message not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.replaceMessages`: atomically swap the entire transcript with
+    /// `messages` (PROTOCOL §5.5). Used by the FE's edit-truncate path so a
+    /// re-generated turn does not leave orphaned rows. Rejected with
+    /// `InvalidParams` when the agent is mid-turn (same rationale as
+    /// [`WorkspaceApi::agent_append_message`]). Returns `{ success: true,
+    /// messages: AgentMessage[] }` with the freshly-minted ids/`seq`s.
+    fn agent_replace_messages(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        messages: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, workspace_id, messages);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_replace_messages not implemented".to_string(),
             ))
         })
     }
@@ -728,6 +936,22 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `agent.sendMessage`: deliver a user message, auto-queuing when the agent
     /// is mid-stream; `{ success, queued, messageId? }` (PROTOCOL §5.5).
+    /// `priority: "interrupt"` preempts an in-flight turn instead of queueing:
+    /// the current turn is cancelled keep-alive (the agent process is never
+    /// killed) and the message is delivered immediately as a fresh turn.
+    ///
+    /// `image_blocks` / `file_blocks` are FE-supplied attachment arrays that
+    /// reach the agent as ACP content blocks appended after the text prompt
+    /// (reference-parity `acp-provider.ts`); a queued message preserves them
+    /// so the drained turn carries the same blocks.
+    ///
+    /// `note_ids` / `stdin_context` / `context_references` are the FE-side
+    /// per-turn prompt-assembly hints (PROTOCOL §5.5). `stdin_context` is
+    /// prepended verbatim to the outbound prompt as a `Context:` block
+    /// (reference-parity `acp-provider.ts`); the other two are threaded
+    /// through to the prompt builder for downstream note-image /
+    /// context-reference resolution.
+    #[allow(clippy::too_many_arguments)]
     fn agent_send_message(
         &self,
         workspace_id: WorkspaceId,
@@ -735,8 +959,26 @@ pub trait WorkspaceApi: Send + Sync {
         content: String,
         message_id: Option<String>,
         image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
+        priority: Option<String>,
+        note_ids: Option<serde_json::Value>,
+        stdin_context: Option<String>,
+        context_references: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, agent_id, content, message_id, image_blocks);
+        let _ = (
+            workspace_id,
+            agent_id,
+            content,
+            message_id,
+            image_blocks,
+            file_blocks,
+            priority,
+            note_ids,
+            stdin_context,
+            context_references,
+            message_metadata,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_send_message not implemented".to_string(),
@@ -745,7 +987,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.forceMessage`: stop the current stream then deliver immediately
-    /// (PROTOCOL §5.5).
+    /// (PROTOCOL §5.5). Accepts the same attachment (`image_blocks`,
+    /// `file_blocks`) and per-turn prompt-assembly (`stdin_context`,
+    /// `note_ids`, `context_references`) hints as `sendMessage`.
     #[allow(clippy::too_many_arguments)]
     fn agent_force_message(
         &self,
@@ -754,7 +998,11 @@ pub trait WorkspaceApi: Send + Sync {
         message_id: String,
         content: String,
         image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
         note_ids: Option<serde_json::Value>,
+        stdin_context: Option<String>,
+        context_references: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
@@ -762,7 +1010,11 @@ pub trait WorkspaceApi: Send + Sync {
             message_id,
             content,
             image_blocks,
+            file_blocks,
             note_ids,
+            stdin_context,
+            context_references,
+            message_metadata,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -773,14 +1025,17 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `agent.queueMessage`: explicitly enqueue a message; `{ success,
     /// queuedMessage }` where `queuedMessage` is `{ id, content, queuedAt,
-    /// position, imageBlocks? }` (PROTOCOL §5.5).
+    /// position, imageBlocks?, fileBlocks? }` (PROTOCOL §5.5). Attachment
+    /// arrays are preserved on the queued entry so the drained turn carries
+    /// the same blocks.
     fn agent_queue_message(
         &self,
         agent_id: AgentId,
         content: String,
         image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, content, image_blocks);
+        let _ = (agent_id, content, image_blocks, file_blocks);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_queue_message not implemented".to_string(),
@@ -823,9 +1078,15 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.getQueue`: the agent's pending message queue; `{ success, queue:
-    /// [{ id, content, queuedAt, position, imageBlocks? }] }` (PROTOCOL §5.5).
-    fn agent_get_queue(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = agent_id;
+    /// [{ id, content, queuedAt, position, imageBlocks?, fileBlocks? }] }` (PROTOCOL §5.5).
+    /// When `workspace_id` is supplied the callee verifies the session belongs
+    /// to that workspace (defense-in-depth against a bare `agentId` probe).
+    fn agent_get_queue(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, workspace_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_get_queue not implemented".to_string(),
@@ -869,6 +1130,58 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `models.list`: the rich model catalog for FE model pickers —
+    /// `{ models: [ModelInfo…], source: "auggie" | "static" }` from
+    /// `auggie model list --json` (plain-text fallback) with the static tier
+    /// catalog when the CLI is unavailable; no `workspaceId` (PROTOCOL §5.30).
+    fn models_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::models_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.enhancePrompt`: one-shot prompt-enhance / AI-layout generation via
+    /// the auggie CLI — `{ enhanced, original, mode }`; `mode` is `"enhance"` or
+    /// `"layout"`, `workspaceId` optionally pins the CLI's cwd (PROTOCOL §5.31).
+    fn agent_enhance_prompt(
+        &self,
+        prompt: String,
+        mode: String,
+        model: Option<String>,
+        workspace_id: Option<WorkspaceId>,
+        timeout_ms: Option<u64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (prompt, mode, model, workspace_id, timeout_ms);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_enhance_prompt not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.completeOnce`: stateless one-shot prompt→completion via the
+    /// auggie CLI — `{ text }`. Optional `system_prompt` is composed with
+    /// `prompt` before dispatch; `workspace_id` optionally pins the CLI's cwd
+    /// (PROTOCOL §5.32). Daemon owns the full lifecycle including reap on
+    /// timeout/failure; no session or agent state is created.
+    fn agent_complete_once(
+        &self,
+        prompt: String,
+        system_prompt: Option<String>,
+        model: Option<String>,
+        workspace_id: Option<WorkspaceId>,
+        timeout_ms: Option<u64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (prompt, system_prompt, model, workspace_id, timeout_ms);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_complete_once not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.respondPermission`: resolve an outstanding interactive permission
     /// prompt by `requestId`, unblocking the agent with the §8 `outcome`
     /// (`{ outcome: "selected", optionId }` / `{ outcome: "cancelled" }`).
@@ -902,12 +1215,15 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.rename`: rename an agent; `{ success: true, name }` (PROTOCOL §5.5).
+    /// With `skip_if_explicitly_set = true`, an already-explicitly-named session
+    /// is left untouched and the result carries `skipped: true` (P3-1.2b).
     fn agent_rename(
         &self,
         agent_id: AgentId,
         name: String,
+        skip_if_explicitly_set: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, name);
+        let _ = (agent_id, name, skip_if_explicitly_set);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_rename not implemented".to_string(),
@@ -929,16 +1245,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `agent.wakeOrCreate`: resume/create the agent assigned to a task note
-    /// (PROTOCOL §5.5).
+    /// `agent.wakeOrCreate` (PROTOCOL §5.5, widened by C1d-10a): resume the
+    /// newest live/resumable agent assigned to the task, or create + assign a
+    /// new one — inheriting specialist/model from the most-recent previous
+    /// session and honoring the FE `WakeOrCreateTaskAgentTool` create payload
+    /// (name/contextReferences/metadata/skipAutoCommit) — then deliver the
+    /// context message (optionally tagged with `input.messageMetadata`).
+    /// `input.callerAgentId`/`input.delegationDepth` gate the
+    /// delegation-depth guard. All fields on [`crate::AgentWakeOrCreateInput`]
+    /// are optional so the pre-widening 3-required-params callers stay green.
     fn agent_wake_or_create(
         &self,
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
         context_message: String,
-        model: Option<String>,
+        input: crate::model::AgentWakeOrCreateInput,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, task_note_id, context_message, model);
+        let _ = (workspace_id, task_note_id, context_message, input);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_wake_or_create not implemented".to_string(),
@@ -963,11 +1286,14 @@ pub trait WorkspaceApi: Send + Sync {
     /// `agent.getSessionStats`: the per-session credit/message/tool rollup as
     /// `{ stats: SessionStats }` (PROTOCOL §5.24). `sessionId` is required; an
     /// unknown session surfaces `NotFound` which the router maps to `-32602`.
+    /// When `workspace_id` is supplied the callee verifies the session belongs
+    /// to that workspace (defense-in-depth against a bare `sessionId` probe).
     fn agent_get_session_stats(
         &self,
         session_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = session_id;
+        let _ = (session_id, workspace_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_get_session_stats not implemented".to_string(),
@@ -1398,6 +1724,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `git.pull`: fetch + rebase-pull `branch_name` from `origin` for the repo
+    /// at `repo_path` (path-based like `git_get_branches`; an invalid repo path
+    /// is `-32602`). Ordinary pull failures are a structured `{ ok: false,
+    /// error }` result, not an `Err` (PROTOCOL §5.6).
+    fn git_pull(
+        &self,
+        repo_path: String,
+        branch_name: String,
+    ) -> BoxFuture<'_, Result<GitPullResult>> {
+        let _ = (repo_path, branch_name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_pull not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `git.commit` (deprecated; prefer `git_agent_commit`): commit the already
     /// staged changes with `message`. Failures (incl. nothing to commit) are
     /// `-32603` (PROTOCOL §5.6).
@@ -1531,6 +1874,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `git.showFile`: raw file content at a revision (`git show <ref>:<path>`
+    /// semantics) as `{ content }`. `ref` accepts anything revparse-able plus
+    /// the index ref `":0"`; a path missing at the ref and remote/non-repo
+    /// workspaces return `{ content: "" }` (wire §7.7), while an unresolvable
+    /// `ref` is `-32603` (PROTOCOL §5.6 extensions).
+    fn git_show_file(
+        &self,
+        workspace_id: WorkspaceId,
+        file_path: String,
+        git_ref: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, file_path, git_ref);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_show_file not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `git.clone`: streaming clone of `url` into `<parent_dir>/<target_name>`
     /// (or the URL-derived basename when `target_name` is `None`). Returns
     /// `{ requestId, targetPath }` promptly and pushes `git:clone:progress`
@@ -1561,6 +1923,18 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::repo_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `repo.remove`: delete one entry from the persistent known-repository
+    /// registry by `path`, as `{ removed: bool }` (PROTOCOL §5.11). Removing a
+    /// path that is not registered is not an error — `removed` is `false`.
+    fn repo_remove(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = path;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::repo_remove not implemented".to_string(),
             ))
         })
     }
@@ -2831,6 +3205,56 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `mcp.oauth.list` → `{ tokens: [{ serverId, value }] }` — one entry per
+    /// stored OAuth bag, `value` always the redaction placeholder. The bag
+    /// itself never crosses the wire (PROTOCOL §5.22 companion).
+    fn mcp_oauth_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_oauth_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.oauth.get` → `{ serverId, value }`; `value` is the redaction
+    /// placeholder when a bag exists and `null` when it does not (PROTOCOL
+    /// §5.22 companion).
+    fn mcp_oauth_get(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = server_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_oauth_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.oauth.set` → persist `tokenBag` for `serverId` and return
+    /// `{ serverId, value }` with the redaction placeholder as `value` (the
+    /// bag itself is never echoed). PROTOCOL §5.22 companion.
+    fn mcp_oauth_set(
+        &self,
+        server_id: String,
+        token_bag: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (server_id, token_bag);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_oauth_set not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.oauth.delete` → drop the persisted bag for `serverId`; idempotent
+    /// `{ success: true }` (PROTOCOL §5.22 companion).
+    fn mcp_oauth_delete(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = server_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_oauth_delete not implemented".to_string(),
+            ))
+        })
+    }
+
     // ------------------------------------------------------------------------
     // accept-changes.* — commit→push→PR→merge orchestration (PROTOCOL §5.18).
     // ------------------------------------------------------------------------
@@ -3212,9 +3636,15 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `script.remove`: stop (if running) and forget a script; returns
-    /// `{ ok, scriptId }` (PROTOCOL §5.8).
-    fn script_remove(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = script_id;
+    /// `{ ok, scriptId }` (PROTOCOL §5.8). Workspace-scoped: the callee
+    /// looks up the script under `(workspace_id, script_id)` so a script id
+    /// owned by another workspace surfaces as `NotFound`.
+    fn script_remove(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_remove not implemented".to_string(),
@@ -3224,8 +3654,13 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `script.start`: spawn the script on the PTY host (service mode auto-
     /// restarts per policy); returns `{ ok, scriptId }` (PROTOCOL §5.8).
-    fn script_start(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = script_id;
+    /// Workspace-scoped.
+    fn script_start(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_start not implemented".to_string(),
@@ -3234,9 +3669,13 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `script.stop`: stop a running script (cancels pending auto-restart);
-    /// returns `{ ok, scriptId }` (PROTOCOL §5.8).
-    fn script_stop(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = script_id;
+    /// returns `{ ok, scriptId }` (PROTOCOL §5.8). Workspace-scoped.
+    fn script_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_stop not implemented".to_string(),
@@ -3245,9 +3684,13 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `script.restart`: stop then start, resetting the restart counter; returns
-    /// `{ ok, scriptId }` (PROTOCOL §5.8).
-    fn script_restart(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = script_id;
+    /// `{ ok, scriptId }` (PROTOCOL §5.8). Workspace-scoped.
+    fn script_restart(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_restart not implemented".to_string(),
@@ -3258,14 +3701,16 @@ pub trait WorkspaceApi: Send + Sync {
     /// `script.output`: the script's current PTY scrollback as plaintext
     /// output-buffer text (optionally trailing `maxLines`, default 100); returns
     /// a bare string (`"No output yet."` when empty), not an object (§5.8).
+    /// Workspace-scoped.
     fn script_output(
         &self,
+        workspace_id: WorkspaceId,
         script_id: String,
         max_lines: Option<i64>,
         paginate: Option<bool>,
         page_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (script_id, max_lines, paginate, page_token);
+        let _ = (workspace_id, script_id, max_lines, paginate, page_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_output not implemented".to_string(),
@@ -3274,9 +3719,13 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `script.status`: the script's [`ScriptRuntimeState`](crate::model::ScriptRuntimeState)
-    /// (PROTOCOL §5.8).
-    fn script_status(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = script_id;
+    /// (PROTOCOL §5.8). Workspace-scoped.
+    fn script_status(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_status not implemented".to_string(),
@@ -3286,14 +3735,15 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `script.run`: run a command-mode script to completion (optional
     /// `timeoutSeconds`), returning `{ exitCode?, output, timedOut?, warning? }`;
-    /// service-mode scripts return a `warning` (PROTOCOL §5.8).
+    /// service-mode scripts return a `warning` (PROTOCOL §5.8). Workspace-scoped.
     fn script_run(
         &self,
+        workspace_id: WorkspaceId,
         script_id: String,
         max_lines: Option<i64>,
         timeout_seconds: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (script_id, max_lines, timeout_seconds);
+        let _ = (workspace_id, script_id, max_lines, timeout_seconds);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_run not implemented".to_string(),
@@ -3495,6 +3945,41 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_tree not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.exists`: existence + type probe returning
+    /// `{ exists, isFile, isDirectory }` (PROTOCOL §5.9). Mirrors the legacy
+    /// `FileExistsResult` shape so retirement-wave consumers swap over 1:1;
+    /// lookup errors collapse to `{ exists: false, isFile: false, isDirectory: false }`.
+    fn file_exists(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_exists not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.stat`: file/directory metadata as
+    /// `{ size, mtime, isFile, isDirectory, isSymlink, permissions }`
+    /// (PROTOCOL §5.9). Mirrors the legacy `StatResult` shape. Symlinks are
+    /// followed for size/type reporting; `permissions` is the octal mode
+    /// string (`"0644"`).
+    fn file_stat(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_stat not implemented".to_string(),
             ))
         })
     }

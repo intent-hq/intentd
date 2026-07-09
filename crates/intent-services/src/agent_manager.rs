@@ -17,18 +17,20 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use intent_acp::session::{ContentBlock, StopReason};
+use intent_acp::handshake::try_bypass_permissions_mode;
+use intent_acp::session::{ContentBlock, SessionModeState, StopReason};
 use intent_acp::{
-    build_baseline_mcp_env_from_process, handshake, serve_workspace_mcp_tcp, spawn_provider,
-    to_auggie_mcp_config, ClientRequestHandler, Connection, ConnectionHooks, EventSink,
-    FileService, IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer,
-    NormalizedMcpServers, PermissionOutcome, PermissionPolicy, PermissionRegistry,
-    PermissionRequestData, SinkEvent, SpawnOptions, WorkspaceMcpServer,
+    apply_baseline_env_to_stdio_servers, build_baseline_mcp_env_from_process, handshake,
+    normalize_mcp_servers, serve_workspace_mcp_tcp, spawn_provider, to_auggie_mcp_config,
+    ClientRequestHandler, Connection, ConnectionHooks, EnvMap, EventSink, FileService,
+    IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer, NormalizedMcpServers,
+    PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData, SinkEvent,
+    SpawnOptions, WorkspaceMcpServer,
 };
 use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
-    now_iso, ActorType, AgentId, AgentSession, AgentStatus, BoxFuture, Error, EventActor, Result,
-    WorkspaceApi, WorkspaceAttention, WorkspaceId,
+    now_iso, slug::is_workspace_slug, ActorType, AgentId, AgentSession, AgentStatus, BoxFuture,
+    Error, EventActor, Result, WorkspaceApi, WorkspaceAttention, WorkspaceId,
 };
 use intent_providers::ProviderConfig;
 use intent_store::{NewEvent, NewTrackedChange};
@@ -46,7 +48,56 @@ use crate::Services;
 #[cfg(test)]
 mod tests;
 
+/// Capitalize the leading ASCII byte of `s` (leaves the rest of the string
+/// untouched). Used to normalize OAuth `token_type` values into the
+/// conventional `Bearer` header form when a bag stores the RFC 6749 lower-case
+/// spelling.
+fn title_case_ascii(s: &str) -> String {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = String::with_capacity(s.len());
+    out.push(first.to_ascii_uppercase());
+    out.push_str(chars.as_str());
+    out
+}
+
 const GB: u64 = 1024 * 1024 * 1024;
+
+/// Per-turn prompt-assembly hints threaded through `agent.sendMessage` /
+/// `agent.forceMessage` (PROTOCOL §5.5). `stdin_context` is prepended
+/// verbatim to the outbound prompt as a `Context:` block (reference-parity
+/// `acp-provider.ts`); `note_ids` and `context_references` are carried
+/// forward for downstream note-image / context-reference resolution and are
+/// otherwise inert today.
+///
+/// Only the FIRST turn triggered by a `sendMessage` / `forceMessage` call
+/// carries these options; queue-drained follow-up turns run with
+/// [`TurnOptions::default`] since a `QueuedMessage` has no per-turn hints of
+/// its own.
+#[derive(Debug, Default, Clone)]
+pub struct TurnOptions {
+    pub stdin_context: Option<String>,
+    pub note_ids: Option<serde_json::Value>,
+    pub context_references: Option<serde_json::Value>,
+    /// FE-supplied image attachments: each `{ data, mimeType }` becomes an ACP
+    /// `Image` content block appended after the text prompt (reference-parity
+    /// `acp-provider.ts`).
+    pub image_blocks: Option<serde_json::Value>,
+    /// FE-supplied file attachments: each `{ data, mimeType, fileName }`
+    /// becomes an ACP `Resource` content block (`EmbeddedResource` with
+    /// `BlobResourceContents`) appended after the text prompt and any image
+    /// blocks; the `fileName` becomes the resource `uri` as `file:///<name>`
+    /// so downstream consumers can reference it.
+    pub file_blocks: Option<serde_json::Value>,
+    /// Opaque per-message payload from `agent.sendMessage` / `agent.forceMessage`
+    /// `messageMetadata` (PROTOCOL §5.5). Persisted verbatim on the user
+    /// message row (via [`Store::append_agent_message_with_metadata`]) for the
+    /// FIRST turn only; queue-drained follow-up turns run with
+    /// [`TurnOptions::default`] and therefore carry no metadata of their own.
+    pub message_metadata: Option<serde_json::Value>,
+}
 
 /// Conservative cap used when total system memory cannot be determined.
 const DEFAULT_PROCESS_CAP: usize = 8;
@@ -540,6 +591,13 @@ pub struct AgentManager {
     /// `<supervisor>` XML so the fresh session has context, then clears the flag
     /// (parity: TS `sessionWasRecreated`).
     recreated: Arc<Mutex<HashSet<AgentId>>>,
+    /// Most recent interrupt-priority `messageId` delivered per agent
+    /// (PROTOCOL §5.5). [`AgentManager::interrupt_send_message`] records the
+    /// client-supplied id under this lock BEFORE preempting, so the SAME
+    /// interrupt delivered twice (client retry / event double-fire) preempts
+    /// exactly once — the duplicate is acknowledged idempotently instead of
+    /// cancelling the interrupt turn it raced and re-persisting the message.
+    interrupt_ids: Arc<Mutex<HashMap<AgentId, String>>>,
 }
 
 impl AgentManager {
@@ -552,16 +610,22 @@ impl AgentManager {
             handles: Arc::new(Mutex::new(HashMap::new())),
             sink,
             permissions: Arc::new(PermissionRegistry::new()),
-            // Headless default (§6.7/M3.5): auto-allow low-risk reads, auto-deny
-            // medium/high-risk prompts. An FE-attached deployment selects
-            // `Interactive` via `with_policy()` (wired from `INTENTD_PERMISSION_POLICY`)
-            // to drive the `agent.respondPermission`/`agent.pendingPermissions` RPCs.
-            policy: PermissionPolicy::AutoByRisk,
+            // Shipped default (§6.7/M3.5): `AllowAll` for reference parity with
+            // the TS acp-provider — [`start_session`] additionally attempts
+            // `session/set_mode bypassPermissions` on providers that advertise
+            // set-mode (auggie today), and the local `AllowAll` auto-approve
+            // handles anything the provider still surfaces. An FE-attached
+            // deployment selects `Interactive` via `with_policy()` (wired from
+            // `INTENTD_PERMISSION_POLICY`) to drive the
+            // `agent.respondPermission` / `agent.pendingPermissions` RPCs;
+            // `AutoByRisk` / `DenyAll` remain selectable via the same env var.
+            policy: PermissionPolicy::AllowAll,
             mcp_bridge_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("intentd")),
             busy: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             recreated: Arc::new(Mutex::new(HashSet::new())),
+            interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -652,7 +716,7 @@ impl AgentManager {
         let mut mcp_config: Option<TempConfigFile> = None;
         let mut mcp_config_path: Option<String> = None;
         if opts.provider.supports_mcp_config {
-            let config = self.generate_mcp_config(&bridge);
+            let config = self.generate_mcp_config(&bridge).await?;
             let path = std::env::temp_dir().join(format!("intentd-mcp-{}.json", Uuid::new_v4()));
             let bytes = serde_json::to_vec_pretty(&config)
                 .map_err(|e| Error::Internal(format!("serialize mcp config failed: {e}")))?;
@@ -764,8 +828,14 @@ impl AgentManager {
 
     /// Build the generated `--mcp-config` (auggie `{ mcpServers }` shape): the
     /// `workspace-mcp` server is the `intentd mcp-bridge --connect <addr>`
-    /// subcommand, with the safe baseline env injected (§6.8).
-    fn generate_mcp_config(&self, bridge: &McpBridge) -> serde_json::Value {
+    /// subcommand, with the user's `mcp.servers` catalog merged in and the safe
+    /// baseline env injected across every stdio entry (§6.8, §18.4). Mirrors
+    /// the FE `mergeUserMcpServersWithAuth` path: honours the
+    /// `mcp.enableUserServers` gate, filters out globally-disabled servers, and
+    /// — for http/sse transports — injects an `Authorization` header from the
+    /// persisted OAuth token bag when the catalog entry does not already set
+    /// one. `workspace-mcp` is reserved and never overridden.
+    async fn generate_mcp_config(&self, bridge: &McpBridge) -> Result<serde_json::Value> {
         let mut servers = NormalizedMcpServers::new();
         servers.insert(
             "workspace-mcp".to_string(),
@@ -776,10 +846,155 @@ impl AgentManager {
                     "--connect".to_string(),
                     bridge.connect_addr(),
                 ],
-                env: build_baseline_mcp_env_from_process(),
+                env: EnvMap::new(),
             },
         );
-        to_auggie_mcp_config(&servers)
+        self.merge_user_mcp_servers(&mut servers).await?;
+        let baseline = build_baseline_mcp_env_from_process();
+        let servers = apply_baseline_env_to_stdio_servers(&servers, &baseline);
+        Ok(to_auggie_mcp_config(&servers))
+    }
+
+    /// Fold user-configured MCP servers (sensitive `mcp.servers` secret) into
+    /// `out`, honouring the `mcp.enableUserServers` gate and the global
+    /// `mcp.disabledServers` list, and injecting an `Authorization` header from
+    /// the persisted OAuth bag on http/sse entries when the catalog does not
+    /// already set one. Any config that collides with a reserved built-in name
+    /// (e.g. `workspace-mcp`) is skipped so the bridge cannot be shadowed.
+    async fn merge_user_mcp_servers(&self, out: &mut NormalizedMcpServers) -> Result<()> {
+        if !crate::mcp_servers::enable_user_servers(&self.services.store).await {
+            return Ok(());
+        }
+        let configs = crate::mcp_servers::read_configs(&self.services.secrets).await;
+        if configs.is_empty() {
+            return Ok(());
+        }
+        let disabled = crate::mcp_servers::disabled_servers(&self.services.store).await;
+        let disabled: HashSet<&str> = disabled.iter().map(String::as_str).collect();
+
+        let mut reshaped = serde_json::Map::new();
+        for (id, cfg) in &configs {
+            let Some(obj) = cfg.as_object() else { continue };
+            if !obj.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
+                continue;
+            }
+            if disabled.contains(id.as_str()) {
+                continue;
+            }
+            let name = obj
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(id.as_str())
+                .to_string();
+            if out.contains_key(&name) {
+                tracing::debug!(server = %name, "user MCP server collides with reserved name; skipping");
+                continue;
+            }
+            let Some(entry) = self.reshape_user_mcp_config(id, obj).await? else {
+                continue;
+            };
+            reshaped.insert(name, entry);
+        }
+        if reshaped.is_empty() {
+            return Ok(());
+        }
+        let normalized = normalize_mcp_servers(&Value::Object(reshaped));
+        for (name, server) in normalized {
+            out.entry(name).or_insert(server);
+        }
+        Ok(())
+    }
+
+    /// Reshape one `mcp.servers` entry into the shape [`normalize_mcp_servers`]
+    /// expects — stdio entries stay untouched (`command`/`args`/`env`), remote
+    /// entries get a `type` tag plus an `Authorization` header sourced from the
+    /// persisted OAuth bag when the config does not already set one. Returns
+    /// `None` for malformed entries (missing `command`/`url`) so they drop out
+    /// of the merge silently.
+    async fn reshape_user_mcp_config(
+        &self,
+        id: &str,
+        obj: &serde_json::Map<String, Value>,
+    ) -> Result<Option<Value>> {
+        let transport = obj
+            .get("transport")
+            .and_then(Value::as_str)
+            .unwrap_or("stdio");
+        let mut out = serde_json::Map::new();
+        match transport {
+            "http" | "sse" => {
+                let Some(url) = obj
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                else {
+                    return Ok(None);
+                };
+                out.insert("type".into(), Value::String(transport.to_string()));
+                out.insert("url".into(), Value::String(url.to_string()));
+                let mut headers = obj
+                    .get("headers")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                let has_auth = headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("authorization"));
+                if !has_auth {
+                    if let Some(auth) = self.oauth_authorization_header(id).await? {
+                        headers.insert("Authorization".to_string(), Value::String(auth));
+                    }
+                }
+                if !headers.is_empty() {
+                    out.insert("headers".into(), Value::Object(headers));
+                }
+            }
+            _ => {
+                let Some(command) = obj
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                else {
+                    return Ok(None);
+                };
+                out.insert("command".into(), Value::String(command.to_string()));
+                if let Some(a) = obj.get("args") {
+                    out.insert("args".into(), a.clone());
+                }
+                if let Some(e) = obj.get("env") {
+                    out.insert("env".into(), e.clone());
+                }
+            }
+        }
+        Ok(Some(Value::Object(out)))
+    }
+
+    /// Build the `Authorization: <token_type> <access_token>` header value from
+    /// the persisted OAuth bag for `server_id`, or `None` when no bag is
+    /// stored / the bag is malformed / `access_token` is missing. `token_type`
+    /// defaults to `Bearer` and is title-cased so a bag storing the RFC 6749
+    /// lower-case `bearer` still produces the conventional header form.
+    async fn oauth_authorization_header(&self, server_id: &str) -> Result<Option<String>> {
+        let Some(raw) = self.services.store.get_mcp_oauth_token(server_id).await? else {
+            return Ok(None);
+        };
+        let Ok(bag) = serde_json::from_str::<Value>(&raw) else {
+            return Ok(None);
+        };
+        let Some(access) = bag
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        let token_type = bag
+            .get("token_type")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Bearer");
+        Ok(Some(format!("{} {}", title_case_ascii(token_type), access)))
     }
 
     /// Complete the connection handshake and establish an ACP session for a
@@ -836,7 +1051,7 @@ impl AgentManager {
             )
             .await
         {
-            Ok(Some(acp_session_id)) => {
+            Ok(Some(opened)) => {
                 // `session/load` replays the prior conversation as a buffered
                 // `session/update` burst; discard it before the first turn so it
                 // is neither re-published as events nor re-accumulated into the
@@ -853,7 +1068,14 @@ impl AgentManager {
                     let mut guard = notes.lock().await;
                     Services::drain_replay_notifications(&mut guard).await;
                 }
-                return Ok(acp_session_id);
+                self.maybe_bypass_permissions(
+                    conn.as_ref(),
+                    provider,
+                    &opened.session_id,
+                    opened.modes.as_ref(),
+                )
+                .await;
+                return Ok(opened.session_id);
             }
             Ok(None) => {}
             // `session/load` was attempted but failed → fall through to recreate.
@@ -870,18 +1092,55 @@ impl AgentManager {
         // replace keeps the id canonical, swapping only the exact id we failed to
         // load.
         if let Some(expected_old) = stored_id {
-            let acp_session_id = self
+            let opened = self
                 .services
                 .recreate_acp_session(conn.as_ref(), agent_id, &expected_old, cwd, Vec::new())
                 .await?;
             self.recreated.lock().unwrap().insert(agent_id.clone());
-            return Ok(acp_session_id);
+            self.maybe_bypass_permissions(
+                conn.as_ref(),
+                provider,
+                &opened.session_id,
+                opened.modes.as_ref(),
+            )
+            .await;
+            return Ok(opened.session_id);
         }
 
         // 3) Brand-new agent → open and persist the first session (write-once).
-        self.services
+        let opened = self
+            .services
             .open_acp_session(conn.as_ref(), agent_id, cwd, Vec::new())
-            .await
+            .await?;
+        self.maybe_bypass_permissions(
+            conn.as_ref(),
+            provider,
+            &opened.session_id,
+            opened.modes.as_ref(),
+        )
+        .await;
+        Ok(opened.session_id)
+    }
+
+    /// Under the shipped `AllowAll` policy, best-effort ask the provider to run
+    /// in a permissive mode via `session/set_mode` (parity with the TS
+    /// acp-provider). The mode id is picked by
+    /// [`try_bypass_permissions_mode`] from the modes the provider actually
+    /// advertised in `session/new` / `session/load`, so agents that don't
+    /// offer a bypass-equivalent (auggie today) are left alone rather than
+    /// triggering a `-32602`; every other policy is a no-op so Interactive /
+    /// `AutoByRisk` / `DenyAll` decisions stay authoritative.
+    async fn maybe_bypass_permissions(
+        &self,
+        conn: &Connection,
+        provider: &ProviderConfig,
+        acp_session_id: &str,
+        modes: Option<&SessionModeState>,
+    ) {
+        if self.policy != PermissionPolicy::AllowAll {
+            return;
+        }
+        try_bypass_permissions_mode(conn, provider, acp_session_id, modes).await;
     }
 
     /// Take (clear) the recreate flag for `agent_id`: `true` when the agent's ACP
@@ -890,6 +1149,47 @@ impl AgentManager {
     fn take_recreated(&self, agent_id: &AgentId) -> bool {
         self.recreated.lock().unwrap().remove(agent_id)
     }
+    /// Compute the fire-once workspace-naming instruction for the outbound
+    /// prompt, or `None` when it should be omitted. Ported from the reference
+    /// `agent-backend-handler.service.ts` (`namingInstructions` block):
+    ///
+    /// * Fires only on the agent's **first** turn — detected by the absence of
+    ///   any prior `assistant` message in the persisted transcript.
+    /// * Fires only when the workspace lookup succeeds AND the current title
+    ///   is empty/whitespace OR still shaped like an auto-generated slug
+    ///   ([`intent_core::slug::is_workspace_slug`]).
+    /// * Names the concrete daemon tool the agent must call
+    ///   (`set_workspace_title_workspace-mcp`), not the FE `workspace_api`
+    ///   JS surface (which daemon-spawned agents do not have).
+    ///
+    /// The agent-rename half of the reference block is intentionally SKIPPED:
+    /// the daemon currently exposes no `set_agent_name` tool. Restore that
+    /// branch once such a tool exists.
+    async fn build_workspace_naming_instruction(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Option<String> {
+        let messages = self
+            .services
+            .store
+            .get_agent_messages(agent_id, None)
+            .await
+            .ok()?;
+        if messages.iter().any(|m| m.role == "assistant") {
+            return None;
+        }
+        let workspace = self.services.store.get_workspace(workspace_id).await.ok()?;
+        let title = workspace.title.trim();
+        let needs_rename = title.is_empty() || is_workspace_slug(title);
+        if !needs_rename {
+            return None;
+        }
+        Some(
+            "<system>\nThis workspace needs a title. As your first action, call the `set_workspace_title_workspace-mcp` tool with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering.\n</system>"
+                .to_string(),
+        )
+    }
 
     /// Build the prompt blocks for an agent's next turn. Normally just the user
     /// `content`; but when the ACP session was recreated (the resume-impossible
@@ -897,7 +1197,18 @@ impl AgentManager {
     /// the fresh session has context, then clear the flag (parity: TS
     /// `sessionWasRecreated` → `formatHistoryAsXml`). The just-persisted current
     /// user message is excluded from the rendered history.
-    async fn build_turn_prompt(&self, agent_id: &AgentId, content: &str) -> Vec<ContentBlock> {
+    ///
+    /// When `options.stdin_context` is set the prompt is prefixed with a
+    /// `Context:\n<stdin>\n\n---\n\n` block, reference-parity with
+    /// `acp-provider.ts`; other [`TurnOptions`] fields are reserved for
+    /// downstream note-image / context-reference resolution.
+    async fn build_turn_prompt(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        content: &str,
+        options: &TurnOptions,
+    ) -> Vec<ContentBlock> {
         // Role reminder is rebuilt every turn (interval = 1, port of
         // acp-provider.ts) and prepended to the outbound prompt for specialist
         // agents; absent for non-specialist agents. Because it fires every turn
@@ -908,7 +1219,83 @@ impl AgentManager {
             Some(r) => format!("{r}\n\n{body}"),
             None => body,
         };
-        text_prompt(&prompt_text)
+        // Fire-once workspace-naming instruction (port of
+        // `agent-backend-handler.service.ts` `namingInstructions`): on the
+        // first turn of an agent in a still-untitled / slug-titled workspace,
+        // prepend a `<system>` block asking the agent to set the workspace
+        // title as its first action. Never mutates the persisted user
+        // message; agent-rename half is deferred until the daemon exposes a
+        // `set_agent_name` tool.
+        let naming = self
+            .build_workspace_naming_instruction(agent_id, workspace_id)
+            .await;
+        let prompt_text = match naming {
+            Some(sys) => format!("{sys}\n\n{prompt_text}"),
+            None => prompt_text,
+        };
+        // `stdinContext` is prepended verbatim as a `Context:` block; the
+        // trailing separator matches the reference `acp-provider.ts` so
+        // downstream consumers see the same shape whether the prompt
+        // originates from the daemon or the legacy Electron main path.
+        // When `stdinContext` is absent/empty we synthesise one from
+        // `contextReferences` (port of the FE reference builder in
+        // `agent-backend-handler.service.ts`); an explicit `stdinContext`
+        // always wins.
+        let synthesised = match options.stdin_context.as_deref() {
+            Some(ctx) if !ctx.is_empty() => None,
+            _ => build_stdin_context_from_context_references(options.context_references.as_ref()),
+        };
+        let prompt_text = match options.stdin_context.as_deref() {
+            Some(ctx) if !ctx.is_empty() => format!("Context:\n{ctx}\n\n---\n\n{prompt_text}"),
+            _ => match synthesised.as_deref() {
+                Some(ctx) if !ctx.is_empty() => {
+                    format!("Context:\n{ctx}\n\n---\n\n{prompt_text}")
+                }
+                _ => prompt_text,
+            },
+        };
+        let mut blocks = text_prompt(&prompt_text);
+        append_attachment_blocks(&mut blocks, options);
+        // Resolve `noteIds` to `workspace-asset://` image content blocks
+        // (Fidelity B, PROTOCOL §5.5): each note is scanned for markdown
+        // image references whose URL is a workspace-asset in the current
+        // workspace; the referenced bytes are loaded and appended as ACP
+        // `image` content blocks. A single system text block is added when
+        // any images are resolved so the agent knows they are inlined for
+        // direct viewing (parity with the FE notice).
+        if let Some(ids_json) = options.note_ids.as_ref() {
+            let ids: Vec<String> = ids_json
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !ids.is_empty() {
+                let images = self
+                    .services
+                    .load_note_image_blocks(workspace_id, &ids)
+                    .await;
+                if !images.is_empty() {
+                    for (data, mime) in &images {
+                        if let Ok(img) = serde_json::from_value::<ContentBlock>(json!({
+                            "type": "image",
+                            "data": data,
+                            "mimeType": mime,
+                        })) {
+                            blocks.push(img);
+                        }
+                    }
+                    let notice = format!(
+                        "[System: {n} image(s) from the referenced note(s) are attached to this message.]",
+                        n = images.len(),
+                    );
+                    blocks.extend(text_prompt(&notice));
+                }
+            }
+        }
+        blocks
     }
 
     /// Build the user-turn body: normally just `content`, but when the ACP
@@ -1130,7 +1517,7 @@ impl AgentManager {
         if let Err(e) = self
             .services
             .store
-            .set_agent_session_status(agent_id, status, is_active, &ts)
+            .set_agent_session_status(workspace_id, agent_id, status, is_active, &ts)
             .await
         {
             // Sessions are persisted before the runtime path opens (see
@@ -1182,9 +1569,15 @@ impl AgentManager {
         workspace_id: WorkspaceId,
         content: String,
         message_id: Option<String>,
+        options: TurnOptions,
     ) -> Result<Value> {
         if !self.try_begin(&agent_id, &workspace_id).await {
-            let (queued, position) = self.services.enqueue_message(&agent_id, content, None);
+            let (queued, position) = self.services.enqueue_message(
+                &agent_id,
+                content,
+                options.image_blocks.clone(),
+                options.file_blocks.clone(),
+            );
             let result = json!({
                 "success": true,
                 "queued": true,
@@ -1198,7 +1591,13 @@ impl AgentManager {
         if self
             .services
             .store
-            .append_agent_message(&agent_id, "user", &blocks, &now_iso())
+            .append_agent_message_with_metadata(
+                &agent_id,
+                "user",
+                &blocks,
+                options.message_metadata.as_ref(),
+                &now_iso(),
+            )
             .await
             .is_err()
         {
@@ -1207,7 +1606,12 @@ impl AgentManager {
             // the slot we just released will be reclaimed below if the queue is
             // ready and the agent is otherwise free.
             self.end_turn(&agent_id).await;
-            let (queued, position) = self.services.enqueue_message(&agent_id, content, None);
+            let (queued, position) = self.services.enqueue_message(
+                &agent_id,
+                content,
+                options.image_blocks.clone(),
+                options.file_blocks.clone(),
+            );
             let result = json!({
                 "success": true,
                 "queued": true,
@@ -1217,7 +1621,7 @@ impl AgentManager {
             self.clone().try_drain_queue(agent_id, workspace_id).await;
             return Ok(result);
         }
-        self.spawn_worker(agent_id, workspace_id, content);
+        self.spawn_worker(agent_id, workspace_id, content, options);
         Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
     }
 
@@ -1259,7 +1663,15 @@ impl AgentManager {
             )
             .await;
         persist_user(&self, &agent_id, &next.content).await;
-        self.spawn_worker(agent_id, workspace_id, next.content);
+        // Queue-drained turns carry no per-turn prompt hints of their own,
+        // but the FE-supplied attachments captured at enqueue time do ride
+        // along so the drained turn receives the same image + file blocks.
+        let options = TurnOptions {
+            image_blocks: next.image_blocks.clone(),
+            file_blocks: next.file_blocks.clone(),
+            ..TurnOptions::default()
+        };
+        self.spawn_worker(agent_id, workspace_id, next.content, options);
     }
 
     /// `agent.forceMessage` runtime path (§5.5): stop the current stream (abort
@@ -1271,6 +1683,7 @@ impl AgentManager {
         workspace_id: WorkspaceId,
         message_id: String,
         content: String,
+        options: TurnOptions,
     ) -> Result<Value> {
         self.stop(&agent_id).await;
         if self.services.clear_queue(&agent_id) {
@@ -1281,11 +1694,94 @@ impl AgentManager {
         let blocks = user_text_blocks(&content);
         self.services
             .store
-            .append_agent_message(&agent_id, "user", &blocks, &now_iso())
+            .append_agent_message_with_metadata(
+                &agent_id,
+                "user",
+                &blocks,
+                options.message_metadata.as_ref(),
+                &now_iso(),
+            )
             .await?;
         self.try_begin(&agent_id, &workspace_id).await;
-        self.spawn_worker(agent_id, workspace_id, content);
+        self.spawn_worker(agent_id, workspace_id, content, options);
         Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+    }
+
+    /// `agent.sendMessage` with `priority: "interrupt"` (§5.5): preempt the
+    /// in-flight turn instead of queueing behind it, then deliver `content`
+    /// immediately as a fresh turn on the SAME live session. The preemption is
+    /// the keep-alive [`AgentManager::interrupt`] (`session/cancel` + worker
+    /// abort) — unlike [`AgentManager::force_message`], the child process is
+    /// never killed and the pending queue is preserved, so the interrupted
+    /// agent keeps processing (the queue drains after the interrupt turn). An
+    /// idle agent falls through to the normal [`AgentManager::send_message`]
+    /// path unchanged.
+    ///
+    /// Two crash timings from the reference app are guarded here:
+    /// - **Duplicate delivery.** The SAME interrupt (same client-supplied
+    ///   `messageId`) delivered twice in quick succession preempts exactly
+    ///   once: the id is recorded under [`AgentManager::interrupt_ids`] BEFORE
+    ///   preempting, so the duplicate returns an idempotent
+    ///   `{ success, queued: false, messageId, deduplicated: true }` ack
+    ///   without cancelling the interrupt turn it raced and without
+    ///   re-persisting the message. Dedup requires a stable `messageId`; a
+    ///   distinct id is a genuinely new interrupt and preempts normally.
+    /// - **Turn startup.** When the busy slot is claimed but there is no
+    ///   cancellable turn yet (child handle / `acpSessionId` not live — the
+    ///   spawn/`session/new` window), [`AgentManager::interrupt`] would fall
+    ///   back to the hard `stop` kill. Preemption is skipped instead and the
+    ///   message queues keep-alive behind the starting turn (`queued: true`),
+    ///   draining right after it — the agent is never killed.
+    pub async fn interrupt_send_message(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        content: String,
+        message_id: Option<String>,
+        options: TurnOptions,
+    ) -> Result<Value> {
+        // Duplicate-delivery guard: check-and-record is atomic under the lock,
+        // so of two racing duplicates exactly one proceeds to preempt.
+        if let Some(mid) = message_id.as_deref() {
+            let mut ids = self.interrupt_ids.lock().unwrap();
+            if ids.get(&agent_id).map(String::as_str) == Some(mid) {
+                return Ok(json!({
+                    "success": true,
+                    "queued": false,
+                    "messageId": mid,
+                    "deduplicated": true,
+                }));
+            }
+            ids.insert(agent_id.clone(), mid.to_string());
+        }
+        if self.is_busy(&agent_id) {
+            // Preempt only when a cancellable turn is live (handle +
+            // `acpSessionId`); during turn startup the keep-alive interrupt
+            // would fall back to the `stop` kill path, so skip it and let
+            // `send_message` queue behind the starting turn instead.
+            let cancellable = self.contains(&agent_id)
+                && self
+                    .services
+                    .store
+                    .get_agent_session(&agent_id)
+                    .await
+                    .ok()
+                    .and_then(|s| s.acp_session_id)
+                    .is_some();
+            if cancellable {
+                // Keep-alive: cancels the turn over the wire, aborts the
+                // draining worker, releases the in-flight slot, and emits the
+                // terminal `agent:stream:end` — the child + ACP session stay
+                // alive.
+                self.interrupt(&agent_id).await;
+            }
+        }
+        // The slot was just released (or was never held): the send path claims
+        // it and streams the interrupt message right away rather than queueing.
+        // If a concurrent send wins the race the message queues instead — it is
+        // still delivered by that worker's drain loop, never dropped.
+        self.send_message(agent_id, workspace_id, content, message_id, options)
+            .await
     }
 
     /// Spawn (and track) the background turn worker for an agent. The caller must
@@ -1295,11 +1791,12 @@ impl AgentManager {
         agent_id: AgentId,
         workspace_id: WorkspaceId,
         content: String,
+        options: TurnOptions,
     ) {
         let mgr = self.clone();
         let id = agent_id.clone();
         let handle = tokio::spawn(async move {
-            run_message_worker(mgr, id, workspace_id, content).await;
+            run_message_worker(mgr, id, workspace_id, content, options).await;
         });
         self.workers.lock().unwrap().insert(agent_id, handle);
     }
@@ -1434,6 +1931,138 @@ fn text_prompt(content: &str) -> Vec<ContentBlock> {
     serde_json::from_value(json!([{ "type": "text", "text": content }])).unwrap_or_default()
 }
 
+/// Port of the FE `contextReferences` → `stdinContext` builder
+/// (`agent-backend-handler.service.ts` — the ~3170–3248 block). Iterates the
+/// raw JSON array in order and emits one context entry per reference,
+/// joined by `\n\n`. Only entries the reference supports today are
+/// materialised: type-specific labels for `selection` / `task` /
+/// `code_chunk` / `file` (with content) / `linear-issue` / `github-issue` /
+/// `sentry-issue` / `terminal`, a `Note: <id>` line for `note`, a bare
+/// `File: <path>` line for a file reference whose content was not inlined
+/// on the wire (the FE variant would try to read from disk here — that
+/// on-disk fallback is deferred), and a fall-through that emits the raw
+/// content when no `type` matches. Returns `None` when nothing produces a
+/// non-empty entry so the caller can leave the prompt untouched.
+fn build_stdin_context_from_context_references(refs: Option<&Value>) -> Option<String> {
+    let arr = refs?.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for r in arr {
+        let obj = match r.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        // Content resolution mirrors the FE: `content` → `selectedText` →
+        // `taskText` → `codeChunk` (first non-empty wins).
+        let content = ["content", "selectedText", "taskText", "codeChunk"]
+            .iter()
+            .find_map(|k| obj.get(*k).and_then(Value::as_str))
+            .filter(|s| !s.is_empty());
+        // Same aliasing rule for the path field.
+        let file_path = obj
+            .get("path")
+            .or_else(|| obj.get("filePath"))
+            .and_then(Value::as_str);
+        let ref_type = obj.get("type").and_then(Value::as_str);
+        if let Some(content) = content {
+            let entry = match ref_type {
+                Some("selection") => format!("Selected text:\n{content}"),
+                Some("task") => format!("Task:\n{content}"),
+                Some("code_chunk") => format!("Code:\n{content}"),
+                Some("file") => match file_path {
+                    Some(p) => format!("File {p}:\n{content}"),
+                    None => content.to_string(),
+                },
+                Some("linear-issue") => format!("Linear Issue:\n{content}"),
+                Some("github-issue") => format!("GitHub Issue:\n{content}"),
+                Some("sentry-issue") => format!("Sentry Issue:\n{content}"),
+                Some("terminal") => {
+                    let meta = obj.get("metadata").and_then(Value::as_object);
+                    let terminal_id = meta
+                        .and_then(|m| m.get("terminalId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let terminal_name = meta
+                        .and_then(|m| m.get("terminalName"))
+                        .and_then(Value::as_str)
+                        .or_else(|| obj.get("title").and_then(Value::as_str))
+                        .unwrap_or("Terminal");
+                    format!("Terminal \"{terminal_name}\" (terminal_id: {terminal_id}):\n{content}")
+                }
+                _ => content.to_string(),
+            };
+            parts.push(entry);
+        } else if ref_type == Some("file") {
+            if let Some(p) = file_path {
+                // Reference builds a bare `File: <path>` line when content is
+                // not inlined and disk read is skipped/unavailable.
+                parts.push(format!("File: {p}"));
+            }
+        } else if ref_type == Some("note") {
+            let note_id = obj.get("noteId").and_then(Value::as_str).or_else(|| {
+                obj.get("metadata")
+                    .and_then(Value::as_object)
+                    .and_then(|m| m.get("noteId"))
+                    .and_then(Value::as_str)
+            });
+            if let Some(id) = note_id {
+                parts.push(format!("Note: {id}"));
+            }
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
+/// Append one ACP content block per FE-supplied attachment to `blocks`
+/// (reference-parity `acp-provider.ts`): image entries `{ data, mimeType }`
+/// become `image` content blocks; file entries `{ data, mimeType, fileName }`
+/// become `resource` blocks carrying a `BlobResourceContents` with the file
+/// name lifted into the resource URI (`file:///<fileName>`). Malformed entries
+/// (missing required fields, wrong types) are silently skipped so a partial
+/// attachment array can never break the turn.
+fn append_attachment_blocks(blocks: &mut Vec<ContentBlock>, options: &TurnOptions) {
+    if let Some(imgs) = options.image_blocks.as_ref().and_then(Value::as_array) {
+        for img in imgs {
+            let data = img.get("data").and_then(Value::as_str);
+            let mime = img.get("mimeType").and_then(Value::as_str);
+            if let (Some(data), Some(mime)) = (data, mime) {
+                if let Ok(block) = serde_json::from_value::<ContentBlock>(json!({
+                    "type": "image",
+                    "data": data,
+                    "mimeType": mime,
+                })) {
+                    blocks.push(block);
+                }
+            }
+        }
+    }
+    if let Some(files) = options.file_blocks.as_ref().and_then(Value::as_array) {
+        for file in files {
+            let data = file.get("data").and_then(Value::as_str);
+            let mime = file.get("mimeType").and_then(Value::as_str);
+            let name = file.get("fileName").and_then(Value::as_str);
+            if let (Some(data), Some(mime), Some(name)) = (data, mime, name) {
+                if let Ok(block) = serde_json::from_value::<ContentBlock>(json!({
+                    "type": "resource",
+                    "resource": {
+                        "blob": data,
+                        "mimeType": mime,
+                        "uri": format!("file:///{name}"),
+                    },
+                })) {
+                    blocks.push(block);
+                }
+            }
+        }
+    }
+}
+
 /// Resolved spawn inputs for an agent: the provider config plus the owned model,
 /// cwd, and extra env the borrowing [`SpawnOptions`] reference during a spawn.
 struct ResolvedSpawn {
@@ -1556,12 +2185,21 @@ async fn run_message_worker(
     agent_id: AgentId,
     workspace_id: WorkspaceId,
     initial_content: String,
+    initial_options: TurnOptions,
 ) {
     let mut content = initial_content;
+    // Only the first turn carries the caller's per-turn prompt-assembly hints
+    // (`stdinContext` / `noteIds` / `contextReferences`) — a `QueuedMessage`
+    // has none. Attachment blocks (`imageBlocks` / `fileBlocks`) are captured
+    // at enqueue time and DO ride along on drain, so a queued turn reaches the
+    // agent with the same ACP content blocks as if it had run inline.
+    let mut options = initial_options;
     'outer: loop {
         match mgr.ensure_started(&agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
-                let prompt = mgr.build_turn_prompt(&agent_id, &content).await;
+                let prompt = mgr
+                    .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
+                    .await;
                 if let Err(e) = mgr
                     .run_turn(&agent_id, &workspace_id, &acp_session_id, prompt)
                     .await
@@ -1582,8 +2220,15 @@ async fn run_message_worker(
                     mgr.services.queue_snapshot(&agent_id),
                 )
                 .await;
+            let next_image_blocks = next.image_blocks.clone();
+            let next_file_blocks = next.file_blocks.clone();
             persist_user(&mgr, &agent_id, &next.content).await;
             content = next.content;
+            options = TurnOptions {
+                image_blocks: next_image_blocks,
+                file_blocks: next_file_blocks,
+                ..TurnOptions::default()
+            };
             continue;
         }
         // Queue drained: release the slot, then re-check for a message that
@@ -1603,8 +2248,15 @@ async fn run_message_worker(
                     mgr.services.queue_snapshot(&agent_id),
                 )
                 .await;
+            let next_image_blocks = next.image_blocks.clone();
+            let next_file_blocks = next.file_blocks.clone();
             persist_user(&mgr, &agent_id, &next.content).await;
             content = next.content;
+            options = TurnOptions {
+                image_blocks: next_image_blocks,
+                file_blocks: next_file_blocks,
+                ..TurnOptions::default()
+            };
             continue 'outer;
         }
         // A concurrent send won the slot; hand the message back to it and
@@ -1719,6 +2371,14 @@ mod role_reminder_tests {
             stats: None,
             task_note_id: None,
             skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
             created_at: ts.clone(),
             updated_at: ts,
         }
@@ -1769,7 +2429,14 @@ mod role_reminder_tests {
         let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
         // Interval = 1 → every turn carries the prefix.
         for _ in 0..2 {
-            let prompt = mgr.build_turn_prompt(&agent_id, "do the thing").await;
+            let prompt = mgr
+                .build_turn_prompt(
+                    &agent_id,
+                    &WorkspaceId::from("ws-role"),
+                    "do the thing",
+                    &TurnOptions::default(),
+                )
+                .await;
             let text = prompt_text(&prompt);
             assert!(
                 text.starts_with("[Role Reminder: You are a Implementor. Stay in scope.]\n\n"),
@@ -1788,7 +2455,14 @@ mod role_reminder_tests {
         let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
         // Flag the agent's session as recreated; the reminder must still prepend.
         mgr.recreated.lock().unwrap().insert(agent_id.clone());
-        let prompt = mgr.build_turn_prompt(&agent_id, "resume work").await;
+        let prompt = mgr
+            .build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-role"),
+                "resume work",
+                &TurnOptions::default(),
+            )
+            .await;
         let text = prompt_text(&prompt);
         assert!(
             text.starts_with("[Role Reminder: You are a Implementor. Stay in scope.]\n\n"),
@@ -1801,7 +2475,75 @@ mod role_reminder_tests {
     #[tokio::test]
     async fn no_injection_without_specialist() {
         let (mgr, agent_id) = manager_with(None, None).await;
-        let prompt = mgr.build_turn_prompt(&agent_id, "plain message").await;
+        let prompt = mgr
+            .build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-role"),
+                "plain message",
+                &TurnOptions::default(),
+            )
+            .await;
         assert_eq!(prompt_text(&prompt), "plain message");
+    }
+
+    #[tokio::test]
+    async fn stdin_context_is_prepended_as_context_block() {
+        // Reference-parity `acp-provider.ts` §5.5: `stdinContext` is prepended
+        // to the outbound prompt as `Context:\n<ctx>\n\n---\n\n<body>` before
+        // any role reminder. Applies to both plain and specialist agents.
+        let (mgr, agent_id) = manager_with(None, None).await;
+        let opts = TurnOptions {
+            stdin_context: Some("hello ctx".to_string()),
+            ..TurnOptions::default()
+        };
+        let prompt = mgr
+            .build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-role"),
+                "user says hi",
+                &opts,
+            )
+            .await;
+        let text = prompt_text(&prompt);
+        assert_eq!(text, "Context:\nhello ctx\n\n---\n\nuser says hi");
+    }
+
+    #[tokio::test]
+    async fn stdin_context_empty_string_is_not_prepended() {
+        // An empty `stdinContext` is treated as absent so we do not emit a
+        // stray `Context:` header with nothing under it.
+        let (mgr, agent_id) = manager_with(None, None).await;
+        let opts = TurnOptions {
+            stdin_context: Some(String::new()),
+            ..TurnOptions::default()
+        };
+        let prompt = mgr
+            .build_turn_prompt(&agent_id, &WorkspaceId::from("ws-role"), "body", &opts)
+            .await;
+        assert_eq!(prompt_text(&prompt), "body");
+    }
+
+    #[tokio::test]
+    async fn stdin_context_precedes_role_reminder() {
+        // Ordering: `Context:` block first, then the role reminder, then the
+        // body — matching the reference `acp-provider.ts` prompt-assembly.
+        let dir = write_specialist(
+            "implementor",
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
+        );
+        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let opts = TurnOptions {
+            stdin_context: Some("ctx".to_string()),
+            ..TurnOptions::default()
+        };
+        let prompt = mgr
+            .build_turn_prompt(&agent_id, &WorkspaceId::from("ws-role"), "do it", &opts)
+            .await;
+        let text = prompt_text(&prompt);
+        assert!(
+            text.starts_with("Context:\nctx\n\n---\n\n[Role Reminder:"),
+            "unexpected ordering: {text:?}"
+        );
+        assert!(text.ends_with("do it"));
     }
 }

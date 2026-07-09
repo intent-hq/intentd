@@ -32,6 +32,31 @@ impl Drop for TempDb {
     }
 }
 
+/// Drop-cleanup wrapper around a per-test workspaces root, paired with the
+/// intent-services hermetic-tests guard (see `default_workspaces_root`). Every
+/// test that constructs a `Services` reachable from workspace provisioning
+/// **must** attach one via `.with_workspaces_root(root.path().to_path_buf())`;
+/// otherwise the guard panics rather than writing under `~/intent/workspaces`.
+struct WorkspacesRoot(PathBuf);
+
+impl WorkspacesRoot {
+    fn new() -> Self {
+        let p = std::env::temp_dir().join(format!("intentd-wss-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).expect("mkdir hermetic workspaces root");
+        Self(p)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for WorkspacesRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn workspace(id: &WorkspaceId) -> Workspace {
     let ts = now_iso();
     Workspace {
@@ -172,6 +197,14 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         stats: None,
         task_note_id: None,
         skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        is_background: false,
+        metadata: None,
         created_at: now_iso(),
         updated_at: now_iso(),
     };
@@ -431,6 +464,62 @@ async fn set_content_reduction_guard_requires_confirmation() {
         .await
         .expect("confirmed");
     assert_eq!(ok.new_content, "x");
+}
+
+/// A5 (CRDT note-merge, PROTOCOL §5.2): two `note.setContent` calls whose new
+/// content each observes the other's write survive in the merged result. The
+/// second write's `oldContent` still points at the persisted state before it
+/// ran, but the CRDT diff against the yrs doc's *current* text preserves the
+/// first write's characters — the FE parity signal that the daemon no longer
+/// last-write-wins on concurrent full-content writes.
+#[tokio::test]
+async fn set_content_merges_concurrent_writes() {
+    let (_tmp, svc, ws, id) = setup("BODY").await;
+
+    // Author A appends a line at the end.
+    let a = svc
+        .set_note_content(ws.clone(), id.clone(), "BODY\nA-line".into(), true, None)
+        .await
+        .expect("A write");
+    assert_eq!(a.new_content, "BODY\nA-line");
+
+    // Author B prepends a line, having read the post-A content as baseline —
+    // the yrs merge stitches both edits together.
+    let b = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "B-line\nBODY\nA-line".into(),
+            true,
+            None,
+        )
+        .await
+        .expect("B write");
+    assert_eq!(b.new_content, "B-line\nBODY\nA-line");
+
+    // A surgical mutation invalidates the CRDT session so the next
+    // `setContent` reseeds from the fresh persisted content.
+    svc.edit_note(
+        ws.clone(),
+        id.clone(),
+        NoteEditInput {
+            old: "A-line".into(),
+            new: "A-line (edited)".into(),
+        },
+    )
+    .await
+    .expect("edit");
+    let c = svc
+        .set_note_content(
+            ws,
+            id,
+            "B-line\nBODY\nA-line (edited)\nC-line".into(),
+            true,
+            None,
+        )
+        .await
+        .expect("C write");
+    assert_eq!(c.new_content, "B-line\nBODY\nA-line (edited)\nC-line");
 }
 
 #[tokio::test]
@@ -911,6 +1000,84 @@ async fn assign_agent_validates_and_starts_task() {
 }
 
 #[tokio::test]
+async fn remove_agent_from_all_tasks_strips_id_only_from_matching_tasks() {
+    use intent_core::{AgentId, TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+    let victim = AgentId::from("agent-victim");
+    let other = AgentId::from("agent-other");
+
+    // Task A: assigned to both `victim` and `other`.
+    let mut a = note(&ws, "task-a", "a");
+    a.task = Some(TaskMetadata {
+        status: TaskStatus::InProgress,
+        assigned_agent_ids: vec![victim.clone(), other.clone()],
+        ..Default::default()
+    });
+    store.insert_note(&a).await.unwrap();
+
+    // Task B: assigned only to `other` (must be left untouched).
+    let mut b = note(&ws, "task-b", "b");
+    b.task = Some(TaskMetadata {
+        status: TaskStatus::NotStarted,
+        assigned_agent_ids: vec![other.clone()],
+        ..Default::default()
+    });
+    store.insert_note(&b).await.unwrap();
+
+    // Task C: assigned only to `victim`.
+    let mut c = note(&ws, "task-c", "c");
+    c.task = Some(TaskMetadata {
+        status: TaskStatus::NotStarted,
+        assigned_agent_ids: vec![victim.clone()],
+        ..Default::default()
+    });
+    store.insert_note(&c).await.unwrap();
+
+    // Non-task note: must be skipped.
+    store
+        .insert_note(&note(&ws, "plain", "not a task"))
+        .await
+        .unwrap();
+
+    let svc = Services::new(store);
+    let r = svc
+        .remove_agent_from_all_tasks(ws.clone(), victim.clone())
+        .await
+        .expect("removeAgentFromAllTasks");
+    assert!(r.ok);
+    assert_eq!(r.updated_count, 2);
+
+    let a = svc
+        .get_note(ws.clone(), NoteId::from("task-a"))
+        .await
+        .unwrap();
+    assert_eq!(a.task.unwrap().assigned_agent_ids, vec![other.clone()]);
+    let b = svc
+        .get_note(ws.clone(), NoteId::from("task-b"))
+        .await
+        .unwrap();
+    assert_eq!(b.task.unwrap().assigned_agent_ids, vec![other]);
+    let c = svc
+        .get_note(ws.clone(), NoteId::from("task-c"))
+        .await
+        .unwrap();
+    assert!(c.task.unwrap().assigned_agent_ids.is_empty());
+
+    // Idempotent: replaying with the now-absent id updates nothing.
+    let r2 = svc
+        .remove_agent_from_all_tasks(ws, victim)
+        .await
+        .expect("removeAgentFromAllTasks-replay");
+    assert!(r2.ok);
+    assert_eq!(r2.updated_count, 0);
+}
+
+#[tokio::test]
 async fn convert_blocks_creates_children_idempotently() {
     let content = "intro\n@@@task\n# Build API\nBuild the thing.\n@@@\ntail";
     let (_tmp, svc, ws, id) = setup(content).await;
@@ -1152,6 +1319,85 @@ async fn comment_resolve_thread_requires_thread_or_comment_id() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Internal(ref m) if m.contains("Either threadId or commentId")));
+}
+
+/// Cross-workspace bare-id probes must not delete a comment that lives in a
+/// different workspace: `comment_delete` scopes its DELETE by `workspace_id`
+/// so a caller declaring workspace B cannot remove a row owned by workspace A
+/// (the store's `set_thread_status` UPDATE is scoped the same way, so
+/// `comment_resolve_thread` becomes a no-op across workspaces).
+#[tokio::test]
+async fn comment_ops_reject_cross_workspace_bare_id_writes() {
+    let (_tmp, svc, ws_a, id_a) = setup("Hello world, this is a test sentence.").await;
+    // Provision a second workspace on the same store/services handle.
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("second workspace");
+
+    let added = svc
+        .comment_add(
+            ws_a.clone(),
+            id_a.clone(),
+            "this is a test sentence".into(),
+            "test".into(),
+            "nice".into(),
+            None,
+            None,
+        )
+        .await
+        .expect("comment.add");
+
+    // Cross-workspace delete with the wrong workspaceId is rejected and the
+    // row survives.
+    let err = svc
+        .comment_delete(ws_b.clone(), id_a.clone(), added.comment_id.clone())
+        .await
+        .expect_err("cross-ws delete must not remove");
+    assert!(matches!(err, Error::Internal(_)), "delete: {err:?}");
+    let thread = svc
+        .comment_get_thread(
+            ws_a.clone(),
+            id_a.clone(),
+            Some(added.comment_id.clone()),
+            None,
+        )
+        .await
+        .expect("thread still readable");
+    assert_eq!(thread.total_comments, 1);
+
+    // Cross-workspace resolve is rejected at the note-scope guard (the note
+    // is not visible to ws_b) so the thread stays open when the owning
+    // workspace re-reads it. Even if a caller bypassed the note guard, the
+    // store's UPDATE is now scoped by workspace_id and would affect zero rows
+    // (covered by the store-level regression tests in `agent_ops::tests`).
+    let err = svc
+        .comment_resolve_thread(
+            ws_b.clone(),
+            id_a.clone(),
+            Some(added.comment_id.clone()),
+            None,
+            true,
+        )
+        .await
+        .expect_err("cross-ws resolve must not observe");
+    assert!(matches!(err, Error::Internal(_)), "resolve: {err:?}");
+    let thread = svc
+        .comment_get_thread(
+            ws_a.clone(),
+            id_a.clone(),
+            Some(added.comment_id.clone()),
+            None,
+        )
+        .await
+        .expect("thread readable");
+    assert_eq!(thread.status, "open");
+
+    // The owner can still delete their own row.
+    svc.comment_delete(ws_a, id_a, added.comment_id)
+        .await
+        .expect("owner delete succeeds");
 }
 
 // ---- event.* query/aggregation methods (M2.4) ----
@@ -1497,11 +1743,12 @@ mod change_event_parity {
     use intent_store::Store;
     use serde_json::{json, Value};
 
-    use super::{note, workspace, TempDb};
+    use super::{note, workspace, TempDb, WorkspacesRoot};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
     struct Harness {
         _tmp: TempDb,
+        _ws_root: WorkspacesRoot,
         store: Store,
         services: Services,
         bus: EventBus,
@@ -1514,9 +1761,13 @@ mod change_event_parity {
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        let ws_root = WorkspacesRoot::new();
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone());
         Harness {
             _tmp: tmp,
+            _ws_root: ws_root,
             store,
             services,
             bus,
@@ -1949,6 +2200,240 @@ mod change_event_parity {
             .await
             .expect("seen again");
         assert_eq!(again.attention, WorkspaceAttention::None);
+    }
+
+    /// `workspace.create` emits `workspace:created` after the row is inserted
+    /// (§6.5), with the self-sufficient `{ workspaceId, workspace }` payload
+    /// (§6.7). The new workspace mints its own id, so subscribe unfiltered.
+    #[tokio::test]
+    async fn workspace_created_payload() {
+        use intent_core::WorkspaceCreate;
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let created = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("New workspace".to_string()),
+                    branch: Some("feat/created-event".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &created.id.0, "workspace:created");
+        assert_eq!(ev["data"]["workspaceId"], created.id.0);
+        assert_eq!(
+            ev["data"]["workspace"],
+            serde_json::to_value(&created).expect("workspace json")
+        );
+    }
+
+    /// Idempotency replay (design note TB-0 §5.3): a second `workspace.create`
+    /// with the same key returns the ORIGINAL workspace without re-executing —
+    /// so no second row, and neither the `workspace:created` nor the seeded
+    /// spec's `note:created` is republished on the replay.
+    #[tokio::test]
+    async fn idempotent_create_workspace_replay_no_second_event() {
+        use intent_core::WorkspaceCreate;
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let key = Some("ws-idem-1".to_string());
+        let first = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("First".to_string()),
+                    branch: Some("feat/idem-a".to_string()),
+                    ..Default::default()
+                },
+                key.clone(),
+            )
+            .await
+            .expect("first create")
+            .workspace;
+        // The first create publishes `workspace:created` and the spec seed's
+        // `note:created`; drain both before checking replay is silent.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &first.id.0, "workspace:created");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &first.id.0, "note:created");
+        assert_eq!(ev["data"]["noteId"], "spec");
+
+        // Replay with the same key but different input still returns the
+        // original workspace (the body is never re-executed).
+        let second = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Second".to_string()),
+                    branch: Some("feat/idem-b".to_string()),
+                    ..Default::default()
+                },
+                key,
+            )
+            .await
+            .expect("replay create")
+            .workspace;
+        assert_eq!(
+            second.id.0, first.id.0,
+            "replay returns the original workspace"
+        );
+
+        // No further events are published (the replay short-circuits the op).
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(none.is_err(), "replay must not publish a second event");
+    }
+
+    /// `workspace.create` seeds the well-known `spec` note (reference parity
+    /// with `notes.service.ts ensureSpecExists`): default Spec — empty
+    /// markdown, `spec` tag, pinned, default, workspace visibility — with a
+    /// v1 version snapshot and a `note:created` event carrying `noteId=spec`.
+    #[tokio::test]
+    async fn workspace_create_seeds_spec_note() {
+        use intent_core::{NoteId, NoteVisibility, WorkspaceCreate};
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let created = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Seeded WS".to_string()),
+                    branch: Some("feat/seed-spec".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        // Persisted spec matches the reference default.
+        let spec = h
+            .store
+            .get_note(&NoteId::from("spec"))
+            .await
+            .expect("spec exists");
+        assert_eq!(spec.workspace_id, created.id);
+        assert_eq!(spec.title, "Spec");
+        assert_eq!(spec.content, "");
+        assert_eq!(spec.tags, vec!["spec".to_string()]);
+        assert!(spec.is_pinned);
+        assert!(spec.is_default);
+        assert!(!spec.is_archived);
+        assert_eq!(spec.visibility, NoteVisibility::Workspace);
+        assert!(spec.task.is_none());
+
+        // Initial version snapshot captured.
+        let versions = h
+            .store
+            .list_note_versions(&NoteId::from("spec"))
+            .await
+            .expect("versions");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].v, 1);
+
+        // `workspace:created` first, then the spec seed's `note:created`.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &created.id.0, "workspace:created");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &created.id.0, "note:created");
+        assert_eq!(ev["data"]["noteId"], "spec");
+        assert_eq!(ev["data"]["title"], "Spec");
+    }
+
+    /// Spec seeding is idempotent inside the create scope: a replay with the
+    /// same `idempotencyKey` short-circuits and does not attempt to reinsert.
+    /// (Cross-workspace collision under the current globally-unique `note.id`
+    /// schema is exercised in `spec_seed_skips_when_owned_by_another_workspace`.)
+    #[tokio::test]
+    async fn workspace_create_spec_seed_replay_no_duplicate() {
+        use intent_core::{NoteId, WorkspaceCreate};
+        let h = harness().await;
+        let key = Some("spec-seed-idem".to_string());
+        let first = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("First".to_string()),
+                    branch: Some("feat/spec-seed-a".to_string()),
+                    ..Default::default()
+                },
+                key.clone(),
+            )
+            .await
+            .expect("first create")
+            .workspace;
+        let _ = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Second".to_string()),
+                    branch: Some("feat/spec-seed-b".to_string()),
+                    ..Default::default()
+                },
+                key,
+            )
+            .await
+            .expect("replay create");
+        let spec = h
+            .store
+            .get_note(&NoteId::from("spec"))
+            .await
+            .expect("spec exists");
+        assert_eq!(spec.workspace_id, first.id);
+        let versions = h
+            .store
+            .list_note_versions(&NoteId::from("spec"))
+            .await
+            .expect("versions");
+        assert_eq!(versions.len(), 1, "replay must not append a second version");
+    }
+
+    /// Under the current schema (`note.id` is globally unique), a second
+    /// workspace's spec seed is skipped with a warning rather than failing
+    /// `workspace.create`. Documents the known limitation exercised by this
+    /// path so a future schema fix has a regression anchor.
+    #[tokio::test]
+    async fn spec_seed_skips_when_owned_by_another_workspace() {
+        use intent_core::{NoteId, WorkspaceCreate};
+        let h = harness().await;
+        let first = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("First".to_string()),
+                    branch: Some("feat/spec-owner-a".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("first create")
+            .workspace;
+        let second = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Second".to_string()),
+                    branch: Some("feat/spec-owner-b".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("second create")
+            .workspace;
+        assert_ne!(second.id, first.id);
+        let spec = h
+            .store
+            .get_note(&NoteId::from("spec"))
+            .await
+            .expect("spec exists");
+        assert_eq!(spec.workspace_id, first.id, "spec stays with first ws");
     }
 }
 
@@ -4357,6 +4842,14 @@ mod search_adapters {
             stats: None,
             task_note_id: None,
             skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
         };
@@ -5169,7 +5662,7 @@ mod script {
         let id = create(&h, "echo", "echo run-once-output", ScriptMode::Command).await;
         let out = h
             .services
-            .script_run(id, None, Some(10))
+            .script_run(h.ws.clone(), id, None, Some(10))
             .await
             .expect("run");
         assert_eq!(out["timedOut"], false);
@@ -5197,7 +5690,10 @@ mod script {
             ScriptMode::Service,
         )
         .await;
-        h.services.script_start(id.clone()).await.expect("start");
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
         drain_until(&mut sub, Duration::from_secs(5), |v| {
             if v["type"] == "script:output" {
                 let bytes = v["data"]["chunk"].as_str().map(decode).unwrap_or_default();
@@ -5210,7 +5706,7 @@ mod script {
 
         let out = h
             .services
-            .script_output(id.clone(), Some(10), None, None)
+            .script_output(h.ws.clone(), id.clone(), Some(10), None, None)
             .await
             .expect("output");
         let text = out
@@ -5225,7 +5721,10 @@ mod script {
             text.contains("OUTPUT-PARITY-MARK"),
             "buffer text included: {text:?}"
         );
-        h.services.script_stop(id).await.expect("stop");
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
     }
 
     /// `script.output` on a script that never produced output returns the bare
@@ -5236,7 +5735,7 @@ mod script {
         let id = create(&h, "idle", "echo never-started", ScriptMode::Command).await;
         let out = h
             .services
-            .script_output(id, None, None, None)
+            .script_output(h.ws.clone(), id, None, None, None)
             .await
             .expect("output");
         assert_eq!(out, Value::String("No output yet.".to_string()));
@@ -5255,7 +5754,10 @@ mod script {
         let h = harness().await;
         let mut sub = subscribe(&h);
         let id = create(&h, "boom", "echo boom", ScriptMode::Service).await;
-        h.services.script_start(id.clone()).await.expect("start");
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
         drain_until(&mut sub, Duration::from_secs(5), |v| {
             (v["type"] == "script:state" && v["data"]["status"] == "exited").then_some(())
         })
@@ -5283,7 +5785,11 @@ mod script {
                 }
             }
         }
-        let st = h.services.script_status(id).await.expect("status");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id)
+            .await
+            .expect("status");
         assert_eq!(st["status"], "exited");
         assert_eq!(st["restartCount"], 0);
     }
@@ -5295,7 +5801,10 @@ mod script {
         let h = harness().await;
         let mut sub = subscribe(&h);
         let id = create(&h, "svc", "sleep 2.1", ScriptMode::Service).await;
-        h.services.script_start(id.clone()).await.expect("start");
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
         drain_until(&mut sub, Duration::from_secs(12), |v| {
             (v["type"] == "script:state"
                 && v["data"]["status"] == "running"
@@ -5303,9 +5812,16 @@ mod script {
                 .then_some(())
         })
         .await;
-        let st = h.services.script_status(id.clone()).await.expect("status");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
         assert_eq!(st["restartCount"], 1);
-        h.services.script_stop(id).await.expect("stop");
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
     }
 
     /// A service whose output prints a local dev-server URL surfaces it on
@@ -5321,7 +5837,10 @@ mod script {
             ScriptMode::Service,
         )
         .await;
-        h.services.script_start(id.clone()).await.expect("start");
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
         let (url, _) = drain_until(&mut sub, Duration::from_secs(5), |v| {
             if v["type"] == "script:state" {
                 v["data"]["detectedUrl"].as_str().map(str::to_string)
@@ -5331,7 +5850,10 @@ mod script {
         })
         .await;
         assert!(url.contains("localhost:3000"), "detected url: {url}");
-        h.services.script_stop(id).await.expect("stop");
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
     }
 
     /// The unified host: a running script's PTY is visible to `terminal.list` and
@@ -5348,7 +5870,10 @@ mod script {
             ScriptMode::Service,
         )
         .await;
-        h.services.script_start(id.clone()).await.expect("start");
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
         // Wait until the marker has streamed (so it is in the PTY scrollback).
         drain_until(&mut sub, Duration::from_secs(5), |v| {
             if v["type"] == "script:output" {
@@ -5382,7 +5907,10 @@ mod script {
             contains(&bytes, b"SCRIPT-PTY-MARK"),
             "terminal reads the running script's PTY output"
         );
-        h.services.script_stop(id).await.expect("stop");
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
     }
 }
 
@@ -5751,7 +6279,8 @@ mod known_repo {
     async fn create_workspace_registers_repo_visible_in_repo_list() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let svc = Services::new(store);
+        let ws_root = WorkspacesRoot::new();
+        let svc = Services::new(store).with_workspaces_root(ws_root.path().to_path_buf());
 
         svc.create_workspace(
             WorkspaceCreate {
@@ -5773,6 +6302,643 @@ mod known_repo {
         assert_eq!(repos[0]["owner"], "cloudlands-ai");
         assert!(repos[0]["addedAt"].is_string());
         assert!(repos[0]["lastUsedAt"].is_string());
+    }
+}
+
+mod worktree_provisioning {
+    use super::*;
+    use intent_core::WorkspaceCreate;
+
+    /// Drop guard removing a temp directory tree.
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_dir(prefix: &str) -> TempDir {
+        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+
+    /// Commit everything in the worktree on the current branch, returning the oid.
+    fn commit_all(repo: &git2::Repository, msg: &str) -> git2::Oid {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .and_then(|o| repo.find_commit(o).ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
+            .unwrap()
+    }
+
+    /// Init a git repo with one commit; returns (guard, head sha, head branch).
+    fn seed_repo(prefix: &str) -> (TempDir, String, String) {
+        let dir = unique_dir(prefix);
+        let repo = git2::Repository::init(&dir.0).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Tester").unwrap();
+            cfg.set_str("user.email", "t@e.dev").unwrap();
+        }
+        std::fs::write(dir.0.join("README.md"), "init\n").unwrap();
+        let sha = commit_all(&repo, "chore: init").to_string();
+        let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+        (dir, sha, branch)
+    }
+
+    /// Regression for "agent spawns in a temp dir": `workspace.create` off a
+    /// local git repo must provision a linked worktree at
+    /// `<root>/<workspaceId>/<repo-slug>` on the workspace branch and record
+    /// the base commit SHA.
+    #[tokio::test]
+    async fn create_provisions_worktree_from_local_repo() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, head_sha, head_branch) = seed_repo("intentd-wtprov-repo");
+        let root = unique_dir("intentd-wtprov-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    repository_name: Some("My Repo".to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let wt = ws.worktree_path.as_deref().expect("worktree path set");
+        assert_eq!(
+            wt,
+            root.0
+                .join(&ws.id.0)
+                .join("my-repo")
+                .to_string_lossy()
+                .as_ref(),
+            "worktree lives at <root>/<workspaceId>/<repo-slug>"
+        );
+        let wt_repo = git2::Repository::open(wt).expect("worktree opens as a git repo");
+        assert!(wt_repo.is_worktree());
+        // Auto-generated branches are friendly `word-word` slugs (never the
+        // raw workspace UUID) and are checked out.
+        assert_slug_branch(&ws.branch);
+        assert_ne!(ws.branch, ws.id.0, "branch must not be the raw UUID");
+        assert_eq!(
+            wt_repo.head().unwrap().shorthand().expect("branch name"),
+            ws.branch.as_str()
+        );
+        assert_eq!(ws.base_commit_sha.as_deref(), Some(head_sha.as_str()));
+    }
+
+    /// Assert a `word-word` slug branch, optionally with a `-N` collision
+    /// suffix (e.g. `auth-fix`, `amber-forest`, `auth-fix-2`).
+    fn assert_slug_branch(branch: &str) {
+        let parts: Vec<&str> = branch.split('-').collect();
+        assert!(
+            (2..=3).contains(&parts.len()),
+            "branch '{branch}' must be word-word(-N)"
+        );
+        for part in &parts[..2] {
+            assert!(
+                (2..=15).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_lowercase()),
+                "branch '{branch}': segment '{part}' must be 2-15 lowercase letters"
+            );
+        }
+        if let Some(suffix) = parts.get(2) {
+            assert!(
+                suffix.bytes().all(|b| b.is_ascii_digit()),
+                "branch '{branch}': trailing segment must be numeric"
+            );
+        }
+    }
+
+    /// The initial-agent prompt seeds the branch slug, the
+    /// `workspace.branchPrefix` setting is prepended, and a second workspace
+    /// with the same prompt gets a `-2` collision suffix.
+    #[tokio::test]
+    async fn create_names_branch_from_prompt_with_prefix_and_suffix() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store
+            .set_setting("workspace.branchPrefix", "\"aw/\"")
+            .await
+            .expect("set prefix");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-wtslug-repo");
+        let root = unique_dir("intentd-wtslug-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let create = |prompt: &str| WorkspaceCreate {
+            repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+            base_ref: Some(head_branch.clone()),
+            initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                prompt: Some(prompt.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let ws = svc
+            .create_workspace(create("fix the auth flow"), None)
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(ws.branch, "aw/auth-fix");
+
+        // Same prompt again: the branch now exists, so a suffix is appended.
+        let ws2 = svc
+            .create_workspace(create("fix the auth flow"), None)
+            .await
+            .expect("create second")
+            .workspace;
+        assert_eq!(ws2.branch, "aw/auth-fix-2");
+    }
+
+    /// An explicit `branch` wins untouched — no slug, prefix, or suffix.
+    #[tokio::test]
+    async fn create_keeps_explicit_branch_untouched() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store
+            .set_setting("workspace.branchPrefix", "\"aw/\"")
+            .await
+            .expect("set prefix");
+        let root = unique_dir("intentd-wtexpl-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    branch: Some("exact/name".to_string()),
+                    skip_worktree: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(ws.branch, "exact/name");
+    }
+
+    /// `baseRef` selects the starting commit, and an explicit `branch` names
+    /// the checked-out branch.
+    #[tokio::test]
+    async fn create_provisions_worktree_at_requested_base_ref() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, first_sha, _) = seed_repo("intentd-wtbase-repo");
+        let repo = git2::Repository::open(&repo_dir.0).unwrap();
+        // Pin `base` at the first commit, then advance HEAD past it.
+        let first = repo
+            .find_commit(git2::Oid::from_str(&first_sha).unwrap())
+            .unwrap();
+        repo.branch("base", &first, false).unwrap();
+        std::fs::write(repo_dir.0.join("b.txt"), "y\n").unwrap();
+        commit_all(&repo, "feat: second");
+        let root = unique_dir("intentd-wtbase-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    branch: Some("my-feature".to_string()),
+                    base_ref: Some("base".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.branch, "my-feature");
+        assert_eq!(ws.base_commit_sha.as_deref(), Some(first_sha.as_str()));
+        let wt_repo =
+            git2::Repository::open(ws.worktree_path.as_deref().unwrap()).expect("worktree");
+        let head = wt_repo.head().unwrap();
+        assert_eq!(head.shorthand().expect("branch name"), "my-feature");
+        assert_eq!(head.target().unwrap().to_string(), first_sha);
+    }
+
+    /// An unresolvable `baseRef` on a valid repo fails creation loudly instead
+    /// of silently persisting a workspace without a checkout.
+    #[tokio::test]
+    async fn create_fails_on_unresolvable_base_ref() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, _) = seed_repo("intentd-wtbad-repo");
+        let root = unique_dir("intentd-wtbad-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some("no-such-ref".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("create must fail");
+        assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    /// `skipWorktree`, non-git `repositoryPath`, and a caller-supplied
+    /// `worktreePath` all skip provisioning (prior row-only behavior).
+    #[tokio::test]
+    async fn create_skips_provisioning_when_opted_out_or_not_a_repo() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, _) = seed_repo("intentd-wtskip-repo");
+        let root = unique_dir("intentd-wtskip-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    skip_worktree: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert!(ws.worktree_path.is_none(), "skipWorktree opts out");
+
+        let plain = unique_dir("intentd-wtskip-plain");
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(plain.0.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert!(ws.worktree_path.is_none(), "non-git path stays row-only");
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    worktree_path: Some("/tmp/custom-wt".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(
+            ws.worktree_path.as_deref(),
+            Some("/tmp/custom-wt"),
+            "caller-supplied worktreePath is respected untouched"
+        );
+    }
+
+    /// `workspace.delete` cleans up the provisioned checkout (TS
+    /// `removeGitWorktree` parity): the worktree directory and its
+    /// `<root>/<workspaceId>` parent are removed, the registration is pruned,
+    /// and the auto-generated workspace branch is deleted from the source repo.
+    #[tokio::test]
+    async fn delete_removes_worktree_and_auto_generated_branch() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-wtdel-repo");
+        let root = unique_dir("intentd-wtdel-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        let wt = PathBuf::from(ws.worktree_path.as_deref().expect("worktree path"));
+        assert!(wt.exists());
+        assert!(
+            store
+                .workspace_branch_auto_generated(&ws.id)
+                .await
+                .expect("flag readable"),
+            "auto-generated branch is recorded as workspace-owned"
+        );
+
+        svc.delete_workspace(ws.id.clone()).await.expect("delete");
+
+        assert!(!wt.exists(), "worktree directory removed");
+        assert!(
+            !root.0.join(&ws.id.0).exists(),
+            "empty <root>/<workspaceId> parent removed"
+        );
+        let repo = git2::Repository::open(&repo_dir.0).unwrap();
+        assert!(
+            repo.find_branch(&ws.branch, git2::BranchType::Local)
+                .is_err(),
+            "auto-generated workspace branch deleted"
+        );
+        assert!(
+            matches!(svc.get_workspace(ws.id).await, Err(Error::NotFound(_))),
+            "workspace row deleted"
+        );
+    }
+
+    /// The branch-deletion guard: a caller-supplied (explicit) branch is never
+    /// deleted on `workspace.delete`, even though the worktree itself is
+    /// cleaned up — mirroring the reference's "pre-existing branch" skip.
+    #[tokio::test]
+    async fn delete_preserves_explicit_branch() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-wtdelex-repo");
+        let root = unique_dir("intentd-wtdelex-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    branch: Some("keep-me".to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        let wt = PathBuf::from(ws.worktree_path.as_deref().expect("worktree path"));
+        assert!(
+            !store
+                .workspace_branch_auto_generated(&ws.id)
+                .await
+                .expect("flag readable"),
+            "explicit branch is not workspace-owned"
+        );
+
+        svc.delete_workspace(ws.id).await.expect("delete");
+
+        assert!(!wt.exists(), "worktree directory still removed");
+        let repo = git2::Repository::open(&repo_dir.0).unwrap();
+        assert!(
+            repo.find_branch("keep-me", git2::BranchType::Local).is_ok(),
+            "explicit branch preserved"
+        );
+    }
+
+    /// A workspace without a provisioned checkout (`skipWorktree`) deletes its
+    /// row without touching the repository.
+    #[tokio::test]
+    async fn delete_without_worktree_only_removes_row() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, _) = seed_repo("intentd-wtdelskip-repo");
+        let root = unique_dir("intentd-wtdelskip-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    skip_worktree: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        let branch = ws.branch.clone();
+        svc.delete_workspace(ws.id.clone()).await.expect("delete");
+        assert!(matches!(
+            svc.get_workspace(ws.id).await,
+            Err(Error::NotFound(_))
+        ));
+        // No checkout was provisioned, so nothing in the repo changed.
+        let repo = git2::Repository::open(&repo_dir.0).unwrap();
+        assert!(repo.find_branch(&branch, git2::BranchType::Local).is_err());
+    }
+
+    /// `workspace.create` derives the workspace id from the initial-agent
+    /// prompt via `extract_local_slug` (TS `generateLocalSlug` parity), so the
+    /// on-disk directory is human-readable (e.g. `auth-fix`) instead of an
+    /// opaque UUID. A second create with the same prompt collides and yields
+    /// `<slug>-2`, mirroring the branch collision suffix.
+    #[tokio::test]
+    async fn create_derives_slug_id_from_prompt_and_uniquifies() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-idslug-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let make = |prompt: &str| WorkspaceCreate {
+            skip_worktree: Some(true),
+            initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                prompt: Some(prompt.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let first = svc
+            .create_workspace(make("fix the auth flow"), None)
+            .await
+            .expect("first create")
+            .workspace;
+        assert_eq!(first.id.0, "auth-fix");
+
+        let second = svc
+            .create_workspace(make("fix the auth flow"), None)
+            .await
+            .expect("second create")
+            .workspace;
+        assert_eq!(second.id.0, "auth-fix-2");
+    }
+
+    /// When no initial-agent prompt is supplied, `workspace.create` falls back
+    /// to a random adjective-animal slug (never a raw UUID). The resulting id
+    /// must satisfy the FE `word-word` shape (`isValidWorkspaceId`).
+    #[tokio::test]
+    async fn create_falls_back_to_random_slug_id_without_prompt() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-idrand-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    skip_worktree: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let parts: Vec<&str> = ws.id.0.split('-').collect();
+        assert_eq!(parts.len(), 2, "id '{}' must be word-word", ws.id.0);
+        for part in &parts {
+            assert!(
+                (2..=15).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_lowercase()),
+                "id '{}': segment '{}' must be 2-15 lowercase letters",
+                ws.id.0,
+                part
+            );
+        }
+    }
+
+    /// `workspace.create` also writes the legacy
+    /// `<root>/<id>/.workspace/workspace.json` metadata file so renderer paths
+    /// (FE `FileSystemWorkspaceRepository.findById`) find it without ENOENT.
+    /// The file matches the FE `WorkspaceSchema`: id/title/branch/status plus
+    /// the empty `changesets`/`timeline`/`conversationInfo` arrays it requires.
+    #[tokio::test]
+    async fn create_writes_workspace_json_metadata_file() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-wsjson-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("My workspace".to_string()),
+                    branch: Some("feat/wsjson".to_string()),
+                    skip_worktree: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let metadata_path = root
+            .0
+            .join(&ws.id.0)
+            .join(".workspace")
+            .join("workspace.json");
+        assert!(
+            metadata_path.exists(),
+            "workspace.json must exist at {}",
+            metadata_path.display()
+        );
+        let contents = std::fs::read_to_string(&metadata_path).expect("read workspace.json");
+        let value: serde_json::Value =
+            serde_json::from_str(&contents).expect("parse workspace.json");
+        assert_eq!(value["id"], ws.id.0);
+        assert_eq!(value["title"], "My workspace");
+        assert_eq!(value["branch"], "feat/wsjson");
+        assert_eq!(value["status"], "Active");
+        // FE schema requires these three arrays; the daemon does not model
+        // them so `write_workspace_metadata_file` fills empty arrays.
+        assert!(value["changesets"].is_array());
+        assert!(value["timeline"].is_array());
+        assert!(value["conversationInfo"].is_array());
+        assert_eq!(value["changesets"].as_array().unwrap().len(), 0);
+    }
+
+    /// When the caller passes an empty (or missing) title, `workspace.create`
+    /// seeds the workspace title with the derived id (slug) so the FE header
+    /// shows a readable name (e.g. `auth-fix`) immediately instead of
+    /// "Untitled". The FE recognizes this shape via `isWorkspaceSlug()` and
+    /// still prompts the initial agent to rename via `workspace.setTitle`.
+    #[tokio::test]
+    async fn create_seeds_title_from_slug_when_title_omitted() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-titleslug-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    // Onboarding sends `title: ''` today; simulate that.
+                    title: Some(String::new()),
+                    skip_worktree: Some(true),
+                    initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                        prompt: Some("fix the auth flow".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.id.0, "auth-fix");
+        assert_eq!(ws.title, "auth-fix", "title falls back to the derived slug");
+
+        // The metadata file mirrors the seeded title so FE reads see it too.
+        let metadata_path = root
+            .0
+            .join(&ws.id.0)
+            .join(".workspace")
+            .join("workspace.json");
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
+        assert_eq!(value["title"], "auth-fix");
+    }
+
+    /// An explicit non-empty title from the caller wins over the slug
+    /// fallback (the reference-app path still allows explicit titles).
+    #[tokio::test]
+    async fn create_preserves_explicit_title_over_slug_fallback() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-titleexpl-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("My Explicit Title".to_string()),
+                    skip_worktree: Some(true),
+                    initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                        prompt: Some("fix the auth flow".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.title, "My Explicit Title");
     }
 }
 
@@ -6481,6 +7647,14 @@ mod heal_stale_agent_sessions {
             stats: None,
             task_note_id: None,
             skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
             created_at: ts.clone(),
             updated_at: ts,
         }
@@ -6580,5 +7754,471 @@ mod heal_stale_agent_sessions {
             .await
             .expect("heal sweep (idempotent)");
         assert_eq!(healed_again, 0);
+    }
+}
+
+/// Daemon-owned initial-agent orchestration inside `workspace.create`
+/// (PROTOCOL §5.1): agent row + exactly-once prompt delivery inside the
+/// idempotency scope. No `AgentManager` is attached here, so delivery takes
+/// the store-only `agent_send_message_op` fallback (same persist the runtime
+/// path starts from).
+mod initial_agent_orchestration {
+    use std::time::Duration;
+
+    use intent_core::{AgentId, WorkspaceApi, WorkspaceCreate, WorkspaceCreateInitialAgent};
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use super::{TempDb, WorkspacesRoot};
+    use crate::{EventBus, Services, SubscriptionFilter};
+
+    fn create_input(agent: Option<WorkspaceCreateInitialAgent>) -> WorkspaceCreate {
+        WorkspaceCreate {
+            title: Some("WS".to_string()),
+            branch: Some("feat/initial-agent".to_string()),
+            initial_agent: agent,
+            ..Default::default()
+        }
+    }
+
+    /// Drain published events (unfiltered subscription) until the bus goes
+    /// quiet, flattening batches into one ordered list of event types.
+    async fn drain_event_types(sub: &mut crate::Subscription) -> Vec<String> {
+        let mut types = Vec::new();
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        {
+            for ev in batch {
+                types.push(ev.event_type);
+            }
+        }
+        types
+    }
+
+    #[tokio::test]
+    async fn creates_agent_and_delivers_prompt_once() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let ws_root = WorkspacesRoot::new();
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let requested = format!("agent-{}", uuid::Uuid::new_v4());
+        let res = services
+            .create_workspace(
+                create_input(Some(WorkspaceCreateInitialAgent {
+                    agent_id: Some(requested.clone()),
+                    prompt: Some("fix the auth flow".to_string()),
+                    name: Some("Auth fixer".to_string()),
+                    model: Some("opus".to_string()),
+                    specialist: Some("implementor".to_string()),
+                    ..Default::default()
+                })),
+                None,
+            )
+            .await
+            .expect("create");
+
+        // Result carries the AgentLite (client-supplied agentId honored).
+        let agent = res.initial_agent.expect("initialAgent in result");
+        assert_eq!(agent["id"], Value::from(requested.as_str()));
+        assert_eq!(agent["name"], "Auth fixer");
+
+        // Session row: parentless, non-background, specialist/model persisted,
+        // prompt kept as `initialMessage` (resume source).
+        let session = store
+            .get_agent_session(&AgentId::from(requested.as_str()))
+            .await
+            .expect("session");
+        assert_eq!(session.workspace_id, res.workspace.id);
+        assert!(session.parent_agent_id.is_none());
+        assert!(!session.is_background);
+        assert_eq!(session.specialist.as_deref(), Some("implementor"));
+        assert_eq!(session.model.as_deref(), Some("opus"));
+        assert_eq!(
+            session.initial_message.as_deref(),
+            Some("fix the auth flow")
+        );
+
+        // Exactly one persisted message: the user prompt.
+        let messages = store
+            .get_agent_messages(&AgentId::from(requested.as_str()), None)
+            .await
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "exactly one delivered prompt");
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(
+            messages[0].content,
+            json!([{ "type": "text", "text": "fix the auth flow" }])
+        );
+
+        // workspace:created precedes agent:created.
+        let types = drain_event_types(&mut sub).await;
+        let ws_pos = types.iter().position(|t| t == "workspace:created");
+        let agent_pos = types.iter().position(|t| t == "agent:created");
+        assert!(ws_pos.is_some(), "workspace:created published: {types:?}");
+        assert!(agent_pos.is_some(), "agent:created published: {types:?}");
+        assert!(ws_pos < agent_pos, "workspace:created first: {types:?}");
+    }
+
+    /// Idempotency replay: the stored result is returned without re-running
+    /// the op — no duplicate agent row and no second prompt delivery.
+    #[tokio::test]
+    async fn idempotent_replay_no_duplicate_agent_or_message() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let services =
+            Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+        let key = Some("ws-agent-idem-1".to_string());
+
+        let input = || {
+            create_input(Some(WorkspaceCreateInitialAgent {
+                prompt: Some("fix the auth flow".to_string()),
+                ..Default::default()
+            }))
+        };
+        let first = services
+            .create_workspace(input(), key.clone())
+            .await
+            .expect("first create");
+        let agent_id = first.initial_agent.as_ref().unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let second = services
+            .create_workspace(input(), key)
+            .await
+            .expect("replay create");
+        assert_eq!(second.workspace.id, first.workspace.id);
+        assert_eq!(
+            second.initial_agent.as_ref().unwrap()["id"]
+                .as_str()
+                .unwrap(),
+            agent_id,
+            "replay returns the original agent"
+        );
+
+        let sessions = store
+            .list_agent_sessions(&first.workspace.id)
+            .await
+            .expect("sessions");
+        assert_eq!(sessions.len(), 1, "no duplicate agent row");
+        let messages = store
+            .get_agent_messages(&AgentId::from(agent_id.as_str()), None)
+            .await
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "no second prompt delivery");
+    }
+
+    /// No (or blank) prompt → no agent: the result has no `initialAgent` and
+    /// no session row is created.
+    #[tokio::test]
+    async fn no_prompt_no_agent() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let services =
+            Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+
+        for prompt in [None, Some("   ".to_string())] {
+            let res = services
+                .create_workspace(
+                    create_input(Some(WorkspaceCreateInitialAgent {
+                        prompt,
+                        name: Some("Never created".to_string()),
+                        ..Default::default()
+                    })),
+                    None,
+                )
+                .await
+                .expect("create");
+            assert!(res.initial_agent.is_none(), "no agent in result");
+            let sessions = store
+                .list_agent_sessions(&res.workspace.id)
+                .await
+                .expect("sessions");
+            assert!(sessions.is_empty(), "no session row created");
+        }
+    }
+}
+
+/// Daemon-owned clone orchestration inside `workspace.create` (PROTOCOL §5.1):
+/// when `githubUrl` is set and no local repo is provided, the daemon clones
+/// first, sets `repositoryPath` from the clone target, derives owner/name
+/// from the URL, and streams `git:clone:*` under the new workspace id.
+/// Failures fail the whole create pre-insert.
+mod clone_orchestration {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use intent_core::{WorkspaceApi, WorkspaceCreate};
+    use intent_store::Store;
+
+    use super::TempDb;
+    use crate::{EventBus, Services, SubscriptionFilter};
+
+    /// Drop guard removing a temp directory tree.
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_dir(prefix: &str) -> TempDir {
+        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+
+    /// Init a small git repo with one commit; returns the guard.
+    fn seed_repo(prefix: &str) -> TempDir {
+        let dir = unique_dir(prefix);
+        let repo = git2::Repository::init(&dir.0).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Tester").unwrap();
+            cfg.set_str("user.email", "t@e.dev").unwrap();
+        }
+        std::fs::write(dir.0.join("README.md"), "init\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
+            .unwrap();
+        dir
+    }
+
+    async fn drain_event_types(sub: &mut crate::Subscription) -> Vec<String> {
+        let mut types = Vec::new();
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        {
+            for ev in batch {
+                types.push(ev.event_type);
+            }
+        }
+        types
+    }
+
+    /// `githubUrl` → daemon clones via `file://` (fast, hermetic), sets
+    /// `repositoryPath` to the clone target, and streams `git:clone:progress`
+    /// + `git:clone:done` under the new workspace id before the row insert
+    /// and `workspace:created`. Owner/name derivation from a real GitHub URL
+    /// is covered by `clone_ops::tests::parse_owner_repo_handles_https_and_ssh`.
+    #[tokio::test]
+    async fn create_clones_github_url_before_worktree() {
+        let source = seed_repo("intentd-clone-src");
+        let root = unique_dir("intentd-clone-root");
+        let clone_target = unique_dir("intentd-clone-target");
+        let clone_dir: PathBuf = clone_target.0.join("checkout");
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let res = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Cloned WS".to_string()),
+                    branch: Some("feat/clone-orch".to_string()),
+                    github_url: Some(url),
+                    clone_path: Some(clone_dir.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create");
+        let ws = res.workspace;
+        assert_eq!(
+            ws.repository_path.as_deref(),
+            Some(clone_dir.to_string_lossy().as_ref()),
+            "repositoryPath set from clone target"
+        );
+        assert!(clone_dir.join(".git").exists(), "clone actually happened");
+
+        // The clone streamed progress + a terminal ok done before the row
+        // insert and `workspace:created`.
+        let types = drain_event_types(&mut sub).await;
+        let starting_pos = types.iter().position(|t| t == "git:clone:progress");
+        let done_pos = types.iter().position(|t| t == "git:clone:done");
+        let ws_pos = types.iter().position(|t| t == "workspace:created");
+        assert!(
+            starting_pos.is_some(),
+            "git:clone:progress observed: {types:?}"
+        );
+        assert!(done_pos.is_some(), "git:clone:done observed: {types:?}");
+        assert!(
+            done_pos < ws_pos,
+            "clone completes before workspace insert: {types:?}"
+        );
+    }
+
+    /// A clone that cannot succeed (unreachable target under `file://`) fails
+    /// the whole `workspace.create` — no workspace row is persisted.
+    #[tokio::test]
+    async fn clone_failure_fails_create_no_row_persisted() {
+        let root = unique_dir("intentd-clone-fail-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let missing = format!("/does/not/exist/{}.git", uuid::Uuid::new_v4());
+        let target = unique_dir("intentd-clone-fail-target");
+        let clone_dir: PathBuf = target.0.join("checkout");
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Nope".to_string()),
+                    branch: Some("feat/clone-fail".to_string()),
+                    github_url: Some(format!("file://{missing}")),
+                    clone_path: Some(clone_dir.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("create must fail on clone failure");
+        assert!(
+            format!("{err}").contains("clone"),
+            "error mentions clone: {err}"
+        );
+        let list = store.list_workspaces(true).await.expect("list");
+        assert!(list.is_empty(), "no row persisted on clone failure");
+    }
+
+    /// A `githubUrl` alongside an existing local `repositoryPath` (a real git
+    /// repo on disk) is a no-op for clone: the daemon uses the local repo as
+    /// the workspace's `repositoryPath` and does not re-clone.
+    #[tokio::test]
+    async fn github_url_skipped_when_local_repo_is_present() {
+        let repo = seed_repo("intentd-clone-skip-src");
+        let root = unique_dir("intentd-clone-skip-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let res = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Skip clone".to_string()),
+                    branch: Some("feat/clone-skip".to_string()),
+                    repository_path: Some(repo.0.to_string_lossy().to_string()),
+                    github_url: Some("file:///does-not-matter/owner/name.git".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create");
+        assert_eq!(
+            res.workspace.repository_path.as_deref(),
+            Some(repo.0.to_string_lossy().as_ref()),
+            "existing local repo wins over githubUrl"
+        );
+        let types = drain_event_types(&mut sub).await;
+        assert!(
+            types.iter().all(|t| t != "git:clone:progress"),
+            "no clone attempted: {types:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A6 verifier hooks: surgical mutations schedule line-attribution recompute;
+// composition-root sweeper spawns as an abortable task.
+// ---------------------------------------------------------------------------
+mod line_attribution_hooks {
+    use super::*;
+
+    fn assert_debouncer_scheduled(svc: &Services, ws: &WorkspaceId, id: &NoteId) {
+        let map = svc
+            .line_attribution_debouncers
+            .lock()
+            .expect("debouncer lock");
+        assert!(
+            map.contains_key(&(ws.clone(), id.clone())),
+            "schedule_line_attribution_recompute must register a debounced timer",
+        );
+    }
+
+    #[tokio::test]
+    async fn task_update_status_schedules_recompute() {
+        let (_tmp, svc, ws, id) = setup("- [ ] alpha\n- [ ] beta").await;
+        svc.task_update_status(ws.clone(), id.clone(), "beta".into(), "in-progress".into())
+            .await
+            .expect("updateStatus");
+        assert_debouncer_scheduled(&svc, &ws, &id);
+    }
+
+    #[tokio::test]
+    async fn task_update_schedules_recompute() {
+        let (_tmp, svc, ws, id) = setup("- [ ] alpha").await;
+        svc.task_update(ws.clone(), id.clone(), 1, None, Some("done".into()), None)
+            .await
+            .expect("task.update");
+        assert_debouncer_scheduled(&svc, &ws, &id);
+    }
+
+    #[tokio::test]
+    async fn convert_task_blocks_schedules_recompute() {
+        let content = "intro\n@@@task\n# Build API\nBuild the thing.\n@@@\ntail";
+        let (_tmp, svc, ws, id) = setup(content).await;
+        svc.convert_task_blocks(ws.clone(), id.clone())
+            .await
+            .expect("convertBlocks");
+        assert_debouncer_scheduled(&svc, &ws, &id);
+    }
+
+    #[tokio::test]
+    async fn comment_add_schedules_recompute() {
+        let (_tmp, svc, ws, id) = setup("Hello world, this is a test sentence.").await;
+        svc.comment_add(
+            ws.clone(),
+            id.clone(),
+            "this is a test sentence".into(),
+            "test".into(),
+            "nice".into(),
+            None,
+            None,
+        )
+        .await
+        .expect("comment.add");
+        assert_debouncer_scheduled(&svc, &ws, &id);
+    }
+
+    #[tokio::test]
+    async fn spawn_crdt_session_sweep_loop_returns_abortable_handle() {
+        let (_tmp, svc, _ws, _id) = setup("").await;
+        let handle = svc.spawn_crdt_session_sweep_loop();
+        assert!(!handle.is_finished(), "sweep loop should stay running");
+        handle.abort();
+        let joined = handle.await;
+        assert!(
+            matches!(&joined, Err(e) if e.is_cancelled()),
+            "aborted sweep loop must join with a cancellation error: {joined:?}",
+        );
     }
 }

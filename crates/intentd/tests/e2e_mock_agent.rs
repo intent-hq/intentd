@@ -84,7 +84,11 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
     let db = std::env::temp_dir().join(format!("intentd-e2e-{}.db", uuid::Uuid::new_v4()));
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone()).with_event_bus(bus.clone());
+    let services = Services::new(store.clone())
+        .with_workspaces_root(
+            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+        )
+        .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
     store

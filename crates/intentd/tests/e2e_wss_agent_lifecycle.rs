@@ -66,11 +66,15 @@ fn temp_data_dir() -> PathBuf {
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
         .arg("--listen")
         .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     for (k, v) in env {
@@ -759,6 +763,615 @@ async fn agent_stop_keep_alive_resume_over_wss() {
     );
 }
 
+/// Interrupt-priority delivery (PROTOCOL §5.5): `agent.sendMessage` with
+/// `priority: "interrupt"` preempts a mid-turn agent instead of queueing —
+/// the current turn is cancelled keep-alive (terminal `agent:stream:end`,
+/// child NEVER killed) and the message streams immediately as a fresh turn on
+/// the SAME session (mock reports `turn=2`; a killed/restarted child would
+/// report `turn=1`). A follow-up interrupt-priority send to the then-idle
+/// agent falls through to the plain send path (`turn=3`), proving the agent
+/// keeps processing across interrupts without failing or restarting.
+#[tokio::test]
+async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
+    let Some(script) = gate("WSS interrupt-priority sendMessage E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // First turn streams a chunk and parks at session/cancel.
+    let mut saw_block_chunk = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+            && frame["params"]["event"]["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streaming-before-cancel")
+        {
+            saw_block_chunk = true;
+            break;
+        }
+    }
+    assert!(saw_block_chunk, "first turn streamed a chunk and parked");
+
+    // Interrupt-priority send while mid-turn: NOT queued — the response shape
+    // is the immediate-stream `{ success, queued: false, messageId }` (a
+    // normal-priority send here would return `queued: true`).
+    let interrupted = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": "urgent interrupt",
+            "priority": "interrupt",
+        }),
+    )
+    .await;
+    assert_eq!(interrupted["success"], true, "interrupt ok: {interrupted}");
+    assert_eq!(
+        interrupted["queued"], false,
+        "interrupt priority streams immediately, never queues: {interrupted}"
+    );
+    assert!(
+        interrupted["messageId"].is_string(),
+        "immediate delivery carries a messageId: {interrupted}"
+    );
+
+    // Preemption ordering: terminal stream:end for the cancelled first turn →
+    // the interrupt message streams `turn=2` on the SAME child → its own end.
+    let mut saw_preempt_end = false;
+    let mut saw_interrupt_chunk = false;
+    let mut saw_interrupt_end = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:stream:end") if !saw_preempt_end => {
+                assert_eq!(
+                    frame["params"]["event"]["data"]["agentId"]
+                        .as_str()
+                        .unwrap_or_default(),
+                    agent_id,
+                    "terminal stream:end carries the agent id"
+                );
+                saw_preempt_end = true;
+            }
+            Some("agent:stream:chunk") => {
+                if frame["params"]["event"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("turn=2")
+                {
+                    assert!(
+                        saw_preempt_end,
+                        "the interrupt turn starts only after the preempted turn's stream:end"
+                    );
+                    saw_interrupt_chunk = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                saw_interrupt_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_preempt_end,
+        "preemption emitted the terminal stream:end"
+    );
+    assert!(
+        saw_interrupt_chunk,
+        "interrupt message ran on the SAME process (mock reported turn=2, not a turn=1 respawn)"
+    );
+    assert!(
+        saw_interrupt_end,
+        "interrupt turn emits its own terminal stream:end"
+    );
+
+    // Idle fall-through + liveness: another interrupt-priority send now behaves
+    // like a plain send and the SAME child answers turn=3 — the agent survived
+    // both interrupts (never killed, never failed, never restarted).
+    let idle_send = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": "after interrupt",
+            "priority": "interrupt",
+        }),
+    )
+    .await;
+    assert_eq!(idle_send["success"], true, "idle interrupt ok: {idle_send}");
+    assert_eq!(
+        idle_send["queued"], false,
+        "idle interrupt streams: {idle_send}"
+    );
+
+    let mut saw_third_chunk = false;
+    let mut saw_third_end = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:stream:chunk") => {
+                if frame["params"]["event"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("turn=3")
+                {
+                    saw_third_chunk = true;
+                }
+            }
+            Some("agent:stream:end") if saw_third_chunk => {
+                saw_third_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_third_chunk,
+        "post-interrupt send still reaches the SAME live child (turn=3)"
+    );
+    assert!(saw_third_end, "post-interrupt turn completes cleanly");
+}
+
+/// Interrupt-priority `agent.sendToTask` (PROTOCOL §5.5): a message addressed
+/// to the task note's assignee with `priority: "interrupt"` preempts the
+/// assignee's mid-turn stream keep-alive and delivers immediately — the same
+/// never-kill semantics as `agent.sendMessage`, resolved through the task
+/// assignment (`task.markAsTask` + `task.assignAgent`).
+#[tokio::test]
+async fn interrupt_priority_send_to_task_over_wss() {
+    let Some(script) = gate("WSS interrupt-priority sendToTask E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Make the seeded note a task and assign the agent to it.
+    let marked = wss_rpc(
+        &mut rpc,
+        11,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+    let assigned = wss_rpc(
+        &mut rpc,
+        12,
+        "task.assignAgent",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(assigned["ok"], true, "assignAgent ok: {assigned}");
+
+    // Park the assignee mid-turn.
+    let sent = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let mut saw_block_chunk = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+            && frame["params"]["event"]["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streaming-before-cancel")
+        {
+            saw_block_chunk = true;
+            break;
+        }
+    }
+    assert!(saw_block_chunk, "assignee streamed a chunk and parked");
+
+    // Interrupt via the task note: resolves the assignee and preempts its turn.
+    let result = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendToTask",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": note_id,
+            "message": "interrupt via task",
+            "priority": "interrupt",
+        }),
+    )
+    .await;
+    assert_eq!(result["ok"], true, "sendToTask ok: {result}");
+    assert_eq!(
+        result["agentId"].as_str().unwrap_or_default(),
+        agent_id,
+        "resolved the task assignee"
+    );
+    assert_eq!(
+        result["result"]["queued"], false,
+        "interrupt priority delivered immediately, not queued: {result}"
+    );
+
+    // Same keep-alive preemption as sendMessage: terminal stream:end, then the
+    // interrupt message runs turn=2 on the SAME (never-killed) child.
+    let mut saw_preempt_end = false;
+    let mut saw_interrupt_chunk = false;
+    let mut saw_interrupt_end = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:stream:end") if !saw_preempt_end => saw_preempt_end = true,
+            Some("agent:stream:chunk") => {
+                if frame["params"]["event"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("turn=2")
+                {
+                    saw_interrupt_chunk = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                saw_interrupt_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_preempt_end,
+        "preemption emitted the terminal stream:end"
+    );
+    assert!(
+        saw_interrupt_chunk,
+        "task interrupt ran on the SAME process (turn=2)"
+    );
+    assert!(saw_interrupt_end, "interrupt turn completes cleanly");
+}
+
+/// Duplicate interrupt delivery (PROTOCOL §5.5): the SAME interrupt-priority
+/// message (same `messageId`) delivered twice in quick succession — the exact
+/// race that transitioned agents to `failed` in the reference app — preempts
+/// exactly ONE turn. The duplicate is acknowledged idempotently
+/// (`deduplicated: true`) without cancelling the interrupt turn it raced; the
+/// message is persisted once (not double-persisted); and the agent survives:
+/// the follow-up send runs `turn=3` on the SAME child (a double delivery
+/// would have burned a turn and reported `turn=4`; a killed/restarted child
+/// would report `turn=1`) and `agent.get` never shows an `error` status.
+#[tokio::test]
+async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
+    let Some(script) = gate("WSS duplicate interrupt-priority E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Park the first turn mid-stream.
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let mut saw_block_chunk = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+            && frame["params"]["event"]["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streaming-before-cancel")
+        {
+            saw_block_chunk = true;
+            break;
+        }
+    }
+    assert!(saw_block_chunk, "first turn streamed a chunk and parked");
+
+    // The SAME interrupt delivered twice back-to-back (stable messageId).
+    let dup_payload = json!({
+        "workspaceId": ws_id,
+        "agentId": agent_id,
+        "content": "duplicate interrupt payload",
+        "messageId": "user-msg-dup-e2e",
+        "priority": "interrupt",
+    });
+    let first = wss_rpc(&mut rpc, 12, "agent.sendMessage", dup_payload.clone()).await;
+    assert_eq!(first["success"], true, "first delivery ok: {first}");
+    assert_eq!(
+        first["queued"], false,
+        "first delivery preempts and streams immediately: {first}"
+    );
+    assert_eq!(first["messageId"], "user-msg-dup-e2e");
+
+    let second = wss_rpc(&mut rpc, 13, "agent.sendMessage", dup_payload).await;
+    assert_eq!(
+        second["success"], true,
+        "duplicate is not an error: {second}"
+    );
+    assert_eq!(
+        second["deduplicated"], true,
+        "duplicate is acknowledged idempotently, no second preemption: {second}"
+    );
+    assert_eq!(second["messageId"], "user-msg-dup-e2e");
+
+    // Exactly one preemption: terminal stream:end for the parked turn, then
+    // the interrupt runs turn=2 on the SAME child and completes.
+    let mut saw_preempt_end = false;
+    let mut saw_interrupt_chunk = false;
+    let mut saw_interrupt_end = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:stream:end") if !saw_preempt_end => saw_preempt_end = true,
+            Some("agent:stream:chunk") => {
+                if frame["params"]["event"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("turn=2")
+                {
+                    saw_interrupt_chunk = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                saw_interrupt_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_preempt_end,
+        "the single preemption emitted the terminal stream:end"
+    );
+    assert!(
+        saw_interrupt_chunk,
+        "the interrupt ran once on the SAME process (turn=2)"
+    );
+    assert!(saw_interrupt_end, "the interrupt turn completes cleanly");
+
+    // Not double-persisted: the conversation carries the interrupt content in
+    // exactly ONE user message.
+    let convo = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let dup_count = convo["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|m| {
+            m["role"] == "user"
+                && serde_json::to_string(&m["contentBlocks"])
+                    .unwrap_or_default()
+                    .contains("duplicate interrupt payload")
+        })
+        .count();
+    assert_eq!(
+        dup_count, 1,
+        "duplicate delivery must not double-persist: {convo}"
+    );
+
+    // Liveness + turn accounting: the follow-up send runs turn=3 on the SAME
+    // child. A double-delivered interrupt would have burned an extra turn
+    // (turn=4 here); a killed/restarted child would report turn=1.
+    let after = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "after dup" }),
+    )
+    .await;
+    assert_eq!(after["success"], true, "post-dup send ok: {after}");
+    let mut saw_third_chunk = false;
+    let mut saw_third_end = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:stream:chunk") => {
+                if frame["params"]["event"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("turn=3")
+                {
+                    saw_third_chunk = true;
+                }
+            }
+            Some("agent:stream:end") if saw_third_chunk => {
+                saw_third_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_third_chunk,
+        "exactly one interrupt turn ran — follow-up is turn=3 on the SAME live child"
+    );
+    assert!(saw_third_end, "post-dup turn completes cleanly");
+
+    // The agent never transitioned to a failed status across the duplicate.
+    let got = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_ne!(
+        got["agent"]["status"].as_str().unwrap_or_default(),
+        "error",
+        "the agent never reaches a failed status: {got}"
+    );
+}
+
 /// AUDIT-P1-3: the daemon-owned activity flags (`isResponding`/`isWaitingOnTool`/
 /// `isWaitingForOtherAgents`, PROTOCOL §5.5/§7.1) reflect a genuinely-active
 /// worker over the WSS wire. A `blockUntilCancel` agent parks mid-turn (a live
@@ -1232,7 +1845,9 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
     use intent_store::Store;
     let db_path = data_dir.join("intentd.db");
     let store = Store::open(&db_path).await.expect("open store");
-    let services = Services::new(store.clone());
+    let services = Services::new(store.clone()).with_workspaces_root(
+        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+    );
     let ws = WorkspaceId::new();
     store
         .insert_workspace(&workspace_seed(&ws))
@@ -1529,7 +2144,7 @@ async fn router_read_lifecycle_arms_over_wss() {
         &mut rpc,
         12,
         "script.status",
-        json!({ "scriptId": script_id }),
+        json!({ "workspaceId": ws_id, "scriptId": script_id }),
     )
     .await;
     assert!(status.is_object(), "script.status object: {status}");
@@ -1537,7 +2152,7 @@ async fn router_read_lifecycle_arms_over_wss() {
         &mut rpc,
         13,
         "script.remove",
-        json!({ "scriptId": script_id }),
+        json!({ "workspaceId": ws_id, "scriptId": script_id }),
     )
     .await;
     assert_eq!(removed["ok"], json!(true));
@@ -2451,4 +3066,343 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
         final_q["queue"].as_array().unwrap().is_empty(),
         "queue is empty post-save-drain",
     );
+}
+
+/// Daemon-owned initial-agent orchestration over WSS (PROTOCOL §5.1):
+/// `workspace.create` with an `initialAgent` creates the workspace AND the
+/// agent, delivers the prompt exactly once, and starts the first turn — the
+/// subscriber sees `workspace:created` → `agent:created` → stream frames keyed
+/// to the agent. A replay with the same `idempotencyKey` returns the stored
+/// result without re-sending (still exactly one user message).
+#[tokio::test]
+async fn workspace_create_orchestrates_initial_agent_over_wss() {
+    let Some(script) = gate("WSS workspace.create initial-agent E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let behavior = json!({ "response": "initial agent ran" }).to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — the workspace id is minted by the create, so subscribe
+    // unfiltered across both families BEFORE creating.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:*", "agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // RPC conn — one workspace.create carrying the full initialAgent payload.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let agent_id = format!("agent-{}", Uuid::new_v4());
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "Orchestrated WS",
+            "branch": "feat/initial-agent-e2e",
+            "idempotencyKey": "wss-create-idem-1",
+            "initialAgent": {
+                "agentId": agent_id,
+                "prompt": "build the initial feature",
+                "name": "Initial agent",
+                "model": "mock:default",
+                "specialist": "implementor",
+            },
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"].as_str().expect("workspace id");
+    assert_eq!(
+        created["initialAgent"]["id"], agent_id,
+        "result carries the created agent: {created}"
+    );
+    assert_eq!(created["initialAgent"]["name"], "Initial agent");
+
+    // Event flow: workspace:created for the new id, agent:created for the
+    // initial agent, ≥1 stream chunk keyed to it, exactly one stream:end.
+    let mut saw_ws_created = false;
+    let mut saw_agent_created = false;
+    let mut chunks = 0u32;
+    let mut ends = 0u32;
+    for _ in 0..120 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        match ev["type"].as_str() {
+            Some("workspace:created") => {
+                assert_eq!(ev["data"]["workspaceId"], ws_id, "created for the new ws");
+                assert_eq!(ev["data"]["workspace"]["id"], ws_id);
+                saw_ws_created = true;
+            }
+            Some("agent:created") => {
+                assert!(saw_ws_created, "workspace:created precedes agent:created");
+                assert_eq!(ev["data"]["agentId"], agent_id.as_str());
+                saw_agent_created = true;
+            }
+            Some("agent:stream:chunk") => {
+                assert_eq!(
+                    ev["data"]["agentId"],
+                    agent_id.as_str(),
+                    "chunk scoped to the initial agent: {ev}"
+                );
+                chunks += 1;
+            }
+            Some("agent:stream:end") => {
+                assert_eq!(ev["data"]["agentId"], agent_id.as_str());
+                ends += 1;
+            }
+            _ => {}
+        }
+        if saw_ws_created && saw_agent_created && ends >= 1 {
+            break;
+        }
+    }
+    assert!(saw_ws_created, "workspace:created observed");
+    assert!(saw_agent_created, "agent:created observed");
+    assert!(chunks >= 1, "initial agent streamed ≥1 chunk");
+    assert_eq!(ends, 1, "exactly one terminal stream:end");
+
+    // Spec seed: workspace.create seeded the well-known `spec` note and it is
+    // addressable through the wire (`note.get`) with the reference-parity
+    // defaults (title "Spec", empty body, `spec` tag, pinned + default).
+    let spec = wss_rpc(
+        &mut rpc,
+        14,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": "spec" }),
+    )
+    .await;
+    let note = &spec["note"];
+    assert_eq!(note["id"], "spec", "spec note addressable by id: {spec}");
+    assert_eq!(note["workspaceId"], ws_id);
+    assert_eq!(note["title"], "Spec");
+    assert_eq!(note["content"], "");
+    assert_eq!(note["tags"], json!(["spec"]));
+    assert_eq!(note["isPinned"], true);
+    assert_eq!(note["isDefault"], true);
+
+    // Transcript: exactly ONE user message (the prompt, delivered once) and an
+    // assistant reply — the double-send bug class is structurally impossible.
+    let conv = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let user_count = messages.iter().filter(|m| m["role"] == "user").count();
+    assert_eq!(user_count, 1, "exactly one delivered prompt: {conv}");
+    assert!(
+        messages.iter().any(|m| m["role"] == "user"
+            && serde_json::to_string(&m["contentBlocks"])
+                .unwrap_or_default()
+                .contains("build the initial feature")),
+        "the user message carries the prompt: {conv}"
+    );
+    assert!(
+        messages.iter().any(|m| m["role"] == "assistant"),
+        "initial agent produced an assistant reply: {conv}"
+    );
+
+    // Replay with the same idempotencyKey: the stored result comes back (same
+    // workspace + agent) and no second prompt is delivered.
+    let replay = wss_rpc(
+        &mut rpc,
+        12,
+        "workspace.create",
+        json!({
+            "title": "Different title",
+            "branch": "feat/other-branch",
+            "idempotencyKey": "wss-create-idem-1",
+            "initialAgent": {
+                "prompt": "some other prompt",
+                "model": "mock:default",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(replay["workspace"]["id"], ws_id, "replay returns original");
+    assert_eq!(replay["initialAgent"]["id"], agent_id.as_str());
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let user_count = conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .count();
+    assert_eq!(user_count, 1, "replay delivered no second prompt: {conv}");
+}
+
+/// Init a small local git repo (one commit) and return its on-disk path. Used
+/// by the WSS clone-orchestration e2e as a `file://` source. Skips the test
+/// when `git` is unavailable on `PATH` by returning `None`.
+fn seed_local_repo(prefix: &str) -> Option<PathBuf> {
+    intent_providers::resolve_on_path("git")?;
+    let id = Uuid::new_v4().simple().to_string();
+    let dir = PathBuf::from("/tmp").join(format!("{prefix}-{}", &id[..8]));
+    std::fs::create_dir_all(&dir).ok()?;
+    let run = |args: &[&str]| -> bool {
+        Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .env("GIT_AUTHOR_NAME", "Tester")
+            .env("GIT_AUTHOR_EMAIL", "t@e.dev")
+            .env("GIT_COMMITTER_NAME", "Tester")
+            .env("GIT_COMMITTER_EMAIL", "t@e.dev")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !run(&["init", "--quiet"]) {
+        return None;
+    }
+    std::fs::write(dir.join("README.md"), "init\n").ok()?;
+    if !run(&["add", "README.md"]) || !run(&["commit", "-q", "-m", "chore: init"]) {
+        return None;
+    }
+    Some(dir)
+}
+
+/// `workspace.create { githubUrl }` clones the URL inside the idempotent op
+/// and streams `git:clone:progress` + `git:clone:done` under the new workspace
+/// id before `workspace:created` publishes. The result's `workspace` carries
+/// the clone target as `repositoryPath`.
+#[tokio::test]
+async fn workspace_create_clones_github_url_over_wss() {
+    let Some(source) = seed_local_repo("itd-wss-clone-src") else {
+        eprintln!("skipping WSS clone E2E: git not available");
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let clone_target = data_dir.join("cloned-checkout");
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe unfiltered before creating so the clone
+    // frames land in the buffer.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:*", "git:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "Cloned via WSS",
+            "branch": "feat/wss-clone",
+            "githubUrl": format!("file://{}", source.display()),
+            "clonePath": clone_target.to_string_lossy(),
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"].as_str().expect("workspace id");
+    assert_eq!(
+        created["workspace"]["repositoryPath"],
+        clone_target.to_string_lossy().as_ref(),
+        "repositoryPath set from clone target: {created}"
+    );
+    assert!(
+        clone_target.join(".git").exists(),
+        "checkout materialized at {clone_target:?}"
+    );
+
+    let mut saw_progress = false;
+    let mut saw_done_ok = false;
+    let mut ws_created_after_clone = false;
+    let mut clone_done_first = false;
+    for _ in 0..60 {
+        let frame = wss_event(&mut sub, 15).await;
+        let ev = &frame["params"]["event"];
+        match ev["type"].as_str() {
+            Some("git:clone:progress") => {
+                assert_eq!(ev["workspaceId"], ws_id, "progress scoped to new ws: {ev}");
+                saw_progress = true;
+            }
+            Some("git:clone:done") => {
+                assert_eq!(ev["workspaceId"], ws_id);
+                assert_eq!(ev["data"]["ok"], true, "clone succeeded: {ev}");
+                saw_done_ok = true;
+                clone_done_first = !ws_created_after_clone;
+            }
+            Some("workspace:created") => {
+                assert_eq!(ev["data"]["workspaceId"], ws_id);
+                ws_created_after_clone = true;
+            }
+            _ => {}
+        }
+        if saw_progress && saw_done_ok && ws_created_after_clone {
+            break;
+        }
+    }
+    assert!(saw_progress, "git:clone:progress observed");
+    assert!(saw_done_ok, "git:clone:done ok observed");
+    assert!(
+        clone_done_first,
+        "git:clone:done precedes workspace:created"
+    );
+
+    // Cleanup the seed source (best-effort).
+    let _ = std::fs::remove_dir_all(&source);
 }

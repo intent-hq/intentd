@@ -8,14 +8,16 @@
 //! and auggie CLI parser respectively.
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
-use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_QUEUE_UPDATED};
+use intent_core::events::{
+    AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE, AGENT_QUEUE_UPDATED, AGENT_UPDATED,
+};
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
-    AgentSession, AgentStatus, Error, EventActor, NoteId, Result, SessionStats, WorkspaceApi,
-    WorkspaceId,
+    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput, Error, EventActor,
+    NoteId, Result, SessionStats, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
 };
-
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
 const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
@@ -25,6 +27,11 @@ use crate::agent_subscriptions::CompletionWatch;
 /// `waitMode` value that defers the completion watch into an `after_all`
 /// delegation group (AS-4) rather than registering a standalone oneShot here.
 const WAIT_MODE_AFTER_ALL: &str = "after_all";
+
+/// Marker `metadata.source` written on new agents created by
+/// `agent.wakeOrCreate` (C1d-10a). Mirrors the FE tool's own tag so downstream
+/// consumers (activity feeds, filters) can trace provenance.
+const WAKE_OR_CREATE_SOURCE: &str = "wake_or_create_task_agent";
 use intent_providers::models::PROVIDER_MODEL_TIERS;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -45,6 +52,7 @@ pub(crate) struct QueuedMessage {
     pub id: String,
     pub content: String,
     pub image_blocks: Option<Value>,
+    pub file_blocks: Option<Value>,
     pub queued_at: String,
     pub editing: bool,
 }
@@ -52,10 +60,10 @@ pub(crate) struct QueuedMessage {
 impl QueuedMessage {
     /// The camelCase wire shape for `agent.getQueue` / queue results, matching the
     /// TS `QueuedMessage` and the iOS decoder (`{id, content, queuedAt, position,
-    /// imageBlocks?, editing?}`). `position` is the entry's 0-based index in the
-    /// queue (0 = next to be sent) and is supplied by the caller since it is
-    /// positional. `editing` is only present when `true` (a client that hasn't
-    /// migrated still sees the legacy shape unchanged).
+    /// imageBlocks?, fileBlocks?, editing?}`). `position` is the entry's 0-based
+    /// index in the queue (0 = next to be sent) and is supplied by the caller
+    /// since it is positional. `editing` is only present when `true` (a client
+    /// that hasn't migrated still sees the legacy shape unchanged).
     pub(crate) fn to_value(&self, position: usize) -> Value {
         let mut v = json!({
             "id": self.id,
@@ -65,6 +73,9 @@ impl QueuedMessage {
         });
         if let Some(blocks) = &self.image_blocks {
             v["imageBlocks"] = blocks.clone();
+        }
+        if let Some(blocks) = &self.file_blocks {
+            v["fileBlocks"] = blocks.clone();
         }
         if self.editing {
             v["editing"] = Value::Bool(true);
@@ -296,6 +307,144 @@ pub(crate) async fn fetch_auggie_models() -> Result<Option<Vec<Value>>> {
     Ok(Some(models))
 }
 
+/// How long a successful `models.list` CLI fetch stays fresh (PROTOCOL §5.30),
+/// porting the reference app's 5-minute provider-model cache.
+pub(crate) const MODELS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// The shared `models.list` success-cache slot on [`Services`]: the fetch
+/// instant plus the finalized rows (PROTOCOL §5.30).
+pub(crate) type ModelsCache = Arc<Mutex<Option<(std::time::Instant, Vec<Value>)>>>;
+
+/// Parse `auggie model list --json` output into rich wire `ModelInfo` rows
+/// (PROTOCOL §5.30), porting the TS `parseModelListJson`: expects
+/// `{ models: [...] }`, maps `id` ← `shortName` and `name` ← `displayName`,
+/// and skips rows missing either string. Optional picker metadata
+/// (`description`, `modelGroupPriority`, `costTier`, `badges`, `effortLevels`,
+/// `isDefault`, `priority`) is copied only when present/non-empty. The
+/// transient `isLegacyModel` flag is kept so [`finalize_model_rows`] can
+/// filter it, then stripped from the wire. Returns `None` when the payload is
+/// not the expected JSON shape, so the caller falls back to plain text.
+pub(crate) fn parse_model_list_json(stdout: &str) -> Option<Vec<Value>> {
+    let parsed: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let models = parsed.get("models")?.as_array()?;
+    let mut out = Vec::new();
+    for m in models {
+        let (Some(short), Some(display)) = (
+            m.get("shortName").and_then(Value::as_str),
+            m.get("displayName").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let mut row = json!({ "id": short, "name": display, "provider": "auggie" });
+        if let Some(d) = m.get("description").and_then(Value::as_str) {
+            if !d.is_empty() {
+                row["description"] = Value::String(d.to_string());
+            }
+        }
+        for key in ["modelGroupPriority", "costTier", "priority"] {
+            if let Some(v) = m.get(key).filter(|v| v.is_number()) {
+                row[key] = v.clone();
+            }
+        }
+        for key in ["badges", "effortLevels"] {
+            if let Some(v) = m.get(key).and_then(Value::as_array) {
+                if !v.is_empty() {
+                    row[key] = Value::Array(v.clone());
+                }
+            }
+        }
+        if m.get("isDefault").and_then(Value::as_bool) == Some(true) {
+            row["isDefault"] = Value::Bool(true);
+        }
+        if m.get("isLegacyModel").and_then(Value::as_bool) == Some(true) {
+            row["isLegacyModel"] = Value::Bool(true);
+        }
+        out.push(row);
+    }
+    Some(out)
+}
+
+/// Post-process parsed `models.list` rows (PROTOCOL §5.30), porting the
+/// reference `fetchAuggieModels` tail: drop rows flagged `isLegacyModel`
+/// (stripping the flag from survivors) and sort by `modelGroupPriority`, then
+/// `priority`, then `name` — missing priorities sort last (`999`).
+pub(crate) fn finalize_model_rows(rows: Vec<Value>) -> Vec<Value> {
+    fn priority(row: &Value, key: &str) -> f64 {
+        row.get(key).and_then(Value::as_f64).unwrap_or(999.0)
+    }
+    fn name(row: &Value) -> &str {
+        row.get("name").and_then(Value::as_str).unwrap_or("")
+    }
+    let mut kept: Vec<Value> = rows
+        .into_iter()
+        .filter(|r| r.get("isLegacyModel").and_then(Value::as_bool) != Some(true))
+        .map(|mut r| {
+            if let Some(obj) = r.as_object_mut() {
+                obj.remove("isLegacyModel");
+            }
+            r
+        })
+        .collect();
+    kept.sort_by(|a, b| {
+        priority(a, "modelGroupPriority")
+            .total_cmp(&priority(b, "modelGroupPriority"))
+            .then_with(|| priority(a, "priority").total_cmp(&priority(b, "priority")))
+            .then_with(|| name(a).cmp(name(b)))
+    });
+    kept
+}
+
+/// Best-effort `models.list` dynamic fetch (PROTOCOL §5.30), porting the
+/// reference `fetchAuggieModels`: try `auggie model list --json` for the rich
+/// rows, fall back to the plain-text parser ([`parse_model_list_output`]),
+/// then filter legacy models and sort ([`finalize_model_rows`]). Returns
+/// `None` when the CLI is unavailable or yields nothing parseable, so the
+/// caller can fall back to [`static_models`].
+pub(crate) async fn fetch_auggie_models_rich() -> Option<Vec<Value>> {
+    let mut rows: Option<Vec<Value>> = None;
+    if let Ok(output) = tokio::process::Command::new("auggie")
+        .args(["model", "list", "--json"])
+        .output()
+        .await
+    {
+        rows = parse_model_list_json(&String::from_utf8_lossy(&output.stdout))
+            .filter(|r| !r.is_empty());
+    }
+    if rows.is_none() {
+        let output = tokio::process::Command::new("auggie")
+            .args(["model", "list"])
+            .output()
+            .await
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut parsed = parse_model_list_output(&stdout);
+        if parsed.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            parsed = parse_model_list_output(&stderr);
+        }
+        if !parsed.is_empty() {
+            rows = Some(
+                parsed
+                    .into_iter()
+                    .map(|(value, label, description)| {
+                        let mut m = json!({ "id": value, "name": label, "provider": "auggie" });
+                        if let Some(d) = description {
+                            m["description"] = Value::String(d);
+                        }
+                        m
+                    })
+                    .collect(),
+            );
+        }
+    }
+    let finalized = finalize_model_rows(rows?);
+    if finalized.is_empty() {
+        None
+    } else {
+        Some(finalized)
+    }
+}
+
 /// Parse the JSON emitted by `auggie session stats <sessionId> --json` into a
 /// [`SessionStats`] (PROTOCOL §5.24). Tolerant of the CLI's richer shape:
 /// `creditsUsed` is nullable (absent/non-numeric → `None`, i.e. not yet
@@ -353,6 +502,13 @@ pub(crate) fn new_message_id() -> String {
     format!("user-msg-{}", Uuid::new_v4())
 }
 
+/// Whether a wire `priority` requests interrupt delivery (PROTOCOL §5.5):
+/// `"interrupt"` preempts the in-flight turn keep-alive; anything else (or
+/// absent) is normal queue-vs-stream delivery.
+pub(crate) fn is_interrupt_priority(priority: Option<&str>) -> bool {
+    priority == Some("interrupt")
+}
+
 /// Validate a client-supplied `agent.create` `agentId` (PROTOCOL §5.5): the id
 /// must be the exact `agent-{uuid}` form (`agent-` prefix + a parsable UUID
 /// tail), matching the form the daemon mints. Anything else surfaces as
@@ -374,6 +530,91 @@ pub(crate) fn validate_client_agent_id(id: &str) -> Result<()> {
 /// A single user text content block (the persisted/queued message shape).
 fn user_content_blocks(content: &str) -> Value {
     json!([{ "type": "text", "text": content }])
+}
+
+/// Build the persisted `agent_session.metadata` blob for the create branch of
+/// `agent.wakeOrCreate` (C1d-10a). Starts from any caller-supplied
+/// `create.metadata` object (or `{}`), overlays the FE provenance fields the
+/// tool guarantees (`createdByAgentId`, `delegationDepth`, `taskNoteId`,
+/// `isBackground`, `source`), and folds `create.contextReferences` /
+/// `create.agentType` in when present so a child's `agent.wakeOrCreate` can
+/// read them back without a follow-up round-trip. Caller-supplied fields for
+/// `taskNoteId`/`source`/`delegationDepth`/`createdByAgentId` are honored
+/// verbatim only when the wake input did not supply the corresponding hint.
+fn build_create_metadata(
+    create_opts: &AgentWakeCreateOptions,
+    input: &AgentWakeOrCreateInput,
+    task_note_id: &NoteId,
+    parent_depth: Option<i64>,
+    agent_type: Option<String>,
+) -> Option<Value> {
+    let mut obj = create_opts
+        .metadata
+        .clone()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    if !obj.contains_key("taskNoteId") {
+        obj.insert("taskNoteId".to_string(), json!(task_note_id.0));
+    }
+    if !obj.contains_key("source") {
+        obj.insert("source".to_string(), json!(WAKE_OR_CREATE_SOURCE));
+    }
+    if !obj.contains_key("isBackground") {
+        obj.insert("isBackground".to_string(), json!(true));
+    }
+    let child_depth = parent_depth.map(|d| d + 1).unwrap_or(0);
+    obj.entry("delegationDepth".to_string())
+        .or_insert(json!(child_depth));
+    if let Some(caller) = input.caller_agent_id.as_ref() {
+        obj.entry("createdByAgentId".to_string())
+            .or_insert(json!(caller.0));
+    }
+    if let Some(refs) = create_opts.context_references.as_ref() {
+        obj.entry("contextReferences".to_string())
+            .or_insert(refs.clone());
+    }
+    if let Some(agent_type) = agent_type {
+        obj.entry("agentType".to_string())
+            .or_insert(json!(agent_type));
+    }
+    if let Some(skip) = create_opts.skip_auto_commit {
+        obj.entry("skipAutoCommit".to_string())
+            .or_insert(json!(skip));
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(Value::Object(obj))
+    }
+}
+
+/// Build the `agent.wakeOrCreate` response envelope (C1d-10a). `action` is one
+/// of `message_queued_to_active_agent` / `woke_existing` / `created_new` — the
+/// 3-way discriminator the FE tool exposes. `cleanedUpAgentIds` is omitted
+/// when empty so pre-widening callers that only inspect `ok`/`agentId`/
+/// `created`/`result` stay wire-compatible.
+fn build_wake_response(
+    agent_id: AgentId,
+    agent_name: String,
+    created: bool,
+    action: &str,
+    task_title: String,
+    result: Value,
+    cleaned_up: Vec<AgentId>,
+) -> Value {
+    let mut out = json!({
+        "ok": true,
+        "agentId": agent_id,
+        "agentName": agent_name,
+        "created": created,
+        "action": action,
+        "taskTitle": task_title,
+        "result": result,
+    });
+    if !cleaned_up.is_empty() {
+        out["cleanedUpAgentIds"] = json!(cleaned_up);
+    }
+    out
 }
 
 /// Project an [`AgentSession`] (with its loaded messages) into [`AgentLite`].
@@ -415,9 +656,20 @@ impl Services {
     }
 
     /// `agent.get` (PROTOCOL §5.5). `NotFound` is surfaced to the router which
-    /// maps it to `-32602 "Agent not found"`.
-    pub(crate) async fn agent_get_op(&self, agent_id: AgentId) -> Result<AgentLite> {
+    /// maps it to `-32602 "Agent not found"`. When `workspace_id` is supplied
+    /// the caller's workspace must match the session's; a mismatch surfaces as
+    /// `NotFound` (defense-in-depth against bare-id probes across workspaces).
+    pub(crate) async fn agent_get_op(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<AgentLite> {
         let session = self.store.get_agent_session(&agent_id).await?;
+        if let Some(ws) = workspace_id.as_ref() {
+            if session.workspace_id != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
         Ok(self.project_lite_with_flags(session))
     }
 
@@ -506,9 +758,15 @@ impl Services {
         &self,
         agent_id: AgentId,
         limit: Option<i64>,
+        workspace_id: Option<WorkspaceId>,
         page_token: Option<String>,
     ) -> Result<Value> {
         let session = self.store.get_agent_session(&agent_id).await?;
+        if let Some(ws) = workspace_id.as_ref() {
+            if session.workspace_id != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
         let messages = session.messages;
         let total = messages.len();
         let win = crate::pagination::page_window(total, limit, page_token.as_deref());
@@ -522,6 +780,33 @@ impl Services {
         }))
     }
 
+    /// Publish an `agent:*` session-mutation event (P3-1.2b): every persisted
+    /// session mutation emits an invalidation event so subscribed clients
+    /// re-read the projection instead of relying on a local cache.
+    pub(crate) async fn publish_agent_mutation_event(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        event_type: &str,
+        data: Value,
+    ) {
+        crate::publish_event(
+            &self.event_bus,
+            intent_store::NewEvent {
+                workspace_id: workspace_id.clone(),
+                timestamp: now_iso(),
+                event_type: event_type.to_string(),
+                actor: crate::system_actor(),
+                session_id: Some(agent_id.0.clone()),
+                correlation_id: None,
+                parent_event_id: None,
+                metadata: None,
+                data,
+            },
+        )
+        .await;
+    }
+
     /// `agent.create`: persist a new session; the process spawns lazily on first
     /// turn (PROTOCOL §5.5). `task_note_id`/`skip_auto_commit` are set by
     /// `agent.delegate` so the auto-commit-on-idle subscriber (LNI-1) can
@@ -533,10 +818,16 @@ impl Services {
     /// session" race). Malformed values surface as `-32602`; when `None` a
     /// fresh id is generated (existing behavior).
     ///
-    /// `extra` carries the widened FE-facing spawn hints
-    /// (`provider`/`agentType`/`metadata`/`workspacePath`/`workspaceContext`).
-    /// `provider` lands on the persisted [`AgentSession`]; the rest are accepted
-    /// but currently forwarded no further (persistence deferred per P2-12a).
+    /// `extra` carries the widened FE-facing spawn hints. `provider` lands on
+    /// the persisted [`AgentSession`]; `metadata` is harvested for the
+    /// persistence-gap fields (`delegationDepth`, `initialMessage`,
+    /// `contextReferences`, `imageBlocks`; P3-1.2b — plus `isBackground`,
+    /// G-A1/P3-1.2c) with the top-level `contextReferences`/`imageBlocks`/
+    /// `isBackground` params winning over the `metadata` fallback.
+    /// `agentType`/`workspacePath`/`workspaceContext` remain
+    /// accepted-but-unpersisted (P2-12a audit).
+    ///
+    /// Emits `agent:created` after the insert.
     ///
     /// Returns `{ agent: <AgentLite> }` — the full projection so the FE can
     /// upsert the created session without a follow-up `agent.get` round-trip.
@@ -566,16 +857,39 @@ impl Services {
             }
             None => AgentId(format!("agent-{}", Uuid::new_v4())),
         };
-        // `agent_type`, `metadata`, `workspace_path`, `workspace_context` are
-        // accepted for the widened wire shape but have no session-column home
-        // today; the P2-12a audit records that persistence is deferred.
+        // `metadata` is persisted (C1d-10a, closes the metadata half of the
+        // P2-12a deferral) so `agent.wakeOrCreate` chains can read back the
+        // parent's `delegationDepth`/`createdByAgentId`/`taskNoteId`/
+        // `isBackground`/`source`/`skipAutoCommit` without a follow-up round-trip.
+        // `agent_type`, `workspace_path`, `workspace_context` remain deferred.
         let AgentCreateExtra {
             provider,
             agent_type: _,
-            metadata: _,
+            metadata,
             workspace_path: _,
             workspace_context: _,
+            context_references,
+            image_blocks,
+            is_background,
         } = extra;
+        // Harvest the persistence-gap fields the FE writer kept under
+        // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
+        let meta = metadata.as_ref().and_then(Value::as_object);
+        let meta_get = |key: &str| meta.and_then(|m| m.get(key)).cloned();
+        let delegation_depth = meta_get("delegationDepth").and_then(|v| v.as_i64());
+        let initial_message = meta_get("initialMessage")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.trim().is_empty());
+        let context_references = context_references
+            .or_else(|| meta_get("contextReferences"))
+            .or_else(|| meta_get("contextRefs"))
+            .filter(|v| !v.is_null());
+        let image_blocks = image_blocks
+            .or_else(|| meta_get("imageBlocks"))
+            .filter(|v| !v.is_null());
+        let is_background = is_background
+            .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
         let session = AgentSession {
             id,
             workspace_id,
@@ -594,10 +908,25 @@ impl Services {
             stats: None,
             task_note_id,
             skip_auto_commit,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth,
+            initial_message,
+            context_references,
+            image_blocks,
+            is_background,
+            metadata,
             created_at: now.clone(),
             updated_at: now,
         };
         self.store.insert_agent_session(&session).await?;
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            &session.id,
+            intent_core::events::AGENT_CREATED,
+            json!({ "agentId": session.id.0, "name": session.name }),
+        )
+        .await;
         // Project into `AgentLite` so the wire returns the full agent object
         // (superset of `{ id, name }`). A fresh session has no messages, so the
         // derived counts/last-* fields are `None`/0; runtime activity flags stay
@@ -607,17 +936,39 @@ impl Services {
     }
 
     /// `agent.rename` (PROTOCOL §5.5). A missing agent surfaces as `-32603`
-    /// (matching the TS `renameAgentOnDisk` failure path).
-    pub(crate) async fn agent_rename_op(&self, agent_id: AgentId, name: String) -> Result<Value> {
+    /// (matching the TS `renameAgentOnDisk` failure path). When
+    /// `skip_if_explicitly_set` is `true` and the session's name was already
+    /// explicitly set, the rename is a no-op returning the existing name with
+    /// `skipped: true` (the FE `renameAgent` semantics). An applied rename
+    /// emits `agent:renamed`.
+    pub(crate) async fn agent_rename_op(
+        &self,
+        agent_id: AgentId,
+        name: String,
+        skip_if_explicitly_set: bool,
+    ) -> Result<Value> {
         let mut session = self.load_session_internal(&agent_id).await?;
+        if skip_if_explicitly_set && session.name_explicitly_set {
+            return Ok(json!({ "success": true, "name": session.name, "skipped": true }));
+        }
         session.name = name.clone();
         session.name_explicitly_set = true;
         session.updated_at = now_iso();
-        self.store.update_agent_session(&session).await?;
+        let workspace_id = session.workspace_id.clone();
+        self.store
+            .update_agent_session(&workspace_id, &session)
+            .await?;
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            &agent_id,
+            intent_core::events::AGENT_RENAMED,
+            json!({ "agentId": agent_id.0, "name": name }),
+        )
+        .await;
         Ok(json!({ "success": true, "name": name }))
     }
 
-    /// `agent.setModel` (PROTOCOL §5.5).
+    /// `agent.setModel` (PROTOCOL §5.5). Emits `agent:updated`.
     pub(crate) async fn agent_set_model_op(
         &self,
         agent_id: AgentId,
@@ -626,27 +977,59 @@ impl Services {
         let mut session = self.load_session_internal(&agent_id).await?;
         session.model = Some(model_id.clone());
         session.updated_at = now_iso();
-        self.store.update_agent_session(&session).await?;
+        let workspace_id = session.workspace_id.clone();
+        self.store
+            .update_agent_session(&workspace_id, &session)
+            .await?;
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            &agent_id,
+            intent_core::events::AGENT_UPDATED,
+            json!({ "agentId": agent_id.0, "modelId": model_id }),
+        )
+        .await;
         Ok(json!({ "success": true, "modelId": model_id }))
     }
 
-    /// `agent.delete`: idempotent session delete (PROTOCOL §5.5).
-    pub(crate) async fn agent_delete_op(&self, agent_id: AgentId) -> Result<Value> {
+    /// `agent.delete`: idempotent session delete (PROTOCOL §5.5). When
+    /// `workspace_id` is supplied the caller's workspace must match the
+    /// session's; a mismatch surfaces as `NotFound` (defense-in-depth against
+    /// bare-id probes across workspaces).
+    pub(crate) async fn agent_delete_op(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<Value> {
         // Capture the workspace before deleting so the post-delete agent:deleted
         // emit can be workspace-scoped. If the session is already gone, skip the
-        // emit gracefully rather than failing the idempotent delete.
-        let workspace_id = self
+        // emit gracefully rather than failing the idempotent delete. When the
+        // caller declares a workspace, reject a cross-workspace bare-id probe
+        // by mapping to `NotFound` before touching the store.
+        let session_workspace_id = self
             .store
             .get_agent_session(&agent_id)
             .await
             .ok()
             .map(|s| s.workspace_id);
-        self.store.delete_agent_session(&agent_id).await?;
+        if let (Some(ws), Some(session_ws)) = (workspace_id.as_ref(), session_workspace_id.as_ref())
+        {
+            if session_ws != ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
+        // Route the DELETE through the workspace guard so a stale-caller with the
+        // wrong workspace cannot mutate the row even if the pre-check above races
+        // with a concurrent workspace move.
+        if let Some(session_ws) = session_workspace_id.as_ref() {
+            self.store
+                .delete_agent_session(session_ws, &agent_id)
+                .await?;
+        }
         self.agent_queues
             .lock()
             .expect("agent queue registry poisoned")
             .remove(&agent_id);
-        if let Some(workspace_id) = workspace_id {
+        if let Some(workspace_id) = session_workspace_id {
             crate::publish_event(
                 &self.event_bus,
                 intent_store::NewEvent {
@@ -666,6 +1049,331 @@ impl Services {
         Ok(json!({ "success": true }))
     }
 
+    /// `agent.getSession` (PROTOCOL §5.5). Full [`AgentSession`] projection —
+    /// the superset that `agent.get`/[`AgentLite`] strips (`systemPrompt`,
+    /// `specialist`, persisted metadata block, full `messages` log). Used by
+    /// the FE-side agent-backend-handler retirement (C1d/C1e) so a `loadAgent`
+    /// caller can rehydrate the full session shape from the daemon. Emits no
+    /// events (a pure read). `NotFound` when the session is unknown.
+    pub(crate) async fn agent_get_session_op(&self, agent_id: AgentId) -> Result<AgentSession> {
+        self.store.get_agent_session(&agent_id).await
+    }
+
+    /// `agent.update` (PROTOCOL §5.5). Partial update from a `changes` object —
+    /// only listed fields are touched; omitted fields are preserved. The store
+    /// enforces the write-once (`acpSessionId`) and immutable (`provider`)
+    /// invariants; malformed values in `changes` surface as `InvalidParams`.
+    /// Emits `agent:updated` (or `agent:renamed` when `name` is the only field
+    /// mutated) so subscribed clients invalidate their cached projection.
+    pub(crate) async fn agent_update_op(&self, agent_id: AgentId, changes: Value) -> Result<Value> {
+        let obj = match changes {
+            Value::Object(m) => m,
+            _ => {
+                return Err(Error::InvalidParams(
+                    "agent.update: `changes` must be an object".to_string(),
+                ))
+            }
+        };
+        let mut session = self.store.get_agent_session(&agent_id).await?;
+        let allowed = [
+            "status",
+            "isActive",
+            "acpSessionId",
+            "backendSessionId",
+            "name",
+            "nameExplicitlySet",
+            "model",
+            "provider",
+            "systemPrompt",
+            "specialist",
+            "taskNoteId",
+            "skipAutoCommit",
+            "completionReport",
+            "completionReportTimestamp",
+            "delegationDepth",
+            "initialMessage",
+            "contextReferences",
+            "imageBlocks",
+            "isBackground",
+        ];
+        for key in obj.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(Error::InvalidParams(format!(
+                    "agent.update: unknown field `{key}` in `changes`"
+                )));
+            }
+        }
+        let mut mutated_only_name = obj.contains_key("name");
+        for (key, value) in obj.iter() {
+            if key != "name" {
+                mutated_only_name = false;
+            }
+            match key.as_str() {
+                "status" => {
+                    session.status = serde_json::from_value(value.clone()).map_err(|e| {
+                        Error::InvalidParams(format!("agent.update: invalid status: {e}"))
+                    })?;
+                }
+                "isActive" => {
+                    session.is_active = value.as_bool().ok_or_else(|| {
+                        Error::InvalidParams(
+                            "agent.update: `isActive` must be a boolean".to_string(),
+                        )
+                    })?;
+                }
+                "acpSessionId" => {
+                    session.acp_session_id = update_optional_string(value, "acpSessionId")?;
+                }
+                "backendSessionId" => {
+                    session.backend_session_id = update_optional_string(value, "backendSessionId")?
+                        .map(|s| AgentId::from(s.as_str()));
+                }
+                "name" => {
+                    session.name = value
+                        .as_str()
+                        .ok_or_else(|| {
+                            Error::InvalidParams(
+                                "agent.update: `name` must be a string".to_string(),
+                            )
+                        })?
+                        .to_string();
+                    session.name_explicitly_set = true;
+                }
+                "nameExplicitlySet" => {
+                    session.name_explicitly_set = value.as_bool().ok_or_else(|| {
+                        Error::InvalidParams(
+                            "agent.update: `nameExplicitlySet` must be a boolean".to_string(),
+                        )
+                    })?;
+                }
+                "model" => {
+                    session.model = update_optional_string(value, "model")?;
+                }
+                "provider" => {
+                    session.provider = update_optional_string(value, "provider")?;
+                }
+                "systemPrompt" => {
+                    session.system_prompt = update_optional_string(value, "systemPrompt")?;
+                }
+                "specialist" => {
+                    session.specialist = update_optional_string(value, "specialist")?;
+                }
+                "taskNoteId" => {
+                    session.task_note_id =
+                        update_optional_string(value, "taskNoteId")?.map(NoteId::from);
+                }
+                "skipAutoCommit" => {
+                    session.skip_auto_commit = value.as_bool().ok_or_else(|| {
+                        Error::InvalidParams(
+                            "agent.update: `skipAutoCommit` must be a boolean".to_string(),
+                        )
+                    })?;
+                }
+                "completionReport" => {
+                    session.completion_report = update_optional_string(value, "completionReport")?;
+                }
+                "completionReportTimestamp" => {
+                    session.completion_report_timestamp =
+                        update_optional_string(value, "completionReportTimestamp")?;
+                }
+                "delegationDepth" => {
+                    session.delegation_depth = if value.is_null() {
+                        None
+                    } else {
+                        Some(value.as_i64().ok_or_else(|| {
+                            Error::InvalidParams(
+                                "agent.update: `delegationDepth` must be an integer".to_string(),
+                            )
+                        })?)
+                    };
+                }
+                "initialMessage" => {
+                    session.initial_message = update_optional_string(value, "initialMessage")?;
+                }
+                "contextReferences" => {
+                    session.context_references = if value.is_null() {
+                        None
+                    } else {
+                        Some(value.clone())
+                    };
+                }
+                "imageBlocks" => {
+                    session.image_blocks = if value.is_null() {
+                        None
+                    } else {
+                        Some(value.clone())
+                    };
+                }
+                "isBackground" => {
+                    session.is_background = value.as_bool().ok_or_else(|| {
+                        Error::InvalidParams(
+                            "agent.update: `isBackground` must be a boolean".to_string(),
+                        )
+                    })?;
+                }
+                _ => unreachable!("guarded by allow-list above"),
+            }
+        }
+        session.updated_at = now_iso();
+        let workspace_id = session.workspace_id.clone();
+        self.store
+            .update_agent_session(&workspace_id, &session)
+            .await?;
+        let event_type = if mutated_only_name {
+            intent_core::events::AGENT_RENAMED
+        } else {
+            AGENT_UPDATED
+        };
+        let mut event_data = serde_json::Map::new();
+        event_data.insert("agentId".into(), json!(agent_id.0));
+        for (k, v) in obj.iter() {
+            event_data.insert(k.clone(), v.clone());
+        }
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            &agent_id,
+            event_type,
+            Value::Object(event_data),
+        )
+        .await;
+        let lite = self.project_lite_with_flags(session);
+        Ok(json!({ "success": true, "agent": lite }))
+    }
+
+    /// `agent.appendMessage` (PROTOCOL §5.5). Append a single message to the
+    /// transcript. Rejected with `InvalidParams` when the agent is mid-turn
+    /// (message-log mutation must not race the daemon's streaming writer).
+    /// `metadata` is persisted verbatim on the row. Emits `agent:message`.
+    pub(crate) async fn agent_append_message_op(
+        &self,
+        agent_id: AgentId,
+        role: String,
+        content: Value,
+        metadata: Option<Value>,
+    ) -> Result<Value> {
+        let session = self.store.get_agent_session(&agent_id).await?;
+        if self.agent_is_busy(agent_id.clone()) {
+            return Err(Error::InvalidParams(format!(
+                "agent.appendMessage: session {} is busy — cannot mutate transcript during an active turn",
+                agent_id.0
+            )));
+        }
+        validate_message_role(&role)?;
+        let created_at = now_iso();
+        let message = self
+            .store
+            .append_agent_message_with_metadata(
+                &agent_id,
+                &role,
+                &content,
+                metadata.as_ref(),
+                &created_at,
+            )
+            .await?;
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            &agent_id,
+            AGENT_MESSAGE,
+            json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+        )
+        .await;
+        Ok(json!({ "success": true, "message": message }))
+    }
+
+    /// `agent.replaceMessages` (PROTOCOL §5.5). Atomically swap the transcript
+    /// with `messages`. Rejected with `InvalidParams` when the agent is mid-turn
+    /// (same rationale as [`Services::agent_append_message_op`]). Row ids are
+    /// minted by the store — callers cannot smuggle stale ids across the swap.
+    /// Emits `agent:updated` with `{ replacedCount }`.
+    pub(crate) async fn agent_replace_messages_op(
+        &self,
+        agent_id: AgentId,
+        messages: Value,
+    ) -> Result<Value> {
+        let session = self.store.get_agent_session(&agent_id).await?;
+        if self.agent_is_busy(agent_id.clone()) {
+            return Err(Error::InvalidParams(format!(
+                "agent.replaceMessages: session {} is busy — cannot mutate transcript during an active turn",
+                agent_id.0
+            )));
+        }
+        let raw = messages.as_array().ok_or_else(|| {
+            Error::InvalidParams("agent.replaceMessages: `messages` must be an array".to_string())
+        })?;
+        struct Parsed {
+            role: String,
+            content: Value,
+            metadata: Option<Value>,
+            created_at: String,
+        }
+        let mut parsed: Vec<Parsed> = Vec::with_capacity(raw.len());
+        let fallback_ts = now_iso();
+        for (i, entry) in raw.iter().enumerate() {
+            let obj = entry.as_object().ok_or_else(|| {
+                Error::InvalidParams(format!(
+                    "agent.replaceMessages: `messages[{i}]` must be an object"
+                ))
+            })?;
+            let role = obj
+                .get("role")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Error::InvalidParams(format!(
+                        "agent.replaceMessages: `messages[{i}].role` is required"
+                    ))
+                })?
+                .to_string();
+            validate_message_role(&role)?;
+            let content = obj
+                .get("contentBlocks")
+                .or_else(|| obj.get("content"))
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InvalidParams(format!(
+                        "agent.replaceMessages: `messages[{i}].contentBlocks` is required"
+                    ))
+                })?;
+            let metadata = match obj.get("metadata") {
+                Some(Value::Null) | None => None,
+                Some(v) => Some(v.clone()),
+            };
+            let created_at = match obj.get("timestamp").or_else(|| obj.get("createdAt")) {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Null) | None => fallback_ts.clone(),
+                Some(_) => {
+                    return Err(Error::InvalidParams(format!(
+                        "agent.replaceMessages: `messages[{i}].timestamp` must be a string"
+                    )))
+                }
+            };
+            parsed.push(Parsed {
+                role,
+                content,
+                metadata,
+                created_at,
+            });
+        }
+        let batch: Vec<intent_store::ReplaceMessage<'_>> = parsed
+            .iter()
+            .map(|p| intent_store::ReplaceMessage {
+                role: p.role.as_str(),
+                content: &p.content,
+                metadata: p.metadata.as_ref(),
+                created_at: p.created_at.as_str(),
+            })
+            .collect();
+        let inserted = self.store.replace_agent_messages(&agent_id, &batch).await?;
+        let replaced_count = inserted.len();
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            &agent_id,
+            AGENT_UPDATED,
+            json!({ "agentId": agent_id.0, "replacedCount": replaced_count }),
+        )
+        .await;
+        Ok(json!({ "success": true, "messages": inserted }))
+    }
+
     /// `agent.getModels`: auggie CLI with the static-tier fallback (PROTOCOL §5.5).
     pub(crate) async fn agent_get_models_op(&self) -> Result<Value> {
         let models = match fetch_auggie_models().await? {
@@ -673,6 +1381,36 @@ impl Services {
             None => static_models(),
         };
         Ok(json!({ "models": models }))
+    }
+
+    /// `models.list`: the rich model catalog for FE model pickers (PROTOCOL
+    /// §5.30) — auggie CLI (JSON → plain-text fallback) with a 5-minute
+    /// success cache; degrades to the static tier catalog (`source: "static"`)
+    /// when the CLI is unavailable, so the result is never empty.
+    pub(crate) async fn models_list_op(&self) -> Result<Value> {
+        if let Some(models) = self.cached_models() {
+            return Ok(json!({ "models": models, "source": "auggie" }));
+        }
+        if let Some(models) = fetch_auggie_models_rich().await {
+            self.store_models_cache(models.clone());
+            return Ok(json!({ "models": models, "source": "auggie" }));
+        }
+        Ok(json!({ "models": static_models(), "source": "static" }))
+    }
+
+    /// The cached `models.list` rows when still within [`MODELS_CACHE_TTL`].
+    fn cached_models(&self) -> Option<Vec<Value>> {
+        self.models_cache
+            .lock()
+            .expect("models cache poisoned")
+            .as_ref()
+            .and_then(|(at, rows)| (at.elapsed() < MODELS_CACHE_TTL).then(|| rows.clone()))
+    }
+
+    /// Record a successful `models.list` CLI fetch for [`MODELS_CACHE_TTL`].
+    fn store_models_cache(&self, rows: Vec<Value>) {
+        *self.models_cache.lock().expect("models cache poisoned") =
+            Some((std::time::Instant::now(), rows));
     }
 
     /// `agent.queueMessage` (PROTOCOL §5.5). Enqueues the message, publishes
@@ -685,8 +1423,10 @@ impl Services {
         agent_id: AgentId,
         content: String,
         image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
     ) -> Result<Value> {
-        let (queued, position) = self.enqueue_message(&agent_id, content, image_blocks);
+        let (queued, position) =
+            self.enqueue_message(&agent_id, content, image_blocks, file_blocks);
         let result = json!({ "success": true, "queuedMessage": queued.to_value(position) });
         self.publish_queue_updated(&agent_id).await;
         if let Some(manager) = self.agent_manager() {
@@ -699,8 +1439,21 @@ impl Services {
         Ok(result)
     }
 
-    /// `agent.getQueue` (PROTOCOL §5.5).
-    pub(crate) async fn agent_get_queue_op(&self, agent_id: AgentId) -> Result<Value> {
+    /// `agent.getQueue` (PROTOCOL §5.5). When `workspace_id` is supplied the
+    /// callee verifies the session belongs to that workspace (defense-in-depth
+    /// against a bare `agentId` probe across workspaces); a mismatch surfaces
+    /// as `NotFound`.
+    pub(crate) async fn agent_get_queue_op(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<Value> {
+        if let Some(ws) = workspace_id.as_ref() {
+            let session = self.store.get_agent_session(&agent_id).await?;
+            if session.workspace_id != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
         let queue = self.queue_snapshot(&agent_id);
         Ok(json!({ "success": true, "queue": queue }))
     }
@@ -806,7 +1559,7 @@ impl Services {
         {
             Ok(_) => Ok(json!({ "success": true, "queued": false, "messageId": message_id })),
             Err(_) => {
-                let (queued, position) = self.enqueue_message(&agent_id, content, None);
+                let (queued, position) = self.enqueue_message(&agent_id, content, None, None);
                 let result = json!({
                     "success": true,
                     "queued": true,
@@ -860,8 +1613,17 @@ impl Services {
     /// counts fall back to the transcript and `creditsUsed` stays `null`
     /// (graceful degrade — never panics). A refreshed rollup that differs from
     /// the cached snapshot pushes `agent:session-stats-changed` (§6.5).
-    pub(crate) async fn agent_get_session_stats_op(&self, session_id: AgentId) -> Result<Value> {
+    pub(crate) async fn agent_get_session_stats_op(
+        &self,
+        session_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<Value> {
         let session = self.store.get_agent_session(&session_id).await?;
+        if let Some(ws) = workspace_id.as_ref() {
+            if session.workspace_id != *ws {
+                return Err(Error::NotFound(format!("agent session {session_id}")));
+            }
+        }
         let stats = match fetch_session_stats(&session_id).await {
             Some(cli) => cli,
             None => {
@@ -922,8 +1684,10 @@ impl Services {
     /// (PROTOCOL §5.5). Caller identity comes only from the MCP front door; the
     /// RPC dispatch path passes `None`, so it always surfaces `-32603`. When the
     /// caller has no `parentAgentId` (created directly by a user), this is also
-    /// `-32603`. Otherwise the report is delivered to the parent by reusing the
-    /// send-message path.
+    /// `-32603`. Otherwise the report is persisted on the child session
+    /// (`metadata.completionReport` / `completionReportTimestamp`, the TS
+    /// parity; P3-1.2b) — emitting `agent:updated` — and delivered to the
+    /// parent by reusing the send-message path.
     pub(crate) async fn agent_report_to_parent_op(
         &self,
         _workspace_id: WorkspaceId,
@@ -934,8 +1698,8 @@ impl Services {
             Error::Internal("report_to_parent is only available to delegated agents".to_string())
         };
         let caller = caller_agent_id.ok_or_else(not_delegated)?;
-        let session = self.load_session_internal(&caller).await?;
-        let parent = session.parent_agent_id.ok_or_else(not_delegated)?;
+        let mut session = self.load_session_internal(&caller).await?;
+        let parent = session.parent_agent_id.clone().ok_or_else(not_delegated)?;
         // `report` is declared as a string on the MCP surface; coerce other
         // JSON shapes to their textual form for delivery.
         let report_text = match &report {
@@ -943,11 +1707,23 @@ impl Services {
             other => other.to_string(),
         };
         let report_len = report_text.chars().count() as i64;
-        // NOTE: TS persists a `completionReport` on the child that the parent
-        // reads on completion; here we deliver eagerly via the send-message path
-        // (no completion-subscription/waitMode behavior). The returned shape
-        // mirrors the TS service result: { ok, parentAgentId, reportLength,
-        // savedAt }.
+        // Persist the completion report on the child so `agent.get`/`agent.list`
+        // (and `ws.agent.summary`) can re-serve it after restarts.
+        let saved_at = now_iso();
+        session.completion_report = Some(report_text.clone());
+        session.completion_report_timestamp = Some(saved_at.clone());
+        session.updated_at = saved_at.clone();
+        let workspace_id = session.workspace_id.clone();
+        self.store
+            .update_agent_session(&workspace_id, &session)
+            .await?;
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            &caller,
+            intent_core::events::AGENT_UPDATED,
+            json!({ "agentId": caller.0, "completionReportLength": report_len }),
+        )
+        .await;
         let _ = self
             .agent_send_message_op(parent.clone(), report_text, None)
             .await?;
@@ -955,7 +1731,7 @@ impl Services {
             "ok": true,
             "parentAgentId": parent,
             "reportLength": report_len,
-            "savedAt": now_iso(),
+            "savedAt": saved_at,
         }))
     }
 
@@ -972,6 +1748,70 @@ impl Services {
         // auto-commit-on-idle subscriber (LNI-1) can resolve `Linked-Note-Id:`
         // and honor the opt-out without a reverse lookup on every idle event.
         let session_task_note_id = input.task_note_id.clone().or(input.note_id.clone());
+        // Resolve the child's first message up front so it can be persisted as
+        // `metadata.initialMessage` on the created session (P3-1.2b; the FE
+        // stored it so a wake-up can resume). Source priority mirrors the TS
+        // `DelegateTaskTool`: explicit `agentInstructions`, then `taskText`,
+        // then the linked task note's content (falling back to its title).
+        fn first_nonempty(s: &str) -> Option<String> {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        let mut message = input
+            .agent_instructions
+            .as_deref()
+            .and_then(first_nonempty)
+            .or_else(|| input.task_text.as_deref().and_then(first_nonempty));
+        if message.is_none() {
+            if let Some(note_id) = input.task_note_id.clone().or(input.note_id.clone()) {
+                if let Ok(note) = self.store.get_note(&note_id).await {
+                    message = first_nonempty(&note.content).or_else(|| first_nonempty(&note.title));
+                }
+            }
+        }
+        // Load the delegating parent once: it feeds the child's
+        // `delegationDepth` (parent depth + 1; P3-1.2b), the depth-limit guard
+        // below, and the completion-watch registration.
+        let parent_session = match &parent_agent_id {
+            Some(parent) => self.store.get_agent_session(parent).await.ok(),
+            None => None,
+        };
+        // Depth guard (port of `MAX_DELEGATION_DEPTH` in the reference
+        // `agent-interaction-tools.ts`): a caller already at the max depth
+        // cannot delegate further. Enforced only when a caller is present
+        // (MCP front door); RPC-level creates stay parentless and skip it.
+        if parent_agent_id.is_some() {
+            let parent_depth = parent_session
+                .as_ref()
+                .and_then(|s| s.delegation_depth)
+                .unwrap_or(0);
+            if parent_depth >= MAX_DELEGATION_DEPTH {
+                return Err(Error::InvalidParams(format!(
+                    "Cannot delegate task: maximum delegation depth ({MAX_DELEGATION_DEPTH}) reached. You are at depth {parent_depth}. Please complete this task directly instead of delegating further."
+                )));
+            }
+        }
+        let delegation_depth = parent_agent_id.as_ref().map(|_| {
+            parent_session
+                .as_ref()
+                .and_then(|s| s.delegation_depth)
+                .unwrap_or(0)
+                + 1
+        });
+        let mut extra_metadata = serde_json::Map::new();
+        if let Some(depth) = delegation_depth {
+            extra_metadata.insert("delegationDepth".to_string(), json!(depth));
+        }
+        if let Some(msg) = &message {
+            extra_metadata.insert("initialMessage".to_string(), json!(msg));
+        }
+        // Delegated agents are background agents (the TS `DelegateTaskTool`
+        // always sets `metadata.isBackground: true`; G-A1/P3-1.2c).
+        extra_metadata.insert("isBackground".to_string(), json!(true));
+        let extra = AgentCreateExtra {
+            metadata: (!extra_metadata.is_empty()).then_some(Value::Object(extra_metadata)),
+            ..AgentCreateExtra::default()
+        };
         let created = self
             .agent_create_op(
                 workspace_id.clone(),
@@ -982,7 +1822,7 @@ impl Services {
                 session_task_note_id,
                 input.skip_auto_commit.unwrap_or(false),
                 None,
-                AgentCreateExtra::default(),
+                extra,
             )
             .await?;
         let agent_id = created["agent"]["id"]
@@ -1005,7 +1845,6 @@ impl Services {
         if let Some(parent) = parent_agent_id {
             // Best-effort guard: skip if the parent agent is already deleted
             // (TS `selectIsAgentDeleted`).
-            let parent_session = self.store.get_agent_session(&parent).await.ok();
             let parent_deleted = parent_session
                 .as_ref()
                 .map(|s| s.status == AgentStatus::Deleted)
@@ -1040,39 +1879,28 @@ impl Services {
                 }
             }
         }
-        // Deliver the child's first message and start its turn (PROTOCOL §5.5).
+        // Deliver the child's first message (resolved above, persisted as
+        // `metadata.initialMessage`) and start its turn (PROTOCOL §5.5).
         // Without this the child stays `Pending` and never runs. `wait_mode` is
         // already honored by the completion-watch registration above; the child
-        // turn itself starts unconditionally. Message source priority mirrors the
-        // TS `DelegateTaskTool`: explicit `agentInstructions`, then `taskText`,
-        // then the linked task note's content (falling back to its title).
+        // turn itself starts unconditionally.
         //
         // Delivery routes through the runtime `AgentManager` when attached (the
         // proven `agent.sendMessage` path: persist + spawn the turn worker, which
         // lazily spawns the child and streams `agent:stream:*` keyed by the CHILD
         // `agentId`); read-only/test wiring falls back to the store-only persist.
-        fn first_nonempty(s: &str) -> Option<String> {
-            let trimmed = s.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        }
-        let mut message = input
-            .agent_instructions
-            .as_deref()
-            .and_then(first_nonempty)
-            .or_else(|| input.task_text.as_deref().and_then(first_nonempty));
-        if message.is_none() {
-            if let Some(note_id) = input.task_note_id.or(input.note_id) {
-                if let Ok(note) = self.store.get_note(&note_id).await {
-                    message = first_nonempty(&note.content).or_else(|| first_nonempty(&note.title));
-                }
-            }
-        }
         if let Some(message) = message {
             let child = AgentId::from(agent_id.as_str());
             let send = match self.agent_manager() {
                 Some(manager) => {
                     manager
-                        .send_message(child, workspace_id, message, None)
+                        .send_message(
+                            child,
+                            workspace_id,
+                            message,
+                            None,
+                            crate::agent_manager::TurnOptions::default(),
+                        )
                         .await
                 }
                 None => self.agent_send_message_op(child, message, None).await,
@@ -1543,67 +2371,324 @@ impl Services {
     }
 
     /// `agent.sendToTask`: deliver to the agent assigned to a task note (PROTOCOL §5.5).
+    /// `priority: "interrupt"` preempts the assignee's in-flight turn keep-alive
+    /// (never killing the child) and delivers immediately when the runtime
+    /// manager is attached; other priorities keep the existing delivery.
     pub(crate) async fn agent_send_to_task_op(
         &self,
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
         message: String,
+        priority: Option<String>,
     ) -> Result<Value> {
-        let task = self.get_my_task(workspace_id, task_note_id).await?;
+        let task = self.get_my_task(workspace_id.clone(), task_note_id).await?;
         let Some(agent) = task.assigned_agents.first().cloned() else {
             return Ok(
                 json!({ "ok": false, "delivered": false, "error": "No agent assigned to task" }),
             );
         };
-        let result = self
-            .agent_send_message_op(agent.clone(), message, None)
-            .await?;
+        let result = match self.agent_manager() {
+            Some(manager) if is_interrupt_priority(priority.as_deref()) => {
+                manager
+                    .interrupt_send_message(
+                        agent.clone(),
+                        workspace_id,
+                        message,
+                        None,
+                        crate::agent_manager::TurnOptions::default(),
+                    )
+                    .await?
+            }
+            _ => {
+                self.agent_send_message_op(agent.clone(), message, None)
+                    .await?
+            }
+        };
         Ok(json!({ "ok": true, "agentId": agent, "result": result }))
     }
 
-    /// `agent.wakeOrCreate`: resume the assigned agent or create + assign a new
-    /// one, then deliver the context message (PROTOCOL §5.5).
+    /// `agent.wakeOrCreate` (PROTOCOL §5.5, widened by C1d-10a): resume the
+    /// newest live/resumable agent assigned to the task, or — when none is
+    /// found — create a new one with specialist/model inheritance from the
+    /// most-recent previous session and the FE `WakeOrCreateTaskAgentTool`
+    /// create payload (name, contextReferences, metadata, skipAutoCommit),
+    /// then deliver the context message (optionally tagged with
+    /// `messageMetadata`). Prunes stale assignments (`cleanedUpAgentIds`) and
+    /// enforces `MAX_DELEGATION_DEPTH` when the caller provides
+    /// `callerAgentId`/`delegationDepth`.
     pub(crate) async fn agent_wake_or_create_op(
         &self,
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
         context_message: String,
-        model: Option<String>,
+        input: AgentWakeOrCreateInput,
     ) -> Result<Value> {
+        // B3: delegation-depth guard. `parent_depth` mirrors the FE constant
+        // (`MAX_DELEGATION_DEPTH = 2`, "error if parent >= 2" per the C1d-10
+        // fence report). When neither `callerAgentId` nor `delegationDepth` is
+        // provided the guard is a no-op (backward-compatible with the
+        // pre-widening 3-param callers).
+        let parent_depth = self.resolve_parent_delegation_depth(&input).await?;
+        if let Some(depth) = parent_depth {
+            if depth >= MAX_DELEGATION_DEPTH {
+                return Err(Error::InvalidParams(format!(
+                    "agent.wakeOrCreate: delegation depth {depth} exceeds \
+                     MAX_DELEGATION_DEPTH ({MAX_DELEGATION_DEPTH})"
+                )));
+            }
+        }
+
         let task = self
             .get_my_task(workspace_id.clone(), task_note_id.clone())
             .await?;
-        if let Some(agent) = task.assigned_agents.first().cloned() {
-            let result = self
-                .agent_send_message_op(agent.clone(), context_message, None)
-                .await?;
-            return Ok(json!({ "ok": true, "agentId": agent, "created": false, "result": result }));
+        let task_title = task.title.clone();
+
+        // B1 + B2: iterate assigned_agent_ids newest-first (Vec::push
+        // append-order means newest is the tail). Probe each session:
+        //   * NotFound / Deleted → stale, queue for cleanup.
+        //   * Otherwise → treat as resumable; the newest live session wins.
+        // `inheritance_source` captures the newest **known** previous session
+        // (live or deleted) so the create branch can still inherit
+        // specialist/model when no live agent is available.
+        let mut cleaned_up: Vec<AgentId> = Vec::new();
+        let mut live_session: Option<AgentSession> = None;
+        let mut inheritance_source: Option<AgentSession> = None;
+        for candidate in task.assigned_agents.iter().rev().cloned() {
+            match self.store.get_agent_session(&candidate).await {
+                Ok(session) if session.status != AgentStatus::Deleted => {
+                    if inheritance_source.is_none() {
+                        inheritance_source = Some(session.clone());
+                    }
+                    live_session = Some(session);
+                    break;
+                }
+                Ok(deleted_session) => {
+                    if inheritance_source.is_none() {
+                        inheritance_source = Some(deleted_session);
+                    }
+                    cleaned_up.push(candidate);
+                }
+                Err(Error::NotFound(_)) => cleaned_up.push(candidate),
+                Err(e) => return Err(e),
+            }
         }
+
+        // B7: `messageMetadata` is applied to the delivered context message on
+        // BOTH branches via `deliver_wake_message`.
+        if let Some(session) = live_session {
+            let agent_id = session.id.clone();
+            let agent_name = session.name.clone();
+            let result = self
+                .deliver_wake_message(&agent_id, &context_message, input.message_metadata.as_ref())
+                .await?;
+            self.remove_agent_ids_from_workspace_tasks(&workspace_id, &cleaned_up)
+                .await?;
+            // B8: `action` distinguishes queued-to-active-agent from woke-existing
+            // via the delivery's `queued` flag.
+            let action = if result
+                .get("queued")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "message_queued_to_active_agent"
+            } else {
+                "woke_existing"
+            };
+            return Ok(build_wake_response(
+                agent_id, agent_name, false, action, task_title, result, cleaned_up,
+            ));
+        }
+
+        // Create branch: no live session. Purge stale assignments first so the
+        // subsequent `assign_agent` starts from a clean list, then build the
+        // rich create payload.
+        self.remove_agent_ids_from_workspace_tasks(&workspace_id, &cleaned_up)
+            .await?;
+        let create_opts = input.create.clone().unwrap_or_default();
+
+        // B4: specialist/model inheritance — the previous session's specialist
+        // wins; the wake-level `model` override wins over both the previous
+        // session's model and the `create.model` fallback.
+        let specialist = inheritance_source
+            .as_ref()
+            .and_then(|s| s.specialist.clone())
+            .or(create_opts.specialist.clone());
+        let model = input
+            .model
+            .clone()
+            .or_else(|| inheritance_source.as_ref().and_then(|s| s.model.clone()))
+            .or(create_opts.model.clone());
+        let provider = create_opts.provider.clone();
+        let agent_type = create_opts.agent_type.clone();
+
+        // B5: rich create payload (`name` default `Task: {title}`,
+        // `contextReferences` + provenance metadata folded into the persisted
+        // metadata blob so the daemon-side session read-back retains them).
+        let name = Some(
+            create_opts
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Task: {task_title}")),
+        );
+        // B6: honor `create.skipAutoCommit` from the request; default `false`
+        // preserves the pre-widening behavior.
+        let skip_auto_commit = create_opts.skip_auto_commit.unwrap_or(false);
+        let metadata = build_create_metadata(
+            &create_opts,
+            &input,
+            &task_note_id,
+            parent_depth,
+            agent_type.clone(),
+        );
+        let extra = AgentCreateExtra {
+            provider,
+            agent_type,
+            metadata,
+            workspace_path: None,
+            workspace_context: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: None,
+        };
         let created = self
             .agent_create_op(
                 workspace_id.clone(),
-                None,
+                name,
                 model,
-                None,
+                specialist,
                 None,
                 Some(task_note_id.clone()),
-                false,
+                skip_auto_commit,
                 None,
-                AgentCreateExtra::default(),
+                extra,
             )
             .await?;
-        let agent_id = created["agent"]["id"]
-            .as_str()
+        let agent_lite = &created["agent"];
+        let agent_id_str = agent_lite
+            .get("id")
+            .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let agent_name = agent_lite
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let agent = AgentId::from(agent_id_str.as_str());
         let _ = self
-            .assign_agent(workspace_id, task_note_id, agent_id.clone())
+            .assign_agent(workspace_id, task_note_id, agent_id_str)
             .await;
-        let agent = AgentId::from(agent_id.as_str());
         let result = self
-            .agent_send_message_op(agent.clone(), context_message, None)
+            .deliver_wake_message(&agent, &context_message, input.message_metadata.as_ref())
             .await?;
-        Ok(json!({ "ok": true, "agentId": agent, "created": true, "result": result }))
+        Ok(build_wake_response(
+            agent,
+            agent_name,
+            true,
+            "created_new",
+            task_title,
+            result,
+            cleaned_up,
+        ))
+    }
+
+    /// Resolve the effective **parent** delegation depth for the
+    /// `agent.wakeOrCreate` guard. `delegation_depth` on the wire wins when
+    /// present (the FE surfaces it explicitly). Otherwise, when
+    /// `caller_agent_id` is provided, read the caller's persisted
+    /// `session.metadata.delegationDepth` (default `0`). Missing caller
+    /// context → `None` (no guard).
+    async fn resolve_parent_delegation_depth(
+        &self,
+        input: &AgentWakeOrCreateInput,
+    ) -> Result<Option<i64>> {
+        if let Some(depth) = input.delegation_depth {
+            return Ok(Some(depth));
+        }
+        let Some(caller) = input.caller_agent_id.as_ref() else {
+            return Ok(None);
+        };
+        match self.store.get_agent_session(caller).await {
+            Ok(session) => Ok(Some(
+                session
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("delegationDepth"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+            )),
+            Err(Error::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `agent.wakeOrCreate` context-message delivery (both branches). When
+    /// `message_metadata` is `Some`, it is folded onto the persisted text
+    /// block as `messageMetadata` so subscribers/`agent.getConversation`
+    /// consumers see the FE tag (`{type:'task_wake', source, taskNoteId,
+    /// callerAgentId}`) verbatim; when `None`, the block matches the plain
+    /// `agent.sendMessage` shape. Auto-queue-on-store-failure mirrors
+    /// [`Services::agent_send_message_op`].
+    async fn deliver_wake_message(
+        &self,
+        agent_id: &AgentId,
+        content: &str,
+        message_metadata: Option<&Value>,
+    ) -> Result<Value> {
+        let message_id = new_message_id();
+        let block = match message_metadata {
+            Some(md) => json!({ "type": "text", "text": content, "messageMetadata": md }),
+            None => json!({ "type": "text", "text": content }),
+        };
+        let blocks = json!([block]);
+        match self
+            .store
+            .append_agent_message(agent_id, "user", &blocks, &now_iso())
+            .await
+        {
+            Ok(_) => Ok(json!({ "success": true, "queued": false, "messageId": message_id })),
+            Err(_) => {
+                let (queued, position) =
+                    self.enqueue_message(agent_id, content.to_string(), None, None);
+                let result = json!({
+                    "success": true,
+                    "queued": true,
+                    "queuedMessage": queued.to_value(position),
+                });
+                self.publish_queue_updated(agent_id).await;
+                Ok(result)
+            }
+        }
+    }
+
+    /// Daemon-side equivalent of the FE `task.removeAgentFromAllTasks`: strip
+    /// the given agent ids from every task note in the workspace. Silent on
+    /// notes/tasks that never referenced the ids so it is safe to call with an
+    /// empty or partially-stale list.
+    async fn remove_agent_ids_from_workspace_tasks(
+        &self,
+        workspace_id: &WorkspaceId,
+        stale: &[AgentId],
+    ) -> Result<()> {
+        if stale.is_empty() {
+            return Ok(());
+        }
+        let notes = self.store.list_notes(workspace_id).await?;
+        for mut note in notes {
+            let Some(mut task) = note.task.clone() else {
+                continue;
+            };
+            let before = task.assigned_agent_ids.len();
+            task.assigned_agent_ids.retain(|a| !stale.contains(a));
+            if task.assigned_agent_ids.len() == before {
+                continue;
+            }
+            let now = now_iso();
+            note.task = Some(task);
+            note.updated_at = now;
+            self.store.update_note(&note).await?;
+        }
+        Ok(())
     }
 
     /// Load a session, mapping `NotFound` to `-32603` for the methods whose TS
@@ -1627,11 +2712,13 @@ impl Services {
         agent_id: &AgentId,
         content: String,
         image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
     ) -> (QueuedMessage, usize) {
         let queued = QueuedMessage {
             id: new_message_id(),
             content,
             image_blocks,
+            file_blocks,
             queued_at: now_iso(),
             editing: false,
         };
@@ -1699,7 +2786,7 @@ impl Services {
     }
 
     /// Snapshot the current queue contents as wire-shape `QueuedMessage` JSON
-    /// (the §5.5 `{id, content, queuedAt, position, imageBlocks?}` shape) for
+    /// (the §5.5 `{id, content, queuedAt, position, imageBlocks?, fileBlocks?}` shape) for
     /// `agent.getQueue` and the `agent:queue:updated` payload (§6).
     pub(crate) fn queue_snapshot(&self, agent_id: &AgentId) -> Vec<Value> {
         self.agent_queues
@@ -1856,4 +2943,32 @@ fn tool_call_counts(messages: &[AgentMessage]) -> Value {
         }
     }
     json!(counts)
+}
+
+/// Parse an optional string field in an `agent.update` `changes` object. A JSON
+/// `null` clears the underlying `Option<String>`; a JSON string sets it to
+/// `Some(_)`; any other value type is `-32602` (matching the trait's
+/// [`Error::InvalidParams`] contract). Reused by every optional-string field in
+/// [`Services::agent_update_op`] so the diagnostic wording stays uniform.
+fn update_optional_string(value: &Value, field: &str) -> Result<Option<String>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(s) => Ok(Some(s.clone())),
+        _ => Err(Error::InvalidParams(format!(
+            "agent.update: `{field}` must be a string or null"
+        ))),
+    }
+}
+
+/// Reject transcript entries whose `role` is not one of the four wire values
+/// (`user` | `assistant` | `tool` | `system`). Shared by `agent.appendMessage`
+/// and `agent.replaceMessages` so callers cannot smuggle bogus roles that would
+/// break the message-log invariant.
+fn validate_message_role(role: &str) -> Result<()> {
+    match role {
+        "user" | "assistant" | "tool" | "system" => Ok(()),
+        _ => Err(Error::InvalidParams(format!(
+            "invalid message role `{role}` (expected one of user|assistant|tool|system)"
+        ))),
+    }
 }

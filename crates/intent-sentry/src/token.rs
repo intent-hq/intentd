@@ -14,7 +14,10 @@
 //! GUARDRAIL: the token is a secret. It is only ever read and handed to the
 //! HTTP client — never logged, echoed, or returned across the wire.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
+use tokio::time::timeout;
 
 /// Keychain service name used for `intentd` secrets.
 const KEYRING_SERVICE: &str = "intentd";
@@ -22,6 +25,11 @@ const KEYRING_SERVICE: &str = "intentd";
 const KEYRING_TOKEN_ACCOUNT: &str = "sentry.token";
 /// Keychain account/key for the Sentry organization slug.
 const KEYRING_ORG_ACCOUNT: &str = "sentry.org";
+/// Bounded wait for a keychain read before treating the entry as absent. A
+/// stuck OS keychain (e.g. a pending macOS auth prompt) would otherwise block
+/// the caller — and, historically, an entire tokio worker — indefinitely.
+/// Mirrors the read budget used by `intent-services::AsyncSecretStore`.
+const KEYCHAIN_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Strategy used to resolve the Sentry credential pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -54,27 +62,45 @@ impl std::fmt::Debug for Credentials {
 }
 
 /// Resolve a credential pair for the given strategy, or `None` if either half
-/// is missing.
-pub fn resolve(source: &TokenSource) -> Option<Credentials> {
+/// is missing. Keychain reads run on the blocking pool with a bounded timeout
+/// so a wedged OS keychain never blocks the async runtime.
+pub async fn resolve(source: &TokenSource) -> Option<Credentials> {
     match source {
-        TokenSource::Explicit => keyring_credentials(),
+        TokenSource::Explicit => keyring_credentials().await,
         TokenSource::Env => env_credentials(),
-        TokenSource::Auto => keyring_credentials().or_else(env_credentials),
+        TokenSource::Auto => match keyring_credentials().await {
+            Some(c) => Some(c),
+            None => env_credentials(),
+        },
     }
 }
 
-/// Read both halves of the credential pair from the OS keychain.
-fn keyring_credentials() -> Option<Credentials> {
-    let token = keyring::Entry::new(KEYRING_SERVICE, KEYRING_TOKEN_ACCOUNT)
-        .ok()?
-        .get_password()
-        .ok()
-        .and_then(non_empty)?;
-    let organization = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ORG_ACCOUNT)
-        .ok()?
-        .get_password()
-        .ok()
-        .and_then(non_empty)?;
+/// Read both halves of the credential pair from the OS keychain. Both entries
+/// are loaded off the async runtime on the blocking pool with a bounded
+/// timeout so a hung keychain (e.g. a pending macOS auth prompt) cannot
+/// wedge a tokio worker.
+async fn keyring_credentials() -> Option<Credentials> {
+    let handle = tokio::task::spawn_blocking(|| {
+        let token = keyring::Entry::new(KEYRING_SERVICE, KEYRING_TOKEN_ACCOUNT)
+            .ok()?
+            .get_password()
+            .ok()?;
+        let organization = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ORG_ACCOUNT)
+            .ok()?
+            .get_password()
+            .ok()?;
+        Some((token, organization))
+    });
+    let pair = match timeout(KEYCHAIN_LOAD_TIMEOUT, handle).await {
+        Ok(Ok(Some(pair))) => pair,
+        Ok(Ok(None)) | Ok(Err(_)) => return None,
+        Err(_) => {
+            tracing::warn!("keychain load timed out for sentry credentials");
+            return None;
+        }
+    };
+    let token = non_empty(pair.0)?;
+    let organization = non_empty(pair.1)?;
     Some(Credentials {
         token,
         organization,

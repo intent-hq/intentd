@@ -479,10 +479,66 @@ async fn agent_file_change_records_tracked_change_and_diff() {
 
 const MGR_ACP_SID: &str = "mgr-acp-new";
 
+/// Shared capture of `(method, params)` for every request the manager sends to
+/// a mock agent; opt-in per [`spawn_cfg_mock_agent`] so tests that need it can
+/// assert on the exact request sequence.
+type MockCallLog = Arc<Mutex<Vec<(String, Value)>>>;
+
+/// The `availableModes` list a mock agent advertises in its `session/new` /
+/// `session/load` response. Defaults to a set that includes `bypassPermissions`
+/// so tests exercising the "set_mode was attempted" assertions keep working;
+/// tests can substitute a bypass-free set (e.g. `default`+`ask`, matching
+/// auggie today) to exercise the skip path.
+#[derive(Clone)]
+struct MockModes {
+    current_mode_id: &'static str,
+    available_modes: &'static [&'static str],
+}
+
+impl MockModes {
+    const fn with_bypass() -> Self {
+        Self {
+            current_mode_id: "default",
+            available_modes: &["default", "bypassPermissions"],
+        }
+    }
+
+    const fn no_bypass() -> Self {
+        // Matches auggie's real advertised set today: no bypass-equivalent, so
+        // the manager must skip `session/set_mode` rather than trigger `-32602`.
+        Self {
+            current_mode_id: "default",
+            available_modes: &["default", "ask"],
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let available: Vec<Value> = self
+            .available_modes
+            .iter()
+            .map(|id| json!({ "id": id, "name": id }))
+            .collect();
+        json!({
+            "currentModeId": self.current_mode_id,
+            "availableModes": available,
+        })
+    }
+}
+
 /// Configurable mock agent: `initialize` advertises `loadSession` per `load_cap`;
-/// `session/new` mints [`MGR_ACP_SID`]; `session/load` succeeds; everything else
-/// (e.g. `authenticate`) resolves with `{}`.
-fn spawn_cfg_mock_agent<R, W>(read: R, write: W, load_cap: bool) -> JoinHandle<()>
+/// `session/new` mints [`MGR_ACP_SID`] and advertises the caller-chosen
+/// `availableModes` (so tests can flip between the bypass-advertised and
+/// bypass-absent shapes); `session/load` echoes the same modes; everything else
+/// (e.g. `authenticate`) resolves with `{}`. When `log` is `Some`, every request
+/// method (and its params) is recorded so tests can assert what the manager sent
+/// after handshake / session setup.
+fn spawn_cfg_mock_agent_with_modes<R, W>(
+    read: R,
+    write: W,
+    load_cap: bool,
+    log: Option<MockCallLog>,
+    modes: MockModes,
+) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -500,12 +556,18 @@ where
             else {
                 continue;
             };
+            if let Some(log) = &log {
+                let params = value.get("params").cloned().unwrap_or(Value::Null);
+                log.lock().unwrap().push((method.to_string(), params));
+            }
             let result = match method {
                 "initialize" => {
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": load_cap } })
                 }
-                "session/new" => json!({ "sessionId": MGR_ACP_SID }),
-                "session/load" => json!({}),
+                "session/new" => {
+                    json!({ "sessionId": MGR_ACP_SID, "modes": modes.to_json() })
+                }
+                "session/load" => json!({ "modes": modes.to_json() }),
                 _ => json!({}),
             };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -521,9 +583,53 @@ where
 /// Track a handle wired to a configurable mock agent (parity with `create_agent`
 /// minus a real child), returning the agent task handle.
 fn track_mock_agent(mgr: &AgentManager, id: &AgentId, load_cap: bool) -> JoinHandle<()> {
+    track_mock_agent_inner(mgr, id, load_cap, None, MockModes::with_bypass()).0
+}
+
+/// Like [`track_mock_agent`] but also returns a shared log capturing every
+/// request the manager sent to the mock (method + params), so tests can assert
+/// e.g. that `session/set_mode bypassPermissions` was attempted after session
+/// setup.
+fn track_mock_agent_with_log(
+    mgr: &AgentManager,
+    id: &AgentId,
+    load_cap: bool,
+) -> (JoinHandle<()>, MockCallLog) {
+    let log: MockCallLog = Arc::new(Mutex::new(Vec::new()));
+    let (handle, _) = track_mock_agent_inner(
+        mgr,
+        id,
+        load_cap,
+        Some(log.clone()),
+        MockModes::with_bypass(),
+    );
+    (handle, log)
+}
+
+/// Like [`track_mock_agent_with_log`] but with a caller-chosen advertised-modes
+/// set (e.g. `MockModes::no_bypass()` to exercise the "provider offers no
+/// bypass-equivalent" skip path).
+fn track_mock_agent_with_log_modes(
+    mgr: &AgentManager,
+    id: &AgentId,
+    load_cap: bool,
+    modes: MockModes,
+) -> (JoinHandle<()>, MockCallLog) {
+    let log: MockCallLog = Arc::new(Mutex::new(Vec::new()));
+    let (handle, _) = track_mock_agent_inner(mgr, id, load_cap, Some(log.clone()), modes);
+    (handle, log)
+}
+
+fn track_mock_agent_inner(
+    mgr: &AgentManager,
+    id: &AgentId,
+    load_cap: bool,
+    log: Option<MockCallLog>,
+    modes: MockModes,
+) -> (JoinHandle<()>, ()) {
     let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
     let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
-    let agent = spawn_cfg_mock_agent(c2a_agent, a2c_agent, load_cap);
+    let agent = spawn_cfg_mock_agent_with_modes(c2a_agent, a2c_agent, load_cap, log, modes);
     let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
     let connection = Arc::new(Connection::new(
         c2a_client,
@@ -547,7 +653,7 @@ fn track_mock_agent(mgr: &AgentManager, id: &AgentId, load_cap: bool) -> JoinHan
         },
     );
     mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
-    agent
+    (agent, ())
 }
 
 /// A test provider that skips `authenticate` (deterministic handshake).
@@ -613,6 +719,14 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         stats: None,
         task_note_id: None,
         skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        is_background: false,
+        metadata: None,
         created_at: ts.clone(),
         updated_at: ts,
     };
@@ -652,7 +766,7 @@ async fn start_session_resumes_when_load_supported() {
     seed_agent(&mgr, &ws, &id).await;
     mgr.services
         .store
-        .set_acp_session_id(&id, "existing-id")
+        .set_acp_session_id(&ws, &id, "existing-id")
         .await
         .unwrap();
     let _agent = track_mock_agent(&mgr, &id, true);
@@ -674,7 +788,7 @@ async fn start_session_recreates_and_flags_when_load_unsupported() {
     seed_agent(&mgr, &ws, &id).await;
     mgr.services
         .store
-        .set_acp_session_id(&id, "stale-id")
+        .set_acp_session_id(&ws, &id, "stale-id")
         .await
         .unwrap();
     let _agent = track_mock_agent(&mgr, &id, false);
@@ -689,6 +803,143 @@ async fn start_session_recreates_and_flags_when_load_unsupported() {
     // The recreate flag is set so the next turn resends history; take() clears it.
     assert!(mgr.take_recreated(&id), "recreate flags a history resend");
     assert!(!mgr.take_recreated(&id), "flag is cleared once taken");
+}
+
+/// Under the shipped `AllowAll` default, `start_session` best-effort asks the
+/// provider to run in `bypassPermissions` mode (parity with the TS acp-provider)
+/// once a session id is minted. Providers that don't advertise `set_mode` skip
+/// the call; providers that do (auggie today) see it after `session/new`,
+/// `session/load`, or the recreate path.
+#[tokio::test]
+async fn start_session_sends_bypass_permissions_under_allow_all() {
+    let (_tmp, mgr) = manager().await;
+    // `manager()` builds an AllowAll manager (the shipped default), which is
+    // what wires `maybe_bypass_permissions` on the three session paths.
+    assert_eq!(mgr.policy(), PermissionPolicy::AllowAll);
+
+    // 1) Brand-new session: bypass follows `session/new`.
+    let new_id = AgentId::from("a-bypass-new");
+    seed_agent(&mgr, &WorkspaceId::from("ws-bypass-new"), &new_id).await;
+    let (_agent_new, new_log) = track_mock_agent_with_log(&mgr, &new_id, false);
+    let sid = mgr
+        .start_session(&new_id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect("first session");
+    assert_eq!(sid, MGR_ACP_SID);
+    let new_calls = new_log.lock().unwrap().clone();
+    let set_mode = new_calls
+        .iter()
+        .find(|(m, _)| m == "session/set_mode")
+        .expect("session/set_mode called after session/new");
+    assert_eq!(set_mode.1["sessionId"], MGR_ACP_SID);
+    assert_eq!(set_mode.1["modeId"], "bypassPermissions");
+    // Ordering: `session/new` precedes the bypass attempt.
+    let new_idx = new_calls
+        .iter()
+        .position(|(m, _)| m == "session/new")
+        .expect("session/new in log");
+    let set_idx = new_calls
+        .iter()
+        .position(|(m, _)| m == "session/set_mode")
+        .expect("session/set_mode in log");
+    assert!(new_idx < set_idx, "bypass attempted after session/new");
+
+    // 2) Resume path: bypass follows `session/load`.
+    let resume_id = AgentId::from("a-bypass-resume");
+    let resume_ws = WorkspaceId::from("ws-bypass-resume");
+    seed_agent(&mgr, &resume_ws, &resume_id).await;
+    mgr.services
+        .store
+        .set_acp_session_id(&resume_ws, &resume_id, "existing-id")
+        .await
+        .unwrap();
+    let (_agent_r, resume_log) = track_mock_agent_with_log(&mgr, &resume_id, true);
+    let sid = mgr
+        .start_session(&resume_id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect("resume");
+    assert_eq!(sid, "existing-id");
+    let resume_calls = resume_log.lock().unwrap().clone();
+    let set_mode = resume_calls
+        .iter()
+        .find(|(m, _)| m == "session/set_mode")
+        .expect("session/set_mode called after session/load");
+    assert_eq!(set_mode.1["sessionId"], "existing-id");
+    assert_eq!(set_mode.1["modeId"], "bypassPermissions");
+
+    // 3) Recreate path: bypass follows the fallback `session/new`.
+    let recreate_id = AgentId::from("a-bypass-recreate");
+    let recreate_ws = WorkspaceId::from("ws-bypass-recreate");
+    seed_agent(&mgr, &recreate_ws, &recreate_id).await;
+    mgr.services
+        .store
+        .set_acp_session_id(&recreate_ws, &recreate_id, "stale-id")
+        .await
+        .unwrap();
+    let (_agent_rc, recreate_log) = track_mock_agent_with_log(&mgr, &recreate_id, false);
+    let sid = mgr
+        .start_session(&recreate_id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect("recreate");
+    assert_eq!(sid, MGR_ACP_SID);
+    let recreate_calls = recreate_log.lock().unwrap().clone();
+    let set_mode = recreate_calls
+        .iter()
+        .find(|(m, _)| m == "session/set_mode")
+        .expect("session/set_mode called on recreate path");
+    assert_eq!(set_mode.1["sessionId"], MGR_ACP_SID);
+    assert_eq!(set_mode.1["modeId"], "bypassPermissions");
+}
+
+/// Every non-`AllowAll` policy leaves the provider alone: `Interactive` drives
+/// the FE round-trip, `AutoByRisk` / `DenyAll` apply local decisions, and none
+/// of them should ask the provider to disable its own prompts.
+#[tokio::test]
+async fn start_session_skips_bypass_under_non_allow_all_policies() {
+    for policy in [
+        PermissionPolicy::Interactive,
+        PermissionPolicy::AutoByRisk,
+        PermissionPolicy::DenyAll,
+    ] {
+        let (_tmp, mgr) = manager().await;
+        let mgr = mgr.with_policy(policy);
+        let (ws, id) = (
+            WorkspaceId::from("ws-1"),
+            AgentId::from(format!("a-no-bypass-{policy:?}").as_str()),
+        );
+        seed_agent(&mgr, &ws, &id).await;
+        let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+        mgr.start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+            .await
+            .expect("session");
+        let calls = log.lock().unwrap().clone();
+        assert!(
+            calls.iter().all(|(m, _)| m != "session/set_mode"),
+            "policy {policy:?} must not attempt bypassPermissions; got {calls:?}"
+        );
+    }
+}
+
+/// A provider that doesn't advertise a bypass-equivalent in `availableModes`
+/// (auggie today: `default`+`ask`) is left alone under `AllowAll` rather than
+/// being hit with `session/set_mode bypassPermissions` and getting `-32602`.
+/// The local `AllowAll` auto-approve carries the parity contract by itself.
+#[tokio::test]
+async fn start_session_skips_bypass_when_provider_doesnt_advertise_bypass_mode() {
+    let (_tmp, mgr) = manager().await;
+    assert_eq!(mgr.policy(), PermissionPolicy::AllowAll);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-no-bypass-cap"));
+    seed_agent(&mgr, &ws, &id).await;
+    // Mock advertises `default`+`ask` only, mirroring what auggie returns today.
+    let (_agent, log) = track_mock_agent_with_log_modes(&mgr, &id, false, MockModes::no_bypass());
+    mgr.start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect("session");
+    let calls = log.lock().unwrap().clone();
+    assert!(
+        calls.iter().all(|(m, _)| m != "session/set_mode"),
+        "no session/set_mode when provider doesn't advertise a bypass-equivalent; got {calls:?}"
+    );
 }
 
 #[tokio::test]
@@ -715,7 +966,9 @@ async fn build_turn_prompt_prepends_history_once_after_recreate() {
     }
     mgr.recreated.lock().unwrap().insert(id.clone());
 
-    let prompt = mgr.build_turn_prompt(&id, "current message").await;
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "current message", &super::TurnOptions::default())
+        .await;
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -733,12 +986,237 @@ async fn build_turn_prompt_prepends_history_once_after_recreate() {
     );
 
     // The flag is consumed: a follow-up turn sends only the message text.
-    let plain = mgr.build_turn_prompt(&id, "next message").await;
+    let plain = mgr
+        .build_turn_prompt(&id, &ws, "next message", &super::TurnOptions::default())
+        .await;
     let plain_text = serde_json::to_value(&plain).unwrap()[0]["text"]
         .as_str()
         .unwrap()
         .to_string();
     assert_eq!(plain_text, "next message");
+}
+
+// --- Attachment blocks (image + file) ----------------------------------------
+
+/// FE-supplied `imageBlocks` become ACP `image` content blocks appended after
+/// the text prompt (reference-parity `acp-provider.ts`), preserving `data`
+/// and `mimeType` verbatim in the camelCase wire shape.
+#[tokio::test]
+async fn build_turn_prompt_appends_image_blocks_after_text() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-img"), AgentId::from("a-img"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let options = super::TurnOptions {
+        image_blocks: Some(json!([
+            {"data": "AAAA", "mimeType": "image/png"},
+            {"data": "BBBB", "mimeType": "image/jpeg"},
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
+    let wire = serde_json::to_value(&prompt).unwrap();
+    let arr = wire.as_array().unwrap();
+    assert_eq!(arr.len(), 3, "text + 2 image blocks");
+    assert_eq!(arr[0]["type"], json!("text"));
+    assert_eq!(arr[1]["type"], json!("image"));
+    assert_eq!(arr[1]["data"], json!("AAAA"));
+    assert_eq!(arr[1]["mimeType"], json!("image/png"));
+    assert_eq!(arr[2]["type"], json!("image"));
+    assert_eq!(arr[2]["data"], json!("BBBB"));
+    assert_eq!(arr[2]["mimeType"], json!("image/jpeg"));
+}
+
+/// FE-supplied `fileBlocks` become ACP `resource` content blocks with a
+/// `BlobResourceContents` carrying the file name lifted into the resource
+/// `uri` (`file:///<fileName>`), appended after any image blocks.
+#[tokio::test]
+async fn build_turn_prompt_appends_file_blocks_after_text_and_images() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-file"), AgentId::from("a-file"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let options = super::TurnOptions {
+        image_blocks: Some(json!([{"data": "IMG", "mimeType": "image/png"}])),
+        file_blocks: Some(json!([
+            {"data": "Zm9v", "mimeType": "text/plain", "fileName": "notes.txt"},
+            {"data": "YmFy", "mimeType": "application/pdf", "fileName": "spec.pdf"},
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
+    let wire = serde_json::to_value(&prompt).unwrap();
+    let arr = wire.as_array().unwrap();
+    assert_eq!(arr.len(), 4, "text + 1 image + 2 file blocks");
+    assert_eq!(arr[0]["type"], json!("text"));
+    assert_eq!(arr[1]["type"], json!("image"));
+    // Images come before files, files come in caller order.
+    assert_eq!(arr[2]["type"], json!("resource"));
+    assert_eq!(arr[2]["resource"]["blob"], json!("Zm9v"));
+    assert_eq!(arr[2]["resource"]["mimeType"], json!("text/plain"));
+    assert_eq!(arr[2]["resource"]["uri"], json!("file:///notes.txt"));
+    assert_eq!(arr[3]["type"], json!("resource"));
+    assert_eq!(arr[3]["resource"]["blob"], json!("YmFy"));
+    assert_eq!(arr[3]["resource"]["mimeType"], json!("application/pdf"));
+    assert_eq!(arr[3]["resource"]["uri"], json!("file:///spec.pdf"));
+}
+
+/// Malformed attachment entries (missing required fields, wrong types) are
+/// silently dropped so a partial array can never poison the whole turn — only
+/// the well-formed sibling blocks reach the prompt.
+#[tokio::test]
+async fn build_turn_prompt_skips_malformed_attachments() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-bad"), AgentId::from("a-bad"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let options = super::TurnOptions {
+        image_blocks: Some(json!([
+            {"data": "OK"},                        // missing mimeType
+            {"data": 42, "mimeType": "image/png"}, // wrong type
+            {"data": "GOOD", "mimeType": "image/png"},
+        ])),
+        file_blocks: Some(json!([
+            {"mimeType": "text/plain", "fileName": "x.txt"},   // missing data
+            {"data": "d", "fileName": "x.txt"},                 // missing mimeType
+            {"data": "d", "mimeType": "text/plain"},            // missing fileName
+            {"data": "d", "mimeType": "text/plain", "fileName": "keep.txt"},
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
+    let wire = serde_json::to_value(&prompt).unwrap();
+    let arr = wire.as_array().unwrap();
+    // text + 1 well-formed image + 1 well-formed file.
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[1]["data"], json!("GOOD"));
+    assert_eq!(arr[2]["resource"]["uri"], json!("file:///keep.txt"));
+}
+
+// --- First-turn workspace-naming instruction ---------------------------------
+
+/// Seed an agent whose workspace already carries `title` (used by naming-instruction
+/// tests to distinguish slug-shaped vs custom titles).
+async fn seed_agent_with_title(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId, title: &str) {
+    seed_agent(mgr, ws, id).await;
+    let mut workspace = mgr.services.store.get_workspace(ws).await.unwrap();
+    workspace.title = title.to_string();
+    mgr.services
+        .store
+        .update_workspace(&workspace)
+        .await
+        .expect("update ws title");
+}
+
+/// Slug-shaped workspace title on an agent's first turn → the naming instruction
+/// is prepended as a `<system>` block naming the daemon MCP tool
+/// (`set_workspace_title_workspace-mcp`), not the FE `workspace_api` surface.
+#[tokio::test]
+async fn build_turn_prompt_injects_naming_instruction_for_slug_title() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-slug"), AgentId::from("a-slug"));
+    seed_agent_with_title(&mgr, &ws, &id, "amber-fox").await;
+    // Persist the current user turn so `build_turn_prompt` sees the "first
+    // turn" shape (one user message, zero assistant messages).
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "hello" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        text.starts_with("<system>"),
+        "naming instruction prepends the prompt: {text:?}"
+    );
+    assert!(
+        text.contains("`set_workspace_title_workspace-mcp`"),
+        "instruction names the daemon MCP tool: {text:?}"
+    );
+    assert!(
+        !text.contains("workspace_api"),
+        "instruction must not reference the FE workspace_api surface: {text:?}"
+    );
+    assert!(text.trim_end().ends_with("hello"));
+}
+
+/// Custom workspace title on an agent's first turn → no naming instruction is
+/// injected (the reference `needsWorkspaceRename` guard skips already-titled
+/// workspaces).
+#[tokio::test]
+async fn build_turn_prompt_skips_naming_instruction_for_custom_title() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-custom"), AgentId::from("a-custom"));
+    seed_agent_with_title(&mgr, &ws, &id, "Add dark mode support").await;
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "hi" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hi", &super::TurnOptions::default())
+        .await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(text, "hi", "no naming block for already-titled workspaces");
+}
+
+/// Slug-shaped title but an assistant message already exists → the naming
+/// instruction fires only on the FIRST turn and stays absent for every turn
+/// after (reference `!messages.some(m => m.role === 'assistant')`).
+#[tokio::test]
+async fn build_turn_prompt_skips_naming_instruction_after_first_turn() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-second"), AgentId::from("a-second"));
+    seed_agent_with_title(&mgr, &ws, &id, "amber-fox").await;
+    for (role, text) in [
+        ("user", "first question"),
+        ("assistant", "first answer"),
+        ("user", "follow-up"),
+    ] {
+        mgr.services
+            .store
+            .append_agent_message(
+                &id,
+                role,
+                &json!([{ "type": "text", "text": text }]),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "follow-up", &super::TurnOptions::default())
+        .await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !text.contains("<system>"),
+        "second-turn prompt carries no naming instruction: {text:?}"
+    );
+    assert_eq!(text, "follow-up");
 }
 
 /// The keep-alive interrupt path emits ONLY the terminal `agent:stream:end` and
@@ -755,7 +1233,7 @@ async fn interrupt_emits_terminal_stream_end_but_no_idle() {
     // `interrupt` falls back to the hard `stop` kill path).
     mgr.services
         .store
-        .set_acp_session_id(&id, "acp-int")
+        .set_acp_session_id(&ws, &id, "acp-int")
         .await
         .unwrap();
     // Claim the in-flight slot so the interrupt exercises the busy turn path.
@@ -777,6 +1255,249 @@ async fn interrupt_emits_terminal_stream_end_but_no_idle() {
     assert!(
         !types.contains(&"agent:idle"),
         "interrupt suppresses agent:idle (got {types:?})"
+    );
+}
+
+/// `priority: "interrupt"` delivery to a BUSY agent preempts the turn
+/// keep-alive: the message streams immediately (`queued: false`) instead of
+/// queueing behind the turn, the preemption emits the terminal
+/// `agent:stream:end`, and the child handle survives — the agent is never
+/// killed (contrast `force_message`, which tears the child down).
+#[tokio::test]
+async fn interrupt_send_message_preempts_busy_turn_without_kill() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-send"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    // A live `acpSessionId` keeps the preemption on the keep-alive interrupt
+    // path (no session → `interrupt` would fall back to the kill path).
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-int-send")
+        .await
+        .unwrap();
+    // Claim the in-flight slot so the send sees a busy (mid-turn) agent.
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let result = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "urgent".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("interrupt send");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(
+        result["queued"],
+        json!(false),
+        "interrupt priority streams immediately, never queues: {result}"
+    );
+    assert!(result["messageId"].is_string());
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"agent:stream:end"),
+        "preemption emits the terminal stream:end (got {types:?})"
+    );
+    assert!(
+        mgr.handles.lock().unwrap().contains_key(&id),
+        "the child handle survives the interrupt (never killed)"
+    );
+    // The interrupt message was persisted as the next user turn.
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let last = session.messages.last().expect("message persisted");
+    assert_eq!(last.role, "user");
+    assert!(serde_json::to_string(&last.content)
+        .unwrap()
+        .contains("urgent"));
+}
+
+/// Interrupt-priority delivery to an IDLE agent falls through to the plain
+/// `send_message` path unchanged: `{ success, queued: false, messageId }`.
+#[tokio::test]
+async fn interrupt_send_message_idle_agent_falls_through_to_send() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-idle"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-int-idle")
+        .await
+        .unwrap();
+
+    let result = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "hello".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("idle interrupt send");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(result["queued"], json!(false));
+    assert!(result["messageId"].is_string());
+    assert!(
+        mgr.handles.lock().unwrap().contains_key(&id),
+        "idle fall-through never touches the handle"
+    );
+}
+
+/// The SAME interrupt-priority message (same `messageId`) delivered twice in
+/// quick succession preempts exactly once: the duplicate is acknowledged
+/// idempotently (`deduplicated: true`) without cancelling the interrupt turn
+/// it raced and without re-persisting the message; the child handle survives
+/// and the agent never reaches a failed status. A DISTINCT `messageId` is a
+/// genuinely new interrupt and still preempts.
+#[tokio::test]
+async fn duplicate_interrupt_send_same_message_id_preempts_once() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-dup"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-int-dup")
+        .await
+        .unwrap();
+    // Claim the in-flight slot so the first delivery preempts a busy turn.
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let first = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "dup-urgent".to_string(),
+            Some("user-msg-dup".to_string()),
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("first interrupt send");
+    assert_eq!(first["success"], json!(true));
+    assert_eq!(first["queued"], json!(false));
+    assert_eq!(first["messageId"], json!("user-msg-dup"));
+
+    // Duplicate delivery of the SAME message id, racing the interrupt turn the
+    // first delivery just started: acknowledged, no second preemption/persist.
+    let second = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "dup-urgent".to_string(),
+            Some("user-msg-dup".to_string()),
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("duplicate interrupt send");
+    assert_eq!(second["success"], json!(true));
+    assert_eq!(
+        second["deduplicated"],
+        json!(true),
+        "duplicate is acknowledged idempotently: {second}"
+    );
+    assert_eq!(second["messageId"], json!("user-msg-dup"));
+
+    // Not double-persisted: exactly ONE user message carries the content.
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let dup_count = session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == "user"
+                && serde_json::to_string(&m.content)
+                    .unwrap()
+                    .contains("dup-urgent")
+        })
+        .count();
+    assert_eq!(dup_count, 1, "duplicate delivery must not double-persist");
+    assert!(
+        mgr.handles.lock().unwrap().contains_key(&id),
+        "the child handle survives the duplicate (never killed)"
+    );
+    assert_ne!(
+        session.status,
+        AgentStatus::Error,
+        "the agent never transitions to a failed status"
+    );
+
+    // A DISTINCT message id is a new interrupt, not a duplicate: it preempts
+    // (or claims the idle slot) and persists normally.
+    let third = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "next-urgent".to_string(),
+            Some("user-msg-next".to_string()),
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("distinct interrupt send");
+    assert_eq!(third["success"], json!(true));
+    assert!(
+        third.get("deduplicated").is_none(),
+        "a new messageId is never deduplicated: {third}"
+    );
+}
+
+/// Interrupt-priority delivery during TURN STARTUP (busy slot claimed but no
+/// cancellable turn yet — no `acpSessionId` persisted, the spawn/`session/new`
+/// window): preemption is skipped (a keep-alive interrupt is impossible and
+/// falling back to `stop` would kill the child) and the message queues behind
+/// the starting turn instead. The child handle survives, the starting turn is
+/// left intact, and the agent never reaches a failed status.
+#[tokio::test]
+async fn interrupt_send_during_turn_startup_queues_keep_alive() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-startup"));
+    seed_agent(&mgr, &ws, &id).await;
+    // Child handle live but NO `acpSessionId` yet — `session/new` in flight.
+    let _agent = track_mock_agent(&mgr, &id, false);
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let result = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "early interrupt".to_string(),
+            Some("user-msg-early".to_string()),
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("startup-window interrupt send");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(
+        result["queued"],
+        json!(true),
+        "startup window queues keep-alive instead of preempting: {result}"
+    );
+    assert_eq!(result["queuedMessage"]["content"], json!("early interrupt"));
+    assert!(
+        mgr.handles.lock().unwrap().contains_key(&id),
+        "the child handle survives (no stop-kill fallback)"
+    );
+    assert!(
+        mgr.is_busy(&id),
+        "the starting turn keeps its in-flight slot"
+    );
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_ne!(
+        session.status,
+        AgentStatus::Error,
+        "the agent never transitions to a failed status"
     );
 }
 
@@ -834,6 +1555,14 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         stats: None,
         task_note_id: None,
         skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        is_background: false,
+        metadata: None,
         created_at: now_iso(),
         updated_at: now_iso(),
     }
@@ -915,10 +1644,13 @@ fn prompt(request_id: &str, session_id: &str) -> PermissionRequestData {
 }
 
 #[tokio::test]
-async fn default_policy_is_auto_by_risk_and_overridable() {
+async fn default_policy_is_allow_all_and_overridable() {
     let (_tmp, mgr) = manager().await;
-    // Headless default per §6.7/M3.5.
-    assert_eq!(mgr.policy(), PermissionPolicy::AutoByRisk);
+    // Shipped default (§6.7/M3.5): reference parity with the TS acp-provider —
+    // `start_session` best-effort sets `bypassPermissions` on providers that
+    // advertise set-mode, and `AllowAll` auto-approves anything the provider
+    // still surfaces.
+    assert_eq!(mgr.policy(), PermissionPolicy::AllowAll);
     // `with_policy` selects an FE-driven interactive deployment.
     let (_tmp2, mgr2, _bus) = manager_with_bus().await;
     let mgr2 = mgr2.with_policy(PermissionPolicy::Interactive);
@@ -1179,7 +1911,7 @@ async fn try_drain_queue_no_op_when_already_busy() {
     let (ws, id) = (WorkspaceId::from("ws-drain"), AgentId::from("a-drain"));
     // Queue a ready message so the only barrier is the busy flag.
     mgr.services
-        .enqueue_message(&id, "queued".to_string(), None);
+        .enqueue_message(&id, "queued".to_string(), None, None);
     assert!(mgr.try_begin(&id, &ws).await);
 
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -1213,7 +1945,13 @@ async fn send_message_queues_when_already_busy() {
     assert!(mgr.try_begin(&id, &ws).await);
 
     let result = mgr
-        .send_message(id.clone(), ws.clone(), "queued".to_string(), None)
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "queued".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
         .await
         .expect("send_message returns the queued envelope");
     assert_eq!(result["success"], json!(true));
@@ -1221,6 +1959,67 @@ async fn send_message_queues_when_already_busy() {
     assert_eq!(result["queuedMessage"]["content"], json!("queued"));
     assert_eq!(result["queuedMessage"]["position"], json!(0));
     assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+}
+
+/// When `send_message` hits the busy auto-queue fallback, the caller's
+/// image + file blocks are preserved on the queued entry (the wire snapshot
+/// includes both) so the eventual drain turn reaches the agent with the same
+/// ACP content blocks.
+#[tokio::test]
+async fn send_message_auto_queue_preserves_image_and_file_blocks() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-q-blocks"),
+        AgentId::from("a-q-blocks"),
+    );
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let options = super::TurnOptions {
+        image_blocks: Some(json!([{"data": "IMG", "mimeType": "image/png"}])),
+        file_blocks: Some(json!([
+            {"data": "FILE", "mimeType": "text/plain", "fileName": "n.txt"}
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let result = mgr
+        .send_message(id.clone(), ws.clone(), "hi".to_string(), None, options)
+        .await
+        .expect("queued");
+    assert_eq!(result["queued"], json!(true));
+    let snap = mgr.services.queue_snapshot(&id);
+    assert_eq!(snap.len(), 1);
+    assert_eq!(
+        snap[0]["imageBlocks"],
+        json!([{"data": "IMG", "mimeType": "image/png"}]),
+        "image blocks land on the queued entry"
+    );
+    assert_eq!(
+        snap[0]["fileBlocks"],
+        json!([{"data": "FILE", "mimeType": "text/plain", "fileName": "n.txt"}]),
+        "file blocks land on the queued entry"
+    );
+}
+
+/// enqueue → dequeue round-trip preserves both attachment arrays so the drain
+/// path can pipe them into the next turn's `TurnOptions`.
+#[tokio::test]
+async fn queue_dequeue_round_trip_preserves_image_and_file_blocks() {
+    let (_tmp, mgr) = manager().await;
+    let id = AgentId::from("a-rt");
+    let images = Some(json!([{"data": "I", "mimeType": "image/png"}]));
+    let files = Some(json!([
+        {"data": "F", "mimeType": "text/plain", "fileName": "r.txt"}
+    ]));
+    mgr.services
+        .enqueue_message(&id, "msg".to_string(), images.clone(), files.clone());
+    let drained = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("dequeue returns the head");
+    assert_eq!(drained.content, "msg");
+    assert_eq!(drained.image_blocks, images);
+    assert_eq!(drained.file_blocks, files);
 }
 
 // --- Recreate flag + history rendering ---------------------------------------
@@ -1449,4 +2248,439 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
     );
 
     let _ = std::fs::remove_dir_all(&ws_dir);
+}
+
+// --- Context references → stdinContext builder (Fidelity B) ---------------
+
+/// Port parity: the builder emits one entry per reference in order, with
+/// the reference labels (`Selected text:`, `Task:`, `Code:`, `File <p>:`,
+/// `Linear Issue:`, `GitHub Issue:`, `Sentry Issue:`, `Terminal ...`,
+/// `Note: <id>`) and joins them with `\n\n`.
+#[test]
+fn build_stdin_context_from_context_references_ports_reference_shapes() {
+    let refs = json!([
+        {"type": "selection", "content": "hello"},
+        {"type": "task", "taskText": "do the thing"},
+        {"type": "code_chunk", "codeChunk": "fn foo() {}"},
+        {"type": "file", "path": "src/a.rs", "content": "pub fn a() {}"},
+        {"type": "file", "filePath": "src/only-path.rs"},
+        {"type": "linear-issue", "content": "XYZ-1 title"},
+        {"type": "github-issue", "content": "#42 title"},
+        {"type": "sentry-issue", "content": "issue text"},
+        {
+            "type": "terminal",
+            "content": "$ ls",
+            "metadata": {"terminalId": "t1", "terminalName": "build"}
+        },
+        {"type": "note", "noteId": "note-1"},
+        {"type": "note", "metadata": {"noteId": "note-2"}},
+    ]);
+    let out =
+        super::build_stdin_context_from_context_references(Some(&refs)).expect("non-empty context");
+    let parts: Vec<&str> = out.split("\n\n").collect();
+    assert_eq!(parts.len(), 11);
+    assert_eq!(parts[0], "Selected text:\nhello");
+    assert_eq!(parts[1], "Task:\ndo the thing");
+    assert_eq!(parts[2], "Code:\nfn foo() {}");
+    assert_eq!(parts[3], "File src/a.rs:\npub fn a() {}");
+    assert_eq!(parts[4], "File: src/only-path.rs");
+    assert_eq!(parts[5], "Linear Issue:\nXYZ-1 title");
+    assert_eq!(parts[6], "GitHub Issue:\n#42 title");
+    assert_eq!(parts[7], "Sentry Issue:\nissue text");
+    assert_eq!(parts[8], "Terminal \"build\" (terminal_id: t1):\n$ ls");
+    assert_eq!(parts[9], "Note: note-1");
+    assert_eq!(parts[10], "Note: note-2");
+}
+
+/// Empty / absent inputs collapse to `None` so the prompt is left unchanged.
+#[test]
+fn build_stdin_context_from_context_references_empty_is_none() {
+    assert!(super::build_stdin_context_from_context_references(None).is_none());
+    assert!(super::build_stdin_context_from_context_references(Some(&json!([]))).is_none());
+    // Only-unsupported entries also collapse to None.
+    assert!(
+        super::build_stdin_context_from_context_references(Some(&json!([
+            {"type": "note"}, {"type": "file"}
+        ])))
+        .is_none()
+    );
+}
+
+/// End-to-end prompt shape: when `stdin_context` is absent but
+/// `context_references` yield content, `build_turn_prompt` prepends a
+/// `Context:` block synthesised by the builder; an explicit
+/// `stdin_context` still wins over the fallback.
+#[tokio::test]
+async fn build_turn_prompt_uses_context_references_when_stdin_context_is_absent() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-ctx"), AgentId::from("a-ctx"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    // Synthesised path.
+    let options = super::TurnOptions {
+        context_references: Some(json!([
+            {"type": "selection", "content": "selected"},
+            {"type": "file", "path": "a.rs", "content": "pub fn a() {}"},
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr.build_turn_prompt(&id, &ws, "do it", &options).await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        text.starts_with(
+            "Context:\nSelected text:\nselected\n\nFile a.rs:\npub fn a() {}\n\n---\n\n"
+        ),
+        "unexpected prompt: {text:?}"
+    );
+    assert!(text.ends_with("do it"));
+
+    // Explicit stdin_context wins over the synthesised fallback.
+    let options = super::TurnOptions {
+        stdin_context: Some("explicit".to_string()),
+        context_references: Some(json!([
+            {"type": "selection", "content": "ignored"}
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr.build_turn_prompt(&id, &ws, "do it", &options).await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(text.starts_with("Context:\nexplicit\n\n---\n\n"));
+    assert!(!text.contains("ignored"));
+}
+
+/// `noteIds` (PROTOCOL §5.5): the resolver loads workspace-asset
+/// images referenced by each note's markdown content, appends them as
+/// ACP `image` content blocks, and adds a system text notice so the
+/// agent knows the images are inlined (parity with the FE extraction
+/// in `agent-backend-handler.service.ts`).
+#[tokio::test]
+async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
+    use base64::Engine as _;
+    use intent_core::{ContentType, Note, NoteId, NoteVisibility};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let assets_dir =
+        std::env::temp_dir().join(format!("intentd-note-img-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&assets_dir).expect("assets tempdir");
+    let services = Services::new(store.clone())
+        .with_event_bus(bus.clone())
+        .with_assets_root(assets_dir.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = AgentManager::new(services, sink, 8);
+
+    let ws = WorkspaceId::from("ws-note-img");
+    let id = AgentId::from("a-note-img");
+    seed_agent(&mgr, &ws, &id).await;
+
+    // Write an on-disk asset the note will reference.
+    let asset_id = "asset-abc.png";
+    let asset_bytes: &[u8] = b"pretend-png";
+    let ws_dir = assets_dir.join(&ws.0);
+    std::fs::create_dir_all(&ws_dir).expect("asset dir");
+    std::fs::write(ws_dir.join(asset_id), asset_bytes).expect("write asset");
+
+    // Persist a note whose markdown references the asset URL.
+    let note_id = NoteId::new();
+    let ts = now_iso();
+    let note = Note {
+        id: note_id.clone(),
+        workspace_id: ws.clone(),
+        title: "Spec".to_string(),
+        content: format!(
+            "# Screenshot\n\n![shot](workspace-asset://{ws}/{asset})\n",
+            ws = ws.0,
+            asset = asset_id,
+        ),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        task: None,
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts,
+    };
+    store.insert_note(&note).await.expect("insert note");
+
+    let options = super::TurnOptions {
+        note_ids: Some(json!([note_id.to_string()])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr.build_turn_prompt(&id, &ws, "look", &options).await;
+    let wire = serde_json::to_value(&prompt).unwrap();
+    let arr = wire.as_array().unwrap();
+    // Expect: original text prompt, image block, system notice.
+    assert_eq!(arr.len(), 3, "text + image + notice");
+    assert_eq!(arr[0]["type"], json!("text"));
+    assert!(arr[0]["text"].as_str().unwrap().contains("look"));
+    assert_eq!(arr[1]["type"], json!("image"));
+    let expected_b64 = base64::engine::general_purpose::STANDARD.encode(asset_bytes);
+    assert_eq!(arr[1]["data"], json!(expected_b64));
+    assert_eq!(arr[1]["mimeType"], json!("image/png"));
+    assert_eq!(arr[2]["type"], json!("text"));
+    assert!(arr[2]["text"].as_str().unwrap().contains("1 image(s)"));
+
+    // A cross-workspace URL is silently skipped (no image, no notice).
+    let stray_id = NoteId::new();
+    let stray = Note {
+        id: stray_id.clone(),
+        content: format!(
+            "![x](workspace-asset://other-ws/{asset})\n",
+            asset = asset_id
+        ),
+        ..note.clone()
+    };
+    let mut stray = stray;
+    stray.id = stray_id.clone();
+    store.insert_note(&stray).await.expect("insert stray");
+    let options = super::TurnOptions {
+        note_ids: Some(json!([stray_id.to_string()])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr.build_turn_prompt(&id, &ws, "look", &options).await;
+    let arr_json = serde_json::to_value(&prompt).unwrap();
+    let arr = arr_json.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "only text; stray URL is skipped");
+}
+
+/// A10 — daemon-side merge of user MCP servers into the agent spawn config.
+/// Directly exercises [`AgentManager::merge_user_mcp_servers`] against an
+/// [`InMemorySecretStore`] and a fresh store so the tests stay hermetic (no
+/// keychain / real bridge involved).
+mod merge_user_mcp_servers_tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use intent_acp::{NormalizedMcpServer, NormalizedMcpServers};
+    use serde_json::json;
+
+    use super::{manager, TempDb};
+    use crate::agent_manager::AgentManager;
+    use crate::agent_manager::BusEventSink;
+    use crate::events::EventBus;
+    use crate::settings::{InMemorySecretStore, SecretStore};
+    use crate::Services;
+    use intent_acp::EventSink;
+    use intent_store::Store;
+
+    async fn manager_with_secrets() -> (TempDb, AgentManager, Arc<InMemorySecretStore>) {
+        let tmp = super::TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let secrets = Arc::new(InMemorySecretStore::default());
+        let services = Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_secret_store(secrets.clone() as Arc<dyn SecretStore>);
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+        (tmp, AgentManager::new(services, sink, 8), secrets)
+    }
+
+    fn write_servers(secrets: &InMemorySecretStore, servers: serde_json::Value) {
+        secrets
+            .store("mcp.servers", &serde_json::to_string(&servers).unwrap())
+            .expect("write mcp.servers");
+    }
+
+    #[tokio::test]
+    async fn skips_when_enable_user_servers_disabled() {
+        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        write_servers(
+            &secrets,
+            json!({ "srv-1": { "id": "srv-1", "name": "u", "transport": "stdio",
+                                 "command": "node", "enabled": true } }),
+        );
+        mgr.services
+            .store
+            .set_setting("mcp.enableUserServers", "false")
+            .await
+            .unwrap();
+        let mut out = NormalizedMcpServers::new();
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        assert!(out.is_empty(), "gate off → nothing merged: {:?}", out);
+    }
+
+    #[tokio::test]
+    async fn merges_enabled_stdio_server_by_name() {
+        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        write_servers(
+            &secrets,
+            json!({
+                "srv-1": {
+                    "id": "srv-1", "name": "my-tool", "transport": "stdio",
+                    "command": "node", "args": ["srv.js"], "enabled": true,
+                    "env": { "A": "1" }
+                }
+            }),
+        );
+        let mut out = NormalizedMcpServers::new();
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        let entry = out.get("my-tool").expect("keyed by name, not id");
+        match entry {
+            NormalizedMcpServer::Stdio { command, args, env } => {
+                assert_eq!(command, "node");
+                assert_eq!(args, &vec!["srv.js".to_string()]);
+                assert_eq!(env.get("A").map(String::as_str), Some("1"));
+            }
+            other => panic!("expected stdio, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_disabled_and_globally_disabled_servers() {
+        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        write_servers(
+            &secrets,
+            json!({
+                "srv-off": { "id": "srv-off", "name": "off", "transport": "stdio",
+                              "command": "node", "enabled": false },
+                "srv-glo": { "id": "srv-glo", "name": "glo", "transport": "stdio",
+                              "command": "node", "enabled": true },
+                "srv-on":  { "id": "srv-on",  "name": "on",  "transport": "stdio",
+                              "command": "node", "enabled": true }
+            }),
+        );
+        mgr.services
+            .store
+            .set_setting(
+                "mcp.disabledServers",
+                &serde_json::to_string(&json!(["srv-glo"])).unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut out = NormalizedMcpServers::new();
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        let names: HashSet<_> = out.keys().cloned().collect();
+        assert!(names.contains("on"), "enabled+not-disabled kept: {names:?}");
+        assert!(!names.contains("off"), "enabled=false dropped");
+        assert!(!names.contains("glo"), "globally-disabled dropped");
+    }
+
+    #[tokio::test]
+    async fn injects_oauth_authorization_header_for_http() {
+        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        write_servers(
+            &secrets,
+            json!({
+                "srv-remote": {
+                    "id": "srv-remote", "name": "remote", "transport": "http",
+                    "url": "https://example.test/mcp", "enabled": true
+                }
+            }),
+        );
+        mgr.services
+            .store
+            .set_mcp_oauth_token(
+                "srv-remote",
+                &serde_json::to_string(
+                    &json!({ "access_token": "tok-xyz", "token_type": "bearer" }),
+                )
+                .unwrap(),
+                "2026-07-05T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let mut out = NormalizedMcpServers::new();
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        match out.get("remote").expect("http server merged") {
+            NormalizedMcpServer::Http { url, headers } => {
+                assert_eq!(url, "https://example.test/mcp");
+                let headers = headers.as_ref().expect("auth header written");
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer tok-xyz"),
+                    "token_type title-cased, access_token appended",
+                );
+            }
+            other => panic!("expected http, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn preserves_existing_authorization_header() {
+        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        write_servers(
+            &secrets,
+            json!({
+                "srv-remote": {
+                    "id": "srv-remote", "name": "remote", "transport": "sse",
+                    "url": "https://example.test/sse", "enabled": true,
+                    "headers": { "Authorization": "Basic user:pass" }
+                }
+            }),
+        );
+        mgr.services
+            .store
+            .set_mcp_oauth_token(
+                "srv-remote",
+                &serde_json::to_string(&json!({ "access_token": "tok-xyz" })).unwrap(),
+                "2026-07-05T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let mut out = NormalizedMcpServers::new();
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        match out.get("remote").unwrap() {
+            NormalizedMcpServer::Sse { headers, .. } => {
+                let headers = headers.as_ref().unwrap();
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Basic user:pass"),
+                );
+            }
+            other => panic!("expected sse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn does_not_overwrite_reserved_workspace_mcp() {
+        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        write_servers(
+            &secrets,
+            json!({
+                "srv-x": { "id": "srv-x", "name": "workspace-mcp", "transport": "stdio",
+                             "command": "evil", "enabled": true }
+            }),
+        );
+        let mut out = NormalizedMcpServers::new();
+        out.insert(
+            "workspace-mcp".to_string(),
+            NormalizedMcpServer::Stdio {
+                command: "bridge".into(),
+                args: vec![],
+                env: Default::default(),
+            },
+        );
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        match out.get("workspace-mcp").unwrap() {
+            NormalizedMcpServer::Stdio { command, .. } => {
+                assert_eq!(command, "bridge", "reserved entry left intact");
+            }
+            other => panic!("expected stdio, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_secret_is_a_noop() {
+        let (_tmp, mgr, _secrets) = manager_with_secrets().await;
+        let mut out = NormalizedMcpServers::new();
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        assert!(out.is_empty());
+    }
+
+    // Prevent dead-code warnings for `manager` when this module compiles alone.
+    #[allow(dead_code)]
+    async fn _use_manager() {
+        let _ = manager().await;
+    }
 }

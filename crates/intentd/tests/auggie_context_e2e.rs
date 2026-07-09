@@ -96,7 +96,11 @@ async fn auggie_context_engine_real_retrieve_e2e() {
         .insert_workspace(&workspace(&ws, &workspace_path))
         .await
         .expect("insert workspace");
-    let svc = Services::new(store).with_context_engine(std::sync::Arc::new(engine));
+    let svc = Services::new(store)
+        .with_workspaces_root(
+            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+        )
+        .with_context_engine(std::sync::Arc::new(engine));
 
     eprintln!(
         "auggie_context_e2e: search.codebase over {} …",

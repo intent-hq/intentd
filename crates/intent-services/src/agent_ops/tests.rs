@@ -16,13 +16,20 @@ use intent_store::{NewEvent, Store};
 use serde_json::json;
 use tokio::time::timeout;
 
-use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_SESSION_STATS_CHANGED};
+use intent_core::events::{
+    AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE, AGENT_RENAMED,
+    AGENT_SESSION_STATS_CHANGED, AGENT_UPDATED,
+};
 use intent_core::{ActorType, Event, EventActor, SessionStats};
 
 use crate::{EventBus, SubscriptionFilter};
 
-use crate::agent_ops::{parse_model_list_output, parse_session_stats_output, static_models};
+use crate::agent_ops::{
+    finalize_model_rows, parse_model_list_json, parse_model_list_output,
+    parse_session_stats_output, static_models,
+};
 use crate::Services;
+use intent_core::MAX_DELEGATION_DEPTH;
 
 struct TempDb {
     path: PathBuf,
@@ -138,7 +145,7 @@ async fn delete_emits_agent_deleted_scoped_to_workspace() {
         ..Default::default()
     });
 
-    let r = svc.agent_delete_op(id.clone()).await.expect("delete");
+    let r = svc.agent_delete_op(id.clone(), None).await.expect("delete");
     assert_eq!(r["success"], json!(true));
 
     let batch = timeout(Duration::from_secs(2), sub.recv())
@@ -161,7 +168,7 @@ async fn delete_skips_emit_when_session_already_gone() {
 
     let missing = AgentId::from("agent-00000000-0000-0000-0000-00000missing0");
     let r = svc
-        .agent_delete_op(missing)
+        .agent_delete_op(missing, None)
         .await
         .expect("idempotent delete");
     assert_eq!(r["success"], json!(true));
@@ -272,7 +279,7 @@ async fn create_then_list_and_get_projects_agent_lite() {
     assert_eq!(agents[0].name, "Builder");
     assert_eq!(agents[0].message_count, 0);
 
-    let got = svc.agent_get_op(id.clone()).await.expect("get");
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
     assert_eq!(got.id, id);
     assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
 }
@@ -302,7 +309,10 @@ async fn agent_create_honors_client_supplied_agent_id() {
     assert_eq!(created["agent"]["id"].as_str(), Some(requested.0.as_str()));
     // Round-trip through the store proves the session is addressable at the
     // client-supplied id.
-    let got = svc.agent_get_op(requested.clone()).await.expect("get");
+    let got = svc
+        .agent_get_op(requested.clone(), None)
+        .await
+        .expect("get");
     assert_eq!(got.id, requested);
 }
 
@@ -352,7 +362,7 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
         .expect("create");
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-    let lite = svc.agent_get_op(id).await.expect("get");
+    let lite = svc.agent_get_op(id, None).await.expect("get");
     let v = serde_json::to_value(&lite).unwrap();
     // Nested metadata object (iOS `parseAgent` reads metadata.specialist /
     // isBackground / createdByAgentId).
@@ -402,7 +412,7 @@ async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
         None,
     );
 
-    let lite = svc.agent_get_op(parent.clone()).await.expect("get");
+    let lite = svc.agent_get_op(parent.clone(), None).await.expect("get");
     let v = serde_json::to_value(&lite).unwrap();
     assert_eq!(v["isResponding"], true);
     assert_eq!(v["isWaitingOnTool"], true);
@@ -433,7 +443,8 @@ async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
             }),
         ],
     );
-    let v = serde_json::to_value(svc.agent_get_op(parent.clone()).await.expect("get")).unwrap();
+    let v =
+        serde_json::to_value(svc.agent_get_op(parent.clone(), None).await.expect("get")).unwrap();
     assert_eq!(v["isResponding"], true);
     assert_eq!(v["isWaitingOnTool"], false);
     assert_eq!(v["isWaitingForOtherAgents"], true);
@@ -449,12 +460,13 @@ async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
         true,
         None,
     );
-    let v = serde_json::to_value(svc.agent_get_op(parent.clone()).await.expect("get")).unwrap();
+    let v =
+        serde_json::to_value(svc.agent_get_op(parent.clone(), None).await.expect("get")).unwrap();
     assert_eq!(v["waitingForAgentIds"], json!([child.0]));
 
     // The child has no worker and parents no watches: every flag false and the
     // waiting-on id list is the empty array (never null/omitted).
-    let cv = serde_json::to_value(svc.agent_get_op(child).await.expect("get")).unwrap();
+    let cv = serde_json::to_value(svc.agent_get_op(child, None).await.expect("get")).unwrap();
     assert_eq!(cv["isResponding"], false);
     assert_eq!(cv["isWaitingOnTool"], false);
     assert_eq!(cv["isWaitingForOtherAgents"], false);
@@ -481,7 +493,7 @@ async fn agent_lite_metadata_created_by_agent_id_from_parent() {
         .expect("create child");
     let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-    let lite = svc.agent_get_op(child).await.expect("get");
+    let lite = svc.agent_get_op(child, None).await.expect("get");
     let v = serde_json::to_value(&lite).unwrap();
     assert_eq!(v["metadata"]["createdByAgentId"], parent.0);
     // No specialist supplied → omitted from metadata.
@@ -497,7 +509,7 @@ async fn agent_lite_derives_last_user_message() {
         .append_agent_message(&id, "user", &content, &now_iso())
         .await
         .expect("append");
-    let lite = svc.agent_get_op(id).await.expect("get");
+    let lite = svc.agent_get_op(id, None).await.expect("get");
     assert_eq!(
         lite.last_user_message.as_deref(),
         Some("please do the thing")
@@ -508,7 +520,10 @@ async fn agent_lite_derives_last_user_message() {
 async fn get_unknown_agent_is_not_found() {
     let (_t, svc, _ws) = setup().await;
     let err = svc
-        .agent_get_op(AgentId::from("agent-00000000-0000-0000-0000-000000000000"))
+        .agent_get_op(
+            AgentId::from("agent-00000000-0000-0000-0000-000000000000"),
+            None,
+        )
         .await
         .expect_err("missing");
     assert!(matches!(err, Error::NotFound(_)));
@@ -548,7 +563,7 @@ async fn get_conversation_truncates_to_limit() {
             .expect("append");
     }
     let res = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None)
         .await
         .expect("conv");
     assert_eq!(res["totalMessages"], 5);
@@ -579,7 +594,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
 
     // Page 1: newest two, oldest→newest within the page, nextToken present.
     let p1 = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None)
         .await
         .expect("p1");
     assert_eq!(p1["totalMessages"], 5);
@@ -594,7 +609,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
 
     // Page 2 follows the token to the next-older window.
     let p2 = svc
-        .agent_get_conversation_op(id.clone(), Some(2), Some(t1))
+        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t1))
         .await
         .expect("p2");
     let m2 = p2["messages"].as_array().unwrap();
@@ -604,7 +619,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
 
     // Page 3 is the final page: oldest message, no further token.
     let p3 = svc
-        .agent_get_conversation_op(id.clone(), Some(2), Some(t2))
+        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t2))
         .await
         .expect("p3");
     let m3 = p3["messages"].as_array().unwrap();
@@ -616,13 +631,13 @@ async fn get_conversation_paginates_with_opaque_next_token() {
     // No limit → default page returns all five with no token; an over-max limit
     // clamps to 200 and likewise fits all five in one page.
     let all = svc
-        .agent_get_conversation_op(id.clone(), None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None)
         .await
         .expect("all");
     assert_eq!(all["messages"].as_array().unwrap().len(), 5);
     assert!(all["nextToken"].is_null());
     let clamped = svc
-        .agent_get_conversation_op(id, Some(10_000), None)
+        .agent_get_conversation_op(id, Some(10_000), None, None)
         .await
         .expect("clamped");
     assert_eq!(clamped["messages"].as_array().unwrap().len(), 5);
@@ -634,14 +649,14 @@ async fn rename_and_set_model_persist() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Old").await;
     let r = svc
-        .agent_rename_op(id.clone(), "New".into())
+        .agent_rename_op(id.clone(), "New".into(), false)
         .await
         .expect("rename");
     assert_eq!(r["name"], "New");
     svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into())
         .await
         .expect("setModel");
-    let got = svc.agent_get_op(id).await.expect("get");
+    let got = svc.agent_get_op(id, None).await.expect("get");
     assert_eq!(got.name, "New");
     assert!(got.name_explicitly_set);
     assert_eq!(got.model.as_deref(), Some("auggie:opus4.7"));
@@ -654,19 +669,379 @@ async fn rename_missing_agent_is_internal() {
         .agent_rename_op(
             AgentId::from("agent-00000000-0000-0000-0000-000000000000"),
             "x".into(),
+            false,
         )
         .await
         .expect_err("missing");
     assert!(matches!(err, Error::Internal(_)));
 }
 
+/// `agent.rename` `skipIfExplicitlySet` (P3-1.2b): an explicitly-named session
+/// is left untouched (`skipped: true`, existing name echoed); an auto-named
+/// session is renamed normally, after which the skip flag holds.
+#[tokio::test]
+async fn rename_skip_if_explicitly_set() {
+    let (_t, svc, ws) = setup().await;
+    // `create_agent` supplies a name -> nameExplicitlySet = true.
+    let explicit = create_agent(&svc, &ws, "Named").await;
+    let r = svc
+        .agent_rename_op(explicit.clone(), "Clobber".into(), true)
+        .await
+        .expect("skip rename");
+    assert_eq!(r["success"], json!(true));
+    assert_eq!(r["skipped"], json!(true));
+    assert_eq!(r["name"], "Named");
+    let got = svc.agent_get_op(explicit, None).await.expect("get");
+    assert_eq!(got.name, "Named");
+
+    // No client name -> auto-generated, nameExplicitlySet = false: the
+    // skip-guarded rename applies (and `skipped` is absent from the result).
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create auto-named");
+    let auto = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let r = svc
+        .agent_rename_op(auto.clone(), "Chosen".into(), true)
+        .await
+        .expect("rename");
+    assert_eq!(r["name"], "Chosen");
+    assert!(r.get("skipped").is_none());
+    let got = svc.agent_get_op(auto.clone(), None).await.expect("get");
+    assert_eq!(got.name, "Chosen");
+    assert!(got.name_explicitly_set);
+    // Now explicitly set -> a further skip-guarded rename is a no-op.
+    let r = svc
+        .agent_rename_op(auto, "Again".into(), true)
+        .await
+        .expect("skip");
+    assert_eq!(r["skipped"], json!(true));
+    assert_eq!(r["name"], "Chosen");
+}
+
+/// `agent.create` harvests the persistence-gap fields (P3-1.2b) from the
+/// `metadata` spawn hint / top-level params and re-serves them via
+/// `agent.get`/`agent.list`: `metadata.delegationDepth`, `metadata.initialMessage`,
+/// session-level `contextReferences` / `imageBlocks`, and
+/// `metadata.isBackground` (G-A1/P3-1.2c).
+#[tokio::test]
+async fn create_persists_and_reserves_gap_fields() {
+    let (_t, svc, ws) = setup().await;
+    let extra = intent_core::AgentCreateExtra {
+        metadata: Some(json!({
+            "delegationDepth": 2,
+            "initialMessage": "start here",
+            "contextReferences": [{ "type": "file", "path": "src/a.rs" }],
+            "isBackground": true,
+        })),
+        image_blocks: Some(json!([{ "type": "image", "data": "abc" }])),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Gaps".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            extra,
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    // Re-served on `agent.get` (session-level fields + nested metadata).
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    let v = serde_json::to_value(&got).expect("lite json");
+    assert_eq!(v["metadata"]["delegationDepth"], json!(2));
+    assert_eq!(v["metadata"]["initialMessage"], "start here");
+    assert_eq!(
+        v["contextReferences"],
+        json!([{ "type": "file", "path": "src/a.rs" }])
+    );
+    assert_eq!(
+        v["imageBlocks"],
+        json!([{ "type": "image", "data": "abc" }])
+    );
+    assert_eq!(v["metadata"]["isBackground"], json!(true));
+
+    // And on `agent.list`.
+    let agents = svc.agent_list_op(ws).await.expect("list");
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0].metadata.delegation_depth, Some(2));
+    assert!(agents[0].metadata.is_background);
+}
+
+/// The top-level `isBackground` param wins over the `metadata` fallback, and
+/// an agent created with neither defaults to foreground (G-A1/P3-1.2c).
+#[tokio::test]
+async fn create_is_background_top_level_wins_and_defaults_false() {
+    let (_t, svc, ws) = setup().await;
+
+    // Top-level `false` beats `metadata.isBackground: true`.
+    let extra = intent_core::AgentCreateExtra {
+        metadata: Some(json!({ "isBackground": true })),
+        is_background: Some(false),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("FG".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            extra,
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let got = svc.agent_get_op(id, None).await.expect("get");
+    let v = serde_json::to_value(&got).expect("lite json");
+    assert_eq!(v["metadata"]["isBackground"], json!(false));
+
+    // Neither param nor metadata → defaults to foreground.
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Plain".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            intent_core::AgentCreateExtra::default(),
+        )
+        .await
+        .expect("create plain");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let got = svc.agent_get_op(id, None).await.expect("get plain");
+    let v = serde_json::to_value(&got).expect("lite json");
+    assert_eq!(v["metadata"]["isBackground"], json!(false));
+}
+
+/// `agent.create` / `agent.rename` / `agent.setModel` emit their `agent:*`
+/// invalidation events (P3-1.2b): `agent:created`, `agent:renamed`,
+/// `agent:updated`.
+#[tokio::test]
+async fn create_rename_set_model_emit_agent_events() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![
+            AGENT_CREATED.to_string(),
+            AGENT_RENAMED.to_string(),
+            AGENT_UPDATED.to_string(),
+        ],
+        ..Default::default()
+    });
+
+    let id = create_agent(&svc, &ws, "Evented").await;
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("created recv")
+        .expect("sub closed");
+    assert_eq!(batch[0].event_type, AGENT_CREATED);
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
+
+    svc.agent_rename_op(id.clone(), "Renamed".into(), false)
+        .await
+        .expect("rename");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("renamed recv")
+        .expect("sub closed");
+    assert_eq!(batch[0].event_type, AGENT_RENAMED);
+    assert_eq!(batch[0].data["name"], "Renamed");
+
+    svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into())
+        .await
+        .expect("setModel");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("updated recv")
+        .expect("sub closed");
+    assert_eq!(batch[0].event_type, AGENT_UPDATED);
+    assert_eq!(batch[0].data["modelId"], "auggie:opus4.7");
+}
+
+/// A skipped rename mutates nothing and therefore emits no `agent:renamed`.
+#[tokio::test]
+async fn skipped_rename_emits_no_event() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Named").await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_RENAMED.to_string()],
+        ..Default::default()
+    });
+    let r = svc
+        .agent_rename_op(id, "Clobber".into(), true)
+        .await
+        .expect("skip");
+    assert_eq!(r["skipped"], json!(true));
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "no agent:renamed expected for a skipped rename"
+    );
+}
+
+/// `agent.reportToParent` persists `completionReport` /
+/// `completionReportTimestamp` on the child session (re-served under
+/// `metadata` by `agent.get`) in addition to delivering to the parent
+/// (P3-1.2b).
+#[tokio::test]
+async fn report_to_parent_persists_completion_report() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let r = svc
+        .agent_report_to_parent_op(ws.clone(), json!("all done"), Some(child.clone()))
+        .await
+        .expect("report");
+    assert_eq!(r["ok"], json!(true));
+    assert_eq!(r["parentAgentId"].as_str(), Some(parent.0.as_str()));
+
+    let got = svc.agent_get_op(child, None).await.expect("get child");
+    let v = serde_json::to_value(&got).expect("lite json");
+    assert_eq!(v["metadata"]["completionReport"], "all done");
+    assert_eq!(v["metadata"]["completionReportTimestamp"], r["savedAt"]);
+}
+
+/// `agent.delegate` persists the resolved first message as
+/// `metadata.initialMessage` and the child's `metadata.delegationDepth`
+/// (parent depth + 1) so a wake-up can resume (P3-1.2b). Delegated children
+/// are background agents (G-A1/P3-1.2c).
+#[tokio::test]
+async fn delegate_persists_initial_message_and_delegation_depth() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let out = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("Do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(out["agentId"].as_str().unwrap());
+    let got = svc.agent_get_op(child, None).await.expect("get child");
+    let v = serde_json::to_value(&got).expect("lite json");
+    assert_eq!(v["metadata"]["initialMessage"], "Do the thing");
+    assert_eq!(v["metadata"]["delegationDepth"], json!(1));
+    assert_eq!(v["metadata"]["isBackground"], json!(true));
+}
+
+/// Port of the reference `MAX_DELEGATION_DEPTH` guard: a caller already at the
+/// max depth cannot delegate further, and the error carries the depth in its
+/// message so downstream tools can render it verbatim.
+#[tokio::test]
+async fn delegate_rejects_when_parent_at_max_depth() {
+    let (_t, svc, ws) = setup().await;
+    // Create a parent already at depth 2 (MAX_DELEGATION_DEPTH).
+    let extra = intent_core::AgentCreateExtra {
+        metadata: Some(json!({ "delegationDepth": intent_core::MAX_DELEGATION_DEPTH })),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("MaxDepth".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            extra,
+        )
+        .await
+        .expect("create parent at max depth");
+    let parent = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("still trying".into()),
+                ..Default::default()
+            },
+            Some(parent),
+        )
+        .await
+        .expect_err("delegate must be refused at max depth");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("maximum delegation depth"),
+        "unexpected err: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("({})", intent_core::MAX_DELEGATION_DEPTH)),
+        "missing depth in err: {msg}"
+    );
+}
+
+/// The top-level (RPC / user) front door stays parentless and is never
+/// subject to the depth guard even when a foreground parent exists.
+#[tokio::test]
+async fn delegate_without_parent_bypasses_depth_guard() {
+    let (_t, svc, ws) = setup().await;
+    // No caller_agent_id: this is the top-level create path.
+    let out = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("user-initiated".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("parentless delegate succeeds");
+    assert!(out["agentId"].is_string());
+}
+
 #[tokio::test]
 async fn delete_removes_session() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Doomed").await;
-    let r = svc.agent_delete_op(id.clone()).await.expect("delete");
+    let r = svc.agent_delete_op(id.clone(), None).await.expect("delete");
     assert_eq!(r["success"], true);
-    assert!(svc.agent_get_op(id).await.is_err());
+    assert!(svc.agent_get_op(id, None).await.is_err());
 }
 
 #[tokio::test]
@@ -674,7 +1049,7 @@ async fn queue_lifecycle_add_get_edit_remove() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Q").await;
     let added = svc
-        .agent_queue_message_op(id.clone(), "hello".into(), None)
+        .agent_queue_message_op(id.clone(), "hello".into(), None, None)
         .await
         .expect("queue");
     assert_eq!(added["success"], true);
@@ -685,7 +1060,10 @@ async fn queue_lifecycle_add_get_edit_remove() {
     assert!(added["queuedMessage"].get("createdAt").is_none());
     assert!(added["queuedMessage"].get("agentId").is_none());
 
-    let q = svc.agent_get_queue_op(id.clone()).await.expect("getQueue");
+    let q = svc
+        .agent_get_queue_op(id.clone(), None)
+        .await
+        .expect("getQueue");
     assert_eq!(q["success"], true);
     assert_eq!(q["queue"].as_array().unwrap().len(), 1);
     assert_eq!(q["queue"][0]["content"], "hello");
@@ -697,13 +1075,16 @@ async fn queue_lifecycle_add_get_edit_remove() {
         .await
         .expect("edit");
     assert_eq!(edited["queuedMessage"]["position"], 0);
-    let q = svc.agent_get_queue_op(id.clone()).await.expect("getQueue");
+    let q = svc
+        .agent_get_queue_op(id.clone(), None)
+        .await
+        .expect("getQueue");
     assert_eq!(q["queue"][0]["content"], "edited");
 
     svc.agent_remove_queued_message_op(id.clone(), mid)
         .await
         .expect("remove");
-    let q = svc.agent_get_queue_op(id).await.expect("getQueue");
+    let q = svc.agent_get_queue_op(id, None).await.expect("getQueue");
     assert_eq!(q["queue"].as_array().unwrap().len(), 0);
 }
 
@@ -759,7 +1140,7 @@ async fn queue_message_emits_queue_updated_with_snapshot() {
     });
 
     let added = svc
-        .agent_queue_message_op(id.clone(), "first".into(), None)
+        .agent_queue_message_op(id.clone(), "first".into(), None, None)
         .await
         .expect("queue");
     let mid = added["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -789,7 +1170,7 @@ async fn remove_queued_message_emits_queue_updated_only_when_present() {
 
     // Seed one queued message, then drain the events for the seed enqueue.
     let added = svc
-        .agent_queue_message_op(id.clone(), "first".into(), None)
+        .agent_queue_message_op(id.clone(), "first".into(), None, None)
         .await
         .expect("queue");
     let mid = added["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -835,12 +1216,12 @@ async fn editing_flag_excludes_message_from_dequeue() {
     let id = create_agent(&svc, &ws, "Q").await;
 
     let a = svc
-        .agent_queue_message_op(id.clone(), "first".into(), None)
+        .agent_queue_message_op(id.clone(), "first".into(), None, None)
         .await
         .expect("queue first");
     let a_mid = a["queuedMessage"]["id"].as_str().unwrap().to_string();
     let b = svc
-        .agent_queue_message_op(id.clone(), "second".into(), None)
+        .agent_queue_message_op(id.clone(), "second".into(), None, None)
         .await
         .expect("queue second");
     let b_mid = b["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -887,7 +1268,7 @@ async fn clearing_editing_flag_emits_queue_updated() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let id = create_agent(&svc, &ws, "Q").await;
     let added = svc
-        .agent_queue_message_op(id.clone(), "draft".into(), None)
+        .agent_queue_message_op(id.clone(), "draft".into(), None, None)
         .await
         .expect("queue");
     let mid = added["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -941,7 +1322,7 @@ async fn send_message_delivers_when_agent_exists() {
     assert_eq!(r["queued"], false);
     assert_eq!(r["messageId"], "m1");
     let conv = svc
-        .agent_get_conversation_op(id, None, None)
+        .agent_get_conversation_op(id, None, None, None)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
@@ -1013,6 +1394,84 @@ fn parse_model_list_output_extracts_rows() {
     assert_eq!(rows[0].2.as_deref(), Some("Balanced general model"));
     assert_eq!(rows[1].0, "haiku4.5");
     assert_eq!(rows[1].2, None);
+}
+
+#[test]
+fn parse_model_list_json_maps_rich_rows_and_skips_incomplete() {
+    let out = r#"{ "models": [
+        { "shortName": "sonnet4.5", "displayName": "Sonnet 4.5",
+          "description": "Balanced general model", "modelGroupPriority": 1,
+          "costTier": 2, "badges": [{ "color": "green", "label": "Auto" }],
+          "effortLevels": ["low", "high"], "isDefault": true, "priority": 1 },
+        { "shortName": "old-model", "displayName": "Old", "isLegacyModel": true },
+        { "displayName": "No shortName" },
+        { "shortName": "haiku4.5", "displayName": "Haiku", "description": "",
+          "badges": [], "effortLevels": [] }
+    ] }"#;
+    let rows = parse_model_list_json(out).expect("parsed");
+    assert_eq!(rows.len(), 3, "row without shortName is skipped");
+    assert_eq!(rows[0]["id"], "sonnet4.5");
+    assert_eq!(rows[0]["name"], "Sonnet 4.5");
+    assert_eq!(rows[0]["provider"], "auggie");
+    assert_eq!(rows[0]["description"], "Balanced general model");
+    assert_eq!(rows[0]["modelGroupPriority"], 1);
+    assert_eq!(rows[0]["costTier"], 2);
+    assert_eq!(rows[0]["badges"][0]["label"], "Auto");
+    assert_eq!(rows[0]["effortLevels"], json!(["low", "high"]));
+    assert_eq!(rows[0]["isDefault"], true);
+    assert_eq!(rows[0]["priority"], 1);
+    assert_eq!(rows[1]["isLegacyModel"], true);
+    // Empty description / empty arrays are omitted, not emitted as empties.
+    let haiku = rows[2].as_object().unwrap();
+    assert_eq!(haiku["id"], "haiku4.5");
+    assert!(!haiku.contains_key("description"));
+    assert!(!haiku.contains_key("badges"));
+    assert!(!haiku.contains_key("effortLevels"));
+}
+
+#[test]
+fn parse_model_list_json_rejects_non_catalog_payloads() {
+    assert!(parse_model_list_json("not json").is_none());
+    assert!(parse_model_list_json("{}").is_none());
+    assert!(parse_model_list_json(r#"{ "models": "nope" }"#).is_none());
+}
+
+#[test]
+fn finalize_model_rows_filters_legacy_and_sorts() {
+    let rows = vec![
+        json!({ "id": "z", "name": "Zeta", "provider": "auggie" }),
+        json!({ "id": "old", "name": "Old", "provider": "auggie", "isLegacyModel": true }),
+        json!({ "id": "b", "name": "Beta", "provider": "auggie",
+                "modelGroupPriority": 2, "priority": 1 }),
+        json!({ "id": "a", "name": "Alpha", "provider": "auggie",
+                "modelGroupPriority": 1, "priority": 2 }),
+        json!({ "id": "a2", "name": "Alpha2", "provider": "auggie",
+                "modelGroupPriority": 1, "priority": 1 }),
+    ];
+    let out = finalize_model_rows(rows);
+    let ids: Vec<&str> = out.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    // Group asc, then priority asc, then name; missing priorities sort last.
+    assert_eq!(ids, vec!["a2", "a", "b", "z"]);
+    assert!(out
+        .iter()
+        .all(|r| r.as_object().unwrap().get("isLegacyModel").is_none()));
+}
+
+#[tokio::test]
+async fn models_list_returns_non_empty_catalog_with_source() {
+    let (_t, svc, _ws) = setup().await;
+    let res = svc.models_list_op().await.expect("models.list");
+    let models = res["models"].as_array().unwrap();
+    assert!(!models.is_empty());
+    assert!(models[0].get("id").is_some());
+    assert!(models[0].get("name").is_some());
+    assert!(models[0].get("provider").is_some());
+    let source = res["source"].as_str().unwrap();
+    assert!(source == "auggie" || source == "static", "source: {source}");
+    // A second call is served from the cache (auggie) or recomputed statics —
+    // either way the result is stable within the TTL window.
+    let again = svc.models_list_op().await.expect("models.list again");
+    assert_eq!(res, again);
 }
 
 #[tokio::test]
@@ -1492,7 +1951,7 @@ async fn delegate_skips_watch_when_parent_deleted() {
         .expect("parent session");
     session.status = intent_core::AgentStatus::Deleted;
     svc.store()
-        .update_agent_session(&session)
+        .update_agent_session(&session.workspace_id.clone(), &session)
         .await
         .expect("flag deleted");
 
@@ -1571,7 +2030,7 @@ async fn delegate_delivers_agent_instructions_as_child_first_message() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child.clone(), None, None)
+        .agent_get_conversation_op(child.clone(), None, None, None)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1, "child got exactly one message");
@@ -1600,7 +2059,7 @@ async fn delegate_falls_back_to_task_text_for_child_first_message() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child.clone(), None, None)
+        .agent_get_conversation_op(child.clone(), None, None, None)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
@@ -1658,7 +2117,7 @@ async fn delegate_falls_back_to_task_note_content_for_child_first_message() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child.clone(), None, None)
+        .agent_get_conversation_op(child.clone(), None, None, None)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
@@ -1679,7 +2138,7 @@ async fn delegate_without_message_source_delivers_nothing() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child, None, None)
+        .agent_get_conversation_op(child, None, None, None)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 0, "no message delivered");
@@ -2310,8 +2769,745 @@ async fn session_stats_emits_only_on_change() {
 async fn get_session_stats_unknown_session_is_not_found() {
     let (_t, svc, _ws) = setup().await;
     let err = svc
-        .agent_get_session_stats_op(AgentId::from("agent-00000000-0000-0000-0000-00000missing0"))
+        .agent_get_session_stats_op(
+            AgentId::from("agent-00000000-0000-0000-0000-00000missing0"),
+            None,
+        )
         .await
         .expect_err("unknown session");
     assert!(matches!(err, Error::NotFound(_)));
+}
+
+// -- A8: agent.getSession / agent.update / agent.appendMessage / agent.replaceMessages --
+
+/// `agent.getSession` returns the full [`AgentSession`] projection, including
+/// the `systemPrompt`/`specialist`/persisted-metadata fields that [`AgentLite`]
+/// strips (PROTOCOL §5.5, C1d/C1e). Also round-trips the `messages` log so a
+/// `loadAgent` caller does not need a second `agent.getConversation` call.
+#[tokio::test]
+async fn agent_get_session_projects_full_session_shape() {
+    let (_t, svc, ws) = setup().await;
+    // Create with a `specialistId` so the session carries a persisted specialist
+    // (the projection field `agent.get`/AgentLite strips into `metadata`).
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Full".into()),
+            Some("auggie:sonnet4.5".into()),
+            Some("implementor".into()),
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    // Directly set a systemPrompt via the update op so we can then read it back
+    // via getSession (systemPrompt is stripped from AgentLite).
+    svc.agent_update_op(
+        id.clone(),
+        json!({ "systemPrompt": "you are a helpful agent" }),
+    )
+    .await
+    .expect("update systemPrompt");
+    let session = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("getSession");
+    assert_eq!(session.id, id);
+    assert_eq!(session.name, "Full");
+    assert_eq!(session.specialist.as_deref(), Some("implementor"));
+    assert_eq!(
+        session.system_prompt.as_deref(),
+        Some("you are a helpful agent")
+    );
+    assert!(session.messages.is_empty());
+}
+
+#[tokio::test]
+async fn agent_get_session_unknown_agent_is_not_found() {
+    let (_t, svc, _ws) = setup().await;
+    let err = svc
+        .agent_get_session_op(AgentId::from("agent-00000000-0000-0000-0000-00000missing0"))
+        .await
+        .expect_err("unknown agent");
+    assert!(matches!(err, Error::NotFound(_)));
+}
+
+/// `agent.update` patches only listed fields; omitted fields survive the write.
+/// Emits `agent:updated` with the payload the client sent.
+#[tokio::test]
+async fn agent_update_patches_listed_fields_and_emits_updated() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Patch").await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    let r = svc
+        .agent_update_op(
+            id.clone(),
+            json!({
+                "systemPrompt": "patched",
+                "isBackground": true,
+                "delegationDepth": 2,
+            }),
+        )
+        .await
+        .expect("update");
+    assert_eq!(r["success"], json!(true));
+
+    let session = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("getSession");
+    assert_eq!(session.system_prompt.as_deref(), Some("patched"));
+    assert!(session.is_background);
+    assert_eq!(session.delegation_depth, Some(2));
+    // Name (unmutated) survives.
+    assert_eq!(session.name, "Patch");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv")
+        .expect("open");
+    assert!(batch.iter().any(
+        |e| e.event_type == AGENT_UPDATED && e.data["agentId"].as_str() == Some(id.0.as_str())
+    ));
+}
+
+/// Name-only updates fold into `agent:renamed` (not `agent:updated`), matching
+/// the existing `agent.rename` semantics.
+#[tokio::test]
+async fn agent_update_name_only_emits_agent_renamed() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "OldName").await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_RENAMED.to_string()],
+        ..Default::default()
+    });
+
+    svc.agent_update_op(id.clone(), json!({ "name": "NewName" }))
+        .await
+        .expect("update");
+
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    assert_eq!(session.name, "NewName");
+    assert!(session.name_explicitly_set);
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv")
+        .expect("open");
+    assert!(batch.iter().any(|e| e.event_type == AGENT_RENAMED));
+}
+
+/// Unknown fields in `changes` surface as `-32602` so callers cannot smuggle
+/// stray keys that would silently no-op.
+#[tokio::test]
+async fn agent_update_rejects_unknown_field() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Strict").await;
+    let err = svc
+        .agent_update_op(id, json!({ "unknownKey": "x" }))
+        .await
+        .expect_err("unknown field");
+    assert!(matches!(err, Error::InvalidParams(_)));
+}
+
+/// The immutable/write-once invariants on `provider`/`acpSessionId` are still
+/// enforced by the store; `agent.update` surfaces them verbatim.
+#[tokio::test]
+async fn agent_update_respects_store_invariants() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Locked").await;
+    svc.agent_update_op(id.clone(), json!({ "acpSessionId": "sess-first" }))
+        .await
+        .expect("first set");
+    let err = svc
+        .agent_update_op(id, json!({ "acpSessionId": "sess-second" }))
+        .await
+        .expect_err("write-once");
+    assert!(matches!(err, Error::Internal(_)));
+}
+
+/// `agent.appendMessage` inserts one row and emits `agent:message`.
+#[tokio::test]
+async fn agent_append_message_persists_and_emits() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Appender").await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_MESSAGE.to_string()],
+        ..Default::default()
+    });
+
+    let r = svc
+        .agent_append_message_op(
+            id.clone(),
+            "user".into(),
+            json!([{ "type": "text", "text": "hello" }]),
+            None,
+        )
+        .await
+        .expect("append");
+    assert_eq!(r["success"], json!(true));
+    assert_eq!(r["message"]["role"], json!("user"));
+    assert_eq!(r["message"]["seq"], json!(0));
+
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    assert_eq!(session.messages.len(), 1);
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv")
+        .expect("open");
+    assert!(batch.iter().any(|e| e.event_type == AGENT_MESSAGE));
+}
+
+#[tokio::test]
+async fn agent_append_message_rejects_bad_role() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "RoleGuard").await;
+    let err = svc
+        .agent_append_message_op(id, "bogus".into(), json!([]), None)
+        .await
+        .expect_err("bad role");
+    assert!(matches!(err, Error::InvalidParams(_)));
+}
+
+/// `agent.replaceMessages` atomically swaps the transcript with fresh
+/// `seq: 0..n` values under freshly-minted row ids.
+#[tokio::test]
+async fn agent_replace_messages_swaps_transcript_atomically() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Swapper").await;
+    // Prime with two messages so we can prove the swap replaces rather than
+    // appends.
+    for i in 0..2 {
+        svc.agent_append_message_op(
+            id.clone(),
+            "user".into(),
+            json!([{ "type": "text", "text": format!("old {i}") }]),
+            None,
+        )
+        .await
+        .expect("append");
+    }
+
+    let r = svc
+        .agent_replace_messages_op(
+            id.clone(),
+            json!([
+                { "role": "user", "contentBlocks": [{ "type": "text", "text": "new0" }] },
+                { "role": "assistant", "contentBlocks": [{ "type": "text", "text": "new1" }] },
+            ]),
+        )
+        .await
+        .expect("replace");
+    assert_eq!(r["success"], json!(true));
+
+    let session = svc.agent_get_session_op(id).await.expect("get");
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.messages[0].seq, 0);
+    assert_eq!(session.messages[1].seq, 1);
+    assert_eq!(session.messages[0].role, "user");
+    assert_eq!(session.messages[1].role, "assistant");
+}
+
+#[tokio::test]
+async fn agent_replace_messages_rejects_non_array_and_bad_entries() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "ReplaceGuard").await;
+    let err = svc
+        .agent_replace_messages_op(id.clone(), json!({ "not": "array" }))
+        .await
+        .expect_err("non-array");
+    assert!(matches!(err, Error::InvalidParams(_)));
+    let err = svc
+        .agent_replace_messages_op(id, json!([{ "role": "user" }]))
+        .await
+        .expect_err("missing content");
+    assert!(matches!(err, Error::InvalidParams(_)));
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// `agent.wakeOrCreate` widening (C1d-10a) — behaviors B1-B8 + backward compat.
+// Each test seeds a task note via `mark_as_task` and drives the widened
+// service op directly so it doesn't depend on the runtime `AgentManager`.
+// ────────────────────────────────────────────────────────────────────────────
+
+use intent_core::{AgentCreateExtra, AgentWakeCreateOptions, AgentWakeOrCreateInput, NoteId};
+
+async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: title.into(),
+                content: Some(format!("{title} body")),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    svc.mark_as_task(
+        ws.clone(),
+        note.id.clone(),
+        "not_started".into(),
+        vec![],
+        None,
+    )
+    .await
+    .expect("markAsTask");
+    note.id
+}
+
+fn wake_input(model: Option<&str>) -> AgentWakeOrCreateInput {
+    AgentWakeOrCreateInput {
+        model: model.map(str::to_string),
+        ..Default::default()
+    }
+}
+
+/// The pre-widening 3-required-params shape (`model` only) still creates and
+/// assigns when the task has no prior agent; response carries the widened
+/// `action`/`agentName`/`taskTitle` fields and `created: true`.
+#[tokio::test]
+async fn wake_or_create_backcompat_create_branch_widened_response() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Ship it").await;
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "go".into(), wake_input(None))
+        .await
+        .expect("wake");
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["created"], true);
+    assert_eq!(resp["action"], "created_new");
+    assert_eq!(resp["taskTitle"], "Ship it");
+    assert_eq!(resp["agentName"], "Task: Ship it");
+    assert!(resp.get("cleanedUpAgentIds").is_none());
+}
+
+/// B1: newest-first. When the task has an older assignment plus a newer live
+/// one, the newer one is woken (not the oldest) and `created: false`.
+#[tokio::test]
+async fn wake_or_create_wakes_newest_of_multiple_assignments() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Multi").await;
+    // Two live sessions assigned in order: old first, then new.
+    let old = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("old".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create old");
+    let new = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("new".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create new");
+    let old_id = old["agent"]["id"].as_str().unwrap().to_string();
+    let new_id = new["agent"]["id"].as_str().unwrap().to_string();
+    svc.assign_agent(ws.clone(), note_id.clone(), old_id.clone())
+        .await
+        .expect("assign old");
+    svc.assign_agent(ws.clone(), note_id.clone(), new_id.clone())
+        .await
+        .expect("assign new");
+
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "wake".into(), wake_input(None))
+        .await
+        .expect("wake");
+    assert_eq!(resp["created"], false);
+    assert_eq!(resp["agentId"], new_id);
+    assert_eq!(resp["agentName"], "new");
+    assert_eq!(resp["action"], "woke_existing");
+}
+
+/// B2: stale earlier assignment (session gone) is skipped, cleaned up from
+/// the task's `assigned_agent_ids`, and reported in `cleanedUpAgentIds`; the
+/// older-but-live agent is woken.
+#[tokio::test]
+async fn wake_or_create_skips_stale_and_reports_cleanup() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Stale").await;
+    // A live agent + a stale (deleted) agent assigned later so the reverse
+    // iteration hits the stale one first and falls through to the live one.
+    let live = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("live".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create live");
+    let stale = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("stale".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create stale");
+    let live_id = live["agent"]["id"].as_str().unwrap().to_string();
+    let stale_id = stale["agent"]["id"].as_str().unwrap().to_string();
+    svc.assign_agent(ws.clone(), note_id.clone(), live_id.clone())
+        .await
+        .expect("assign live");
+    svc.assign_agent(ws.clone(), note_id.clone(), stale_id.clone())
+        .await
+        .expect("assign stale");
+    // Wipe the stale session so its assignment becomes NotFound-stale.
+    svc.agent_delete_op(AgentId::from(stale_id.as_str()), None)
+        .await
+        .expect("delete stale");
+
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id.clone(), "hi".into(), wake_input(None))
+        .await
+        .expect("wake");
+    assert_eq!(resp["created"], false);
+    assert_eq!(resp["agentId"], live_id);
+    assert_eq!(
+        resp["cleanedUpAgentIds"],
+        json!([AgentId::from(stale_id.as_str())])
+    );
+
+    // Stale id is stripped from the task's assigned_agent_ids.
+    let note = svc.get_note(ws, note_id).await.expect("note");
+    let task = note.task.expect("task");
+    assert!(task
+        .assigned_agent_ids
+        .iter()
+        .all(|a| a.as_str() != stale_id));
+}
+
+/// B3: delegation-depth guard rejects when the explicit `delegationDepth`
+/// meets or exceeds `MAX_DELEGATION_DEPTH` with an `InvalidParams` error.
+#[tokio::test]
+async fn wake_or_create_depth_guard_rejects_at_cap() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Deep").await;
+    let input = AgentWakeOrCreateInput {
+        delegation_depth: Some(MAX_DELEGATION_DEPTH),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_wake_or_create_op(ws, note_id, "go".into(), input)
+        .await
+        .expect_err("must reject");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("MAX_DELEGATION_DEPTH")),
+        "expected InvalidParams MAX_DELEGATION_DEPTH, got {err:?}",
+    );
+}
+
+/// B3 (compute path): when `delegationDepth` is omitted but `callerAgentId`
+/// is provided, the guard reads the caller session's `metadata.delegationDepth`.
+#[tokio::test]
+async fn wake_or_create_depth_guard_reads_caller_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Caller").await;
+    // Seed a caller session at depth == MAX_DELEGATION_DEPTH so the guard
+    // trips through the caller lookup path.
+    let caller = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("caller".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            AgentCreateExtra {
+                metadata: Some(json!({ "delegationDepth": MAX_DELEGATION_DEPTH })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create caller");
+    let caller_id = caller["agent"]["id"].as_str().unwrap().to_string();
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(AgentId::from(caller_id.as_str())),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_wake_or_create_op(ws, note_id, "go".into(), input)
+        .await
+        .expect_err("must reject");
+    assert!(matches!(err, Error::InvalidParams(_)));
+}
+
+/// B4 + B5 + B6: specialist inherits from the newest previous session; the
+/// rich create payload (name / contextReferences / metadata / skipAutoCommit)
+/// lands on the persisted session row so a child wake can read it back.
+#[tokio::test]
+async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Inherit").await;
+    // Previous session with a specialist that should be inherited.
+    let prev = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("prev".into()),
+            Some("gpt-4".into()),
+            Some("implementor".into()),
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create prev");
+    let prev_id = prev["agent"]["id"].as_str().unwrap().to_string();
+    svc.assign_agent(ws.clone(), note_id.clone(), prev_id.clone())
+        .await
+        .expect("assign prev");
+    // Flip the previous session to `Deleted` (row stays, marked as
+    // non-resumable) so wake falls through to the create branch while the
+    // inheritance source can still read specialist/model from the row.
+    let mut prev_session = svc
+        .store()
+        .get_agent_session(&AgentId::from(prev_id.as_str()))
+        .await
+        .expect("load prev");
+    prev_session.status = intent_core::AgentStatus::Deleted;
+    prev_session.updated_at = intent_core::now_iso();
+    svc.store()
+        .update_agent_session(&prev_session.workspace_id.clone(), &prev_session)
+        .await
+        .expect("mark prev deleted");
+
+    let input = AgentWakeOrCreateInput {
+        create: Some(AgentWakeCreateOptions {
+            name: Some("Explicit Name".into()),
+            context_references: Some(json!([{ "type": "note", "id": "note-1" }])),
+            metadata: Some(json!({ "custom": "field" })),
+            skip_auto_commit: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "go".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["created"], true);
+    assert_eq!(resp["action"], "created_new");
+    assert_eq!(resp["agentName"], "Explicit Name");
+
+    // Verify the new session persisted the rich payload.
+    let new_id = resp["agentId"].as_str().unwrap();
+    let session = svc
+        .store()
+        .get_agent_session(&AgentId::from(new_id))
+        .await
+        .expect("load new session");
+    assert_eq!(session.name, "Explicit Name");
+    assert!(session.skip_auto_commit, "skipAutoCommit honored");
+    let md = session.metadata.as_ref().expect("metadata persisted");
+    assert_eq!(md["custom"], "field");
+    assert_eq!(md["source"], "wake_or_create_task_agent");
+    assert_eq!(md["isBackground"], true);
+    assert_eq!(md["contextReferences"][0]["id"], "note-1");
+    assert_eq!(md["skipAutoCommit"], true);
+    // Specialist was inherited from the previous (now-deleted) session.
+    assert_eq!(session.specialist.as_deref(), Some("implementor"));
+    // Depth defaults to `0` when neither caller nor explicit depth was given.
+    assert_eq!(md["delegationDepth"], 0);
+    assert!(!md["taskNoteId"].as_str().unwrap().is_empty());
+}
+
+/// B7: `messageMetadata` is folded onto the delivered content block on the
+/// create branch (and by construction the wake branch shares the same helper).
+#[tokio::test]
+async fn wake_or_create_delivers_message_metadata_on_block() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Tag").await;
+    let input = AgentWakeOrCreateInput {
+        message_metadata: Some(json!({ "type": "task_wake", "source": "wake" })),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws, note_id, "hello".into(), input)
+        .await
+        .expect("wake");
+    let new_id = AgentId::from(resp["agentId"].as_str().unwrap());
+    let conv = svc
+        .agent_get_conversation_op(new_id, None, None, None)
+        .await
+        .expect("conv");
+    // The delivered message is the first user message; its content block
+    // carries `messageMetadata` verbatim.
+    let msg = &conv["messages"][0];
+    assert_eq!(msg["role"], "user");
+    let block = &msg["contentBlocks"][0];
+    assert_eq!(block["text"], "hello");
+    assert_eq!(block["messageMetadata"]["type"], "task_wake");
+}
+
+/// Cross-workspace bare-id probes must NOT observe an agent that lives in a
+/// different workspace: `agent_get_op` / `agent_get_conversation_op` /
+/// `agent_get_queue_op` / `agent_get_session_stats_op` / `agent_delete_op` all
+/// return `NotFound` when the caller's declared `workspaceId` does not match
+/// the session's owning workspace (defense-in-depth against the
+/// "know-the-id-to-mutate/read" attack).
+#[tokio::test]
+async fn agent_ops_reject_cross_workspace_bare_id_probes() {
+    let (_t, svc, ws_a) = setup().await;
+    // Provision a second workspace that shares the same store/services handle.
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("second workspace");
+
+    let id = create_agent(&svc, &ws_a, "Owned").await;
+
+    // The `None` workspace guard preserves the legacy behavior (all internal
+    // callers still see the session).
+    svc.agent_get_op(id.clone(), None)
+        .await
+        .expect("owner read");
+
+    // A caller declaring ws_b sees NotFound rather than the ws_a row.
+    let err = svc
+        .agent_get_op(id.clone(), Some(ws_b.clone()))
+        .await
+        .expect_err("cross-ws get must not observe");
+    assert!(matches!(err, Error::NotFound(_)), "get: {err:?}");
+
+    let err = svc
+        .agent_get_conversation_op(id.clone(), None, Some(ws_b.clone()), None)
+        .await
+        .expect_err("cross-ws conversation must not observe");
+    assert!(matches!(err, Error::NotFound(_)), "conversation: {err:?}");
+
+    let err = svc
+        .agent_get_queue_op(id.clone(), Some(ws_b.clone()))
+        .await
+        .expect_err("cross-ws queue must not observe");
+    assert!(matches!(err, Error::NotFound(_)), "queue: {err:?}");
+
+    let err = svc
+        .agent_get_session_stats_op(id.clone(), Some(ws_b.clone()))
+        .await
+        .expect_err("cross-ws stats must not observe");
+    assert!(matches!(err, Error::NotFound(_)), "stats: {err:?}");
+
+    // Delete: a cross-workspace probe must not remove the row.
+    let err = svc
+        .agent_delete_op(id.clone(), Some(ws_b.clone()))
+        .await
+        .expect_err("cross-ws delete must not observe");
+    assert!(matches!(err, Error::NotFound(_)), "delete: {err:?}");
+
+    // The row is still there for the owning workspace.
+    svc.agent_get_op(id.clone(), Some(ws_a.clone()))
+        .await
+        .expect("owner still reads after failed cross-ws delete");
+}
+
+/// Store-layer defense-in-depth: even if an op-layer guard were bypassed, the
+/// UPDATE/DELETE queries scope by `(id, workspace_id)` so a mutation issued
+/// with the wrong workspace_id affects zero rows and surfaces `NotFound`.
+#[tokio::test]
+async fn agent_store_mutations_reject_cross_workspace_writes() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("second workspace");
+
+    let id = create_agent(&svc, &ws_a, "Owned").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&id)
+        .await
+        .expect("owner session");
+    session.name = "Renamed".to_string();
+    session.updated_at = now_iso();
+
+    // Wrong workspace → NotFound; the row is unchanged.
+    let err = svc
+        .store()
+        .update_agent_session(&ws_b, &session)
+        .await
+        .expect_err("cross-ws update must not mutate");
+    assert!(matches!(err, Error::NotFound(_)), "update: {err:?}");
+    let reread = svc
+        .store()
+        .get_agent_session(&id)
+        .await
+        .expect("still there");
+    assert_ne!(reread.name, "Renamed");
+
+    let err = svc
+        .store()
+        .set_agent_session_status(
+            &ws_b,
+            &id,
+            intent_core::AgentStatus::RuntimeIdle,
+            false,
+            &now_iso(),
+        )
+        .await
+        .expect_err("cross-ws status write must not mutate");
+    assert!(matches!(err, Error::NotFound(_)), "status: {err:?}");
+
+    let err = svc
+        .store()
+        .set_acp_session_id(&ws_b, &id, "acp-x")
+        .await
+        .expect_err("cross-ws acp write must not mutate");
+    assert!(matches!(err, Error::NotFound(_)), "acp: {err:?}");
+
+    let removed = svc
+        .store()
+        .delete_agent_session(&ws_b, &id)
+        .await
+        .expect("delete returns bool");
+    assert!(!removed, "cross-ws delete must remove zero rows");
+    svc.store()
+        .get_agent_session(&id)
+        .await
+        .expect("row still present after cross-ws delete");
 }

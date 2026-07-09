@@ -47,6 +47,11 @@ pub(crate) enum HostMethod {
     Env,
     FindApp,
     ListInstalledEditors,
+    /// Client-callable editor-open trigger (`host.openInEditor`, §5.14):
+    /// dispatched to [`open_in_editor`], which short-circuits locally on a
+    /// local connection and re-dispatches to the connected FE as the
+    /// FE-served reverse RPC on a remote one.
+    OpenInEditor,
     Exec,
     /// Streaming/interactive exec surface (`host.execStream`, §5.14): returns
     /// `{ requestId }` immediately, then streams `host:exec:*` bus frames.
@@ -97,6 +102,7 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
         "host.env" => HostMethod::Env,
         "host.findApp" => HostMethod::FindApp,
         "host.listInstalledEditors" => HostMethod::ListInstalledEditors,
+        "host.openInEditor" => HostMethod::OpenInEditor,
         "host.exec" => HostMethod::Exec,
         "host.execStream" => HostMethod::ExecStream,
         "host.execStream.write" => HostMethod::ExecStreamWrite,
@@ -154,11 +160,14 @@ pub(crate) fn host_status_json(
 /// `intent_services::auggie_discovery`. `findBinary` / `findApp` require a
 /// `name` param (`-32602` when absent); `env` is secret-safe (names only, no
 /// values); `findApp` / `listInstalledEditors` return only app names + paths.
+/// `reverse` is the connection's reverse-RPC channel, consumed by the
+/// client-called `openInEditor` trigger on a remote connection.
 pub(crate) async fn handle(
     req: HostRequest,
     api: &dyn WorkspaceApi,
     bus: Option<&EventBus>,
     is_local: bool,
+    reverse: &ReverseChannel,
 ) -> Option<String> {
     let HostRequest {
         method,
@@ -297,6 +306,48 @@ pub(crate) async fn handle(
                 .await
                 .unwrap_or_else(|_| json!({ "editors": [] }));
             success_frame(id_echo, result)
+        }
+        HostMethod::OpenInEditor => {
+            let editor_id = params
+                .get("editorId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let path = params
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let line = params.get("line").and_then(Value::as_u64).map(|v| v as u32);
+            let column = params
+                .get("column")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32);
+            // The platform editor catalog only backs the local short-circuit;
+            // the remote path forwards the intent to the FE untouched.
+            let editors = if is_local {
+                tokio::task::spawn_blocking(host_ops::list_installed_editors_op)
+                    .await
+                    .unwrap_or_else(|_| json!({ "editors": [] }))
+            } else {
+                json!({ "editors": [] })
+            };
+            match open_in_editor(
+                &editor_id,
+                &path,
+                line,
+                column,
+                is_local,
+                detect_has_display(),
+                &editors,
+                &OsEditorLauncher,
+                reverse,
+            )
+            .await
+            {
+                Ok(()) => success_frame(id_echo, json!({ "ok": true })),
+                Err(e) => error_frame(id_echo, e.code(), &e.to_string()),
+            }
         }
         HostMethod::Exec => {
             let parsed = match intent_services::host_exec::parse_args(&params) {

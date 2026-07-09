@@ -192,6 +192,93 @@ pub(crate) fn mkdir(root: &str, path: &str) -> Result<Value> {
     Ok(json!({ "ok": true, "path": path, "created": true }))
 }
 
+/// `file.exists` → `{ exists, isFile, isDirectory }`, mirroring the legacy
+/// `intent-server.cjs` `fileExists` shape so retirement-wave consumers
+/// (`RemoteExecutor`, `RemoteMetadataFS`, `RemoteFileSystemService`,
+/// `MetadataSyncService`) swap over 1:1. Any lookup error yields the same
+/// all-false shape as the legacy handler, rather than surfacing as `-32603`.
+pub(crate) fn exists(root: &str, path: &str) -> Result<Value> {
+    let full = resolve_within(root, path)?;
+    match std::fs::metadata(&full) {
+        Ok(md) => Ok(json!({
+            "exists": true,
+            "isFile": md.is_file(),
+            "isDirectory": md.is_dir(),
+        })),
+        Err(_) => Ok(json!({
+            "exists": false,
+            "isFile": false,
+            "isDirectory": false,
+        })),
+    }
+}
+
+/// `file.stat` → `{ size, mtime, isFile, isDirectory, isSymlink, permissions }`,
+/// mirroring the legacy `intent-server.cjs` `stat` shape. Symlinks are followed
+/// for size/type reporting (matching `fs.lstatSync` + `fs.statSync` when the
+/// entry is a symlink), and `permissions` is the octal mode string ("0644").
+pub(crate) fn stat(root: &str, path: &str) -> Result<Value> {
+    let full = resolve_within(root, path)?;
+    let lmd = std::fs::symlink_metadata(&full).map_err(io_err)?;
+    let is_symlink = lmd.file_type().is_symlink();
+    let md = if is_symlink {
+        std::fs::metadata(&full).map_err(io_err)?
+    } else {
+        lmd
+    };
+    let mtime = md
+        .modified()
+        .ok()
+        .map(mtime_iso)
+        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string());
+    let permissions = permissions_octal(&md);
+    Ok(json!({
+        "size": md.len(),
+        "mtime": mtime,
+        "isFile": md.is_file(),
+        "isDirectory": md.is_dir(),
+        "isSymlink": is_symlink,
+        "permissions": permissions,
+    }))
+}
+
+/// Format a `SystemTime` as the ISO-8601 string legacy `stat` produced via
+/// `Date.prototype.toISOString` (millisecond precision, always `Z`). Falls back
+/// to the epoch when the timestamp is outside the representable range.
+fn mtime_iso(t: std::time::SystemTime) -> String {
+    let dur = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = dur.as_secs() as i64;
+    let ms = dur.subsec_millis();
+    match time::OffsetDateTime::from_unix_timestamp(secs) {
+        Ok(dt) => format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            dt.year(),
+            u8::from(dt.month()),
+            dt.day(),
+            dt.hour(),
+            dt.minute(),
+            dt.second(),
+            ms,
+        ),
+        Err(_) => "1970-01-01T00:00:00.000Z".to_string(),
+    }
+}
+
+/// Render POSIX permission bits as the legacy octal string ("0" + mode & 0o777).
+/// On non-Unix targets we fall back to "0000" — the FE only inspects this
+/// string on POSIX hosts, mirroring the legacy behaviour.
+#[cfg(unix)]
+fn permissions_octal(md: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = md.permissions().mode() & 0o777;
+    format!("0{:o}", mode)
+}
+
+#[cfg(not(unix))]
+fn permissions_octal(_md: &std::fs::Metadata) -> String {
+    "0000".to_string()
+}
+
 /// `file.rename` → `{ ok, oldPath, newPath, renamed: true, isDirectory }`.
 pub(crate) fn rename(root: &str, old_path: &str, new_path: &str) -> Result<Value> {
     let old_full = node_resolve(root, old_path);
@@ -399,11 +486,79 @@ mod tests {
             mkdir(&root, "../escape"),
             rename(&root, "../a", "b"),
             rename(&root, "a", "../b"),
+            exists(&root, "../escape.txt"),
+            stat(&root, "../escape.txt"),
         ] {
             match res {
                 Err(Error::Internal(m)) => assert_eq!(m, ACCESS_DENIED),
                 other => panic!("expected access denied, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn exists_reports_present_absent_and_type() {
+        let t = TempRoot::new();
+        let root = t.root();
+        write(&root, "a.txt", "x").unwrap();
+        mkdir(&root, "d").unwrap();
+        assert_eq!(
+            exists(&root, "a.txt").unwrap(),
+            json!({ "exists": true, "isFile": true, "isDirectory": false })
+        );
+        assert_eq!(
+            exists(&root, "d").unwrap(),
+            json!({ "exists": true, "isFile": false, "isDirectory": true })
+        );
+        // A missing path is not an error — legacy handler returned the same shape.
+        assert_eq!(
+            exists(&root, "missing.txt").unwrap(),
+            json!({ "exists": false, "isFile": false, "isDirectory": false })
+        );
+    }
+
+    #[test]
+    fn stat_returns_full_legacy_shape() {
+        let t = TempRoot::new();
+        let root = t.root();
+        write(&root, "a.txt", "hello").unwrap();
+        let s = stat(&root, "a.txt").unwrap();
+        assert_eq!(s["size"], json!(5u64));
+        assert_eq!(s["isFile"], json!(true));
+        assert_eq!(s["isDirectory"], json!(false));
+        assert_eq!(s["isSymlink"], json!(false));
+        let mtime = s["mtime"].as_str().expect("mtime is string");
+        assert!(mtime.ends_with('Z'), "mtime {mtime} not Z-terminated");
+        assert!(mtime.contains('T'), "mtime {mtime} missing T separator");
+        let perms = s["permissions"].as_str().expect("perms is string");
+        assert!(
+            perms.starts_with('0') && perms.len() >= 4,
+            "unexpected permissions: {perms}"
+        );
+
+        mkdir(&root, "sub").unwrap();
+        let ds = stat(&root, "sub").unwrap();
+        assert_eq!(ds["isFile"], json!(false));
+        assert_eq!(ds["isDirectory"], json!(true));
+
+        assert!(matches!(stat(&root, "nope"), Err(Error::Internal(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stat_follows_symlinks_and_flags_them() {
+        use std::os::unix::fs::symlink;
+        let t = TempRoot::new();
+        let root = t.root();
+        write(&root, "target.txt", "abc").unwrap();
+        symlink(
+            std::path::Path::new(&root).join("target.txt"),
+            std::path::Path::new(&root).join("link.txt"),
+        )
+        .unwrap();
+        let s = stat(&root, "link.txt").unwrap();
+        assert_eq!(s["isSymlink"], json!(true));
+        assert_eq!(s["isFile"], json!(true));
+        assert_eq!(s["size"], json!(3u64));
     }
 }

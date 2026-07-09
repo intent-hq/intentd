@@ -120,7 +120,9 @@ async fn uds_git_write_ops_round_trip() {
 
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store).with_workspaces_root(
+        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+    ));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
@@ -248,6 +250,46 @@ async fn uds_git_write_ops_round_trip() {
     assert_eq!(resp["result"]["ok"], json!(true));
     assert_eq!(resp["result"]["paths"], json!(["seed.txt"]));
 
+    // (h) git.agentCommit userRequested with no `files` commits only the
+    // already-staged paths — the unstaged edit stays in the worktree.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":11,"method":"git.stage","params":{"workspaceId":"ws-git","paths":["seed.txt"]}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    std::fs::write(repo.join("other.txt"), "unstaged\n").unwrap();
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":12,"method":"git.agentCommit","params":{"workspaceId":"ws-git","message":"user checkpoint","userRequested":true}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["files"], json!(["seed.txt"]));
+    assert_eq!(resp["result"]["fileCount"], json!(1));
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":13,"method":"git.status","params":{"workspaceId":"ws-git"}}"#,
+    )
+    .await;
+    let files = resp["result"]["files"].as_array().expect("files array");
+    assert!(
+        files.iter().any(|f| f["path"] == json!("other.txt")),
+        "unstaged file survives the userRequested commit: {files:?}"
+    );
+    assert!(
+        files.iter().all(|f| f["path"] != json!("seed.txt")),
+        "staged file was committed: {files:?}"
+    );
+
+    // (i) userRequested with a clean index → -32603 (nothing staged).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":14,"method":"git.agentCommit","params":{"workspaceId":"ws-git","message":"empty checkpoint","userRequested":true}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32603));
+
     let _ = tx.send(());
     let _ = server.await;
     std::fs::remove_dir_all(&base).ok();
@@ -281,7 +323,9 @@ async fn uds_git_read_ops_round_trip() {
 
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store).with_workspaces_root(
+        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+    ));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
@@ -365,6 +409,28 @@ async fn uds_git_read_ops_round_trip() {
     .await;
     assert_eq!(resp["result"]["items"].as_array().expect("items").len(), 1);
 
+    // (d) git.showFile → committed content at HEAD (the worktree edit above is
+    // not visible at the ref), empty content for a path missing at the ref,
+    // and -32603 for an unresolvable ref (PROTOCOL §5.6 extensions).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":6,"method":"git.showFile","params":{"workspaceId":"ws-gitr","filePath":"seed.txt","ref":"HEAD"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["content"], json!("seed\n"));
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":7,"method":"git.showFile","params":{"workspaceId":"ws-gitr","filePath":"nope.txt","ref":"HEAD"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["content"], json!(""));
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":8,"method":"git.showFile","params":{"workspaceId":"ws-gitr","filePath":"seed.txt","ref":"no-such-ref"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32603));
+
     let _ = tx.send(());
     let _ = server.await;
     std::fs::remove_dir_all(&base).ok();
@@ -415,7 +481,9 @@ async fn uds_git_commit_details_round_trip() {
 
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store).with_workspaces_root(
+        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+    ));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
@@ -542,7 +610,9 @@ async fn uds_git_branch_status_round_trip() {
 
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store).with_workspaces_root(
+        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+    ));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
@@ -649,8 +719,8 @@ async fn uds_git_branch_status_round_trip() {
         json!("Missing required parameter: branchName")
     );
 
-    // (f) Unknown repo path → -32602 with the verbatim gate message (mirrors
-    // git.getBranches).
+    // (f) Nonexistent repo path → -32602 with the verbatim validation message
+    // (mirrors git.getBranches).
     let resp = send(
         &config.socket_path,
         r#"{"jsonrpc":"2.0","id":6,"method":"git.branchStatus","params":{"repoPath":"/no/such/repo","branchName":"main"}}"#,
@@ -659,7 +729,285 @@ async fn uds_git_branch_status_round_trip() {
     assert_eq!(resp["error"]["code"], json!(-32602));
     assert_eq!(
         resp["error"]["message"],
-        json!("Unknown or unauthorized repository path")
+        json!("Repository path does not exist: /no/such/repo")
+    );
+
+    let _ = tx.send(());
+    let _ = server.await;
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Over-the-wire `git.getBranches` slice: the path-based branch listing used by
+/// the workspace-initializer BranchSelector (PROTOCOL §5.6). The repo does NOT
+/// need to be a registered workspace — the create flow lists branches before
+/// the workspace exists — but nonexistent paths and non-git directories are
+/// rejected with distinct -32602 errors.
+#[tokio::test]
+async fn uds_git_get_branches_round_trip() {
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let base = Path::new("/tmp").join(format!("intentd-gitgb-{}", &short[..8]));
+    let data_dir = base.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    // `known` is registered as a workspace; `unreg` is a valid git repo the
+    // daemon has never seen; `plain` is an existing non-git directory.
+    let known = base.join("known");
+    seed_repo(&known);
+    let unreg = base.join("unreg");
+    seed_repo(&unreg);
+    git(&unreg, &["branch", "feature-y"]);
+    let plain = base.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+
+    let config = {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTENTD_DATA_DIR", &data_dir);
+        Config::resolve().expect("resolve config")
+    };
+
+    let ws_id = WorkspaceId::from("ws-gitgb");
+    {
+        let store = Store::open(&config.db_path).await.expect("open store");
+        store
+            .insert_workspace(&seed_workspace(&ws_id, known.to_str().unwrap()))
+            .await
+            .expect("seed ws");
+    }
+
+    let store = Store::open(&config.db_path).await.expect("reopen store");
+    let bus = EventBus::new(store.clone());
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store).with_workspaces_root(
+        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+    ));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let socket = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_uds(services, bus, &socket, None, async move {
+            let _ = rx.await;
+        })
+        .await
+        .expect("serve");
+    });
+    for _ in 0..50 {
+        if config.socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let head_branch = |repo: &Path| {
+        String::from_utf8(
+            Command::new("git")
+                .current_dir(repo)
+                .args(["branch", "--show-current"])
+                .output()
+                .expect("branch --show-current")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string()
+    };
+
+    // (a) Known-workspace repo → branch payload (unchanged behavior).
+    let known_head = head_branch(&known);
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"git.getBranches","params":{{"repoPath":"{}"}}}}"#,
+            known.display(),
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["currentBranch"], json!(known_head));
+    assert!(resp["result"]["branches"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(known_head)));
+
+    // (b) Unregistered-but-valid local repo → succeeds (the workspace-create
+    // flow needs branches before the repo is known to the daemon).
+    let unreg_head = head_branch(&unreg);
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.getBranches","params":{{"repoPath":"{}","includeRemote":true}}}}"#,
+            unreg.display(),
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["currentBranch"], json!(unreg_head));
+    let branches = resp["result"]["branches"].as_array().unwrap();
+    assert!(branches.contains(&json!(unreg_head)));
+    assert!(branches.contains(&json!("feature-y")));
+    assert_eq!(resp["result"]["remoteBranches"], json!([]));
+
+    // (c) Existing directory that is not a git repository → -32602.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"git.getBranches","params":{{"repoPath":"{}"}}}}"#,
+            plain.display(),
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(
+        resp["error"]["message"],
+        json!(format!("Path is not a git repository: {}", plain.display()))
+    );
+
+    // (d) Nonexistent path → -32602 with the distinct message.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":4,"method":"git.getBranches","params":{"repoPath":"/no/such/repo"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(
+        resp["error"]["message"],
+        json!("Repository path does not exist: /no/such/repo")
+    );
+
+    let _ = tx.send(());
+    let _ = server.await;
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Over-the-wire `git.pull` slice: the workspace-create auto-pull (PROTOCOL
+/// §5.6). Path-based like `git.getBranches` — the repo does NOT need to be a
+/// registered workspace. Covers the checked-out fast-forward pull (with a
+/// dirty worktree exercising the auto-stash bookends), the structured
+/// `{ ok: false, error }` failure, and the -32602 param rejections.
+#[tokio::test]
+async fn uds_git_pull_round_trip() {
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let base = Path::new("/tmp").join(format!("intentd-gitpl-{}", &short[..8]));
+    let data_dir = base.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // `repo` tracks a bare `origin` and is one commit behind it; `lone` has no
+    // remote at all (the structured-failure path).
+    let repo = base.join("repo");
+    seed_repo(&repo);
+    let bare = base.join("origin.git");
+    git(&base, &["init", "-q", "--bare", "origin.git"]);
+    git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    let branch = String::from_utf8(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("branch --show-current")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+    git(&repo, &["push", "-q", "origin", &branch]);
+    std::fs::write(repo.join("remote.txt"), "from-remote\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "remote change"]);
+    git(&repo, &["push", "-q", "origin", &branch]);
+    git(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+    // A dirty untracked file must survive the pull (auto-stash + pop).
+    std::fs::write(repo.join("local.txt"), "uncommitted\n").unwrap();
+    let lone = base.join("lone");
+    seed_repo(&lone);
+
+    let config = {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTENTD_DATA_DIR", &data_dir);
+        Config::resolve().expect("resolve config")
+    };
+    let store = Store::open(&config.db_path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store).with_workspaces_root(
+        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+    ));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let socket = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_uds(services, bus, &socket, None, async move {
+            let _ = rx.await;
+        })
+        .await
+        .expect("serve");
+    });
+    for _ in 0..50 {
+        if config.socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // (a) Behind + dirty checked-out branch → fast-forward pull succeeds, the
+    // remote commit arrives, and the local change is restored.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"git.pull","params":{{"repoPath":"{}","branchName":"{}"}}}}"#,
+            repo.display(),
+            branch,
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"], json!({ "ok": true }));
+    assert!(repo.join("remote.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(repo.join("local.txt")).unwrap(),
+        "uncommitted\n"
+    );
+
+    // (b) Repo without an `origin` remote → structured { ok: false, error }
+    // (an ordinary pull failure is never a JSON-RPC error).
+    let lone_branch = String::from_utf8(
+        Command::new("git")
+            .current_dir(&lone)
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("branch --show-current")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.pull","params":{{"repoPath":"{}","branchName":"{}"}}}}"#,
+            lone.display(),
+            lone_branch,
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(false));
+    assert!(!resp["result"]["error"].as_str().unwrap().is_empty());
+
+    // (c) Nonexistent repo path → -32602 with the validation message verbatim.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":3,"method":"git.pull","params":{"repoPath":"/no/such/repo","branchName":"main"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(
+        resp["error"]["message"],
+        json!("Repository path does not exist: /no/such/repo")
+    );
+
+    // (d) Missing branchName → -32602.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"git.pull","params":{{"repoPath":"{}"}}}}"#,
+            repo.display(),
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(
+        resp["error"]["message"],
+        json!("Missing required parameter: branchName")
     );
 
     let _ = tx.send(());

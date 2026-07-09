@@ -11,7 +11,8 @@
 
 use agent_client_protocol::schema::{
     AuthMethodId, AuthenticateRequest, ClientCapabilities, FileSystemCapabilities, Implementation,
-    InitializeRequest, InitializeResponse, ProtocolVersion, SetSessionModeRequest,
+    InitializeRequest, InitializeResponse, ProtocolVersion, SessionModeState,
+    SetSessionModeRequest,
 };
 use intent_providers::{auth_error_message, is_provider_authentication_error, ProviderConfig};
 
@@ -23,6 +24,17 @@ const CLIENT_NAME: &str = "Intent";
 /// Auth method id used when no interactive auth is required (parity: TS sends
 /// `methodId: "none"`).
 const NO_AUTH_METHOD_ID: &str = "none";
+/// Session mode id that asks the provider to skip its own permission prompts
+/// (parity: TS acp-provider sends `session/set_mode { modeId: "bypassPermissions" }`
+/// when the provider actually advertises that mode; the backend then locally
+/// auto-approves anything the provider still surfaces). Only requested when it
+/// appears in the session's `availableModes` — see [`select_preferred_mode`].
+pub const BYPASS_PERMISSIONS_MODE: &str = "bypassPermissions";
+/// Logical key looked up in [`ProviderConfig::mode_map`] to obtain a
+/// provider-specific override for the bypass-permissions preference (used by
+/// agents that name their permissive mode something other than
+/// `bypassPermissions`).
+pub const BYPASS_LOGICAL_KEY: &str = "bypass";
 
 /// Outcome of a completed handshake.
 #[derive(Debug)]
@@ -100,4 +112,144 @@ pub async fn set_session_mode(conn: &Connection, session_id: &str, mode_id: &str
     let params = serde_json::to_value(&request)?;
     conn.request("session/set_mode", params).await?;
     Ok(())
+}
+
+/// Pick the preferred permissive mode id to request via `session/set_mode` from
+/// the modes the provider actually advertised in `session/new` / `session/load`.
+///
+/// Selection order:
+/// 1. Provider [`mode_map`](ProviderConfig::mode_map) override under
+///    [`BYPASS_LOGICAL_KEY`] — used only if the mapped id appears in
+///    `available_modes` (a config typo shouldn't force a `-32602`).
+/// 2. Otherwise [`BYPASS_PERMISSIONS_MODE`] if present in `available_modes`.
+/// 3. Otherwise `None` — the caller skips the call so we never ask a provider
+///    for a mode it never offered.
+pub fn select_preferred_mode<'a>(
+    mode_map: Option<&'a [(&'a str, &'a str)]>,
+    available_modes: &'a [agent_client_protocol::schema::SessionMode],
+) -> Option<&'a str> {
+    if let Some(map) = mode_map {
+        if let Some((_, mapped)) = map
+            .iter()
+            .find(|(logical, _)| *logical == BYPASS_LOGICAL_KEY)
+        {
+            if available_modes.iter().any(|m| m.id.0.as_ref() == *mapped) {
+                return Some(mapped);
+            }
+        }
+    }
+    if available_modes
+        .iter()
+        .any(|m| m.id.0.as_ref() == BYPASS_PERMISSIONS_MODE)
+    {
+        return Some(BYPASS_PERMISSIONS_MODE);
+    }
+    None
+}
+
+/// Best-effort `session/set_mode` to run the provider in a permissive mode
+/// (parity with the reference acp-provider). Consults [`select_preferred_mode`]
+/// against the modes the provider actually advertised in the session response,
+/// so an agent that doesn't offer `bypassPermissions` (or a `mode_map`-mapped
+/// equivalent) is left alone rather than triggering a JSON-RPC `-32602`
+/// invalid-params error. When a call is attempted and the provider still fails
+/// on an ADVERTISED mode, the failure is logged at WARN so it stays visible.
+/// Returns `true` when the provider accepted the mode change.
+pub async fn try_bypass_permissions_mode(
+    conn: &Connection,
+    provider: &ProviderConfig,
+    session_id: &str,
+    modes: Option<&SessionModeState>,
+) -> bool {
+    let Some(state) = modes else {
+        tracing::debug!(
+            provider = provider.id,
+            session_id,
+            "session response advertised no modes; local AllowAll auto-approves prompts"
+        );
+        return false;
+    };
+    let Some(mode_id) = select_preferred_mode(provider.mode_map, &state.available_modes) else {
+        tracing::debug!(
+            provider = provider.id,
+            session_id,
+            current_mode = %state.current_mode_id,
+            "no advertised bypass-equivalent mode; local AllowAll auto-approves prompts"
+        );
+        return false;
+    };
+    match set_session_mode(conn, session_id, mode_id).await {
+        Ok(()) => {
+            tracing::debug!(
+                provider = provider.id,
+                session_id,
+                mode = mode_id,
+                "session/set_mode accepted; provider running in bypass mode"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                provider = provider.id,
+                session_id,
+                mode = mode_id,
+                error = %e,
+                "session/set_mode failed on advertised mode; falling back to local AllowAll auto-approve"
+            );
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod mode_select_tests {
+    use super::*;
+    use agent_client_protocol::schema::SessionMode;
+
+    fn mode(id: &str) -> SessionMode {
+        SessionMode::new(id.to_string(), id.to_string())
+    }
+
+    #[test]
+    fn prefers_bypass_permissions_when_advertised() {
+        let modes = vec![mode("default"), mode(BYPASS_PERMISSIONS_MODE)];
+        assert_eq!(
+            select_preferred_mode(None, &modes),
+            Some(BYPASS_PERMISSIONS_MODE)
+        );
+    }
+
+    #[test]
+    fn skips_when_bypass_not_advertised_and_no_mode_map() {
+        // Auggie's real advertised modes today: `default` + `ask`, neither
+        // permissive-labelled — we must skip rather than trigger `-32602`.
+        let modes = vec![mode("default"), mode("ask")];
+        assert_eq!(select_preferred_mode(None, &modes), None);
+    }
+
+    #[test]
+    fn mode_map_override_wins_when_mapped_id_is_advertised() {
+        let map: &[(&str, &str)] = &[("bypass", "yolo")];
+        let modes = vec![mode("default"), mode("yolo"), mode(BYPASS_PERMISSIONS_MODE)];
+        // The override takes precedence over the default `bypassPermissions`
+        // fallback so per-provider quirks stay data.
+        assert_eq!(select_preferred_mode(Some(map), &modes), Some("yolo"));
+    }
+
+    #[test]
+    fn mode_map_override_is_ignored_when_mapped_id_is_not_advertised() {
+        // A stale `mode_map` entry must not force a `-32602`: fall through to
+        // the `bypassPermissions` fallback if that one is actually offered.
+        let map: &[(&str, &str)] = &[("bypass", "ghost")];
+        let modes = vec![mode("default"), mode(BYPASS_PERMISSIONS_MODE)];
+        assert_eq!(
+            select_preferred_mode(Some(map), &modes),
+            Some(BYPASS_PERMISSIONS_MODE)
+        );
+    }
+
+    #[test]
+    fn empty_available_modes_returns_none() {
+        assert_eq!(select_preferred_mode(None, &[]), None);
+    }
 }

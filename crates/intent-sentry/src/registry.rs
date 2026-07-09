@@ -39,9 +39,10 @@ pub struct SentryRegistry;
 
 impl SentryRegistry {
     /// Construct the engine, or a typed [`Error::NotConfigured`] when no
-    /// credential pair is available.
-    pub fn from_settings(settings: &SentrySettings) -> Result<Arc<dyn SentryEngine>> {
-        let creds = resolve_credentials(settings)?;
+    /// credential pair is available. Async because the keychain lookup runs
+    /// on the blocking pool with a bounded timeout (see [`token::resolve`]).
+    pub async fn from_settings(settings: &SentrySettings) -> Result<Arc<dyn SentryEngine>> {
+        let creds = resolve_credentials(settings).await?;
         let client = SentryClient::new(
             &creds.token,
             &creds.organization,
@@ -52,7 +53,7 @@ impl SentryRegistry {
 }
 
 /// Resolve credentials from inline settings or the configured source.
-fn resolve_credentials(settings: &SentrySettings) -> Result<Credentials> {
+async fn resolve_credentials(settings: &SentrySettings) -> Result<Credentials> {
     let inline_token = settings
         .token
         .as_deref()
@@ -69,7 +70,7 @@ fn resolve_credentials(settings: &SentrySettings) -> Result<Credentials> {
             organization: organization.to_string(),
         });
     }
-    token::resolve(&settings.token_source).ok_or_else(|| {
+    token::resolve(&settings.token_source).await.ok_or_else(|| {
         Error::NotConfigured(
             "sentry: no credentials found (set sentry.organization + sentry.token, or \
              SENTRY_ORG + SENTRY_API_TOKEN)"
@@ -82,47 +83,38 @@ fn resolve_credentials(settings: &SentrySettings) -> Result<Credentials> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn inline_pair_builds_engine() {
+    #[tokio::test]
+    async fn inline_pair_builds_engine() {
         let settings = SentrySettings {
             organization: Some("acme".into()),
             token: Some("sntrys_test".into()),
             ..SentrySettings::default()
         };
-        let engine = SentryRegistry::from_settings(&settings);
+        let engine = SentryRegistry::from_settings(&settings).await;
         assert!(engine.is_ok());
     }
 
-    #[test]
-    fn missing_credentials_is_not_configured() {
-        // `Explicit` reads the keychain only; no `intentd` entries exist in
-        // CI, so resolution yields `None` regardless of ambient env vars.
-        let settings = SentrySettings {
-            organization: None,
-            token: None,
-            token_source: TokenSource::Explicit,
-            api_base_url: None,
-        };
-        let result = SentryRegistry::from_settings(&settings);
-        assert!(matches!(result, Err(Error::NotConfigured(_))));
-    }
-
-    #[test]
-    fn inline_half_only_falls_through_to_not_configured() {
+    #[tokio::test]
+    async fn inline_half_only_falls_through_to_not_configured() {
+        // Use the `Env` source so the tests do not touch the OS keychain; a
+        // partial inline pair must still yield the same `NotConfigured`
+        // outcome the wire relies on.
         let result = resolve_credentials(&SentrySettings {
             organization: Some("acme".into()),
             token: Some("   ".into()),
-            token_source: TokenSource::Explicit,
+            token_source: TokenSource::Env,
             api_base_url: None,
-        });
+        })
+        .await;
         assert!(matches!(result, Err(Error::NotConfigured(_))));
 
         let result = resolve_credentials(&SentrySettings {
             organization: None,
             token: Some("sntrys_test".into()),
-            token_source: TokenSource::Explicit,
+            token_source: TokenSource::Env,
             api_base_url: None,
-        });
+        })
+        .await;
         assert!(matches!(result, Err(Error::NotConfigured(_))));
     }
 }

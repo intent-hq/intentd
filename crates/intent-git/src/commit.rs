@@ -137,6 +137,21 @@ pub fn all_changed_paths(worktree_path: &Path) -> Result<Vec<String>> {
     Ok(paths)
 }
 
+/// All distinct paths with **index (staged)** changes only — the commit set
+/// for a `userRequested` `agentCommit` given no explicit `files`: a user
+/// checkpoint commits what the user staged (plain `git commit` semantics)
+/// instead of sweeping every change in the worktree into the commit.
+pub fn staged_paths(worktree_path: &Path) -> Result<Vec<String>> {
+    let st = crate::status::status(worktree_path)?;
+    let mut paths = Vec::new();
+    for f in st.files {
+        if f.staged && !paths.contains(&f.path) {
+            paths.push(f.path);
+        }
+    }
+    Ok(paths)
+}
+
 /// The files changed between `parent`'s tree and `new_tree` (the committed delta),
 /// mirroring `git diff-tree --no-commit-id --name-only -r <hash>`.
 fn changed_files(
@@ -254,5 +269,24 @@ mod tests {
             paths,
             vec!["tracked.txt".to_string(), "untracked.txt".to_string()]
         );
+    }
+
+    #[test]
+    fn staged_paths_excludes_unstaged_and_untracked() {
+        let dir = init_repo("commit-staged");
+        commit_file(dir.path(), "tracked.txt", "one\n");
+        write_file(dir.path(), "staged.txt", "s\n");
+        stage(dir.path(), &["staged.txt".to_string()]).unwrap();
+        write_file(dir.path(), "tracked.txt", "two\n");
+        write_file(dir.path(), "untracked.txt", "new\n");
+        assert_eq!(staged_paths(dir.path()).unwrap(), vec!["staged.txt"]);
+    }
+
+    #[test]
+    fn staged_paths_is_empty_for_clean_index() {
+        let dir = init_repo("commit-staged-clean");
+        commit_file(dir.path(), "tracked.txt", "one\n");
+        write_file(dir.path(), "tracked.txt", "two\n");
+        assert!(staged_paths(dir.path()).unwrap().is_empty());
     }
 }

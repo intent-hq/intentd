@@ -36,22 +36,23 @@ pub struct LinearRegistry;
 
 impl LinearRegistry {
     /// Construct the engine, or a typed [`Error::NotConfigured`] when no key is
-    /// available.
-    pub fn from_settings(settings: &LinearSettings) -> Result<Arc<dyn LinearEngine>> {
-        let key = resolve_token(settings)?;
+    /// available. Async because the keychain lookup runs on the blocking pool
+    /// with a bounded timeout (see [`token::resolve`]).
+    pub async fn from_settings(settings: &LinearSettings) -> Result<Arc<dyn LinearEngine>> {
+        let key = resolve_token(settings).await?;
         let client = LinearClient::new(&key, settings.api_base_url.as_deref())?;
         Ok(Arc::new(LinearEngineImpl::new(client)))
     }
 }
 
 /// Resolve the API key from inline settings or the configured source.
-fn resolve_token(settings: &LinearSettings) -> Result<String> {
+async fn resolve_token(settings: &LinearSettings) -> Result<String> {
     if let Some(token) = settings.token.as_deref() {
         if !token.trim().is_empty() {
             return Ok(token.trim().to_string());
         }
     }
-    token::resolve(&settings.token_source).ok_or_else(|| {
+    token::resolve(&settings.token_source).await.ok_or_else(|| {
         Error::NotConfigured(
             "linear: no API key found (set linear.token or LINEAR_API_KEY)".to_string(),
         )
@@ -62,36 +63,24 @@ fn resolve_token(settings: &LinearSettings) -> Result<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn inline_token_builds_engine() {
+    #[tokio::test]
+    async fn inline_token_builds_engine() {
         let settings = LinearSettings {
             token: Some("lin_api_test".to_string()),
             ..LinearSettings::default()
         };
-        let engine = LinearRegistry::from_settings(&settings);
+        let engine = LinearRegistry::from_settings(&settings).await;
         assert!(engine.is_ok());
     }
 
-    #[test]
-    fn missing_token_is_not_configured() {
-        // `Explicit` reads the keychain only; no `intentd` entry exists in CI,
-        // so resolution yields `None` regardless of ambient env vars.
-        let settings = LinearSettings {
-            token: None,
-            token_source: TokenSource::Explicit,
-            api_base_url: None,
-        };
-        let result = LinearRegistry::from_settings(&settings);
-        assert!(matches!(result, Err(Error::NotConfigured(_))));
-    }
-
-    #[test]
-    fn blank_inline_token_falls_through_to_not_configured() {
+    #[tokio::test]
+    async fn blank_inline_token_falls_through_to_not_configured() {
         let result = resolve_token(&LinearSettings {
             token: Some("   ".to_string()),
-            token_source: TokenSource::Explicit,
+            token_source: TokenSource::Env,
             api_base_url: None,
-        });
+        })
+        .await;
         assert!(matches!(result, Err(Error::NotConfigured(_))));
     }
 }

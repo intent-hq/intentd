@@ -92,6 +92,15 @@ impl ConnSubs {
 /// binding, set by `client.hello` and consumed by `drafts.*` (§16); `is_local`
 /// reflects that connection's resolved locality (§5.14). Returns `false` when
 /// the outbound channel is closed.
+///
+/// The fast-paths that mutate per-connection state (`reverse.route_response`,
+/// `system.*`, `forward.*`, `client.hello`, `drafts.*`, `events.`/subscription
+/// fast-paths) run inline on the read loop and stay serialized. The two
+/// stateless slow paths — `host::handle` and the [`handle_message`] JSON-RPC
+/// dispatcher — are spawned onto detached tokio tasks that write their response
+/// frame through a cloned `out_tx`, so a long-running request (e.g.
+/// `host.exec`) cannot delay responses to other requests on the same connection.
+/// Out-of-order responses are fine: JSON-RPC correlates by `id`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_frame(
     raw: &str,
@@ -121,10 +130,24 @@ pub(crate) async fn process_frame(
             }
         }
         if let Some(req) = host::classify(&value) {
-            return match host::handle(req, api.as_ref(), Some(bus), is_local).await {
-                Some(frame) => out_tx.send(frame).await.is_ok(),
-                None => true,
-            };
+            // Slow path: spawn so `host.exec` and friends can't block the read
+            // loop (UDS HOL fix). `openInEditor` in particular awaits an
+            // FE-served reverse RPC on this same connection (§5.14) — running
+            // it inline would deadlock frame reads until the reverse timeout.
+            // Response is delivered through the cloned outbound sender; if the
+            // connection has since closed the send is dropped silently.
+            let api = Arc::clone(api);
+            let bus = bus.clone();
+            let out = out_tx.clone();
+            let reverse = reverse.clone();
+            tokio::spawn(async move {
+                if let Some(frame) =
+                    host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse).await
+                {
+                    let _ = out.send(frame).await;
+                }
+            });
+            return true;
         }
         if let Some(req) = forward::classify(&value) {
             return match forward::handle(req, forwards, is_local).await {
@@ -151,10 +174,17 @@ pub(crate) async fn process_frame(
             return handle_fast_path(fast_path, bus, out_tx, subs).await;
         }
     }
-    match handle_message(api.as_ref(), raw).await {
-        Some(response) => out_tx.send(response).await.is_ok(),
-        None => true,
-    }
+    // Slow path: the ported-methods dispatcher can touch any service, so spawn
+    // it too. Owns the raw frame so the read loop can advance to the next line.
+    let api = api.clone();
+    let out_tx = out_tx.clone();
+    let raw = raw.to_string();
+    tokio::spawn(async move {
+        if let Some(response) = handle_message(api.as_ref(), &raw).await {
+            let _ = out_tx.send(response).await;
+        }
+    });
+    true
 }
 
 /// Handle a classified `events.subscribe` / `events.unsubscribe` request,

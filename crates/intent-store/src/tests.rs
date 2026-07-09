@@ -5,13 +5,13 @@ use std::path::PathBuf;
 
 use intent_core::{
     events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientId, Comment,
-    CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, EventActor, Note,
-    NoteId, NoteVisibility, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, Error, EventActor,
+    Note, NoteId, NoteVersionAuthor, NoteVisibility, TaskMetadata, TaskStatus, Workspace,
+    WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use serde_json::json;
 
-use crate::{EventQuery, NewEvent, Store};
+use crate::{EventQuery, NewEvent, Store, MAX_NOTE_VERSIONS};
 
 /// A unique temp DB path that cleans up its `.db`/`-wal`/`-shm` files on drop.
 struct TempDb {
@@ -85,14 +85,19 @@ async fn migration_status_reports_current_after_open() {
     assert!(status.is_current(), "fresh open must apply all migrations");
     assert_eq!(
         status.expected,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30
+        ]
     );
     assert_eq!(
         status.applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30
+        ]
     );
 }
-
 #[tokio::test]
 async fn workspace_round_trip_and_archive_filter() {
     let tmp = TempDb::new();
@@ -240,6 +245,85 @@ async fn note_round_trip() {
 
     let fetched = store.get_note(&note.id).await.expect("get note");
     assert_eq!(fetched.id, note.id);
+}
+
+#[tokio::test]
+async fn note_version_append_list_get_and_prune() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let ts = now_iso();
+    let mut note = Note {
+        id: NoteId::new(),
+        workspace_id: ws_id.clone(),
+        title: "Versioned".to_string(),
+        content: String::new(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        task: None,
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts.clone(),
+    };
+    store.insert_note(&note).await.expect("insert note");
+
+    let author = NoteVersionAuthor {
+        id: "system".to_string(),
+        name: "intentd".to_string(),
+        author_type: "system".to_string(),
+    };
+    // Append MAX + 5 versions; only the newest MAX survive the prune.
+    let total = MAX_NOTE_VERSIONS + 5;
+    for i in 1..=total {
+        note.content = format!("content v{i}");
+        let v = store
+            .append_note_version(&note, &author, &ts)
+            .await
+            .expect("append version");
+        assert_eq!(v, i, "version numbers are strictly increasing");
+    }
+
+    let versions = store
+        .list_note_versions(&note.id)
+        .await
+        .expect("list versions");
+    assert_eq!(versions.len(), MAX_NOTE_VERSIONS as usize);
+    assert_eq!(versions.first().map(|e| e.v), Some(6), "oldest 5 pruned");
+    assert_eq!(versions.last().map(|e| e.v), Some(total));
+    assert!(versions.iter().all(|e| e.entry_type == "snapshot"));
+    assert_eq!(
+        versions.last().map(|e| e.content_length),
+        Some(note.content.len() as i64)
+    );
+
+    let got = store
+        .get_note_version(&note.id, 6)
+        .await
+        .expect("get version 6");
+    assert_eq!(got.content, "content v6");
+    assert_eq!(got.author.author_type, "system");
+    // Pruned and never-existing versions are NotFound.
+    assert!(store.get_note_version(&note.id, 5).await.is_err());
+    assert!(store.get_note_version(&note.id, total + 1).await.is_err());
+
+    // Deleting the note cascades to its versions.
+    store.delete_note(&note.id).await.expect("delete note");
+    let after = store
+        .list_note_versions(&note.id)
+        .await
+        .expect("list after delete");
+    assert!(after.is_empty(), "note delete cascades to note_version");
 }
 
 #[tokio::test]
@@ -558,8 +642,8 @@ async fn comment_round_trip_update_delete_and_thread() {
     c2.suggestion_original = None;
     c2.suggestion_proposed = None;
     c2.agent_id = None;
-    store.insert_comment(&c1).await.expect("insert c1");
-    store.insert_comment(&c2).await.expect("insert c2");
+    store.insert_comment(&ws_id, &c1).await.expect("insert c1");
+    store.insert_comment(&ws_id, &c2).await.expect("insert c2");
 
     let got = store.get_comment("c1").await.expect("get c1");
     assert_eq!(got, c1);
@@ -574,12 +658,15 @@ async fn comment_round_trip_update_delete_and_thread() {
     let mut updated = c1.clone();
     updated.status = CommentStatus::Resolved;
     updated.content = "resolved now".to_string();
-    store.update_comment(&updated).await.expect("update c1");
+    store
+        .update_comment(&ws_id, &updated)
+        .await
+        .expect("update c1");
     let reread = store.get_comment("c1").await.expect("reget c1");
     assert_eq!(reread.status, CommentStatus::Resolved);
     assert_eq!(reread.content, "resolved now");
 
-    store.delete_comment("c1").await.expect("delete c1");
+    store.delete_comment(&ws_id, "c1").await.expect("delete c1");
     assert!(store.get_comment("c1").await.is_err());
     assert_eq!(
         store
@@ -589,6 +676,73 @@ async fn comment_round_trip_update_delete_and_thread() {
             .len(),
         1
     );
+}
+
+/// Store-layer defense-in-depth for comment mutations: UPDATE/DELETE and
+/// `set_thread_status` all scope by `(id, workspace_id)`, so a caller
+/// declaring workspace B cannot mutate a comment row that belongs to
+/// workspace A. Bare-id probes surface as NotFound / zero-row updates
+/// depending on the mutation shape (mirrors the note_repo 0022 pattern).
+#[tokio::test]
+async fn comment_mutations_reject_cross_workspace_bare_id_writes() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_a = WorkspaceId::new();
+    let ws_b = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_a, "A", false))
+        .await
+        .expect("insert ws_a");
+    store
+        .insert_workspace(&sample_workspace(&ws_b, "B", false))
+        .await
+        .expect("insert ws_b");
+    let note = task_note(&ws_a, "Note", None);
+    store.insert_note(&note).await.expect("insert note");
+    let c1 = sample_comment(&note.id, "thread-x", "c1");
+    store
+        .insert_comment(&ws_a, &c1)
+        .await
+        .expect("insert c1 in ws_a");
+
+    // Cross-workspace UPDATE returns NotFound and does NOT mutate the row.
+    let mut mutated = c1.clone();
+    mutated.content = "cross-ws mutation".to_string();
+    let err = store
+        .update_comment(&ws_b, &mutated)
+        .await
+        .expect_err("cross-ws update must not mutate");
+    assert!(matches!(err, Error::NotFound(_)), "update: {err:?}");
+    let reread = store.get_comment("c1").await.expect("still readable");
+    assert_ne!(reread.content, "cross-ws mutation");
+
+    // Cross-workspace DELETE returns NotFound and does NOT remove the row.
+    let err = store
+        .delete_comment(&ws_b, "c1")
+        .await
+        .expect_err("cross-ws delete must not remove");
+    assert!(matches!(err, Error::NotFound(_)), "delete: {err:?}");
+    store.get_comment("c1").await.expect("row still present");
+
+    // Cross-workspace resolve is a no-op (zero rows affected).
+    let rows = store
+        .set_thread_status(&ws_b, "thread-x", CommentStatus::Resolved, "now")
+        .await
+        .expect("set_thread_status returns");
+    assert_eq!(rows, 0, "cross-ws set_thread_status must affect zero rows");
+    let reread = store.get_comment("c1").await.expect("still readable");
+    assert_eq!(
+        reread.status,
+        CommentStatus::Open,
+        "row still open after failed cross-ws resolve"
+    );
+
+    // Owner can still resolve; row count is 1 (only the ws_a row matches).
+    let rows = store
+        .set_thread_status(&ws_a, "thread-x", CommentStatus::Resolved, "later")
+        .await
+        .expect("owner resolve");
+    assert_eq!(rows, 1);
 }
 
 fn file_event(ws: &WorkspaceId, ts: &str, path: &str, actor: EventActor) -> NewEvent {
@@ -942,11 +1096,18 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         stats: None,
         task_note_id: None,
         skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        is_background: false,
+        metadata: None,
         created_at: ts.clone(),
         updated_at: ts,
     }
 }
-
 #[tokio::test]
 async fn agent_session_round_trip_and_append_only_log() {
     let tmp = TempDb::new();
@@ -1017,6 +1178,185 @@ async fn agent_session_round_trip_and_append_only_log() {
     assert_eq!(listed[0].messages.len(), 2);
 }
 
+/// `append_agent_message_with_metadata` persists the opaque per-message
+/// `messageMetadata` payload (PROTOCOL §5.5) verbatim on the row and
+/// round-trips it on transcript reads; the plain `append_agent_message`
+/// path continues to store `NULL` for messages without metadata.
+#[tokio::test]
+async fn agent_message_metadata_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::from("agent-aaaaaaaa-1111-2222-3333-444444444444");
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+
+    let metadata = json!({ "source": "system", "tag": "restart" });
+    let stored = store
+        .append_agent_message_with_metadata(
+            &agent_id,
+            "user",
+            &json!([{ "type": "text", "text": "hi" }]),
+            Some(&metadata),
+            "t0",
+        )
+        .await
+        .expect("append with metadata");
+    assert_eq!(stored.metadata.as_ref(), Some(&metadata));
+
+    // Plain append leaves metadata as NULL.
+    let plain = store
+        .append_agent_message(
+            &agent_id,
+            "assistant",
+            &json!([{ "type": "text", "text": "yo" }]),
+            "t1",
+        )
+        .await
+        .expect("append plain");
+    assert!(
+        plain.metadata.is_none(),
+        "plain append persists NULL metadata"
+    );
+
+    // Both survive the read path in order.
+    let messages = store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].metadata.as_ref(), Some(&metadata));
+    assert!(messages[1].metadata.is_none());
+
+    // The metadata payload also round-trips through the get_agent_session
+    // aggregate loader (transcript embedded on the session).
+    let session = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.messages[0].metadata.as_ref(), Some(&metadata));
+    assert!(session.messages[1].metadata.is_none());
+}
+
+/// The P3-1.2b persistence-gap fields round-trip through insert → get →
+/// update → get: `completion_report(_timestamp)`, `delegation_depth`,
+/// `initial_message`, the JSON `context_references` / `image_blocks`, and
+/// `is_background` (G-A1/P3-1.2c).
+#[tokio::test]
+async fn agent_session_gap_fields_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let agent_id = AgentId::from("agent-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    let mut session = sample_agent_session(&agent_id, &ws);
+    session.delegation_depth = Some(2);
+    session.initial_message = Some("kick off".to_string());
+    session.context_references = Some(json!([{ "type": "file", "path": "src/a.rs" }]));
+    session.image_blocks = Some(json!([{ "type": "image", "data": "abc" }]));
+    session.is_background = true;
+    store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert session");
+
+    let loaded = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(loaded.delegation_depth, Some(2));
+    assert!(loaded.is_background, "is_background must round-trip");
+    assert_eq!(loaded.initial_message.as_deref(), Some("kick off"));
+    assert_eq!(
+        loaded.context_references,
+        Some(json!([{ "type": "file", "path": "src/a.rs" }]))
+    );
+    assert_eq!(
+        loaded.image_blocks,
+        Some(json!([{ "type": "image", "data": "abc" }]))
+    );
+    assert_eq!(loaded.completion_report, None);
+
+    // The report fields land via the update path.
+    let mut updated = loaded.clone();
+    updated.completion_report = Some("done".to_string());
+    updated.completion_report_timestamp = Some("t9".to_string());
+    store
+        .update_agent_session(&ws, &updated)
+        .await
+        .expect("update");
+    let reloaded = store.get_agent_session(&agent_id).await.expect("reload");
+    assert_eq!(reloaded.completion_report.as_deref(), Some("done"));
+    assert_eq!(reloaded.completion_report_timestamp.as_deref(), Some("t9"));
+    // The spawn-time fields survive the update untouched.
+    assert_eq!(reloaded.delegation_depth, Some(2));
+    assert_eq!(reloaded.initial_message.as_deref(), Some("kick off"));
+    assert!(reloaded.is_background, "is_background survives update");
+}
+
+/// Transient streaming flags are NEVER persisted (P3-1.2b; the daemon-side
+/// mirror of the FE `performAtomicWrite` scrub): the `agent_session` schema
+/// has no column for them, and the persisted session's wire form carries no
+/// `isResponding` / `isStreaming` / `isProcessing` / `currentStreamId` keys —
+/// those exist only on the runtime-overlaid `AgentLite` projection.
+#[tokio::test]
+async fn transient_streaming_flags_are_never_persisted() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+
+    // Schema guard: no transient-flag column exists on agent_session.
+    let cols: Vec<String> = sqlx::query("PRAGMA table_info(agent_session)")
+        .fetch_all(store.pool())
+        .await
+        .expect("pragma")
+        .iter()
+        .map(|r| sqlx::Row::get::<String, _>(r, "name"))
+        .collect();
+    for forbidden in [
+        "is_responding",
+        "is_streaming",
+        "is_processing",
+        "current_stream_id",
+    ] {
+        assert!(
+            !cols.iter().any(|c| c == forbidden),
+            "agent_session must not have a `{forbidden}` column"
+        );
+    }
+
+    // Wire guard: a persisted-and-reloaded session serializes without any
+    // transient streaming keys.
+    let agent_id = AgentId::from("agent-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+    let loaded = store.get_agent_session(&agent_id).await.expect("get");
+    let v = serde_json::to_value(&loaded).expect("session json");
+    let obj = v.as_object().expect("object");
+    for forbidden in [
+        "isResponding",
+        "isStreaming",
+        "isProcessing",
+        "currentStreamId",
+    ] {
+        assert!(
+            !obj.contains_key(forbidden),
+            "persisted AgentSession must not carry `{forbidden}`"
+        );
+    }
+}
+
 #[tokio::test]
 async fn agent_session_parent_agent_id_round_trips() {
     let tmp = TempDb::new();
@@ -1063,7 +1403,10 @@ async fn agent_session_parent_agent_id_round_trips() {
     // Update clears the linkage back to None.
     let mut cleared = store.get_agent_session(&child).await.expect("get");
     cleared.parent_agent_id = None;
-    store.update_agent_session(&cleared).await.expect("update");
+    store
+        .update_agent_session(&ws, &cleared)
+        .await
+        .expect("update");
     assert_eq!(
         store
             .get_agent_session(&child)
@@ -1118,7 +1461,10 @@ async fn agent_session_specialist_round_trips() {
 
     let mut updated = store.get_agent_session(&spec_agent).await.expect("get");
     updated.name = "Renamed".to_string();
-    store.update_agent_session(&updated).await.expect("update");
+    store
+        .update_agent_session(&ws, &updated)
+        .await
+        .expect("update");
     assert_eq!(
         store
             .get_agent_session(&spec_agent)
@@ -1146,20 +1492,23 @@ async fn agent_acp_session_id_is_write_once() {
 
     // First write succeeds; re-setting the same value is idempotent.
     store
-        .set_acp_session_id(&agent_id, "acp-1")
+        .set_acp_session_id(&ws, &agent_id, "acp-1")
         .await
         .expect("first set");
     store
-        .set_acp_session_id(&agent_id, "acp-1")
+        .set_acp_session_id(&ws, &agent_id, "acp-1")
         .await
         .expect("idempotent set");
     // Changing it to a different value is rejected.
-    assert!(store.set_acp_session_id(&agent_id, "acp-2").await.is_err());
+    assert!(store
+        .set_acp_session_id(&ws, &agent_id, "acp-2")
+        .await
+        .is_err());
 
     // update_agent_session also refuses to overwrite a set acpSessionId.
     let mut s = store.get_agent_session(&agent_id).await.expect("get");
     s.acp_session_id = Some("acp-3".to_string());
-    assert!(store.update_agent_session(&s).await.is_err());
+    assert!(store.update_agent_session(&ws, &s).await.is_err());
 }
 
 #[tokio::test]
@@ -1178,14 +1527,14 @@ async fn replace_acp_session_id_is_no_clobber_cas() {
         .expect("insert session");
 
     store
-        .set_acp_session_id(&agent_id, "acp-1")
+        .set_acp_session_id(&ws, &agent_id, "acp-1")
         .await
         .expect("first set");
 
     // CAS no-clobber: a stale expected-old does NOT overwrite the canonical id;
     // the stored value is returned for the caller to reuse.
     let kept = store
-        .replace_acp_session_id(&agent_id, "wrong-old", "acp-2")
+        .replace_acp_session_id(&ws, &agent_id, "wrong-old", "acp-2")
         .await
         .expect("cas returns canonical");
     assert_eq!(kept, "acp-1", "diverged expected-old reuses the stored id");
@@ -1195,7 +1544,7 @@ async fn replace_acp_session_id_is_no_clobber_cas() {
     // CAS swap: a matching expected-old replaces with the fresh id (the
     // resume-impossible fallback, where `set_acp_session_id` would reject).
     let swapped = store
-        .replace_acp_session_id(&agent_id, "acp-1", "acp-2")
+        .replace_acp_session_id(&ws, &agent_id, "acp-1", "acp-2")
         .await
         .expect("cas swaps on match");
     assert_eq!(swapped, "acp-2");
@@ -1204,7 +1553,7 @@ async fn replace_acp_session_id_is_no_clobber_cas() {
 
     // A missing session surfaces NotFound rather than a silent no-op.
     assert!(store
-        .replace_acp_session_id(&AgentId::new(), "acp-2", "acp-x")
+        .replace_acp_session_id(&ws, &AgentId::new(), "acp-2", "acp-x")
         .await
         .is_err());
 }
@@ -1228,12 +1577,15 @@ async fn agent_provider_is_immutable_once_set() {
     let mut s = store.get_agent_session(&agent_id).await.expect("get");
     s.provider = Some("auggie".to_string());
     s.status = AgentStatus::Active;
-    store.update_agent_session(&s).await.expect("set provider");
+    store
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("set provider");
 
     // Changing the provider afterwards is rejected.
     let mut s = store.get_agent_session(&agent_id).await.expect("get");
     s.provider = Some("claude-code".to_string());
-    assert!(store.update_agent_session(&s).await.is_err());
+    assert!(store.update_agent_session(&ws, &s).await.is_err());
 }
 
 #[tokio::test]
@@ -1433,6 +1785,90 @@ async fn known_repo_list_orders_by_last_used_desc() {
     let repos = store.list_known_repos().await.expect("list");
     let paths: Vec<&str> = repos.iter().map(|r| r.path.as_str()).collect();
     assert_eq!(paths, vec!["/src/a", "/src/c", "/src/b"]);
+}
+
+#[tokio::test]
+async fn known_repo_remove_deletes_by_path_and_tolerates_missing() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    store.upsert_known_repo("/src/a", "a", None).await.unwrap();
+    store.upsert_known_repo("/src/b", "b", None).await.unwrap();
+
+    // Removing a registered path deletes exactly that row.
+    let removed = store.remove_known_repo("/src/a").await.expect("remove");
+    assert!(removed, "existing path reports removed=true");
+    let repos = store.list_known_repos().await.expect("list");
+    let paths: Vec<&str> = repos.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(paths, vec!["/src/b"], "only the targeted repo is deleted");
+
+    // Removing an unregistered path is a no-op, not an error.
+    let removed = store.remove_known_repo("/src/a").await.expect("remove");
+    assert!(!removed, "missing path reports removed=false");
+    assert_eq!(store.list_known_repos().await.expect("list").len(), 1);
+}
+
+#[tokio::test]
+async fn script_upsert_list_remove_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let mut env = std::collections::BTreeMap::new();
+    env.insert("PORT".to_string(), "3000".to_string());
+    let script = intent_core::Script {
+        id: "s-1".to_string(),
+        workspace_id: "ws-1".to_string(),
+        name: "dev server".to_string(),
+        command: "npm run dev".to_string(),
+        cwd: Some("web".to_string()),
+        env: Some(env),
+        mode: intent_core::ScriptMode::Service,
+        category: Some("dev".to_string()),
+        source: "user".to_string(),
+        auto_start: Some(true),
+        created_at: now_iso(),
+        updated_at: None,
+    };
+    store.upsert_script(&script).await.expect("insert");
+
+    // Every field round-trips, including the JSON env map and optionals.
+    let listed = store.list_all_scripts().await.expect("list");
+    assert_eq!(listed, vec![script.clone()]);
+
+    // Upsert on the same id replaces the row (no duplicate).
+    let mut renamed = script.clone();
+    renamed.name = "dev server 2".to_string();
+    renamed.updated_at = Some(now_iso());
+    store.upsert_script(&renamed).await.expect("replace");
+    let listed = store.list_all_scripts().await.expect("list");
+    assert_eq!(listed, vec![renamed]);
+
+    // Sparse optionals persist as NULL and read back as None.
+    let sparse = intent_core::Script {
+        id: "s-2".to_string(),
+        workspace_id: "ws-2".to_string(),
+        name: "build".to_string(),
+        command: "make".to_string(),
+        cwd: None,
+        env: None,
+        mode: intent_core::ScriptMode::Command,
+        category: None,
+        source: "user".to_string(),
+        auto_start: None,
+        created_at: now_iso(),
+        updated_at: None,
+    };
+    store.upsert_script(&sparse).await.expect("insert sparse");
+    let listed = store.list_all_scripts().await.expect("list");
+    assert_eq!(listed.len(), 2);
+    assert!(listed.contains(&sparse));
+
+    // Remove deletes exactly the targeted row; a missing id is not an error.
+    assert!(store.remove_script("s-1").await.expect("remove"));
+    assert!(!store.remove_script("s-1").await.expect("remove again"));
+    let listed = store.list_all_scripts().await.expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, "s-2");
 }
 
 #[tokio::test]

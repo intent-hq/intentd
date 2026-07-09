@@ -29,6 +29,7 @@ pub const AGENT_CREATED: &str = "agent:created";
 pub const AGENT_DELETED: &str = "agent:deleted";
 pub const AGENT_RESTORED: &str = "agent:restored";
 pub const AGENT_RENAMED: &str = "agent:renamed";
+pub const AGENT_UPDATED: &str = "agent:updated";
 pub const AGENT_IDLE: &str = "agent:idle";
 pub const AGENT_STATUS_CHANGED: &str = "agent:status-changed";
 pub const AGENT_MESSAGE_SENT: &str = "agent:message:sent";
@@ -104,6 +105,13 @@ pub const GIT_MERGE: &str = "git:merge";
 pub const NOTE_CREATED: &str = "note:created";
 pub const NOTE_UPDATED: &str = "note:updated";
 pub const NOTE_DELETED: &str = "note:deleted";
+
+// Line-attribution events (new in intentd; PROTOCOL §5.2.1). Emitted after the
+// daemon recomputes per-line attributions for a note (post-mutation,
+// debounced). The self-sufficient payload `{ workspaceId, noteId,
+// attributions: { <lineNumber>: { timestamp, author? } } }` lets the FE
+// gutter re-render without a follow-up `note.lineAttribution.load`.
+pub const LINE_ATTRIBUTION_UPDATED: &str = "line-attribution:updated";
 
 // Task events.
 pub const TASK_STATUS_CHANGED: &str = "task:status-changed";
@@ -248,6 +256,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_DELETED,
     AGENT_RESTORED,
     AGENT_RENAMED,
+    AGENT_UPDATED,
     AGENT_IDLE,
     AGENT_STATUS_CHANGED,
     AGENT_MESSAGE_SENT,
@@ -287,6 +296,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     NOTE_CREATED,
     NOTE_UPDATED,
     NOTE_DELETED,
+    LINE_ATTRIBUTION_UPDATED,
     TASK_STATUS_CHANGED,
     TASK_READY_TASKS_CHANGED,
     TERMINAL_COMMAND,

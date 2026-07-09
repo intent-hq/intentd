@@ -14,7 +14,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use intent_acp::session::{
-    self, ContentBlock, InitializeResponse, MappedToolCall, MappedUpdate, McpServer, StopReason,
+    self, ContentBlock, InitializeResponse, MappedToolCall, MappedUpdate, McpServer,
+    SessionModeState, StopReason,
 };
 use intent_acp::{Connection, IncomingNotification};
 use intent_core::events::{
@@ -30,6 +31,22 @@ use crate::Services;
 
 #[cfg(test)]
 mod tests;
+
+/// Result of opening or resuming an ACP session: the canonical `acpSessionId`
+/// (persisted on `AgentSession`) plus the modes the provider advertised in the
+/// same response, so the caller can pick a permissive `session/set_mode` target
+/// only from `availableModes` rather than blindly asking for a mode the agent
+/// never offered.
+#[derive(Debug, Clone)]
+pub struct AcpSessionOpened {
+    /// The canonical `acpSessionId` to drive future turns.
+    pub session_id: String,
+    /// The modes the provider advertised in `session/new` / `session/load`, if
+    /// any. `None` when the provider omitted the field or when a concurrent
+    /// recreate won the CAS (the modes we captured belong to the wrong
+    /// session).
+    pub modes: Option<SessionModeState>,
+}
 
 /// Accumulates streamed assistant content into one transcript message per turn,
 /// coalescing consecutive text chunks into a single text block and pushing
@@ -307,22 +324,32 @@ impl Services {
     }
 
     /// Open a new ACP session and persist its id as `AgentSession.acpSessionId`
-    /// (write-once, for later resume) (§6.5).
+    /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
+    /// modes the provider advertised in `session/new` (used by the caller to
+    /// pick a permissive `session/set_mode` target from `availableModes`).
     pub async fn open_acp_session(
         &self,
         conn: &Connection,
         agent_id: &AgentId,
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
-    ) -> Result<String> {
+    ) -> Result<AcpSessionOpened> {
+        // Load the session up front so the store write is scoped to the owning
+        // workspace (the store's `set_acp_session_id` now requires it as a
+        // defense-in-depth guard). This call is only reached after the caller
+        // resolved this agent id inside a workspace-scoped path.
+        let workspace_id = self.store.get_agent_session(agent_id).await?.workspace_id;
         let resp = session::new_session(conn, cwd, mcp_servers)
             .await
             .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
         let acp_session_id = resp.session_id.0.to_string();
         self.store
-            .set_acp_session_id(agent_id, &acp_session_id)
+            .set_acp_session_id(&workspace_id, agent_id, &acp_session_id)
             .await?;
-        Ok(acp_session_id)
+        Ok(AcpSessionOpened {
+            session_id: acp_session_id,
+            modes: resp.modes,
+        })
     }
 
     /// Open a FRESH ACP session that REPLACES a lost/unsupported stored id (the
@@ -332,7 +359,9 @@ impl Services {
     /// this is used ONLY when resume is impossible — `loadSession` unsupported or
     /// `session/load` failed (§6.5). The CAS keeps the id canonical: if a
     /// concurrent recreate already swapped it, the stored value is returned and
-    /// reused instead of being clobbered. Returns the canonical `acpSessionId`.
+    /// reused instead of being clobbered. Returns the canonical `acpSessionId`
+    /// with modes only when the freshly-opened session won the CAS — otherwise
+    /// the modes belong to some other session and callers must not act on them.
     pub async fn recreate_acp_session(
         &self,
         conn: &Connection,
@@ -340,21 +369,35 @@ impl Services {
         expected_old: &str,
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
-    ) -> Result<String> {
+    ) -> Result<AcpSessionOpened> {
+        // Load the session up front so the CAS replace is scoped to the owning
+        // workspace (see [`open_acp_session`]).
+        let workspace_id = self.store.get_agent_session(agent_id).await?.workspace_id;
         let resp = session::new_session(conn, cwd, mcp_servers)
             .await
             .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
         let new_acp_session_id = resp.session_id.0.to_string();
         let canonical = self
             .store
-            .replace_acp_session_id(agent_id, expected_old, &new_acp_session_id)
+            .replace_acp_session_id(&workspace_id, agent_id, expected_old, &new_acp_session_id)
             .await?;
-        Ok(canonical)
+        // On CAS loss the canonical id belongs to a session we did not open;
+        // our modes are meaningless for it and would target the wrong sid.
+        let modes = if canonical == new_acp_session_id {
+            resp.modes
+        } else {
+            None
+        };
+        Ok(AcpSessionOpened {
+            session_id: canonical,
+            modes,
+        })
     }
 
     /// Resume the agent's persisted `acpSessionId` via `session/load`, but only
     /// when one was stored and the agent advertised the `loadSession` capability.
-    /// Returns the resumed id, or `None` when resume is not possible (§6.5).
+    /// Returns the resumed id plus the modes the provider advertised in
+    /// `session/load`, or `None` when resume is not possible (§6.5).
     pub async fn resume_acp_session(
         &self,
         conn: &Connection,
@@ -362,7 +405,7 @@ impl Services {
         agent_id: &AgentId,
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<AcpSessionOpened>> {
         let stored = self.store.get_agent_session(agent_id).await?;
         let Some(acp_session_id) = stored.acp_session_id else {
             return Ok(None);
@@ -370,10 +413,13 @@ impl Services {
         if !session::supports_load_session(init) {
             return Ok(None);
         }
-        session::load_session(conn, &acp_session_id, cwd, mcp_servers)
+        let resp = session::load_session(conn, &acp_session_id, cwd, mcp_servers)
             .await
             .map_err(|e| Error::Internal(format!("session/load failed: {e}")))?;
-        Ok(Some(acp_session_id))
+        Ok(Some(AcpSessionOpened {
+            session_id: acp_session_id,
+            modes: resp.modes,
+        }))
     }
 
     /// Discard the `session/update` burst that `session/load` replays after a
@@ -464,6 +510,7 @@ impl Services {
                     &message_id,
                     "assistant",
                     &Value::Array(blocks),
+                    None,
                     &now_iso(),
                 )
                 .await?;

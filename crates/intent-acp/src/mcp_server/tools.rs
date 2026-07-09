@@ -74,6 +74,11 @@ static ALL_TOOLS: &[ToolDef] = &[
         description: "List checkbox tasks parsed from a note.",
         params: &[p("noteId", "string", true)],
     },
+    ToolDef {
+        name: "get_workspace_details_workspace-mcp",
+        description: "Read workspace metadata (id, title, hasTitle, status, statusMessage,                       branch, repositoryName, tags).",
+        params: &[],
+    },
     // ---- Note write tools ----
     ToolDef {
         name: "create_note_workspace-mcp",
@@ -130,6 +135,17 @@ static ALL_TOOLS: &[ToolDef] = &[
             p("title", "string", false),
             p("tags", "array", false),
         ],
+    },
+    // ---- Workspace metadata write tools ----
+    ToolDef {
+        name: "set_workspace_title_workspace-mcp",
+        description: "Set the workspace title (1-5 words describing the task). Skips when                       the workspace already has a custom title (title different from its id).",
+        params: &[p("title", "string", true)],
+    },
+    ToolDef {
+        name: "set_workspace_status_message_workspace-mcp",
+        description: "Set or clear the workspace status message (1-2 sentence user-facing                       work summary). Pass an empty string to clear.",
+        params: &[p("statusMessage", "string", false)],
     },
     ToolDef {
         name: "delete_note_workspace-mcp",
@@ -239,6 +255,82 @@ static ALL_TOOLS: &[ToolDef] = &[
         name: "report_to_parent_workspace-mcp",
         description: "Send a completion report to your parent agent (delegated agents only).",
         params: &[p("report", "string", true)],
+    },
+    ToolDef {
+        name: "send_message_to_agent_workspace-mcp",
+        description: "Send a message to another agent; `priority: \"interrupt\"` stops the target mid-turn.",
+        params: &[
+            p("agentId", "string", true),
+            p("message", "string", true),
+            p("priority", "string", false),
+        ],
+    },
+    ToolDef {
+        name: "send_message_to_task_agent_workspace-mcp",
+        description: "Follow up with the agent assigned to a task note by ID.",
+        params: &[
+            p("taskNoteId", "string", true),
+            p("message", "string", true),
+            p("priority", "string", false),
+        ],
+    },
+    ToolDef {
+        name: "wake_or_create_task_agent_workspace-mcp",
+        description: "Ensure a task has a working agent: resume the assigned one or create a new agent for the task.",
+        params: &[
+            p("taskNoteId", "string", true),
+            p("contextMessage", "string", true),
+            p("model", "string", false),
+        ],
+    },
+    // ---- Agent read tools (never restricted) ----
+    ToolDef {
+        name: "list_agents_workspace-mcp",
+        description: "List agents in this workspace; completed agents are omitted unless requested.",
+        params: &[p("includeCompleted", "boolean", false)],
+    },
+    ToolDef {
+        name: "get_agent_status_workspace-mcp",
+        description: "Detailed status for one agent including task linkage and activity timestamps.",
+        params: &[p("agentId", "string", true)],
+    },
+    ToolDef {
+        name: "read_agent_conversation_workspace-mcp",
+        description: "Read another agent's conversation transcript.",
+        params: &[
+            p("agentId", "string", true),
+            p("lastN", "integer", false),
+            p("pageToken", "string", false),
+        ],
+    },
+    ToolDef {
+        name: "get_agent_summary_workspace-mcp",
+        description: "Quick summary of what another agent did.",
+        params: &[p("agentId", "string", true)],
+    },
+    ToolDef {
+        name: "get_agent_diagnostics_workspace-mcp",
+        description: "Sanitized snapshot of agent statuses, subscriptions, delegation groups, and stuck-risk signals.",
+        params: &[
+            p("agentId", "string", false),
+            p("taskNoteId", "string", false),
+            p("staleRespondingAfterMs", "integer", false),
+        ],
+    },
+    // ---- Event subscription tools ----
+    ToolDef {
+        name: "subscribe_to_events_workspace-mcp",
+        description: "Subscribe to batched workspace events (service-style; not the WSS streaming surface).",
+        params: &[
+            p("eventTypes", "array", true),
+            p("excludeSelf", "boolean", false),
+            p("batchWindow", "integer", false),
+        ],
+    },
+    ToolDef {
+        name: "unsubscribe_from_events_workspace-mcp",
+        description: "Cancel one event subscription by id.",
+        params: &[p("subscriptionId", "string", true)],
     },
     // ---- Git write tools ----
     ToolDef {

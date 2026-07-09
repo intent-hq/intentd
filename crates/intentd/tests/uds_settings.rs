@@ -124,6 +124,9 @@ async fn settings_round_trip_redaction_validation_and_event() {
     // store so sensitive settings never touch the real keychain.
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
+            .with_workspaces_root(
+                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+            )
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),
     );
@@ -152,6 +155,9 @@ async fn settings_round_trip_redaction_validation_and_event() {
     assert_eq!(token["value"], Value::Null, "unset secret reads as null");
     assert_eq!(token["sensitive"], json!(true));
     assert_eq!(entry(&list, "server.auth.token")["sensitive"], json!(true));
+    let linear = entry(&list, "linear.token");
+    assert_eq!(linear["value"], Value::Null, "unset secret reads as null");
+    assert_eq!(linear["sensitive"], json!(true));
 
     // settings.get — one definition with its (default) value.
     let got = rpc(
@@ -259,7 +265,10 @@ async fn settings_round_trip_redaction_validation_and_event() {
         &mut r,
         8,
         "settings.update",
-        json!({ "changes": [{ "path": "sourceControl.github.token", "value": SECRET }] }),
+        json!({ "changes": [
+            { "path": "sourceControl.github.token", "value": SECRET },
+            { "path": "linear.token", "value": SECRET },
+        ] }),
     )
     .await;
     let applied_text = serde_json::to_string(&applied).unwrap();
@@ -269,6 +278,9 @@ async fn settings_round_trip_redaction_validation_and_event() {
     );
     assert_ne!(applied["applied"][0]["value"], json!(SECRET));
     assert!(applied["applied"][0]["value"].is_string());
+    assert_eq!(applied["applied"][1]["path"], "linear.token");
+    assert_ne!(applied["applied"][1]["value"], json!(SECRET));
+    assert!(applied["applied"][1]["value"].is_string());
     let ev = read_json(&mut sr).await;
     let ev_text = serde_json::to_string(&ev).unwrap();
     assert!(
@@ -312,6 +324,83 @@ async fn settings_round_trip_redaction_validation_and_event() {
     assert_eq!(
         ev["params"]["event"]["data"]["changes"][0],
         json!({ "path": "git.autoCommit", "value": true })
+    );
+
+    // linear.token behaves the same as other secrets: get stays redacted and
+    // reset clears the keychain entry (value back to null) + emits the event.
+    let got = rpc(
+        &mut w,
+        &mut r,
+        12,
+        "settings.get",
+        json!({ "path": "linear.token" }),
+    )
+    .await;
+    assert!(!serde_json::to_string(&got).unwrap().contains(SECRET));
+    assert!(
+        got["value"].is_string(),
+        "set secret reads as a placeholder"
+    );
+    let reset = rpc(
+        &mut w,
+        &mut r,
+        13,
+        "settings.reset",
+        json!({ "path": "linear.token" }),
+    )
+    .await;
+    assert_eq!(reset, json!({ "path": "linear.token", "value": null }));
+    let ev = read_json(&mut sr).await;
+    assert_eq!(ev["params"]["event"]["type"], "settings:changed");
+    assert_eq!(
+        ev["params"]["event"]["data"]["changes"][0],
+        json!({ "path": "linear.token", "value": null })
+    );
+
+    // `workspace.sshKeyPath` is a **plain non-secret** path setting: the value
+    // is the filesystem path to the key (not key material), so `settings.list`
+    // must expose `sensitive: false` and `settings.update`/`get` must round-trip
+    // the string verbatim — the FE `git`-env consumer needs to read it back to
+    // hand it to `git`.
+    let ssh_path = "/tmp/id_ed25519_for_agents";
+    let list = rpc(&mut w, &mut r, 14, "settings.list", json!({})).await;
+    let ssh_entry = entry(&list, "workspace.sshKeyPath");
+    // `sensitive` is only emitted for sensitive definitions, so a path setting
+    // omits the field entirely (see `SettingDefinition::definition_json`).
+    assert!(
+        ssh_entry.get("sensitive").is_none(),
+        "workspace.sshKeyPath is a path, not a secret"
+    );
+    assert_eq!(ssh_entry["type"], "string");
+    assert_eq!(ssh_entry["value"], Value::Null, "unset path reads as null");
+    let applied = rpc(
+        &mut w,
+        &mut r,
+        15,
+        "settings.update",
+        json!({ "changes": [{ "path": "workspace.sshKeyPath", "value": ssh_path }] }),
+    )
+    .await;
+    assert_eq!(
+        applied["applied"][0],
+        json!({ "path": "workspace.sshKeyPath", "value": ssh_path }),
+        "path setting round-trips in plaintext"
+    );
+    let _ = read_json(&mut sr).await; // drain the settings:changed event.
+    let got = rpc(
+        &mut w,
+        &mut r,
+        16,
+        "settings.get",
+        json!({ "path": "workspace.sshKeyPath" }),
+    )
+    .await;
+    assert_eq!(got["value"], json!(ssh_path), "get returns plaintext path");
+    let list = rpc(&mut w, &mut r, 17, "settings.list", json!({})).await;
+    assert_eq!(
+        entry(&list, "workspace.sshKeyPath")["value"],
+        json!(ssh_path),
+        "list returns plaintext path"
     );
 
     let _ = shutdown_tx.send(());

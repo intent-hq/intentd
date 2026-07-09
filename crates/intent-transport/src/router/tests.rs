@@ -100,13 +100,16 @@ impl WorkspaceApi for FakeApi {
         &self,
         input: WorkspaceCreate,
         _idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<Workspace>> {
+    ) -> BoxFuture<'_, Result<intent_core::WorkspaceCreateResult>> {
         Box::pin(async move {
             let mut ws = sample_ws();
             if let Some(t) = input.title {
                 ws.title = t;
             }
-            Ok(ws)
+            Ok(intent_core::WorkspaceCreateResult {
+                workspace: ws,
+                initial_agent: None,
+            })
         })
     }
     fn update_workspace(
@@ -788,6 +791,10 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn repo_remove(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!({ "removed": path == "/src/intent" })) })
+    }
+
     fn github_repos_list(
         &self,
         limit: Option<i64>,
@@ -1154,6 +1161,33 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn file_exists(
+        &self,
+        _workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "exists": !path.is_empty(),
+                "isFile": true,
+                "isDirectory": false,
+            }))
+        })
+    }
+
+    fn file_stat(&self, _workspace_id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "size": path.len() as u64,
+                "mtime": "1970-01-01T00:00:00.000Z",
+                "isFile": true,
+                "isDirectory": false,
+                "isSymlink": false,
+                "permissions": "0644",
+            }))
+        })
+    }
+
     fn primitive_add_reference(
         &self,
         _workspace_id: WorkspaceId,
@@ -1288,24 +1322,65 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn script_remove(&self, script_id: String) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "scriptId": script_id })) })
+    fn script_remove(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true,
+                "scriptId": script_id,
+                "workspaceId": workspace_id.as_str(),
+            }))
+        })
     }
 
-    fn script_start(&self, script_id: String) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "scriptId": script_id })) })
+    fn script_start(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true,
+                "scriptId": script_id,
+                "workspaceId": workspace_id.as_str(),
+            }))
+        })
     }
 
-    fn script_stop(&self, script_id: String) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "scriptId": script_id })) })
+    fn script_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true,
+                "scriptId": script_id,
+                "workspaceId": workspace_id.as_str(),
+            }))
+        })
     }
 
-    fn script_restart(&self, script_id: String) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "scriptId": script_id })) })
+    fn script_restart(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true,
+                "scriptId": script_id,
+                "workspaceId": workspace_id.as_str(),
+            }))
+        })
     }
 
     fn script_output(
         &self,
+        workspace_id: WorkspaceId,
         script_id: String,
         max_lines: Option<i64>,
         _paginate: Option<bool>,
@@ -1315,7 +1390,7 @@ impl WorkspaceApi for FakeApi {
             // `script.output` returns plaintext buffer text (a bare string), not
             // an object (§5.8). Echo `scriptId`/`maxLines` into the string so the
             // dispatch test can still assert they were threaded through.
-            let _ = script_id;
+            let _ = (script_id, workspace_id);
             Ok(Value::String(format!(
                 "[1 lines]\nmaxLines={}",
                 max_lines.unwrap_or(-1)
@@ -1323,12 +1398,23 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn script_status(&self, script_id: String) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async move { Ok(serde_json::json!({ "scriptId": script_id, "status": "idle" })) })
+    fn script_status(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "scriptId": script_id,
+                "workspaceId": workspace_id.as_str(),
+                "status": "idle",
+            }))
+        })
     }
 
     fn script_run(
         &self,
+        workspace_id: WorkspaceId,
         script_id: String,
         max_lines: Option<i64>,
         timeout_seconds: Option<i64>,
@@ -1336,8 +1422,27 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async move {
             Ok(serde_json::json!({
                 "scriptId": script_id,
+                "workspaceId": workspace_id.as_str(),
                 "maxLines": max_lines,
                 "timeoutSeconds": timeout_seconds,
+            }))
+        })
+    }
+
+    // Echo the parsed rename params so the router tests can assert the
+    // optional `skipIfExplicitlySet` flag is forwarded (P3-1.2b).
+    fn agent_rename(
+        &self,
+        agent_id: AgentId,
+        name: String,
+        skip_if_explicitly_set: bool,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "success": true,
+                "name": name,
+                "agentId": agent_id,
+                "skipIfExplicitlySet": skip_if_explicitly_set,
             }))
         })
     }
@@ -2068,6 +2173,42 @@ async fn task_comment_methods_missing_note_id_is_minus_32602() {
 }
 
 #[tokio::test]
+async fn task_remove_agent_from_all_tasks_param_validation_and_routing() {
+    // Missing workspaceId → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"task.removeAgentFromAllTasks","params":{"agentId":"a1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("workspaceId is required")
+    );
+
+    // Missing agentId → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"task.removeAgentFromAllTasks","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: agentId")
+    );
+
+    // Both present routes past param validation into the trait default
+    // (`Internal` → `-32603`), proving the arm is wired.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"task.removeAgentFromAllTasks","params":{"workspaceId":"ws-1","agentId":"a1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+}
+
+#[tokio::test]
 async fn event_query_methods_route_and_pass_params() {
     // recentFiles passes `limit` through.
     let v = call(
@@ -2264,6 +2405,86 @@ async fn agent_methods_validate_required_params() {
         v["error"]["message"],
         serde_json::json!("Missing required parameter: outcome")
     );
+
+    // agent.enhancePrompt (§5.31) without prompt.
+    let v = call(r#"{"jsonrpc":"2.0","id":8,"method":"agent.enhancePrompt","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: prompt")
+    );
+
+    // agent.enhancePrompt with a blank prompt.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":9,"method":"agent.enhancePrompt","params":{"prompt":"   "}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("prompt cannot be empty")
+    );
+
+    // agent.enhancePrompt with an unknown mode.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":10,"method":"agent.enhancePrompt","params":{"prompt":"improve me","mode":"summarize"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("mode must be \"enhance\" or \"layout\"")
+    );
+
+    // agent.enhancePrompt with a non-positive timeoutMs.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":11,"method":"agent.enhancePrompt","params":{"prompt":"improve me","timeoutMs":0}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("timeoutMs must be a positive integer")
+    );
+
+    // agent.completeOnce (§5.32) without prompt.
+    let v = call(r#"{"jsonrpc":"2.0","id":12,"method":"agent.completeOnce","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: prompt")
+    );
+
+    // agent.completeOnce with a blank prompt.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":13,"method":"agent.completeOnce","params":{"prompt":"   "}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("prompt cannot be empty")
+    );
+
+    // agent.completeOnce with a non-positive timeoutMs.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":14,"method":"agent.completeOnce","params":{"prompt":"hi","timeoutMs":0}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("timeoutMs must be a positive integer")
+    );
 }
 
 #[tokio::test]
@@ -2282,6 +2503,30 @@ async fn agent_methods_are_routed_not_method_not_found() {
         .unwrap();
     assert_eq!(err_code(&v), -32603);
 
+    // models.list (§5.30) takes no params and must route too.
+    let v = call(r#"{"jsonrpc":"2.0","id":8,"method":"models.list"}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32603);
+
+    // agent.enhancePrompt (§5.31) with valid params routes past dispatch (the
+    // default impl yields -32603, never -32601).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":9,"method":"agent.enhancePrompt","params":{"prompt":"improve me","mode":"layout","model":"haiku4.5","timeoutMs":5000}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+
+    // agent.completeOnce (§5.32) with valid params routes past dispatch (the
+    // default impl yields -32603, never -32601).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":10,"method":"agent.completeOnce","params":{"prompt":"pick a slug","systemPrompt":"be terse","model":"haiku4.5","timeoutMs":5000}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+
     // agent.pendingPermissions takes an optional agentId and must route.
     let v = call(r#"{"jsonrpc":"2.0","id":3,"method":"agent.pendingPermissions","params":{}}"#)
         .await
@@ -2296,6 +2541,28 @@ async fn agent_methods_are_routed_not_method_not_found() {
     .await
     .unwrap();
     assert_eq!(err_code(&v), -32603);
+}
+
+/// `agent.rename` forwards the optional `skipIfExplicitlySet` flag (defaulting
+/// to `false` when omitted) and trims the name before dispatch (P3-1.2b).
+#[tokio::test]
+async fn agent_rename_forwards_skip_if_explicitly_set() {
+    // Omitted → false.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.rename","params":{"agentId":"agent-1","name":" Neo "}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["name"], "Neo");
+    assert_eq!(v["result"]["skipIfExplicitlySet"], serde_json::json!(false));
+
+    // Supplied → forwarded verbatim.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.rename","params":{"agentId":"agent-1","name":"Neo","skipIfExplicitlySet":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["skipIfExplicitlySet"], serde_json::json!(true));
 }
 
 #[tokio::test]
@@ -2521,6 +2788,28 @@ async fn repo_list_returns_repos_with_camelcase_keys() {
     assert_eq!(repo["owner"], serde_json::json!("cloudlands-ai"));
     assert_eq!(repo["addedAt"], serde_json::json!("t0"));
     assert_eq!(repo["lastUsedAt"], serde_json::json!("t1"));
+}
+
+#[tokio::test]
+async fn repo_remove_routes_path_and_returns_removed_flag() {
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"repo.remove","params":{"path":"/src/intent"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(v["result"], serde_json::json!({ "removed": true }));
+
+    let v = call(r#"{"jsonrpc":"2.0","id":2,"method":"repo.remove","params":{"path":"/other"}}"#)
+        .await
+        .unwrap();
+    assert_eq!(v["result"], serde_json::json!({ "removed": false }));
+}
+
+#[tokio::test]
+async fn repo_remove_requires_path_param() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"repo.remove","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
 }
 
 // ---- github.* browse / auth / identity routing (PROTOCOL §5.27) --------
@@ -3140,6 +3429,33 @@ async fn file_methods_dispatch_with_exact_wire_shapes() {
             "renamed": true, "isDirectory": false
         })
     );
+
+    // file.exists → { exists, isFile, isDirectory }.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.exists","params":{"workspaceId":"ws-1","path":"a.txt"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "exists": true, "isFile": true, "isDirectory": false })
+    );
+
+    // file.stat → { size, mtime, isFile, isDirectory, isSymlink, permissions }.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.stat","params":{"workspaceId":"ws-1","path":"a.txt"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["size"], serde_json::json!(5u64));
+    assert_eq!(
+        v["result"]["mtime"],
+        serde_json::json!("1970-01-01T00:00:00.000Z")
+    );
+    assert_eq!(v["result"]["isFile"], serde_json::json!(true));
+    assert_eq!(v["result"]["isDirectory"], serde_json::json!(false));
+    assert_eq!(v["result"]["isSymlink"], serde_json::json!(false));
+    assert_eq!(v["result"]["permissions"], serde_json::json!("0644"));
 }
 
 #[tokio::test]
@@ -3171,6 +3487,18 @@ async fn file_methods_require_params() {
     )
     .await
     .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // file.exists / file.stat missing path → -32602.
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"file.exists","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"file.stat","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
     assert_eq!(err_code(&v), -32602);
 }
 
@@ -3367,7 +3695,7 @@ async fn script_lifecycle_and_run_dispatch() {
         "script.remove",
     ] {
         let msg = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"scriptId":"s-1"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"workspaceId":"ws-1","scriptId":"s-1"}}}}"#
         );
         let v = call(&msg).await.unwrap();
         assert_eq!(v["result"]["ok"], serde_json::json!(true), "{method}");
@@ -3376,21 +3704,27 @@ async fn script_lifecycle_and_run_dispatch() {
             serde_json::json!("s-1"),
             "{method}"
         );
+        assert_eq!(
+            v["result"]["workspaceId"],
+            serde_json::json!("ws-1"),
+            "{method} threads workspaceId"
+        );
     }
 
     // script.run accepts the `timeout` alias for `timeoutSeconds`.
     let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"script.run","params":{"scriptId":"s-1","maxLines":50,"timeout":30}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"script.run","params":{"workspaceId":"ws-1","scriptId":"s-1","maxLines":50,"timeout":30}}"#,
     )
     .await
     .unwrap();
     assert_eq!(v["result"]["maxLines"], serde_json::json!(50));
     assert_eq!(v["result"]["timeoutSeconds"], serde_json::json!(30));
+    assert_eq!(v["result"]["workspaceId"], serde_json::json!("ws-1"));
 
     // script.output passes maxLines and its result is a bare plaintext string
     // (a header line + text), not an object (§5.8).
     let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"script.output","params":{"scriptId":"s-1","maxLines":10}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"script.output","params":{"workspaceId":"ws-1","scriptId":"s-1","maxLines":10}}"#,
     )
     .await
     .unwrap();
@@ -3401,7 +3735,14 @@ async fn script_lifecycle_and_run_dispatch() {
     assert!(out.contains("maxLines=10"), "maxLines threaded: {out:?}");
 
     // Missing scriptId → -32602.
-    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"script.start","params":{}}"#)
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"script.start","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // Missing workspaceId → -32602 (every mutating script.* op is workspace-scoped).
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"script.start","params":{"scriptId":"s-1"}}"#)
         .await
         .unwrap();
     assert_eq!(err_code(&v), -32602);
@@ -3492,5 +3833,308 @@ async fn github_missing_required_params_are_minus_32602() {
     ] {
         let v = call(msg).await.unwrap();
         assert_eq!(err_code(&v), -32602, "msg={msg}");
+    }
+}
+
+/// FIX 1 parity: `agent.sendMessage` / `agent.forceMessage` must forward the
+/// FE-side per-turn prompt-assembly hints (`noteIds`, `stdinContext`,
+/// `contextReferences`) verbatim to the [`WorkspaceApi`] call — the daemon
+/// previously dropped them (see FE audit).
+mod send_message_payload_forwarding {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{AgentId, BoxFuture, Result, WorkspaceApi, WorkspaceId};
+    use serde_json::{json, Value};
+
+    use super::super::handle_message;
+
+    /// Recorded snapshot of a single `agent_send_message` / `agent_force_message`
+    /// call. Only the fields the FIX widens are asserted; the rest are captured
+    /// so the tests document the full observed shape.
+    #[derive(Default, Debug, Clone)]
+    #[allow(dead_code)]
+    struct Capture {
+        workspace_id: Option<WorkspaceId>,
+        agent_id: Option<AgentId>,
+        content: Option<String>,
+        message_id: Option<String>,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
+        priority: Option<String>,
+        note_ids: Option<Value>,
+        stdin_context: Option<String>,
+        context_references: Option<Value>,
+        message_metadata: Option<Value>,
+    }
+
+    #[derive(Default)]
+    struct RecordingApi {
+        send: Arc<Mutex<Capture>>,
+        force: Arc<Mutex<Capture>>,
+    }
+
+    impl WorkspaceApi for RecordingApi {
+        #[allow(clippy::too_many_arguments)]
+        fn agent_send_message(
+            &self,
+            workspace_id: WorkspaceId,
+            agent_id: AgentId,
+            content: String,
+            message_id: Option<String>,
+            image_blocks: Option<Value>,
+            file_blocks: Option<Value>,
+            priority: Option<String>,
+            note_ids: Option<Value>,
+            stdin_context: Option<String>,
+            context_references: Option<Value>,
+            message_metadata: Option<Value>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let slot = self.send.clone();
+            Box::pin(async move {
+                *slot.lock().unwrap() = Capture {
+                    workspace_id: Some(workspace_id),
+                    agent_id: Some(agent_id),
+                    content: Some(content),
+                    message_id,
+                    image_blocks,
+                    file_blocks,
+                    priority,
+                    note_ids,
+                    stdin_context,
+                    context_references,
+                    message_metadata,
+                };
+                Ok(json!({ "success": true, "queued": false, "messageId": "m-1" }))
+            })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn agent_force_message(
+            &self,
+            workspace_id: WorkspaceId,
+            agent_id: AgentId,
+            message_id: String,
+            content: String,
+            image_blocks: Option<Value>,
+            file_blocks: Option<Value>,
+            note_ids: Option<Value>,
+            stdin_context: Option<String>,
+            context_references: Option<Value>,
+            message_metadata: Option<Value>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let slot = self.force.clone();
+            Box::pin(async move {
+                *slot.lock().unwrap() = Capture {
+                    workspace_id: Some(workspace_id),
+                    agent_id: Some(agent_id),
+                    content: Some(content),
+                    message_id: Some(message_id),
+                    image_blocks,
+                    file_blocks,
+                    priority: None,
+                    note_ids,
+                    stdin_context,
+                    context_references,
+                    message_metadata,
+                };
+                Ok(json!({ "success": true, "queued": false, "messageId": "m-2" }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn send_message_forwards_note_ids_stdin_context_and_context_references() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":1,"method":"agent.sendMessage",
+            "params":{
+                "workspaceId":"ws-1",
+                "agentId":"agent-1",
+                "content":"hi",
+                "messageId":"m-1",
+                "priority":"interrupt",
+                "noteIds":["note-a","note-b"],
+                "stdinContext":"ctx text",
+                "contextReferences":[{"path":"src/a.rs"}]
+            }
+        }"#;
+        let out = handle_message(&api, msg).await.expect("response");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["result"]["success"], Value::Bool(true));
+
+        let cap = api.send.lock().unwrap().clone();
+        assert_eq!(cap.workspace_id.as_ref().map(|w| w.as_str()), Some("ws-1"));
+        assert_eq!(cap.agent_id.as_ref().map(|a| a.as_str()), Some("agent-1"));
+        assert_eq!(cap.content.as_deref(), Some("hi"));
+        assert_eq!(cap.message_id.as_deref(), Some("m-1"));
+        assert_eq!(cap.priority.as_deref(), Some("interrupt"));
+        assert_eq!(cap.stdin_context.as_deref(), Some("ctx text"));
+        assert_eq!(
+            cap.note_ids,
+            Some(json!(["note-a", "note-b"])),
+            "noteIds must be forwarded verbatim"
+        );
+        assert_eq!(
+            cap.context_references,
+            Some(json!([{"path": "src/a.rs"}])),
+            "contextReferences must be forwarded verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_omitted_hints_are_none() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":2,"method":"agent.sendMessage",
+            "params":{"workspaceId":"ws-1","agentId":"agent-1","content":"hi"}
+        }"#;
+        handle_message(&api, msg).await.expect("response");
+        let cap = api.send.lock().unwrap().clone();
+        assert!(cap.note_ids.is_none());
+        assert!(cap.stdin_context.is_none());
+        assert!(cap.context_references.is_none());
+        assert!(cap.priority.is_none());
+    }
+
+    #[tokio::test]
+    async fn force_message_forwards_stdin_context_and_context_references() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":3,"method":"agent.forceMessage",
+            "params":{
+                "workspaceId":"ws-1",
+                "agentId":"agent-1",
+                "messageId":"m-force",
+                "content":"stop",
+                "noteIds":["note-x"],
+                "stdinContext":"forced ctx",
+                "contextReferences":[{"symbol":"Foo"}]
+            }
+        }"#;
+        handle_message(&api, msg).await.expect("response");
+        let cap = api.force.lock().unwrap().clone();
+        assert_eq!(cap.message_id.as_deref(), Some("m-force"));
+        assert_eq!(cap.content.as_deref(), Some("stop"));
+        assert_eq!(cap.stdin_context.as_deref(), Some("forced ctx"));
+        assert_eq!(cap.note_ids, Some(json!(["note-x"])));
+        assert_eq!(cap.context_references, Some(json!([{"symbol": "Foo"}])));
+    }
+
+    #[tokio::test]
+    async fn send_message_forwards_image_and_file_blocks() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":4,"method":"agent.sendMessage",
+            "params":{
+                "workspaceId":"ws-1",
+                "agentId":"agent-1",
+                "content":"hi",
+                "imageBlocks":[{"data":"aGVsbG8=","mimeType":"image/png"}],
+                "fileBlocks":[{"data":"Zm9v","mimeType":"text/plain","fileName":"notes.txt"}]
+            }
+        }"#;
+        handle_message(&api, msg).await.expect("response");
+        let cap = api.send.lock().unwrap().clone();
+        assert_eq!(
+            cap.image_blocks,
+            Some(json!([{"data": "aGVsbG8=", "mimeType": "image/png"}])),
+            "imageBlocks must be forwarded verbatim"
+        );
+        assert_eq!(
+            cap.file_blocks,
+            Some(json!([{"data": "Zm9v", "mimeType": "text/plain", "fileName": "notes.txt"}])),
+            "fileBlocks must be forwarded verbatim"
+        );
+    }
+
+    /// `messageMetadata` (PROTOCOL §5.5) is the opaque per-message payload
+    /// the FE attaches to distinguish daemon-initiated turns; both
+    /// `agent.sendMessage` and `agent.forceMessage` must forward it
+    /// verbatim to [`WorkspaceApi`] so the store can persist it on the
+    /// user row (Fidelity B).
+    #[tokio::test]
+    async fn send_and_force_message_forward_message_metadata_verbatim() {
+        let api = RecordingApi::default();
+        let send = r#"{
+            "jsonrpc":"2.0","id":10,"method":"agent.sendMessage",
+            "params":{
+                "workspaceId":"ws-1","agentId":"agent-1","content":"hi",
+                "messageMetadata":{"source":"system","tag":"restart"}
+            }
+        }"#;
+        handle_message(&api, send).await.expect("send response");
+        let cap = api.send.lock().unwrap().clone();
+        assert_eq!(
+            cap.message_metadata,
+            Some(json!({"source": "system", "tag": "restart"})),
+            "sendMessage must forward messageMetadata verbatim"
+        );
+
+        let force = r#"{
+            "jsonrpc":"2.0","id":11,"method":"agent.forceMessage",
+            "params":{
+                "workspaceId":"ws-1","agentId":"agent-1",
+                "messageId":"m-force","content":"stop",
+                "messageMetadata":{"kind":"queue-drain"}
+            }
+        }"#;
+        handle_message(&api, force).await.expect("force response");
+        let cap = api.force.lock().unwrap().clone();
+        assert_eq!(
+            cap.message_metadata,
+            Some(json!({"kind": "queue-drain"})),
+            "forceMessage must forward messageMetadata verbatim"
+        );
+    }
+
+    /// Omitted `messageMetadata` collapses to `None` on both arms (same
+    /// contract as the other opaque payloads).
+    #[tokio::test]
+    async fn omitted_message_metadata_is_none() {
+        let api = RecordingApi::default();
+        let send = r#"{
+            "jsonrpc":"2.0","id":12,"method":"agent.sendMessage",
+            "params":{"workspaceId":"ws-1","agentId":"agent-1","content":"hi"}
+        }"#;
+        handle_message(&api, send).await.expect("send response");
+        assert!(api.send.lock().unwrap().message_metadata.is_none());
+
+        let force = r#"{
+            "jsonrpc":"2.0","id":13,"method":"agent.forceMessage",
+            "params":{
+                "workspaceId":"ws-1","agentId":"agent-1",
+                "messageId":"m-x","content":"stop"
+            }
+        }"#;
+        handle_message(&api, force).await.expect("force response");
+        assert!(api.force.lock().unwrap().message_metadata.is_none());
+    }
+
+    #[tokio::test]
+    async fn force_message_forwards_image_and_file_blocks() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":5,"method":"agent.forceMessage",
+            "params":{
+                "workspaceId":"ws-1",
+                "agentId":"agent-1",
+                "messageId":"m-force",
+                "content":"stop",
+                "imageBlocks":[{"data":"YWFh","mimeType":"image/jpeg"}],
+                "fileBlocks":[{"data":"YmJi","mimeType":"application/pdf","fileName":"spec.pdf"}]
+            }
+        }"#;
+        handle_message(&api, msg).await.expect("response");
+        let cap = api.force.lock().unwrap().clone();
+        assert_eq!(
+            cap.image_blocks,
+            Some(json!([{"data": "YWFh", "mimeType": "image/jpeg"}])),
+            "imageBlocks must be forwarded verbatim"
+        );
+        assert_eq!(
+            cap.file_blocks,
+            Some(json!([{"data": "YmJi", "mimeType": "application/pdf", "fileName": "spec.pdf"}])),
+            "fileBlocks must be forwarded verbatim"
+        );
     }
 }

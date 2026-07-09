@@ -11,6 +11,7 @@ pub mod error;
 pub mod events;
 pub mod ids;
 pub mod model;
+pub mod slug;
 pub mod traits;
 
 pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso};
@@ -18,25 +19,31 @@ pub use config::Config;
 pub use error::{Error, Result};
 pub use events::is_known_event_type;
 pub use ids::{AgentId, ClientId, NoteId, WorkspaceId};
+pub use model::MAX_DELEGATION_DEPTH;
+pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{
     ActorType, AgentActivity, AgentCreateExtra, AgentDelegateInput, AgentLite, AgentMessage,
-    AgentMetadata, AgentSession, AgentStatus, AnchorContext, AuthorType, Client, Comment,
-    CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
-    CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
-    CommentRespondResult, CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary,
-    CommentType, CommentWire, ContentType, Draft, Event, EventActor, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
-    GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitStatus,
-    KnownRepo, Memory, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
-    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteSetContentResult,
-    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ProjectType,
-    PullRequestInfo, PullRequestStatus, ReadAssetResult, Script, ScriptCreateParams, ScriptMode,
-    ScriptRuntimeState, ScriptStatus, SessionStats, SetupScript, SetupScriptGeneratedBy,
-    SuggestionDiff, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskMetadata, TaskStatus,
-    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
-    TokenUsageTotals, TopChangedFile, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
-    WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceDiffSummary,
+    AgentMetadata, AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
+    AnchorContext, AuthorType, Client, Comment, CommentAddResult, CommentAnchor, CommentAnchorType,
+    CommentDeleteResult, CommentGetThreadResult, CommentListResult, CommentLocation,
+    CommentResolveThreadResult, CommentRespondResult, CommentRespondThread, CommentStatus,
+    CommentThread, CommentThreadSummary, CommentType, CommentWire, ContentType, Draft, Event,
+    EventActor, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity,
+    FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
+    GitMergeConflicts, GitPullResult, GitStatus, KnownRepo, LineAttributionAuthor,
+    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Memory, Note,
+    NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
+    NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult, NoteSetContentResult,
+    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor,
+    NoteVersionSummary, NoteVisibility, ProjectType, PullRequestInfo, PullRequestStatus,
+    ReadAssetResult, SaveAssetResult, Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState,
+    ScriptStatus, SessionStats, SetupScript, SetupScriptGeneratedBy, SuggestionDiff,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
+    TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, TokenUsageTotals, TopChangedFile,
+    Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiffSummary,
     WorkspaceDiffSummaryFile, WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask,
     WorkspaceTaskStats, WorkspaceUpdate,
 };

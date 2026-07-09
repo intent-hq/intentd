@@ -188,7 +188,7 @@ async fn import_workspace(
     let ws_dir = source.join("workspaces").join(&id.0).join(WORKSPACE_SUBDIR);
     import_notes(store, &ws_dir.join("notes"), summary).await;
     import_agents(store, &ws_dir.join("agents"), summary).await;
-    import_comments(store, &ws_dir.join("comments"), summary).await;
+    import_comments(store, &id, &ws_dir.join("comments"), summary).await;
 }
 
 /// Upsert a workspace by id; `Ok(true)` when it already existed (updated).
@@ -290,7 +290,10 @@ async fn import_agents(store: &Store, dir: &Path, summary: &mut ImportSummary) {
             }
         };
         match store.get_agent_session(&session.id).await {
-            Ok(_) => match store.update_agent_session(&session).await {
+            Ok(_) => match store
+                .update_agent_session(&session.workspace_id.clone(), &session)
+                .await
+            {
                 Ok(()) => summary.agents_updated += 1,
                 Err(e) => summary.skip(format!("agent {} update failed: {e}", session.id)),
             },
@@ -316,7 +319,12 @@ async fn import_agents(store: &Store, dir: &Path, summary: &mut ImportSummary) {
 }
 
 /// Import a workspace's comments, upserting each by id.
-async fn import_comments(store: &Store, dir: &Path, summary: &mut ImportSummary) {
+async fn import_comments(
+    store: &Store,
+    workspace_id: &intent_core::WorkspaceId,
+    dir: &Path,
+    summary: &mut ImportSummary,
+) {
     for mut obj in load_objects(dir, summary) {
         fill_defaults(
             &mut obj,
@@ -335,11 +343,11 @@ async fn import_comments(store: &Store, dir: &Path, summary: &mut ImportSummary)
             }
         };
         match store.get_comment(&comment.id).await {
-            Ok(_) => match store.update_comment(&comment).await {
+            Ok(_) => match store.update_comment(workspace_id, &comment).await {
                 Ok(()) => summary.comments_updated += 1,
                 Err(e) => summary.skip(format!("comment {} update failed: {e}", comment.id)),
             },
-            Err(Error::NotFound(_)) => match store.insert_comment(&comment).await {
+            Err(Error::NotFound(_)) => match store.insert_comment(workspace_id, &comment).await {
                 Ok(()) => summary.comments_imported += 1,
                 Err(e) => summary.skip(format!("comment {} insert failed: {e}", comment.id)),
             },

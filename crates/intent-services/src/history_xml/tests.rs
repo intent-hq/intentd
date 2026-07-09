@@ -13,6 +13,7 @@ fn msg(role: &str, content: Value) -> AgentMessage {
         seq: 0,
         role: role.to_string(),
         content,
+        metadata: None,
         created_at: "2024-01-01T00:00:00Z".to_string(),
     }
 }

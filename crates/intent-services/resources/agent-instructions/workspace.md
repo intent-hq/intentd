@@ -45,9 +45,11 @@ Keep the workspace `statusMessage` current when the high-level work status chang
 
 ## Workspace Management
 
-- `ws.workspace.setTitle(title)` — Set the workspace title (1-5 words describing the task)
-- `ws.workspace.details()` — Get workspace metadata, including lifecycle `status` and user-facing `statusMessage`
-- `ws.workspace.setStatusMessage(message)` — Update or clear the 1–2 sentence high-level work status message
+- `set_workspace_title_workspace-mcp` — Set the workspace title (1–5 words describing the task)
+- `get_workspace_details_workspace-mcp` — Get workspace metadata, including lifecycle `status` and user-facing `statusMessage`
+- `set_workspace_status_message_workspace-mcp` — Update or clear the 1–2 sentence high-level work status message
+
+**Rename the workspace (only if untitled)** — On your first turn, call `get_workspace_details_workspace-mcp`. If `hasTitle` is `false` (the workspace title still looks like its auto-generated id / slug), call `set_workspace_title_workspace-mcp` early with a short 3–5 word sentence-case human title describing the task (e.g. "Add dark mode support"). Do NOT rename if the workspace already has a meaningful custom title — `set_workspace_title_workspace-mcp` will short-circuit and return `{ ok: true, skipped: true }` in that case.
 
 ## Agent Collaboration
 

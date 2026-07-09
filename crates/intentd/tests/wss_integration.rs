@@ -2,8 +2,10 @@
 //!
 //! Drives a real [`WsApiServer`] over TLS: `/health`, the upgrade auth gate,
 //! a JSON-RPC round-trip that must be byte-identical to the UDS transport, and
-//! the §5.6 hardening guarantees (port backoff, graceful-shutdown restart,
-//! heartbeat termination). The client pins the M5.1 self-signed fingerprint.
+//! the §5.6 hardening guarantees (fail-fast bind on an occupied port,
+//! graceful-shutdown restart, heartbeat termination). The client pins the
+//! M5.1 self-signed fingerprint. A separate insecure-mode test proves the
+//! plain-`ws://` accept path serves JSON-RPC with no TLS and no bearer token.
 
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
 use std::path::Path;
@@ -137,8 +139,12 @@ fn free_port() -> u16 {
 /// Build a real `Services` API + event bus over a fresh temp SQLite store.
 /// The store is returned alongside so tests that need to seed fixtures with a
 /// fixed id (e.g. the workspace `spec` note) can `store.insert_*` directly,
-/// since `note.create` mints a fresh `NoteId` by design.
-async fn make_services() -> (Arc<dyn WorkspaceApi>, EventBus, Store, std::path::PathBuf) {
+/// since `note.create` mints a fresh `NoteId` by design. `auggie_bin`
+/// optionally pins the auggie binary `agent.enhancePrompt` spawns (§5.31) to a
+/// deterministic fixture script.
+async fn make_services(
+    auggie_bin: Option<std::path::PathBuf>,
+) -> (Arc<dyn WorkspaceApi>, EventBus, Store, std::path::PathBuf) {
     let short = uuid::Uuid::new_v4().simple().to_string();
     let dir = Path::new("/tmp").join(format!("intentd-wss-{}", &short[..8]));
     std::fs::create_dir_all(&dir).unwrap();
@@ -146,7 +152,15 @@ async fn make_services() -> (Arc<dyn WorkspaceApi>, EventBus, Store, std::path::
         .await
         .expect("open store");
     let bus = EventBus::new(store.clone());
-    let api: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store.clone()));
+    let workspaces_root = dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
+    let mut services = Services::new(store.clone())
+        .with_assets_root(dir.join("assets"))
+        .with_workspaces_root(workspaces_root);
+    if let Some(bin) = auggie_bin {
+        services = services.with_auggie_bin(bin);
+    }
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     (api, bus, store, dir)
 }
 
@@ -163,8 +177,14 @@ struct Server {
 }
 
 /// Build + start a WSS listener with the given options on a free base port.
-async fn start(mut opts: WsOptions) -> Server {
-    let (api, bus, store, dir) = make_services().await;
+async fn start(opts: WsOptions) -> Server {
+    start_with_auggie(opts, None).await
+}
+
+/// [`start`] with an optional auggie-binary override for `agent.enhancePrompt`
+/// tests (§5.31).
+async fn start_with_auggie(mut opts: WsOptions, auggie_bin: Option<std::path::PathBuf>) -> Server {
+    let (api, bus, store, dir) = make_services(auggie_bin).await;
     let tls = ensure_tls_certificate(&dir).expect("cert");
     let token_store = Arc::new(MemTokenStore::default());
     token_store.store_token(TOKEN).unwrap();
@@ -429,16 +449,17 @@ async fn wss_agent_create_widened_params_round_trip() {
         .to_string();
     let requested = format!("agent-{}", uuid::Uuid::new_v4());
 
-    // Full-param create: exercise every new optional field. `provider`
-    // persists on the session; `agentType`/`metadata`/`workspacePath`/
-    // `workspaceContext` are accepted but deferred (per P2-12a audit).
+    // Full-param create: exercise every new optional field. `provider` and
+    // `isBackground` (G-A1/P3-1.2c) persist on the session;
+    // `agentType`/`workspacePath`/`workspaceContext` are accepted but
+    // deferred (per P2-12a audit).
     let params = format!(
         concat!(
             r#"{{"workspaceId":"{ws}","agentId":"{aid}","name":"WSS Wide","#,
             r#""model":"auggie:sonnet4.5","specialistId":"implementor","#,
             r#""provider":"auggie","agentType":"task-loop","#,
             r#""metadata":{{"tag":"unit"}},"workspacePath":"/tmp/wid","#,
-            r#""workspaceContext":{{"selection":"note:1"}}}}"#
+            r#""workspaceContext":{{"selection":"note:1"}},"isBackground":true}}"#
         ),
         ws = ws_id,
         aid = requested,
@@ -471,6 +492,11 @@ async fn wss_agent_create_widened_params_round_trip() {
     assert_eq!(created["provider"].as_str(), Some("auggie"));
     assert_eq!(created["workspaceId"].as_str(), Some(ws_id.as_str()));
     assert_eq!(created["metadata"]["specialist"], "implementor");
+    assert_eq!(
+        created["metadata"]["isBackground"], true,
+        "isBackground must persist and be served on the projection: {}",
+        sess[0]
+    );
     // Full-`AgentLite` shape check: `messageCount` is present on the projection.
     assert!(
         created.get("messageCount").is_some(),
@@ -486,6 +512,10 @@ async fn wss_agent_create_widened_params_round_trip() {
     assert_eq!(
         sess[1]["result"]["agent"]["provider"].as_str(),
         Some("auggie"),
+    );
+    assert_eq!(
+        sess[1]["result"]["agent"]["metadata"]["isBackground"], true,
+        "isBackground survives the persist → agent.get round-trip",
     );
 
     // Backward-compat: a create that omits every widened param still returns
@@ -508,6 +538,159 @@ async fn wss_agent_create_widened_params_round_trip() {
     assert!(
         minimal["result"]["agent"].get("createdAt").is_some(),
         "minimal create still returns full AgentLite: {minimal}",
+    );
+    assert_eq!(
+        minimal["result"]["agent"]["metadata"]["isBackground"], false,
+        "omitting isBackground defaults to foreground: {minimal}",
+    );
+
+    srv.ws.stop().await;
+}
+
+/// A8: the four session-shape RPCs unblocking the FE agent-backend-handler
+/// retirement (C1d/C1e) — `agent.getSession`, `agent.update`,
+/// `agent.appendMessage`, `agent.replaceMessages` — over the real WSS
+/// transport. Asserts the wire contract PROTOCOL §5.5 documents: full
+/// `AgentSession` projection (superset of `AgentLite`), whitelisted partial
+/// updates round-tripping through `agent.getSession`, append-then-swap
+/// transcript mutations under freshly-minted `seq: 0..n`, and the `-32602`
+/// error codes for unknown agents / unknown fields.
+#[tokio::test]
+async fn wss_agent_session_shape_rpcs_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"A8"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            // 1) create an agent to operate on.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"A8"}}}}"#
+            ),
+        ],
+    )
+    .await;
+    let agent_id = sess[0]["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // 2) drive the four new RPCs on one long-lived WSS session so the wire
+    //    contract is exercised end-to-end (upgrade → JSON-RPC → services →
+    //    store, and back). All four ids are unique so a session-level replay
+    //    would fail loudly.
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            // agent.getSession — full projection (has `messages` array).
+            format!(
+                r#"{{"jsonrpc":"2.0","id":10,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
+            ),
+            // agent.update — patch systemPrompt + isBackground.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":11,"method":"agent.update","params":{{"agentId":"{agent_id}","changes":{{"systemPrompt":"be helpful","isBackground":true}}}}}}"#
+            ),
+            // agent.getSession — verify patch persisted.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":12,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
+            ),
+            // agent.update — unknown field → -32602.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":13,"method":"agent.update","params":{{"agentId":"{agent_id}","changes":{{"nope":"x"}}}}}}"#
+            ),
+            // agent.appendMessage — append one user message.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":14,"method":"agent.appendMessage","params":{{"agentId":"{agent_id}","role":"user","contentBlocks":[{{"type":"text","text":"wake"}}]}}}}"#
+            ),
+            // agent.replaceMessages — atomic swap → seq 0/1.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":15,"method":"agent.replaceMessages","params":{{"agentId":"{agent_id}","messages":[{{"role":"user","contentBlocks":[{{"type":"text","text":"edit"}}]}},{{"role":"assistant","contentBlocks":[{{"type":"text","text":"ok"}}]}}]}}}}"#
+            ),
+            // agent.getSession unknown → -32602 "Agent not found".
+            r#"{"jsonrpc":"2.0","id":16,"method":"agent.getSession","params":{"agentId":"agent-00000000-0000-0000-0000-000000000000"}}"#.to_string(),
+        ],
+    )
+    .await;
+
+    // agent.getSession returns the full `AgentSession` shape.
+    assert_eq!(
+        sess[0]["result"]["session"]["id"].as_str(),
+        Some(agent_id.as_str()),
+        "getSession returns session: {}",
+        sess[0]
+    );
+    assert!(
+        sess[0]["result"]["session"]["messages"].is_array(),
+        "getSession carries messages array (AgentSession, not AgentLite): {}",
+        sess[0]
+    );
+
+    // agent.update returns { success, agent: AgentLite }.
+    assert_eq!(
+        sess[1]["result"]["success"],
+        Value::Bool(true),
+        "update: {}",
+        sess[1]
+    );
+    assert_eq!(
+        sess[1]["result"]["agent"]["id"].as_str(),
+        Some(agent_id.as_str())
+    );
+
+    // The patch round-trips through getSession.
+    assert_eq!(
+        sess[2]["result"]["session"]["systemPrompt"].as_str(),
+        Some("be helpful"),
+        "update persisted: {}",
+        sess[2]
+    );
+    assert_eq!(
+        sess[2]["result"]["session"]["isBackground"].as_bool(),
+        Some(true)
+    );
+
+    // Unknown fields in `changes` → -32602.
+    assert_eq!(
+        sess[3]["error"]["code"].as_i64(),
+        Some(-32602),
+        "unknown field must be -32602: {}",
+        sess[3]
+    );
+
+    // appendMessage persists one row.
+    assert_eq!(sess[4]["result"]["success"], Value::Bool(true));
+    assert_eq!(sess[4]["result"]["message"]["role"].as_str(), Some("user"));
+
+    // replaceMessages atomically swaps under fresh seq.
+    assert_eq!(sess[5]["result"]["success"], Value::Bool(true));
+    let swapped = sess[5]["result"]["messages"]
+        .as_array()
+        .expect("messages array");
+    assert_eq!(swapped.len(), 2);
+    assert_eq!(swapped[0]["seq"].as_i64(), Some(0));
+    assert_eq!(swapped[1]["seq"].as_i64(), Some(1));
+
+    // Unknown-agent lookups surface as -32602 "Agent not found".
+    assert_eq!(
+        sess[6]["error"]["code"].as_i64(),
+        Some(-32602),
+        "unknown agent must be -32602: {}",
+        sess[6]
+    );
+    assert_eq!(
+        sess[6]["error"]["message"].as_str(),
+        Some("Agent not found")
     );
 
     srv.ws.stop().await;
@@ -649,6 +832,265 @@ async fn wss_jsonrpc_roundtrip_matches_uds() {
 }
 
 #[tokio::test]
+async fn wss_models_list_returns_catalog_with_source() {
+    // models.list (§5.30): the rich FE model catalog — `{ models, source }`
+    // where `source` is "auggie" (live CLI) or "static" (tier fallback), and
+    // every row carries the id/name/provider triple; never empty.
+    let srv = start(WsOptions::default()).await;
+    let frame = r#"{"jsonrpc":"2.0","id":7,"method":"models.list"}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 7);
+    let models = resp["result"]["models"].as_array().expect("models array");
+    assert!(!models.is_empty(), "catalog must never be empty");
+    for m in models {
+        assert!(m["id"].is_string(), "{m}");
+        assert!(m["name"].is_string(), "{m}");
+        assert!(m["provider"].is_string(), "{m}");
+    }
+    let source = resp["result"]["source"].as_str().expect("source");
+    assert!(source == "auggie" || source == "static", "source: {source}");
+    srv.ws.stop().await;
+}
+
+/// Write a deterministic fake `auggie` script for `agent.enhancePrompt` tests
+/// (§5.31): swallows the piped stdin, then runs `body`.
+#[cfg(unix)]
+fn fake_auggie_script(tag: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Path::new("/tmp").join(format!("intentd-wss-auggie-{tag}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("auggie");
+    std::fs::write(&bin, format!("#!/bin/sh\ncat > /dev/null\n{body}\n")).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_enhance_prompt_round_trip() {
+    // agent.enhancePrompt (§5.31): `mode: "enhance"` (the default) extracts the
+    // `<augment-enhanced-prompt>` payload; `mode: "layout"` returns the full
+    // cleaned reply. Both `{ enhanced, original, mode }` shapes ride the same
+    // deterministic fixture CLI.
+    let bin = fake_auggie_script(
+        "ok",
+        "printf '\u{1b}[32m🔧 Tool call: noise\u{1b}[0m\\n🤖\\n<augment-enhanced-prompt>Enhanced: ship it</augment-enhanced-prompt>\\n'",
+    );
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":31,"method":"agent.enhancePrompt","params":{"prompt":"ship it"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 31);
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["result"]["enhanced"], "Enhanced: ship it");
+    assert_eq!(resp["result"]["original"], "ship it");
+    assert_eq!(resp["result"]["mode"], "enhance");
+
+    // Layout mode: no template wrap, no tag extraction — the cleaned reply
+    // (everything after the 🤖 marker) comes back verbatim.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":32,"method":"agent.enhancePrompt","params":{"prompt":"make a layout","mode":"layout"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 32);
+    assert_eq!(
+        resp["result"]["enhanced"],
+        "<augment-enhanced-prompt>Enhanced: ship it</augment-enhanced-prompt>"
+    );
+    assert_eq!(resp["result"]["original"], "make a layout");
+    assert_eq!(resp["result"]["mode"], "layout");
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_enhance_prompt_parse_failure_is_internal_error() {
+    // A reply without the `<augment-enhanced-prompt>` tags in enhance mode is
+    // the documented -32603 parse failure (§5.31).
+    let bin = fake_auggie_script("notags", "printf '🤖\\nno tags here\\n'");
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":33,"method":"agent.enhancePrompt","params":{"prompt":"ship it"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 33);
+    assert_eq!(resp["error"]["code"], -32603);
+    assert_eq!(
+        resp["error"]["data"],
+        "Failed to parse enhanced prompt from response"
+    );
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn wss_agent_enhance_prompt_cli_missing_is_internal_error() {
+    // A missing/unspawnable auggie binary is a hard -32603 (§5.31) — there is
+    // no static fallback for enhancement.
+    let srv = start_with_auggie(
+        WsOptions::default(),
+        Some(std::path::PathBuf::from("/nonexistent/intentd-wss/auggie")),
+    )
+    .await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":34,"method":"agent.enhancePrompt","params":{"prompt":"ship it"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 34);
+    assert_eq!(resp["error"]["code"], -32603);
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn wss_agent_enhance_prompt_validates_params() {
+    // Router-side -32602s (§5.31): missing prompt, unknown mode — rejected
+    // before any CLI spawn, so no auggie override is needed.
+    let srv = start(WsOptions::default()).await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":35,"method":"agent.enhancePrompt","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["message"],
+        "Missing required parameter: prompt"
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":36,"method":"agent.enhancePrompt","params":{"prompt":"x","mode":"summarize"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["message"],
+        "mode must be \"enhance\" or \"layout\""
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_round_trip() {
+    // agent.completeOnce (§5.32) — stateless one-shot prompt→completion.
+    // `{ prompt }` returns `{ text }` with the cleaned CLI reply verbatim,
+    // over the real pinned-TLS WSS transport.
+    let bin = fake_auggie_script(
+        "complete-ok",
+        "printf '\u{1b}[32m🔧 Tool call: noise\u{1b}[0m\\n🤖\\nfix-login-flow\\n'",
+    );
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":41,"method":"agent.completeOnce","params":{"prompt":"slug for login fix"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 41);
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["result"]["text"], "fix-login-flow");
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn wss_agent_complete_once_cli_missing_is_internal_error() {
+    // A missing/unspawnable auggie binary surfaces as -32603 rather than
+    // hanging — the daemon reaps and returns a JSON-RPC error (§5.32).
+    let srv = start_with_auggie(
+        WsOptions::default(),
+        Some(std::path::PathBuf::from("/nonexistent/intentd-wss/auggie")),
+    )
+    .await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":42,"method":"agent.completeOnce","params":{"prompt":"hi"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 42);
+    assert_eq!(resp["error"]["code"], -32603);
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_timeout_reaps_and_errors() {
+    // A hung CLI is reaped when the client-provided timeout elapses; the
+    // response is a -32603 whose `data` carries the timeout message. Proves
+    // the standing design principle — the daemon owns cleanup on in-flight
+    // failure, no session/agent state is leaked.
+    let bin = fake_auggie_script("complete-slow", "sleep 30");
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":43,"method":"agent.completeOnce","params":{"prompt":"hi","timeoutMs":200}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 43);
+    assert_eq!(resp["error"]["code"], -32603);
+    let data = resp["error"]["data"].as_str().unwrap_or_default();
+    assert!(
+        data.contains("timed out after 200ms"),
+        "unexpected data: {data}"
+    );
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn wss_agent_complete_once_validates_params() {
+    // Router-side -32602s (§5.32): missing prompt, blank prompt, non-positive
+    // timeoutMs — all rejected before any CLI spawn.
+    let srv = start(WsOptions::default()).await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":44,"method":"agent.completeOnce","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["message"],
+        "Missing required parameter: prompt"
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":45,"method":"agent.completeOnce","params":{"prompt":"   "}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(resp["error"]["message"], "prompt cannot be empty");
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":46,"method":"agent.completeOnce","params":{"prompt":"hi","timeoutMs":0}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["message"],
+        "timeoutMs must be a positive integer"
+    );
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
 async fn wss_host_status_reports_remote_locality() {
     // host.status is answered on the WSS transport (§5.14) and reports `remote`
     // by default, with the host capability fields a client gates UI on.
@@ -683,28 +1125,82 @@ async fn wss_host_status_override_forces_local() {
 }
 
 #[tokio::test]
-async fn port_backoff_picks_next_port() {
+async fn bind_fails_fast_on_occupied_port() {
+    // Fixed-port fail-fast (§5.6): a busy configured port must surface the OS
+    // bind error immediately — no port walking, no retry. Occupy the port for
+    // the whole test so the listener has no chance to bind, then assert
+    // `start()` returns an `AddrInUse` error on the SAME port it was asked for.
     let base = free_port();
-    // Occupy the base port for the whole test so the listener must advance.
     let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, base)).unwrap();
-    let srv = start(WsOptions {
+    let (api, bus, _store, dir) = make_services(None).await;
+    let tls = ensure_tls_certificate(&dir).expect("cert");
+    let token_store = Arc::new(MemTokenStore::default());
+    token_store.store_token(TOKEN).unwrap();
+    let mut opts = WsOptions {
         base_port: base,
         ..WsOptions::default()
-    })
-    .await;
-    // `free_port()` discovers a number by binding port 0 then releasing it, so
-    // any concurrently-running test may grab `base + 1` before this listener's
-    // backoff reaches it — a TOCTOU that is fundamental to OS port assignment.
-    // The guarantee under test is "a busy base port makes the listener walk
-    // forward within the attempt window", so assert that range rather than one
-    // exact port (which is inherently racy under default parallelism).
-    let max = base + intent_transport::lifecycle::MAX_PORT_ATTEMPTS;
-    assert!(
-        srv.port > base && srv.port < max,
-        "should walk forward past the busy base {base} within the attempt window, got {}",
-        srv.port
+    };
+    opts.bind_address = Ipv4Addr::LOCALHOST.into();
+    let ws = WsApiServer::new(api, bus, &tls, token_store, opts).expect("server");
+    let err = ws
+        .start()
+        .await
+        .expect_err("start must fail when the configured port is occupied");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::AddrInUse,
+        "expected AddrInUse for busy port {base}, got {err:?}"
     );
-    srv.ws.stop().await;
+    // The bound-port accessor must stay `None` — a failed bind never records a
+    // port, so a subsequent restart can retry cleanly on the same configured
+    // port (proven by the graceful_shutdown_allows_immediate_restart test).
+    assert_eq!(ws.bound_port().await, None);
+    ws.stop().await;
+}
+
+#[tokio::test]
+async fn insecure_mode_serves_plain_ws_without_token() {
+    // Insecure dev mode: no TLS acceptor, no bearer-token enforcement. A plain
+    // TCP client must be able to open `ws://.../ws` with NO `Authorization`
+    // header and complete a JSON-RPC round-trip. The listener's `fingerprint()`
+    // is `None` and `is_insecure()` reports `true` so `system.status` surfaces
+    // the real posture.
+    let (api, bus, _store, _dir) = make_services(None).await;
+    let opts = WsOptions {
+        base_port: free_port(),
+        bind_address: Ipv4Addr::LOCALHOST.into(),
+        ..Default::default()
+    };
+    let ws = WsApiServer::new_insecure(api, bus, opts);
+    assert!(ws.is_insecure(), "constructor selects insecure posture");
+    assert!(ws.fingerprint().is_none(), "no TLS cert ⇒ no fingerprint");
+    let port = ws.start().await.expect("start");
+    // Open a plain WebSocket (no TLS wrapping) to the listener with NO token
+    // in either the query string or the `Authorization` header.
+    let url = format!("ws://127.0.0.1:{port}/ws");
+    let (mut sock, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("plain ws handshake");
+    sock.send(Message::Text(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list"}"#.to_string(),
+    ))
+    .await
+    .expect("send");
+    let resp = loop {
+        match sock.next().await {
+            Some(Ok(Message::Text(text))) => {
+                break serde_json::from_str::<Value>(&text).expect("json");
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    };
+    assert_eq!(resp["id"], 1, "id echoed");
+    assert!(
+        resp.get("result").is_some(),
+        "insecure ws:// round-trip returns a result: {resp}"
+    );
+    ws.stop().await;
 }
 
 #[tokio::test]
@@ -965,6 +1461,110 @@ async fn wss_task_list_empty_workspace_emits_zero_stats() {
     srv.ws.stop().await;
 }
 
+/// `task.removeAgentFromAllTasks` (PROTOCOL §5.4 extension) over the real WSS
+/// wire: strips the target agent from every task-note's `assignedAgentIds` in
+/// the workspace and reports the number of task-notes touched. The response
+/// envelope is `{ ok: true, updatedCount: <n> }` and the mutation persists
+/// through the shared store so subsequent `note.get` reads see the stripped
+/// arrays. Non-target agents and non-task notes are left untouched. Replay is
+/// idempotent — a second call with the same agent id updates zero notes.
+#[tokio::test]
+async fn wss_task_remove_agent_from_all_tasks_round_trip() {
+    use intent_core::AgentId;
+
+    let srv = start(WsOptions::default()).await;
+
+    let ws = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws))
+        .await
+        .expect("insert workspace");
+
+    let victim = AgentId::from("agent-victim");
+    let other = AgentId::from("agent-other");
+
+    let mk_task = |id: &str, agents: Vec<AgentId>| {
+        let mut n = fixture_note(&ws, id, "body");
+        n.task = Some(TaskMetadata {
+            status: TaskStatus::InProgress,
+            assigned_agent_ids: agents,
+            ..Default::default()
+        });
+        n
+    };
+    for n in [
+        mk_task("task-a", vec![victim.clone(), other.clone()]),
+        mk_task("task-b", vec![other.clone()]),
+        mk_task("task-c", vec![victim.clone()]),
+    ] {
+        srv.store.insert_note(&n).await.expect("insert task");
+    }
+    // A plain (non-task) note is left alone even if it shares an id shape.
+    srv.store
+        .insert_note(&fixture_note(&ws, "plain", "not a task"))
+        .await
+        .expect("insert plain");
+
+    let req = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"task.removeAgentFromAllTasks","params":{{"workspaceId":"{}","agentId":"{}"}}}}"#,
+        ws.0, victim.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &req).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 1);
+    assert!(resp["error"].is_null(), "unexpected error envelope: {resp}");
+    let result = &resp["result"];
+    assert_eq!(result["ok"], true, "envelope: {resp}");
+    assert_eq!(result["updatedCount"], 2, "two matching tasks: {resp}");
+
+    // Post-condition: victim is stripped from A and C; B is untouched.
+    let a = srv
+        .api
+        .get_note(ws.clone(), NoteId::from("task-a"))
+        .await
+        .expect("get_note task-a");
+    assert_eq!(
+        a.task.as_ref().unwrap().assigned_agent_ids,
+        vec![other.clone()]
+    );
+    let b = srv
+        .api
+        .get_note(ws.clone(), NoteId::from("task-b"))
+        .await
+        .expect("get_note task-b");
+    assert_eq!(b.task.as_ref().unwrap().assigned_agent_ids, vec![other]);
+    let c = srv
+        .api
+        .get_note(ws.clone(), NoteId::from("task-c"))
+        .await
+        .expect("get_note task-c");
+    assert!(c.task.as_ref().unwrap().assigned_agent_ids.is_empty());
+
+    // Replay is idempotent — the second call touches zero notes.
+    let req2 = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"task.removeAgentFromAllTasks","params":{{"workspaceId":"{}","agentId":"{}"}}}}"#,
+        ws.0, victim.0
+    );
+    let resp2 = wss_call(srv.port, srv.cfg.clone(), &req2).await;
+    let result2 = &resp2["result"];
+    assert_eq!(result2["ok"], true);
+    assert_eq!(result2["updatedCount"], 0);
+
+    // Param validation still routes through `-32602` on the wire.
+    let missing_agent = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"task.removeAgentFromAllTasks","params":{{"workspaceId":"{}"}}}}"#,
+        ws.0
+    );
+    let resp3 = wss_call(srv.port, srv.cfg.clone(), &missing_agent).await;
+    assert_eq!(resp3["error"]["code"], -32602);
+    assert_eq!(
+        resp3["error"]["message"],
+        "Missing required parameter: agentId"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `git.commitDetails` + `git.diffs` (with `commitHash`) round-trip over WSS:
 /// proves the daemon's per-commit reads reach a pinned-TLS WebSocket client
 /// with the documented PROTOCOL §5.6 wire shape.
@@ -1075,9 +1675,11 @@ async fn wss_git_commit_details_round_trip() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
-/// `git.branchStatus` over WSS — the path-based BranchSelector seam (§5.6).
-/// Drives the happy path (response shape parity with the UDS coverage), the
-/// missing-branchName -32602, and the unknown-repo gate.
+/// `git.branchStatus` + `git.getBranches` over WSS — the path-based
+/// BranchSelector seam (§5.6). Drives the happy path (response shape parity
+/// with the UDS coverage), the missing-branchName -32602, the
+/// nonexistent-path -32602, and the unregistered-repo branch listing used by
+/// the workspace-create flow.
 #[tokio::test]
 async fn wss_git_branch_status_round_trip() {
     let srv = start(WsOptions::default()).await;
@@ -1114,7 +1716,8 @@ async fn wss_git_branch_status_round_trip() {
     .trim()
     .to_string();
 
-    // Register the repo as a workspace so the known-repo gate authorizes it.
+    // Register the repo as a workspace (the path-based reads do not require
+    // it, but a registered repo must keep working unchanged).
     let create_frame = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS branchStatus WS","worktreePath":"{}","path":"{}"}}}}"#,
         repo.display(),
@@ -1170,7 +1773,7 @@ async fn wss_git_branch_status_round_trip() {
         "Missing required parameter: branchName"
     );
 
-    // (d) Unknown repo path → -32602 with the gate-rejection message.
+    // (d) Nonexistent repo path → -32602 with the validation message.
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1180,9 +1783,560 @@ async fn wss_git_branch_status_round_trip() {
     assert_eq!(resp["error"]["code"], -32602);
     assert_eq!(
         resp["error"]["message"],
-        "Unknown or unauthorized repository path"
+        "Repository path does not exist: /no/such/repo"
+    );
+
+    // (e) `git.getBranches` on a valid local repo the daemon has never seen →
+    // succeeds (the workspace-create flow lists branches before the repo is
+    // registered; PROTOCOL §5.6).
+    let unreg = Path::new("/tmp").join(format!("intentd-wssgb-{}", &short[..8]));
+    std::fs::create_dir_all(&unreg).unwrap();
+    let git_in = |dir: &Path, args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git_in(&unreg, &["init", "-q"]);
+    git_in(&unreg, &["config", "user.name", "Test"]);
+    git_in(&unreg, &["config", "user.email", "test@example.com"]);
+    git_in(&unreg, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(unreg.join("seed.txt"), "seed\n").unwrap();
+    git_in(&unreg, &["add", "."]);
+    git_in(&unreg, &["commit", "-q", "-m", "seed"]);
+    let unreg_head = String::from_utf8(
+        std::process::Command::new("git")
+            .current_dir(&unreg)
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("branch --show-current")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"git.getBranches","params":{{"repoPath":"{}"}}}}"#,
+            unreg.display(),
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["currentBranch"], unreg_head);
+    assert!(resp["result"]["branches"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!(unreg_head)));
+
+    // (f) `git.getBranches` on an existing non-git directory → -32602 with the
+    // distinct message.
+    let plain = Path::new("/tmp").join(format!("intentd-wsspl-{}", &short[..8]));
+    std::fs::create_dir_all(&plain).unwrap();
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"git.getBranches","params":{{"repoPath":"{}"}}}}"#,
+            plain.display(),
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["message"],
+        format!("Path is not a git repository: {}", plain.display())
     );
 
     srv.ws.stop().await;
     std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&unreg).ok();
+    std::fs::remove_dir_all(&plain).ok();
+}
+
+/// `git.pull` over WSS — the workspace-create auto-pull seam (§5.6).
+/// Path-based like `git.getBranches`: the repo is never registered as a
+/// workspace. Drives the checked-out fast-forward pull (`{ ok: true }`), the
+/// structured `{ ok: false, error }` failure for a repo without a remote, and
+/// the nonexistent-path -32602.
+#[tokio::test]
+async fn wss_git_pull_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let base = Path::new("/tmp").join(format!("intentd-wsspull-{}", &short[..8]));
+    std::fs::create_dir_all(&base).unwrap();
+    let git_in = |dir: &Path, args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    let seed = |dir: &Path| {
+        std::fs::create_dir_all(dir).unwrap();
+        git_in(dir, &["init", "-q"]);
+        git_in(dir, &["config", "user.name", "Test"]);
+        git_in(dir, &["config", "user.email", "test@example.com"]);
+        git_in(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        git_in(dir, &["add", "."]);
+        git_in(dir, &["commit", "-q", "-m", "seed"]);
+    };
+    let head_branch = |dir: &Path| {
+        String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["branch", "--show-current"])
+                .output()
+                .expect("branch --show-current")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string()
+    };
+
+    // `repo` tracks a bare origin and is one commit behind it.
+    let repo = base.join("repo");
+    seed(&repo);
+    let bare = base.join("origin.git");
+    git_in(&base, &["init", "-q", "--bare", "origin.git"]);
+    git_in(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    let branch = head_branch(&repo);
+    git_in(&repo, &["push", "-q", "origin", &branch]);
+    std::fs::write(repo.join("remote.txt"), "from-remote\n").unwrap();
+    git_in(&repo, &["add", "."]);
+    git_in(&repo, &["commit", "-q", "-m", "remote change"]);
+    git_in(&repo, &["push", "-q", "origin", &branch]);
+    git_in(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+
+    // (a) Behind checked-out branch → fast-forward pull succeeds with the
+    // exact `{ ok: true }` result (`error` omitted on success).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"git.pull","params":{{"repoPath":"{}","branchName":"{}"}}}}"#,
+            repo.display(),
+            branch,
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"], serde_json::json!({ "ok": true }));
+    assert!(repo.join("remote.txt").exists());
+
+    // (b) Repo without an `origin` remote → structured `{ ok: false, error }`.
+    let lone = base.join("lone");
+    seed(&lone);
+    let lone_branch = head_branch(&lone);
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.pull","params":{{"repoPath":"{}","branchName":"{}"}}}}"#,
+            lone.display(),
+            lone_branch,
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], false);
+    assert!(!resp["result"]["error"].as_str().unwrap().is_empty());
+
+    // (c) Nonexistent repo path → -32602 with the validation message.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"git.pull","params":{"repoPath":"/no/such/repo","branchName":"main"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["message"],
+        "Repository path does not exist: /no/such/repo"
+    );
+
+    srv.ws.stop().await;
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Note version history over WSS (PROTOCOL §5.2 version-history extensions):
+/// every content mutation appends a full snapshot, `note.listVersions` returns
+/// summaries (no content blob), `note.getVersion` returns one snapshot with
+/// content, and `note.restoreVersion` resets the note to an old snapshot while
+/// appending a new version that captures the restored state.
+#[tokio::test]
+async fn wss_note_version_history_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Versions"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // v1: create; v2: full set; v3: append.
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"note.create","params":{{"workspaceId":"{ws_id}","title":"Versioned","content":"first draft"}}}}"#
+            ),
+        ],
+    )
+    .await;
+    let note_id = sess[0]["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"note.setContent","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}","content":"second draft"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"note.add","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}","content":"appended line"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":5,"method":"note.listVersions","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":6,"method":"note.getVersion","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}","v":2}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":7,"method":"note.restoreVersion","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}","v":2}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":8,"method":"note.get","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":9,"method":"note.getVersion","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}","v":99}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":10,"method":"note.getVersion","params":{{"workspaceId":"{ws_id}","noteId":"{note_id}"}}}}"#
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(sess[0]["result"]["ok"], true, "setContent: {}", sess[0]);
+    assert_eq!(sess[1]["result"]["ok"], true, "add: {}", sess[1]);
+
+    // listVersions: bare ascending array of snapshot summaries, no content.
+    let versions = sess[2]["result"].as_array().expect("versions array");
+    assert_eq!(versions.len(), 3, "create+setContent+add: {}", sess[2]);
+    for (i, entry) in versions.iter().enumerate() {
+        assert_eq!(entry["v"].as_i64(), Some(i as i64 + 1));
+        assert_eq!(entry["type"], "snapshot");
+        assert_eq!(entry["author"]["type"], "system");
+        assert!(entry["date"].is_string());
+        assert!(entry["contentLength"].is_i64());
+        assert!(entry.get("content").is_none(), "summaries carry no content");
+    }
+    assert_eq!(versions[0]["title"], "Versioned");
+
+    // getVersion: one full snapshot with content.
+    assert_eq!(sess[3]["result"]["v"].as_i64(), Some(2));
+    assert_eq!(sess[3]["result"]["content"], "second draft");
+    assert_eq!(sess[3]["result"]["type"], "snapshot");
+
+    // restoreVersion: content reset to v2, new v4 appended.
+    assert_eq!(sess[4]["result"]["ok"], true, "restore: {}", sess[4]);
+    assert_eq!(sess[4]["result"]["restoredFrom"].as_i64(), Some(2));
+    assert_eq!(sess[4]["result"]["v"].as_i64(), Some(4));
+    assert_eq!(sess[4]["result"]["note"]["content"], "second draft");
+
+    // note.get confirms the persisted content matches the restored snapshot.
+    assert_eq!(sess[5]["result"]["note"]["content"], "second draft");
+
+    // Unknown version → -32602 (NotFound, PROTOCOL §9); missing `v` → -32602.
+    assert_eq!(sess[6]["error"]["code"].as_i64(), Some(-32602));
+    assert_eq!(sess[7]["error"]["code"].as_i64(), Some(-32602));
+    assert_eq!(sess[7]["error"]["message"], "Missing required parameter: v");
+
+    srv.ws.stop().await;
+}
+
+/// `git.showFile` over WSS (PROTOCOL §5.6 extensions): file content at a
+/// revision (`HEAD` / `HEAD^`), the empty-content fallback for a path missing
+/// at the ref, and -32603 for an unresolvable ref.
+#[tokio::test]
+async fn wss_git_show_file_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed a real git repo with two commits so HEAD and HEAD^ differ.
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let repo = Path::new("/tmp").join(format!("intentd-wsssf-{}", &short[..8]));
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "seed"]);
+    std::fs::write(repo.join("seed.txt"), "seed\nadded\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "second"]);
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS showFile WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    // Content at HEAD and at the parent revision.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"seed.txt","ref":"HEAD"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["content"], "seed\nadded\n");
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"seed.txt","ref":"HEAD^"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["content"], "seed\n");
+
+    // Missing path at the ref → empty content, not an error.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"nope.txt","ref":"HEAD"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["content"], "");
+
+    // Unresolvable ref → -32603; missing ref param → -32602 (PROTOCOL §9).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"seed.txt","ref":"no-such-ref"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32603);
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"seed.txt"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// `note.saveAsset` over WSS (PROTOCOL §5.2 — additive asset write): the write
+/// returns `{ assetId, path, url }` and the asset round-trips back through
+/// `note.readAsset`; a missing `data` param is -32602.
+#[tokio::test]
+async fn wss_note_save_asset_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Save with a data-URL prefix (the FE sends FileReader.readAsDataURL output).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.saveAsset","params":{"workspaceId":"ws-asset","data":"data:image/png;base64,aGVsbG8=","mimeType":"image/png","originalName":"pasted.png"}}"#,
+    )
+    .await;
+    let asset_id = resp["result"]["assetId"].as_str().expect("assetId");
+    assert!(
+        asset_id.ends_with(".png"),
+        "mime-derived extension: {asset_id}"
+    );
+    assert_eq!(
+        resp["result"]["url"],
+        Value::from(format!("workspace-asset://ws-asset/{asset_id}"))
+    );
+    let path = resp["result"]["path"].as_str().expect("path");
+    assert!(path.ends_with(asset_id));
+    let url = resp["result"]["url"].as_str().unwrap().to_string();
+
+    // Round-trip through note.readAsset by workspace-asset:// URL.
+    let read_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"note.readAsset","params":{{"workspaceId":"ws-asset","asset":"{url}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &read_frame).await;
+    assert_eq!(resp["result"]["assetId"], Value::from(asset_id));
+    assert_eq!(resp["result"]["mimeType"], "image/png");
+    assert_eq!(resp["result"]["data"], "aGVsbG8=");
+
+    // Missing data → -32602 (PROTOCOL §9).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"note.saveAsset","params":{"workspaceId":"ws-asset","mimeType":"image/png"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(resp["error"]["message"], "Missing required parameter: data");
+
+    srv.ws.stop().await;
+}
+
+/// Client-called `host.openInEditor` over WSS (PROTOCOL §5.14): a WSS
+/// connection resolves as remote, so the daemon re-dispatches the intent to
+/// the connected client as the FE-served reverse RPC (`id: "rev-<n>"`) and
+/// echoes `{ ok: true }` back on the original request; missing params are
+/// -32602.
+#[tokio::test]
+async fn wss_host_open_in_editor_reverse_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+
+    let call = r#"{"jsonrpc":"2.0","id":1,"method":"host.openInEditor","params":{"editorId":"vscode","path":"/repo/src/main.rs","line":12,"column":3}}"#;
+    ws.send(Message::Text(call.to_string()))
+        .await
+        .expect("send");
+
+    // The daemon turns the trigger into a reverse request on the same socket.
+    let mut final_response = None;
+    while final_response.is_none() {
+        match ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "host.openInEditor" {
+                    let id = v["id"].as_str().expect("reverse id");
+                    assert!(id.starts_with("rev-"), "reverse ids use rev-: {id}");
+                    assert_eq!(v["params"]["editorId"], "vscode");
+                    assert_eq!(v["params"]["path"], "/repo/src/main.rs");
+                    assert_eq!(v["params"]["line"], 12);
+                    assert_eq!(v["params"]["column"], 3);
+                    let reply = serde_json::json!({
+                        "jsonrpc": "2.0", "id": id, "result": { "ok": true }
+                    });
+                    ws.send(Message::Text(reply.to_string()))
+                        .await
+                        .expect("send reverse reply");
+                } else if v["id"] == 1 {
+                    final_response = Some(v);
+                }
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    let resp = final_response.unwrap();
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    assert_eq!(resp["result"]["ok"], true);
+
+    // Missing editorId → -32602 without any reverse dispatch.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"host.openInEditor","params":{"path":"/repo/src/main.rs"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+}
+
+/// `repo.remove` over WSS (PROTOCOL §5.11): removing a registered path deletes
+/// it from the known-repo registry (`removed: true`, gone from `repo.list`);
+/// removing an unknown path is `removed: false`; missing `path` is -32602.
+#[tokio::test]
+async fn wss_repo_remove_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed two known repos directly in the store (repo.list is read-only).
+    srv.store
+        .upsert_known_repo("/src/keep", "keep", None)
+        .await
+        .expect("seed keep");
+    srv.store
+        .upsert_known_repo("/src/gone", "gone", Some("owner"))
+        .await
+        .expect("seed gone");
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"repo.list","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["repos"].as_array().unwrap().len(), 2);
+
+    // Remove one; the response carries `{ removed: true }`.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"repo.remove","params":{"path":"/src/gone"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"], serde_json::json!({ "removed": true }));
+
+    // The registry no longer lists it — this is what the FE re-reads.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"repo.list","params":{}}"#,
+    )
+    .await;
+    let repos = resp["result"]["repos"].as_array().unwrap();
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0]["path"], "/src/keep");
+
+    // Removing it again is a no-op, not an error.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"repo.remove","params":{"path":"/src/gone"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"], serde_json::json!({ "removed": false }));
+
+    // Missing path → -32602 (PROTOCOL §9).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":5,"method":"repo.remove","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(resp["error"]["message"], "Missing required parameter: path");
+
+    srv.ws.stop().await;
 }

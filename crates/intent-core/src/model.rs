@@ -325,9 +325,9 @@ pub struct WorkspaceDiffSummary {
 }
 
 /// Wire input for `workspace.create` (PROTOCOL §5.1). All fields are optional;
-/// the service fills ids/timestamps/defaults. Unknown fields (e.g.
-/// `initialAgent`) are ignored — initial-agent activation is fire-and-forget and
-/// not part of this persistence slice.
+/// the service fills ids/timestamps/defaults. `initialAgent` carries the full
+/// agent payload for daemon-owned initial-agent orchestration; its `prompt`
+/// also seeds the auto-generated branch slug (TS `generateLocalSlug` parity).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspaceCreate {
@@ -347,35 +347,108 @@ pub struct WorkspaceCreate {
     pub setup_script: Option<String>,
     pub is_remote: Option<bool>,
     pub default_model: Option<String>,
+    /// Git remote used to resolve `baseRef` when provisioning the worktree
+    /// (default `origin`; e.g. `upstream` for forks). Not persisted.
+    pub remote: Option<String>,
+    /// GitHub-style clone URL (https or ssh). When set and `repositoryPath` is
+    /// not already an existing local git repo, the daemon clones the URL into
+    /// `clonePath` (or a default derived from the workspaces root) *before*
+    /// worktree provisioning, and the resulting checkout becomes the
+    /// workspace's `repositoryPath` (PROTOCOL §5.1).
+    pub github_url: Option<String>,
+    /// Optional clone target directory used when `githubUrl` is set. Defaults
+    /// to `<workspaces_root>/clones/<repo-name>` when omitted.
+    pub clone_path: Option<String>,
+    /// Initial agent payload (full shape; `prompt` also seeds the branch slug).
+    pub initial_agent: Option<WorkspaceCreateInitialAgent>,
+}
+
+/// The `initialAgent` sub-object of `workspace.create` (PROTOCOL §5.1). Full
+/// agent payload mirroring `agent.create` (§5.5) so the daemon can own
+/// initial-agent creation and prompt delivery inside the create op; `agentId`
+/// is honored verbatim when supplied (like `agent.create`), and `prompt`
+/// doubles as the branch-slug seed (TS `generateLocalSlug` parity).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WorkspaceCreateInitialAgent {
+    pub agent_id: Option<String>,
+    pub prompt: Option<String>,
+    pub name: Option<String>,
+    pub model: Option<String>,
+    pub specialist: Option<String>,
+    pub provider: Option<String>,
+    pub behavior_prompt: Option<String>,
+    pub agent_type: Option<String>,
+    pub context_references: Option<serde_json::Value>,
+    pub image_blocks: Option<serde_json::Value>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Result of `workspace.create` (PROTOCOL §5.1): the created workspace plus,
+/// when the request carried an `initialAgent` with a prompt, the created
+/// agent's `AgentLite` wire projection (the same shape as the `agent.create`
+/// result's `agent`). Serialized verbatim as the RPC result object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceCreateResult {
+    pub workspace: Workspace,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_agent: Option<serde_json::Value>,
 }
 
 /// Wire input for `workspace.update` (PROTOCOL §5.1). Every field is optional;
 /// an absent field leaves the stored value unchanged (`workspaceId` is supplied
 /// separately by the router).
-#[derive(Debug, Clone, Default, Deserialize)]
+///
+/// Serializes with `skip_serializing_if = "Option::is_none"` so the
+/// `workspace:updated` change event only carries the fields the caller
+/// actually asked to mutate.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspaceUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_commit_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<WorkspaceStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub repository_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub repository_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub repository_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub skip_worktree: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub setup_script: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub is_remote: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub attention: Option<WorkspaceAttention>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
 }
 
@@ -707,6 +780,123 @@ pub struct ReadAssetResult {
     pub size_kb: i64,
 }
 
+/// Result of `note.saveAsset` (PROTOCOL §5.2 — additive asset write). `path`
+/// is the absolute on-disk location under the workspace assets root; `url` is
+/// the `workspace-asset://<workspaceId>/<assetId>` form the FE embeds in note
+/// markdown and feeds back to `note.readAsset`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveAssetResult {
+    pub asset_id: String,
+    pub path: String,
+    pub url: String,
+}
+
+/// Author stamp on a stored note version (PROTOCOL §5.2 version-history
+/// extensions). Mirrors the FE `VersionAuthor` shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoteVersionAuthor {
+    pub id: String,
+    pub name: String,
+    /// `user` | `agent` | `system`.
+    #[serde(rename = "type")]
+    pub author_type: String,
+}
+
+/// One version-list entry returned by `note.listVersions` — the FE
+/// `VersionEntry` shape without the content blob (`contentLength` instead).
+/// `entry_type` is always `"snapshot"` (full-snapshot model).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteVersionSummary {
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    pub v: i64,
+    pub date: String,
+    pub author: NoteVersionAuthor,
+    pub title: String,
+    pub content_length: i64,
+}
+
+/// One full stored note version returned by `note.getVersion`. `entry_type`
+/// is always `"snapshot"` (full-snapshot model).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteVersion {
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    pub v: i64,
+    pub date: String,
+    pub author: NoteVersionAuthor,
+    pub title: String,
+    pub content: String,
+}
+
+/// Result of `note.restoreVersion` — the note's content is reset to version
+/// `restoredFrom` and a new version `v` capturing the restored state is
+/// appended.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteRestoreVersionResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    pub restored_from: i64,
+    pub v: i64,
+    pub note: Note,
+}
+
+// ---------------------------------------------------------------------------
+// Line-attribution wire types (new in intentd; PROTOCOL §5.2.1). Ported from
+// the FE `LineAttributionData` / `LineAttributionInfo` / `LineAuthor` shapes
+// so the `line-attribution:load` + `line-attribution:updated` payloads stay
+// drop-in-compatible with what `LineAttributionGutter.svelte` consumes.
+// ---------------------------------------------------------------------------
+
+/// Author info stamped on an attributed line (FE `LineAuthor`).
+/// `author_type` is one of `user` / `agent` / `system`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineAttributionAuthor {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub author_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_number: Option<i64>,
+}
+
+/// Attribution info for a single line (FE `LineAttributionInfo`).
+/// `timestamp` is milliseconds since Unix epoch (JS `Date.now()`-compatible)
+/// so the FE gutter’s age math works unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineAttributionInfo {
+    pub timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<LineAttributionAuthor>,
+}
+
+/// Serialized attribution payload for a note (FE `LineAttributionData`).
+/// Keys of `attributions` are stringified 1-based line numbers so the JSON
+/// shape matches the FE `Record<number, AttributionInfo>` decoder.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineAttributionData {
+    pub note_id: NoteId,
+    pub workspace_id: WorkspaceId,
+    pub computed_at: String,
+    pub attributions: std::collections::BTreeMap<String, LineAttributionInfo>,
+}
+
+/// Result of `note.lineAttribution.computeNow`. Mirrors the FE IPC handler’s
+/// inner `{ success: true }` — `success` is IPC-transport-level and dropped
+/// on the wire; the RPC result carries only `ok`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineAttributionComputeResult {
+    pub ok: bool,
+}
+
 // ---------------------------------------------------------------------------
 // task.* result DTOs (PROTOCOL §5.4). Field names/optionality match the TS
 // `ws.task.*` peer returns so the iOS client is unchanged.
@@ -832,6 +1022,17 @@ pub struct TaskAssignAgentResult {
     pub ok: bool,
     pub note_id: NoteId,
     pub agent_id: AgentId,
+}
+
+/// Result of `task.removeAgentFromAllTasks` (§5.4 extension). Bulk-sweep helper
+/// called during agent teardown: strips the given agent from every task-note's
+/// `assignedAgentIds` in the workspace and reports how many task-notes were
+/// mutated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRemoveAgentFromAllTasksResult {
+    pub ok: bool,
+    pub updated_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1231,9 +1432,30 @@ pub struct AgentMessage {
     pub role: String,
     #[serde(rename = "contentBlocks")]
     pub content: serde_json::Value,
+    /// Opaque per-message payload the FE attaches to `agent.sendMessage` /
+    /// `agent.forceMessage` as `messageMetadata` (PROTOCOL §5.5): e.g.
+    /// `{ source: "system" }` for daemon-initiated turns. Persisted verbatim
+    /// on the user message row and round-tripped on transcript reads; `None`
+    /// for messages without caller-supplied metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
     #[serde(rename = "timestamp")]
     pub created_at: String,
 }
+
+/// Maximum delegation depth to prevent unbounded recursive agent creation
+/// (port of the TS `MAX_DELEGATION_DEPTH` in `agent-interaction-tools.ts`).
+/// Depth 0 = user-created agents, depth 1 = their children, depth 2 =
+/// grandchildren (max). A parent already at this depth cannot spawn further
+/// delegates. Lives in `intent-core` so both the service impl and the MCP tool
+/// dispatcher (which cannot depend on `intent-services`) share one policy value.
+pub const MAX_DELEGATION_DEPTH: i64 = 2;
+
+/// Maximum length (chars) of a workspace `statusMessage` (port of the TS
+/// `WORKSPACE_STATUS_MESSAGE_MAX_LENGTH` in `src/shared/types.ts`). The MCP
+/// `set_workspace_status_message` tool enforces this cap before calling
+/// `update_workspace`, matching the reference `ws.workspace.setStatusMessage`.
+pub const WORKSPACE_STATUS_MESSAGE_MAX_LENGTH: usize = 500;
 
 /// Agent runtime session (§9.1). Field names/casing match the TS `AgentSession`
 /// (`agent-session.ts`): `backendSessionId`, `acpSessionId` (write-once after
@@ -1284,6 +1506,49 @@ pub struct AgentSession {
     /// the TS `AgentSession` shape for non-opted-out sessions.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skip_auto_commit: bool,
+    /// The child's final report persisted by `agent.reportToParent` (P3-1.2b;
+    /// FE `metadata.completionReport`). Surfaced as `metadata.completionReport`
+    /// in the [`AgentLite`] projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_report: Option<String>,
+    /// ISO timestamp the completion report was saved at (FE
+    /// `metadata.completionReportTimestamp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_report_timestamp: Option<String>,
+    /// Delegation-chain depth (FE `metadata.delegationDepth`): 0/absent for
+    /// user-created agents, parent depth + 1 for delegated children. Gates
+    /// runaway delegation loops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_depth: Option<i64>,
+    /// The first message a delegated agent was started with (FE
+    /// `metadata.initialMessage`), persisted so a wake-up can resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_message: Option<String>,
+    /// Session-level context references captured at spawn (FE top-level
+    /// `contextReferences`); an opaque JSON array persisted verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_references: Option<serde_json::Value>,
+    /// Session-level image blocks captured at spawn (FE top-level
+    /// `imageBlocks`); an opaque JSON array persisted verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_blocks: Option<serde_json::Value>,
+    /// Whether the agent runs in the background (FE `metadata.isBackground`;
+    /// G-A1/P3-1.2c). Persisted at `agent.create`/`agent.delegate` and served
+    /// as `metadata.isBackground` in the [`AgentLite`] projection — the FE
+    /// branches rehydration/list-placement/retry behavior on it. Omitted from
+    /// the session wire form when `false` to preserve the TS `AgentSession`
+    /// shape for foreground sessions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_background: bool,
+    /// Free-form `metadata` object persisted with the session (C1d-10a). Closes
+    /// the metadata half of the P2-12a deferral for `agent_create_op` so the
+    /// widened `agent.wakeOrCreate` composite can read back
+    /// `delegationDepth` / `createdByAgentId` / `taskNoteId` / `isBackground`
+    /// / `source` / `skipAutoCommit` from a parent's session without a
+    /// follow-up round-trip. `None` for pre-existing rows and for creates
+    /// that omit the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1291,8 +1556,11 @@ pub struct AgentSession {
 /// Nested `metadata` object on [`AgentLite`] (PROTOCOL §5.5). Mirrors the subset
 /// of the TS `AgentMetadata` the iOS `AgentSession.parseAgent` reads:
 /// `isBackground`, `specialist`, `createdByAgentId` (the parent/spawning agent),
-/// and `taskNoteId`. `isBackground` is always emitted (iOS reads it with a
-/// `false` default); the rest are omitted when absent.
+/// and `taskNoteId` — plus the persistence-gap fields the FE writer stored
+/// under `metadata` (`completionReport`, `completionReportTimestamp`,
+/// `delegationDepth`, `initialMessage`; P3-1.2b). `isBackground` is always
+/// emitted (iOS reads it with a `false` default) and carries the persisted
+/// session value (G-A1/P3-1.2c); the rest are omitted when absent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentMetadata {
@@ -1303,6 +1571,14 @@ pub struct AgentMetadata {
     pub created_by_agent_id: Option<AgentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_note_id: Option<NoteId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_report: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_report_timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_depth: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_message: Option<String>,
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
@@ -1379,6 +1655,14 @@ pub struct AgentLite {
     pub last_user_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+    /// Session-level context references persisted at spawn (P3-1.2b); omitted
+    /// when absent so pre-gap wire shapes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_references: Option<serde_json::Value>,
+    /// Session-level image blocks persisted at spawn (P3-1.2b); omitted when
+    /// absent so pre-gap wire shapes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_blocks: Option<serde_json::Value>,
     pub metadata: AgentMetadata,
 }
 
@@ -1393,10 +1677,14 @@ impl AgentLite {
         digest: Option<String>,
     ) -> Self {
         let metadata = AgentMetadata {
-            is_background: false,
+            is_background: session.is_background,
             specialist: session.specialist,
             created_by_agent_id: session.parent_agent_id.clone(),
             task_note_id: session.task_note_id.clone(),
+            completion_report: session.completion_report,
+            completion_report_timestamp: session.completion_report_timestamp,
+            delegation_depth: session.delegation_depth,
+            initial_message: session.initial_message,
         };
         Self {
             id: session.id,
@@ -1424,6 +1712,8 @@ impl AgentLite {
             last_agent_response,
             last_user_message,
             digest,
+            context_references: session.context_references,
+            image_blocks: session.image_blocks,
             metadata,
         }
     }
@@ -1435,11 +1725,13 @@ impl AgentLite {
 /// optional; the FE fills them in when routing an agent-spawn through the daemon
 /// so the seam does not need to make a follow-up RPC for provider/context.
 ///
-/// `provider` is persisted on the created [`AgentSession`] (existing column);
-/// `agentType`, `metadata`, `workspacePath`, and `workspaceContext` are accepted
-/// and currently forwarded no further (the widened seam unblocks the FE
-/// flip — persistence for the new hints is deferred to a follow-up per the
-/// P2-12a audit).
+/// `provider` is persisted on the created [`AgentSession`] (existing column).
+/// `metadata` is harvested for the persistence-gap fields (`delegationDepth`,
+/// `initialMessage`, `contextReferences`; P3-1.2b); `contextReferences` /
+/// `imageBlocks` / `isBackground` also land as session-level fields (top-level
+/// params win over the `metadata` fallback). `agentType`, `workspacePath`, and
+/// `workspaceContext` are accepted and currently forwarded no further
+/// (deferred per the P2-12a audit).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentCreateExtra {
@@ -1448,6 +1740,9 @@ pub struct AgentCreateExtra {
     pub metadata: Option<serde_json::Value>,
     pub workspace_path: Option<String>,
     pub workspace_context: Option<serde_json::Value>,
+    pub context_references: Option<serde_json::Value>,
+    pub image_blocks: Option<serde_json::Value>,
+    pub is_background: Option<bool>,
 }
 
 /// Wire input for `agent.delegate` (PROTOCOL §5.5). `workspaceId` is passed
@@ -1465,6 +1760,45 @@ pub struct AgentDelegateInput {
     pub behavior_prompt: Option<String>,
     pub wait_mode: Option<String>,
     pub skip_auto_commit: Option<bool>,
+}
+
+/// Optional `create.*` payload on [`AgentWakeOrCreateInput`] — the fields the
+/// widened `agent.wakeOrCreate` (C1d-10a) forwards into `agent.create` when the
+/// task has no live/resumable assigned agent. Mirrors the FE
+/// `WakeOrCreateTaskAgentTool` create payload: `name`, `specialist`,
+/// `provider`, `agentType`, `model`, `contextReferences`, `metadata`, and
+/// `skipAutoCommit`. All optional so the pre-widening wire shape stays valid;
+/// specialist/model inheritance from a previous assigned session wins over
+/// these when both are present.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AgentWakeCreateOptions {
+    pub name: Option<String>,
+    pub specialist: Option<String>,
+    pub provider: Option<String>,
+    pub agent_type: Option<String>,
+    pub model: Option<String>,
+    pub context_references: Option<serde_json::Value>,
+    pub metadata: Option<serde_json::Value>,
+    pub skip_auto_commit: Option<bool>,
+}
+
+/// Wire input for `agent.wakeOrCreate` (PROTOCOL §5.5, widened by C1d-10a).
+/// `workspaceId`, `taskNoteId`, `contextMessage` are passed separately (the
+/// existing 3-required-params shape). Everything here is optional so the
+/// pre-widening callers stay green: `model` is the wake-branch model override;
+/// `callerAgentId`/`delegationDepth` drive the delegation-depth guard;
+/// `messageMetadata` is threaded onto the delivered context message on both
+/// branches; `create` carries the rich `agent.create` payload used when no
+/// live/resumable assigned agent is found.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AgentWakeOrCreateInput {
+    pub model: Option<String>,
+    pub caller_agent_id: Option<AgentId>,
+    pub delegation_depth: Option<i64>,
+    pub message_metadata: Option<serde_json::Value>,
+    pub create: Option<AgentWakeCreateOptions>,
 }
 
 /// A single file's status line, mirroring the TS `GitFileStatus` enum
@@ -1538,6 +1872,19 @@ pub struct GitBranchStatus {
     pub ahead: i64,
     pub behind: i64,
     pub has_uncommitted_changes: bool,
+}
+
+/// `git.pull` result (`{ ok, error? }`), mirroring the legacy `git:pullBranch`
+/// IPC's `{ success, error? }` payload: ordinary pull failures (conflicts,
+/// unreachable remote, stash-recovery problems) are a structured `ok: false` +
+/// `error` rather than a JSON-RPC error, so the workspace-create flow can show
+/// its pull-conflict dialog. `error` is omitted on success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPullResult {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// `git.commit` service result (the `ok` flag is added by the transport). Mirrors
@@ -2276,13 +2623,23 @@ mod tests {
             stats: None,
             task_note_id: None,
             skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: true,
+            metadata: None,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
         };
         let lite = AgentLite::from_session(session, 0, None, Some("hi".to_string()), None);
         let v = serde_json::to_value(&lite).unwrap();
         assert_eq!(v["metadata"]["specialist"], "implementor");
-        assert_eq!(v["metadata"]["isBackground"], false);
+        // The persisted session value is served, not a hard-coded `false`
+        // (G-A1/P3-1.2c).
+        assert_eq!(v["metadata"]["isBackground"], true);
         assert_eq!(v["metadata"]["createdByAgentId"], "agent-parent");
         assert_eq!(v["isStreaming"], false);
         assert_eq!(v["isProcessing"], false);
@@ -2321,11 +2678,20 @@ mod tests {
                 seq: 0,
                 role: "user".to_string(),
                 content: json!([{ "type": "text", "text": "hi" }]),
+                metadata: None,
                 created_at: "t0".to_string(),
             }],
             stats: None,
             task_note_id: None,
             skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
         };
@@ -2370,6 +2736,7 @@ mod tests {
             seq: 0,
             role: "user".to_string(),
             content: json!([{ "type": "text", "text": "hi" }]),
+            metadata: None,
             created_at: "t0".to_string(),
         };
         let value = serde_json::to_value(&message).unwrap();
@@ -2391,5 +2758,58 @@ mod tests {
         assert!(!obj.contains_key("createdAt"));
         let back: AgentMessage = serde_json::from_value(value).unwrap();
         assert_eq!(back, message);
+    }
+
+    #[test]
+    fn workspace_create_initial_agent_parses_full_payload() {
+        // PROTOCOL §5.1: `initialAgent` mirrors the agent.create payload so the
+        // daemon can own initial-agent orchestration inside workspace.create.
+        let input: WorkspaceCreate = serde_json::from_value(json!({
+            "title": "WS",
+            "initialAgent": {
+                "agentId": "agent-1",
+                "prompt": "fix the auth flow",
+                "name": "Auth fixer",
+                "model": "opus",
+                "specialist": "implementor",
+                "provider": "auggie",
+                "behaviorPrompt": "be terse",
+                "agentType": "task-loop",
+                "contextReferences": [{ "path": "src/auth.ts" }],
+                "imageBlocks": [{ "type": "image", "data": "abc" }],
+                "metadata": { "initialMessage": "fix the auth flow" }
+            }
+        }))
+        .unwrap();
+        let agent = input.initial_agent.expect("initialAgent");
+        assert_eq!(agent.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(agent.prompt.as_deref(), Some("fix the auth flow"));
+        assert_eq!(agent.name.as_deref(), Some("Auth fixer"));
+        assert_eq!(agent.model.as_deref(), Some("opus"));
+        assert_eq!(agent.specialist.as_deref(), Some("implementor"));
+        assert_eq!(agent.provider.as_deref(), Some("auggie"));
+        assert_eq!(agent.behavior_prompt.as_deref(), Some("be terse"));
+        assert_eq!(agent.agent_type.as_deref(), Some("task-loop"));
+        assert_eq!(
+            agent.context_references,
+            Some(json!([{ "path": "src/auth.ts" }]))
+        );
+        assert_eq!(
+            agent.image_blocks,
+            Some(json!([{ "type": "image", "data": "abc" }]))
+        );
+        assert_eq!(
+            agent.metadata,
+            Some(json!({ "initialMessage": "fix the auth flow" }))
+        );
+
+        // Absent sub-fields stay None (all optional, `default` container).
+        let bare: WorkspaceCreate =
+            serde_json::from_value(json!({ "initialAgent": { "prompt": "p" } })).unwrap();
+        let bare = bare.initial_agent.expect("initialAgent");
+        assert_eq!(bare.prompt.as_deref(), Some("p"));
+        assert!(bare.agent_id.is_none());
+        assert!(bare.specialist.is_none());
+        assert!(bare.metadata.is_none());
     }
 }

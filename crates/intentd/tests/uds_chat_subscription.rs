@@ -89,7 +89,13 @@ async fn boot(
     let socket = std::env::temp_dir().join(format!("intentd-uds-{}.sock", Uuid::new_v4()));
     // Keep a typed handle so tests can drive the live-turn slot directly (the
     // server is handed the same handle coerced to `Arc<dyn WorkspaceApi>`).
-    let services = Arc::new(Services::new(bus.store().clone()).with_event_bus(bus.clone()));
+    let services = Arc::new(
+        Services::new(bus.store().clone())
+            .with_workspaces_root(
+                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+            )
+            .with_event_bus(bus.clone()),
+    );
     let api: Arc<dyn intent_core::WorkspaceApi> = services.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server = tokio::spawn({
@@ -458,6 +464,7 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
             &user_id,
             "user",
             &json!([{ "type": "text", "id": format!("{user_id}:0"), "text": "Run the tests" }]),
+            None,
             &now_iso(),
         )
         .await
@@ -560,6 +567,7 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
                   "output": "12 passed", "is_error": false },
                 { "type": "text", "id": format!("{mid}:3"), "text": "Done." },
             ]),
+            None,
             &now_iso(),
         )
         .await
@@ -670,6 +678,7 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
             &user_id,
             "user",
             &json!([{ "type": "text", "id": format!("{user_id}:0"), "text": "Run the tests" }]),
+            None,
             &now_iso(),
         )
         .await
@@ -789,6 +798,7 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
                   "output": "12 passed", "is_error": false },
                 { "type": "text", "id": format!("{mid}:3"), "text": "Done." },
             ]),
+            None,
             &now_iso(),
         )
         .await
@@ -883,6 +893,7 @@ async fn chat_snapshot_does_not_merge_live_turn_when_agent_is_not_busy() {
             &user_id,
             "user",
             &json!([{ "type": "text", "id": format!("{user_id}:0"), "text": "Run the tests" }]),
+            None,
             &now_iso(),
         )
         .await
@@ -1185,6 +1196,7 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
             &user_id,
             "user",
             &json!([{ "type": "text", "id": format!("{user_id}:0"), "text": "Run the tests" }]),
+            None,
             &now_iso(),
         )
         .await
@@ -1293,6 +1305,7 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
                 { "type": "tool_result", "id": format!("{mid}:3"), "tool_use_id": "call_abc",
                   "output": "12 passed", "is_error": false },
             ]),
+            None,
             &now_iso(),
         )
         .await

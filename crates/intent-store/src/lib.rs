@@ -20,16 +20,22 @@ mod draft_repo;
 mod event_repo;
 mod idempotency_repo;
 mod known_repo_repo;
+mod mcp_oauth_repo;
 mod memories_repo;
 mod metrics_repo;
+mod note_line_attribution_repo;
 mod note_repo;
+mod note_version_repo;
+mod script_repo;
 mod settings_repo;
 mod tracked_changes_repo;
 mod workspace_repo;
 
+pub use agent_repo::ReplaceMessage;
 pub use diffs_repo::{DiffRow, NewDiff};
 pub use event_repo::{EventQuery, NewEvent};
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
+pub use note_version_repo::MAX_NOTE_VERSIONS;
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
 
 #[cfg(test)]

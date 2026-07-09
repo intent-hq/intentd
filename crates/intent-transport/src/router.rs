@@ -7,9 +7,10 @@
 //! transport (UDS today, WS/TLS later) shares one code path.
 
 use intent_core::{
-    AgentCreateExtra, AgentDelegateInput, AgentId, Error, EventQueryParams, NoteAddInput,
-    NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams,
-    ScriptMode, WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
+    AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
+    Error, EventQueryParams, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId,
+    NoteUpdateInput, ScriptCreateParams, ScriptMode, WorkspaceApi, WorkspaceCreate, WorkspaceId,
+    WorkspaceUpdate,
 };
 use serde_json::{json, Map, Value};
 
@@ -166,11 +167,15 @@ async fn dispatch(
             let idempotency_key = opt_str(params, "idempotencyKey");
             let input: WorkspaceCreate = serde_json::from_value(Value::Object(params.clone()))
                 .map_err(|e| rpc(INVALID_PARAMS, format!("invalid params: {e}")))?;
-            let ws = api
+            let res = api
                 .create_workspace(input, idempotency_key)
                 .await
                 .map_err(workspace_err)?;
-            Ok(json!({ "workspace": ws }))
+            let mut result = json!({ "workspace": res.workspace });
+            if let Some(agent) = res.initial_agent {
+                result["initialAgent"] = agent;
+            }
+            Ok(result)
         }
         "workspace.update" => {
             let id = require_workspace_id(params)?;
@@ -384,6 +389,67 @@ async fn dispatch(
             let result = api.read_asset(ws, asset).await.map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        "note.saveAsset" => {
+            let ws = require_ws_note(params)?;
+            let data = require_str_param(params, "data")?;
+            let mime_type = require_str_param(params, "mimeType")?;
+            let original_name = opt_str(params, "originalName");
+            let result = api
+                .save_asset(ws, data, mime_type, original_name)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "note.listVersions" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let versions = api
+                .list_note_versions(ws, note_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            // Bare array, like `note.listTasks`.
+            to_result_value(&versions)
+        }
+        "note.getVersion" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let v = require_int_param(params, "v")?;
+            let version = api
+                .get_note_version(ws, note_id, v)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&version)
+        }
+        "note.restoreVersion" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let v = require_int_param(params, "v")?;
+            let result = api
+                .restore_note_version(ws, note_id, v)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "note.lineAttribution.load" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let data = api
+                .line_attribution_load(ws, note_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            // Bare LineAttributionData | null so the FE gutter’s
+            // `line-attribution:load` decoder round-trips as-is.
+            to_result_value(&data)
+        }
+        "note.lineAttribution.computeNow" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let result = api
+                .line_attribution_compute_now(ws, note_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
         "task.updateStatus" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
@@ -471,6 +537,15 @@ async fn dispatch(
             let agent_id = require_str_param(params, "agentId")?;
             let result = api
                 .assign_agent(ws, note_id, agent_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "task.removeAgentFromAllTasks" => {
+            let ws = require_ws_note(params)?;
+            let agent_id = require_str_param(params, "agentId").map(AgentId::from)?;
+            let result = api
+                .remove_agent_from_all_tasks(ws, agent_id)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -692,9 +767,64 @@ async fn dispatch(
         "agent.getSessionStats" => {
             let session_id =
                 require_str_param(params, "sessionId").map(|s| AgentId::from(s.as_str()))?;
-            match api.agent_get_session_stats(session_id).await {
+            let ws = opt_workspace_id(params);
+            match api.agent_get_session_stats(session_id, ws).await {
                 Ok(v) => Ok(v),
                 Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Session not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "agent.getSession" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            match api.agent_get_session(agent_id, ws).await {
+                Ok(session) => Ok(json!({ "session": session })),
+                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "agent.update" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let changes = params
+                .get("changes")
+                .cloned()
+                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: changes"))?;
+            match api.agent_update(agent_id, ws, changes).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "agent.appendMessage" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let role = require_str_param(params, "role")?;
+            let content = params
+                .get("contentBlocks")
+                .or_else(|| params.get("content"))
+                .cloned()
+                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: contentBlocks"))?;
+            let metadata = opt_value(params, "metadata");
+            match api
+                .agent_append_message(agent_id, ws, role, content, metadata)
+                .await
+            {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "agent.replaceMessages" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let messages = params
+                .get("messages")
+                .cloned()
+                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: messages"))?;
+            match api.agent_replace_messages(agent_id, ws, messages).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -721,6 +851,9 @@ async fn dispatch(
                 metadata: opt_value(params, "metadata"),
                 workspace_path: opt_nonempty_str(params, "workspacePath"),
                 workspace_context: opt_value(params, "workspaceContext"),
+                context_references: opt_value(params, "contextReferences"),
+                image_blocks: opt_value(params, "imageBlocks"),
+                is_background: opt_bool(params, "isBackground"),
             };
             // FE/RPC front door: top-level creates stay parentless.
             let result = api
@@ -768,8 +901,42 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let message_id = opt_str(params, "messageId");
             let image_blocks = opt_value(params, "imageBlocks");
+            let file_blocks = opt_value(params, "fileBlocks");
+            let priority = opt_str(params, "priority");
+            // Per-turn prompt-assembly hints (PROTOCOL §5.5): `stdinContext`
+            // is prepended verbatim to the outbound prompt as a `Context:`
+            // block (reference-parity `acp-provider.ts`); `noteIds` and
+            // `contextReferences` are threaded to the prompt builder for
+            // downstream note-image / context-reference resolution.
+            let note_ids = opt_value(params, "noteIds");
+            let stdin_context = opt_str(params, "stdinContext");
+            let context_references = opt_value(params, "contextReferences");
+            // Opaque per-message payload (PROTOCOL §5.5): the FE attaches
+            // arbitrary JSON to distinguish daemon-initiated turns (e.g.
+            // `{ source: "system" }`). Passed through unmodified and persisted
+            // on the user message row via the store's metadata-aware append.
+            let message_metadata = opt_value(params, "messageMetadata");
+            // App-ID trio (`userAppMessageId` / `assistantMessageId` /
+            // `assistantAppMessageId`) is a client-side identity/dedupe layer
+            // that the daemon does NOT consume: the transcript is keyed on
+            // the server-minted UUIDv7 `id` (see `Store::append_agent_message*`)
+            // and the FE round-trips its ids through the arbitrary
+            // `messageMetadata` payload above. Any future daemon-side dedupe
+            // would surface as an explicit field on the request envelope.
             let result = api
-                .agent_send_message(ws, agent_id, content, message_id, image_blocks)
+                .agent_send_message(
+                    ws,
+                    agent_id,
+                    content,
+                    message_id,
+                    image_blocks,
+                    file_blocks,
+                    priority,
+                    note_ids,
+                    stdin_context,
+                    context_references,
+                    message_metadata,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -780,9 +947,29 @@ async fn dispatch(
             let content = require_str_param(params, "content")?;
             let ws = require_ws_note(params)?;
             let image_blocks = opt_value(params, "imageBlocks");
+            let file_blocks = opt_value(params, "fileBlocks");
             let note_ids = opt_value(params, "noteIds");
+            // Per-turn prompt-assembly hints (PROTOCOL §5.5); same shape as
+            // `agent.sendMessage`.
+            let stdin_context = opt_str(params, "stdinContext");
+            let context_references = opt_value(params, "contextReferences");
+            // Opaque per-message payload (PROTOCOL §5.5); see the
+            // `agent.sendMessage` extraction site above for the app-ID trio
+            // rationale and metadata semantics.
+            let message_metadata = opt_value(params, "messageMetadata");
             let result = api
-                .agent_force_message(ws, agent_id, message_id, content, image_blocks, note_ids)
+                .agent_force_message(
+                    ws,
+                    agent_id,
+                    message_id,
+                    content,
+                    image_blocks,
+                    file_blocks,
+                    note_ids,
+                    stdin_context,
+                    context_references,
+                    message_metadata,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -791,8 +978,9 @@ async fn dispatch(
             let agent_id = require_agent_id(params)?;
             let content = require_str_param(params, "content")?;
             let image_blocks = opt_value(params, "imageBlocks");
+            let file_blocks = opt_value(params, "fileBlocks");
             let result = api
-                .agent_queue_message(agent_id, content, image_blocks)
+                .agent_queue_message(agent_id, content, image_blocks, file_blocks)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -819,7 +1007,11 @@ async fn dispatch(
         }
         "agent.getQueue" => {
             let agent_id = require_agent_id(params)?;
-            let result = api.agent_get_queue(agent_id).await.map_err(domain_to_rpc)?;
+            let ws = opt_workspace_id(params);
+            let result = api
+                .agent_get_queue(agent_id, ws)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(result)
         }
         "agent.stop" => {
@@ -839,6 +1031,66 @@ async fn dispatch(
         }
         "agent.getModels" => {
             let result = api.agent_get_models().await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "models.list" => {
+            // Additive rich model catalog (PROTOCOL §5.30); no params.
+            let result = api.models_list().await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.enhancePrompt" => {
+            // One-shot prompt-enhance / AI-layout generation (PROTOCOL §5.31).
+            let prompt = require_str_param(params, "prompt")?;
+            if prompt.trim().is_empty() {
+                return Err(rpc(INVALID_PARAMS, "prompt cannot be empty"));
+            }
+            let mode = opt_str(params, "mode").unwrap_or_else(|| "enhance".to_string());
+            if mode != "enhance" && mode != "layout" {
+                return Err(rpc(
+                    INVALID_PARAMS,
+                    "mode must be \"enhance\" or \"layout\"",
+                ));
+            }
+            let model = opt_str(params, "model");
+            let ws = opt_workspace_id(params);
+            let timeout_ms =
+                match params.get("timeoutMs") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
+                        rpc(INVALID_PARAMS, "timeoutMs must be a positive integer")
+                    })?),
+                };
+            let result = api
+                .agent_enhance_prompt(prompt, mode, model, ws, timeout_ms)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.completeOnce" => {
+            // Stateless one-shot prompt→completion RPC (PROTOCOL §5.32). Ports
+            // the FE `background-request.service.ts` slug-generation +
+            // note-status callers so no ACPProvider / ephemeral session is
+            // needed. The daemon reaps the CLI on any failure path — no
+            // session/agent state is created, so there is nothing to
+            // garbage-collect on error.
+            let prompt = require_str_param(params, "prompt")?;
+            if prompt.trim().is_empty() {
+                return Err(rpc(INVALID_PARAMS, "prompt cannot be empty"));
+            }
+            let system_prompt = opt_str(params, "systemPrompt");
+            let model = opt_str(params, "model");
+            let ws = opt_workspace_id(params);
+            let timeout_ms =
+                match params.get("timeoutMs") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
+                        rpc(INVALID_PARAMS, "timeoutMs must be a positive integer")
+                    })?),
+                };
+            let result = api
+                .agent_complete_once(prompt, system_prompt, model, ws, timeout_ms)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(result)
         }
         "agent.respondPermission" => {
@@ -871,8 +1123,12 @@ async fn dispatch(
             if trimmed.is_empty() {
                 return Err(rpc(INVALID_PARAMS, "Name cannot be empty"));
             }
+            // `skipIfExplicitlySet` (optional, default false): leave an
+            // already-explicitly-named session untouched (P3-1.2b; the FE
+            // `renameAgent` option) — the result then carries `skipped: true`.
+            let skip_if_explicitly_set = opt_bool(params, "skipIfExplicitlySet").unwrap_or(false);
             let result = api
-                .agent_rename(agent_id, trimmed)
+                .agent_rename(agent_id, trimmed, skip_if_explicitly_set)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -890,9 +1146,32 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let task_note_id = require_str_param(params, "taskNoteId").map(NoteId::from)?;
             let context_message = require_str_param(params, "contextMessage")?;
-            let model = opt_str(params, "model");
+            // Widened wire input (C1d-10a). All fields optional so the
+            // pre-widening 3-required-params call shape stays green;
+            // `create.*` is parsed via serde (a missing `create` object
+            // collapses to `None`, empty subfields collapse to `None`).
+            let create = params
+                .get("create")
+                .filter(|v| !v.is_null())
+                .cloned()
+                .map(serde_json::from_value::<AgentWakeCreateOptions>)
+                .transpose()
+                .map_err(|e| {
+                    rpc(
+                        INVALID_PARAMS,
+                        format!("agent.wakeOrCreate: invalid `create` payload: {e}"),
+                    )
+                })?;
+            let input = AgentWakeOrCreateInput {
+                model: opt_nonempty_str(params, "model"),
+                caller_agent_id: opt_nonempty_str(params, "callerAgentId")
+                    .map(|s| AgentId::from(s.as_str())),
+                delegation_depth: params.get("delegationDepth").and_then(Value::as_i64),
+                message_metadata: opt_value(params, "messageMetadata"),
+                create,
+            };
             let result = api
-                .agent_wake_or_create(ws, task_note_id, context_message, model)
+                .agent_wake_or_create(ws, task_note_id, context_message, input)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -998,8 +1277,9 @@ async fn dispatch(
             let include_remote = parse_bool(params, "includeRemote");
             match api.git_get_branches(repo_path, include_remote).await {
                 Ok(branches) => to_result_value(&branches),
-                // Unknown/unauthorized repo path → -32602 with the TS message
-                // verbatim (no `invalid params:` prefix from `domain_to_rpc`).
+                // Nonexistent / non-git repo path → -32602 with the service
+                // message verbatim (no `invalid params:` prefix from
+                // `domain_to_rpc`).
                 Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
@@ -1009,9 +1289,24 @@ async fn dispatch(
             let branch_name = require_str_param(params, "branchName")?;
             match api.git_branch_status(repo_path, branch_name).await {
                 Ok(status) => to_result_value(&status),
-                // Same gate as `git.getBranches`: unknown/unauthorized repo path
-                // surfaces verbatim as `-32602` without the `invalid params:`
-                // prefix `domain_to_rpc` would add.
+                // Same validation as `git.getBranches`: nonexistent / non-git
+                // repo path surfaces verbatim as `-32602` without the
+                // `invalid params:` prefix `domain_to_rpc` would add.
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "git.pull" => {
+            let repo_path = require_str_param(params, "repoPath")?;
+            let branch_name = require_str_param(params, "branchName")?;
+            match api.git_pull(repo_path, branch_name).await {
+                // Ordinary pull failures are a structured `{ ok: false, error }`
+                // result (the FE shows its pull-conflict dialog), never a
+                // JSON-RPC error.
+                Ok(r) => to_result_value(&r),
+                // Same validation as `git.getBranches`: nonexistent / non-git
+                // repo path surfaces verbatim as `-32602` without the
+                // `invalid params:` prefix `domain_to_rpc` would add.
                 Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
@@ -1019,6 +1314,13 @@ async fn dispatch(
         "repo.list" => {
             // No params; returns `{ repos: KnownRepo[] }` with camelCase keys.
             let r = api.repo_list().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "repo.remove" => {
+            // Delete one known-repo registry entry by path; returns
+            // `{ removed: bool }` (false when the path was not registered).
+            let path = require_str_param(params, "path")?;
+            let r = api.repo_remove(path).await.map_err(domain_to_rpc)?;
             Ok(r)
         }
         "git.clone" => {
@@ -1109,6 +1411,16 @@ async fn dispatch(
             let (limit, page_token) = parse_page_params(params);
             let r = api
                 .git_commits(ws, limit, page_token)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "git.showFile" => {
+            let ws = require_ws_note(params)?;
+            let file_path = require_str_param(params, "filePath")?;
+            let git_ref = require_str_param(params, "ref")?;
+            let r = api
+                .git_show_file(ws, file_path, git_ref)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -1956,6 +2268,16 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        "file.exists" => {
+            let ws = require_ws_note(params)?;
+            let path = require_str_param(params, "path")?;
+            api.file_exists(ws, path).await.map_err(domain_to_rpc)
+        }
+        "file.stat" => {
+            let ws = require_ws_note(params)?;
+            let path = require_str_param(params, "path")?;
+            api.file_stat(ws, path).await.map_err(domain_to_rpc)
+        }
         "primitive.addReference" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
@@ -2027,41 +2349,54 @@ async fn dispatch(
             api.script_create(ws, create).await.map_err(domain_to_rpc)
         }
         "script.remove" => {
+            let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
-            api.script_remove(script_id).await.map_err(domain_to_rpc)
+            api.script_remove(ws, script_id)
+                .await
+                .map_err(domain_to_rpc)
         }
         "script.start" => {
+            let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
-            api.script_start(script_id).await.map_err(domain_to_rpc)
+            api.script_start(ws, script_id).await.map_err(domain_to_rpc)
         }
         "script.stop" => {
+            let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
-            api.script_stop(script_id).await.map_err(domain_to_rpc)
+            api.script_stop(ws, script_id).await.map_err(domain_to_rpc)
         }
         "script.restart" => {
+            let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
-            api.script_restart(script_id).await.map_err(domain_to_rpc)
+            api.script_restart(ws, script_id)
+                .await
+                .map_err(domain_to_rpc)
         }
         "script.output" => {
+            let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             let max_lines = opt_int(params, "maxLines");
             let paginate = params.get("paginate").and_then(Value::as_bool);
             let page_token = opt_str(params, "nextToken");
-            api.script_output(script_id, max_lines, paginate, page_token)
+            api.script_output(ws, script_id, max_lines, paginate, page_token)
                 .await
                 .map_err(domain_to_rpc)
         }
         "script.status" => {
+            let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
-            api.script_status(script_id).await.map_err(domain_to_rpc)
+            api.script_status(ws, script_id)
+                .await
+                .map_err(domain_to_rpc)
         }
         "script.run" => {
+            let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             let max_lines = opt_int(params, "maxLines");
             // `timeoutSeconds` with the `timeout` alias (PROTOCOL §5.8).
             let timeout_seconds =
                 opt_int(params, "timeoutSeconds").or_else(|| opt_int(params, "timeout"));
-            api.script_run(script_id, max_lines, timeout_seconds)
+            api.script_run(ws, script_id, max_lines, timeout_seconds)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -2215,6 +2550,39 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "mcp.oauth.list" => api.mcp_oauth_list().await.map_err(domain_to_rpc),
+        "mcp.oauth.get" => {
+            let server_id = require_str_param(params, "serverId")?;
+            match api.mcp_oauth_get(server_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.oauth.set" => {
+            let server_id = require_str_param(params, "serverId")?;
+            require_present(params, "tokenBag")?;
+            let token_bag = params.get("tokenBag").cloned().unwrap_or(Value::Null);
+            match api.mcp_oauth_set(server_id, token_bag).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.oauth.delete" => {
+            let server_id = require_str_param(params, "serverId")?;
+            match api.mcp_oauth_delete(server_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
+                    Err(rpc(INVALID_PARAMS, m))
+                }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }
@@ -2262,6 +2630,17 @@ fn require_str_param(params: &Map<String, Value>, name: &str) -> Result<String, 
     match params.get(name) {
         Some(Value::String(s)) => Ok(s.clone()),
         _ => Err(rpc(
+            INVALID_PARAMS,
+            format!("Missing required parameter: {name}"),
+        )),
+    }
+}
+
+/// Require an integer param (e.g. `v` on `note.getVersion`/`restoreVersion`).
+fn require_int_param(params: &Map<String, Value>, name: &str) -> Result<i64, RpcErr> {
+    match params.get(name).and_then(Value::as_i64) {
+        Some(v) => Ok(v),
+        None => Err(rpc(
             INVALID_PARAMS,
             format!("Missing required parameter: {name}"),
         )),

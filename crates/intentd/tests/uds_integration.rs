@@ -132,7 +132,9 @@ async fn uds_slice_end_to_end() {
 
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store).with_workspaces_root(
+        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+    ));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
@@ -557,6 +559,20 @@ async fn uds_slice_end_to_end() {
     let models = resp["result"]["models"].as_array().expect("models array");
     assert!(!models.is_empty());
 
+    // (o′) models.list (§5.30) → non-empty rich catalog + `source` tag.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":93,"method":"models.list"}"#,
+    )
+    .await;
+    let models = resp["result"]["models"].as_array().expect("models array");
+    assert!(!models.is_empty());
+    assert!(models[0]["id"].is_string());
+    assert!(models[0]["name"].is_string());
+    assert!(models[0]["provider"].is_string());
+    let source = resp["result"]["source"].as_str().expect("source");
+    assert!(source == "auggie" || source == "static", "source: {source}");
+
     // (p) agent.create → { agent: { id, name } } on the seeded workspace.
     let resp = send(
         &config.socket_path,
@@ -616,6 +632,91 @@ async fn uds_slice_end_to_end() {
     assert!(message["timestamp"].is_string());
     assert!(message.get("content").is_none());
     assert!(message.get("createdAt").is_none());
+
+    // (s1a) agent.getSession → full `AgentSession` (superset of AgentLite):
+    // `messages` is present as an array (the field AgentLite strips). Confirms
+    // the C1d/C1e loadAgent rehydration RPC returns the full shape (§5.5).
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2401,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    let session = &resp["result"]["session"];
+    assert_eq!(session["id"], json!(agent_id));
+    assert!(session["messages"].is_array());
+    assert!(session["name"].is_string());
+
+    // (s1b) agent.getSession unknown → -32602 "Agent not found".
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":2402,"method":"agent.getSession","params":{"agentId":"agent-00000000-0000-0000-0000-000000000000"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(resp["error"]["message"], json!("Agent not found"));
+
+    // (s1c) agent.update patches `systemPrompt` + `isBackground`; the round
+    // trip through agent.getSession proves the patch persisted.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2403,"method":"agent.update","params":{{"agentId":"{agent_id}","changes":{{"systemPrompt":"be helpful","isBackground":true}}}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+    assert_eq!(resp["result"]["agent"]["id"], json!(agent_id));
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2404,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["session"]["systemPrompt"],
+        json!("be helpful")
+    );
+    assert_eq!(resp["result"]["session"]["isBackground"], json!(true));
+
+    // (s1d) agent.update rejects unknown field → -32602.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2405,"method":"agent.update","params":{{"agentId":"{agent_id}","changes":{{"nope":"x"}}}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+
+    // (s1e) agent.appendMessage + agent.replaceMessages: append a user
+    // message, then atomically swap the transcript with two fresh entries at
+    // seq 0/1. Row ids are minted by the store so callers cannot smuggle
+    // stale ids across the swap (§5.5).
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2406,"method":"agent.appendMessage","params":{{"agentId":"{agent_id}","role":"user","contentBlocks":[{{"type":"text","text":"wake"}}]}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+    assert_eq!(resp["result"]["message"]["role"], json!("user"));
+
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2407,"method":"agent.replaceMessages","params":{{"agentId":"{agent_id}","messages":[{{"role":"user","contentBlocks":[{{"type":"text","text":"edit"}}]}},{{"role":"assistant","contentBlocks":[{{"type":"text","text":"ok"}}]}}]}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+    let swapped = resp["result"]["messages"].as_array().expect("messages");
+    assert_eq!(swapped.len(), 2);
+    assert_eq!(swapped[0]["seq"], json!(0));
+    assert_eq!(swapped[1]["seq"], json!(1));
 
     // (s2) agent.getSessionStats → `{ stats: SessionStats }`. With auggie
     // unavailable in CI the counts derive from the transcript (one persisted

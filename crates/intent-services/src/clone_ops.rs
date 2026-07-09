@@ -65,10 +65,40 @@ pub(crate) fn resolve_target_path(
 }
 
 /// Basename-of-URL default (strip a trailing `.git`), matching `git clone`.
-fn derive_default_target(url: &str) -> String {
+pub(crate) fn derive_default_target(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
     let base = trimmed.rsplit(['/', ':']).next().unwrap_or("");
     base.strip_suffix(".git").unwrap_or(base).to_string()
+}
+
+/// Best-effort `(owner, name)` extraction for a GitHub-style clone URL. Returns
+/// `None` when the URL does not carry an `owner/name` pair (bare filesystem
+/// paths, single-segment URLs, etc.); callers should fall back to any
+/// caller-supplied override.
+pub(crate) fn parse_owner_repo(url: &str) -> Option<(String, String)> {
+    let trimmed = url.trim().trim_end_matches('/');
+    let after_scheme = match trimmed.split_once("://") {
+        Some((_, rest)) => rest,
+        None => trimmed,
+    };
+    let path = match after_scheme.split_once(['/', ':']) {
+        Some((_host, rest)) => rest,
+        None => return None,
+    };
+    let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    let raw_name = segments.pop()?;
+    let owner = segments.pop()?.to_string();
+    let name = raw_name
+        .strip_suffix(".git")
+        .unwrap_or(raw_name)
+        .to_string();
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((owner, name))
 }
 
 /// Redact a `user[:pass]@` credential fragment from any URL-like substring in
@@ -112,10 +142,23 @@ pub(crate) struct CloneJob {
 /// spawn. Never returns an error — spawn failures are surfaced on the terminal
 /// event so the caller only correlates by `requestId`.
 pub(crate) fn spawn_clone(job: CloneJob) {
-    tokio::spawn(async move { run_clone(job).await });
+    tokio::spawn(async move {
+        let _ = run_clone(job).await;
+    });
 }
 
-async fn run_clone(job: CloneJob) {
+/// Same pipeline as [`spawn_clone`] but runs on the current task and returns
+/// the clone outcome. Used by `workspace.create` (`githubUrl` orchestration,
+/// PROTOCOL §5.1): the caller needs to fail the whole create atomically when
+/// the clone fails, and needs to know the target checkout succeeded before
+/// promoting it to `repositoryPath`. The terminal `git:clone:done` frame is
+/// still published, so remote clients observe the same event flow as
+/// `git.clone`.
+pub(crate) async fn perform_clone(job: CloneJob) -> std::result::Result<(), String> {
+    run_clone(job).await
+}
+
+async fn run_clone(job: CloneJob) -> std::result::Result<(), String> {
     let CloneJob {
         request_id,
         workspace_id,
@@ -158,31 +201,18 @@ async fn run_clone(job: CloneJob) {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            publish(
-                &bus,
-                &ws,
-                done_event(
-                    &ws,
-                    &request_id,
-                    false,
-                    Some(&format!("git spawn failed: {e}")),
-                ),
-            )
-            .await;
-            return;
+            let msg = format!("git spawn failed: {e}");
+            publish(&bus, &ws, done_event(&ws, &request_id, false, Some(&msg))).await;
+            return Err(msg);
         }
     };
     let stderr = match child.stderr.take() {
         Some(s) => s,
         None => {
             let _ = child.kill().await;
-            publish(
-                &bus,
-                &ws,
-                done_event(&ws, &request_id, false, Some("git stderr not piped")),
-            )
-            .await;
-            return;
+            let msg = "git stderr not piped".to_string();
+            publish(&bus, &ws, done_event(&ws, &request_id, false, Some(&msg))).await;
+            return Err(msg);
         }
     };
 
@@ -208,40 +238,32 @@ async fn run_clone(job: CloneJob) {
             )
             .await;
             publish(&bus, &ws, done_event(&ws, &request_id, true, None)).await;
+            Ok(())
         }
         Ok(Ok(status)) => {
             let msg = match tail_error {
                 Some(t) if !t.is_empty() => format!("git clone failed ({}): {}", status, t),
                 _ => format!("git clone failed ({})", status),
             };
+            let redacted = redact_credentials(&msg);
             publish(
                 &bus,
                 &ws,
-                done_event(&ws, &request_id, false, Some(&redact_credentials(&msg))),
+                done_event(&ws, &request_id, false, Some(&redacted)),
             )
             .await;
+            Err(redacted)
         }
         Ok(Err(e)) => {
-            publish(
-                &bus,
-                &ws,
-                done_event(
-                    &ws,
-                    &request_id,
-                    false,
-                    Some(&format!("git wait failed: {e}")),
-                ),
-            )
-            .await;
+            let msg = format!("git wait failed: {e}");
+            publish(&bus, &ws, done_event(&ws, &request_id, false, Some(&msg))).await;
+            Err(msg)
         }
         Err(_) => {
             reap_child_group(&mut child).await;
-            publish(
-                &bus,
-                &ws,
-                done_event(&ws, &request_id, false, Some("git clone timed out")),
-            )
-            .await;
+            let msg = "git clone timed out".to_string();
+            publish(&bus, &ws, done_event(&ws, &request_id, false, Some(&msg))).await;
+            Err(msg)
         }
     }
 }
@@ -498,6 +520,24 @@ mod tests {
         assert_eq!(derive_default_target("https://github.com/a/b"), "b");
         assert_eq!(derive_default_target("git@github.com:a/b.git"), "b");
         assert_eq!(derive_default_target("https://github.com/a/b/"), "b");
+    }
+
+    #[test]
+    fn parse_owner_repo_handles_https_and_ssh() {
+        assert_eq!(
+            parse_owner_repo("https://github.com/owner/repo.git"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_owner_repo("https://github.com/owner/repo"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_owner_repo("git@github.com:owner/repo.git"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(parse_owner_repo("https://github.com/repo"), None);
+        assert_eq!(parse_owner_repo(""), None);
     }
 
     #[test]
