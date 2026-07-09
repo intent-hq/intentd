@@ -20,8 +20,7 @@ impl Store {
         sqlx::query(
             "INSERT INTO note_line_attribution (note_id, workspace_id, computed_at, attributions_json) \
              VALUES (?, ?, ?, ?) \
-             ON CONFLICT(note_id) DO UPDATE SET \
-               workspace_id = excluded.workspace_id, \
+             ON CONFLICT(workspace_id, note_id) DO UPDATE SET \
                computed_at = excluded.computed_at, \
                attributions_json = excluded.attributions_json",
         )

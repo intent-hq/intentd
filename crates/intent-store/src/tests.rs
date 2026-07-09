@@ -1286,7 +1286,10 @@ async fn agent_session_gap_fields_round_trip() {
     let mut updated = loaded.clone();
     updated.completion_report = Some("done".to_string());
     updated.completion_report_timestamp = Some("t9".to_string());
-    store.update_agent_session(&updated).await.expect("update");
+    store
+        .update_agent_session(&ws, &updated)
+        .await
+        .expect("update");
     let reloaded = store.get_agent_session(&agent_id).await.expect("reload");
     assert_eq!(reloaded.completion_report.as_deref(), Some("done"));
     assert_eq!(reloaded.completion_report_timestamp.as_deref(), Some("t9"));

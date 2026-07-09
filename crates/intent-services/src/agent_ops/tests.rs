@@ -691,7 +691,7 @@ async fn rename_skip_if_explicitly_set() {
     assert_eq!(r["success"], json!(true));
     assert_eq!(r["skipped"], json!(true));
     assert_eq!(r["name"], "Named");
-    let got = svc.agent_get_op(explicit).await.expect("get");
+    let got = svc.agent_get_op(explicit, None).await.expect("get");
     assert_eq!(got.name, "Named");
 
     // No client name -> auto-generated, nameExplicitlySet = false: the
@@ -717,7 +717,7 @@ async fn rename_skip_if_explicitly_set() {
         .expect("rename");
     assert_eq!(r["name"], "Chosen");
     assert!(r.get("skipped").is_none());
-    let got = svc.agent_get_op(auto.clone()).await.expect("get");
+    let got = svc.agent_get_op(auto.clone(), None).await.expect("get");
     assert_eq!(got.name, "Chosen");
     assert!(got.name_explicitly_set);
     // Now explicitly set -> a further skip-guarded rename is a no-op.
@@ -764,7 +764,7 @@ async fn create_persists_and_reserves_gap_fields() {
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
     // Re-served on `agent.get` (session-level fields + nested metadata).
-    let got = svc.agent_get_op(id.clone()).await.expect("get");
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
     let v = serde_json::to_value(&got).expect("lite json");
     assert_eq!(v["metadata"]["delegationDepth"], json!(2));
     assert_eq!(v["metadata"]["initialMessage"], "start here");
@@ -812,7 +812,7 @@ async fn create_is_background_top_level_wins_and_defaults_false() {
         .await
         .expect("create");
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
-    let got = svc.agent_get_op(id).await.expect("get");
+    let got = svc.agent_get_op(id, None).await.expect("get");
     let v = serde_json::to_value(&got).expect("lite json");
     assert_eq!(v["metadata"]["isBackground"], json!(false));
 
@@ -832,7 +832,7 @@ async fn create_is_background_top_level_wins_and_defaults_false() {
         .await
         .expect("create plain");
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
-    let got = svc.agent_get_op(id).await.expect("get plain");
+    let got = svc.agent_get_op(id, None).await.expect("get plain");
     let v = serde_json::to_value(&got).expect("lite json");
     assert_eq!(v["metadata"]["isBackground"], json!(false));
 }
@@ -934,7 +934,7 @@ async fn report_to_parent_persists_completion_report() {
     assert_eq!(r["ok"], json!(true));
     assert_eq!(r["parentAgentId"].as_str(), Some(parent.0.as_str()));
 
-    let got = svc.agent_get_op(child).await.expect("get child");
+    let got = svc.agent_get_op(child, None).await.expect("get child");
     let v = serde_json::to_value(&got).expect("lite json");
     assert_eq!(v["metadata"]["completionReport"], "all done");
     assert_eq!(v["metadata"]["completionReportTimestamp"], r["savedAt"]);
@@ -960,7 +960,7 @@ async fn delegate_persists_initial_message_and_delegation_depth() {
         .await
         .expect("delegate");
     let child = AgentId::from(out["agentId"].as_str().unwrap());
-    let got = svc.agent_get_op(child).await.expect("get child");
+    let got = svc.agent_get_op(child, None).await.expect("get child");
     let v = serde_json::to_value(&got).expect("lite json");
     assert_eq!(v["metadata"]["initialMessage"], "Do the thing");
     assert_eq!(v["metadata"]["delegationDepth"], json!(1));

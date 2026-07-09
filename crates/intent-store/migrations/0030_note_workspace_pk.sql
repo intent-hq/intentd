@@ -102,4 +102,53 @@ ALTER TABLE comment_new RENAME TO comment;
 CREATE INDEX idx_comment_note   ON comment(note_id, workspace_id);
 CREATE INDEX idx_comment_thread ON comment(thread_id);
 
+-- Rebuild `note_version` (0021) so its FK targets the widened composite key.
+-- The version history is workspace-scoped through the parent note, so we join
+-- through `note` to backfill `workspace_id`; orphan rows (parent note deleted
+-- but child left behind, not expected) are dropped.
+CREATE TABLE note_version_new (
+  note_id      TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  v            INTEGER NOT NULL,
+  date         TEXT NOT NULL,
+  author_id    TEXT NOT NULL,
+  author_name  TEXT NOT NULL,
+  author_type  TEXT NOT NULL,
+  title        TEXT NOT NULL,
+  content      TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, note_id, v),
+  FOREIGN KEY (note_id, workspace_id) REFERENCES note(id, workspace_id) ON DELETE CASCADE
+);
+
+INSERT INTO note_version_new (note_id, workspace_id, v, date, author_id,
+  author_name, author_type, title, content)
+SELECT nv.note_id, n.workspace_id, nv.v, nv.date, nv.author_id, nv.author_name,
+  nv.author_type, nv.title, nv.content
+FROM note_version nv JOIN note n ON n.id = nv.note_id;
+
+DROP TABLE note_version;
+ALTER TABLE note_version_new RENAME TO note_version;
+
+-- Rebuild `note_line_attribution` (0028) with the composite FK. The row was
+-- keyed on `note_id` alone; we widen to `(workspace_id, note_id)` so a note id
+-- reused across workspaces (now representable) carries its own attribution.
+CREATE TABLE note_line_attribution_new (
+  note_id           TEXT NOT NULL,
+  workspace_id      TEXT NOT NULL,
+  computed_at       TEXT NOT NULL,
+  attributions_json TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, note_id),
+  FOREIGN KEY (note_id, workspace_id) REFERENCES note(id, workspace_id) ON DELETE CASCADE
+);
+
+INSERT INTO note_line_attribution_new (note_id, workspace_id, computed_at,
+  attributions_json)
+SELECT note_id, workspace_id, computed_at, attributions_json
+FROM note_line_attribution;
+
+DROP TABLE note_line_attribution;
+ALTER TABLE note_line_attribution_new RENAME TO note_line_attribution;
+
+CREATE INDEX idx_note_line_attribution_workspace ON note_line_attribution(workspace_id);
+
 PRAGMA foreign_keys = ON;

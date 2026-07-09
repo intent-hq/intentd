@@ -30,19 +30,23 @@ impl Store {
             .begin()
             .await
             .map_err(|e| Error::Internal(format!("begin note_version tx failed: {e}")))?;
-        let next_v: i64 =
-            sqlx::query("SELECT COALESCE(MAX(v), 0) + 1 AS v FROM note_version WHERE note_id = ?")
-                .bind(&note.id.0)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("next note_version failed: {e}")))?
-                .try_get("v")
-                .map_err(|e| Error::Internal(format!("column v: {e}")))?;
-        sqlx::query(
-            "INSERT INTO note_version (note_id, v, date, author_id, author_name, author_type, \
-             title, content) VALUES (?,?,?,?,?,?,?,?)",
+        let next_v: i64 = sqlx::query(
+            "SELECT COALESCE(MAX(v), 0) + 1 AS v FROM note_version \
+             WHERE note_id = ? AND workspace_id = ?",
         )
         .bind(&note.id.0)
+        .bind(&note.workspace_id.0)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("next note_version failed: {e}")))?
+        .try_get("v")
+        .map_err(|e| Error::Internal(format!("column v: {e}")))?;
+        sqlx::query(
+            "INSERT INTO note_version (note_id, workspace_id, v, date, author_id, author_name, \
+             author_type, title, content) VALUES (?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&note.id.0)
+        .bind(&note.workspace_id.0)
         .bind(next_v)
         .bind(date)
         .bind(&author.id)
@@ -53,8 +57,9 @@ impl Store {
         .execute(&mut *tx)
         .await
         .map_err(|e| Error::Internal(format!("insert note_version failed: {e}")))?;
-        sqlx::query("DELETE FROM note_version WHERE note_id = ? AND v <= ?")
+        sqlx::query("DELETE FROM note_version WHERE note_id = ? AND workspace_id = ? AND v <= ?")
             .bind(&note.id.0)
+            .bind(&note.workspace_id.0)
             .bind(next_v - MAX_NOTE_VERSIONS)
             .execute(&mut *tx)
             .await

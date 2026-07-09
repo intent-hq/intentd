@@ -1166,9 +1166,11 @@ async fn insecure_mode_serves_plain_ws_without_token() {
     // is `None` and `is_insecure()` reports `true` so `system.status` surfaces
     // the real posture.
     let (api, bus, _store, _dir) = make_services(None).await;
-    let mut opts = WsOptions::default();
-    opts.base_port = free_port();
-    opts.bind_address = Ipv4Addr::LOCALHOST.into();
+    let opts = WsOptions {
+        base_port: free_port(),
+        bind_address: Ipv4Addr::LOCALHOST.into(),
+        ..Default::default()
+    };
     let ws = WsApiServer::new_insecure(api, bus, opts);
     assert!(ws.is_insecure(), "constructor selects insecure posture");
     assert!(ws.fingerprint().is_none(), "no TLS cert ⇒ no fingerprint");

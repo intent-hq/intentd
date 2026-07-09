@@ -846,10 +846,11 @@ async fn start_session_sends_bypass_permissions_under_allow_all() {
 
     // 2) Resume path: bypass follows `session/load`.
     let resume_id = AgentId::from("a-bypass-resume");
-    seed_agent(&mgr, &WorkspaceId::from("ws-bypass-resume"), &resume_id).await;
+    let resume_ws = WorkspaceId::from("ws-bypass-resume");
+    seed_agent(&mgr, &resume_ws, &resume_id).await;
     mgr.services
         .store
-        .set_acp_session_id(&resume_id, "existing-id")
+        .set_acp_session_id(&resume_ws, &resume_id, "existing-id")
         .await
         .unwrap();
     let (_agent_r, resume_log) = track_mock_agent_with_log(&mgr, &resume_id, true);
@@ -868,10 +869,11 @@ async fn start_session_sends_bypass_permissions_under_allow_all() {
 
     // 3) Recreate path: bypass follows the fallback `session/new`.
     let recreate_id = AgentId::from("a-bypass-recreate");
-    seed_agent(&mgr, &WorkspaceId::from("ws-bypass-recreate"), &recreate_id).await;
+    let recreate_ws = WorkspaceId::from("ws-bypass-recreate");
+    seed_agent(&mgr, &recreate_ws, &recreate_id).await;
     mgr.services
         .store
-        .set_acp_session_id(&recreate_id, "stale-id")
+        .set_acp_session_id(&recreate_ws, &recreate_id, "stale-id")
         .await
         .unwrap();
     let (_agent_rc, recreate_log) = track_mock_agent_with_log(&mgr, &recreate_id, false);
@@ -1272,7 +1274,7 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
     // path (no session → `interrupt` would fall back to the kill path).
     mgr.services
         .store
-        .set_acp_session_id(&id, "acp-int-send")
+        .set_acp_session_id(&ws, &id, "acp-int-send")
         .await
         .unwrap();
     // Claim the in-flight slot so the send sees a busy (mid-turn) agent.
@@ -1330,7 +1332,7 @@ async fn interrupt_send_message_idle_agent_falls_through_to_send() {
     let _agent = track_mock_agent(&mgr, &id, false);
     mgr.services
         .store
-        .set_acp_session_id(&id, "acp-int-idle")
+        .set_acp_session_id(&ws, &id, "acp-int-idle")
         .await
         .unwrap();
 
@@ -1368,7 +1370,7 @@ async fn duplicate_interrupt_send_same_message_id_preempts_once() {
     let _agent = track_mock_agent(&mgr, &id, false);
     mgr.services
         .store
-        .set_acp_session_id(&id, "acp-int-dup")
+        .set_acp_session_id(&ws, &id, "acp-int-dup")
         .await
         .unwrap();
     // Claim the in-flight slot so the first delivery preempts a busy turn.
