@@ -1015,6 +1015,68 @@ async fn delegate_rejects_when_parent_at_max_depth() {
     );
 }
 
+/// LC-1: the service-layer guard inside `agent_create_op` mirrors the MCP
+/// `create_agent` front-door check, so RPC/service callers spawning a child
+/// for a parent already at `MAX_DELEGATION_DEPTH` are also refused. A parent
+/// below the max (or an unknown parent, read as depth 0) stays accepted.
+#[tokio::test]
+async fn create_rejects_when_parent_at_max_depth() {
+    let (_t, svc, ws) = setup().await;
+    let extra = intent_core::AgentCreateExtra {
+        metadata: Some(json!({ "delegationDepth": intent_core::MAX_DELEGATION_DEPTH })),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("MaxDepth".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            extra,
+        )
+        .await
+        .expect("create parent at max depth");
+    let parent = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent),
+            None,
+            false,
+            None,
+            intent_core::AgentCreateExtra::default(),
+        )
+        .await
+        .expect_err("create must be refused when parent at max depth");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("maximum delegation depth"),
+        "unexpected err: {msg}"
+    );
+    // A parent below the max still spawns children through the same path.
+    let shallow = create_agent(&svc, &ws, "Shallow").await;
+    svc.agent_create_op(
+        ws.clone(),
+        Some("Child OK".into()),
+        None,
+        None,
+        Some(shallow),
+        None,
+        false,
+        None,
+        intent_core::AgentCreateExtra::default(),
+    )
+    .await
+    .expect("create under a shallow parent succeeds");
+}
+
 /// The top-level (RPC / user) front door stays parentless and is never
 /// subject to the depth guard even when a foreground parent exists.
 #[tokio::test]
@@ -1964,6 +2026,58 @@ async fn delegate_skips_watch_when_parent_deleted() {
     )
     .await
     .expect("delegate");
+    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+}
+
+/// `agent_watch_completion_op` (AS-5, the MCP `create_agent` auto-subscribe):
+/// registers exactly one oneShot watch for the parent→child pair and returns
+/// its subscription id.
+#[tokio::test]
+async fn watch_completion_registers_oneshot_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let resp = svc
+        .agent_watch_completion_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("watch completion");
+    assert_eq!(resp["ok"], serde_json::json!(true));
+    let sub_id = resp["subscriptionId"].as_str().expect("subscriptionId");
+
+    let watches = svc.list_watches_for_parent(&ws, &parent);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].id, sub_id);
+    assert!(watches[0].one_shot);
+    assert!(watches[0].group_id.is_none());
+    assert_eq!(watches[0].child_agent_id, child);
+    assert_eq!(svc.find_watches_for_child(&ws, &child).len(), 1);
+}
+
+/// The deleted-parent guard applies to the `create_agent` auto-subscribe too:
+/// `ok: false`, no subscription id, no watch registered.
+#[tokio::test]
+async fn watch_completion_skips_when_parent_deleted() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    session.status = intent_core::AgentStatus::Deleted;
+    svc.store()
+        .update_agent_session(&session.workspace_id.clone(), &session)
+        .await
+        .expect("flag deleted");
+
+    let resp = svc
+        .agent_watch_completion_op(ws.clone(), parent.clone(), child)
+        .await
+        .expect("watch completion");
+    assert_eq!(resp["ok"], serde_json::json!(false));
+    assert!(resp["subscriptionId"].is_null());
     assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
 }
 

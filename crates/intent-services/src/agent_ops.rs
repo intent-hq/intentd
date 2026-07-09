@@ -846,6 +846,25 @@ impl Services {
         requested_agent_id: Option<AgentId>,
         extra: AgentCreateExtra,
     ) -> Result<Value> {
+        // Depth guard at the service layer (LC-1): mirror the MCP `create_agent`
+        // front-door check so every path that spawns a child for a parent
+        // already at `MAX_DELEGATION_DEPTH` is refused — including RPC/service
+        // callers that bypass the dispatch-level guard. An unknown parent reads
+        // as depth 0 (same leniency as the dispatch check).
+        if let Some(parent) = &parent_agent_id {
+            let parent_depth = self
+                .store
+                .get_agent_session(parent)
+                .await
+                .ok()
+                .and_then(|s| s.delegation_depth)
+                .unwrap_or(0);
+            if parent_depth >= MAX_DELEGATION_DEPTH {
+                return Err(Error::InvalidParams(format!(
+                    "Cannot create sub-agent: maximum delegation depth ({MAX_DELEGATION_DEPTH}) reached. You are at depth {parent_depth}. Please complete this task directly instead of delegating further."
+                )));
+            }
+        }
         let now = now_iso();
         let name_explicitly_set = name.is_some();
         let name =
@@ -1910,6 +1929,36 @@ impl Services {
             }
         }
         Ok(json!({ "ok": true, "agentId": agent_id, "name": name }))
+    }
+
+    /// Auto-subscribe `parent_agent_id` to `child_agent_id`'s completion
+    /// (AS-5, the MCP `create_agent` front door): register a oneShot watch,
+    /// mirroring the immediate-mode branch of `agent_delegate_op` above —
+    /// including the deleted-parent guard (TS `selectIsAgentDeleted`).
+    pub(crate) async fn agent_watch_completion_op(
+        &self,
+        workspace_id: WorkspaceId,
+        parent_agent_id: AgentId,
+        child_agent_id: AgentId,
+    ) -> Result<Value> {
+        let parent_session = self.store.get_agent_session(&parent_agent_id).await.ok();
+        let parent_deleted = parent_session
+            .as_ref()
+            .map(|s| s.status == AgentStatus::Deleted)
+            .unwrap_or(false);
+        if parent_deleted {
+            return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
+        }
+        let parent_name = parent_session.map(|s| s.name).unwrap_or_default();
+        let id = self.register_completion_watch(
+            &workspace_id,
+            parent_agent_id,
+            parent_name,
+            child_agent_id,
+            true,
+            None,
+        );
+        Ok(json!({ "ok": true, "subscriptionId": id }))
     }
 
     /// `agent.getSubscriptions`: live completion-watch payload for `agent_id`

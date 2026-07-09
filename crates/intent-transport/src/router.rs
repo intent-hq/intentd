@@ -466,8 +466,10 @@ async fn dispatch(
             let note_id = require_note_id(params)?;
             let status = require_str_param(params, "status")?;
             let expected_version = opt_int(params, "expectedVersion");
+            // FE/RPC front door: no agent provenance (the MCP path passes the
+            // caller agent so `task:status-changed` carries `agentId`).
             let result = api
-                .task_update_note_status(ws, note_id, status, expected_version)
+                .task_update_note_status(ws, note_id, status, expected_version, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)

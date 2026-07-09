@@ -389,6 +389,47 @@ impl Services {
         Some(format!("[Role Reminder: You are a {name}. {reminder}]"))
     }
 
+    /// Resolve the spawn-prompt specialist injection for an agent (PP-1): the
+    /// behavior prompt (the session's persisted `metadata.behaviorPrompt`
+    /// override wins over the specialist file's body — the TS
+    /// `resolveSpecialistConfig` precedence) plus the specialist's display name
+    /// and role reminder for the footer. `None` for non-specialist agents with
+    /// no behavior-prompt override, leaving their prompt unchanged.
+    pub(crate) async fn agent_specialist_injection(
+        &self,
+        agent_id: &AgentId,
+        workspace_path: Option<&Path>,
+    ) -> Option<crate::rules::SpecialistPromptInjection> {
+        let session = self.store.get_agent_session(agent_id).await.ok()?;
+        let override_bp = session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("behaviorPrompt"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let resolved = session.specialist.as_deref().and_then(|id| {
+            self.specialists_service()
+                .resolve_prompt_injection(id, workspace_path)
+        });
+        match (override_bp, resolved) {
+            (bp_override, Some((bp_file, name, reminder))) => {
+                Some(crate::rules::SpecialistPromptInjection {
+                    behavior_prompt: bp_override.or(bp_file),
+                    specialist_name: Some(name),
+                    role_reminder: reminder,
+                })
+            }
+            (Some(bp), None) => Some(crate::rules::SpecialistPromptInjection {
+                behavior_prompt: Some(bp),
+                specialist_name: None,
+                role_reminder: None,
+            }),
+            (None, None) => None,
+        }
+    }
+
     /// Build a [`SettingsService`](settings::SettingsService) view over the store
     /// and secret store for one `settings.*` call. The secret store is cloned
     /// as an `Arc` so `SettingsService` can move it into `spawn_blocking` for
@@ -1820,9 +1861,17 @@ fn assert_hermetic_root_absent() {
 /// Resolve a workspace-id slug for `workspace.create`, porting the TS
 /// `generateLocalSlug` behavior (`workspace.service.ts`): extract from the
 /// `initialAgent.prompt` when possible, else fall back to a random
-/// adjective-animal pair. Uniquified against existing workspace rows with a
-/// `-N` suffix on collision (mirrors `ensure_unique_branch_name`).
-async fn derive_workspace_id(store: &Store, input: &WorkspaceCreate) -> WorkspaceId {
+/// adjective-animal pair. Uniquified with a `-N` suffix whenever the candidate
+/// id was **ever** used — a live row, a delete tombstone
+/// (`deleted_workspace_id`), or a leftover `<workspaces_root>/<id>` directory
+/// on disk — so ids are never recycled across delete/recreate (FE
+/// `recentlyDeletedWorkspaces` parity: reuse would collide the old
+/// workspace's agent streams and file paths with the new one's).
+async fn derive_workspace_id(
+    store: &Store,
+    input: &WorkspaceCreate,
+    workspaces_root: &Path,
+) -> WorkspaceId {
     let base = input
         .initial_agent
         .as_ref()
@@ -1830,16 +1879,28 @@ async fn derive_workspace_id(store: &Store, input: &WorkspaceCreate) -> Workspac
         .and_then(intent_core::slug::extract_local_slug)
         .unwrap_or_else(intent_core::slug::generate_workspace_slug);
     let candidate = WorkspaceId::from_string(base.clone());
-    if store.get_workspace(&candidate).await.is_err() {
+    if workspace_id_available(store, workspaces_root, &candidate).await {
         return candidate;
     }
     let mut n: u32 = 2;
     loop {
-        let candidate = WorkspaceId::from_string(format!("{base}-{n}"));
-        if store.get_workspace(&candidate).await.is_err() {
+        let candidate = WorkspaceId::from_string(intent_core::slug::append_slug_suffix(&base, n));
+        if workspace_id_available(store, workspaces_root, &candidate).await {
             return candidate;
         }
         n += 1;
+    }
+}
+
+/// A workspace id is available for `workspace.create` only when it was never
+/// used before: no live row, no `deleted_workspace_id` tombstone, and no
+/// existing `<workspaces_root>/<id>` directory (covers pre-tombstone deletes
+/// and orphaned dirs). A store error counts as "used" — colliding is safer
+/// than recycling.
+async fn workspace_id_available(store: &Store, workspaces_root: &Path, id: &WorkspaceId) -> bool {
+    match store.workspace_id_ever_used(id).await {
+        Ok(false) => !workspaces_root.join(id.as_str()).exists(),
+        _ => false,
     }
 }
 
@@ -1986,8 +2047,11 @@ fn note_change_event(
 }
 
 /// Build a `task:status-changed` change event with the TS-parity payload
-/// `{ noteId, noteTitle, previousStatus, newStatus, changedAt }` (the system
-/// actor leaves `agentId` undefined, so it is omitted) (`notes.service.ts`).
+/// `{ noteId, noteTitle, previousStatus, newStatus, changedAt, agentId? }`
+/// (`notes.service.ts`). When the change is agent-attributed (`agent` carries
+/// the invoking agent's id + display name), the event uses an agent actor and
+/// the payload includes `agentId`; otherwise the system actor leaves `agentId`
+/// undefined, so it is omitted.
 fn task_status_changed_event(
     workspace_id: &WorkspaceId,
     note_id: &NoteId,
@@ -1995,23 +2059,37 @@ fn task_status_changed_event(
     previous_status: TaskStatus,
     new_status: TaskStatus,
     changed_at: &str,
+    agent: Option<(String, Option<String>)>,
 ) -> NewEvent {
+    let mut data = serde_json::json!({
+        "noteId": note_id.as_str(),
+        "noteTitle": note_title,
+        "previousStatus": status_word(previous_status),
+        "newStatus": status_word(new_status),
+        "changedAt": changed_at,
+    });
+    let actor = match agent {
+        Some((agent_id, name)) => {
+            data["agentId"] = serde_json::json!(agent_id);
+            intent_core::EventActor {
+                actor_type: ActorType::Agent,
+                id: Some(agent_id),
+                name,
+                ..Default::default()
+            }
+        }
+        None => system_actor(),
+    };
     NewEvent {
         workspace_id: workspace_id.clone(),
         timestamp: now_iso(),
         event_type: TASK_STATUS_CHANGED.to_string(),
-        actor: system_actor(),
+        actor,
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
         metadata: None,
-        data: serde_json::json!({
-            "noteId": note_id.as_str(),
-            "noteTitle": note_title,
-            "previousStatus": status_word(previous_status),
-            "newStatus": status_word(new_status),
-            "changedAt": changed_at,
-        }),
+        data,
     }
 }
 
@@ -3833,12 +3911,16 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
+                    let workspaces_root =
+                        workspaces_root.unwrap_or_else(default_workspaces_root);
                     // Workspace id derivation (TS `generateLocalSlug` parity):
                     // slug from the initial-agent prompt when possible, else a
-                    // random adjective-animal pair; uniquified against
-                    // existing rows with a `-N` suffix on collision so the
-                    // on-disk directory reflects intent, not opaque UUIDs.
-                    let id = derive_workspace_id(&store, &input).await;
+                    // random adjective-animal pair; uniquified with a `-N`
+                    // suffix whenever the id was ever used (live row, delete
+                    // tombstone, or leftover directory) so the on-disk
+                    // directory reflects intent and deleted ids are never
+                    // recycled.
+                    let id = derive_workspace_id(&store, &input, &workspaces_root).await;
                     // Clone orchestration (PROTOCOL §5.1): when `githubUrl` is
                     // set and `repositoryPath` is not already a local git
                     // repo, clone it *before* branch naming so the branch
@@ -3868,8 +3950,6 @@ impl WorkspaceApi for Services {
                             let target = match input.clone_path.as_deref() {
                                 Some(p) if !p.trim().is_empty() => PathBuf::from(p),
                                 _ => workspaces_root
-                                    .clone()
-                                    .unwrap_or_else(default_workspaces_root)
                                     .join("clones")
                                     .join(clone_ops::derive_default_target(url)),
                             };
@@ -4042,9 +4122,7 @@ impl WorkspaceApi for Services {
                         .as_deref()
                         .filter(|p| !p.is_empty())
                         .map(PathBuf::from);
-                    let workspaces_root_pathbuf = workspaces_root
-                        .clone()
-                        .unwrap_or_else(default_workspaces_root);
+                    let workspaces_root_pathbuf = workspaces_root.clone();
                     if let Some(repo_dir) = repo_dir {
                         if !ws.is_remote && !ws.skip_worktree && !has_worktree {
                             if repo_dir.join(".git").exists() {
@@ -5259,6 +5337,7 @@ impl WorkspaceApi for Services {
         note_id: NoteId,
         status: String,
         expected_version: Option<i64>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -5281,6 +5360,19 @@ impl WorkspaceApi for Services {
             store.update_note_versioned(&note, expected_version).await?;
             // Mirror `notes.service.ts`: emit only when the status actually changed.
             if previous_status != new_status {
+                // LC-1: agent-attributed changes carry provenance — resolve the
+                // caller's display name best-effort for the agent actor.
+                let agent = match caller_agent_id {
+                    Some(agent_id) => Some((
+                        agent_id.0.clone(),
+                        store
+                            .get_agent_session(&agent_id)
+                            .await
+                            .ok()
+                            .map(|s| s.name),
+                    )),
+                    None => None,
+                };
                 publish_event(
                     &bus,
                     task_status_changed_event(
@@ -5290,6 +5382,7 @@ impl WorkspaceApi for Services {
                         previous_status,
                         new_status,
                         &now,
+                        agent,
                     ),
                 )
                 .await;
@@ -7494,6 +7587,18 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.agent_get_subscriptions_op(workspace_id, agent_id)
+                .await
+        })
+    }
+
+    fn agent_watch_completion(
+        &self,
+        workspace_id: WorkspaceId,
+        parent_agent_id: AgentId,
+        child_agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_watch_completion_op(workspace_id, parent_agent_id, child_agent_id)
                 .await
         })
     }

@@ -831,7 +831,7 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
 
     // updateNoteStatus → in_progress sets startedAt.
     let upd = svc
-        .task_update_note_status(ws.clone(), id.clone(), "in_progress".into(), None)
+        .task_update_note_status(ws.clone(), id.clone(), "in_progress".into(), None, None)
         .await
         .expect("updateNoteStatus");
     assert_eq!(upd.status, intent_core::TaskStatus::InProgress);
@@ -839,7 +839,7 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
 
     // Invalid status string rejected with the TS-style message.
     assert!(svc
-        .task_update_note_status(ws.clone(), id.clone(), "bogus".into(), None)
+        .task_update_note_status(ws.clone(), id.clone(), "bogus".into(), None, None)
         .await
         .is_err());
 
@@ -1739,7 +1739,10 @@ async fn subscribe_resolves_star_and_unsubscribe_roundtrips() {
 mod change_event_parity {
     use std::time::Duration;
 
-    use intent_core::{NoteCreate, TaskMetadata, TaskStatus, WorkspaceApi, WorkspaceId};
+    use intent_core::{
+        now_iso, AgentId, AgentSession, AgentStatus, NoteCreate, TaskMetadata, TaskStatus,
+        WorkspaceApi, WorkspaceId,
+    };
     use intent_store::Store;
     use serde_json::{json, Value};
 
@@ -1918,7 +1921,13 @@ mod change_event_parity {
         h.store.insert_note(&tn).await.expect("insert task note");
         let mut sub = subscribe(&h);
         h.services
-            .task_update_note_status(h.ws.clone(), tn.id.clone(), "in_progress".to_string(), None)
+            .task_update_note_status(
+                h.ws.clone(),
+                tn.id.clone(),
+                "in_progress".to_string(),
+                None,
+                None,
+            )
             .await
             .expect("status");
         let ev = recv_one(&mut sub).await;
@@ -1928,6 +1937,74 @@ mod change_event_parity {
         assert_eq!(ev["data"]["previousStatus"], "not_started");
         assert_eq!(ev["data"]["newStatus"], "in_progress");
         assert!(ev["data"]["changedAt"].is_string());
+        // System-attributed change: no agent provenance on the payload.
+        assert!(ev["data"].get("agentId").is_none());
+    }
+
+    #[tokio::test]
+    async fn task_status_changed_carries_agent_id_when_agent_attributed() {
+        let h = harness().await;
+        let mut tn = note(&h.ws, "task-agent", "Agent Task");
+        tn.task = Some(TaskMetadata {
+            status: TaskStatus::NotStarted,
+            ..Default::default()
+        });
+        h.store.insert_note(&tn).await.expect("insert task note");
+        // A live session so provenance resolves the display name.
+        let session = AgentSession {
+            id: AgentId::from("agent-prov"),
+            workspace_id: h.ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Prov".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                tn.id.clone(),
+                "in_progress".to_string(),
+                None,
+                Some(AgentId::from("agent-prov")),
+            )
+            .await
+            .expect("status");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "task:status-changed");
+        // LC-1: agent-attributed changes surface `agentId` in the payload and
+        // an agent actor on the envelope (TS `notes.service.ts` parity).
+        assert_eq!(ev["data"]["agentId"], "agent-prov");
+        assert_eq!(
+            ev["actor"],
+            json!({ "type": "agent", "id": "agent-prov", "name": "Prov" })
+        );
     }
 
     #[tokio::test]
@@ -1954,7 +2031,13 @@ mod change_event_parity {
         // terminal (excluded), and the parent's only child is complete, so the
         // parent becomes the sole ready task.
         h.services
-            .task_update_note_status(h.ws.clone(), child.id.clone(), "complete".to_string(), None)
+            .task_update_note_status(
+                h.ws.clone(),
+                child.id.clone(),
+                "complete".to_string(),
+                None,
+                None,
+            )
             .await
             .expect("status");
 
@@ -6062,7 +6145,7 @@ mod rules {
         .await
         .unwrap();
 
-        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop")
+        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop", None)
             .await
             .expect("assembled prompt");
 
@@ -6093,7 +6176,7 @@ mod rules {
         )
         .await
         .unwrap();
-        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop")
+        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop", None)
             .await
             .expect("assembled prompt (file still applies)");
         assert!(!prompt.contains("HIDDEN_BODY"));
@@ -6157,7 +6240,7 @@ mod rules {
     async fn assembly_uses_bundled_specialization_when_no_override() {
         let tree = worktree();
         let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
-        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop")
+        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop", None)
             .await
             .expect("assembled prompt");
         // Bundled specialization is injected, and the live workspace file still applies.
@@ -6169,6 +6252,82 @@ mod rules {
             prompt.contains("ALWAYS run the linter."),
             "live workspace file"
         );
+        // Non-specialist assembly (no injection): no specialist artifacts.
+        assert!(!prompt.contains("<specialist_role>"));
+        assert!(!prompt.contains("## Role Reminder"));
+    }
+
+    #[tokio::test]
+    async fn assembly_injects_specialist_role_section_and_footer() {
+        let tree = worktree();
+        let (_tmp, store, svc, ws) = setup(&tree.0).await;
+        svc.rules_update(
+            ws.clone(),
+            "base-system-prompt".into(),
+            "BASE_BODY".into(),
+            None,
+        )
+        .await
+        .unwrap();
+        let injection = crate::rules::SpecialistPromptInjection {
+            behavior_prompt: Some("Implement your assigned task.".into()),
+            specialist_name: Some("Implementor".into()),
+            role_reminder: Some("Stay in scope.".into()),
+        };
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+        )
+        .await
+        .expect("assembled prompt");
+
+        // Section wraps the behavior prompt in <specialist_role> tags, placed
+        // after specialization and user rules (reference layer 4.8).
+        let base = prompt.find("BASE_BODY").expect("base body");
+        let spec = prompt.find("# Task Loop Agent").expect("specialization");
+        let rules = prompt
+            .find("ALWAYS run the linter.")
+            .expect("workspace rules");
+        let role = prompt
+            .find("# Your Specialist Role")
+            .expect("specialist role section");
+        assert!(base < spec && spec < rules && rules < role, "section order");
+        assert!(
+            prompt.contains("<specialist_role>\nImplement your assigned task.\n</specialist_role>")
+        );
+        assert!(
+            prompt.contains("The instructions in <specialist_role> define your primary function.")
+        );
+        // Role-reminder footer sits at the very end (recency).
+        assert!(
+            prompt.ends_with("## Role Reminder\n\nYou are a Implementor. Stay in scope."),
+            "footer at end: {:?}",
+            &prompt[prompt.len().saturating_sub(120)..]
+        );
+    }
+
+    #[tokio::test]
+    async fn assembly_footer_falls_back_without_role_reminder() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+        let injection = crate::rules::SpecialistPromptInjection {
+            behavior_prompt: Some("Verify things.".into()),
+            specialist_name: Some("Verifier".into()),
+            role_reminder: None,
+        };
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+        )
+        .await
+        .expect("assembled prompt");
+        assert!(prompt.ends_with(
+            "## Role Reminder\n\nYou are a Verifier. Follow the instructions in <specialist_role> above."
+        ));
     }
 
     #[tokio::test]
@@ -6841,6 +7000,88 @@ mod worktree_provisioning {
             .expect("second create")
             .workspace;
         assert_eq!(second.id.0, "auth-fix-2");
+    }
+
+    /// Workspace ids are never recycled across delete/recreate (LEAK-2): a
+    /// deleted workspace leaves a tombstone, so re-creating with the same
+    /// prompt yields a *different* (suffixed) id — reusing the id would
+    /// collide the old workspace's agent streams and file paths with the new
+    /// one's (FE `recentlyDeletedWorkspaces` parity).
+    #[tokio::test]
+    async fn create_never_recycles_deleted_workspace_id() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-idrecycle-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let make = |prompt: &str| WorkspaceCreate {
+            skip_worktree: Some(true),
+            initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                prompt: Some(prompt.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let first = svc
+            .create_workspace(make("fix the auth flow"), None)
+            .await
+            .expect("first create")
+            .workspace;
+        assert_eq!(first.id.0, "auth-fix");
+
+        svc.delete_workspace(first.id.clone())
+            .await
+            .expect("delete");
+
+        let second = svc
+            .create_workspace(make("fix the auth flow"), None)
+            .await
+            .expect("recreate")
+            .workspace;
+        assert_ne!(second.id, first.id, "deleted id must not be recycled");
+        assert_eq!(second.id.0, "auth-fix-2");
+
+        // Delete the suffixed one too: the next create must skip *both*
+        // tombstoned ids.
+        svc.delete_workspace(second.id.clone())
+            .await
+            .expect("delete second");
+        let third = svc
+            .create_workspace(make("fix the auth flow"), None)
+            .await
+            .expect("third create")
+            .workspace;
+        assert_eq!(third.id.0, "auth-fix-3");
+    }
+
+    /// A leftover `<workspaces_root>/<id>` directory (orphaned/pre-tombstone
+    /// state) also blocks id reuse: `workspace.create` uniquifies past it.
+    #[tokio::test]
+    async fn create_skips_workspace_id_with_leftover_directory() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-iddir-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        std::fs::create_dir_all(root.0.join("auth-fix")).expect("seed leftover dir");
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    skip_worktree: Some(true),
+                    initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                        prompt: Some("fix the auth flow".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(ws.id.0, "auth-fix-2");
     }
 
     /// When no initial-agent prompt is supplied, `workspace.create` falls back

@@ -509,14 +509,25 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `task.updateNoteStatus`: set task-note metadata status (PROTOCOL §5.4).
     /// `expected_version` gates the write on the current `rev` when `Some` (§5.6).
+    /// `caller_agent_id` attributes the change to the invoking agent (the MCP
+    /// front door passes it): the emitted `task:status-changed` then carries an
+    /// agent actor and an `agentId` payload field, mirroring the TS provenance
+    /// (`notes.service.ts` `agentId: currentActor?.type === 'agent' ? … : undefined`).
     fn task_update_note_status(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         status: String,
         expected_version: Option<i64>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
-        let _ = (workspace_id, note_id, status, expected_version);
+        let _ = (
+            workspace_id,
+            note_id,
+            status,
+            expected_version,
+            caller_agent_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::task_update_note_status not implemented".to_string(),
@@ -1358,6 +1369,26 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_get_subscriptions not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Auto-subscribe a parent agent to a child's completion: register a
+    /// oneShot parent→child completion watch (the TS
+    /// `subscribeCallerToAgentCompletion`). Called by the MCP `create_agent`
+    /// front door after the child session exists and before its first turn
+    /// starts. Returns `{ ok, subscriptionId }`; `ok: false` (no watch) when
+    /// the parent session is deleted.
+    fn agent_watch_completion(
+        &self,
+        workspace_id: WorkspaceId,
+        parent_agent_id: AgentId,
+        child_agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, parent_agent_id, child_agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_watch_completion not implemented".to_string(),
             ))
         })
     }

@@ -17,6 +17,55 @@ const SPECIALISTS_FOLDER: &str = "specialists";
 /// daemon and tests point at app-shipped resources hermetically.
 const BUNDLED_DIR_ENV: &str = "INTENTD_BUNDLED_SPECIALISTS_DIR";
 
+/// The reference specialist definitions embedded at compile time (PP-2,
+/// byte-identical to the reference `resources/specialists/` bundle). They form
+/// the floor of the bundled tier so daemon-side resolution works with zero
+/// local files; an on-disk bundled file (env override / packaged resources)
+/// with the same id still wins over the embedded copy.
+const EMBEDDED_BUNDLED: &[(&str, &str)] = &[
+    (
+        "chief-of-staff",
+        include_str!("../resources/specialists/chief-of-staff.md"),
+    ),
+    (
+        "developer",
+        include_str!("../resources/specialists/developer.md"),
+    ),
+    (
+        "implementor",
+        include_str!("../resources/specialists/implementor.md"),
+    ),
+    (
+        "pr-reviewer",
+        include_str!("../resources/specialists/pr-reviewer.md"),
+    ),
+    (
+        "pr-shepherd",
+        include_str!("../resources/specialists/pr-shepherd.md"),
+    ),
+    ("ralph", include_str!("../resources/specialists/ralph.md")),
+    (
+        "spec-writer",
+        include_str!("../resources/specialists/spec-writer.md"),
+    ),
+    (
+        "ui-designer",
+        include_str!("../resources/specialists/ui-designer.md"),
+    ),
+    (
+        "verifier",
+        include_str!("../resources/specialists/verifier.md"),
+    ),
+];
+
+/// Resolve an embedded bundled specialist by id (the lowest tier).
+fn load_embedded(id: &str) -> Option<Value> {
+    EMBEDDED_BUNDLED
+        .iter()
+        .find(|(k, _)| *k == id)
+        .map(|(k, content)| build_def(k, content, "bundled", Path::new("")))
+}
+
 /// Resolve the user's home directory from the environment (cross-platform).
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
@@ -340,6 +389,8 @@ impl SpecialistsService {
     }
 
     /// Resolve a single id through the 3-tier order project > user > bundled.
+    /// Within the bundled tier an on-disk file wins over the embedded copy;
+    /// the compile-time [`EMBEDDED_BUNDLED`] set is the always-available floor.
     fn resolve(&self, id: &str, workspace_path: Option<&Path>) -> Option<Value> {
         if let Some(wp) = workspace_path {
             if let Some(def) = Self::load_from_dir(&project_dir(wp), id, "project") {
@@ -356,7 +407,7 @@ impl SpecialistsService {
                 return Some(def);
             }
         }
-        None
+        load_embedded(id)
     }
 
     /// Resolve a specialist's `agentType` frontmatter scalar through the 3-tier
@@ -398,10 +449,17 @@ impl SpecialistsService {
     }
 
     /// `specialist.list` → `{ specialists: SpecialistDef[] }` resolved in tier
-    /// order (bundled < user < project), higher tiers overriding lower ones for
-    /// the same id (PROTOCOL §5.11). `workspace_path` adds the project tier.
+    /// order (embedded < bundled dir < user < project), higher tiers overriding
+    /// lower ones for the same id (PROTOCOL §5.11). `workspace_path` adds the
+    /// project tier.
     pub(crate) fn list(&self, workspace_path: Option<&Path>) -> Result<Value> {
         let mut acc = std::collections::BTreeMap::new();
+        for (id, content) in EMBEDDED_BUNDLED {
+            acc.insert(
+                id.to_string(),
+                build_def(id, content, "bundled", Path::new("")),
+            );
+        }
         if let Some(dir) = &self.bundled_dir {
             Self::collect_dir(dir, "bundled", &mut acc);
         }
@@ -458,6 +516,42 @@ impl SpecialistsService {
             return None;
         }
         Some((name, reminder))
+    }
+
+    /// Resolve the spawn-prompt injection fields for a specialist id (PP-1):
+    /// `(behaviorPrompt body, display name, roleReminder)`. The reminder falls
+    /// back to the auto-generated one (same policy as
+    /// [`Self::resolve_role_reminder`]); empty values resolve to `None`.
+    /// Returns `None` when the specialist is unknown.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn resolve_prompt_injection(
+        &self,
+        id: &str,
+        workspace_path: Option<&Path>,
+    ) -> Option<(Option<String>, String, Option<String>)> {
+        let def = self.resolve(id, workspace_path)?;
+        let behavior_prompt = def
+            .get("behaviorPrompt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let name = def
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(id)
+            .to_string();
+        let reminder = def
+            .get("roleReminder")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let auto = auto_generate_role_reminder(behavior_prompt.as_deref().unwrap_or(""));
+                (!auto.is_empty()).then_some(auto)
+            });
+        Some((behavior_prompt, name, reminder))
     }
 
     /// Resolve the writable directory for `scope`, creating it; `project`
@@ -739,5 +833,85 @@ mod tests {
             "---\nname: \"Blank\"\ndescription: \"d\"\n---\n\n# Only Headers\n",
         );
         assert!(svc.resolve_role_reminder("blank", None).is_none());
+    }
+
+    /// The nine reference specialist ids embedded via `include_str!` (PP-2).
+    const EMBEDDED_IDS: [&str; 9] = [
+        "spec-writer",
+        "implementor",
+        "verifier",
+        "developer",
+        "chief-of-staff",
+        "ralph",
+        "ui-designer",
+        "pr-reviewer",
+        "pr-shepherd",
+    ];
+
+    #[test]
+    fn embedded_bundled_resolves_all_nine_with_zero_local_files() {
+        // Empty user + bundled dirs: every embedded id still resolves through
+        // get()/list()/resolve_agent_type()/resolve_role_reminder().
+        let dir = TempSpecialistsDir::new();
+        let svc = service_over(&dir);
+        for id in EMBEDDED_IDS {
+            let got = svc.get(id, None).expect("embedded specialist resolves");
+            let def = &got["specialist"];
+            assert_eq!(def["source"], "bundled", "{id}");
+            assert_eq!(def["isCustomized"], false, "{id}");
+            assert!(def.get("path").is_none(), "{id}: bundled exposes no path");
+            assert!(
+                !def["behaviorPrompt"].as_str().unwrap().trim().is_empty(),
+                "{id}: non-empty body"
+            );
+        }
+        let list = svc.list(None).unwrap();
+        let specs = list["specialists"].as_array().unwrap();
+        for id in EMBEDDED_IDS {
+            assert!(specs.iter().any(|s| s["id"] == id), "{id} listed");
+        }
+        // Frontmatter-driven resolution works too: ralph declares an agentType,
+        // implementor an explicit roleReminder.
+        assert_eq!(
+            svc.resolve_agent_type("ralph", None).as_deref(),
+            Some("ralph-loop")
+        );
+        let (name, reminder) = svc.resolve_role_reminder("implementor", None).unwrap();
+        assert_eq!(name, "Implementor");
+        assert!(reminder.starts_with("Stay within task scope."));
+    }
+
+    #[test]
+    fn user_file_overrides_embedded_bundled() {
+        let dir = TempSpecialistsDir::new();
+        dir.write(
+            "implementor",
+            "---\nname: \"Custom Implementor\"\ndescription: \"d\"\n---\n\nCustom body",
+        );
+        let svc = service_over(&dir);
+        let got = svc.get("implementor", None).unwrap();
+        assert_eq!(got["specialist"]["source"], "user");
+        assert_eq!(got["specialist"]["name"], "Custom Implementor");
+        let list = svc.list(None).unwrap();
+        let specs = list["specialists"].as_array().unwrap();
+        let imp = specs.iter().find(|s| s["id"] == "implementor").unwrap();
+        assert_eq!(imp["source"], "user", "user tier wins in list too");
+    }
+
+    #[test]
+    fn bundled_dir_file_overrides_embedded_copy() {
+        // An on-disk bundled file (env override / packaged resources) with the
+        // same id wins over the embedded copy within the bundled tier.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write(
+            "verifier",
+            "---\nname: \"Patched Verifier\"\ndescription: \"d\"\n---\n\nPatched body",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("verifier", None).unwrap();
+        assert_eq!(got["specialist"]["source"], "bundled");
+        assert_eq!(got["specialist"]["name"], "Patched Verifier");
+        assert_eq!(got["specialist"]["prompt"], "Patched body");
     }
 }
