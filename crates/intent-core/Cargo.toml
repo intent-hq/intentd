@@ -15,3 +15,4 @@ uuid = { workspace = true }
 time = { workspace = true }
 directories = { workspace = true }
 toml.workspace = true
+tracing.workspace = true

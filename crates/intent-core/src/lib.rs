@@ -11,6 +11,7 @@ pub mod error;
 pub mod events;
 pub mod ids;
 pub mod model;
+pub mod secrets;
 pub mod slug;
 pub mod traits;
 
@@ -47,6 +48,7 @@ pub use model::{
     WorkspaceDiffSummaryFile, WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask,
     WorkspaceTaskStats, WorkspaceUpdate,
 };
+pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use traits::{
     BoxFuture, ContextEngine, ContextError, EngineAvailability, RetrieveRequest, RetrieveResult,
     RetrievedItem, WorkspaceApi,
