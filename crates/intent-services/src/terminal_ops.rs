@@ -23,7 +23,7 @@ use intent_acp::{
 use intent_core::events::{TERMINAL_DATA, TERMINAL_EXIT};
 use intent_core::{now_iso, BoxFuture, Error, Result, WorkspaceId};
 use intent_pty::{PtyExit, PtyHost, PtyId, PtySize, SpawnSpec};
-use intent_store::NewEvent;
+use intent_store::{NewEvent, Store};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -53,11 +53,14 @@ fn resolve(terminal_id: &str) -> Result<PtyId> {
 /// output onto the bus; returns `{ terminalId }`. `env` is an optional
 /// overlay layered onto the daemon's inherited environment (`portable-pty`
 /// inherits by default), so callers can pass per-terminal variables through
-/// without dropping them.
+/// without dropping them. When `cwd` is omitted the PTY spawns in the
+/// workspace's worktree root (see [`default_cwd`]); an explicit `cwd` always
+/// wins.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create(
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
+    store: Option<Store>,
     workspace_id: WorkspaceId,
     cols: u16,
     rows: u16,
@@ -67,9 +70,13 @@ pub(crate) async fn create(
 ) -> Result<Value> {
     let mut spec = SpawnSpec::new(workspace_id.as_str(), command.unwrap_or_else(default_shell));
     spec.size = PtySize { rows, cols };
-    if let Some(cwd) = cwd {
-        spec.cwd = Some(PathBuf::from(cwd));
-    }
+    spec.cwd = match cwd {
+        Some(cwd) => Some(PathBuf::from(cwd)),
+        None => match store.as_ref() {
+            Some(store) => default_cwd(store, &workspace_id).await,
+            None => None,
+        },
+    };
     if let Some(map) = env {
         spec.env = map.into_iter().collect();
     }
@@ -77,6 +84,16 @@ pub(crate) async fn create(
     let terminal_id = pty_id.to_string();
     spawn_output_stream(pty, bus, workspace_id, pty_id, terminal_id.clone());
     Ok(json!({ "terminalId": terminal_id }))
+}
+
+/// Default working directory when `terminal.create` omits `cwd`: the
+/// workspace's worktree root, resolved the same way `script_ops` resolves a
+/// script cwd (`worktreePath`, else `repositoryPath`). A missing workspace row
+/// or one without a resolvable worktree yields `None`, so the PTY inherits the
+/// daemon's cwd (the prior behavior).
+async fn default_cwd(store: &Store, workspace_id: &WorkspaceId) -> Option<PathBuf> {
+    let workspace = store.get_workspace(workspace_id).await.ok()?;
+    crate::git_ops::worktree_path(&workspace)
 }
 
 /// Write base64-encoded input to a PTY's stdin.
@@ -500,7 +517,7 @@ mod tests {
 
     use std::time::Instant;
 
-    use intent_core::Event;
+    use intent_core::{Event, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
     use intent_store::Store;
 
     use crate::events::{Subscription, SubscriptionFilter};
@@ -716,9 +733,19 @@ mod tests {
     #[tokio::test]
     async fn create_with_default_shell_lists_then_kills() {
         let pty = host();
-        let res = create(pty.clone(), None, ws("ws-1"), 80, 24, None, None, None)
-            .await
-            .unwrap();
+        let res = create(
+            pty.clone(),
+            None,
+            None,
+            ws("ws-1"),
+            80,
+            24,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let id = term_id(&res);
 
         let listed = list(pty.as_ref(), &ws("ws-1")).unwrap();
@@ -749,6 +776,7 @@ mod tests {
         let res = create(
             pty.clone(),
             None,
+            None,
             ws("ws-1"),
             80,
             24,
@@ -767,6 +795,105 @@ mod tests {
         kill(pty.as_ref(), &id).await.unwrap();
     }
 
+    /// A workspace row with an optional worktree path, for default-cwd tests.
+    fn workspace_row(id: &WorkspaceId, worktree: Option<&PathBuf>) -> Workspace {
+        let ts = now_iso();
+        Workspace {
+            id: id.clone(),
+            title: "WS".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: worktree.map(|p| p.display().to_string()),
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn default_cwd_worktree_present_vs_absent() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let with = ws("ws-with-wt");
+        let without = ws("ws-without-wt");
+        let worktree = PathBuf::from("/tmp/intentd-term-fake-worktree");
+        store
+            .insert_workspace(&workspace_row(&with, Some(&worktree)))
+            .await
+            .expect("insert ws with worktree");
+        store
+            .insert_workspace(&workspace_row(&without, None))
+            .await
+            .expect("insert ws without worktree");
+
+        assert_eq!(default_cwd(&store, &with).await, Some(worktree));
+        assert_eq!(default_cwd(&store, &without).await, None);
+        // Unknown workspace rows fall back without erroring.
+        assert_eq!(default_cwd(&store, &ws("ws-missing")).await, None);
+    }
+
+    #[tokio::test]
+    async fn create_defaults_cwd_to_worktree_root() {
+        let pty = host();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let wsid = ws("ws-wt");
+        let worktree =
+            std::env::temp_dir().join(format!("intentd-term-wt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&worktree).expect("mkdir worktree");
+        store
+            .insert_workspace(&workspace_row(&wsid, Some(&worktree)))
+            .await
+            .expect("insert workspace");
+
+        let res = create(
+            pty.clone(),
+            None,
+            Some(store),
+            wsid.clone(),
+            80,
+            24,
+            None,
+            Some("cat".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        let id = term_id(&res);
+
+        let arr = list(pty.as_ref(), &wsid).unwrap();
+        let entry = &arr.as_array().unwrap()[0];
+        assert_eq!(entry["cwd"], json!(worktree.display().to_string()));
+
+        kill(pty.as_ref(), &id).await.unwrap();
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
     #[tokio::test]
     async fn create_streams_data_events_for_child_output() {
         let pty = host();
@@ -776,6 +903,7 @@ mod tests {
         let res = create(
             pty.clone(),
             Some(bus),
+            None,
             ws("ws-1"),
             80,
             24,
@@ -812,6 +940,7 @@ mod tests {
         let res = create(
             pty.clone(),
             Some(bus),
+            None,
             ws("ws-1"),
             80,
             24,
@@ -840,6 +969,7 @@ mod tests {
         let res = create(
             pty.clone(),
             Some(bus),
+            None,
             ws("ws-1"),
             80,
             24,
@@ -867,6 +997,7 @@ mod tests {
         let pty = host();
         let res = create(
             pty.clone(),
+            None,
             None,
             ws("ws-1"),
             80,
@@ -912,6 +1043,7 @@ mod tests {
         let res = create(
             pty.clone(),
             None,
+            None,
             ws("ws-1"),
             80,
             24,
@@ -937,6 +1069,7 @@ mod tests {
         let res = create(
             pty.clone(),
             None,
+            None,
             ws("ws-1"),
             80,
             24,
@@ -961,6 +1094,7 @@ mod tests {
         let res = create(
             pty.clone(),
             None,
+            None,
             ws("ws-a"),
             80,
             24,
@@ -981,6 +1115,7 @@ mod tests {
         let pty = host();
         let res = create(
             pty.clone(),
+            None,
             None,
             ws("ws-1"),
             80,
@@ -1023,6 +1158,7 @@ mod tests {
         let res = create(
             pty.clone(),
             None,
+            None,
             ws("ws-1"),
             80,
             24,
@@ -1060,6 +1196,7 @@ mod tests {
         let pty = host();
         let res = create(
             pty.clone(),
+            None,
             None,
             ws("ws-1"),
             80,
