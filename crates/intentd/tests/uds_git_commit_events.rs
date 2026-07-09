@@ -212,6 +212,12 @@ async fn git_commit_emits_git_commit_and_changes_git_status_over_uds() {
     let repo_dir = TempRepo::new();
     let repo = repo_dir.path.as_path();
     git(repo, &["init", "-q", "-b", "main"]);
+    // Repo-local identity: the daemon-side commit uses libgit2's
+    // `repo.signature()`, which reads git config (not GIT_AUTHOR_* env vars),
+    // so bare CI runners need these set (same as uds_git.rs).
+    git(repo, &["config", "user.name", "Test"]);
+    git(repo, &["config", "user.email", "test@example.com"]);
+    git(repo, &["config", "commit.gpgsign", "false"]);
     std::fs::write(repo.join("README.md"), "hello\n").unwrap();
     git(repo, &["add", "README.md"]);
     git(repo, &["commit", "-q", "-m", "init"]);
