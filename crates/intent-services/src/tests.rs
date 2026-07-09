@@ -6303,6 +6303,53 @@ mod known_repo {
         assert!(repos[0]["addedAt"].is_string());
         assert!(repos[0]["lastUsedAt"].is_string());
     }
+
+    /// `workspace.create` derives `repository_name` from the local
+    /// `repositoryPath` basename when the caller omits it; an explicit name
+    /// always wins, and a create without a path leaves the name NULL.
+    #[tokio::test]
+    async fn create_workspace_derives_repository_name_from_path_basename() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let svc = Services::new(store).with_workspaces_root(ws_root.path().to_path_buf());
+
+        let create = |path: Option<&str>, name: Option<&str>| WorkspaceCreate {
+            repository_path: path.map(str::to_string),
+            repository_name: name.map(str::to_string),
+            ..Default::default()
+        };
+
+        // Local path, no name → basename derived and persisted.
+        let derived = svc
+            .create_workspace(create(Some("/Users/me/src/describe-workspace"), None), None)
+            .await
+            .expect("create derived");
+        assert_eq!(
+            derived.workspace.repository_name.as_deref(),
+            Some("describe-workspace")
+        );
+
+        // Explicit name wins untouched.
+        let explicit = svc
+            .create_workspace(
+                create(Some("/Users/me/src/describe-workspace"), Some("intent")),
+                None,
+            )
+            .await
+            .expect("create explicit");
+        assert_eq!(
+            explicit.workspace.repository_name.as_deref(),
+            Some("intent")
+        );
+
+        // No repository path → name stays NULL.
+        let pathless = svc
+            .create_workspace(create(None, None), None)
+            .await
+            .expect("create pathless");
+        assert_eq!(pathless.workspace.repository_name, None);
+    }
 }
 
 mod worktree_provisioning {

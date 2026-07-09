@@ -1763,6 +1763,15 @@ fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
     }
 }
 
+/// Derive a repository display name from a local `repositoryPath` basename,
+/// mirroring the `known_repo_name` fallback — but returning `None` instead of
+/// an `"Unknown"` placeholder when the path has no usable basename, so an
+/// underivable name stays NULL on the workspace row.
+fn derive_repo_name_from_path(path: &str) -> Option<String> {
+    let base = path.rsplit('/').next().unwrap_or("");
+    (!base.is_empty()).then(|| base.to_string())
+}
+
 /// Default root for daemon-provisioned worktrees: `$INTENTD_WORKSPACES_DIR`
 /// override, else `~/intent/workspaces` — the FE's
 /// `WorkspaceConfig.WORKSPACES_BASE` layout (`<root>/<workspaceId>/<repo-slug>`).
@@ -3273,8 +3282,20 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         let bus = self.event_bus.clone();
+        let store = self.store.clone();
         Box::pin(async move {
-            terminal_ops::create(pty, bus, workspace_id, cols, rows, cwd, command, env).await
+            terminal_ops::create(
+                pty,
+                bus,
+                Some(store),
+                workspace_id,
+                cols,
+                rows,
+                cwd,
+                command,
+                env,
+            )
+            .await
         })
     }
 
@@ -3889,6 +3910,26 @@ impl WorkspaceApi for Services {
                                     input.repository_name = Some(name);
                                 }
                             }
+                        }
+                    }
+                    // Repository-name derivation (`known_repo_name` fallback
+                    // parity): a caller-supplied `repositoryName` always wins;
+                    // otherwise a local `repositoryPath` yields its basename so
+                    // workspace payloads carry `repositoryName` for locally
+                    // created workspaces (FE recent-repos surfaces). `owner` is
+                    // left untouched — no local-remote inspection.
+                    if !input
+                        .repository_name
+                        .as_deref()
+                        .is_some_and(|n| !n.is_empty())
+                    {
+                        if let Some(name) = input
+                            .repository_path
+                            .as_deref()
+                            .filter(|p| !p.is_empty())
+                            .and_then(derive_repo_name_from_path)
+                        {
+                            input.repository_name = Some(name);
                         }
                     }
                     // Branch naming (TS parity): an explicit `branch` wins

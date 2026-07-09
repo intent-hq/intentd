@@ -87,15 +87,67 @@ async fn migration_status_reports_current_after_open() {
         status.expected,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30
+            25, 26, 27, 28, 29, 30, 31
         ]
     );
     assert_eq!(
         status.applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30
+            25, 26, 27, 28, 29, 30, 31
         ]
+    );
+}
+
+/// The 0031 backfill derives `repository_name` from the `repository_path`
+/// basename for rows missing a name, leaves explicit names untouched, and
+/// skips rows without a path. Exercised by re-running the migration SQL
+/// against rows shaped like the pre-0031 legacy state (the embedded migrator
+/// has already run against an empty DB by the time we can insert rows).
+#[tokio::test]
+async fn backfill_repository_name_from_path_basename() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let legacy_id = WorkspaceId::new();
+    let named_id = WorkspaceId::new();
+    let pathless_id = WorkspaceId::new();
+    let mut legacy = sample_workspace(&legacy_id, "legacy", false);
+    legacy.repository_path = Some("/Users/me/src/describe-workspace".to_string());
+    legacy.repository_name = None;
+    let named = sample_workspace(&named_id, "named", false);
+    let mut pathless = sample_workspace(&pathless_id, "pathless", false);
+    pathless.repository_path = None;
+    pathless.repository_name = None;
+    for ws in [&legacy, &named, &pathless] {
+        store.insert_workspace(ws).await.expect("insert");
+    }
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/0031_workspace_repository_name_backfill.sql"
+    ))
+    .execute(store.pool())
+    .await
+    .expect("re-run backfill");
+
+    let get_name = |id: WorkspaceId| {
+        let store = store.clone();
+        async move { store.get_workspace(&id).await.expect("get").repository_name }
+    };
+    assert_eq!(
+        get_name(legacy_id).await.as_deref(),
+        Some("describe-workspace"),
+        "NULL name with a path backfills to the basename"
+    );
+    assert_eq!(
+        get_name(named_id).await.as_deref(),
+        Some("intentd"),
+        "explicit name is never overwritten"
+    );
+    assert_eq!(
+        get_name(pathless_id).await,
+        None,
+        "no repository_path stays NULL"
     );
 }
 #[tokio::test]

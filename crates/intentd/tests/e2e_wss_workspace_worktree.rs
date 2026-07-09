@@ -372,6 +372,57 @@ async fn workspace_create_provisions_worktree_over_wss() {
     drop(daemon);
 }
 
+/// `workspace.create` with a local `repositoryPath` and no caller-supplied
+/// `repositoryName` derives the name from the path basename (`known_repo_name`
+/// fallback parity) and round-trips it: both the create result and a
+/// subsequent `workspace.list` carry `repositoryName`, so FE recent-repos
+/// surfaces populate for locally-created workspaces.
+#[tokio::test]
+async fn workspace_create_derives_repository_name_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("reponame");
+    let (daemon, port, cfg) = boot(&root).await;
+    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+
+    let mut ws = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "Repo Name E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "baseRef": "main",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let id = created["workspace"]["id"].as_str().expect("id").to_string();
+    assert_eq!(
+        created["workspace"]["repositoryName"],
+        json!("source-repo"),
+        "create result carries the basename-derived repositoryName"
+    );
+
+    let listed = wss_rpc(&mut ws, 3, "workspace.list", json!({})).await;
+    let row = listed["workspaces"]
+        .as_array()
+        .expect("workspaces array")
+        .iter()
+        .find(|w| w["id"] == json!(id))
+        .expect("created workspace listed");
+    assert_eq!(
+        row["repositoryName"],
+        json!("source-repo"),
+        "workspace.list round-trips the derived repositoryName"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
 /// `workspace.delete` cleans up the provisioned checkout over the wire: the
 /// worktree directory (and its `<root>/<workspaceId>` parent) is removed, the
 /// registration is pruned from the source repo, and the auto-generated
