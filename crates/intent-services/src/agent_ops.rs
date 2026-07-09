@@ -846,6 +846,25 @@ impl Services {
         requested_agent_id: Option<AgentId>,
         extra: AgentCreateExtra,
     ) -> Result<Value> {
+        // Depth guard at the service layer (LC-1): mirror the MCP `create_agent`
+        // front-door check so every path that spawns a child for a parent
+        // already at `MAX_DELEGATION_DEPTH` is refused — including RPC/service
+        // callers that bypass the dispatch-level guard. An unknown parent reads
+        // as depth 0 (same leniency as the dispatch check).
+        if let Some(parent) = &parent_agent_id {
+            let parent_depth = self
+                .store
+                .get_agent_session(parent)
+                .await
+                .ok()
+                .and_then(|s| s.delegation_depth)
+                .unwrap_or(0);
+            if parent_depth >= MAX_DELEGATION_DEPTH {
+                return Err(Error::InvalidParams(format!(
+                    "Cannot create sub-agent: maximum delegation depth ({MAX_DELEGATION_DEPTH}) reached. You are at depth {parent_depth}. Please complete this task directly instead of delegating further."
+                )));
+            }
+        }
         let now = now_iso();
         let name_explicitly_set = name.is_some();
         let name =

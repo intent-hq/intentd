@@ -259,6 +259,7 @@ impl WorkspaceMcpServer {
                         id,
                         req_str(args, "status")?,
                         opt_i64(args, "expectedVersion"),
+                        self.caller_agent_id.clone(),
                     )
                     .await)
             }

@@ -2047,8 +2047,11 @@ fn note_change_event(
 }
 
 /// Build a `task:status-changed` change event with the TS-parity payload
-/// `{ noteId, noteTitle, previousStatus, newStatus, changedAt }` (the system
-/// actor leaves `agentId` undefined, so it is omitted) (`notes.service.ts`).
+/// `{ noteId, noteTitle, previousStatus, newStatus, changedAt, agentId? }`
+/// (`notes.service.ts`). When the change is agent-attributed (`agent` carries
+/// the invoking agent's id + display name), the event uses an agent actor and
+/// the payload includes `agentId`; otherwise the system actor leaves `agentId`
+/// undefined, so it is omitted.
 fn task_status_changed_event(
     workspace_id: &WorkspaceId,
     note_id: &NoteId,
@@ -2056,23 +2059,37 @@ fn task_status_changed_event(
     previous_status: TaskStatus,
     new_status: TaskStatus,
     changed_at: &str,
+    agent: Option<(String, Option<String>)>,
 ) -> NewEvent {
+    let mut data = serde_json::json!({
+        "noteId": note_id.as_str(),
+        "noteTitle": note_title,
+        "previousStatus": status_word(previous_status),
+        "newStatus": status_word(new_status),
+        "changedAt": changed_at,
+    });
+    let actor = match agent {
+        Some((agent_id, name)) => {
+            data["agentId"] = serde_json::json!(agent_id);
+            intent_core::EventActor {
+                actor_type: ActorType::Agent,
+                id: Some(agent_id),
+                name,
+                ..Default::default()
+            }
+        }
+        None => system_actor(),
+    };
     NewEvent {
         workspace_id: workspace_id.clone(),
         timestamp: now_iso(),
         event_type: TASK_STATUS_CHANGED.to_string(),
-        actor: system_actor(),
+        actor,
         session_id: None,
         correlation_id: None,
         parent_event_id: None,
         metadata: None,
-        data: serde_json::json!({
-            "noteId": note_id.as_str(),
-            "noteTitle": note_title,
-            "previousStatus": status_word(previous_status),
-            "newStatus": status_word(new_status),
-            "changedAt": changed_at,
-        }),
+        data,
     }
 }
 
@@ -5320,6 +5337,7 @@ impl WorkspaceApi for Services {
         note_id: NoteId,
         status: String,
         expected_version: Option<i64>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -5342,6 +5360,19 @@ impl WorkspaceApi for Services {
             store.update_note_versioned(&note, expected_version).await?;
             // Mirror `notes.service.ts`: emit only when the status actually changed.
             if previous_status != new_status {
+                // LC-1: agent-attributed changes carry provenance — resolve the
+                // caller's display name best-effort for the agent actor.
+                let agent = match caller_agent_id {
+                    Some(agent_id) => Some((
+                        agent_id.0.clone(),
+                        store
+                            .get_agent_session(&agent_id)
+                            .await
+                            .ok()
+                            .map(|s| s.name),
+                    )),
+                    None => None,
+                };
                 publish_event(
                     &bus,
                     task_status_changed_event(
@@ -5351,6 +5382,7 @@ impl WorkspaceApi for Services {
                         previous_status,
                         new_status,
                         &now,
+                        agent,
                     ),
                 )
                 .await;

@@ -831,7 +831,7 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
 
     // updateNoteStatus → in_progress sets startedAt.
     let upd = svc
-        .task_update_note_status(ws.clone(), id.clone(), "in_progress".into(), None)
+        .task_update_note_status(ws.clone(), id.clone(), "in_progress".into(), None, None)
         .await
         .expect("updateNoteStatus");
     assert_eq!(upd.status, intent_core::TaskStatus::InProgress);
@@ -839,7 +839,7 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
 
     // Invalid status string rejected with the TS-style message.
     assert!(svc
-        .task_update_note_status(ws.clone(), id.clone(), "bogus".into(), None)
+        .task_update_note_status(ws.clone(), id.clone(), "bogus".into(), None, None)
         .await
         .is_err());
 
@@ -1739,7 +1739,10 @@ async fn subscribe_resolves_star_and_unsubscribe_roundtrips() {
 mod change_event_parity {
     use std::time::Duration;
 
-    use intent_core::{NoteCreate, TaskMetadata, TaskStatus, WorkspaceApi, WorkspaceId};
+    use intent_core::{
+        now_iso, AgentId, AgentSession, AgentStatus, NoteCreate, TaskMetadata, TaskStatus,
+        WorkspaceApi, WorkspaceId,
+    };
     use intent_store::Store;
     use serde_json::{json, Value};
 
@@ -1918,7 +1921,13 @@ mod change_event_parity {
         h.store.insert_note(&tn).await.expect("insert task note");
         let mut sub = subscribe(&h);
         h.services
-            .task_update_note_status(h.ws.clone(), tn.id.clone(), "in_progress".to_string(), None)
+            .task_update_note_status(
+                h.ws.clone(),
+                tn.id.clone(),
+                "in_progress".to_string(),
+                None,
+                None,
+            )
             .await
             .expect("status");
         let ev = recv_one(&mut sub).await;
@@ -1928,6 +1937,74 @@ mod change_event_parity {
         assert_eq!(ev["data"]["previousStatus"], "not_started");
         assert_eq!(ev["data"]["newStatus"], "in_progress");
         assert!(ev["data"]["changedAt"].is_string());
+        // System-attributed change: no agent provenance on the payload.
+        assert!(ev["data"].get("agentId").is_none());
+    }
+
+    #[tokio::test]
+    async fn task_status_changed_carries_agent_id_when_agent_attributed() {
+        let h = harness().await;
+        let mut tn = note(&h.ws, "task-agent", "Agent Task");
+        tn.task = Some(TaskMetadata {
+            status: TaskStatus::NotStarted,
+            ..Default::default()
+        });
+        h.store.insert_note(&tn).await.expect("insert task note");
+        // A live session so provenance resolves the display name.
+        let session = AgentSession {
+            id: AgentId::from("agent-prov"),
+            workspace_id: h.ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Prov".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                tn.id.clone(),
+                "in_progress".to_string(),
+                None,
+                Some(AgentId::from("agent-prov")),
+            )
+            .await
+            .expect("status");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "task:status-changed");
+        // LC-1: agent-attributed changes surface `agentId` in the payload and
+        // an agent actor on the envelope (TS `notes.service.ts` parity).
+        assert_eq!(ev["data"]["agentId"], "agent-prov");
+        assert_eq!(
+            ev["actor"],
+            json!({ "type": "agent", "id": "agent-prov", "name": "Prov" })
+        );
     }
 
     #[tokio::test]
@@ -1954,7 +2031,13 @@ mod change_event_parity {
         // terminal (excluded), and the parent's only child is complete, so the
         // parent becomes the sole ready task.
         h.services
-            .task_update_note_status(h.ws.clone(), child.id.clone(), "complete".to_string(), None)
+            .task_update_note_status(
+                h.ws.clone(),
+                child.id.clone(),
+                "complete".to_string(),
+                None,
+                None,
+            )
             .await
             .expect("status");
 

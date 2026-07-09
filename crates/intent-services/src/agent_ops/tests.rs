@@ -1015,6 +1015,68 @@ async fn delegate_rejects_when_parent_at_max_depth() {
     );
 }
 
+/// LC-1: the service-layer guard inside `agent_create_op` mirrors the MCP
+/// `create_agent` front-door check, so RPC/service callers spawning a child
+/// for a parent already at `MAX_DELEGATION_DEPTH` are also refused. A parent
+/// below the max (or an unknown parent, read as depth 0) stays accepted.
+#[tokio::test]
+async fn create_rejects_when_parent_at_max_depth() {
+    let (_t, svc, ws) = setup().await;
+    let extra = intent_core::AgentCreateExtra {
+        metadata: Some(json!({ "delegationDepth": intent_core::MAX_DELEGATION_DEPTH })),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("MaxDepth".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            extra,
+        )
+        .await
+        .expect("create parent at max depth");
+    let parent = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent),
+            None,
+            false,
+            None,
+            intent_core::AgentCreateExtra::default(),
+        )
+        .await
+        .expect_err("create must be refused when parent at max depth");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("maximum delegation depth"),
+        "unexpected err: {msg}"
+    );
+    // A parent below the max still spawns children through the same path.
+    let shallow = create_agent(&svc, &ws, "Shallow").await;
+    svc.agent_create_op(
+        ws.clone(),
+        Some("Child OK".into()),
+        None,
+        None,
+        Some(shallow),
+        None,
+        false,
+        None,
+        intent_core::AgentCreateExtra::default(),
+    )
+    .await
+    .expect("create under a shallow parent succeeds");
+}
+
 /// The top-level (RPC / user) front door stays parentless and is never
 /// subject to the depth guard even when a foreground parent exists.
 #[tokio::test]

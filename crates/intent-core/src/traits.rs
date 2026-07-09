@@ -509,14 +509,25 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `task.updateNoteStatus`: set task-note metadata status (PROTOCOL §5.4).
     /// `expected_version` gates the write on the current `rev` when `Some` (§5.6).
+    /// `caller_agent_id` attributes the change to the invoking agent (the MCP
+    /// front door passes it): the emitted `task:status-changed` then carries an
+    /// agent actor and an `agentId` payload field, mirroring the TS provenance
+    /// (`notes.service.ts` `agentId: currentActor?.type === 'agent' ? … : undefined`).
     fn task_update_note_status(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         status: String,
         expected_version: Option<i64>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
-        let _ = (workspace_id, note_id, status, expected_version);
+        let _ = (
+            workspace_id,
+            note_id,
+            status,
+            expected_version,
+            caller_agent_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::task_update_note_status not implemented".to_string(),
