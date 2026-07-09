@@ -357,7 +357,10 @@ mod session_tests {
         };
         assert_eq!(tc.tool_kind, "file");
         assert_eq!(tc.status, "started");
+        // The title has no `<name>: <description>` prefix shape, so the
+        // derived tool name is the title verbatim.
         assert_eq!(tc.tool_name, "Edit src/lib.rs");
+        assert_eq!(tc.title, "Edit src/lib.rs");
         assert_eq!(tc.input, json!({ "path": "src/lib.rs" }));
     }
 
@@ -387,6 +390,39 @@ mod session_tests {
             panic!("expected tool call");
         };
         assert_eq!(tc.status, "error");
+    }
+
+    #[test]
+    fn derive_tool_name_splits_prefix_and_strips_server_suffix() {
+        // `<name>: <description>` titles yield the bare tool name; the registry
+        // names are bare and the ACP provider (auggie) appends `_workspace-mcp`
+        // on its side, so any number of trailing server suffixes is stripped.
+        assert_eq!(
+            session::derive_tool_name("add_to_note_workspace-mcp: Append content"),
+            "add_to_note"
+        );
+        assert_eq!(
+            session::derive_tool_name("add_to_note_workspace-mcp_workspace-mcp: x"),
+            "add_to_note"
+        );
+        assert_eq!(
+            session::derive_tool_name("add_to_note_workspace-mcp"),
+            "add_to_note"
+        );
+        assert_eq!(
+            session::derive_tool_name("sub-agent-explore: Explore the AI agent system"),
+            "sub-agent-explore"
+        );
+        // Titles without the `<name>: ` prefix shape pass through unchanged.
+        assert_eq!(
+            session::derive_tool_name("Edit src/lib.rs"),
+            "Edit src/lib.rs"
+        );
+        assert_eq!(
+            session::derive_tool_name("https://example.com/x"),
+            "https://example.com/x"
+        );
+        assert_eq!(session::derive_tool_name("10:15 sync"), "10:15 sync");
     }
 
     #[test]
@@ -432,8 +468,9 @@ mod mcp_tests {
     use std::sync::{Arc, Mutex};
 
     use intent_core::{
-        AgentId, BoxFuture, GitAgentCommitResult, Note, NoteAddInput, NoteAddResult, NoteCreate,
-        NoteId, Result, WorkspaceApi, WorkspaceId,
+        AgentCreateExtra, AgentId, BoxFuture, GitAgentCommitResult, Note, NoteAddInput,
+        NoteAddResult, NoteCreate, NoteId, Result, TaskAssignAgentResult, WorkspaceApi,
+        WorkspaceId,
     };
     use serde_json::{json, Value};
 
@@ -455,6 +492,15 @@ mod mcp_tests {
     /// call through the MCP server can be observed as a state change.
     /// A recorded `git_agent_commit` call: (message, agent_id, linked_note_id).
     type CommitRecord = (String, Option<String>, Option<String>);
+    /// A recorded `agent_create` call:
+    /// (name, specialist, parent_agent_id, idempotency_key, metadata).
+    type AgentCreateRecord = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<Value>,
+    );
 
     #[derive(Default)]
     pub(super) struct MockApi {
@@ -462,6 +508,11 @@ mod mcp_tests {
         pub(super) committed: Mutex<Vec<CommitRecord>>,
         /// Recorded `create_note` calls: (title, idempotency_key).
         pub(super) created: Mutex<Vec<(String, Option<String>)>>,
+        pub(super) agent_creates: Mutex<Vec<AgentCreateRecord>>,
+        /// Recorded `agent_send_message` calls: (agent_id, content).
+        pub(super) sent: Mutex<Vec<(String, String)>>,
+        /// Recorded `assign_agent` calls: (note_id, agent_id).
+        pub(super) assigned: Mutex<Vec<(String, String)>>,
     }
 
     impl WorkspaceApi for MockApi {
@@ -551,6 +602,73 @@ mod mcp_tests {
                 })
             })
         }
+
+        #[allow(clippy::too_many_arguments)]
+        fn agent_create(
+            &self,
+            _workspace_id: WorkspaceId,
+            name: Option<String>,
+            _model: Option<String>,
+            specialist_id: Option<String>,
+            parent_agent_id: Option<AgentId>,
+            idempotency_key: Option<String>,
+            _requested_agent_id: Option<AgentId>,
+            extra: AgentCreateExtra,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.agent_creates.lock().unwrap().push((
+                name.clone(),
+                specialist_id,
+                parent_agent_id.as_ref().map(|a| a.as_str().to_string()),
+                idempotency_key,
+                extra.metadata,
+            ));
+            Box::pin(async move {
+                Ok(json!({
+                    "agent": { "id": "agent-child", "name": name.unwrap_or_default() }
+                }))
+            })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn agent_send_message(
+            &self,
+            _workspace_id: WorkspaceId,
+            agent_id: AgentId,
+            content: String,
+            _message_id: Option<String>,
+            _image_blocks: Option<Value>,
+            _file_blocks: Option<Value>,
+            _priority: Option<String>,
+            _note_ids: Option<Value>,
+            _stdin_context: Option<String>,
+            _context_references: Option<Value>,
+            _message_metadata: Option<Value>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((agent_id.as_str().to_string(), content));
+            Box::pin(async { Ok(json!({ "ok": true })) })
+        }
+
+        fn assign_agent(
+            &self,
+            _workspace_id: WorkspaceId,
+            note_id: NoteId,
+            agent_id: String,
+        ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
+            self.assigned
+                .lock()
+                .unwrap()
+                .push((note_id.as_str().to_string(), agent_id.clone()));
+            Box::pin(async move {
+                Ok(TaskAssignAgentResult {
+                    ok: true,
+                    note_id,
+                    agent_id: AgentId::from_string(agent_id),
+                })
+            })
+        }
     }
 
     fn server(api: Arc<MockApi>) -> WorkspaceMcpServer {
@@ -587,7 +705,7 @@ mod mcp_tests {
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "add_to_note_workspace-mcp",
+                    "name": "add_to_note",
                     "arguments": { "noteId": "n1", "content": "hello" }
                 }
             }))
@@ -615,7 +733,7 @@ mod mcp_tests {
             .handle_message(&json!({
                 "jsonrpc": "2.0", "id": 9, "method": "tools/call",
                 "params": {
-                    "name": "git_commit_workspace-mcp",
+                    "name": "git_commit",
                     "arguments": { "message": "Add a" }
                 }
             }))
@@ -637,7 +755,7 @@ mod mcp_tests {
             .handle_message(&json!({
                 "jsonrpc": "2.0", "id": 10, "method": "tools/call",
                 "params": {
-                    "name": "git_commit_workspace-mcp",
+                    "name": "git_commit",
                     "arguments": { "message": "Add a" }
                 }
             }))
@@ -649,6 +767,81 @@ mod mcp_tests {
             .unwrap()
             .contains("This tool must be called by an agent."));
         assert!(api.committed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_agent_creates_assigns_and_starts_first_turn() {
+        let api = Arc::new(MockApi::default());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("ws-1"))
+            .with_caller_agent_id(Some(AgentId::from_string("agent-77")));
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                "params": {
+                    "name": "create_agent",
+                    "arguments": {
+                        "name": "Bug Fixer",
+                        "initialMessage": "fix the bug",
+                        "specialist": "implementor",
+                        "taskNoteId": "n-task"
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["ok"], json!(true));
+        assert_eq!(parsed["agentId"], json!("agent-child"));
+        assert_eq!(parsed["name"], json!("Bug Fixer"));
+
+        // The create op was parent-attributed to the MCP caller, carried the
+        // specialist through, and minted a fresh idempotency key.
+        let creates = api.agent_creates.lock().unwrap();
+        assert_eq!(creates.len(), 1);
+        let (name, specialist, parent, idem, metadata) = &creates[0];
+        assert_eq!(name.as_deref(), Some("Bug Fixer"));
+        assert_eq!(specialist.as_deref(), Some("implementor"));
+        assert_eq!(parent.as_deref(), Some("agent-77"));
+        assert!(idem.is_some(), "a fresh idempotency key is minted");
+        let meta = metadata.as_ref().expect("metadata block persisted");
+        assert_eq!(meta["createdByAgentId"], json!("agent-77"));
+        assert_eq!(meta["delegationDepth"], json!(1));
+        assert_eq!(meta["initialMessage"], json!("fix the bug"));
+        assert_eq!(meta["taskNoteId"], json!("n-task"));
+        assert_eq!(meta["isBackground"], json!(true));
+        drop(creates);
+
+        // The child was assigned to the supplied task note…
+        assert_eq!(
+            *api.assigned.lock().unwrap(),
+            vec![("n-task".to_string(), "agent-child".to_string())]
+        );
+        // …and its first turn was started via the initial message.
+        assert_eq!(
+            *api.sent.lock().unwrap(),
+            vec![("agent-child".to_string(), "fix the bug".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_agent_requires_name_and_initial_message() {
+        let api = Arc::new(MockApi::default());
+        let srv = server(api.clone());
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                "params": {
+                    "name": "create_agent",
+                    "arguments": { "name": "No Message" }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        assert!(api.agent_creates.lock().unwrap().is_empty());
+        assert!(api.sent.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -686,15 +879,16 @@ mod mcp_tests {
             .iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert!(!names.contains(&"add_to_note_workspace-mcp".to_string()));
-        assert!(!names.contains(&"delegate_task_workspace-mcp".to_string()));
+        assert!(!names.contains(&"add_to_note".to_string()));
+        assert!(!names.contains(&"delegate_task".to_string()));
+        assert!(!names.contains(&"create_agent".to_string()));
         // Read tools remain available.
-        assert!(names.contains(&"get_note_workspace-mcp".to_string()));
+        assert!(names.contains(&"get_note".to_string()));
 
         let resp = srv
             .handle_message(&json!({
                 "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-                "params": { "name": "add_to_note_workspace-mcp", "arguments": { "noteId": "n1", "content": "x" } }
+                "params": { "name": "add_to_note", "arguments": { "noteId": "n1", "content": "x" } }
             }))
             .await
             .unwrap();
@@ -709,17 +903,17 @@ mod mcp_tests {
         assert!(get_tool_denylist_for_agent_type("interactive").is_empty());
         // Pure text agents deny note writes and file writes.
         let cm = get_tool_denylist_for_agent_type("commit-message");
-        assert!(cm.contains(&"add_to_note_workspace-mcp"));
+        assert!(cm.contains(&"add_to_note"));
         assert!(cm.contains(&"str-replace-editor"));
     }
 
     #[test]
     fn report_to_parent_is_an_agent_creation_tool_and_denied_for_background_types() {
         // It lives in the agent-orchestration group alongside delegate/send.
-        assert!(AGENT_CREATION_TOOLS.contains(&"report_to_parent_workspace-mcp"));
+        assert!(AGENT_CREATION_TOOLS.contains(&"report_to_parent"));
         // Pure-text background agents (full denylist) cannot call it.
         let cm = get_tool_denylist_for_agent_type("commit-message");
-        assert!(cm.contains(&"report_to_parent_workspace-mcp"));
+        assert!(cm.contains(&"report_to_parent"));
         // Interactive/foreground agents stay unrestricted.
         assert!(get_tool_denylist_for_agent_type("interactive").is_empty());
     }
@@ -1452,7 +1646,7 @@ mod tool_registry_tests {
         let tools = unrestricted_tools();
         let def = tools
             .iter()
-            .find(|t| t.name == "create_note_workspace-mcp")
+            .find(|t| t.name == "create_note")
             .expect("create_note tool present");
         let schema = def.schema();
         assert_eq!(schema["type"], serde_json::json!("object"));
@@ -1477,7 +1671,7 @@ mod tool_registry_tests {
         let tools = unrestricted_tools();
         let def = tools
             .iter()
-            .find(|t| t.name == "list_notes_workspace-mcp")
+            .find(|t| t.name == "list_notes")
             .expect("list_notes tool present");
         let schema = def.schema();
         assert_eq!(schema["type"], serde_json::json!("object"));
@@ -1500,36 +1694,39 @@ mod tool_registry_tests {
             names.len(),
             "duplicate tool names in registry"
         );
-        // Every name must end with `_workspace-mcp` per the §18.4 naming convention.
+        // Registry names are bare (no server suffix); the ACP provider (auggie)
+        // appends `_workspace-mcp` on its side, so agents still see
+        // `<name>_workspace-mcp`.
         for n in &names {
             assert!(
-                n.ends_with("_workspace-mcp"),
-                "tool name {n} missing workspace-mcp suffix"
+                !n.ends_with("_workspace-mcp"),
+                "tool name {n} must be bare (provider appends the server suffix)"
             );
         }
         // A representative read, write, agent-creation, and git tool are all present.
         for required in [
-            "list_notes_workspace-mcp",
-            "add_to_note_workspace-mcp",
-            "delegate_task_workspace-mcp",
-            "git_commit_workspace-mcp",
-            "report_to_parent_workspace-mcp",
+            "list_notes",
+            "add_to_note",
+            "create_agent",
+            "delegate_task",
+            "git_commit",
+            "report_to_parent",
             // Agent coordination surface (D-batch 3): send/wake/list/read tools
             // that let agents cooperate over the MCP front door.
-            "send_message_to_agent_workspace-mcp",
-            "send_message_to_task_agent_workspace-mcp",
-            "wake_or_create_task_agent_workspace-mcp",
-            "list_agents_workspace-mcp",
-            "get_agent_status_workspace-mcp",
-            "read_agent_conversation_workspace-mcp",
-            "get_agent_summary_workspace-mcp",
-            "get_agent_diagnostics_workspace-mcp",
-            "subscribe_to_events_workspace-mcp",
-            "unsubscribe_from_events_workspace-mcp",
+            "send_message_to_agent",
+            "send_message_to_task_agent",
+            "wake_or_create_task_agent",
+            "list_agents",
+            "get_agent_status",
+            "read_agent_conversation",
+            "get_agent_summary",
+            "get_agent_diagnostics",
+            "subscribe_to_events",
+            "unsubscribe_from_events",
             // Workspace metadata surface (TS parity for `ws.workspace.*`).
-            "get_workspace_details_workspace-mcp",
-            "set_workspace_title_workspace-mcp",
-            "set_workspace_status_message_workspace-mcp",
+            "get_workspace_details",
+            "set_workspace_title",
+            "set_workspace_status_message",
         ] {
             assert!(names.contains(&required), "missing {required}");
         }
@@ -1562,8 +1759,8 @@ mod tool_registry_tests {
             );
             // Read tools survive.
             let names: Vec<&str> = srv.available_tools().iter().map(|t| t.name).collect();
-            assert!(names.contains(&"get_note_workspace-mcp"), "{ty}");
-            assert!(names.contains(&"list_notes_workspace-mcp"), "{ty}");
+            assert!(names.contains(&"get_note"), "{ty}");
+            assert!(names.contains(&"list_notes"), "{ty}");
         }
     }
 
@@ -1644,7 +1841,7 @@ mod dispatch_unit_tests {
         let resp = srv
             .handle_message(&json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": { "name": "get_note_workspace-mcp" }
+                "params": { "name": "get_note" }
             }))
             .await
             .unwrap();
@@ -1679,117 +1876,81 @@ mod dispatch_unit_tests {
         let (srv, _) = server();
         // (tool, args, expected substring in error message)
         let cases: &[(&str, serde_json::Value, &str)] = &[
-            ("get_note_workspace-mcp", json!({}), "noteId"),
-            ("list_note_tasks_workspace-mcp", json!({}), "noteId"),
-            ("create_note_workspace-mcp", json!({}), "title"),
+            ("get_note", json!({}), "noteId"),
+            ("list_note_tasks", json!({}), "noteId"),
+            ("create_note", json!({}), "title"),
+            ("add_to_note", json!({ "noteId": "n" }), "content"),
+            ("set_note_content", json!({ "noteId": "n" }), "content"),
+            ("edit_note", json!({ "noteId": "n", "old": "x" }), "new"),
             (
-                "add_to_note_workspace-mcp",
-                json!({ "noteId": "n" }),
-                "content",
-            ),
-            (
-                "set_note_content_workspace-mcp",
-                json!({ "noteId": "n" }),
-                "content",
-            ),
-            (
-                "edit_note_workspace-mcp",
-                json!({ "noteId": "n", "old": "x" }),
-                "new",
-            ),
-            (
-                "edit_note_lines_workspace-mcp",
+                "edit_note_lines",
                 json!({ "noteId": "n", "start": 1, "end": 2 }),
                 "content",
             ),
             (
-                "edit_note_lines_workspace-mcp",
+                "edit_note_lines",
                 json!({ "noteId": "n", "end": 2, "content": "x" }),
                 "start",
             ),
-            ("delete_note_workspace-mcp", json!({}), "noteId"),
+            ("delete_note", json!({}), "noteId"),
             (
-                "update_task_status_workspace-mcp",
+                "update_task_status",
                 json!({ "noteId": "n", "taskText": "t" }),
                 "status",
             ),
             (
-                "update_note_task_status_workspace-mcp",
+                "update_note_task_status",
                 json!({ "noteId": "n" }),
                 "status",
             ),
+            ("update_task", json!({ "noteId": "n" }), "line"),
+            ("mark_as_task", json!({ "noteId": "n" }), "status"),
+            ("convert_task_blocks", json!({}), "noteId"),
+            ("create_prerequisite", json!({ "noteId": "n" }), "title"),
+            ("assign_agent", json!({ "noteId": "n" }), "agentId"),
             (
-                "update_task_workspace-mcp",
-                json!({ "noteId": "n" }),
-                "line",
-            ),
-            (
-                "mark_as_task_workspace-mcp",
-                json!({ "noteId": "n" }),
-                "status",
-            ),
-            ("convert_task_blocks_workspace-mcp", json!({}), "noteId"),
-            (
-                "create_prerequisite_workspace-mcp",
-                json!({ "noteId": "n" }),
-                "title",
-            ),
-            (
-                "assign_agent_workspace-mcp",
-                json!({ "noteId": "n" }),
-                "agentId",
-            ),
-            (
-                "add_note_comment_workspace-mcp",
+                "add_note_comment",
                 json!({ "noteId": "n", "searchContext": "s", "commentTarget": "t" }),
                 "comment",
             ),
             (
-                "respond_to_comment_thread_workspace-mcp",
+                "respond_to_comment_thread",
                 json!({ "noteId": "n" }),
                 "comment",
             ),
-            ("git_commit_workspace-mcp", json!({}), "agent"),
-            ("report_to_parent_workspace-mcp", json!({}), "report"),
+            ("git_commit", json!({}), "agent"),
+            ("report_to_parent", json!({}), "report"),
             (
-                "send_message_to_agent_workspace-mcp",
+                "send_message_to_agent",
                 json!({ "message": "hi" }),
                 "agentId",
             ),
             (
-                "send_message_to_agent_workspace-mcp",
+                "send_message_to_agent",
                 json!({ "agentId": "agent-1" }),
                 "message",
             ),
             (
-                "send_message_to_task_agent_workspace-mcp",
+                "send_message_to_task_agent",
                 json!({ "message": "hi" }),
                 "taskNoteId",
             ),
             (
-                "wake_or_create_task_agent_workspace-mcp",
+                "wake_or_create_task_agent",
                 json!({ "contextMessage": "ctx" }),
                 "taskNoteId",
             ),
             (
-                "wake_or_create_task_agent_workspace-mcp",
+                "wake_or_create_task_agent",
                 json!({ "taskNoteId": "n" }),
                 "contextMessage",
             ),
-            ("get_agent_status_workspace-mcp", json!({}), "agentId"),
-            (
-                "read_agent_conversation_workspace-mcp",
-                json!({}),
-                "agentId",
-            ),
-            ("get_agent_summary_workspace-mcp", json!({}), "agentId"),
-            ("subscribe_to_events_workspace-mcp", json!({}), "eventTypes"),
-            (
-                "unsubscribe_from_events_workspace-mcp",
-                json!({}),
-                "subscriptionId",
-            ),
-            ("set_workspace_title_workspace-mcp", json!({}), "title"),
+            ("get_agent_status", json!({}), "agentId"),
+            ("read_agent_conversation", json!({}), "agentId"),
+            ("get_agent_summary", json!({}), "agentId"),
+            ("subscribe_to_events", json!({}), "eventTypes"),
+            ("unsubscribe_from_events", json!({}), "subscriptionId"),
+            ("set_workspace_title", json!({}), "title"),
         ];
         for (tool, args, needle) in cases {
             let resp = call(&srv, tool, args.clone()).await;
@@ -1814,114 +1975,97 @@ mod dispatch_unit_tests {
         // wired through to the real method.
         let (srv, _) = server();
         let valid_args: &[(&str, serde_json::Value)] = &[
-            ("get_note_workspace-mcp", json!({ "noteId": "n" })),
-            ("list_note_tasks_workspace-mcp", json!({ "noteId": "n" })),
+            ("get_note", json!({ "noteId": "n" })),
+            ("list_note_tasks", json!({ "noteId": "n" })),
             (
-                "set_note_content_workspace-mcp",
+                "set_note_content",
                 json!({ "noteId": "n", "content": "c", "confirmReplacement": true, "expectedVersion": 3 }),
             ),
             (
-                "edit_note_workspace-mcp",
+                "edit_note",
                 json!({ "noteId": "n", "old": "a", "new": "b" }),
             ),
             (
-                "edit_note_lines_workspace-mcp",
+                "edit_note_lines",
                 json!({ "noteId": "n", "start": 1, "end": 2, "content": "x" }),
             ),
             (
-                "update_note_metadata_workspace-mcp",
+                "update_note_metadata",
                 json!({ "noteId": "n", "title": "T", "tags": ["a", "b"] }),
             ),
-            ("delete_note_workspace-mcp", json!({ "noteId": "n" })),
+            ("delete_note", json!({ "noteId": "n" })),
             (
-                "update_task_status_workspace-mcp",
+                "update_task_status",
                 json!({ "noteId": "n", "taskText": "t", "status": "done" }),
             ),
             (
-                "update_note_task_status_workspace-mcp",
+                "update_note_task_status",
                 json!({ "noteId": "n", "status": "complete", "expectedVersion": 1 }),
             ),
             (
-                "update_task_workspace-mcp",
+                "update_task",
                 json!({ "noteId": "n", "line": 2, "text": "T", "status": "todo", "expected": "old" }),
             ),
             (
-                "mark_as_task_workspace-mcp",
+                "mark_as_task",
                 json!({ "noteId": "n", "status": "in_progress", "acceptanceCriteria": ["a"], "effort": "small" }),
             ),
+            ("convert_task_blocks", json!({ "noteId": "n" })),
             (
-                "convert_task_blocks_workspace-mcp",
-                json!({ "noteId": "n" }),
-            ),
-            (
-                "create_prerequisite_workspace-mcp",
+                "create_prerequisite",
                 json!({ "noteId": "n", "title": "t", "content": "c", "status": "todo" }),
             ),
+            // `assign_agent` is absent here: `MockApi` overrides
+            // `assign_agent` (for the create_agent tests), so its arm is proven
+            // by `assign_agent_arm_reaches_workspace_api` below instead.
             (
-                "assign_agent_workspace-mcp",
-                json!({ "noteId": "n", "agentId": "agent-1" }),
-            ),
-            (
-                "add_note_comment_workspace-mcp",
+                "add_note_comment",
                 json!({ "noteId": "n", "searchContext": "s", "commentTarget": "t", "comment": "c", "type": "comment", "author": "me" }),
             ),
             (
-                "respond_to_comment_thread_workspace-mcp",
+                "respond_to_comment_thread",
                 json!({ "noteId": "n", "threadId": "th", "comment": "c", "type": "comment", "author": "me", "suggestionOriginal": "o", "suggestionProposed": "p" }),
             ),
             (
-                "delegate_task_workspace-mcp",
+                "delegate_task",
                 json!({ "taskNoteId": "tn", "noteId": "n", "taskText": "t", "agentInstructions": "i",
                         "specialist": "implementor", "model": "opus", "behaviorPrompt": "b",
                         "waitMode": "after_all", "skipAutoCommit": true }),
             ),
+            ("report_to_parent", json!({ "report": "all done" })),
+            // `send_message_to_agent` is absent here: `MockApi`
+            // overrides `agent_send_message` (for the create_agent tests), so
+            // its arm is proven by `send_message_arm_reaches_workspace_api`.
             (
-                "report_to_parent_workspace-mcp",
-                json!({ "report": "all done" }),
-            ),
-            (
-                "send_message_to_agent_workspace-mcp",
-                json!({ "agentId": "agent-1", "message": "hi", "priority": "normal" }),
-            ),
-            (
-                "send_message_to_task_agent_workspace-mcp",
+                "send_message_to_task_agent",
                 json!({ "taskNoteId": "tn", "message": "hi" }),
             ),
             (
-                "wake_or_create_task_agent_workspace-mcp",
+                "wake_or_create_task_agent",
                 json!({ "taskNoteId": "tn", "contextMessage": "ctx", "model": "opus" }),
             ),
+            ("list_agents", json!({ "includeCompleted": true })),
+            ("get_agent_status", json!({ "agentId": "agent-1" })),
             (
-                "list_agents_workspace-mcp",
-                json!({ "includeCompleted": true }),
-            ),
-            (
-                "get_agent_status_workspace-mcp",
-                json!({ "agentId": "agent-1" }),
-            ),
-            (
-                "read_agent_conversation_workspace-mcp",
+                "read_agent_conversation",
                 json!({ "agentId": "agent-1", "lastN": 20 }),
             ),
+            ("get_agent_summary", json!({ "agentId": "agent-1" })),
             (
-                "get_agent_summary_workspace-mcp",
-                json!({ "agentId": "agent-1" }),
-            ),
-            (
-                "get_agent_diagnostics_workspace-mcp",
+                "get_agent_diagnostics",
                 json!({ "agentId": "agent-1", "taskNoteId": "n", "staleRespondingAfterMs": 60000 }),
             ),
             (
-                "subscribe_to_events_workspace-mcp",
+                "subscribe_to_events",
                 json!({ "eventTypes": ["agent:idle"], "excludeSelf": true, "batchWindow": 250 }),
             ),
             (
-                "unsubscribe_from_events_workspace-mcp",
+                "unsubscribe_from_events",
                 json!({ "subscriptionId": "sub-1" }),
             ),
-            ("get_workspace_details_workspace-mcp", json!({})),
+            ("get_workspace_details", json!({})),
             (
-                "set_workspace_status_message_workspace-mcp",
+                "set_workspace_status_message",
                 json!({ "statusMessage": "current progress" }),
             ),
         ];
@@ -1936,13 +2080,45 @@ mod dispatch_unit_tests {
     }
 
     #[tokio::test]
+    async fn assign_agent_arm_reaches_workspace_api() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "assign_agent",
+            json!({ "noteId": "n", "agentId": "agent-1" }),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(
+            *api.assigned.lock().unwrap(),
+            vec![("n".to_string(), "agent-1".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_arm_reaches_workspace_api() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "send_message_to_agent",
+            json!({ "agentId": "agent-1", "message": "hi", "priority": "normal" }),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(
+            *api.sent.lock().unwrap(),
+            vec![("agent-1".to_string(), "hi".to_string())]
+        );
+    }
+
+    #[tokio::test]
     async fn create_note_mints_idempotency_key_when_absent() {
         // Daemon-internal `note.create`: agents do not pass an idempotencyKey,
         // so the dispatch arm mints one — the services soft-launch warn
         // ("idempotencyKey missing on idempotent method") must never fire for
         // MCP tool calls.
         let (srv, api) = server();
-        let resp = call(&srv, "create_note_workspace-mcp", json!({ "title": "t" })).await;
+        let resp = call(&srv, "create_note", json!({ "title": "t" })).await;
         assert!(resp.get("error").is_none(), "unexpected error: {resp}");
         let created = api.created.lock().unwrap();
         assert_eq!(created.len(), 1);
@@ -1964,7 +2140,7 @@ mod dispatch_unit_tests {
         let (srv, api) = server();
         let resp = call(
             &srv,
-            "create_note_workspace-mcp",
+            "create_note",
             json!({ "title": "t", "idempotencyKey": "key-from-caller" }),
         )
         .await;
@@ -1984,7 +2160,7 @@ mod dispatch_unit_tests {
         let resp = srv
             .handle_message(&json!({
                 "jsonrpc": "2.0", "id": 5, "method": "tools/call",
-                "params": { "name": "totally_made_up_workspace-mcp", "arguments": {} }
+                "params": { "name": "totally_made_up", "arguments": {} }
             }))
             .await
             .unwrap();
@@ -2001,13 +2177,13 @@ mod dispatch_unit_tests {
         // the rest of the registry.
         let api = mock_api();
         let srv = WorkspaceMcpServer::new(api, WorkspaceId::from_string("ws-1"))
-            .with_denylist(["get_note_workspace-mcp"]);
-        assert!(srv.is_denied("get_note_workspace-mcp"));
-        assert!(!srv.is_denied("list_notes_workspace-mcp"));
+            .with_denylist(["get_note"]);
+        assert!(srv.is_denied("get_note"));
+        assert!(!srv.is_denied("list_notes"));
         let resp = srv
             .handle_message(&json!({
                 "jsonrpc": "2.0", "id": 6, "method": "tools/call",
-                "params": { "name": "get_note_workspace-mcp", "arguments": { "noteId": "n" } }
+                "params": { "name": "get_note", "arguments": { "noteId": "n" } }
             }))
             .await
             .unwrap();
@@ -2022,18 +2198,14 @@ mod dispatch_unit_tests {
     async fn tools_list_excludes_denied_entries() {
         let api = mock_api();
         let srv = WorkspaceMcpServer::new(api, WorkspaceId::from_string("ws-1"))
-            .with_denylist(["delete_note_workspace-mcp"]);
+            .with_denylist(["delete_note"]);
         let resp = srv
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
             .unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert!(!tools
-            .iter()
-            .any(|t| t["name"] == json!("delete_note_workspace-mcp")));
-        assert!(tools
-            .iter()
-            .any(|t| t["name"] == json!("list_notes_workspace-mcp")));
+        assert!(!tools.iter().any(|t| t["name"] == json!("delete_note")));
+        assert!(tools.iter().any(|t| t["name"] == json!("list_notes")));
     }
 }
 
@@ -2303,7 +2475,7 @@ mod workspace_metadata_tool_tests {
         // this by treating the placeholder as still-untitled.
         let api = WorkspaceMockApi::new("amber-forest", "amber-forest", "amber-forest");
         let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
-        let resp = call(&srv, "get_workspace_details_workspace-mcp", json!({})).await;
+        let resp = call(&srv, "get_workspace_details", json!({})).await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let body = parse_content(&resp);
         assert_eq!(body["id"], json!("amber-forest"));
@@ -2320,8 +2492,7 @@ mod workspace_metadata_tool_tests {
     async fn get_workspace_details_reports_has_title_for_custom_titles() {
         let api = WorkspaceMockApi::new("amber-forest", "Add dark mode", "amber-forest");
         let srv = WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"));
-        let body =
-            parse_content(&call(&srv, "get_workspace_details_workspace-mcp", json!({})).await);
+        let body = parse_content(&call(&srv, "get_workspace_details", json!({})).await);
         assert_eq!(body["hasTitle"], json!(true));
         assert_eq!(body["title"], json!("Add dark mode"));
     }
@@ -2334,7 +2505,7 @@ mod workspace_metadata_tool_tests {
         let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
         let resp = call(
             &srv,
-            "set_workspace_title_workspace-mcp",
+            "set_workspace_title",
             json!({ "title": "  Add dark mode support  " }),
         )
         .await;
@@ -2359,7 +2530,7 @@ mod workspace_metadata_tool_tests {
         let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
         let resp = call(
             &srv,
-            "set_workspace_title_workspace-mcp",
+            "set_workspace_title",
             json!({ "title": "Something else" }),
         )
         .await;
@@ -2377,12 +2548,7 @@ mod workspace_metadata_tool_tests {
     async fn set_workspace_title_rejects_empty_title() {
         let api = WorkspaceMockApi::new("amber-forest", "amber-forest", "amber-forest");
         let srv = WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"));
-        let resp = call(
-            &srv,
-            "set_workspace_title_workspace-mcp",
-            json!({ "title": "   " }),
-        )
-        .await;
+        let resp = call(&srv, "set_workspace_title", json!({ "title": "   " })).await;
         assert_eq!(resp["error"]["code"], json!(-32602));
     }
 
@@ -2392,7 +2558,7 @@ mod workspace_metadata_tool_tests {
         let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
         let resp = call(
             &srv,
-            "set_workspace_status_message_workspace-mcp",
+            "set_workspace_status_message",
             json!({ "statusMessage": " Implementing dark mode toggle " }),
         )
         .await;
@@ -2417,7 +2583,7 @@ mod workspace_metadata_tool_tests {
         let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
         let resp = call(
             &srv,
-            "set_workspace_status_message_workspace-mcp",
+            "set_workspace_status_message",
             json!({ "statusMessage": "" }),
         )
         .await;
@@ -2436,7 +2602,7 @@ mod workspace_metadata_tool_tests {
         let too_long = "x".repeat(intent_core::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH + 1);
         let resp = call(
             &srv,
-            "set_workspace_status_message_workspace-mcp",
+            "set_workspace_status_message",
             json!({ "statusMessage": too_long }),
         )
         .await;
@@ -2467,9 +2633,9 @@ mod workspace_metadata_tool_tests {
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
         for required in [
-            "get_workspace_details_workspace-mcp",
-            "set_workspace_title_workspace-mcp",
-            "set_workspace_status_message_workspace-mcp",
+            "get_workspace_details",
+            "set_workspace_title",
+            "set_workspace_status_message",
         ] {
             assert!(
                 names.contains(&required.to_string()),

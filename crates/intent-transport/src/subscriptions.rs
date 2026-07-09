@@ -615,6 +615,7 @@ impl ChatDeltaState {
         let use_block = intent_services::tool_block::build_tool_use_block(
             &block_id,
             d.get("toolName").and_then(Value::as_str).unwrap_or(""),
+            d.get("title").and_then(Value::as_str).unwrap_or(""),
             d.get("input").cloned().unwrap_or(Value::Null),
             &tool_call_id,
             d.get("toolKind").and_then(Value::as_str).unwrap_or(""),

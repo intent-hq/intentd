@@ -427,6 +427,7 @@ fn tool_event(
     data.insert("toolCallId".into(), Value::String(tool_call_id.into()));
     data.insert("status".into(), Value::String(status.into()));
     data.insert("toolName".into(), Value::String("shell".into()));
+    data.insert("title".into(), Value::String("shell: run ls".into()));
     data.insert("input".into(), json!({ "cmd": "ls" }));
     data.insert("toolKind".into(), Value::String("execute".into()));
     if let Some(out) = output {
@@ -568,19 +569,20 @@ fn chat_tool_delta_error_status_marks_is_error_true() {
 #[test]
 fn chat_tool_delta_synthesizes_name_and_acp_title_from_event() {
     // The delta stream must produce the same shape `record_tool` persists so
-    // seq-0 snapshot and live deltas agree. `toolName` is the ACP title on
-    // the wire; the block's `name` is the derived real tool name and the
-    // title is echoed as `input._acpTitle`.
+    // seq-0 snapshot and live deltas agree. `toolName` is the real derived
+    // tool name on the wire and the raw ACP title travels separately as
+    // `title`; the block's `name` is the toolName verbatim and the title is
+    // echoed as `input._acpTitle`.
     let mut s = ChatDeltaState::new(&agent());
     let d = s
         .tool_delta(&tool_event("msg-9", "msg-9:0", "tc-1", "started", None))
         .expect("tool started delta");
     let block = &d["added"][0]["block"];
-    assert_eq!(block["name"], "shell", "derived from title `shell`");
+    assert_eq!(block["name"], "shell", "toolName used verbatim");
     assert_eq!(block["input"]["cmd"], "ls", "raw args preserved");
     assert_eq!(
-        block["input"]["_acpTitle"], "shell",
-        "ACP title always echoed under `_acpTitle`"
+        block["input"]["_acpTitle"], "shell: run ls",
+        "ACP title echoed under `_acpTitle` when present"
     );
 }
 

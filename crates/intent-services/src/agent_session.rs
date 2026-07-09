@@ -134,14 +134,17 @@ impl Transcript {
                 self.flush_text();
                 let index = self.blocks.len();
                 let id = self.block_id(index);
-                self.blocks.push(json!({
-                    "type": "tool_use",
-                    "id": id,
-                    "name": tc.tool_name,
-                    "input": tc.input,
-                    "toolCallId": tc.tool_call_id,
-                    "metadata": { "toolKind": tc.tool_kind, "status": tc.status },
-                }));
+                // Shared factory (§7.1): keeps the persisted block
+                // byte-identical to the live `chat.subscribe` delta.
+                self.blocks.push(crate::tool_block::build_tool_use_block(
+                    &id,
+                    &tc.tool_name,
+                    &tc.title,
+                    tc.input.clone(),
+                    &tc.tool_call_id,
+                    tc.tool_kind,
+                    tc.status,
+                ));
                 self.tool_use_index.insert(tc.tool_call_id.clone(), index);
                 index
             }
@@ -635,6 +638,7 @@ impl Services {
                 let mut data = json!({
                     "agentId": agent_id.0,
                     "toolName": tc.tool_name,
+                    "title": tc.title,
                     "toolKind": tc.tool_kind,
                     "toolCallId": tc.tool_call_id,
                     "input": tc.input,

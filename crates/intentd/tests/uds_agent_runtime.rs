@@ -226,7 +226,7 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
     };
 
     let behavior = json!({
-        "toolCall": { "name": "add_to_note_workspace-mcp", "arguments": { "noteId": note_id, "content": MARKER } },
+        "toolCall": { "name": "add_to_note", "arguments": { "noteId": note_id, "content": MARKER } },
         "response": "added via mcp over the wire",
     })
     .to_string();

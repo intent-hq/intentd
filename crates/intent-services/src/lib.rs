@@ -82,7 +82,7 @@ pub mod tool_block;
 mod tests;
 
 pub use mcp_servers::McpHub;
-pub use settings::{InMemorySecretStore, KeyringSecretStore, SecretStore};
+pub use settings::{InMemorySecretStore, SecretStore};
 pub use terminal_ops::PtyTerminalHost;
 
 /// Re-export the auggie discovery surface so the transport layer can reuse the
@@ -215,12 +215,13 @@ pub struct Services {
     /// keyed by script id. Scripts run on the same [`pty`](Self::pty) host as
     /// `terminal.*`, so a terminal can attach to a running script (§12.2).
     scripts: script_ops::ScriptRegistry,
-    /// Secret persistence for **sensitive** settings (§9.8) — the keychain seam
-    /// behind `settings.*`. Defaults to the OS keychain ([`KeyringSecretStore`]);
-    /// tests inject an in-memory store so they never touch the real keychain.
+    /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
+    /// seam behind `settings.*`. Defaults to the file-backed
+    /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
+    /// an in-memory store so they never touch the real secrets file.
     /// Wrapped in an [`AsyncSecretStore`](settings::AsyncSecretStore) so every
-    /// keychain call runs on the blocking pool with a bounded timeout + single-
-    /// flight cache, keeping the async runtime free when the OS keychain wedges.
+    /// backing call runs on the blocking pool with a bounded timeout + single-
+    /// flight cache, keeping the async runtime free if the backing store stalls.
     secrets: Arc<settings::AsyncSecretStore>,
     /// Override for the **user** specialists directory (§18.2). `None` resolves
     /// to `~/.augment/specialists/`; tests inject a temp dir for hermetic
@@ -297,7 +298,7 @@ impl Services {
             pty: Arc::new(intent_pty::PtyHost::new()),
             scripts: Arc::new(Mutex::new(HashMap::new())),
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
-                settings::KeyringSecretStore,
+                intent_core::FileSecretStore::new(),
             ))),
             specialists_user_dir: None,
             specialists_bundled_dir: None,
@@ -320,8 +321,9 @@ impl Services {
     }
 
     /// Override the [`SecretStore`] backing sensitive settings (§9.8). The
-    /// composition root keeps the OS-keychain default; tests inject an in-memory
-    /// store so they never read/write the real user keychain. The injected store
+    /// composition root keeps the file-backed default
+    /// ([`intent_core::FileSecretStore`]); tests inject an in-memory store so
+    /// they never read/write the real secrets file. The injected store
     /// is wrapped in an [`AsyncSecretStore`](settings::AsyncSecretStore) so the
     /// same timeout / single-flight guarantees apply in tests.
     pub fn with_secret_store(mut self, secrets: Arc<dyn settings::SecretStore>) -> Self {
@@ -390,7 +392,7 @@ impl Services {
     /// Build a [`SettingsService`](settings::SettingsService) view over the store
     /// and secret store for one `settings.*` call. The secret store is cloned
     /// as an `Arc` so `SettingsService` can move it into `spawn_blocking` for
-    /// non-blocking, timeout-guarded keychain access.
+    /// non-blocking, timeout-guarded secret-store access.
     fn settings_service(&self) -> settings::SettingsService<'_> {
         settings::SettingsService::new(&self.store, &self.secrets)
     }
@@ -1759,6 +1761,16 @@ fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
     } else {
         base.to_string()
     }
+}
+
+/// Derive a repository display name from a local `repositoryPath` basename,
+/// mirroring the `known_repo_name` fallback — but returning `None` instead of
+/// an `"Unknown"` placeholder when the path has no usable basename, so an
+/// underivable name stays NULL on the workspace row. Splits on both `/` and
+/// `\` so Windows-style paths (`C:\src\repo`) derive correctly.
+fn derive_repo_name_from_path(path: &str) -> Option<String> {
+    let base = path.rsplit(['/', '\\']).next().unwrap_or("");
+    (!base.is_empty()).then(|| base.to_string())
 }
 
 /// Default root for daemon-provisioned worktrees: `$INTENTD_WORKSPACES_DIR`
@@ -3271,8 +3283,20 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         let bus = self.event_bus.clone();
+        let store = self.store.clone();
         Box::pin(async move {
-            terminal_ops::create(pty, bus, workspace_id, cols, rows, cwd, command, env).await
+            terminal_ops::create(
+                pty,
+                bus,
+                Some(store),
+                workspace_id,
+                cols,
+                rows,
+                cwd,
+                command,
+                env,
+            )
+            .await
         })
     }
 
@@ -3887,6 +3911,26 @@ impl WorkspaceApi for Services {
                                     input.repository_name = Some(name);
                                 }
                             }
+                        }
+                    }
+                    // Repository-name derivation (`known_repo_name` fallback
+                    // parity): a caller-supplied `repositoryName` always wins;
+                    // otherwise a local `repositoryPath` yields its basename so
+                    // workspace payloads carry `repositoryName` for locally
+                    // created workspaces (FE recent-repos surfaces). `owner` is
+                    // left untouched — no local-remote inspection.
+                    if !input
+                        .repository_name
+                        .as_deref()
+                        .is_some_and(|n| !n.is_empty())
+                    {
+                        if let Some(name) = input
+                            .repository_path
+                            .as_deref()
+                            .filter(|p| !p.is_empty())
+                            .and_then(derive_repo_name_from_path)
+                        {
+                            input.repository_name = Some(name);
                         }
                     }
                     // Branch naming (TS parity): an explicit `branch` wins

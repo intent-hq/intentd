@@ -377,7 +377,8 @@ async fn prompt_turn_streams_events_and_accumulates() {
         json!([
             { "type": "text", "id": format!("{mid}:0"), "text": "Hello world" },
             { "type": "tool_use", "id": format!("{mid}:1"), "name": "Edit src/lib.rs",
-              "input": { "path": "src/lib.rs" }, "toolCallId": "t1",
+              "input": { "path": "src/lib.rs", "_acpTitle": "Edit src/lib.rs" },
+              "toolCallId": "t1",
               "metadata": { "toolKind": "file", "status": "started" } },
         ])
     );
@@ -516,7 +517,8 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
         json!([
             { "type": "text", "id": format!("{mid}:0"), "text": "Hello world" },
             { "type": "tool_use", "id": format!("{mid}:1"), "name": "Edit src/lib.rs",
-              "input": { "path": "src/lib.rs" }, "toolCallId": "t1",
+              "input": { "path": "src/lib.rs", "_acpTitle": "Edit src/lib.rs" },
+              "toolCallId": "t1",
               "metadata": { "toolKind": "file", "status": "started" } },
         ])
     );
@@ -567,7 +569,7 @@ async fn tool_call_then_update_persists_use_and_result_blocks() {
         json!([
             { "type": "text", "id": format!("{mid}:0"), "text": "Working " },
             { "type": "tool_use", "id": format!("{mid}:1"), "name": "Run tests",
-              "input": { "path": "." }, "toolCallId": "t1",
+              "input": { "path": ".", "_acpTitle": "Run tests" }, "toolCallId": "t1",
               "metadata": { "toolKind": "terminal", "status": "completed" } },
             { "type": "tool_result", "id": format!("{mid}:2"), "tool_use_id": "t1",
               "output": { "summary": "12 passed" }, "is_error": false },

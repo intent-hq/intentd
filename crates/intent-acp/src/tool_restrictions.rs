@@ -15,57 +15,58 @@ pub const FILE_WRITE_TOOLS: &[&str] = &[
     "str_replace",
     "create",
     "apply_patch",
-    // MCP workspace tools
-    "write_file_workspace-mcp",
-    "delete_file_workspace-mcp",
-    "create_directory_workspace-mcp",
-    "rename_file_workspace-mcp",
+    // MCP workspace tools (bare registry names; the provider appends the
+    // `_workspace-mcp` server suffix on its side, §6.8)
+    "write_file",
+    "delete_file",
+    "create_directory",
+    "rename_file",
 ];
 
 /// Git tools — agents with these can mutate git state. (`git_status` is
 /// read-only and intentionally omitted.)
-pub const GIT_TOOLS: &[&str] = &["git_stage_workspace-mcp", "git_commit_workspace-mcp"];
+pub const GIT_TOOLS: &[&str] = &["git_stage", "git_commit"];
 
 /// Agent creation/delegation tools — agents with these can spawn/message agents.
 pub const AGENT_CREATION_TOOLS: &[&str] = &[
-    "create_agent_workspace-mcp",
-    "delegate_task_workspace-mcp",
-    "send_message_to_agent_workspace-mcp",
-    "send_message_to_task_agent_workspace-mcp",
-    "wake_or_create_task_agent_workspace-mcp",
-    "report_to_parent_workspace-mcp",
+    "create_agent",
+    "delegate_task",
+    "send_message_to_agent",
+    "send_message_to_task_agent",
+    "wake_or_create_task_agent",
+    "report_to_parent",
 ];
 
 /// Note + task + comment + primitive mutation tools.
 pub const NOTE_WRITE_TOOLS: &[&str] = &[
-    "create_note_workspace-mcp",
-    "set_note_content_workspace-mcp",
-    "add_to_note_workspace-mcp",
-    "edit_note_workspace-mcp",
-    "edit_note_lines_workspace-mcp",
-    "update_note_metadata_workspace-mcp",
-    "delete_note_workspace-mcp",
-    "update_task_status_workspace-mcp",
-    "update_note_task_status_workspace-mcp",
-    "update_task_workspace-mcp",
-    "mark_as_task_workspace-mcp",
-    "convert_task_blocks_workspace-mcp",
-    "create_prerequisite_workspace-mcp",
-    "assign_agent_workspace-mcp",
-    "add_note_comment_workspace-mcp",
-    "respond_to_comment_thread_workspace-mcp",
-    "add_reference_primitive_workspace-mcp",
-    "add_cli_primitive_workspace-mcp",
-    "add_patch_primitive_workspace-mcp",
-    "add_agent_action_primitive_workspace-mcp",
+    "create_note",
+    "set_note_content",
+    "add_to_note",
+    "edit_note",
+    "edit_note_lines",
+    "update_note_metadata",
+    "delete_note",
+    "update_task_status",
+    "update_note_task_status",
+    "update_task",
+    "mark_as_task",
+    "convert_task_blocks",
+    "create_prerequisite",
+    "assign_agent",
+    "add_note_comment",
+    "respond_to_comment_thread",
+    "add_reference_primitive",
+    "add_cli_primitive",
+    "add_patch_primitive",
+    "add_agent_action_primitive",
 ];
 
 /// Workspace modification tools.
 pub const WORKSPACE_WRITE_TOOLS: &[&str] = &[
-    "rename_space_workspace-mcp",
-    "rename_agent_workspace-mcp",
-    "set_workspace_title_workspace-mcp",
-    "set_workspace_status_message_workspace-mcp",
+    "rename_space",
+    "rename_agent",
+    "set_workspace_title",
+    "set_workspace_status_message",
 ];
 
 /// Unified workspace JS API tool (bare + server-suffixed). It can perform any

@@ -4,12 +4,14 @@
 //! min/max validation, and the redaction rule for **sensitive** settings.
 //! Non-secret values persist in the `settings` table (`intent-store`); sensitive
 //! values (`mcp.servers`, `server.auth.token`, `sourceControl.github.token`,
-//! `linear.token`, `accounts.sentry.token`, `ai.apiToken`) live in the OS
-//! keychain via the [`SecretStore`] seam and are **never** returned in
-//! plaintext over the wire — list/get redact them to presence/placeholder
-//! only, and `server.auth.token` is read-only. `workspace.sshKeyPath` is a
-//! plain non-secret **path** setting (the real secret is the key file on
-//! disk); the FE `git`-env consumer must read the value back verbatim.
+//! `linear.token`, `accounts.sentry.token`, `ai.apiToken`) live in the
+//! file-backed secrets store (`~/intent/secrets.json`, via
+//! [`intent_core::FileSecretStore`]) behind the [`SecretStore`] seam and are
+//! **never** returned in plaintext over the wire — list/get redact them to
+//! presence/placeholder only, and `server.auth.token` is read-only.
+//! `workspace.sshKeyPath` is a plain non-secret **path** setting (the real
+//! secret is the key file on disk); the FE `git`-env consumer must read the
+//! value back verbatim.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -22,18 +24,14 @@ use tokio::time::timeout;
 
 use intent_store::Store;
 
-/// Keychain service name used for `intentd` secrets (matches `intent-transport`
-/// auth + `intent-sourcecontrol`), so a setting like `server.auth.token` shares
-/// the same keychain entry the transport layer reads.
-const KEYRING_SERVICE: &str = "intentd";
-
 /// Placeholder returned for a sensitive setting that **has** a stored value, so
 /// the wire conveys presence without ever leaking the plaintext (§9.8).
 pub(crate) const REDACTED_PLACEHOLDER: &str = "********";
 
 /// Abstraction over secret persistence (the sensitive-setting analog of the
-/// transport's `TokenStore`). Production uses [`KeyringSecretStore`]; tests
-/// inject [`InMemorySecretStore`] so they never touch the real user keychain.
+/// transport's `TokenStore`). Production uses the file-backed
+/// [`intent_core::FileSecretStore`]; tests inject [`InMemorySecretStore`] so
+/// they never touch the real secrets file.
 pub trait SecretStore: Send + Sync {
     /// Return the stored secret for `account`, or `None` if unset/unavailable.
     fn load(&self, account: &str) -> Option<String>;
@@ -43,33 +41,20 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, account: &str) -> Result<()>;
 }
 
-/// OS-keychain-backed [`SecretStore`] (the production default).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct KeyringSecretStore;
-
-impl SecretStore for KeyringSecretStore {
+/// File-backed production default: delegate to the shared
+/// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`), whose accounts
+/// are the sensitive setting paths (account = setting path).
+impl SecretStore for intent_core::FileSecretStore {
     fn load(&self, account: &str) -> Option<String> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, account).ok()?;
-        entry.get_password().ok().filter(|v| !v.is_empty())
+        intent_core::FileSecretStore::load(self, account)
     }
 
     fn store(&self, account: &str, value: &str) -> Result<()> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, account)
-            .map_err(|e| Error::Internal(format!("keychain unavailable: {e}")))?;
-        entry
-            .set_password(value)
-            .map_err(|e| Error::Internal(format!("failed to persist secret: {e}")))
+        intent_core::FileSecretStore::store(self, account, value)
     }
 
     fn delete(&self, account: &str) -> Result<()> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, account)
-            .map_err(|e| Error::Internal(format!("keychain unavailable: {e}")))?;
-        match entry.delete_credential() {
-            Ok(()) => Ok(()),
-            // Deleting an absent secret is an idempotent no-op success.
-            Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(Error::Internal(format!("failed to delete secret: {e}"))),
-        }
+        intent_core::FileSecretStore::delete(self, account)
     }
 }
 
@@ -104,29 +89,29 @@ impl SecretStore for InMemorySecretStore {
 }
 
 /// Default bounded wait for a secret **read** before the caller gives up and the
-/// setting is reported as unset. A stuck OS keychain (e.g. a pending macOS auth
-/// prompt) would otherwise block the caller — and, historically, an entire
-/// tokio worker — indefinitely.
+/// setting is reported as unset. A stuck backing store (historically, a
+/// pending macOS keychain auth prompt) would otherwise block the caller — and
+/// an entire tokio worker — indefinitely.
 const DEFAULT_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
-/// Default bounded wait for a secret **write** (`store` / `delete`). Longer than
-/// the read budget because a first-time write can prompt the user for keychain
-/// approval; still must not block the runtime forever.
+/// Default bounded wait for a secret **write** (`store` / `delete`). Longer
+/// than the read budget so a slow disk never spuriously fails a persist; still
+/// must not block the runtime forever.
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a load result (present or absent) is served from the in-process
-/// cache before the next call re-consults the backing keychain. Keeps
+/// cache before the next call re-consults the backing store. Keeps
 /// `settings.list` cheap on the FE mount path without turning secret changes
 /// into a long propagation window.
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
-/// Rate-limit window per account for the `keychain load timed out` warning so
-/// a wedged Keychain doesn't drown the daemon log.
+/// Rate-limit window per account for the `secret-store load timed out` warning
+/// so a wedged backing store doesn't drown the daemon log.
 const DEFAULT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Async, single-flight, TTL-cached wrapper around a synchronous [`SecretStore`]
-/// so blocking OS keychain calls (macOS Security framework, etc.) never wedge
+/// so blocking secret-store calls (file I/O) never wedge
 /// the tokio runtime. Every backing call runs on the blocking pool via
 /// [`tokio::task::spawn_blocking`]; reads are bounded by a short timeout and
-/// coalesced per account via single-flight so a hung keychain occupies at most
-/// one blocking-pool thread total (not one per request). Cache entries are
+/// coalesced per account via single-flight so a hung backing store occupies at
+/// most one blocking-pool thread total (not one per request). Cache entries are
 /// invalidated on successful writes and expire on TTL.
 pub(crate) struct AsyncSecretStore {
     inner: Arc<dyn SecretStore>,
@@ -208,7 +193,7 @@ impl AsyncSecretStore {
     /// Read the secret for `account`, returning `None` on absent / timeout /
     /// backing-error. Concurrent callers for the same `account` are coalesced
     /// into a single spawn_blocking; a cached result is served without touching
-    /// the keychain until it expires.
+    /// the backing store until it expires.
     pub(crate) async fn load(&self, account: &str) -> Option<String> {
         let action = {
             let mut state = self.state.lock().unwrap();
@@ -256,7 +241,7 @@ impl AsyncSecretStore {
     /// Persist `value` for `account`. Runs the blocking write off the async
     /// runtime with a bounded timeout, then refreshes the cache slot so
     /// subsequent `load` calls observe the new value without re-hitting the
-    /// keychain. Timeouts / backing errors surface as [`Error::Internal`].
+    /// backing store. Timeouts / backing errors surface as [`Error::Internal`].
     pub(crate) async fn store(&self, account: &str, value: &str) -> Result<()> {
         let inner = self.inner.clone();
         let account_owned = account.to_string();
@@ -269,12 +254,12 @@ impl AsyncSecretStore {
             }
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(join_err)) => Err(Error::Internal(format!(
-                "keychain write task panicked: {join_err}"
+                "secret-store write task panicked: {join_err}"
             ))),
             Err(_) => {
-                self.warn_timeout(account, "keychain write timed out");
+                self.warn_timeout(account, "secret-store write timed out");
                 Err(Error::Internal(format!(
-                    "keychain write timed out for {account}"
+                    "secret-store write timed out for {account}"
                 )))
             }
         }
@@ -294,12 +279,12 @@ impl AsyncSecretStore {
             }
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(join_err)) => Err(Error::Internal(format!(
-                "keychain delete task panicked: {join_err}"
+                "secret-store delete task panicked: {join_err}"
             ))),
             Err(_) => {
-                self.warn_timeout(account, "keychain delete timed out");
+                self.warn_timeout(account, "secret-store delete timed out");
                 Err(Error::Internal(format!(
-                    "keychain delete timed out for {account}"
+                    "secret-store delete timed out for {account}"
                 )))
             }
         }
@@ -357,14 +342,14 @@ impl AsyncSecretStore {
             return v;
         }
         if remaining.is_zero() {
-            self.warn_timeout(account, "keychain load timed out");
+            self.warn_timeout(account, "secret-store load timed out");
             return None;
         }
         let start = Instant::now();
         loop {
             let left = remaining.saturating_sub(start.elapsed());
             if left.is_zero() {
-                self.warn_timeout(account, "keychain load timed out");
+                self.warn_timeout(account, "secret-store load timed out");
                 return None;
             }
             match timeout(left, rx.changed()).await {
@@ -375,7 +360,7 @@ impl AsyncSecretStore {
                 }
                 Ok(Err(_)) => return None,
                 Err(_) => {
-                    self.warn_timeout(account, "keychain load timed out");
+                    self.warn_timeout(account, "secret-store load timed out");
                     return None;
                 }
             }
@@ -384,7 +369,7 @@ impl AsyncSecretStore {
 
     /// Replace the cache slot for `account` with a fresh Cached entry (used by
     /// writes to reflect the just-persisted state, so a follow-up load doesn't
-    /// have to hit the keychain again).
+    /// have to hit the backing store again).
     fn set_cached(&self, account: &str, value: Option<String>) {
         let mut guard = self.state.lock().unwrap();
         guard.entries.insert(
@@ -396,8 +381,8 @@ impl AsyncSecretStore {
         );
     }
 
-    /// Emit a rate-limited WARN naming `account` when a keychain call times
-    /// out, so a wedged Keychain surfaces in the daemon log without spamming.
+    /// Emit a rate-limited WARN naming `account` when a secret-store call times
+    /// out, so a wedged backing store surfaces in the daemon log without spamming.
     fn warn_timeout(&self, account: &str, msg: &str) {
         let should = {
             let mut guard = self.state.lock().unwrap();
@@ -823,7 +808,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         secret(
             "mcp.servers",
             "MCP servers",
-            "External MCP server configs (secrets in keychain)",
+            "External MCP server configs (secrets in the secrets file)",
             "mcp",
         ),
         // --- Group A: user notifications --------------------------------------
@@ -1193,7 +1178,7 @@ impl<'a> SettingsService<'a> {
     ///
     /// Sensitive-setting presence probes go through [`AsyncSecretStore`], whose
     /// per-account bounded timeout, single-flight, and TTL cache mean each
-    /// probe returns within one keychain budget. The probes are polled via
+    /// probe returns within one secret-store budget. The probes are polled via
     /// `tokio::select!` on all `load` futures concurrently through a `join!`
     /// analog so a stalled account never blocks the others.
     pub(crate) async fn list(&self) -> Result<Value> {
@@ -1351,16 +1336,19 @@ mod tests {
     use super::*;
 
     /// `linear.token` must be a sensitive catalog entry so `settings.update`
-    /// persists it to the keychain under service `intentd` / account
-    /// `linear.token` (account = setting path) — the exact entry
-    /// `intent-linear`'s token resolver reads.
+    /// persists it to the shared secrets store under account `linear.token`
+    /// (account = setting path) — the exact entry `intent-linear`'s token
+    /// resolver reads.
     #[test]
     fn linear_token_is_a_sensitive_catalog_entry() {
         let def = find_definition("linear.token").expect("linear.token missing from catalog");
-        assert_eq!(def.path, "linear.token", "keychain account = setting path");
+        assert_eq!(
+            def.path, "linear.token",
+            "secrets-store account = setting path"
+        );
         assert!(
             def.sensitive,
-            "must persist to keychain + redact on the wire"
+            "must persist to the secret store + redact on the wire"
         );
         assert!(!def.read_only);
         assert_eq!(def.category, "linear");
@@ -1370,9 +1358,9 @@ mod tests {
 
     /// `accounts.sentry.token` and `ai.apiToken` — the two secret catalog gaps
     /// closed for R0-4 — must be sensitive so `settings.update` persists them to
-    /// the keychain under service `intentd` / account = setting path (never the
-    /// DB) and every wire read (`settings.list` / `settings.get`) redacts them
-    /// to a placeholder or `null` when unset.
+    /// the shared secrets store under account = setting path (never the DB) and
+    /// every wire read (`settings.list` / `settings.get`) redacts them to a
+    /// placeholder or `null` when unset.
     #[test]
     fn new_secret_catalog_entries_are_sensitive() {
         for path in ["accounts.sentry.token", "ai.apiToken"] {

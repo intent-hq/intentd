@@ -337,7 +337,7 @@ async fn mock_agent_full_turn_over_wss() {
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     let behavior = json!({
         "toolCall": {
-            "name": "add_to_note_workspace-mcp",
+            "name": "add_to_note",
             "arguments": { "noteId": note_id, "content": MARKER },
         },
         "response": "added via mcp over wss",
@@ -1569,7 +1569,7 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
 /// `waitingForAgentIds: [childId]` alongside `isWaitingForOtherAgents: true`
 /// over the WSS wire (PROTOCOL §5.5/§7.1) — proving the id list reflects the
 /// genuine parent→child watch registered by the MCP `delegate_task` tool.
-/// Drives the full MCP loop (mock ACP fires `delegate_task_workspace-mcp`)
+/// Drives the full MCP loop (mock ACP fires `delegate_task`)
 /// and parks the child so the watch persists for observation.
 #[tokio::test]
 async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
@@ -1586,7 +1586,7 @@ async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
     const CHILD_MARK: &str = "AUDIT_P2_1B_PARK_CHILD";
     let behavior = json!({
         "toolCall": {
-            "name": "delegate_task_workspace-mcp",
+            "name": "delegate_task",
             "arguments": {
                 "agentInstructions": CHILD_MARK,
                 "model": "mock:default",
@@ -2354,7 +2354,7 @@ async fn subscription_filter_branches_over_wss() {
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     let behavior = json!({
         "toolCall": {
-            "name": "add_to_note_workspace-mcp",
+            "name": "add_to_note",
             "arguments": { "noteId": note_id, "content": "filter-branch-marker" },
         },
         "response": "filter-branch-response",

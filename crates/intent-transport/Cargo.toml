@@ -30,7 +30,6 @@ getrandom = "0.2"
 subtle = "2"
 hex = "0.4"
 whoami = "1"
-keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
 mdns-sd = "0.11"
 base64.workspace = true
 

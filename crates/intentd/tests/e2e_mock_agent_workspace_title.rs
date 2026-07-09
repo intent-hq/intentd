@@ -3,7 +3,7 @@
 //!
 //! We seed a workspace whose `title == id` (the daemon's "still a slug" marker),
 //! spawn the deterministic mock ACP agent with a behavior that drives an MCP
-//! `set_workspace_title_workspace-mcp` `tools/call`, and after the turn ends we
+//! `set_workspace_title` `tools/call`, and after the turn ends we
 //! assert:
 //!   1. the workspace row was updated to the human title (persisted via
 //!      `update_workspace` → `store.update_workspace`), and
@@ -118,7 +118,7 @@ async fn mock_agent_renames_workspace_via_mcp_set_title_tool() {
         .expect("create agent");
     let agent_id = AgentId::from(agent_val["agent"]["id"].as_str().unwrap());
 
-    // Mock provider that drives the `set_workspace_title_workspace-mcp` call
+    // Mock provider that drives the `set_workspace_title` call
     // via the daemon's mcp-bridge proxy.
     let script_static: &'static str = Box::leak(script.into_boxed_str());
     let base_args: &'static [&'static str] = Box::leak(vec![script_static].into_boxed_slice());
@@ -132,7 +132,7 @@ async fn mock_agent_renames_workspace_via_mcp_set_title_tool() {
     };
     let behavior = serde_json::json!({
         "toolCall": {
-            "name": "set_workspace_title_workspace-mcp",
+            "name": "set_workspace_title",
             "arguments": { "title": "Add dark mode support" }
         },
         "response": "renamed the workspace",

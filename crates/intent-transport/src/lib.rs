@@ -10,7 +10,7 @@ pub use intent_services::Services;
 
 pub use auth::{
     extract_bearer_token, extract_token, generate_token, get_or_create_token, is_allowed_origin,
-    is_auth_enabled, is_discovery_enabled, validate_token, AsyncTokenStore, KeyringTokenStore,
+    is_auth_enabled, is_discovery_enabled, validate_token, AsyncTokenStore, FileTokenStore,
     TokenStore,
 };
 pub use control::{SystemControl, SystemStatus};

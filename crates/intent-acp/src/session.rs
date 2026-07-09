@@ -127,8 +127,11 @@ pub enum MappedUpdate {
 pub struct MappedToolCall {
     /// The agent-assigned tool call id.
     pub tool_call_id: String,
-    /// Human-readable tool name/title (`data.toolName`).
+    /// The real tool name (`data.toolName`), derived from the ACP title via
+    /// [`derive_tool_name`].
     pub tool_name: String,
+    /// The raw human-readable ACP title (`data.title`), verbatim.
+    pub title: String,
     /// `data.toolKind`: one of file|terminal|search|note|git|other.
     pub tool_kind: &'static str,
     /// Raw tool input (`data.input`); `Null` when absent.
@@ -180,13 +183,16 @@ fn map_content(block: &ContentBlock) -> (Value, Option<String>) {
 
 /// Map a fresh `tool_call` (status defaults to "started").
 fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
+    let title = tool_call.title.clone();
+    let tool_name = derive_tool_name(&title);
     MappedToolCall {
         tool_call_id: tool_call.tool_call_id.0.to_string(),
-        tool_name: tool_call.title.clone(),
-        tool_kind: tool_kind_word(tool_call.kind, &tool_call.title),
+        tool_kind: tool_kind_word(tool_call.kind, &tool_name),
         input: tool_call.raw_input.clone().unwrap_or(Value::Null),
         output: tool_call.raw_output.clone(),
         status: tool_status_word(tool_call.status),
+        tool_name,
+        title,
     }
 }
 
@@ -194,15 +200,66 @@ fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
 fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
     let fields = &update.fields;
     let title = fields.title.clone().unwrap_or_default();
+    let tool_name = derive_tool_name(&title);
     MappedToolCall {
-        tool_kind: tool_kind_word(fields.kind.unwrap_or_default(), &title),
+        tool_kind: tool_kind_word(fields.kind.unwrap_or_default(), &tool_name),
         // A bare progress update (no status) is still mid-flight → "started".
         status: fields.status.map_or("started", tool_status_word),
         tool_call_id: update.tool_call_id.0.to_string(),
-        tool_name: title,
         input: fields.raw_input.clone().unwrap_or(Value::Null),
         output: fields.raw_output.clone(),
+        tool_name,
+        title,
     }
+}
+
+/// Derive the "real" tool name from a human-readable ACP `title` (§6.6).
+///
+/// ACP providers (auggie, codex, …) deliver a prose `title` (e.g.
+/// `"sub-agent-explore: Explore the AI agent system…"`) rather than the raw
+/// tool name the model invoked. Rules:
+///  - A title of the form `<name>: <description>` (`<name>` a bare identifier
+///    of `[A-Za-z0-9_-]+`, followed by `": "` or `":\t"`) is split; the prefix
+///    becomes the name.
+///  - Trailing `_workspace-mcp` server suffixes (one or more) are stripped —
+///    auggie names an MCP tool `<tool>_<server>`, so our registry tool
+///    `add_to_note` surfaces as `add_to_note_workspace-mcp`; stripping
+///    recovers the registry name (§18.4).
+///  - Otherwise the title passes through as-is.
+pub fn derive_tool_name(title: &str) -> String {
+    let base = split_name_prefix(title).unwrap_or(title);
+    strip_workspace_mcp_suffix(base)
+}
+
+fn split_name_prefix(title: &str) -> Option<&str> {
+    let colon = title.find(':')?;
+    let name = &title[..colon];
+    if name.is_empty() {
+        return None;
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    let after = title[colon + 1..].chars().next()?;
+    if after != ' ' && after != '\t' {
+        return None;
+    }
+    Some(name)
+}
+
+fn strip_workspace_mcp_suffix(name: &str) -> String {
+    const SUFFIX: &str = "_workspace-mcp";
+    let mut cur = name;
+    while let Some(stripped) = cur.strip_suffix(SUFFIX) {
+        if stripped.is_empty() {
+            break;
+        }
+        cur = stripped;
+    }
+    cur.to_string()
 }
 
 /// Map ACP's `ToolKind` (+ tool name) to the intentd taxonomy

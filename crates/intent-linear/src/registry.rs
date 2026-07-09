@@ -1,7 +1,7 @@
 //! Engine selection from settings.
 //!
 //! [`LinearRegistry::from_settings`] resolves the Linear API key (inline,
-//! keychain, or `LINEAR_API_KEY`) and builds a [`LinearEngine`]. A missing key
+//! secrets store, or `LINEAR_API_KEY`) and builds a [`LinearEngine`]. A missing key
 //! yields a typed [`Error::NotConfigured`] so the daemon stays up (graceful,
 //! mirroring `intent-sourcecontrol`).
 
@@ -18,8 +18,8 @@ use crate::token::{self, TokenSource};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LinearSettings {
-    /// Inline API key (already resolved, e.g. read from the keychain by the
-    /// caller). When present and non-empty it takes precedence over
+    /// Inline API key (already resolved, e.g. read from the secrets store by
+    /// the caller). When present and non-empty it takes precedence over
     /// [`Self::token_source`]. SECRET — never logged.
     #[serde(default)]
     pub token: Option<String>,
@@ -36,7 +36,7 @@ pub struct LinearRegistry;
 
 impl LinearRegistry {
     /// Construct the engine, or a typed [`Error::NotConfigured`] when no key is
-    /// available. Async because the keychain lookup runs on the blocking pool
+    /// available. Async because the secrets-store lookup runs on the blocking pool
     /// with a bounded timeout (see [`token::resolve`]).
     pub async fn from_settings(settings: &LinearSettings) -> Result<Arc<dyn LinearEngine>> {
         let key = resolve_token(settings).await?;
