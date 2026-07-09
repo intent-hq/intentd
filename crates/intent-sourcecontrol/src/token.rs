@@ -2,8 +2,9 @@
 //!
 //! Tokens are resolved per `sourceControl.github.tokenSource`:
 //!
-//! 1. `explicit` — stored in the OS keychain via the `keyring` crate (never in
-//!    plaintext config or logs).
+//! 1. `explicit` — stored in the file-backed secrets store
+//!    ([`intent_core::FileSecretStore`], `~/intent/secrets.json`) under
+//!    account `sourceControl.github.token` (never in plaintext config or logs).
 //! 2. `env` — `GITHUB_TOKEN` / `GH_TOKEN`.
 //! 3. `gh-cli` — `gh auth token` (shell out to the GitHub CLI).
 //!
@@ -16,15 +17,13 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
-/// Keychain service name used for `intentd` secrets.
-const KEYRING_SERVICE: &str = "intentd";
-/// Keychain account/key for the GitHub token (`sourceControl.github.token`).
-const KEYRING_ACCOUNT: &str = "sourceControl.github.token";
-/// Bounded wait for a keychain read before treating the entry as absent. A
-/// stuck OS keychain (e.g. a pending macOS auth prompt) would otherwise block
-/// the caller — and, historically, an entire tokio worker — indefinitely.
-/// Mirrors the read budget used by `intent-services::AsyncSecretStore`.
-const KEYCHAIN_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
+/// Secrets-store account/key for the GitHub token (`sourceControl.github.token`).
+const SECRET_ACCOUNT: &str = "sourceControl.github.token";
+/// Bounded wait for a secrets-store read before treating the entry as absent.
+/// A stalled backing store (e.g. a wedged filesystem) would otherwise block
+/// the caller indefinitely. Mirrors the read budget used by
+/// `intent-services::AsyncSecretStore`.
+const SECRET_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
 /// Bounded wait for the `gh auth token` subprocess. Shelling out to `gh` can
 /// stall on flaky network / OS state, so cap it so the async runtime is never
 /// blocked waiting on the child.
@@ -34,10 +33,10 @@ const GH_CLI_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TokenSource {
-    /// Try keychain, then env, then `gh` CLI (the default).
+    /// Try the secrets store, then env, then `gh` CLI (the default).
     #[default]
     Auto,
-    /// Read from the OS keychain only.
+    /// Read from the file-backed secrets store only.
     Explicit,
     /// Read from `GITHUB_TOKEN` / `GH_TOKEN` only.
     Env,
@@ -46,16 +45,16 @@ pub enum TokenSource {
 }
 
 /// Resolve a token for the given strategy, or `None` if none is available.
-/// Keychain and `gh` subprocess reads run on the blocking pool with bounded
-/// timeouts so a wedged OS keychain or hung child never blocks the async
-/// runtime.
+/// Secrets-store and `gh` subprocess reads run on the blocking pool with
+/// bounded timeouts so a stalled backing store or hung child never blocks the
+/// async runtime.
 pub async fn resolve(source: &TokenSource) -> Option<String> {
     match source {
-        TokenSource::Explicit => keyring_token().await,
+        TokenSource::Explicit => file_store_token().await,
         TokenSource::Env => env_token(),
         TokenSource::GhCli => gh_cli_token().await,
         TokenSource::Auto => {
-            if let Some(v) = keyring_token().await {
+            if let Some(v) = file_store_token().await {
                 return Some(v);
             }
             if let Some(v) = env_token() {
@@ -66,22 +65,20 @@ pub async fn resolve(source: &TokenSource) -> Option<String> {
     }
 }
 
-/// Read the token from the OS keychain. Any keychain error (missing entry,
-/// unavailable backend) resolves to `None` so resolution can fall through.
-/// Runs on the blocking pool with a bounded timeout so a hung keychain
-/// (e.g. a pending macOS auth prompt) cannot wedge a tokio worker.
-async fn keyring_token() -> Option<String> {
-    let handle = tokio::task::spawn_blocking(|| {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).ok()?;
-        entry.get_password().ok()
-    });
-    match timeout(KEYCHAIN_LOAD_TIMEOUT, handle).await {
+/// Read the token from the file-backed secrets store
+/// ([`intent_core::FileSecretStore`]). A missing or unreadable entry resolves
+/// to `None` so resolution can fall through. Runs on the blocking pool with a
+/// bounded timeout so a stalled backing store cannot wedge a tokio worker.
+async fn file_store_token() -> Option<String> {
+    let handle =
+        tokio::task::spawn_blocking(|| intent_core::FileSecretStore::new().load(SECRET_ACCOUNT));
+    match timeout(SECRET_LOAD_TIMEOUT, handle).await {
         Ok(Ok(Some(v))) => non_empty(v),
         Ok(Ok(None)) | Ok(Err(_)) => None,
         Err(_) => {
             tracing::warn!(
-                account = %KEYRING_ACCOUNT,
-                "keychain load timed out for github token"
+                account = %SECRET_ACCOUNT,
+                "secrets-store load timed out for github token"
             );
             None
         }

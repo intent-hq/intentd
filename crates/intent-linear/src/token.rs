@@ -2,11 +2,12 @@
 //!
 //! The key is resolved per `linear.tokenSource`:
 //!
-//! 1. `explicit` — stored in the OS keychain via the `keyring` crate (never in
-//!    plaintext config or logs).
+//! 1. `explicit` — stored in the file-backed secrets store
+//!    ([`intent_core::FileSecretStore`], `~/intent/secrets.json`) under
+//!    account `linear.token` (never in plaintext config or logs).
 //! 2. `env` — `LINEAR_API_KEY`.
 //!
-//! `auto` (the default) tries keychain then env and uses the first hit. A
+//! `auto` (the default) tries the secrets store then env and uses the first hit. A
 //! missing key is *not* an error here — [`resolve`] returns `None`, and the
 //! registry turns that into a graceful `NotConfigured`.
 //!
@@ -18,59 +19,55 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
-/// Keychain service name used for `intentd` secrets.
-const KEYRING_SERVICE: &str = "intentd";
-/// Keychain account/key for the Linear API key (`linear.token`).
-const KEYRING_ACCOUNT: &str = "linear.token";
-/// Bounded wait for a keychain read before treating the entry as absent. A
-/// stuck OS keychain (e.g. a pending macOS auth prompt) would otherwise block
-/// the caller — and, historically, an entire tokio worker — indefinitely.
-/// Mirrors the read budget used by `intent-services::AsyncSecretStore`.
-const KEYCHAIN_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
+/// Secrets-store account/key for the Linear API key (`linear.token`).
+const SECRET_ACCOUNT: &str = "linear.token";
+/// Bounded wait for a secrets-store read before treating the entry as absent.
+/// A stalled backing store (e.g. a wedged filesystem) would otherwise block
+/// the caller indefinitely. Mirrors the read budget used by
+/// `intent-services::AsyncSecretStore`.
+const SECRET_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Strategy used to resolve the Linear API key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TokenSource {
-    /// Try keychain, then env (the default).
+    /// Try the secrets store, then env (the default).
     #[default]
     Auto,
-    /// Read from the OS keychain only.
+    /// Read from the file-backed secrets store only.
     Explicit,
     /// Read from `LINEAR_API_KEY` only.
     Env,
 }
 
 /// Resolve a key for the given strategy, or `None` if none is available.
-/// Keychain reads run on the blocking pool with a bounded timeout so a wedged
-/// OS keychain never blocks the async runtime.
+/// Secrets-store reads run on the blocking pool with a bounded timeout so a
+/// stalled backing store never blocks the async runtime.
 pub async fn resolve(source: &TokenSource) -> Option<String> {
     match source {
-        TokenSource::Explicit => keyring_token().await,
+        TokenSource::Explicit => file_store_token().await,
         TokenSource::Env => env_token(),
-        TokenSource::Auto => match keyring_token().await {
+        TokenSource::Auto => match file_store_token().await {
             Some(v) => Some(v),
             None => env_token(),
         },
     }
 }
 
-/// Read the key from the OS keychain. Any keychain error (missing entry,
-/// unavailable backend) resolves to `None` so resolution can fall through.
-/// Runs on the blocking pool with a bounded timeout so a hung keychain
-/// (e.g. a pending macOS auth prompt) cannot wedge a tokio worker.
-async fn keyring_token() -> Option<String> {
-    let handle = tokio::task::spawn_blocking(|| {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).ok()?;
-        entry.get_password().ok()
-    });
-    match timeout(KEYCHAIN_LOAD_TIMEOUT, handle).await {
+/// Read the key from the file-backed secrets store
+/// ([`intent_core::FileSecretStore`]). A missing or unreadable entry resolves
+/// to `None` so resolution can fall through. Runs on the blocking pool with a
+/// bounded timeout so a stalled backing store cannot wedge a tokio worker.
+async fn file_store_token() -> Option<String> {
+    let handle =
+        tokio::task::spawn_blocking(|| intent_core::FileSecretStore::new().load(SECRET_ACCOUNT));
+    match timeout(SECRET_LOAD_TIMEOUT, handle).await {
         Ok(Ok(Some(v))) => non_empty(v),
         Ok(Ok(None)) | Ok(Err(_)) => None,
         Err(_) => {
             tracing::warn!(
-                account = %KEYRING_ACCOUNT,
-                "keychain load timed out for linear token"
+                account = %SECRET_ACCOUNT,
+                "secrets-store load timed out for linear token"
             );
             None
         }

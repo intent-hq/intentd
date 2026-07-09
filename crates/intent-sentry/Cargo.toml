@@ -7,6 +7,7 @@ repository.workspace = true
 description = "SentryEngine + DTOs for the sentry.* surface (REST over reqwest)"
 
 [dependencies]
+intent-core = { path = "../intent-core" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -14,11 +15,6 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = "0.1"
-keyring = { version = "3", default-features = false, features = [
-    "apple-native",
-    "windows-native",
-    "linux-native",
-] }
 
 [dev-dependencies]
 tokio = { workspace = true }

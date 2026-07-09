@@ -19,8 +19,8 @@ use crate::SourceControl;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GithubSettings {
-    /// Inline token (already resolved, e.g. read from the keychain by the
-    /// caller). When present and non-empty it takes precedence over
+    /// Inline token (already resolved, e.g. read from the secrets store by
+    /// the caller). When present and non-empty it takes precedence over
     /// [`Self::token_source`].
     #[serde(default)]
     pub token: Option<String>,
@@ -58,7 +58,7 @@ pub struct SourceControlRegistry;
 impl SourceControlRegistry {
     /// Construct the active provider, or a typed error when the provider is
     /// unknown ([`Error::Config`]) or no token is available
-    /// ([`Error::NotConfigured`]). Async because the keychain / `gh` lookups
+    /// ([`Error::NotConfigured`]). Async because the secrets-store / `gh` lookups
     /// run on the blocking pool with bounded timeouts (see [`token::resolve`]).
     pub async fn from_settings(settings: &SourceControlSettings) -> Result<Arc<dyn SourceControl>> {
         match settings.active_provider.as_str() {
@@ -124,7 +124,7 @@ mod tests {
 
     #[tokio::test]
     async fn blank_inline_token_falls_through_to_not_configured() {
-        // Use the `Env` source so the test does not touch the OS keychain or
+        // Use the `Env` source so the test does not touch the secrets store or
         // shell out to `gh`; a blank inline token must still yield the same
         // `NotConfigured` outcome the wire relies on.
         let token = resolve_github_token(&GithubSettings {

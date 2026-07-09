@@ -1,7 +1,7 @@
 //! Engine selection from settings.
 //!
 //! [`SentryRegistry::from_settings`] resolves the Sentry credential pair
-//! (inline org/token, keychain, or env) and builds a [`SentryEngine`]. A
+//! (inline org/token, secrets store, or env) and builds a [`SentryEngine`]. A
 //! missing pair yields a typed [`Error::NotConfigured`] so the daemon stays
 //! up (graceful, mirroring `intent-linear`).
 
@@ -22,8 +22,8 @@ pub struct SentrySettings {
     /// with [`Self::token`] it takes precedence over [`Self::token_source`].
     #[serde(default)]
     pub organization: Option<String>,
-    /// Inline API token (already resolved, e.g. read from the keychain by
-    /// the caller). SECRET — never logged.
+    /// Inline API token (already resolved, e.g. read from the secrets store
+    /// by the caller). SECRET — never logged.
     #[serde(default)]
     pub token: Option<String>,
     /// How to resolve the credential pair when inline values are absent.
@@ -39,8 +39,8 @@ pub struct SentryRegistry;
 
 impl SentryRegistry {
     /// Construct the engine, or a typed [`Error::NotConfigured`] when no
-    /// credential pair is available. Async because the keychain lookup runs
-    /// on the blocking pool with a bounded timeout (see [`token::resolve`]).
+    /// credential pair is available. Async because the secrets-store lookup
+    /// runs on the blocking pool with a bounded timeout (see [`token::resolve`]).
     pub async fn from_settings(settings: &SentrySettings) -> Result<Arc<dyn SentryEngine>> {
         let creds = resolve_credentials(settings).await?;
         let client = SentryClient::new(
@@ -96,7 +96,7 @@ mod tests {
 
     #[tokio::test]
     async fn inline_half_only_falls_through_to_not_configured() {
-        // Use the `Env` source so the tests do not touch the OS keychain; a
+        // Use the `Env` source so the tests do not touch the secrets store; a
         // partial inline pair must still yield the same `NotConfigured`
         // outcome the wire relies on.
         let result = resolve_credentials(&SentrySettings {
