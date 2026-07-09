@@ -766,7 +766,7 @@ async fn start_session_resumes_when_load_supported() {
     seed_agent(&mgr, &ws, &id).await;
     mgr.services
         .store
-        .set_acp_session_id(&id, "existing-id")
+        .set_acp_session_id(&ws, &id, "existing-id")
         .await
         .unwrap();
     let _agent = track_mock_agent(&mgr, &id, true);
@@ -788,7 +788,7 @@ async fn start_session_recreates_and_flags_when_load_unsupported() {
     seed_agent(&mgr, &ws, &id).await;
     mgr.services
         .store
-        .set_acp_session_id(&id, "stale-id")
+        .set_acp_session_id(&ws, &id, "stale-id")
         .await
         .unwrap();
     let _agent = track_mock_agent(&mgr, &id, false);
@@ -1231,7 +1231,7 @@ async fn interrupt_emits_terminal_stream_end_but_no_idle() {
     // `interrupt` falls back to the hard `stop` kill path).
     mgr.services
         .store
-        .set_acp_session_id(&id, "acp-int")
+        .set_acp_session_id(&ws, &id, "acp-int")
         .await
         .unwrap();
     // Claim the in-flight slot so the interrupt exercises the busy turn path.

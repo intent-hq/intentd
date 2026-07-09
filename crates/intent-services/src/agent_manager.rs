@@ -865,7 +865,7 @@ impl AgentManager {
         if !crate::mcp_servers::enable_user_servers(&self.services.store).await {
             return Ok(());
         }
-        let configs = crate::mcp_servers::read_configs(self.services.secret_store());
+        let configs = crate::mcp_servers::read_configs(&self.services.secrets).await;
         if configs.is_empty() {
             return Ok(());
         }
@@ -1517,7 +1517,7 @@ impl AgentManager {
         if let Err(e) = self
             .services
             .store
-            .set_agent_session_status(agent_id, status, is_active, &ts)
+            .set_agent_session_status(workspace_id, agent_id, status, is_active, &ts)
             .await
         {
             // Sessions are persisted before the runtime path opens (see

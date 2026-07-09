@@ -2144,7 +2144,7 @@ async fn router_read_lifecycle_arms_over_wss() {
         &mut rpc,
         12,
         "script.status",
-        json!({ "scriptId": script_id }),
+        json!({ "workspaceId": ws_id, "scriptId": script_id }),
     )
     .await;
     assert!(status.is_object(), "script.status object: {status}");
@@ -2152,7 +2152,7 @@ async fn router_read_lifecycle_arms_over_wss() {
         &mut rpc,
         13,
         "script.remove",
-        json!({ "scriptId": script_id }),
+        json!({ "workspaceId": ws_id, "scriptId": script_id }),
     )
     .await;
     assert_eq!(removed["ok"], json!(true));

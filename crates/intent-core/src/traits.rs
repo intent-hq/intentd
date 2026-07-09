@@ -1079,8 +1079,14 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `agent.getQueue`: the agent's pending message queue; `{ success, queue:
     /// [{ id, content, queuedAt, position, imageBlocks?, fileBlocks? }] }` (PROTOCOL §5.5).
-    fn agent_get_queue(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = agent_id;
+    /// When `workspace_id` is supplied the callee verifies the session belongs
+    /// to that workspace (defense-in-depth against a bare `agentId` probe).
+    fn agent_get_queue(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, workspace_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_get_queue not implemented".to_string(),
@@ -1280,11 +1286,14 @@ pub trait WorkspaceApi: Send + Sync {
     /// `agent.getSessionStats`: the per-session credit/message/tool rollup as
     /// `{ stats: SessionStats }` (PROTOCOL §5.24). `sessionId` is required; an
     /// unknown session surfaces `NotFound` which the router maps to `-32602`.
+    /// When `workspace_id` is supplied the callee verifies the session belongs
+    /// to that workspace (defense-in-depth against a bare `sessionId` probe).
     fn agent_get_session_stats(
         &self,
         session_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = session_id;
+        let _ = (session_id, workspace_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_get_session_stats not implemented".to_string(),

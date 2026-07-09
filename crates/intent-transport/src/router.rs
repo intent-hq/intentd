@@ -767,7 +767,8 @@ async fn dispatch(
         "agent.getSessionStats" => {
             let session_id =
                 require_str_param(params, "sessionId").map(|s| AgentId::from(s.as_str()))?;
-            match api.agent_get_session_stats(session_id).await {
+            let ws = opt_workspace_id(params);
+            match api.agent_get_session_stats(session_id, ws).await {
                 Ok(v) => Ok(v),
                 Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Session not found")),
                 Err(e) => Err(domain_to_rpc(e)),
@@ -1006,7 +1007,11 @@ async fn dispatch(
         }
         "agent.getQueue" => {
             let agent_id = require_agent_id(params)?;
-            let result = api.agent_get_queue(agent_id).await.map_err(domain_to_rpc)?;
+            let ws = opt_workspace_id(params);
+            let result = api
+                .agent_get_queue(agent_id, ws)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(result)
         }
         "agent.stop" => {

@@ -8,7 +8,7 @@
 
 use intent_core::{
     AgentId, Comment, CommentAnchor, CommentStatus, CommentThread, CommentType, Error, NoteId,
-    Result,
+    Result, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqliteRow;
@@ -46,8 +46,11 @@ impl ExtraFields {
 }
 
 impl Store {
-    /// Insert a comment row.
-    pub async fn insert_comment(&self, c: &Comment) -> Result<()> {
+    /// Insert a comment row, scoping it to `workspace_id` (0022 added the
+    /// per-workspace column plus the composite FK to `note(id, workspace_id)`).
+    /// The wire-facing [`Comment`] itself carries no `workspace_id`, so the
+    /// caller supplies it explicitly.
+    pub async fn insert_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
         let anchor_json = serde_json::to_string(&c.anchor)
             .map_err(|e| Error::Internal(format!("encode anchor failed: {e}")))?;
         let extra = ExtraFields {
@@ -65,8 +68,10 @@ impl Store {
                     .map_err(|e| Error::Internal(format!("encode extra failed: {e}")))?,
             )
         };
-        let sql =
-            format!("INSERT INTO comment ({COMMENT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        let sql = format!(
+            "INSERT INTO comment ({COMMENT_COLUMNS}, workspace_id) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        );
         sqlx::query(&sql)
             .bind(&c.id)
             .bind(&c.thread_id)
@@ -82,6 +87,7 @@ impl Store {
             .bind(extra_json)
             .bind(&c.created_at)
             .bind(&c.updated_at)
+            .bind(&workspace_id.0)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("insert comment failed: {e}")))?;
@@ -102,8 +108,11 @@ impl Store {
         }
     }
 
-    /// Update an existing comment (full row replace), or `NotFound`.
-    pub async fn update_comment(&self, c: &Comment) -> Result<()> {
+    /// Update an existing comment (full row replace). Scoped to `workspace_id`
+    /// (defense-in-depth) so a caller bound to workspace B cannot mutate a
+    /// comment row that belongs to workspace A. `NotFound` if the row is absent
+    /// or the workspace does not match.
+    pub async fn update_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
         let anchor_json = serde_json::to_string(&c.anchor)
             .map_err(|e| Error::Internal(format!("encode anchor failed: {e}")))?;
         let extra = ExtraFields {
@@ -124,7 +133,7 @@ impl Store {
         let res = sqlx::query(
             "UPDATE comment SET thread_id=?, note_id=?, kind=?, content=?, author=?, \
              author_type=?, status=?, parent_id=?, anchor_json=?, anchor_text=?, extra_json=?, \
-             updated_at=? WHERE id=?",
+             updated_at=? WHERE id=? AND workspace_id=?",
         )
         .bind(&c.thread_id)
         .bind(c.note_id.as_ref().map(|n| n.0.clone()))
@@ -139,6 +148,7 @@ impl Store {
         .bind(extra_json)
         .bind(&c.updated_at)
         .bind(&c.id)
+        .bind(&workspace_id.0)
         .execute(self.pool())
         .await
         .map_err(|e| Error::Internal(format!("update comment failed: {e}")))?;
@@ -148,10 +158,12 @@ impl Store {
         Ok(())
     }
 
-    /// Delete a comment by id, or `NotFound`.
-    pub async fn delete_comment(&self, id: &str) -> Result<()> {
-        let res = sqlx::query("DELETE FROM comment WHERE id = ?")
+    /// Delete a comment by id, scoped to `workspace_id` (defense-in-depth).
+    /// `NotFound` if the row is absent or the workspace does not match.
+    pub async fn delete_comment(&self, workspace_id: &WorkspaceId, id: &str) -> Result<()> {
+        let res = sqlx::query("DELETE FROM comment WHERE id = ? AND workspace_id = ?")
             .bind(id)
+            .bind(&workspace_id.0)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("delete comment failed: {e}")))?;
@@ -188,20 +200,27 @@ impl Store {
     }
 
     /// Set the `status` of every comment in a thread, refreshing `updated_at`.
-    /// Returns the number of rows updated (0 when the thread does not exist).
+    /// Scoped to `workspace_id` (defense-in-depth) so a caller bound to
+    /// workspace B cannot resolve a thread owned by workspace A. Returns the
+    /// number of rows updated (0 when the thread does not exist in that
+    /// workspace).
     pub async fn set_thread_status(
         &self,
+        workspace_id: &WorkspaceId,
         thread_id: &str,
         status: CommentStatus,
         updated_at: &str,
     ) -> Result<u64> {
-        let res = sqlx::query("UPDATE comment SET status=?, updated_at=? WHERE thread_id=?")
-            .bind(enum_to_db(&status)?)
-            .bind(updated_at)
-            .bind(thread_id)
-            .execute(self.pool())
-            .await
-            .map_err(|e| Error::Internal(format!("set thread status failed: {e}")))?;
+        let res = sqlx::query(
+            "UPDATE comment SET status=?, updated_at=? WHERE thread_id=? AND workspace_id=?",
+        )
+        .bind(enum_to_db(&status)?)
+        .bind(updated_at)
+        .bind(thread_id)
+        .bind(&workspace_id.0)
+        .execute(self.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set thread status failed: {e}")))?;
         Ok(res.rows_affected())
     }
 

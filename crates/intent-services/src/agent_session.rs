@@ -334,12 +334,17 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<AcpSessionOpened> {
+        // Load the session up front so the store write is scoped to the owning
+        // workspace (the store's `set_acp_session_id` now requires it as a
+        // defense-in-depth guard). This call is only reached after the caller
+        // resolved this agent id inside a workspace-scoped path.
+        let workspace_id = self.store.get_agent_session(agent_id).await?.workspace_id;
         let resp = session::new_session(conn, cwd, mcp_servers)
             .await
             .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
         let acp_session_id = resp.session_id.0.to_string();
         self.store
-            .set_acp_session_id(agent_id, &acp_session_id)
+            .set_acp_session_id(&workspace_id, agent_id, &acp_session_id)
             .await?;
         Ok(AcpSessionOpened {
             session_id: acp_session_id,
@@ -365,13 +370,16 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<AcpSessionOpened> {
+        // Load the session up front so the CAS replace is scoped to the owning
+        // workspace (see [`open_acp_session`]).
+        let workspace_id = self.store.get_agent_session(agent_id).await?.workspace_id;
         let resp = session::new_session(conn, cwd, mcp_servers)
             .await
             .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
         let new_acp_session_id = resp.session_id.0.to_string();
         let canonical = self
             .store
-            .replace_acp_session_id(agent_id, expected_old, &new_acp_session_id)
+            .replace_acp_session_id(&workspace_id, agent_id, expected_old, &new_acp_session_id)
             .await?;
         // On CAS loss the canonical id belongs to a session we did not open;
         // our modes are meaningless for it and would target the wrong sid.

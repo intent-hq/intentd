@@ -76,6 +76,7 @@ mod search_ops;
 mod sentry_ops;
 mod settings;
 mod terminal_ops;
+pub mod tool_block;
 
 #[cfg(test)]
 mod tests;
@@ -607,6 +608,7 @@ impl Services {
             // untouched because those columns are not written here.
             self.store
                 .set_agent_session_status(
+                    &session.workspace_id,
                     &session.id,
                     intent_core::AgentStatus::RuntimeIdle,
                     false,
@@ -5763,7 +5765,7 @@ impl WorkspaceApi for Services {
                 created_at: now.clone(),
                 updated_at: now,
             };
-            store.insert_comment(&new_comment).await?;
+            store.insert_comment(&workspace_id, &new_comment).await?;
             publish_event(
                 &bus,
                 comment_added_event(&workspace_id, &note_id, &comment_id),
@@ -6048,7 +6050,7 @@ impl WorkspaceApi for Services {
                 created_at: now.clone(),
                 updated_at: now,
             };
-            store.insert_comment(&reply).await?;
+            store.insert_comment(&workspace_id, &reply).await?;
             Ok(CommentRespondResult {
                 success: true,
                 message: "Reply added successfully".to_string(),
@@ -6063,13 +6065,13 @@ impl WorkspaceApi for Services {
 
     fn comment_delete(
         &self,
-        _workspace_id: WorkspaceId,
+        workspace_id: WorkspaceId,
         note_id: NoteId,
         comment_id: String,
     ) -> BoxFuture<'_, Result<CommentDeleteResult>> {
         let store = self.store.clone();
         Box::pin(async move {
-            match store.delete_comment(&comment_id).await {
+            match store.delete_comment(&workspace_id, &comment_id).await {
                 Ok(()) => Ok(CommentDeleteResult {
                     success: true,
                     message: format!("Comment {comment_id} deleted from note {note_id}"),
@@ -6120,7 +6122,7 @@ impl WorkspaceApi for Services {
                 CommentStatus::Open
             };
             store
-                .set_thread_status(&target, new_status, &now_iso())
+                .set_thread_status(&workspace_id, &target, new_status, &now_iso())
                 .await?;
             publish_event(
                 &bus,
@@ -6959,20 +6961,20 @@ impl WorkspaceApi for Services {
     fn agent_get(
         &self,
         agent_id: AgentId,
-        _workspace_id: Option<WorkspaceId>,
+        workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<AgentLite>> {
-        Box::pin(async move { self.agent_get_op(agent_id).await })
+        Box::pin(async move { self.agent_get_op(agent_id, workspace_id).await })
     }
 
     fn agent_get_conversation(
         &self,
         agent_id: AgentId,
         limit: Option<i64>,
-        _workspace_id: Option<WorkspaceId>,
+        workspace_id: Option<WorkspaceId>,
         page_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_get_conversation_op(agent_id, limit, page_token)
+            self.agent_get_conversation_op(agent_id, limit, workspace_id, page_token)
                 .await
         })
     }
@@ -7267,8 +7269,12 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn agent_get_queue(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_get_queue_op(agent_id).await })
+    fn agent_get_queue(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_get_queue_op(agent_id, workspace_id).await })
     }
 
     fn agent_stop(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -7389,9 +7395,9 @@ impl WorkspaceApi for Services {
     fn agent_delete(
         &self,
         agent_id: AgentId,
-        _workspace_id: Option<WorkspaceId>,
+        workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_delete_op(agent_id).await })
+        Box::pin(async move { self.agent_delete_op(agent_id, workspace_id).await })
     }
 
     fn agent_wake_or_create(
@@ -7410,8 +7416,12 @@ impl WorkspaceApi for Services {
     fn agent_get_session_stats(
         &self,
         session_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_get_session_stats_op(session_id).await })
+        Box::pin(async move {
+            self.agent_get_session_stats_op(session_id, workspace_id)
+                .await
+        })
     }
 
     fn agent_summary(

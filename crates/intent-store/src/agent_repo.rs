@@ -137,9 +137,20 @@ impl Store {
     }
 
     /// Update mutable session state, enforcing the `acp_session_id` write-once
-    /// and `provider` immutability invariants (§9.5). `NotFound` if absent.
-    pub async fn update_agent_session(&self, s: &AgentSession) -> Result<()> {
+    /// and `provider` immutability invariants (§9.5). Scoped to `workspace_id`
+    /// as a defense-in-depth guard so a caller bound to workspace B cannot
+    /// mutate an `agent_session` row that belongs to workspace A (mirrors the
+    /// post-0022 `note_repo` pattern). `NotFound` if absent or the workspace
+    /// does not match.
+    pub async fn update_agent_session(
+        &self,
+        workspace_id: &WorkspaceId,
+        s: &AgentSession,
+    ) -> Result<()> {
         let current = self.get_agent_session(&s.id).await?;
+        if current.workspace_id != *workspace_id {
+            return Err(Error::NotFound(format!("agent session {}", s.id)));
+        }
         if current.provider.is_some() && s.provider != current.provider {
             return Err(Error::Internal(
                 "agent provider is immutable once set".to_string(),
@@ -148,13 +159,13 @@ impl Store {
         if current.acp_session_id.is_some() && s.acp_session_id != current.acp_session_id {
             return Err(Error::Internal("acpSessionId is write-once".to_string()));
         }
-        sqlx::query(
+        let rows = sqlx::query(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, is_background=?, \
-             metadata=? WHERE id=?",
+             metadata=? WHERE id=? AND workspace_id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.acp_session_id)
@@ -179,9 +190,14 @@ impl Store {
         .bind(s.is_background as i64)
         .bind(encode_metadata(s.metadata.as_ref())?)
         .bind(&s.id.0)
+        .bind(&workspace_id.0)
         .execute(self.pool())
         .await
-        .map_err(|e| Error::Internal(format!("update agent session failed: {e}")))?;
+        .map_err(|e| Error::Internal(format!("update agent session failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {}", s.id)));
+        }
         Ok(())
     }
 
@@ -190,25 +206,30 @@ impl Store {
     /// (the broader [`Store::update_agent_session`] enforces those invariants).
     /// Drives the `pending → active → idle` lifecycle so a hydrated/reloaded
     /// chat reflects the live state (PROTOCOL §6.5 `agent:status-changed`).
-    /// `updated_at` is refreshed to the supplied timestamp. `NotFound` if the
-    /// session is absent.
+    /// Scoped to `workspace_id` (defense-in-depth). `updated_at` is refreshed to
+    /// the supplied timestamp. `NotFound` if the session is absent or the
+    /// workspace does not match.
     pub async fn set_agent_session_status(
         &self,
+        workspace_id: &WorkspaceId,
         id: &AgentId,
         status: AgentStatus,
         is_active: bool,
         updated_at: &str,
     ) -> Result<()> {
-        let rows =
-            sqlx::query("UPDATE agent_session SET status=?, is_active=?, updated_at=? WHERE id=?")
-                .bind(enum_to_db(&status)?)
-                .bind(is_active as i64)
-                .bind(updated_at)
-                .bind(&id.0)
-                .execute(self.pool())
-                .await
-                .map_err(|e| Error::Internal(format!("set agent session status failed: {e}")))?
-                .rows_affected();
+        let rows = sqlx::query(
+            "UPDATE agent_session SET status=?, is_active=?, updated_at=? \
+             WHERE id=? AND workspace_id=?",
+        )
+        .bind(enum_to_db(&status)?)
+        .bind(is_active as i64)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set agent session status failed: {e}")))?
+        .rows_affected();
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
@@ -216,18 +237,28 @@ impl Store {
     }
 
     /// Set `acp_session_id` write-once (the provider `session:created` path).
-    /// Errors if it is already set to a different value (§9.5). `NotFound` if
-    /// the session is absent.
-    pub async fn set_acp_session_id(&self, id: &AgentId, acp_session_id: &str) -> Result<()> {
+    /// Scoped to `workspace_id` (defense-in-depth). Errors if it is already set
+    /// to a different value (§9.5). `NotFound` if the session is absent or the
+    /// workspace does not match.
+    pub async fn set_acp_session_id(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        acp_session_id: &str,
+    ) -> Result<()> {
         let current = self.get_agent_session(id).await?;
+        if current.workspace_id != *workspace_id {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
         match current.acp_session_id.as_deref() {
             Some(existing) if existing == acp_session_id => return Ok(()),
             Some(_) => return Err(Error::Internal("acpSessionId is write-once".to_string())),
             None => {}
         }
-        sqlx::query("UPDATE agent_session SET acp_session_id=? WHERE id=?")
+        sqlx::query("UPDATE agent_session SET acp_session_id=? WHERE id=? AND workspace_id=?")
             .bind(acp_session_id)
             .bind(&id.0)
+            .bind(&workspace_id.0)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("set acp session id failed: {e}")))?;
@@ -239,21 +270,27 @@ impl Store {
     /// `expected_old` (the id we just failed to `session/load`). If it has since
     /// diverged — e.g. a concurrent recreate already swapped it — the stored
     /// value is left untouched and returned, so the canonical id is never
-    /// clobbered. Returns the canonical id after the operation. Unlike
-    /// [`Store::set_acp_session_id`] (strict write-once for the first set), this
-    /// is the ONLY relaxation, scoped to the fallback (§6.5). `NotFound` if the
-    /// session is absent.
+    /// clobbered. Scoped to `workspace_id` (defense-in-depth). Returns the
+    /// canonical id after the operation. Unlike [`Store::set_acp_session_id`]
+    /// (strict write-once for the first set), this is the ONLY relaxation,
+    /// scoped to the fallback (§6.5). `NotFound` if the session is absent or
+    /// the workspace does not match.
     pub async fn replace_acp_session_id(
         &self,
+        workspace_id: &WorkspaceId,
         id: &AgentId,
         expected_old: &str,
         new_acp_session_id: &str,
     ) -> Result<String> {
         let current = self.get_agent_session(id).await?;
+        if current.workspace_id != *workspace_id {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
         match current.acp_session_id.as_deref() {
             // The id we failed to load is still canonical → swap in the fresh one.
             Some(existing) if existing == expected_old => {
-                self.write_acp_session_id(id, new_acp_session_id).await?;
+                self.write_acp_session_id(workspace_id, id, new_acp_session_id)
+                    .await?;
                 Ok(new_acp_session_id.to_string())
             }
             // Diverged (a concurrent recreate already swapped) → reuse the stored
@@ -261,7 +298,8 @@ impl Store {
             Some(existing) => Ok(existing.to_string()),
             // Nothing stored to clobber → set the fresh id.
             None => {
-                self.write_acp_session_id(id, new_acp_session_id).await?;
+                self.write_acp_session_id(workspace_id, id, new_acp_session_id)
+                    .await?;
                 Ok(new_acp_session_id.to_string())
             }
         }
@@ -269,10 +307,16 @@ impl Store {
 
     /// Unconditional `acp_session_id` write helper shared by the CAS replace
     /// branches (callers gate the overwrite policy before invoking this).
-    async fn write_acp_session_id(&self, id: &AgentId, acp_session_id: &str) -> Result<()> {
-        sqlx::query("UPDATE agent_session SET acp_session_id=? WHERE id=?")
+    async fn write_acp_session_id(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        acp_session_id: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE agent_session SET acp_session_id=? WHERE id=? AND workspace_id=?")
             .bind(acp_session_id)
             .bind(&id.0)
+            .bind(&workspace_id.0)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("replace acp session id failed: {e}")))?;
@@ -280,10 +324,16 @@ impl Store {
     }
 
     /// Delete an agent session and its message log (the `agent_message` rows
-    /// cascade). Returns whether a row was removed (`agent.delete`, §5.5).
-    pub async fn delete_agent_session(&self, id: &AgentId) -> Result<bool> {
-        let result = sqlx::query("DELETE FROM agent_session WHERE id = ?")
+    /// cascade). Scoped to `workspace_id` (defense-in-depth). Returns whether a
+    /// row was removed (`agent.delete`, §5.5).
+    pub async fn delete_agent_session(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+    ) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM agent_session WHERE id = ? AND workspace_id = ?")
             .bind(&id.0)
+            .bind(&workspace_id.0)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))?;

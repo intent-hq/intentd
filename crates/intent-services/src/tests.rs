@@ -1321,6 +1321,85 @@ async fn comment_resolve_thread_requires_thread_or_comment_id() {
     assert!(matches!(err, Error::Internal(ref m) if m.contains("Either threadId or commentId")));
 }
 
+/// Cross-workspace bare-id probes must not delete a comment that lives in a
+/// different workspace: `comment_delete` scopes its DELETE by `workspace_id`
+/// so a caller declaring workspace B cannot remove a row owned by workspace A
+/// (the store's `set_thread_status` UPDATE is scoped the same way, so
+/// `comment_resolve_thread` becomes a no-op across workspaces).
+#[tokio::test]
+async fn comment_ops_reject_cross_workspace_bare_id_writes() {
+    let (_tmp, svc, ws_a, id_a) = setup("Hello world, this is a test sentence.").await;
+    // Provision a second workspace on the same store/services handle.
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("second workspace");
+
+    let added = svc
+        .comment_add(
+            ws_a.clone(),
+            id_a.clone(),
+            "this is a test sentence".into(),
+            "test".into(),
+            "nice".into(),
+            None,
+            None,
+        )
+        .await
+        .expect("comment.add");
+
+    // Cross-workspace delete with the wrong workspaceId is rejected and the
+    // row survives.
+    let err = svc
+        .comment_delete(ws_b.clone(), id_a.clone(), added.comment_id.clone())
+        .await
+        .expect_err("cross-ws delete must not remove");
+    assert!(matches!(err, Error::Internal(_)), "delete: {err:?}");
+    let thread = svc
+        .comment_get_thread(
+            ws_a.clone(),
+            id_a.clone(),
+            Some(added.comment_id.clone()),
+            None,
+        )
+        .await
+        .expect("thread still readable");
+    assert_eq!(thread.total_comments, 1);
+
+    // Cross-workspace resolve is rejected at the note-scope guard (the note
+    // is not visible to ws_b) so the thread stays open when the owning
+    // workspace re-reads it. Even if a caller bypassed the note guard, the
+    // store's UPDATE is now scoped by workspace_id and would affect zero rows
+    // (covered by the store-level regression tests in `agent_ops::tests`).
+    let err = svc
+        .comment_resolve_thread(
+            ws_b.clone(),
+            id_a.clone(),
+            Some(added.comment_id.clone()),
+            None,
+            true,
+        )
+        .await
+        .expect_err("cross-ws resolve must not observe");
+    assert!(matches!(err, Error::Internal(_)), "resolve: {err:?}");
+    let thread = svc
+        .comment_get_thread(
+            ws_a.clone(),
+            id_a.clone(),
+            Some(added.comment_id.clone()),
+            None,
+        )
+        .await
+        .expect("thread readable");
+    assert_eq!(thread.status, "open");
+
+    // The owner can still delete their own row.
+    svc.comment_delete(ws_a, id_a, added.comment_id)
+        .await
+        .expect("owner delete succeeds");
+}
+
 // ---- event.* query/aggregation methods (M2.4) ----
 
 use intent_core::{ActorType, EventActor};

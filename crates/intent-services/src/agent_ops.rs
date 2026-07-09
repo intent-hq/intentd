@@ -656,9 +656,20 @@ impl Services {
     }
 
     /// `agent.get` (PROTOCOL §5.5). `NotFound` is surfaced to the router which
-    /// maps it to `-32602 "Agent not found"`.
-    pub(crate) async fn agent_get_op(&self, agent_id: AgentId) -> Result<AgentLite> {
+    /// maps it to `-32602 "Agent not found"`. When `workspace_id` is supplied
+    /// the caller's workspace must match the session's; a mismatch surfaces as
+    /// `NotFound` (defense-in-depth against bare-id probes across workspaces).
+    pub(crate) async fn agent_get_op(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<AgentLite> {
         let session = self.store.get_agent_session(&agent_id).await?;
+        if let Some(ws) = workspace_id.as_ref() {
+            if session.workspace_id != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
         Ok(self.project_lite_with_flags(session))
     }
 
@@ -747,9 +758,15 @@ impl Services {
         &self,
         agent_id: AgentId,
         limit: Option<i64>,
+        workspace_id: Option<WorkspaceId>,
         page_token: Option<String>,
     ) -> Result<Value> {
         let session = self.store.get_agent_session(&agent_id).await?;
+        if let Some(ws) = workspace_id.as_ref() {
+            if session.workspace_id != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
         let messages = session.messages;
         let total = messages.len();
         let win = crate::pagination::page_window(total, limit, page_token.as_deref());
@@ -937,9 +954,12 @@ impl Services {
         session.name = name.clone();
         session.name_explicitly_set = true;
         session.updated_at = now_iso();
-        self.store.update_agent_session(&session).await?;
+        let workspace_id = session.workspace_id.clone();
+        self.store
+            .update_agent_session(&workspace_id, &session)
+            .await?;
         self.publish_agent_mutation_event(
-            &session.workspace_id,
+            &workspace_id,
             &agent_id,
             intent_core::events::AGENT_RENAMED,
             json!({ "agentId": agent_id.0, "name": name }),
@@ -957,9 +977,12 @@ impl Services {
         let mut session = self.load_session_internal(&agent_id).await?;
         session.model = Some(model_id.clone());
         session.updated_at = now_iso();
-        self.store.update_agent_session(&session).await?;
+        let workspace_id = session.workspace_id.clone();
+        self.store
+            .update_agent_session(&workspace_id, &session)
+            .await?;
         self.publish_agent_mutation_event(
-            &session.workspace_id,
+            &workspace_id,
             &agent_id,
             intent_core::events::AGENT_UPDATED,
             json!({ "agentId": agent_id.0, "modelId": model_id }),
@@ -968,23 +991,45 @@ impl Services {
         Ok(json!({ "success": true, "modelId": model_id }))
     }
 
-    /// `agent.delete`: idempotent session delete (PROTOCOL §5.5).
-    pub(crate) async fn agent_delete_op(&self, agent_id: AgentId) -> Result<Value> {
+    /// `agent.delete`: idempotent session delete (PROTOCOL §5.5). When
+    /// `workspace_id` is supplied the caller's workspace must match the
+    /// session's; a mismatch surfaces as `NotFound` (defense-in-depth against
+    /// bare-id probes across workspaces).
+    pub(crate) async fn agent_delete_op(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<Value> {
         // Capture the workspace before deleting so the post-delete agent:deleted
         // emit can be workspace-scoped. If the session is already gone, skip the
-        // emit gracefully rather than failing the idempotent delete.
-        let workspace_id = self
+        // emit gracefully rather than failing the idempotent delete. When the
+        // caller declares a workspace, reject a cross-workspace bare-id probe
+        // by mapping to `NotFound` before touching the store.
+        let session_workspace_id = self
             .store
             .get_agent_session(&agent_id)
             .await
             .ok()
             .map(|s| s.workspace_id);
-        self.store.delete_agent_session(&agent_id).await?;
+        if let (Some(ws), Some(session_ws)) = (workspace_id.as_ref(), session_workspace_id.as_ref())
+        {
+            if session_ws != ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
+        // Route the DELETE through the workspace guard so a stale-caller with the
+        // wrong workspace cannot mutate the row even if the pre-check above races
+        // with a concurrent workspace move.
+        if let Some(session_ws) = session_workspace_id.as_ref() {
+            self.store
+                .delete_agent_session(session_ws, &agent_id)
+                .await?;
+        }
         self.agent_queues
             .lock()
             .expect("agent queue registry poisoned")
             .remove(&agent_id);
-        if let Some(workspace_id) = workspace_id {
+        if let Some(workspace_id) = session_workspace_id {
             crate::publish_event(
                 &self.event_bus,
                 intent_store::NewEvent {
@@ -1391,8 +1436,21 @@ impl Services {
         Ok(result)
     }
 
-    /// `agent.getQueue` (PROTOCOL §5.5).
-    pub(crate) async fn agent_get_queue_op(&self, agent_id: AgentId) -> Result<Value> {
+    /// `agent.getQueue` (PROTOCOL §5.5). When `workspace_id` is supplied the
+    /// callee verifies the session belongs to that workspace (defense-in-depth
+    /// against a bare `agentId` probe across workspaces); a mismatch surfaces
+    /// as `NotFound`.
+    pub(crate) async fn agent_get_queue_op(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<Value> {
+        if let Some(ws) = workspace_id.as_ref() {
+            let session = self.store.get_agent_session(&agent_id).await?;
+            if session.workspace_id != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
         let queue = self.queue_snapshot(&agent_id);
         Ok(json!({ "success": true, "queue": queue }))
     }
@@ -1552,8 +1610,17 @@ impl Services {
     /// counts fall back to the transcript and `creditsUsed` stays `null`
     /// (graceful degrade — never panics). A refreshed rollup that differs from
     /// the cached snapshot pushes `agent:session-stats-changed` (§6.5).
-    pub(crate) async fn agent_get_session_stats_op(&self, session_id: AgentId) -> Result<Value> {
+    pub(crate) async fn agent_get_session_stats_op(
+        &self,
+        session_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<Value> {
         let session = self.store.get_agent_session(&session_id).await?;
+        if let Some(ws) = workspace_id.as_ref() {
+            if session.workspace_id != *ws {
+                return Err(Error::NotFound(format!("agent session {session_id}")));
+            }
+        }
         let stats = match fetch_session_stats(&session_id).await {
             Some(cli) => cli,
             None => {

@@ -608,17 +608,18 @@ impl ChatDeltaState {
         self.message_id = Some(message_id.clone());
         let tool_call_id = d.get("toolCallId").and_then(Value::as_str)?.to_string();
         let status = d.get("status").and_then(Value::as_str).unwrap_or("started");
-        let use_block = json!({
-            "type": "tool_use",
-            "id": block_id,
-            "name": d.get("toolName").cloned().unwrap_or(Value::Null),
-            "input": d.get("input").cloned().unwrap_or(Value::Null),
-            "toolCallId": tool_call_id,
-            "metadata": {
-                "toolKind": d.get("toolKind").cloned().unwrap_or(Value::Null),
-                "status": status,
-            },
-        });
+        // Synthesize the `tool_use` block via the shared factory so the live
+        // delta stays byte-identical to the persisted block that `record_tool`
+        // writes on `agent:stream:end` — the invariant chat.subscribe relies
+        // on for its terminal reconcile.
+        let use_block = intent_services::tool_block::build_tool_use_block(
+            &block_id,
+            d.get("toolName").and_then(Value::as_str).unwrap_or(""),
+            d.get("input").cloned().unwrap_or(Value::Null),
+            &tool_call_id,
+            d.get("toolKind").and_then(Value::as_str).unwrap_or(""),
+            status,
+        );
         let use_added = self.note_block(&block_id);
         let mut added = Vec::new();
         let mut updated = Vec::new();
@@ -798,8 +799,10 @@ pub(crate) async fn channel_delta(
 
 /// Map a `task` channel event by re-reading the note and keeping only task
 /// notes. `note:created` → `added`, `note:updated`/`task:status-changed` →
-/// `updated`, `note:deleted` → `removedIds` (the delete is idempotent on the
-/// client even when the removed note was not a task).
+/// `updated` when the note still projects a task or `removedIds` when the note
+/// has been demoted (task block removed), `note:deleted` → `removedIds` (the
+/// delete is idempotent on the client even when the removed note was not a
+/// task).
 pub(crate) async fn task_delta(
     api: &dyn WorkspaceApi,
     workspace_id: &WorkspaceId,
@@ -821,7 +824,9 @@ pub(crate) async fn task_delta(
                 .get_note(workspace_id.clone(), NoteId::from(note_id))
                 .await
                 .ok()?;
-            note.task.as_ref()?;
+            if note.task.is_none() {
+                return Some(json!({ "removedIds": [note_id] }));
+            }
             Some(json!({ "updated": [serde_json::to_value(note).ok()?] }))
         }
         _ => None,

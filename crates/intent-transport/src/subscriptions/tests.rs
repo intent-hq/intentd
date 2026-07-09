@@ -566,6 +566,25 @@ fn chat_tool_delta_error_status_marks_is_error_true() {
 }
 
 #[test]
+fn chat_tool_delta_synthesizes_name_and_acp_title_from_event() {
+    // The delta stream must produce the same shape `record_tool` persists so
+    // seq-0 snapshot and live deltas agree. `toolName` is the ACP title on
+    // the wire; the block's `name` is the derived real tool name and the
+    // title is echoed as `input._acpTitle`.
+    let mut s = ChatDeltaState::new(&agent());
+    let d = s
+        .tool_delta(&tool_event("msg-9", "msg-9:0", "tc-1", "started", None))
+        .expect("tool started delta");
+    let block = &d["added"][0]["block"];
+    assert_eq!(block["name"], "shell", "derived from title `shell`");
+    assert_eq!(block["input"]["cmd"], "ls", "raw args preserved");
+    assert_eq!(
+        block["input"]["_acpTitle"], "shell",
+        "ACP title always echoed under `_acpTitle`"
+    );
+}
+
+#[test]
 fn chat_tool_delta_completed_without_output_only_emits_use_block() {
     let mut s = ChatDeltaState::new(&agent());
     let d = s
@@ -708,4 +727,110 @@ fn merge_live_turn_noop_when_snapshot_is_not_object() {
         &json!({ "messageId": "m", "contentBlocks": [] }),
     );
     assert_eq!(snapshot, json!([]));
+}
+
+// --- task_delta re-read arm (channel-mapping regression) ------------------
+
+mod task_delta_re_read {
+    use super::*;
+    use intent_core::{
+        BoxFuture, ContentType, Error, Note, NoteId, NoteVisibility, Result, TaskMetadata,
+        WorkspaceApi, WorkspaceId,
+    };
+
+    /// Minimal `WorkspaceApi` that returns a pre-canned [`Note`] from `get_note`
+    /// (or `NotFound` when the fixture is `None`). Everything else falls
+    /// through to the trait defaults, which is fine because `task_delta` only
+    /// touches `get_note`.
+    struct StaticNoteApi(Option<Note>);
+
+    impl WorkspaceApi for StaticNoteApi {
+        fn get_note(
+            &self,
+            _workspace_id: WorkspaceId,
+            _note_id: NoteId,
+        ) -> BoxFuture<'_, Result<Note>> {
+            let note = self.0.clone();
+            Box::pin(async move { note.ok_or_else(|| Error::NotFound("note".to_string())) })
+        }
+    }
+
+    fn ws() -> WorkspaceId {
+        WorkspaceId::from("w")
+    }
+
+    fn note_with(task: Option<TaskMetadata>) -> Note {
+        Note {
+            id: NoteId::from("n-1"),
+            workspace_id: ws(),
+            title: "T".to_string(),
+            content: String::new(),
+            content_type: ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: None,
+            visibility: NoteVisibility::Workspace,
+            task,
+            created_at: "t0".to_string(),
+            rev: 0,
+            updated_at: "t0".to_string(),
+        }
+    }
+
+    fn note_event(event_type: &str, note_id: &str) -> Event {
+        Event {
+            id: "evt-1".into(),
+            event_type: event_type.to_string(),
+            timestamp: now_iso(),
+            workspace_id: ws(),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            actor: EventActor {
+                actor_type: ActorType::System,
+                ..Default::default()
+            },
+            data: json!({ "noteId": note_id }),
+        }
+    }
+
+    #[tokio::test]
+    async fn note_updated_emits_removed_ids_when_task_was_demoted() {
+        // The re-read note no longer projects a task → the delta must remove it
+        // from every subscribed task list.
+        let api = StaticNoteApi(Some(note_with(None)));
+        let d = task_delta(&api, &ws(), &note_event(NOTE_UPDATED, "n-1"))
+            .await
+            .expect("delta must be emitted for demotion");
+        assert_eq!(d["removedIds"][0], "n-1");
+        assert!(d.get("updated").is_none());
+        assert!(d.get("added").is_none());
+    }
+
+    #[tokio::test]
+    async fn task_status_changed_also_emits_removed_ids_when_task_missing() {
+        // The `task:status-changed` arm shares the re-read path with
+        // `note:updated`; a demotion that races a status event must still be
+        // reported as a removal, not silently dropped.
+        let api = StaticNoteApi(Some(note_with(None)));
+        let d = task_delta(&api, &ws(), &note_event(TASK_STATUS_CHANGED, "n-1"))
+            .await
+            .expect("delta must be emitted");
+        assert_eq!(d["removedIds"][0], "n-1");
+    }
+
+    #[tokio::test]
+    async fn note_updated_still_emits_updated_when_task_present() {
+        // Regression guard: the removal path must not swallow legitimate
+        // `updated` deltas when the note is still a task.
+        let api = StaticNoteApi(Some(note_with(Some(TaskMetadata::default()))));
+        let d = task_delta(&api, &ws(), &note_event(NOTE_UPDATED, "n-1"))
+            .await
+            .expect("delta must be emitted");
+        assert_eq!(d["updated"][0]["id"], "n-1");
+        assert!(d.get("removedIds").is_none());
+    }
 }

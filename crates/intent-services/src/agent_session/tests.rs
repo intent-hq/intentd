@@ -609,7 +609,7 @@ async fn open_acp_session_persists_id() {
 
 #[tokio::test]
 async fn resume_requires_capability_and_stored_id() {
-    let (_tmp, services, bus, agent_id, _ws) = setup().await;
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
     let (conn, _rx, _agent) = connect();
 
     // No stored acpSessionId yet → None even with the capability.
@@ -620,7 +620,7 @@ async fn resume_requires_capability_and_stored_id() {
         .is_none());
 
     bus.store()
-        .set_acp_session_id(&agent_id, ACP_SID)
+        .set_acp_session_id(&ws, &agent_id, ACP_SID)
         .await
         .unwrap();
 
@@ -646,12 +646,12 @@ async fn resume_requires_capability_and_stored_id() {
 
 #[tokio::test]
 async fn recreate_acp_session_replaces_stored_id() {
-    let (_tmp, services, bus, agent_id, _ws) = setup().await;
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
     let (conn, _rx, _agent) = connect();
 
     // A stale id is persisted (the resume-impossible fallback case).
     bus.store()
-        .set_acp_session_id(&agent_id, "stale-id")
+        .set_acp_session_id(&ws, &agent_id, "stale-id")
         .await
         .unwrap();
 

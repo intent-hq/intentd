@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use intent_core::{
     events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientId, Comment,
-    CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, EventActor, Note,
-    NoteId, NoteVersionAuthor, NoteVisibility, TaskMetadata, TaskStatus, Workspace,
+    CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, Error, EventActor,
+    Note, NoteId, NoteVersionAuthor, NoteVisibility, TaskMetadata, TaskStatus, Workspace,
     WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use serde_json::json;
@@ -87,14 +87,14 @@ async fn migration_status_reports_current_after_open() {
         status.expected,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29
+            25, 26, 27, 28, 29, 30
         ]
     );
     assert_eq!(
         status.applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29
+            25, 26, 27, 28, 29, 30
         ]
     );
 }
@@ -642,8 +642,8 @@ async fn comment_round_trip_update_delete_and_thread() {
     c2.suggestion_original = None;
     c2.suggestion_proposed = None;
     c2.agent_id = None;
-    store.insert_comment(&c1).await.expect("insert c1");
-    store.insert_comment(&c2).await.expect("insert c2");
+    store.insert_comment(&ws_id, &c1).await.expect("insert c1");
+    store.insert_comment(&ws_id, &c2).await.expect("insert c2");
 
     let got = store.get_comment("c1").await.expect("get c1");
     assert_eq!(got, c1);
@@ -658,12 +658,15 @@ async fn comment_round_trip_update_delete_and_thread() {
     let mut updated = c1.clone();
     updated.status = CommentStatus::Resolved;
     updated.content = "resolved now".to_string();
-    store.update_comment(&updated).await.expect("update c1");
+    store
+        .update_comment(&ws_id, &updated)
+        .await
+        .expect("update c1");
     let reread = store.get_comment("c1").await.expect("reget c1");
     assert_eq!(reread.status, CommentStatus::Resolved);
     assert_eq!(reread.content, "resolved now");
 
-    store.delete_comment("c1").await.expect("delete c1");
+    store.delete_comment(&ws_id, "c1").await.expect("delete c1");
     assert!(store.get_comment("c1").await.is_err());
     assert_eq!(
         store
@@ -673,6 +676,73 @@ async fn comment_round_trip_update_delete_and_thread() {
             .len(),
         1
     );
+}
+
+/// Store-layer defense-in-depth for comment mutations: UPDATE/DELETE and
+/// `set_thread_status` all scope by `(id, workspace_id)`, so a caller
+/// declaring workspace B cannot mutate a comment row that belongs to
+/// workspace A. Bare-id probes surface as NotFound / zero-row updates
+/// depending on the mutation shape (mirrors the note_repo 0022 pattern).
+#[tokio::test]
+async fn comment_mutations_reject_cross_workspace_bare_id_writes() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_a = WorkspaceId::new();
+    let ws_b = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_a, "A", false))
+        .await
+        .expect("insert ws_a");
+    store
+        .insert_workspace(&sample_workspace(&ws_b, "B", false))
+        .await
+        .expect("insert ws_b");
+    let note = task_note(&ws_a, "Note", None);
+    store.insert_note(&note).await.expect("insert note");
+    let c1 = sample_comment(&note.id, "thread-x", "c1");
+    store
+        .insert_comment(&ws_a, &c1)
+        .await
+        .expect("insert c1 in ws_a");
+
+    // Cross-workspace UPDATE returns NotFound and does NOT mutate the row.
+    let mut mutated = c1.clone();
+    mutated.content = "cross-ws mutation".to_string();
+    let err = store
+        .update_comment(&ws_b, &mutated)
+        .await
+        .expect_err("cross-ws update must not mutate");
+    assert!(matches!(err, Error::NotFound(_)), "update: {err:?}");
+    let reread = store.get_comment("c1").await.expect("still readable");
+    assert_ne!(reread.content, "cross-ws mutation");
+
+    // Cross-workspace DELETE returns NotFound and does NOT remove the row.
+    let err = store
+        .delete_comment(&ws_b, "c1")
+        .await
+        .expect_err("cross-ws delete must not remove");
+    assert!(matches!(err, Error::NotFound(_)), "delete: {err:?}");
+    store.get_comment("c1").await.expect("row still present");
+
+    // Cross-workspace resolve is a no-op (zero rows affected).
+    let rows = store
+        .set_thread_status(&ws_b, "thread-x", CommentStatus::Resolved, "now")
+        .await
+        .expect("set_thread_status returns");
+    assert_eq!(rows, 0, "cross-ws set_thread_status must affect zero rows");
+    let reread = store.get_comment("c1").await.expect("still readable");
+    assert_eq!(
+        reread.status,
+        CommentStatus::Open,
+        "row still open after failed cross-ws resolve"
+    );
+
+    // Owner can still resolve; row count is 1 (only the ws_a row matches).
+    let rows = store
+        .set_thread_status(&ws_a, "thread-x", CommentStatus::Resolved, "later")
+        .await
+        .expect("owner resolve");
+    assert_eq!(rows, 1);
 }
 
 fn file_event(ws: &WorkspaceId, ts: &str, path: &str, actor: EventActor) -> NewEvent {
@@ -1330,7 +1400,10 @@ async fn agent_session_parent_agent_id_round_trips() {
     // Update clears the linkage back to None.
     let mut cleared = store.get_agent_session(&child).await.expect("get");
     cleared.parent_agent_id = None;
-    store.update_agent_session(&cleared).await.expect("update");
+    store
+        .update_agent_session(&ws, &cleared)
+        .await
+        .expect("update");
     assert_eq!(
         store
             .get_agent_session(&child)
@@ -1385,7 +1458,10 @@ async fn agent_session_specialist_round_trips() {
 
     let mut updated = store.get_agent_session(&spec_agent).await.expect("get");
     updated.name = "Renamed".to_string();
-    store.update_agent_session(&updated).await.expect("update");
+    store
+        .update_agent_session(&ws, &updated)
+        .await
+        .expect("update");
     assert_eq!(
         store
             .get_agent_session(&spec_agent)
@@ -1413,20 +1489,23 @@ async fn agent_acp_session_id_is_write_once() {
 
     // First write succeeds; re-setting the same value is idempotent.
     store
-        .set_acp_session_id(&agent_id, "acp-1")
+        .set_acp_session_id(&ws, &agent_id, "acp-1")
         .await
         .expect("first set");
     store
-        .set_acp_session_id(&agent_id, "acp-1")
+        .set_acp_session_id(&ws, &agent_id, "acp-1")
         .await
         .expect("idempotent set");
     // Changing it to a different value is rejected.
-    assert!(store.set_acp_session_id(&agent_id, "acp-2").await.is_err());
+    assert!(store
+        .set_acp_session_id(&ws, &agent_id, "acp-2")
+        .await
+        .is_err());
 
     // update_agent_session also refuses to overwrite a set acpSessionId.
     let mut s = store.get_agent_session(&agent_id).await.expect("get");
     s.acp_session_id = Some("acp-3".to_string());
-    assert!(store.update_agent_session(&s).await.is_err());
+    assert!(store.update_agent_session(&ws, &s).await.is_err());
 }
 
 #[tokio::test]
@@ -1445,14 +1524,14 @@ async fn replace_acp_session_id_is_no_clobber_cas() {
         .expect("insert session");
 
     store
-        .set_acp_session_id(&agent_id, "acp-1")
+        .set_acp_session_id(&ws, &agent_id, "acp-1")
         .await
         .expect("first set");
 
     // CAS no-clobber: a stale expected-old does NOT overwrite the canonical id;
     // the stored value is returned for the caller to reuse.
     let kept = store
-        .replace_acp_session_id(&agent_id, "wrong-old", "acp-2")
+        .replace_acp_session_id(&ws, &agent_id, "wrong-old", "acp-2")
         .await
         .expect("cas returns canonical");
     assert_eq!(kept, "acp-1", "diverged expected-old reuses the stored id");
@@ -1462,7 +1541,7 @@ async fn replace_acp_session_id_is_no_clobber_cas() {
     // CAS swap: a matching expected-old replaces with the fresh id (the
     // resume-impossible fallback, where `set_acp_session_id` would reject).
     let swapped = store
-        .replace_acp_session_id(&agent_id, "acp-1", "acp-2")
+        .replace_acp_session_id(&ws, &agent_id, "acp-1", "acp-2")
         .await
         .expect("cas swaps on match");
     assert_eq!(swapped, "acp-2");
@@ -1471,7 +1550,7 @@ async fn replace_acp_session_id_is_no_clobber_cas() {
 
     // A missing session surfaces NotFound rather than a silent no-op.
     assert!(store
-        .replace_acp_session_id(&AgentId::new(), "acp-2", "acp-x")
+        .replace_acp_session_id(&ws, &AgentId::new(), "acp-2", "acp-x")
         .await
         .is_err());
 }
@@ -1495,12 +1574,15 @@ async fn agent_provider_is_immutable_once_set() {
     let mut s = store.get_agent_session(&agent_id).await.expect("get");
     s.provider = Some("auggie".to_string());
     s.status = AgentStatus::Active;
-    store.update_agent_session(&s).await.expect("set provider");
+    store
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("set provider");
 
     // Changing the provider afterwards is rejected.
     let mut s = store.get_agent_session(&agent_id).await.expect("get");
     s.provider = Some("claude-code".to_string());
-    assert!(store.update_agent_session(&s).await.is_err());
+    assert!(store.update_agent_session(&ws, &s).await.is_err());
 }
 
 #[tokio::test]

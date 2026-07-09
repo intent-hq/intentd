@@ -145,7 +145,7 @@ async fn delete_emits_agent_deleted_scoped_to_workspace() {
         ..Default::default()
     });
 
-    let r = svc.agent_delete_op(id.clone()).await.expect("delete");
+    let r = svc.agent_delete_op(id.clone(), None).await.expect("delete");
     assert_eq!(r["success"], json!(true));
 
     let batch = timeout(Duration::from_secs(2), sub.recv())
@@ -168,7 +168,7 @@ async fn delete_skips_emit_when_session_already_gone() {
 
     let missing = AgentId::from("agent-00000000-0000-0000-0000-00000missing0");
     let r = svc
-        .agent_delete_op(missing)
+        .agent_delete_op(missing, None)
         .await
         .expect("idempotent delete");
     assert_eq!(r["success"], json!(true));
@@ -279,7 +279,7 @@ async fn create_then_list_and_get_projects_agent_lite() {
     assert_eq!(agents[0].name, "Builder");
     assert_eq!(agents[0].message_count, 0);
 
-    let got = svc.agent_get_op(id.clone()).await.expect("get");
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
     assert_eq!(got.id, id);
     assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
 }
@@ -309,7 +309,10 @@ async fn agent_create_honors_client_supplied_agent_id() {
     assert_eq!(created["agent"]["id"].as_str(), Some(requested.0.as_str()));
     // Round-trip through the store proves the session is addressable at the
     // client-supplied id.
-    let got = svc.agent_get_op(requested.clone()).await.expect("get");
+    let got = svc
+        .agent_get_op(requested.clone(), None)
+        .await
+        .expect("get");
     assert_eq!(got.id, requested);
 }
 
@@ -359,7 +362,7 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
         .expect("create");
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-    let lite = svc.agent_get_op(id).await.expect("get");
+    let lite = svc.agent_get_op(id, None).await.expect("get");
     let v = serde_json::to_value(&lite).unwrap();
     // Nested metadata object (iOS `parseAgent` reads metadata.specialist /
     // isBackground / createdByAgentId).
@@ -409,7 +412,7 @@ async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
         None,
     );
 
-    let lite = svc.agent_get_op(parent.clone()).await.expect("get");
+    let lite = svc.agent_get_op(parent.clone(), None).await.expect("get");
     let v = serde_json::to_value(&lite).unwrap();
     assert_eq!(v["isResponding"], true);
     assert_eq!(v["isWaitingOnTool"], true);
@@ -440,7 +443,8 @@ async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
             }),
         ],
     );
-    let v = serde_json::to_value(svc.agent_get_op(parent.clone()).await.expect("get")).unwrap();
+    let v =
+        serde_json::to_value(svc.agent_get_op(parent.clone(), None).await.expect("get")).unwrap();
     assert_eq!(v["isResponding"], true);
     assert_eq!(v["isWaitingOnTool"], false);
     assert_eq!(v["isWaitingForOtherAgents"], true);
@@ -456,12 +460,13 @@ async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
         true,
         None,
     );
-    let v = serde_json::to_value(svc.agent_get_op(parent.clone()).await.expect("get")).unwrap();
+    let v =
+        serde_json::to_value(svc.agent_get_op(parent.clone(), None).await.expect("get")).unwrap();
     assert_eq!(v["waitingForAgentIds"], json!([child.0]));
 
     // The child has no worker and parents no watches: every flag false and the
     // waiting-on id list is the empty array (never null/omitted).
-    let cv = serde_json::to_value(svc.agent_get_op(child).await.expect("get")).unwrap();
+    let cv = serde_json::to_value(svc.agent_get_op(child, None).await.expect("get")).unwrap();
     assert_eq!(cv["isResponding"], false);
     assert_eq!(cv["isWaitingOnTool"], false);
     assert_eq!(cv["isWaitingForOtherAgents"], false);
@@ -488,7 +493,7 @@ async fn agent_lite_metadata_created_by_agent_id_from_parent() {
         .expect("create child");
     let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-    let lite = svc.agent_get_op(child).await.expect("get");
+    let lite = svc.agent_get_op(child, None).await.expect("get");
     let v = serde_json::to_value(&lite).unwrap();
     assert_eq!(v["metadata"]["createdByAgentId"], parent.0);
     // No specialist supplied → omitted from metadata.
@@ -504,7 +509,7 @@ async fn agent_lite_derives_last_user_message() {
         .append_agent_message(&id, "user", &content, &now_iso())
         .await
         .expect("append");
-    let lite = svc.agent_get_op(id).await.expect("get");
+    let lite = svc.agent_get_op(id, None).await.expect("get");
     assert_eq!(
         lite.last_user_message.as_deref(),
         Some("please do the thing")
@@ -515,7 +520,10 @@ async fn agent_lite_derives_last_user_message() {
 async fn get_unknown_agent_is_not_found() {
     let (_t, svc, _ws) = setup().await;
     let err = svc
-        .agent_get_op(AgentId::from("agent-00000000-0000-0000-0000-000000000000"))
+        .agent_get_op(
+            AgentId::from("agent-00000000-0000-0000-0000-000000000000"),
+            None,
+        )
         .await
         .expect_err("missing");
     assert!(matches!(err, Error::NotFound(_)));
@@ -555,7 +563,7 @@ async fn get_conversation_truncates_to_limit() {
             .expect("append");
     }
     let res = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None)
         .await
         .expect("conv");
     assert_eq!(res["totalMessages"], 5);
@@ -586,7 +594,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
 
     // Page 1: newest two, oldest→newest within the page, nextToken present.
     let p1 = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None)
         .await
         .expect("p1");
     assert_eq!(p1["totalMessages"], 5);
@@ -601,7 +609,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
 
     // Page 2 follows the token to the next-older window.
     let p2 = svc
-        .agent_get_conversation_op(id.clone(), Some(2), Some(t1))
+        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t1))
         .await
         .expect("p2");
     let m2 = p2["messages"].as_array().unwrap();
@@ -611,7 +619,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
 
     // Page 3 is the final page: oldest message, no further token.
     let p3 = svc
-        .agent_get_conversation_op(id.clone(), Some(2), Some(t2))
+        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t2))
         .await
         .expect("p3");
     let m3 = p3["messages"].as_array().unwrap();
@@ -623,13 +631,13 @@ async fn get_conversation_paginates_with_opaque_next_token() {
     // No limit → default page returns all five with no token; an over-max limit
     // clamps to 200 and likewise fits all five in one page.
     let all = svc
-        .agent_get_conversation_op(id.clone(), None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None)
         .await
         .expect("all");
     assert_eq!(all["messages"].as_array().unwrap().len(), 5);
     assert!(all["nextToken"].is_null());
     let clamped = svc
-        .agent_get_conversation_op(id, Some(10_000), None)
+        .agent_get_conversation_op(id, Some(10_000), None, None)
         .await
         .expect("clamped");
     assert_eq!(clamped["messages"].as_array().unwrap().len(), 5);
@@ -648,7 +656,7 @@ async fn rename_and_set_model_persist() {
     svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into())
         .await
         .expect("setModel");
-    let got = svc.agent_get_op(id).await.expect("get");
+    let got = svc.agent_get_op(id, None).await.expect("get");
     assert_eq!(got.name, "New");
     assert!(got.name_explicitly_set);
     assert_eq!(got.model.as_deref(), Some("auggie:opus4.7"));
@@ -1031,9 +1039,9 @@ async fn delegate_without_parent_bypasses_depth_guard() {
 async fn delete_removes_session() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Doomed").await;
-    let r = svc.agent_delete_op(id.clone()).await.expect("delete");
+    let r = svc.agent_delete_op(id.clone(), None).await.expect("delete");
     assert_eq!(r["success"], true);
-    assert!(svc.agent_get_op(id).await.is_err());
+    assert!(svc.agent_get_op(id, None).await.is_err());
 }
 
 #[tokio::test]
@@ -1052,7 +1060,10 @@ async fn queue_lifecycle_add_get_edit_remove() {
     assert!(added["queuedMessage"].get("createdAt").is_none());
     assert!(added["queuedMessage"].get("agentId").is_none());
 
-    let q = svc.agent_get_queue_op(id.clone()).await.expect("getQueue");
+    let q = svc
+        .agent_get_queue_op(id.clone(), None)
+        .await
+        .expect("getQueue");
     assert_eq!(q["success"], true);
     assert_eq!(q["queue"].as_array().unwrap().len(), 1);
     assert_eq!(q["queue"][0]["content"], "hello");
@@ -1064,13 +1075,16 @@ async fn queue_lifecycle_add_get_edit_remove() {
         .await
         .expect("edit");
     assert_eq!(edited["queuedMessage"]["position"], 0);
-    let q = svc.agent_get_queue_op(id.clone()).await.expect("getQueue");
+    let q = svc
+        .agent_get_queue_op(id.clone(), None)
+        .await
+        .expect("getQueue");
     assert_eq!(q["queue"][0]["content"], "edited");
 
     svc.agent_remove_queued_message_op(id.clone(), mid)
         .await
         .expect("remove");
-    let q = svc.agent_get_queue_op(id).await.expect("getQueue");
+    let q = svc.agent_get_queue_op(id, None).await.expect("getQueue");
     assert_eq!(q["queue"].as_array().unwrap().len(), 0);
 }
 
@@ -1308,7 +1322,7 @@ async fn send_message_delivers_when_agent_exists() {
     assert_eq!(r["queued"], false);
     assert_eq!(r["messageId"], "m1");
     let conv = svc
-        .agent_get_conversation_op(id, None, None)
+        .agent_get_conversation_op(id, None, None, None)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
@@ -1937,7 +1951,7 @@ async fn delegate_skips_watch_when_parent_deleted() {
         .expect("parent session");
     session.status = intent_core::AgentStatus::Deleted;
     svc.store()
-        .update_agent_session(&session)
+        .update_agent_session(&session.workspace_id.clone(), &session)
         .await
         .expect("flag deleted");
 
@@ -2016,7 +2030,7 @@ async fn delegate_delivers_agent_instructions_as_child_first_message() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child.clone(), None, None)
+        .agent_get_conversation_op(child.clone(), None, None, None)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1, "child got exactly one message");
@@ -2045,7 +2059,7 @@ async fn delegate_falls_back_to_task_text_for_child_first_message() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child.clone(), None, None)
+        .agent_get_conversation_op(child.clone(), None, None, None)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
@@ -2103,7 +2117,7 @@ async fn delegate_falls_back_to_task_note_content_for_child_first_message() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child.clone(), None, None)
+        .agent_get_conversation_op(child.clone(), None, None, None)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
@@ -2124,7 +2138,7 @@ async fn delegate_without_message_source_delivers_nothing() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child, None, None)
+        .agent_get_conversation_op(child, None, None, None)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 0, "no message delivered");
@@ -2755,7 +2769,10 @@ async fn session_stats_emits_only_on_change() {
 async fn get_session_stats_unknown_session_is_not_found() {
     let (_t, svc, _ws) = setup().await;
     let err = svc
-        .agent_get_session_stats_op(AgentId::from("agent-00000000-0000-0000-0000-00000missing0"))
+        .agent_get_session_stats_op(
+            AgentId::from("agent-00000000-0000-0000-0000-00000missing0"),
+            None,
+        )
         .await
         .expect_err("unknown session");
     assert!(matches!(err, Error::NotFound(_)));
@@ -3176,7 +3193,7 @@ async fn wake_or_create_skips_stale_and_reports_cleanup() {
         .await
         .expect("assign stale");
     // Wipe the stale session so its assignment becomes NotFound-stale.
-    svc.agent_delete_op(AgentId::from(stale_id.as_str()))
+    svc.agent_delete_op(AgentId::from(stale_id.as_str()), None)
         .await
         .expect("delete stale");
 
@@ -3294,7 +3311,7 @@ async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
     prev_session.status = intent_core::AgentStatus::Deleted;
     prev_session.updated_at = intent_core::now_iso();
     svc.store()
-        .update_agent_session(&prev_session)
+        .update_agent_session(&prev_session.workspace_id.clone(), &prev_session)
         .await
         .expect("mark prev deleted");
 
@@ -3354,7 +3371,7 @@ async fn wake_or_create_delivers_message_metadata_on_block() {
         .expect("wake");
     let new_id = AgentId::from(resp["agentId"].as_str().unwrap());
     let conv = svc
-        .agent_get_conversation_op(new_id, None, None)
+        .agent_get_conversation_op(new_id, None, None, None)
         .await
         .expect("conv");
     // The delivered message is the first user message; its content block
@@ -3364,4 +3381,133 @@ async fn wake_or_create_delivers_message_metadata_on_block() {
     let block = &msg["contentBlocks"][0];
     assert_eq!(block["text"], "hello");
     assert_eq!(block["messageMetadata"]["type"], "task_wake");
+}
+
+/// Cross-workspace bare-id probes must NOT observe an agent that lives in a
+/// different workspace: `agent_get_op` / `agent_get_conversation_op` /
+/// `agent_get_queue_op` / `agent_get_session_stats_op` / `agent_delete_op` all
+/// return `NotFound` when the caller's declared `workspaceId` does not match
+/// the session's owning workspace (defense-in-depth against the
+/// "know-the-id-to-mutate/read" attack).
+#[tokio::test]
+async fn agent_ops_reject_cross_workspace_bare_id_probes() {
+    let (_t, svc, ws_a) = setup().await;
+    // Provision a second workspace that shares the same store/services handle.
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("second workspace");
+
+    let id = create_agent(&svc, &ws_a, "Owned").await;
+
+    // The `None` workspace guard preserves the legacy behavior (all internal
+    // callers still see the session).
+    svc.agent_get_op(id.clone(), None)
+        .await
+        .expect("owner read");
+
+    // A caller declaring ws_b sees NotFound rather than the ws_a row.
+    let err = svc
+        .agent_get_op(id.clone(), Some(ws_b.clone()))
+        .await
+        .expect_err("cross-ws get must not observe");
+    assert!(matches!(err, Error::NotFound(_)), "get: {err:?}");
+
+    let err = svc
+        .agent_get_conversation_op(id.clone(), None, Some(ws_b.clone()), None)
+        .await
+        .expect_err("cross-ws conversation must not observe");
+    assert!(matches!(err, Error::NotFound(_)), "conversation: {err:?}");
+
+    let err = svc
+        .agent_get_queue_op(id.clone(), Some(ws_b.clone()))
+        .await
+        .expect_err("cross-ws queue must not observe");
+    assert!(matches!(err, Error::NotFound(_)), "queue: {err:?}");
+
+    let err = svc
+        .agent_get_session_stats_op(id.clone(), Some(ws_b.clone()))
+        .await
+        .expect_err("cross-ws stats must not observe");
+    assert!(matches!(err, Error::NotFound(_)), "stats: {err:?}");
+
+    // Delete: a cross-workspace probe must not remove the row.
+    let err = svc
+        .agent_delete_op(id.clone(), Some(ws_b.clone()))
+        .await
+        .expect_err("cross-ws delete must not observe");
+    assert!(matches!(err, Error::NotFound(_)), "delete: {err:?}");
+
+    // The row is still there for the owning workspace.
+    svc.agent_get_op(id.clone(), Some(ws_a.clone()))
+        .await
+        .expect("owner still reads after failed cross-ws delete");
+}
+
+/// Store-layer defense-in-depth: even if an op-layer guard were bypassed, the
+/// UPDATE/DELETE queries scope by `(id, workspace_id)` so a mutation issued
+/// with the wrong workspace_id affects zero rows and surfaces `NotFound`.
+#[tokio::test]
+async fn agent_store_mutations_reject_cross_workspace_writes() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("second workspace");
+
+    let id = create_agent(&svc, &ws_a, "Owned").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&id)
+        .await
+        .expect("owner session");
+    session.name = "Renamed".to_string();
+    session.updated_at = now_iso();
+
+    // Wrong workspace → NotFound; the row is unchanged.
+    let err = svc
+        .store()
+        .update_agent_session(&ws_b, &session)
+        .await
+        .expect_err("cross-ws update must not mutate");
+    assert!(matches!(err, Error::NotFound(_)), "update: {err:?}");
+    let reread = svc
+        .store()
+        .get_agent_session(&id)
+        .await
+        .expect("still there");
+    assert_ne!(reread.name, "Renamed");
+
+    let err = svc
+        .store()
+        .set_agent_session_status(
+            &ws_b,
+            &id,
+            intent_core::AgentStatus::RuntimeIdle,
+            false,
+            &now_iso(),
+        )
+        .await
+        .expect_err("cross-ws status write must not mutate");
+    assert!(matches!(err, Error::NotFound(_)), "status: {err:?}");
+
+    let err = svc
+        .store()
+        .set_acp_session_id(&ws_b, &id, "acp-x")
+        .await
+        .expect_err("cross-ws acp write must not mutate");
+    assert!(matches!(err, Error::NotFound(_)), "acp: {err:?}");
+
+    let removed = svc
+        .store()
+        .delete_agent_session(&ws_b, &id)
+        .await
+        .expect("delete returns bool");
+    assert!(!removed, "cross-ws delete must remove zero rows");
+    svc.store()
+        .get_agent_session(&id)
+        .await
+        .expect("row still present after cross-ws delete");
 }
