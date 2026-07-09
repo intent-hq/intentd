@@ -432,8 +432,9 @@ mod mcp_tests {
     use std::sync::{Arc, Mutex};
 
     use intent_core::{
-        AgentId, BoxFuture, GitAgentCommitResult, Note, NoteAddInput, NoteAddResult, NoteCreate,
-        NoteId, Result, WorkspaceApi, WorkspaceId,
+        AgentCreateExtra, AgentId, BoxFuture, GitAgentCommitResult, Note, NoteAddInput,
+        NoteAddResult, NoteCreate, NoteId, Result, TaskAssignAgentResult, WorkspaceApi,
+        WorkspaceId,
     };
     use serde_json::{json, Value};
 
@@ -455,6 +456,15 @@ mod mcp_tests {
     /// call through the MCP server can be observed as a state change.
     /// A recorded `git_agent_commit` call: (message, agent_id, linked_note_id).
     type CommitRecord = (String, Option<String>, Option<String>);
+    /// A recorded `agent_create` call:
+    /// (name, specialist, parent_agent_id, idempotency_key, metadata).
+    type AgentCreateRecord = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<Value>,
+    );
 
     #[derive(Default)]
     pub(super) struct MockApi {
@@ -462,6 +472,11 @@ mod mcp_tests {
         pub(super) committed: Mutex<Vec<CommitRecord>>,
         /// Recorded `create_note` calls: (title, idempotency_key).
         pub(super) created: Mutex<Vec<(String, Option<String>)>>,
+        pub(super) agent_creates: Mutex<Vec<AgentCreateRecord>>,
+        /// Recorded `agent_send_message` calls: (agent_id, content).
+        pub(super) sent: Mutex<Vec<(String, String)>>,
+        /// Recorded `assign_agent` calls: (note_id, agent_id).
+        pub(super) assigned: Mutex<Vec<(String, String)>>,
     }
 
     impl WorkspaceApi for MockApi {
@@ -548,6 +563,73 @@ mod mcp_tests {
                     new_content: input.content,
                     converted_count: 0,
                     created_task_note_ids: Vec::new(),
+                })
+            })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn agent_create(
+            &self,
+            _workspace_id: WorkspaceId,
+            name: Option<String>,
+            _model: Option<String>,
+            specialist_id: Option<String>,
+            parent_agent_id: Option<AgentId>,
+            idempotency_key: Option<String>,
+            _requested_agent_id: Option<AgentId>,
+            extra: AgentCreateExtra,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.agent_creates.lock().unwrap().push((
+                name.clone(),
+                specialist_id,
+                parent_agent_id.as_ref().map(|a| a.as_str().to_string()),
+                idempotency_key,
+                extra.metadata,
+            ));
+            Box::pin(async move {
+                Ok(json!({
+                    "agent": { "id": "agent-child", "name": name.unwrap_or_default() }
+                }))
+            })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn agent_send_message(
+            &self,
+            _workspace_id: WorkspaceId,
+            agent_id: AgentId,
+            content: String,
+            _message_id: Option<String>,
+            _image_blocks: Option<Value>,
+            _file_blocks: Option<Value>,
+            _priority: Option<String>,
+            _note_ids: Option<Value>,
+            _stdin_context: Option<String>,
+            _context_references: Option<Value>,
+            _message_metadata: Option<Value>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((agent_id.as_str().to_string(), content));
+            Box::pin(async { Ok(json!({ "ok": true })) })
+        }
+
+        fn assign_agent(
+            &self,
+            _workspace_id: WorkspaceId,
+            note_id: NoteId,
+            agent_id: String,
+        ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
+            self.assigned
+                .lock()
+                .unwrap()
+                .push((note_id.as_str().to_string(), agent_id.clone()));
+            Box::pin(async move {
+                Ok(TaskAssignAgentResult {
+                    ok: true,
+                    note_id,
+                    agent_id: AgentId::from_string(agent_id),
                 })
             })
         }
@@ -652,6 +734,81 @@ mod mcp_tests {
     }
 
     #[tokio::test]
+    async fn create_agent_creates_assigns_and_starts_first_turn() {
+        let api = Arc::new(MockApi::default());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("ws-1"))
+            .with_caller_agent_id(Some(AgentId::from_string("agent-77")));
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                "params": {
+                    "name": "create_agent_workspace-mcp",
+                    "arguments": {
+                        "name": "Bug Fixer",
+                        "initialMessage": "fix the bug",
+                        "specialist": "implementor",
+                        "taskNoteId": "n-task"
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["ok"], json!(true));
+        assert_eq!(parsed["agentId"], json!("agent-child"));
+        assert_eq!(parsed["name"], json!("Bug Fixer"));
+
+        // The create op was parent-attributed to the MCP caller, carried the
+        // specialist through, and minted a fresh idempotency key.
+        let creates = api.agent_creates.lock().unwrap();
+        assert_eq!(creates.len(), 1);
+        let (name, specialist, parent, idem, metadata) = &creates[0];
+        assert_eq!(name.as_deref(), Some("Bug Fixer"));
+        assert_eq!(specialist.as_deref(), Some("implementor"));
+        assert_eq!(parent.as_deref(), Some("agent-77"));
+        assert!(idem.is_some(), "a fresh idempotency key is minted");
+        let meta = metadata.as_ref().expect("metadata block persisted");
+        assert_eq!(meta["createdByAgentId"], json!("agent-77"));
+        assert_eq!(meta["delegationDepth"], json!(1));
+        assert_eq!(meta["initialMessage"], json!("fix the bug"));
+        assert_eq!(meta["taskNoteId"], json!("n-task"));
+        assert_eq!(meta["isBackground"], json!(true));
+        drop(creates);
+
+        // The child was assigned to the supplied task note…
+        assert_eq!(
+            *api.assigned.lock().unwrap(),
+            vec![("n-task".to_string(), "agent-child".to_string())]
+        );
+        // …and its first turn was started via the initial message.
+        assert_eq!(
+            *api.sent.lock().unwrap(),
+            vec![("agent-child".to_string(), "fix the bug".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_agent_requires_name_and_initial_message() {
+        let api = Arc::new(MockApi::default());
+        let srv = server(api.clone());
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                "params": {
+                    "name": "create_agent_workspace-mcp",
+                    "arguments": { "name": "No Message" }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        assert!(api.agent_creates.lock().unwrap().is_empty());
+        assert!(api.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn notification_yields_no_response() {
         let srv = server(Arc::new(MockApi::default()));
         let resp = srv
@@ -688,6 +845,7 @@ mod mcp_tests {
             .collect();
         assert!(!names.contains(&"add_to_note_workspace-mcp".to_string()));
         assert!(!names.contains(&"delegate_task_workspace-mcp".to_string()));
+        assert!(!names.contains(&"create_agent_workspace-mcp".to_string()));
         // Read tools remain available.
         assert!(names.contains(&"get_note_workspace-mcp".to_string()));
 
@@ -1511,6 +1669,7 @@ mod tool_registry_tests {
         for required in [
             "list_notes_workspace-mcp",
             "add_to_note_workspace-mcp",
+            "create_agent_workspace-mcp",
             "delegate_task_workspace-mcp",
             "git_commit_workspace-mcp",
             "report_to_parent_workspace-mcp",
@@ -1857,10 +2016,9 @@ mod dispatch_unit_tests {
                 "create_prerequisite_workspace-mcp",
                 json!({ "noteId": "n", "title": "t", "content": "c", "status": "todo" }),
             ),
-            (
-                "assign_agent_workspace-mcp",
-                json!({ "noteId": "n", "agentId": "agent-1" }),
-            ),
+            // `assign_agent_workspace-mcp` is absent here: `MockApi` overrides
+            // `assign_agent` (for the create_agent tests), so its arm is proven
+            // by `assign_agent_arm_reaches_workspace_api` below instead.
             (
                 "add_note_comment_workspace-mcp",
                 json!({ "noteId": "n", "searchContext": "s", "commentTarget": "t", "comment": "c", "type": "comment", "author": "me" }),
@@ -1879,10 +2037,9 @@ mod dispatch_unit_tests {
                 "report_to_parent_workspace-mcp",
                 json!({ "report": "all done" }),
             ),
-            (
-                "send_message_to_agent_workspace-mcp",
-                json!({ "agentId": "agent-1", "message": "hi", "priority": "normal" }),
-            ),
+            // `send_message_to_agent_workspace-mcp` is absent here: `MockApi`
+            // overrides `agent_send_message` (for the create_agent tests), so
+            // its arm is proven by `send_message_arm_reaches_workspace_api`.
             (
                 "send_message_to_task_agent_workspace-mcp",
                 json!({ "taskNoteId": "tn", "message": "hi" }),
@@ -1933,6 +2090,38 @@ mod dispatch_unit_tests {
                 "{tool}: expected Internal default, got {resp}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn assign_agent_arm_reaches_workspace_api() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "assign_agent_workspace-mcp",
+            json!({ "noteId": "n", "agentId": "agent-1" }),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(
+            *api.assigned.lock().unwrap(),
+            vec![("n".to_string(), "agent-1".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_arm_reaches_workspace_api() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "send_message_to_agent_workspace-mcp",
+            json!({ "agentId": "agent-1", "message": "hi", "priority": "normal" }),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(
+            *api.sent.lock().unwrap(),
+            vec![("agent-1".to_string(), "hi".to_string())]
+        );
     }
 
     #[tokio::test]

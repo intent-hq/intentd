@@ -4,8 +4,8 @@
 
 use intent_core::model::AgentDelegateInput;
 use intent_core::{
-    AgentId, Error, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId,
-    NoteUpdateMetadataResult, Result, WorkspaceUpdate, MAX_DELEGATION_DEPTH,
+    AgentCreateExtra, AgentId, Error, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput,
+    NoteId, NoteUpdateMetadataResult, Result, WorkspaceUpdate, MAX_DELEGATION_DEPTH,
     WORKSPACE_STATUS_MESSAGE_MAX_LENGTH,
 };
 use serde::Serialize;
@@ -342,6 +342,119 @@ impl WorkspaceMcpServer {
                     .await)
             }
             // ---- Agent creation tools ----
+            // Port of the reference `CreateAgentTool`: create a managed child
+            // session via `agent.create` (parent-attributed to the MCP caller),
+            // then deliver the initial message so the child starts its first
+            // turn — mirroring `agent_delegate_op`'s create-then-send flow.
+            // `behaviorPrompt`/`taskNoteId` land on the persisted metadata
+            // block; `createLinkedNote`/`noteContent`/`parentNoteId` are
+            // accepted for wire parity but not acted on (linked-note creation
+            // is not ported).
+            "create_agent_workspace-mcp" => {
+                let name = req_str(args, "name")?;
+                let initial_message = req_str(args, "initialMessage")?;
+                // Depth guard (reference `MAX_DELEGATION_DEPTH`, mirroring the
+                // wake_or_create arm): the caller's persisted depth also seeds
+                // the child's `delegationDepth` (parent depth + 1).
+                let mut caller_depth = 0;
+                if let Some(caller) = self.caller_agent_id.clone() {
+                    if let Ok(caller_lite) = api.agent_get(caller, Some(ws.clone())).await {
+                        caller_depth = caller_lite.metadata.delegation_depth.unwrap_or(0);
+                    }
+                    if caller_depth >= MAX_DELEGATION_DEPTH {
+                        return Err(Error::InvalidParams(format!(
+                            "Cannot create sub-agent: maximum delegation depth ({MAX_DELEGATION_DEPTH}) reached. You are at depth {caller_depth}. Please complete this task directly instead of delegating further."
+                        )));
+                    }
+                }
+                let task_note_id = opt_str(args, "taskNoteId");
+                // Spawned agents are background by default (TS `CreateAgentTool`).
+                let is_background = opt_bool(args, "isBackground").unwrap_or(true);
+                let mut metadata = serde_json::Map::new();
+                metadata.insert(
+                    "initialMessage".to_string(),
+                    Value::String(initial_message.clone()),
+                );
+                metadata.insert("isBackground".to_string(), Value::Bool(is_background));
+                if let Some(caller) = &self.caller_agent_id {
+                    metadata.insert(
+                        "createdByAgentId".to_string(),
+                        Value::String(caller.as_str().to_string()),
+                    );
+                    metadata.insert("delegationDepth".to_string(), Value::from(caller_depth + 1));
+                }
+                if let Some(bp) = opt_str(args, "behaviorPrompt") {
+                    metadata.insert("behaviorPrompt".to_string(), Value::String(bp));
+                }
+                if let Some(tn) = &task_note_id {
+                    metadata.insert("taskNoteId".to_string(), Value::String(tn.clone()));
+                }
+                let extra = AgentCreateExtra {
+                    metadata: Some(Value::Object(metadata)),
+                    is_background: Some(is_background),
+                    ..AgentCreateExtra::default()
+                };
+                // `agent.create` is an idempotent method (TB-0 §5): mint a
+                // fresh key when the tool arguments carry none (same policy as
+                // `note.create`) rather than tripping the services-layer
+                // soft-launch warn.
+                let created = api
+                    .agent_create(
+                        ws.clone(),
+                        Some(name),
+                        opt_str(args, "model"),
+                        opt_str(args, "specialist"),
+                        self.caller_agent_id.clone(),
+                        opt_str(args, "idempotencyKey")
+                            .or_else(|| Some(uuid::Uuid::new_v4().to_string())),
+                        None,
+                        extra,
+                    )
+                    .await?;
+                let agent_id = created["agent"]["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let agent_name = created["agent"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                // Best-effort task assignment (delegate parity) when the
+                // caller supplied an existing task note.
+                if let Some(tn) = task_note_id {
+                    let _ = api
+                        .assign_agent(ws.clone(), NoteId::from_string(tn), agent_id.clone())
+                        .await;
+                }
+                // Deliver the initial message so the child actually starts its
+                // first turn (the services impl routes through the runtime
+                // `AgentManager`, exactly like `agent_delegate_op`). Delivery
+                // failure is non-fatal: the session already exists.
+                let child = AgentId::from(agent_id.as_str());
+                if let Err(e) = api
+                    .agent_send_message(
+                        ws,
+                        child,
+                        initial_message,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, error = %e, "create_agent: failed to start child turn");
+                }
+                val::<Value>(Ok(serde_json::json!({
+                    "ok": true,
+                    "agentId": agent_id,
+                    "name": agent_name,
+                })))
+            }
             // No idempotency key here: `agent.delegate` reaches the create op
             // directly inside services (an explicit internal caller), so it
             // never crosses the `agent.create` soft-launch warn.

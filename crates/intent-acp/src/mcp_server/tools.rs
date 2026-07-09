@@ -237,6 +237,24 @@ static ALL_TOOLS: &[ToolDef] = &[
     },
     // ---- Agent creation tools ----
     ToolDef {
+        name: "create_agent_workspace-mcp",
+        description: "Create a new agent to work on a task; it starts working immediately. \
+                      `createLinkedNote`/`noteContent`/`parentNoteId` are accepted for wire \
+                      parity but linked-note creation is not yet supported by the daemon.",
+        params: &[
+            p("name", "string", true),
+            p("initialMessage", "string", true),
+            p("taskNoteId", "string", false),
+            p("specialist", "string", false),
+            p("model", "string", false),
+            p("behaviorPrompt", "string", false),
+            p("isBackground", "boolean", false),
+            p("createLinkedNote", "boolean", false),
+            p("noteContent", "string", false),
+            p("parentNoteId", "string", false),
+        ],
+    },
+    ToolDef {
         name: "delegate_task_workspace-mcp",
         description: "Delegate a task to a new agent.",
         params: &[
