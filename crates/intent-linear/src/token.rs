@@ -13,12 +13,20 @@
 //! GUARDRAIL: the key is a secret. It is only ever read and handed to the
 //! HTTP client — never logged, echoed, or returned across the wire.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
+use tokio::time::timeout;
 
 /// Keychain service name used for `intentd` secrets.
 const KEYRING_SERVICE: &str = "intentd";
 /// Keychain account/key for the Linear API key (`linear.token`).
 const KEYRING_ACCOUNT: &str = "linear.token";
+/// Bounded wait for a keychain read before treating the entry as absent. A
+/// stuck OS keychain (e.g. a pending macOS auth prompt) would otherwise block
+/// the caller — and, historically, an entire tokio worker — indefinitely.
+/// Mirrors the read budget used by `intent-services::AsyncSecretStore`.
+const KEYCHAIN_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Strategy used to resolve the Linear API key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -34,19 +42,39 @@ pub enum TokenSource {
 }
 
 /// Resolve a key for the given strategy, or `None` if none is available.
-pub fn resolve(source: &TokenSource) -> Option<String> {
+/// Keychain reads run on the blocking pool with a bounded timeout so a wedged
+/// OS keychain never blocks the async runtime.
+pub async fn resolve(source: &TokenSource) -> Option<String> {
     match source {
-        TokenSource::Explicit => keyring_token(),
+        TokenSource::Explicit => keyring_token().await,
         TokenSource::Env => env_token(),
-        TokenSource::Auto => keyring_token().or_else(env_token),
+        TokenSource::Auto => match keyring_token().await {
+            Some(v) => Some(v),
+            None => env_token(),
+        },
     }
 }
 
 /// Read the key from the OS keychain. Any keychain error (missing entry,
 /// unavailable backend) resolves to `None` so resolution can fall through.
-fn keyring_token() -> Option<String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).ok()?;
-    entry.get_password().ok().and_then(non_empty)
+/// Runs on the blocking pool with a bounded timeout so a hung keychain
+/// (e.g. a pending macOS auth prompt) cannot wedge a tokio worker.
+async fn keyring_token() -> Option<String> {
+    let handle = tokio::task::spawn_blocking(|| {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).ok()?;
+        entry.get_password().ok()
+    });
+    match timeout(KEYCHAIN_LOAD_TIMEOUT, handle).await {
+        Ok(Ok(Some(v))) => non_empty(v),
+        Ok(Ok(None)) | Ok(Err(_)) => None,
+        Err(_) => {
+            tracing::warn!(
+                account = %KEYRING_ACCOUNT,
+                "keychain load timed out for linear token"
+            );
+            None
+        }
+    }
 }
 
 /// Read `LINEAR_API_KEY` from the environment.

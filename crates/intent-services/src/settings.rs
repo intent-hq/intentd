@@ -13,11 +13,11 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use intent_core::{Error, Result};
 use serde_json::{json, Map, Value};
-use tokio::task;
+use tokio::sync::watch;
 use tokio::time::timeout;
 
 use intent_store::Store;
@@ -30,14 +30,6 @@ const KEYRING_SERVICE: &str = "intentd";
 /// Placeholder returned for a sensitive setting that **has** a stored value, so
 /// the wire conveys presence without ever leaking the plaintext (§9.8).
 pub(crate) const REDACTED_PLACEHOLDER: &str = "********";
-
-/// Per-secret keychain-call timeout. The [`KeyringSecretStore`] wraps blocking
-/// OS-keychain FFI (`Security.framework` / `libsecret` / `wincred`), which can
-/// stall indefinitely — e.g. a locked/prompting keychain — and would otherwise
-/// hang the transport task servicing `settings.list` / `get` / `update` /
-/// `reset`. On timeout the operation is treated as "absent" for reads and
-/// surfaces `-32603` for writes so the response is never silently dropped.
-const SECRET_OP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Abstraction over secret persistence (the sensitive-setting analog of the
 /// transport's `TokenStore`). Production uses [`KeyringSecretStore`]; tests
@@ -109,6 +101,336 @@ impl SecretStore for InMemorySecretStore {
         self.map.lock().unwrap().remove(account);
         Ok(())
     }
+}
+
+/// Default bounded wait for a secret **read** before the caller gives up and the
+/// setting is reported as unset. A stuck OS keychain (e.g. a pending macOS auth
+/// prompt) would otherwise block the caller — and, historically, an entire
+/// tokio worker — indefinitely.
+const DEFAULT_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
+/// Default bounded wait for a secret **write** (`store` / `delete`). Longer than
+/// the read budget because a first-time write can prompt the user for keychain
+/// approval; still must not block the runtime forever.
+const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a load result (present or absent) is served from the in-process
+/// cache before the next call re-consults the backing keychain. Keeps
+/// `settings.list` cheap on the FE mount path without turning secret changes
+/// into a long propagation window.
+const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
+/// Rate-limit window per account for the `keychain load timed out` warning so
+/// a wedged Keychain doesn't drown the daemon log.
+const DEFAULT_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Async, single-flight, TTL-cached wrapper around a synchronous [`SecretStore`]
+/// so blocking OS keychain calls (macOS Security framework, etc.) never wedge
+/// the tokio runtime. Every backing call runs on the blocking pool via
+/// [`tokio::task::spawn_blocking`]; reads are bounded by a short timeout and
+/// coalesced per account via single-flight so a hung keychain occupies at most
+/// one blocking-pool thread total (not one per request). Cache entries are
+/// invalidated on successful writes and expire on TTL.
+pub(crate) struct AsyncSecretStore {
+    inner: Arc<dyn SecretStore>,
+    state: Arc<Mutex<AsyncState>>,
+    load_timeout: Duration,
+    write_timeout: Duration,
+    cache_ttl: Duration,
+    warn_interval: Duration,
+}
+
+/// Per-account async state: cached values (with expiry) and in-flight load
+/// registrations, plus rate-limit bookkeeping for the timeout warning and a
+/// monotonic counter used by the generation guard in [`AsyncSecretStore::spawn_load`].
+struct AsyncState {
+    entries: HashMap<String, Entry>,
+    last_warn: HashMap<String, Instant>,
+    /// Monotonic counter dispensing a unique `load_id` per in-flight load, so a
+    /// delayed spawn_blocking result can tell whether it still owns the slot.
+    next_load_id: u64,
+}
+
+/// One per-account cache slot: either an in-flight load that later resolvers
+/// can wait on, or a resolved value valid until `expires_at`.
+enum Entry {
+    /// A blocking load is in progress. `rx` receives `Some(value)` when the
+    /// spawn_blocking task finishes; `started_at` lets late waiters shrink their
+    /// remaining budget so the effective wait per caller stays bounded.
+    /// `load_id` uniquely tags this in-flight load so a delayed completion can
+    /// detect an intervening store/delete/newer load and refuse to clobber the
+    /// fresher slot.
+    InFlight {
+        rx: watch::Receiver<Option<Option<String>>>,
+        started_at: Instant,
+        load_id: u64,
+    },
+    /// A resolved value cached in-process; served without touching the keychain
+    /// until `expires_at`.
+    Cached {
+        value: Option<String>,
+        expires_at: Instant,
+    },
+}
+
+impl AsyncSecretStore {
+    /// Wrap `inner` with the production timeout/TTL defaults.
+    pub(crate) fn new(inner: Arc<dyn SecretStore>) -> Self {
+        Self::with_timings(
+            inner,
+            DEFAULT_LOAD_TIMEOUT,
+            DEFAULT_WRITE_TIMEOUT,
+            DEFAULT_CACHE_TTL,
+            DEFAULT_WARN_INTERVAL,
+        )
+    }
+
+    /// Wrap `inner` with explicit timings — used by tests to compress the
+    /// timeout / TTL windows so a full round-trip fits in a test budget.
+    pub(crate) fn with_timings(
+        inner: Arc<dyn SecretStore>,
+        load_timeout: Duration,
+        write_timeout: Duration,
+        cache_ttl: Duration,
+        warn_interval: Duration,
+    ) -> Self {
+        Self {
+            inner,
+            state: Arc::new(Mutex::new(AsyncState {
+                entries: HashMap::new(),
+                last_warn: HashMap::new(),
+                next_load_id: 0,
+            })),
+            load_timeout,
+            write_timeout,
+            cache_ttl,
+            warn_interval,
+        }
+    }
+
+    /// Read the secret for `account`, returning `None` on absent / timeout /
+    /// backing-error. Concurrent callers for the same `account` are coalesced
+    /// into a single spawn_blocking; a cached result is served without touching
+    /// the keychain until it expires.
+    pub(crate) async fn load(&self, account: &str) -> Option<String> {
+        let action = {
+            let mut state = self.state.lock().unwrap();
+            match state.entries.get(account) {
+                Some(Entry::Cached { value, expires_at }) if *expires_at > Instant::now() => {
+                    return value.clone();
+                }
+                Some(Entry::InFlight { rx, started_at, .. }) => LoadAction::Wait {
+                    rx: rx.clone(),
+                    started_at: *started_at,
+                },
+                _ => {
+                    let (tx, rx) = watch::channel::<Option<Option<String>>>(None);
+                    let started_at = Instant::now();
+                    let load_id = state.next_load_id;
+                    state.next_load_id = state.next_load_id.wrapping_add(1);
+                    state.entries.insert(
+                        account.to_string(),
+                        Entry::InFlight {
+                            rx: rx.clone(),
+                            started_at,
+                            load_id,
+                        },
+                    );
+                    LoadAction::Start { tx, rx, load_id }
+                }
+            }
+        };
+        match action {
+            LoadAction::Wait { mut rx, started_at } => {
+                let remaining = self.load_timeout.saturating_sub(started_at.elapsed());
+                self.await_load(account, &mut rx, remaining).await
+            }
+            LoadAction::Start {
+                tx,
+                mut rx,
+                load_id,
+            } => {
+                self.spawn_load(account.to_string(), tx, load_id);
+                self.await_load(account, &mut rx, self.load_timeout).await
+            }
+        }
+    }
+
+    /// Persist `value` for `account`. Runs the blocking write off the async
+    /// runtime with a bounded timeout, then refreshes the cache slot so
+    /// subsequent `load` calls observe the new value without re-hitting the
+    /// keychain. Timeouts / backing errors surface as [`Error::Internal`].
+    pub(crate) async fn store(&self, account: &str, value: &str) -> Result<()> {
+        let inner = self.inner.clone();
+        let account_owned = account.to_string();
+        let value_owned = value.to_string();
+        let handle = tokio::task::spawn_blocking(move || inner.store(&account_owned, &value_owned));
+        match timeout(self.write_timeout, handle).await {
+            Ok(Ok(Ok(()))) => {
+                self.set_cached(account, Some(value.to_string()));
+                Ok(())
+            }
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(join_err)) => Err(Error::Internal(format!(
+                "keychain write task panicked: {join_err}"
+            ))),
+            Err(_) => {
+                self.warn_timeout(account, "keychain write timed out");
+                Err(Error::Internal(format!(
+                    "keychain write timed out for {account}"
+                )))
+            }
+        }
+    }
+
+    /// Delete the stored secret for `account`. Runs the blocking delete off the
+    /// async runtime with a bounded timeout, then updates the cache to reflect
+    /// absence. Absent secrets are idempotent successes per [`SecretStore`].
+    pub(crate) async fn delete(&self, account: &str) -> Result<()> {
+        let inner = self.inner.clone();
+        let account_owned = account.to_string();
+        let handle = tokio::task::spawn_blocking(move || inner.delete(&account_owned));
+        match timeout(self.write_timeout, handle).await {
+            Ok(Ok(Ok(()))) => {
+                self.set_cached(account, None);
+                Ok(())
+            }
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(join_err)) => Err(Error::Internal(format!(
+                "keychain delete task panicked: {join_err}"
+            ))),
+            Err(_) => {
+                self.warn_timeout(account, "keychain delete timed out");
+                Err(Error::Internal(format!(
+                    "keychain delete timed out for {account}"
+                )))
+            }
+        }
+    }
+
+    /// Kick off the blocking load for `account`, publishing the result via `tx`
+    /// and swapping the InFlight slot for a Cached one so subsequent callers
+    /// short-circuit. Runs to completion even after every awaiting caller has
+    /// timed out — that's the point: only ONE blocking-pool thread per account.
+    /// The `load_id` generation guard ensures a delayed completion does NOT
+    /// overwrite a slot that an intervening `store` / `delete` / newer load
+    /// already refreshed: the write only happens if the slot is still the
+    /// InFlight tagged with `load_id`.
+    fn spawn_load(&self, account: String, tx: watch::Sender<Option<Option<String>>>, load_id: u64) {
+        let inner = self.inner.clone();
+        let state = self.state.clone();
+        let ttl = self.cache_ttl;
+        tokio::spawn(async move {
+            let load_account = account.clone();
+            let result: Option<String> =
+                tokio::task::spawn_blocking(move || inner.load(&load_account))
+                    .await
+                    .unwrap_or_default();
+            {
+                let mut guard = state.lock().unwrap();
+                let still_ours = matches!(
+                    guard.entries.get(&account),
+                    Some(Entry::InFlight { load_id: id, .. }) if *id == load_id,
+                );
+                if still_ours {
+                    guard.entries.insert(
+                        account.clone(),
+                        Entry::Cached {
+                            value: result.clone(),
+                            expires_at: Instant::now() + ttl,
+                        },
+                    );
+                }
+            }
+            let _ = tx.send(Some(result));
+        });
+    }
+
+    /// Wait up to `remaining` for the in-flight load to publish a value; on
+    /// timeout return `None` (the current caller gives up but the underlying
+    /// blocking task keeps running and will populate the cache when it
+    /// eventually completes).
+    async fn await_load(
+        &self,
+        account: &str,
+        rx: &mut watch::Receiver<Option<Option<String>>>,
+        remaining: Duration,
+    ) -> Option<String> {
+        if let Some(v) = rx.borrow().clone() {
+            return v;
+        }
+        if remaining.is_zero() {
+            self.warn_timeout(account, "keychain load timed out");
+            return None;
+        }
+        let start = Instant::now();
+        loop {
+            let left = remaining.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                self.warn_timeout(account, "keychain load timed out");
+                return None;
+            }
+            match timeout(left, rx.changed()).await {
+                Ok(Ok(())) => {
+                    if let Some(v) = rx.borrow().clone() {
+                        return v;
+                    }
+                }
+                Ok(Err(_)) => return None,
+                Err(_) => {
+                    self.warn_timeout(account, "keychain load timed out");
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Replace the cache slot for `account` with a fresh Cached entry (used by
+    /// writes to reflect the just-persisted state, so a follow-up load doesn't
+    /// have to hit the keychain again).
+    fn set_cached(&self, account: &str, value: Option<String>) {
+        let mut guard = self.state.lock().unwrap();
+        guard.entries.insert(
+            account.to_string(),
+            Entry::Cached {
+                value,
+                expires_at: Instant::now() + self.cache_ttl,
+            },
+        );
+    }
+
+    /// Emit a rate-limited WARN naming `account` when a keychain call times
+    /// out, so a wedged Keychain surfaces in the daemon log without spamming.
+    fn warn_timeout(&self, account: &str, msg: &str) {
+        let should = {
+            let mut guard = self.state.lock().unwrap();
+            let now = Instant::now();
+            match guard.last_warn.get(account) {
+                Some(prev) if now.duration_since(*prev) < self.warn_interval => false,
+                _ => {
+                    guard.last_warn.insert(account.to_string(), now);
+                    true
+                }
+            }
+        };
+        if should {
+            tracing::warn!(account = %account, "{msg}");
+        }
+    }
+}
+
+/// Internal choice returned by the entry-map probe in [`AsyncSecretStore::load`].
+enum LoadAction {
+    /// A load is already in flight; wait on the existing receiver.
+    Wait {
+        rx: watch::Receiver<Option<Option<String>>>,
+        started_at: Instant,
+    },
+    /// No load in flight; the current caller registered a new InFlight slot
+    /// (tagged with `load_id`) and now owns the spawn_blocking / notify
+    /// responsibility.
+    Start {
+        tx: watch::Sender<Option<Option<String>>>,
+        rx: watch::Receiver<Option<Option<String>>>,
+        load_id: u64,
+    },
 }
 
 /// The value-type vocabulary of a [`SettingDefinition`] (PROTOCOL §5.12).
@@ -455,12 +777,11 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "workspace",
             None,
         ),
-        string(
+        secret(
             "workspace.sshKeyPath",
             "SSH key path",
             "Path to the SSH key used for git",
             "workspace",
-            None,
         ),
         string(
             "workspace.defaultShell",
@@ -504,41 +825,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "External MCP server configs (secrets in keychain)",
             "mcp",
         ),
-        // --- Group A: user notifications --------------------------------------
-        // Ports the FE `notificationSettings` electron-store bag (four fields
-        // surfaced individually via the FE app-settings schema `notifications.*`
-        // paths) so the daemon owns the persisted notification user prefs and
-        // the legacy `settings` electron-store can retire (§9.8 group A).
-        boolean(
-            "notifications.enabled",
-            "Notifications enabled",
-            "Whether app notifications are enabled",
-            "notifications",
-            true,
-        ),
-        boolean(
-            "notifications.soundEnabled",
-            "Notification sounds",
-            "Whether notification sounds are enabled",
-            "notifications",
-            true,
-        ),
-        boolean(
-            "notifications.soundOnlyWhenUnfocused",
-            "Sound only when unfocused",
-            "Only play notification sounds when the app is unfocused",
-            "notifications",
-            true,
-        ),
-        number(
-            "notifications.volume",
-            "Notification volume",
-            "Notification sound volume from 0 to 1",
-            "notifications",
-            Some(0.0),
-            Some(1.0),
-            0.5,
-        ),
         // --- Group B: server / transport ------------------------------------
         enumerated(
             "server.listenMode",
@@ -569,7 +855,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "server",
             Some(1024.0),
             Some(65535.0),
-            5181.0,
+            5180.0,
         ),
         boolean(
             "server.tls.enabled",
@@ -629,121 +915,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "GitHub (Enterprise) API base",
             "sourceControl",
             Some("https://api.github.com"),
-        ),
-        // --- Group A: Linear integration --------------------------------------
-        secret(
-            "linear.token",
-            "Linear API key",
-            "API key used by the Linear integration",
-            "linear",
-        ),
-        // --- Group A: Sentry account -----------------------------------------
-        secret(
-            "accounts.sentry.token",
-            "Sentry API token",
-            "API token used by the Sentry integration",
-            "accounts",
-        ),
-        string(
-            "accounts.sentry.organization",
-            "Sentry organization",
-            "Sentry organization slug (non-secret companion of accounts.sentry.token)",
-            "accounts",
-            None,
-        ),
-        // --- Group A: primary AI provider config ------------------------------
-        // Ports the FE `workspace-config` `config.ai.*` blob so the daemon owns
-        // the provider knobs the FE previously stored in electron-store.
-        // `ai.apiToken` is a **secret**; the rest are plain settings.
-        secret(
-            "ai.apiToken",
-            "AI provider API token",
-            "Bearer token used by the primary AI provider",
-            "ai",
-        ),
-        string(
-            "ai.apiUrl",
-            "AI provider API URL",
-            "Base URL for the primary AI provider",
-            "ai",
-            None,
-        ),
-        string("ai.model", "AI model", "Default AI model", "ai", None),
-        number(
-            "ai.temperature",
-            "AI temperature",
-            "Sampling temperature for the primary AI provider",
-            "ai",
-            Some(0.0),
-            Some(2.0),
-            0.7,
-        ),
-        number(
-            "ai.maxTokens",
-            "AI max tokens",
-            "Maximum tokens per completion for the primary AI provider",
-            "ai",
-            Some(1.0),
-            None,
-            4096.0,
-        ),
-        number(
-            "ai.streamingSpeed",
-            "AI streaming speed",
-            "Streaming pacing hint (tokens per second; 0 = no throttle)",
-            "ai",
-            Some(0.0),
-            None,
-            0.0,
-        ),
-        // --- Group A: persisted permission rules ------------------------------
-        // Port of the FE `ConfigManager` `config.permissions.rules` bag: an array
-        // of command allow/deny/ask entries with optional expiries. Structure is
-        // opaque here; the runtime enforcement path validates entries.
-        object(
-            "permissions.rules",
-            "Command permission rules",
-            "Persisted command allow/deny/ask rules",
-            "permissions",
-            Some(json!([])),
-        ),
-        // --- Group A: user + workspace prompt-rules ---------------------------
-        // Ports of `ConfigManager` `config.userRules` and `config.workspaceRules`:
-        // free-form content injected into agent system prompts. Kept as opaque
-        // objects here; the prompt-assembly pipeline validates internal shape.
-        object(
-            "userRules",
-            "User rules",
-            "Global user prompt-rule content injected into agent system prompts",
-            "rules",
-            Some(json!({})),
-        ),
-        object(
-            "workspaceRules",
-            "Workspace rules",
-            "Workspace-scoped prompt-rule content injected into agent system prompts",
-            "rules",
-            Some(json!({})),
-        ),
-        // --- Group A: cross-workspace known repos -----------------------------
-        // Port of the FE `repo-registry` electron-store: the ordered list of
-        // recently used repositories the FE surfaces in "recent repos" UI.
-        object(
-            "repos.known",
-            "Known repositories",
-            "Recently used repositories tracked across workspaces",
-            "repos",
-            Some(json!([])),
-        ),
-        // --- Group A: persisted workspace change history ----------------------
-        // Port of the FE default `config.json` `changeHistory` bag: per-workspace
-        // durable diff summaries the FE renders in the change-history UI.
-        object(
-            "workspace.changeHistory",
-            "Workspace change history",
-            "Per-workspace persisted diff summaries",
-            "workspace",
-            Some(json!({})),
         ),
         // --- Group B: context engine ----------------------------------------
         boolean(
@@ -811,19 +982,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
     ]
 }
 
-/// Read the effective `workspace.branchPrefix` (default empty) — prepended to
-/// auto-generated workspace branch names (TS `getBranchPrefix` parity). A
-/// missing/garbled row means "no prefix".
-pub(crate) async fn branch_prefix(store: &Store) -> String {
-    match store.get_setting("workspace.branchPrefix").await {
-        Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_default(),
-        _ => String::new(),
-    }
-}
-
 /// Read the effective `git.autoCommit` flag (default `true`) — the gate behind
 /// `assert_agent_commit_allowed` (§9.8 OQ#2). A missing/garbled row defaults to
 /// the permissive `true` so the established auto-commit behavior is preserved.
@@ -837,82 +995,29 @@ pub(crate) async fn auto_commit_enabled(store: &Store) -> bool {
     }
 }
 
+/// Read the effective `workspace.branchPrefix` (default empty) — prepended to
+/// auto-generated workspace branch names (TS `getBranchPrefix` parity). A
+/// missing/garbled row means "no prefix".
+pub(crate) async fn branch_prefix(store: &Store) -> String {
+    match store.get_setting("workspace.branchPrefix").await {
+        Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// Stateless executor for the `settings.*` namespace over a [`Store`] +
-/// [`SecretStore`]. Construct one per call from the long-lived `Services`.
-///
-/// The [`SecretStore`] is held as an `Arc` so its blocking keychain FFI calls
-/// can be moved into [`tokio::task::spawn_blocking`] with a timeout — without
-/// that offload a stalling keychain (locked, prompting, or otherwise) would
-/// hang the transport task servicing `settings.*` and the response would never
-/// reach the wire.
+/// [`AsyncSecretStore`]. Construct one per call from the long-lived `Services`.
 pub(crate) struct SettingsService<'a> {
     store: &'a Store,
-    secrets: Arc<dyn SecretStore>,
+    secrets: &'a AsyncSecretStore,
 }
 
 impl<'a> SettingsService<'a> {
-    pub(crate) fn new(store: &'a Store, secrets: Arc<dyn SecretStore>) -> Self {
+    pub(crate) fn new(store: &'a Store, secrets: &'a AsyncSecretStore) -> Self {
         Self { store, secrets }
-    }
-
-    /// Probe the keychain for `path` without blocking the runtime.
-    ///
-    /// Runs [`SecretStore::load`] on a blocking thread with a
-    /// [`SECRET_OP_TIMEOUT`] budget: on timeout or panic the setting is
-    /// treated as absent (returns `false`) so `settings.list` / `get` still
-    /// respond promptly — a stalled OS keychain must never silently drop a
-    /// well-formed JSON-RPC response.
-    async fn secret_present(&self, path: &'static str) -> bool {
-        let secrets = Arc::clone(&self.secrets);
-        let handle = task::spawn_blocking(move || secrets.load(path).is_some());
-        match timeout(SECRET_OP_TIMEOUT, handle).await {
-            Ok(Ok(present)) => present,
-            Ok(Err(e)) => {
-                tracing::warn!(setting = path, error = %e, "secret load panicked");
-                false
-            }
-            Err(_) => {
-                tracing::warn!(
-                    setting = path,
-                    timeout_ms = SECRET_OP_TIMEOUT.as_millis() as u64,
-                    "secret load timed out — reporting absent",
-                );
-                false
-            }
-        }
-    }
-
-    /// Persist `value` for the given sensitive `path` via [`SecretStore::store`]
-    /// off the runtime, subject to [`SECRET_OP_TIMEOUT`]. A timeout or panic
-    /// surfaces as [`Error::Internal`] → `-32603` so callers always get a
-    /// terminal JSON-RPC response instead of silence.
-    async fn secret_store(&self, path: &'static str, value: String) -> Result<()> {
-        let secrets = Arc::clone(&self.secrets);
-        let handle = task::spawn_blocking(move || secrets.store(path, &value));
-        match timeout(SECRET_OP_TIMEOUT, handle).await {
-            Ok(Ok(res)) => res,
-            Ok(Err(e)) => Err(Error::Internal(format!("secret store panicked: {e}"))),
-            Err(_) => Err(Error::Internal(format!(
-                "keychain write timed out after {}ms",
-                SECRET_OP_TIMEOUT.as_millis()
-            ))),
-        }
-    }
-
-    /// Delete the secret at `path` via [`SecretStore::delete`] off the runtime,
-    /// subject to [`SECRET_OP_TIMEOUT`]. Timeout / panic surfaces as
-    /// [`Error::Internal`] so `settings.reset` never hangs the transport.
-    async fn secret_delete(&self, path: &'static str) -> Result<()> {
-        let secrets = Arc::clone(&self.secrets);
-        let handle = task::spawn_blocking(move || secrets.delete(path));
-        match timeout(SECRET_OP_TIMEOUT, handle).await {
-            Ok(Ok(res)) => res,
-            Ok(Err(e)) => Err(Error::Internal(format!("secret delete panicked: {e}"))),
-            Err(_) => Err(Error::Internal(format!(
-                "keychain delete timed out after {}ms",
-                SECRET_OP_TIMEOUT.as_millis()
-            ))),
-        }
     }
 
     /// The current value for a definition: sensitive settings are **redacted**
@@ -920,7 +1025,7 @@ impl<'a> SettingsService<'a> {
     /// non-secret settings come from the DB, falling back to the default.
     async fn current_value(&self, def: &SettingDefinition) -> Value {
         if def.sensitive {
-            if self.secret_present(def.path).await {
+            if self.secrets.load(def.path).await.is_some() {
                 json!(REDACTED_PLACEHOLDER)
             } else {
                 Value::Null
@@ -934,62 +1039,11 @@ impl<'a> SettingsService<'a> {
     }
 
     /// `settings.list` → `{ settings: SettingDefinitionWithValue[] }` (§5.12).
-    ///
-    /// Sensitive-setting presence probes are launched **concurrently** so the
-    /// worst-case latency is one [`SECRET_OP_TIMEOUT`], not `N × timeout`. A
-    /// stalled OS keychain therefore bounds the whole call to a single budget
-    /// instead of accumulating across every sensitive definition.
     pub(crate) async fn list(&self) -> Result<Value> {
         let defs = definitions();
-        // Launch each sensitive probe first so their timeouts run in parallel.
-        let mut sensitive: Vec<(&'static str, tokio::task::JoinHandle<bool>)> = Vec::new();
-        for def in &defs {
-            if def.sensitive {
-                let secrets = Arc::clone(&self.secrets);
-                let path = def.path;
-                let handle = task::spawn(async move {
-                    let inner = task::spawn_blocking(move || secrets.load(path).is_some());
-                    match timeout(SECRET_OP_TIMEOUT, inner).await {
-                        Ok(Ok(present)) => present,
-                        Ok(Err(e)) => {
-                            tracing::warn!(setting = path, error = %e, "secret load panicked");
-                            false
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                setting = path,
-                                timeout_ms = SECRET_OP_TIMEOUT.as_millis() as u64,
-                                "secret load timed out — reporting absent",
-                            );
-                            false
-                        }
-                    }
-                });
-                sensitive.push((def.path, handle));
-            }
-        }
-        // Collect all sensitive results — panics fall back to "absent" so the
-        // wire response is always well-formed.
-        let mut presence: HashMap<&'static str, bool> = HashMap::with_capacity(sensitive.len());
-        for (path, handle) in sensitive {
-            let present = handle.await.unwrap_or(false);
-            presence.insert(path, present);
-        }
-
         let mut out = Vec::with_capacity(defs.len());
         for def in &defs {
-            let value = if def.sensitive {
-                if presence.get(def.path).copied().unwrap_or(false) {
-                    json!(REDACTED_PLACEHOLDER)
-                } else {
-                    Value::Null
-                }
-            } else {
-                match self.store.get_setting(def.path).await {
-                    Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or(Value::Null),
-                    _ => def.default_value.clone().unwrap_or(Value::Null),
-                }
-            };
+            let value = self.current_value(def).await;
             let mut obj = def.definition_json();
             if let Some(map) = obj.as_object_mut() {
                 map.insert("value".into(), value);
@@ -1044,7 +1098,7 @@ impl<'a> SettingsService<'a> {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                self.secret_store(def.path, secret_value).await?;
+                self.secrets.store(def.path, &secret_value).await?;
                 applied.push(json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }));
             } else {
                 let raw = serde_json::to_string(&value)
@@ -1062,7 +1116,7 @@ impl<'a> SettingsService<'a> {
         let def = find_definition(path)
             .ok_or_else(|| Error::InvalidParams(format!("unknown setting: {path}")))?;
         if def.sensitive {
-            self.secret_delete(def.path).await?;
+            self.secrets.delete(def.path).await?;
         } else {
             self.store.delete_setting(def.path).await?;
         }
@@ -1073,296 +1127,290 @@ impl<'a> SettingsService<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+    use std::thread;
+    use std::time::Duration;
+
     use super::*;
 
-    /// `linear.token` must be a sensitive catalog entry so `settings.update`
-    /// persists it to the keychain under service `intentd` / account
-    /// `linear.token` (account = setting path) — the exact entry
-    /// `intent-linear`'s token resolver reads.
-    #[test]
-    fn linear_token_is_a_sensitive_catalog_entry() {
-        let def = find_definition("linear.token").expect("linear.token missing from catalog");
-        assert_eq!(def.path, "linear.token", "keychain account = setting path");
-        assert!(
-            def.sensitive,
-            "must persist to keychain + redact on the wire"
-        );
-        assert!(!def.read_only);
-        assert_eq!(def.category, "linear");
-        assert!(matches!(def.ty, SettingType::String));
-        assert!(def.default_value.is_none());
+    /// A `SecretStore` whose `load` blocks forever (well past any test budget).
+    /// Used to prove that the async wrapper's timeout + single-flight actually
+    /// keep the async runtime free when the keychain wedges.
+    #[derive(Default)]
+    struct BlockingSecretStore {
+        load_calls: AtomicUsize,
     }
 
-    /// `accounts.sentry.token` and `ai.apiToken` — the two secret catalog gaps
-    /// closed for R0-4 — must be sensitive so `settings.update` persists them to
-    /// the keychain under service `intentd` / account = setting path (never the
-    /// DB) and every wire read (`settings.list` / `settings.get`) redacts them
-    /// to a placeholder or `null` when unset.
-    #[test]
-    fn new_secret_catalog_entries_are_sensitive() {
-        for path in ["accounts.sentry.token", "ai.apiToken"] {
-            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
-            assert_eq!(def.path, path);
-            assert!(def.sensitive, "{path} must be a sensitive catalog entry");
-            assert!(!def.read_only, "{path} must not be read-only");
-            assert!(matches!(def.ty, SettingType::String));
-            assert!(def.default_value.is_none(), "{path} default is null");
-        }
-    }
-
-    /// `workspace.sshKeyPath` is a **plain non-secret** path setting: the value
-    /// is a filesystem path pointing at the key, not key material — the real
-    /// secret is the key file on disk. Marking the catalog entry as sensitive
-    /// makes `settings.get` return the redaction placeholder, which
-    /// permanently breaks the FE `git`-env consumer (`app-settings.service.ts`
-    /// `getSshKeyPath` must read the real path back to hand it to `git`).
-    #[test]
-    fn ssh_key_path_is_a_plain_non_secret_string() {
-        let def = find_definition("workspace.sshKeyPath").expect("workspace.sshKeyPath missing");
-        assert!(
-            !def.sensitive,
-            "workspace.sshKeyPath is a path setting, not key material"
-        );
-        assert!(!def.read_only);
-        assert_eq!(def.category, "workspace");
-        assert!(matches!(def.ty, SettingType::String));
-        assert!(def.default_value.is_none());
-    }
-
-    /// The non-secret companion of `accounts.sentry.token` lives beside it in
-    /// the `accounts` category with no default (the FE opts in per install).
-    #[test]
-    fn sentry_organization_is_a_plain_string_setting() {
-        let def =
-            find_definition("accounts.sentry.organization").expect("sentry organization missing");
-        assert!(!def.sensitive);
-        assert!(matches!(def.ty, SettingType::String));
-        assert_eq!(def.category, "accounts");
-        assert!(def.default_value.is_none());
-    }
-
-    /// The non-secret half of the `ai.*` group (URL / model / temperature /
-    /// maxTokens / streamingSpeed) ports the FE `workspace-config` `config.ai.*`
-    /// blob one-to-one; `temperature` carries the documented 0..=2 clamp and
-    /// `maxTokens` / `streamingSpeed` refuse negative values.
-    #[test]
-    fn ai_non_secret_group_matches_fe_shape() {
-        for (path, default_present) in [
-            ("ai.apiUrl", false),
-            ("ai.model", false),
-            ("ai.temperature", true),
-            ("ai.maxTokens", true),
-            ("ai.streamingSpeed", true),
-        ] {
-            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
-            assert!(!def.sensitive, "{path} is non-secret");
-            assert_eq!(def.category, "ai");
-            assert_eq!(
-                def.default_value.is_some(),
-                default_present,
-                "{path} default presence"
-            );
-        }
-        let temp = find_definition("ai.temperature").unwrap();
-        assert!(matches!(
-            temp.ty,
-            SettingType::Number {
-                min: Some(0.0),
-                max: Some(2.0),
-            }
-        ));
-        for path in ["ai.maxTokens", "ai.streamingSpeed"] {
-            let def = find_definition(path).unwrap();
-            let min = match def.ty {
-                SettingType::Number { min, .. } => min,
-                _ => panic!("{path} must be a Number"),
-            };
-            assert!(
-                min.map(|m| m >= 0.0).unwrap_or(false),
-                "{path} must reject negative values"
-            );
-        }
-    }
-
-    /// The five non-secret gap entries live in the catalog as opaque `Object`
-    /// settings with a documented default. Each is validated by shape only;
-    /// downstream consumers own the internal schema (permission rules, prompt
-    /// rules, known repos, change-history bags).
-    #[test]
-    fn non_secret_object_gap_entries_have_defaults() {
-        for path in [
-            "permissions.rules",
-            "userRules",
-            "workspaceRules",
-            "repos.known",
-            "workspace.changeHistory",
-        ] {
-            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
-            assert!(!def.sensitive, "{path} must be non-secret");
-            assert!(
-                matches!(def.ty, SettingType::Object),
-                "{path} must be Object"
-            );
-            assert!(def.default_value.is_some(), "{path} has a default");
-        }
-    }
-
-    /// Ports the FE `notificationSettings` electron-store bag as four
-    /// individually-addressable, non-secret catalog entries under the
-    /// `notifications` category. `notifications.volume` carries a documented
-    /// `0.0..=1.0` clamp so out-of-range writes surface as `-32602`.
-    #[test]
-    fn notifications_catalog_entries_match_fe_shape() {
-        for (path, expect_bool, default) in [
-            ("notifications.enabled", true, json!(true)),
-            ("notifications.soundEnabled", true, json!(true)),
-            ("notifications.soundOnlyWhenUnfocused", true, json!(true)),
-            ("notifications.volume", false, json!(0.5)),
-        ] {
-            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
-            assert!(!def.sensitive, "{path} must be non-secret");
-            assert!(!def.read_only, "{path} must not be read-only");
-            assert_eq!(def.category, "notifications");
-            assert_eq!(def.default_value.as_ref(), Some(&default));
-            if expect_bool {
-                assert!(
-                    matches!(def.ty, SettingType::Boolean),
-                    "{path} must be Boolean"
-                );
-            } else {
-                assert!(
-                    matches!(
-                        def.ty,
-                        SettingType::Number {
-                            min: Some(0.0),
-                            max: Some(1.0),
-                        }
-                    ),
-                    "{path} must be a Number clamped to 0..=1"
-                );
-            }
-        }
-    }
-
-    /// A [`SecretStore`] whose `load` blocks the calling thread for `hang_for`
-    /// before returning `None` — models a locked / prompting OS keychain that
-    /// used to hang `settings.list` indefinitely.
-    #[derive(Debug)]
-    struct HangingSecretStore {
-        hang_for: Duration,
-    }
-    impl SecretStore for HangingSecretStore {
+    impl SecretStore for BlockingSecretStore {
         fn load(&self, _account: &str) -> Option<String> {
-            std::thread::sleep(self.hang_for);
+            self.load_calls.fetch_add(1, Ordering::SeqCst);
+            // Long enough to outlive the wrapper's compressed test timeout so
+            // callers observe the timeout branch, but short enough that the
+            // tokio runtime's blocking-pool shutdown at end-of-test doesn't
+            // hold up the whole test binary.
+            thread::sleep(Duration::from_millis(500));
             None
         }
         fn store(&self, _account: &str, _value: &str) -> Result<()> {
-            std::thread::sleep(self.hang_for);
             Ok(())
         }
         fn delete(&self, _account: &str) -> Result<()> {
-            std::thread::sleep(self.hang_for);
             Ok(())
         }
     }
 
-    /// Regression: a stalled OS keychain (e.g. locked, prompting) MUST NOT hang
-    /// `settings.list`. Each sensitive setting is bounded by
-    /// [`SECRET_OP_TIMEOUT`] and, on timeout, reads as `null` (absent) so the
-    /// response reaches the wire — never a silent drop over WS/UDS.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn settings_list_survives_a_hung_keychain() {
-        let tmp =
-            std::env::temp_dir().join(format!("intentd-settings-hang-{}.db", uuid::Uuid::new_v4()));
-        let store = Store::open(&tmp).await.expect("open store");
-        // Hang for well over the per-op budget so a naive implementation would
-        // stall for `N_sensitive * hang_for` seconds and blow past the test's
-        // outer timeout.
-        let secrets: Arc<dyn SecretStore> = Arc::new(HangingSecretStore {
-            hang_for: Duration::from_secs(30),
-        });
-        let svc = SettingsService::new(&store, secrets);
+    /// A `SecretStore` that counts `load` calls so tests can verify cache hits.
+    #[derive(Default)]
+    struct CountingSecretStore {
+        load_calls: AtomicUsize,
+        value: Mutex<Option<String>>,
+    }
 
-        let started = std::time::Instant::now();
-        // Outer cap: sensitive probes fan out concurrently, so total latency
-        // is bounded by ONE `SECRET_OP_TIMEOUT` — well under the 30-second
-        // per-call stall the store models. A small slack absorbs task-spawn
-        // overhead on cold runners.
-        let cap = SECRET_OP_TIMEOUT + Duration::from_secs(2);
-        let list = timeout(cap, svc.list())
-            .await
-            .expect("settings.list must not hang when the keychain stalls")
-            .expect("settings.list must not return a domain error");
-        let elapsed = started.elapsed();
-
-        // Every sensitive entry MUST redact to `null` (absent) — the timed-out
-        // load is treated as "not present" so the response is well-formed.
-        let arr = list["settings"].as_array().expect("settings array");
-        let mut sensitive_seen = 0;
-        for entry in arr {
-            if entry["sensitive"] == json!(true) {
-                sensitive_seen += 1;
-                assert_eq!(
-                    entry["value"],
-                    Value::Null,
-                    "hung keychain must read as absent for {}: {entry}",
-                    entry["path"],
-                );
-            }
+    impl SecretStore for CountingSecretStore {
+        fn load(&self, _account: &str) -> Option<String> {
+            self.load_calls.fetch_add(1, Ordering::SeqCst);
+            self.value.lock().unwrap().clone()
         }
-        assert!(sensitive_seen > 0, "catalog must contain sensitive entries");
-        assert!(
-            elapsed < cap,
-            "settings.list took {elapsed:?} — timeout cap was {cap:?}",
-        );
-
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
-                "{}{suffix}",
-                tmp.display()
-            )));
+        fn store(&self, _account: &str, value: &str) -> Result<()> {
+            *self.value.lock().unwrap() = Some(value.to_string());
+            Ok(())
+        }
+        fn delete(&self, _account: &str) -> Result<()> {
+            *self.value.lock().unwrap() = None;
+            Ok(())
         }
     }
 
-    /// Regression: `settings.update` on a sensitive path with a stalled
-    /// keychain MUST surface `Error::Internal` (→ `-32603`) instead of hanging
-    /// the transport task — the write path is symmetric with the read path.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn settings_update_secret_times_out_on_hung_keychain() {
-        let tmp = std::env::temp_dir().join(format!(
-            "intentd-settings-hang-update-{}.db",
-            uuid::Uuid::new_v4()
-        ));
-        let store = Store::open(&tmp).await.expect("open store");
-        let secrets: Arc<dyn SecretStore> = Arc::new(HangingSecretStore {
-            hang_for: Duration::from_secs(30),
-        });
-        let svc = SettingsService::new(&store, secrets);
+    /// A `SecretStore` whose `load` waits on a barrier so tests can hold ONE
+    /// call in flight while probing single-flight semantics.
+    struct BarrierSecretStore {
+        load_calls: AtomicUsize,
+        barrier: Arc<Barrier>,
+    }
 
-        let started = std::time::Instant::now();
-        let cap = SECRET_OP_TIMEOUT + Duration::from_secs(2);
-        let err = timeout(
-            cap,
-            svc.update(&json!([{ "path": "linear.token", "value": "irrelevant" }])),
-        )
-        .await
-        .expect("settings.update must not hang past the budget")
-        .expect_err("hung keychain must surface an error, not success");
-        let elapsed = started.elapsed();
-        assert!(
-            matches!(err, Error::Internal(_)),
-            "expected Error::Internal, got {err:?}",
-        );
-        assert!(
-            elapsed < cap,
-            "settings.update took {elapsed:?}, cap {cap:?}"
-        );
-
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
-                "{}{suffix}",
-                tmp.display()
-            )));
+    impl SecretStore for BarrierSecretStore {
+        fn load(&self, _account: &str) -> Option<String> {
+            self.load_calls.fetch_add(1, Ordering::SeqCst);
+            self.barrier.wait();
+            Some("released".to_string())
         }
+        fn store(&self, _account: &str, _value: &str) -> Result<()> {
+            Ok(())
+        }
+        fn delete(&self, _account: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A wedged keychain: `load` returns `None` within the timeout and the
+    /// caller sees an unset setting instead of hanging forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn load_returns_none_on_timeout() {
+        let inner: Arc<dyn SecretStore> = Arc::new(BlockingSecretStore::default());
+        let store = AsyncSecretStore::with_timings(
+            inner,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let start = Instant::now();
+        let v = store.load("acct").await;
+        let elapsed = start.elapsed();
+        assert!(v.is_none(), "wedged keychain must resolve to None");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "load must return within its deadline, took {elapsed:?}"
+        );
+    }
+
+    /// Concurrent callers for the same account share the single in-flight
+    /// keychain call — a wedged keychain occupies one blocking-pool thread
+    /// total, not one per caller.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_loads_are_single_flight() {
+        let sync = Arc::new(BlockingSecretStore::default());
+        let inner: Arc<dyn SecretStore> = sync.clone();
+        let store = Arc::new(AsyncSecretStore::with_timings(
+            inner,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = store.clone();
+            handles.push(tokio::spawn(async move { s.load("acct").await }));
+        }
+        for h in handles {
+            assert!(h.await.unwrap().is_none());
+        }
+        assert_eq!(
+            sync.load_calls.load(Ordering::SeqCst),
+            1,
+            "single-flight must coalesce concurrent callers into ONE keychain load"
+        );
+    }
+
+    /// A late arrival for an in-flight load waits on the existing keychain
+    /// call rather than spawning a second one, even after the initial waiters
+    /// have already timed out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn late_caller_reuses_in_flight_load() {
+        let barrier = Arc::new(Barrier::new(2));
+        let sync = Arc::new(BarrierSecretStore {
+            load_calls: AtomicUsize::new(0),
+            barrier: barrier.clone(),
+        });
+        let inner: Arc<dyn SecretStore> = sync.clone();
+        let store = Arc::new(AsyncSecretStore::with_timings(
+            inner,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        // First caller: starts the in-flight load, then times out (barrier
+        // is still holding the sync `load` inside the blocking pool).
+        assert!(store.load("acct").await.is_none());
+        // Second caller arrives while the first blocking call is still parked
+        // on the barrier — it must NOT spawn a fresh load.
+        assert!(store.load("acct").await.is_none());
+        // Release the sync `load`; the completion task caches "released".
+        barrier.wait();
+        for _ in 0..50 {
+            if store.load("acct").await == Some("released".to_string()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            sync.load_calls.load(Ordering::SeqCst),
+            1,
+            "in-flight load must be reused by later arrivals; got {} calls",
+            sync.load_calls.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Once a load completes, follow-up calls within the TTL are served from
+    /// the in-process cache and the backing keychain is not touched again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_hit_skips_keychain_within_ttl() {
+        let sync = Arc::new(CountingSecretStore::default());
+        *sync.value.lock().unwrap() = Some("tok".to_string());
+        let inner: Arc<dyn SecretStore> = sync.clone();
+        let store = AsyncSecretStore::with_timings(
+            inner,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        assert_eq!(store.load("acct").await, Some("tok".to_string()));
+        assert_eq!(store.load("acct").await, Some("tok".to_string()));
+        assert_eq!(store.load("acct").await, Some("tok".to_string()));
+        assert_eq!(
+            sync.load_calls.load(Ordering::SeqCst),
+            1,
+            "cache must serve repeat reads without re-hitting the keychain"
+        );
+    }
+
+    /// A successful write updates the cache so a follow-up read returns the
+    /// just-persisted value without another keychain load.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_updates_cache() {
+        let sync = Arc::new(CountingSecretStore::default());
+        let inner: Arc<dyn SecretStore> = sync.clone();
+        let store = AsyncSecretStore::new(inner);
+        store.store("acct", "new-value").await.unwrap();
+        assert_eq!(store.load("acct").await, Some("new-value".to_string()));
+        assert_eq!(
+            sync.load_calls.load(Ordering::SeqCst),
+            0,
+            "post-write cache should serve the read without hitting the keychain"
+        );
+    }
+
+    /// A successful `delete` refreshes the cache so a follow-up read reports
+    /// the secret as absent without another keychain load.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_updates_cache() {
+        let sync = Arc::new(CountingSecretStore::default());
+        *sync.value.lock().unwrap() = Some("tok".to_string());
+        let inner: Arc<dyn SecretStore> = sync.clone();
+        let store = AsyncSecretStore::new(inner);
+        store.delete("acct").await.unwrap();
+        assert_eq!(store.load("acct").await, None);
+        assert_eq!(
+            sync.load_calls.load(Ordering::SeqCst),
+            0,
+            "post-delete cache should serve the read without hitting the keychain"
+        );
+    }
+
+    /// A `store` that lands while a slow load is still parked in the blocking
+    /// pool must win: the delayed load result must not clobber the fresher
+    /// cache entry. Guards against the pre-generation-counter race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn intervening_store_wins_over_slow_load() {
+        let barrier = Arc::new(Barrier::new(2));
+        let sync = Arc::new(BarrierSecretStore {
+            load_calls: AtomicUsize::new(0),
+            barrier: barrier.clone(),
+        });
+        let inner: Arc<dyn SecretStore> = sync.clone();
+        let store = Arc::new(AsyncSecretStore::with_timings(
+            inner,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        // Start a load; the caller times out but the sync `load` is still
+        // parked on the barrier inside the blocking pool.
+        assert!(store.load("acct").await.is_none());
+        // Fresh write lands while the slow load is still pending.
+        store.store("acct", "new-value").await.unwrap();
+        // Release the sync `load`; its completion task must refuse to clobber
+        // the fresher Cached slot (the load_id no longer matches).
+        barrier.wait();
+        // Give the completion task time to run and observe the mismatch.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            store.load("acct").await,
+            Some("new-value".to_string()),
+            "intervening store must win against a delayed load result"
+        );
+    }
+
+    /// A `delete` that lands while a slow load is still parked must win: the
+    /// delayed load result must not resurrect the (now-absent) value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn intervening_delete_wins_over_slow_load() {
+        let barrier = Arc::new(Barrier::new(2));
+        let sync = Arc::new(BarrierSecretStore {
+            load_calls: AtomicUsize::new(0),
+            barrier: barrier.clone(),
+        });
+        let inner: Arc<dyn SecretStore> = sync.clone();
+        let store = Arc::new(AsyncSecretStore::with_timings(
+            inner,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        assert!(store.load("acct").await.is_none());
+        store.delete("acct").await.unwrap();
+        barrier.wait();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            store.load("acct").await,
+            None,
+            "intervening delete must win against a delayed load result"
+        );
     }
 }

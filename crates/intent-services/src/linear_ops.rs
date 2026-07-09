@@ -28,13 +28,17 @@ pub(crate) fn map_linear_err(e: intent_linear::Error) -> Error {
 /// Resolve the active [`LinearEngine`]: the injected handle (tests / explicit
 /// wiring) else the registry-built engine from default settings (key from
 /// `LINEAR_API_KEY` / keychain, §5.28). A missing key yields `Internal`
-/// (graceful "not configured"), never a panic.
-pub(crate) fn resolve_engine(
+/// (graceful "not configured"), never a panic. Async because the keychain
+/// lookup runs on the blocking pool with a bounded timeout so a wedged OS
+/// keychain never blocks the async runtime.
+pub(crate) async fn resolve_engine(
     injected: Option<Arc<dyn LinearEngine>>,
 ) -> Result<Arc<dyn LinearEngine>> {
     match injected {
         Some(engine) => Ok(engine),
-        None => LinearRegistry::from_settings(&LinearSettings::default()).map_err(map_linear_err),
+        None => LinearRegistry::from_settings(&LinearSettings::default())
+            .await
+            .map_err(map_linear_err),
     }
 }
 

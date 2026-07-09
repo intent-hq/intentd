@@ -34,9 +34,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role};
 use tokio_tungstenite::WebSocketStream;
 
-use crate::auth::{
-    extract_token, is_allowed_origin, validate_token_bounded, TokenStore, ValidateOutcome,
-};
+use crate::auth::{extract_token, is_allowed_origin, validate_token, AsyncTokenStore, TokenStore};
 use crate::conn::{self, ConnSubs, OUTBOUND_CAPACITY};
 use crate::forward::ForwardRegistry;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
@@ -108,8 +106,10 @@ pub(crate) struct WsInner {
     /// insecure dev-mode plain-`ws://` accept path.
     pub acceptor: Option<TlsAcceptor>,
     /// Bearer-token store consulted only when `auth_enabled` is set; `None` in
-    /// insecure mode where auth is unconditionally off.
-    pub token_store: Option<Arc<dyn TokenStore>>,
+    /// insecure mode where auth is unconditionally off. Wrapped in
+    /// [`AsyncTokenStore`] so keychain reads run on the blocking pool with a
+    /// bounded per-call timeout + single-flight cache.
+    pub token_store: Option<AsyncTokenStore>,
     pub enabled: bool,
     pub auth_enabled: bool,
     pub discovery_enabled: bool,
@@ -152,7 +152,7 @@ impl WsApiServer {
             api,
             bus,
             acceptor: Some(acceptor),
-            token_store: Some(token_store),
+            token_store: Some(AsyncTokenStore::new(token_store)),
             enabled: options.enabled,
             auth_enabled: options.auth_enabled,
             discovery_enabled: options.discovery_enabled,
@@ -357,30 +357,18 @@ impl WsInner {
         }
         if self.auth_enabled {
             // Keychain-backed token reads can stall on a locked/prompting OS
-            // keychain; `validate_token_bounded` offloads to a blocking thread
-            // with a fixed timeout so a hung upgrade never wedges the accept
-            // loop or delays other connections. Timeout and mismatch both map
-            // to `401` on the wire — logging distinguishes them.
-            let outcome = match (
+            // keychain; [`AsyncTokenStore`] offloads to the blocking pool with
+            // a bounded per-call timeout + single-flight cache so a hung
+            // upgrade never wedges the accept loop or delays other connections.
+            let ok = match (
                 self.token_store.as_ref(),
                 extract_token(authorization.as_deref(), target),
             ) {
-                (Some(store), Some(candidate)) => {
-                    validate_token_bounded(Arc::clone(store), candidate).await
-                }
-                _ => ValidateOutcome::Invalid,
+                (Some(store), Some(t)) => validate_token(store, &t).await,
+                _ => false,
             };
-            match outcome {
-                ValidateOutcome::Ok => {}
-                ValidateOutcome::Invalid => {
-                    return reject(&mut stream, 401, "Unauthorized").await;
-                }
-                ValidateOutcome::Unavailable => {
-                    tracing::warn!(
-                        "ws upgrade rejected: token store unavailable (keychain timeout or panic)",
-                    );
-                    return reject(&mut stream, 401, "Unauthorized").await;
-                }
+            if !ok {
+                return reject(&mut stream, 401, "Unauthorized").await;
             }
         }
         let Some(key) = ws_key else {

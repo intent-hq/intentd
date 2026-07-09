@@ -218,7 +218,10 @@ pub struct Services {
     /// Secret persistence for **sensitive** settings (§9.8) — the keychain seam
     /// behind `settings.*`. Defaults to the OS keychain ([`KeyringSecretStore`]);
     /// tests inject an in-memory store so they never touch the real keychain.
-    secrets: Arc<dyn settings::SecretStore>,
+    /// Wrapped in an [`AsyncSecretStore`](settings::AsyncSecretStore) so every
+    /// keychain call runs on the blocking pool with a bounded timeout + single-
+    /// flight cache, keeping the async runtime free when the OS keychain wedges.
+    secrets: Arc<settings::AsyncSecretStore>,
     /// Override for the **user** specialists directory (§18.2). `None` resolves
     /// to `~/.augment/specialists/`; tests inject a temp dir for hermetic
     /// 3-tier coverage.
@@ -293,7 +296,9 @@ impl Services {
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
             pty: Arc::new(intent_pty::PtyHost::new()),
             scripts: Arc::new(Mutex::new(HashMap::new())),
-            secrets: Arc::new(settings::KeyringSecretStore),
+            secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
+                settings::KeyringSecretStore,
+            ))),
             specialists_user_dir: None,
             specialists_bundled_dir: None,
             mcp_hub: Arc::new(McpHub::new()),
@@ -316,18 +321,12 @@ impl Services {
 
     /// Override the [`SecretStore`] backing sensitive settings (§9.8). The
     /// composition root keeps the OS-keychain default; tests inject an in-memory
-    /// store so they never read/write the real user keychain.
+    /// store so they never read/write the real user keychain. The injected store
+    /// is wrapped in an [`AsyncSecretStore`](settings::AsyncSecretStore) so the
+    /// same timeout / single-flight guarantees apply in tests.
     pub fn with_secret_store(mut self, secrets: Arc<dyn settings::SecretStore>) -> Self {
-        self.secrets = secrets;
+        self.secrets = Arc::new(settings::AsyncSecretStore::new(secrets));
         self
-    }
-
-    /// Borrow the configured [`SecretStore`] (§9.8) for sibling services that
-    /// need to read sensitive settings without going through the wire-facing
-    /// [`SettingsService`] — e.g. the agent-manager's `--mcp-config` builder
-    /// which merges the `mcp.servers` catalog into a spawned agent's config.
-    pub(crate) fn secret_store(&self) -> &dyn settings::SecretStore {
-        self.secrets.as_ref()
     }
 
     /// Override the **user** and **bundled** specialist directory roots (§18.2).
@@ -393,7 +392,7 @@ impl Services {
     /// as an `Arc` so `SettingsService` can move it into `spawn_blocking` for
     /// non-blocking, timeout-guarded keychain access.
     fn settings_service(&self) -> settings::SettingsService<'_> {
-        settings::SettingsService::new(&self.store, Arc::clone(&self.secrets))
+        settings::SettingsService::new(&self.store, &self.secrets)
     }
 
     /// Borrow the shared PTY host (composition root / ACP terminal-adapter use).
@@ -729,7 +728,7 @@ impl Services {
     /// Build an [`McpServersService`](mcp_servers::McpServersService) view over the
     /// store, secret store, and hub for one `mcp.servers.*` call.
     fn mcp_servers_service(&self) -> mcp_servers::McpServersService<'_> {
-        mcp_servers::McpServersService::new(&self.store, self.secrets.as_ref(), &self.mcp_hub)
+        mcp_servers::McpServersService::new(&self.store, &self.secrets, &self.mcp_hub)
     }
 
     /// Build an [`McpOauthService`](mcp_oauth::McpOauthService) view over the
@@ -768,7 +767,7 @@ impl Services {
             Ok(pair) => pair,
             Err(_) => return Ok(PrRefreshOutcome::Skipped),
         };
-        let sc = pr_ops::resolve_source_control(self.source_control.clone())?;
+        let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
         let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
 
         match ws.pr_number {
@@ -7536,7 +7535,7 @@ impl WorkspaceApi for Services {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             let (owner, repo) = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc
                 .get_pr(&repo_ref, number)
@@ -7575,7 +7574,7 @@ impl WorkspaceApi for Services {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             let (owner, repo) = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let comments = sc
                 .list_comments(&repo_ref, number)
@@ -7600,7 +7599,7 @@ impl WorkspaceApi for Services {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             let (owner, repo) = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             match sc
                 .get_review_threads(
@@ -7683,7 +7682,7 @@ impl WorkspaceApi for Services {
                 Some(n) => n,
                 None => pr_ops::active_pr_number(&ws)?,
             };
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let reviews = sc
                 .list_reviews(&repo_ref, number)
@@ -7711,7 +7710,7 @@ impl WorkspaceApi for Services {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             let (owner, repo) = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let git_ref = match git_ref {
                 Some(r) => r,
@@ -7772,7 +7771,7 @@ impl WorkspaceApi for Services {
                     let ws = load_ws_for_pr(&store, &workspace_id).await?;
                     let (owner, repo) = pr_ops::repo_of(&ws)?;
                     let number = pr_ops::active_pr_number(&ws)?;
-                    let sc = pr_ops::resolve_source_control(injected)?;
+                    let sc = pr_ops::resolve_source_control(injected).await?;
                     let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
                     let pr = sc
                         .get_pr(&repo_ref, number)
@@ -7838,7 +7837,7 @@ impl WorkspaceApi for Services {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             let (owner, repo) = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             match sc.update_branch(&repo_ref, number).await {
                 // URL revisit (§7.6): the forge `update_branch` returns no URL,
@@ -7887,7 +7886,7 @@ impl WorkspaceApi for Services {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             let (owner, repo) = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let comment = sc
                 .add_comment(&repo_ref, number, &body, None)
@@ -7912,7 +7911,7 @@ impl WorkspaceApi for Services {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             let (owner, repo) = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let reply = sc
                 .reply_to_review_comment(&repo_ref, number, comment_id, &body)
@@ -7940,7 +7939,7 @@ impl WorkspaceApi for Services {
             // forge call keys off the thread id alone.
             let _ = pr_ops::repo_of(&ws)?;
             let _ = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let success = if action == "unresolve" {
                 sc.unresolve_thread(&thread_id).await
             } else {
@@ -7973,7 +7972,7 @@ impl WorkspaceApi for Services {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             let (owner, repo) = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let review = sc
                 .submit_review(&repo_ref, number, verdict, body)
@@ -7999,7 +7998,7 @@ impl WorkspaceApi for Services {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             let (owner, repo) = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
 
             let timeout_ms = timeout * 1000;
@@ -8083,7 +8082,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             // `head` is forwarded VERBATIM (no `owner:branch` login prefix) —
             // the engine sends `input.source_branch` as the raw `head`,
@@ -8113,7 +8112,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc
                 .get_pr(&repo_ref, number)
@@ -8139,7 +8138,7 @@ impl WorkspaceApi for Services {
             let state = github_ops::parse_pr_state(state.as_deref())?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
                 .list_prs(
@@ -8185,7 +8184,7 @@ impl WorkspaceApi for Services {
             };
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
                 .list_prs(
@@ -8222,7 +8221,7 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         Box::pin(async move {
             let method = pr_ops::validate_merge_method(merge_method)?;
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let outcome = sc
                 .merge_pr(
@@ -8262,7 +8261,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let page = sc
                 .list_repos(intent_sourcecontrol::PageParams { limit, cursor })
                 .await
@@ -8286,7 +8285,7 @@ impl WorkspaceApi for Services {
             // `expectedHeadSha` is accepted for FE shape parity; the engine
             // `update_branch` does not take a race guard, so it is unused.
             let _ = expected_head_sha;
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             sc.update_branch(&repo_ref, number)
                 .await
@@ -8308,7 +8307,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let page = sc
                 .search_repos(&query, intent_sourcecontrol::PageParams { limit, cursor })
                 .await
@@ -8335,7 +8334,7 @@ impl WorkspaceApi for Services {
             let state = github_ops::parse_issue_state(state.as_deref())?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
                 .list_issues(
@@ -8385,7 +8384,7 @@ impl WorkspaceApi for Services {
             };
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
                 .list_issues(
@@ -8423,7 +8422,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
                 .list_review_comments(
@@ -8455,7 +8454,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let rc = sc
                 .reply_to_review_comment(&repo_ref, number, comment_id, &body)
@@ -8477,7 +8476,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
                 .get_review_threads(
@@ -8502,7 +8501,7 @@ impl WorkspaceApi for Services {
     fn github_resolve_thread(&self, thread_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let is_resolved = sc
                 .resolve_thread(&thread_id)
                 .await
@@ -8517,7 +8516,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let is_resolved = sc
                 .unresolve_thread(&thread_id)
                 .await
@@ -8533,7 +8532,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             match sc.get_repo(&owner, &repo).await {
                 Ok(r) => Ok(serde_json::json!({ "repo": github_browse_ops::repo_to_wire(&r) })),
                 // FE `getGitHubRepo` returns `GithubRepo | null`; a missing repo
@@ -8557,7 +8556,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let page = sc
                 .list_remote_branches(
                     &owner,
@@ -8578,7 +8577,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             // A missing/invalid token is the graceful "not configured" state,
             // NOT an error: report `isConfigured: false` instead of throwing.
-            let is_configured = match pr_ops::resolve_source_control(injected) {
+            let is_configured = match pr_ops::resolve_source_control(injected).await {
                 Ok(sc) => sc
                     .check_auth()
                     .await
@@ -8614,7 +8613,7 @@ impl WorkspaceApi for Services {
     fn github_get_user(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let sc = pr_ops::resolve_source_control(injected)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let user = sc.get_user().await.map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({ "user": github_browse_ops::user_to_wire(&user) }))
         })
@@ -8631,7 +8630,7 @@ impl WorkspaceApi for Services {
     fn linear_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            let engine = linear_ops::resolve_engine(injected)?;
+            let engine = linear_ops::resolve_engine(injected).await?;
             let status = engine
                 .auth_status()
                 .await
@@ -8649,7 +8648,7 @@ impl WorkspaceApi for Services {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
             let filter = linear_ops::parse_filter(filter)?;
-            let engine = linear_ops::resolve_engine(injected)?;
+            let engine = linear_ops::resolve_engine(injected).await?;
             let issues = engine
                 .list_issues(filter, linear_ops::wire_limit(limit))
                 .await
@@ -8666,7 +8665,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            let engine = linear_ops::resolve_engine(injected)?;
+            let engine = linear_ops::resolve_engine(injected).await?;
             let issues = engine
                 .search_issues(&query, linear_ops::wire_limit(limit))
                 .await
@@ -8682,7 +8681,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            let engine = linear_ops::resolve_engine(injected)?;
+            let engine = linear_ops::resolve_engine(injected).await?;
             let issue = engine
                 .get_issue(&id_or_identifier)
                 .await
@@ -8695,7 +8694,7 @@ impl WorkspaceApi for Services {
     fn linear_viewer(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            let engine = linear_ops::resolve_engine(injected)?;
+            let engine = linear_ops::resolve_engine(injected).await?;
             let user = engine.viewer().await.map_err(linear_ops::map_linear_err)?;
             serde_json::to_value(user)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
@@ -8705,7 +8704,7 @@ impl WorkspaceApi for Services {
     fn linear_list_teams(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            let engine = linear_ops::resolve_engine(injected)?;
+            let engine = linear_ops::resolve_engine(injected).await?;
             let teams = engine
                 .list_teams(linear_ops::wire_limit(limit))
                 .await
@@ -8721,7 +8720,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            let engine = linear_ops::resolve_engine(injected)?;
+            let engine = linear_ops::resolve_engine(injected).await?;
             let states = engine
                 .list_workflow_states(linear_ops::wire_limit(limit))
                 .await
@@ -8734,7 +8733,7 @@ impl WorkspaceApi for Services {
     fn linear_list_projects(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            let engine = linear_ops::resolve_engine(injected)?;
+            let engine = linear_ops::resolve_engine(injected).await?;
             let projects = engine
                 .list_projects(linear_ops::wire_limit(limit))
                 .await
@@ -8747,7 +8746,7 @@ impl WorkspaceApi for Services {
     fn linear_list_labels(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            let engine = linear_ops::resolve_engine(injected)?;
+            let engine = linear_ops::resolve_engine(injected).await?;
             let labels = engine
                 .list_labels(linear_ops::wire_limit(limit))
                 .await
@@ -8764,7 +8763,7 @@ impl WorkspaceApi for Services {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
             let req = linear_ops::parse_create_issue(request)?;
-            let engine = linear_ops::resolve_engine(injected)?;
+            let engine = linear_ops::resolve_engine(injected).await?;
             let issue = engine
                 .create_issue(req)
                 .await
@@ -8781,7 +8780,7 @@ impl WorkspaceApi for Services {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
             let req = linear_ops::parse_update_issue(request)?;
-            let engine = linear_ops::resolve_engine(injected)?;
+            let engine = linear_ops::resolve_engine(injected).await?;
             let issue = engine
                 .update_issue(req)
                 .await
@@ -8803,7 +8802,7 @@ impl WorkspaceApi for Services {
     fn sentry_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
-            let engine = sentry_ops::resolve_engine(injected)?;
+            let engine = sentry_ops::resolve_engine(injected).await?;
             let status = engine
                 .auth_status()
                 .await
@@ -8823,7 +8822,7 @@ impl WorkspaceApi for Services {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
             let status = sentry_ops::parse_status(status)?;
-            let engine = sentry_ops::resolve_engine(injected)?;
+            let engine = sentry_ops::resolve_engine(injected).await?;
             let request = intent_sentry::FetchIssuesRequest {
                 project,
                 status,
@@ -8847,7 +8846,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
-            let engine = sentry_ops::resolve_engine(injected)?;
+            let engine = sentry_ops::resolve_engine(injected).await?;
             let issues = engine
                 .search_issues(&query, project.as_deref(), sentry_ops::wire_limit(limit))
                 .await
@@ -8860,7 +8859,7 @@ impl WorkspaceApi for Services {
     fn sentry_list_projects(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
-            let engine = sentry_ops::resolve_engine(injected)?;
+            let engine = sentry_ops::resolve_engine(injected).await?;
             let projects = engine
                 .list_projects(sentry_ops::wire_limit(limit))
                 .await
@@ -8873,7 +8872,7 @@ impl WorkspaceApi for Services {
     fn sentry_get_issue(&self, id_or_short_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
-            let engine = sentry_ops::resolve_engine(injected)?;
+            let engine = sentry_ops::resolve_engine(injected).await?;
             let issue = engine
                 .get_issue(&id_or_short_id)
                 .await
@@ -8886,7 +8885,7 @@ impl WorkspaceApi for Services {
     fn sentry_resolve_issue(&self, id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
-            let engine = sentry_ops::resolve_engine(injected)?;
+            let engine = sentry_ops::resolve_engine(injected).await?;
             let issue = engine
                 .resolve_issue(&id)
                 .await
@@ -8899,7 +8898,7 @@ impl WorkspaceApi for Services {
     fn sentry_ignore_issue(&self, id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
-            let engine = sentry_ops::resolve_engine(injected)?;
+            let engine = sentry_ops::resolve_engine(injected).await?;
             let issue = engine
                 .ignore_issue(&id)
                 .await
@@ -8916,7 +8915,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
-            let engine = sentry_ops::resolve_engine(injected)?;
+            let engine = sentry_ops::resolve_engine(injected).await?;
             let issue = engine
                 .assign_issue(&id, assigned_to.as_deref())
                 .await
@@ -9738,7 +9737,7 @@ impl Services {
         }
         let (owner, repo) = pr_ops::repo_of(&ws)
             .map_err(|_| Error::Internal("No remote configured for this repository".to_string()))?;
-        let sc = pr_ops::resolve_source_control(self.source_control.clone())?;
+        let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
         let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
 
         let branch = ws.branch.clone();
@@ -9789,7 +9788,7 @@ impl Services {
             Error::Internal(format!("Workspace not found: {}", workspace_id.as_str()))
         })?;
         let (owner, repo) = pr_ops::repo_of(&ws)?;
-        let sc = pr_ops::resolve_source_control(self.source_control.clone())?;
+        let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
         let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
         let options = intent_sourcecontrol::MergeOptions {
             commit_title,

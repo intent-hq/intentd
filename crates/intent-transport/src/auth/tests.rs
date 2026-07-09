@@ -3,8 +3,9 @@
 //! allow-list matrix. The keychain is replaced by an in-memory [`MemoryStore`]
 //! so tests never touch the real OS keychain.
 
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
+use std::thread;
 
 use super::*;
 
@@ -32,10 +33,56 @@ impl TokenStore for MemoryStore {
     }
 }
 
-#[test]
-fn generate_token_is_64_lowercase_hex_and_persisted() {
-    let store = MemoryStore::default();
-    let token = generate_token(&store).unwrap();
+/// A `TokenStore` whose `load_token` sleeps well past the compressed test
+/// timeout, counting calls so tests can prove concurrent callers are
+/// coalesced into a single spawn_blocking.
+#[derive(Default)]
+struct BlockingTokenStore {
+    load_calls: AtomicUsize,
+}
+
+impl TokenStore for BlockingTokenStore {
+    fn load_token(&self) -> Option<String> {
+        self.load_calls.fetch_add(1, Ordering::SeqCst);
+        // Long enough to outlive the wrapper's compressed test timeout but
+        // short enough that the tokio runtime's blocking-pool shutdown at
+        // end-of-test doesn't hold up the whole test binary.
+        thread::sleep(Duration::from_millis(500));
+        None
+    }
+    fn store_token(&self, _token: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A `TokenStore` whose `load_token` waits on a barrier so tests can hold
+/// ONE call in flight while probing generation-guard semantics.
+struct BarrierTokenStore {
+    load_calls: AtomicUsize,
+    barrier: Arc<Barrier>,
+}
+
+impl TokenStore for BarrierTokenStore {
+    fn load_token(&self) -> Option<String> {
+        self.load_calls.fetch_add(1, Ordering::SeqCst);
+        self.barrier.wait();
+        Some("old-token".to_string())
+    }
+    fn store_token(&self, _token: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Wrap a [`MemoryStore`] as an [`AsyncTokenStore`]. Tests share the same
+/// `Arc` so the inner store survives the wrapper for load-after-store checks.
+fn async_of(inner: Arc<MemoryStore>) -> AsyncTokenStore {
+    AsyncTokenStore::new(inner)
+}
+
+#[tokio::test]
+async fn generate_token_is_64_lowercase_hex_and_persisted() {
+    let store = Arc::new(MemoryStore::default());
+    let token = generate_token(&async_of(store.clone())).await.unwrap();
     assert_eq!(token.len(), 64, "32 random bytes hex-encode to 64 chars");
     assert!(
         token
@@ -46,49 +93,65 @@ fn generate_token_is_64_lowercase_hex_and_persisted() {
     assert_eq!(store.load_token().as_deref(), Some(token.as_str()));
 }
 
-#[test]
-fn generated_tokens_are_unique() {
-    let a = generate_token(&MemoryStore::default()).unwrap();
-    let b = generate_token(&MemoryStore::default()).unwrap();
+#[tokio::test]
+async fn generated_tokens_are_unique() {
+    let a = generate_token(&async_of(Arc::new(MemoryStore::default())))
+        .await
+        .unwrap();
+    let b = generate_token(&async_of(Arc::new(MemoryStore::default())))
+        .await
+        .unwrap();
     assert_ne!(a, b);
 }
 
-#[test]
-fn get_or_create_returns_existing_then_stable() {
-    let store = MemoryStore::default();
-    let first = get_or_create_token(&store).unwrap();
-    let second = get_or_create_token(&store).unwrap();
+#[tokio::test]
+async fn get_or_create_returns_existing_then_stable() {
+    let store = async_of(Arc::new(MemoryStore::default()));
+    let first = get_or_create_token(&store).await.unwrap();
+    let second = get_or_create_token(&store).await.unwrap();
     assert_eq!(first, second, "must not regenerate when one already exists");
 }
 
-#[test]
-fn validate_token_accepts_the_stored_value() {
-    let token = generate_token(&MemoryStore::default()).unwrap();
-    let store = MemoryStore::with(&token);
-    assert!(validate_token(&store, &token));
+#[tokio::test]
+async fn validate_token_accepts_the_stored_value() {
+    let token = generate_token(&async_of(Arc::new(MemoryStore::default())))
+        .await
+        .unwrap();
+    let store = async_of(Arc::new(MemoryStore::with(&token)));
+    assert!(validate_token(&store, &token).await);
 }
 
-#[test]
-fn validate_token_rejects_wrong_same_length_value() {
+#[tokio::test]
+async fn validate_token_rejects_wrong_same_length_value() {
     // Same length, differs only in the last char — exercises the constant-time path.
     let stored = "a".repeat(64);
     let candidate = format!("{}b", "a".repeat(63));
-    let store = MemoryStore::with(&stored);
+    let store = async_of(Arc::new(MemoryStore::with(&stored)));
     assert_eq!(stored.len(), candidate.len());
-    assert!(!validate_token(&store, &candidate));
+    assert!(!validate_token(&store, &candidate).await);
 }
 
-#[test]
-fn validate_token_rejects_empty_and_length_mismatch() {
-    let store = MemoryStore::with(&"a".repeat(64));
-    assert!(!validate_token(&store, ""), "empty candidate rejected");
-    assert!(!validate_token(&store, "a"), "length mismatch rejected");
-    assert!(!validate_token(&store, &"a".repeat(65)), "longer rejected");
+#[tokio::test]
+async fn validate_token_rejects_empty_and_length_mismatch() {
+    let store = async_of(Arc::new(MemoryStore::with(&"a".repeat(64))));
+    assert!(
+        !validate_token(&store, "").await,
+        "empty candidate rejected"
+    );
+    assert!(
+        !validate_token(&store, "a").await,
+        "length mismatch rejected"
+    );
+    assert!(
+        !validate_token(&store, &"a".repeat(65)).await,
+        "longer rejected"
+    );
 }
 
-#[test]
-fn validate_token_rejects_when_nothing_stored() {
-    assert!(!validate_token(&MemoryStore::default(), &"a".repeat(64)));
+#[tokio::test]
+async fn validate_token_rejects_when_nothing_stored() {
+    let store = async_of(Arc::new(MemoryStore::default()));
+    assert!(!validate_token(&store, &"a".repeat(64)).await);
 }
 
 #[test]
@@ -261,89 +324,6 @@ fn discovery_disabled_by_default() {
     assert!(!is_discovery_enabled(Some(false)));
 }
 
-/// [`TokenStore`] whose `load_token` sleeps for `hang_for` before answering —
-/// models a locked / prompting OS keychain that would otherwise wedge the WS
-/// upgrade path.
-struct SleepingTokenStore {
-    hang_for: Duration,
-}
-
-impl TokenStore for SleepingTokenStore {
-    fn load_token(&self) -> Option<String> {
-        std::thread::sleep(self.hang_for);
-        Some("a".repeat(64))
-    }
-    fn store_token(&self, _token: &str) -> Result<()> {
-        Ok(())
-    }
-}
-
-/// Regression: a stalled OS keychain MUST NOT hang the WS upgrade path.
-/// `validate_token_bounded` returns [`ValidateOutcome::Unavailable`] within
-/// one [`TOKEN_OP_TIMEOUT`] so the caller can reject the connection cleanly
-/// and the accept loop keeps flowing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn validate_token_bounded_times_out_on_hung_store() {
-    let store: Arc<dyn TokenStore> = Arc::new(SleepingTokenStore {
-        hang_for: Duration::from_secs(30),
-    });
-    let started = Instant::now();
-    let outcome = validate_token_bounded(store, "a".repeat(64)).await;
-    let elapsed = started.elapsed();
-    assert_eq!(outcome, ValidateOutcome::Unavailable);
-    let cap = TOKEN_OP_TIMEOUT + Duration::from_secs(2);
-    assert!(
-        elapsed < cap,
-        "validate_token_bounded took {elapsed:?}, cap {cap:?}",
-    );
-}
-
-/// A concurrent hung validation MUST NOT block a second, healthy validation:
-/// each call has its own blocking task + timeout budget, so the accept loop
-/// stays responsive while one connection is waiting on the keychain.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn validate_token_bounded_isolates_a_hung_call() {
-    let hung: Arc<dyn TokenStore> = Arc::new(SleepingTokenStore {
-        hang_for: Duration::from_secs(30),
-    });
-    let fast: Arc<dyn TokenStore> = Arc::new(MemoryStore::with(&"a".repeat(64)));
-
-    let hung_task = tokio::spawn(validate_token_bounded(hung, "a".repeat(64)));
-    // Give the hung call a moment to start on its blocking thread.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let started = Instant::now();
-    let ok = validate_token_bounded(fast, "a".repeat(64)).await;
-    let elapsed = started.elapsed();
-    assert_eq!(ok, ValidateOutcome::Ok);
-    assert!(
-        elapsed < TOKEN_OP_TIMEOUT,
-        "healthy validation was delayed by hung call: {elapsed:?}",
-    );
-
-    let hung_outcome = hung_task.await.expect("hung task must resolve");
-    assert_eq!(hung_outcome, ValidateOutcome::Unavailable);
-}
-
-/// A rejected token (store answers but the value mismatches) is
-/// [`ValidateOutcome::Invalid`], distinct from [`ValidateOutcome::Unavailable`].
-#[tokio::test]
-async fn validate_token_bounded_returns_invalid_on_mismatch() {
-    let store: Arc<dyn TokenStore> = Arc::new(MemoryStore::with(&"a".repeat(64)));
-    let outcome = validate_token_bounded(store, "b".repeat(64)).await;
-    assert_eq!(outcome, ValidateOutcome::Invalid);
-}
-
-/// The happy path: the store answers, the candidate matches, `Ok` returns
-/// well within the timeout budget.
-#[tokio::test]
-async fn validate_token_bounded_returns_ok_on_match() {
-    let token = "a".repeat(64);
-    let store: Arc<dyn TokenStore> = Arc::new(MemoryStore::with(&token));
-    let outcome = validate_token_bounded(store, token).await;
-    assert_eq!(outcome, ValidateOutcome::Ok);
-}
-
 #[test]
 fn extract_bearer_token_rejects_short_and_non_whitespace_separator() {
     // header.get(..6) returns None for anything shorter than 6 bytes.
@@ -428,4 +408,89 @@ fn origin_rejects_empty_authority_and_missing_scheme() {
     assert!(!is_allowed_origin_with_host(Some("https:///path"), LOCAL));
     // Scheme with only `:` after authority (empty host before port).
     assert!(!is_allowed_origin_with_host(Some("https://:5180"), LOCAL));
+}
+
+/// A wedged keychain: `load_token` returns `None` within the timeout and the
+/// caller sees an unset token instead of hanging forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn load_token_returns_none_on_timeout() {
+    let inner: Arc<dyn TokenStore> = Arc::new(BlockingTokenStore::default());
+    let store = AsyncTokenStore::with_timings(
+        inner,
+        Duration::from_millis(50),
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    let start = Instant::now();
+    let v = store.load_token().await;
+    let elapsed = start.elapsed();
+    assert!(v.is_none(), "wedged keychain must resolve to None");
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "load must return within its deadline, took {elapsed:?}"
+    );
+}
+
+/// Concurrent callers share the single in-flight keychain call — a wedged
+/// keychain occupies one blocking-pool thread total, not one per caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_load_tokens_are_single_flight() {
+    let sync = Arc::new(BlockingTokenStore::default());
+    let inner: Arc<dyn TokenStore> = sync.clone();
+    let store = Arc::new(AsyncTokenStore::with_timings(
+        inner,
+        Duration::from_millis(50),
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+    ));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let s = store.clone();
+        handles.push(tokio::spawn(async move { s.load_token().await }));
+    }
+    for h in handles {
+        assert!(h.await.unwrap().is_none());
+    }
+    assert_eq!(
+        sync.load_calls.load(Ordering::SeqCst),
+        1,
+        "single-flight must coalesce concurrent callers into ONE keychain load"
+    );
+}
+
+/// A `store_token` that lands while a slow load is still parked in the
+/// blocking pool must win: the delayed load result must not clobber the
+/// fresher cache entry. Guards against the pre-generation-counter race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn intervening_store_token_wins_over_slow_load() {
+    let barrier = Arc::new(Barrier::new(2));
+    let sync = Arc::new(BarrierTokenStore {
+        load_calls: AtomicUsize::new(0),
+        barrier: barrier.clone(),
+    });
+    let inner: Arc<dyn TokenStore> = sync.clone();
+    let store = Arc::new(AsyncTokenStore::with_timings(
+        inner,
+        Duration::from_millis(50),
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+    ));
+    // Start a load; the caller times out but the sync `load_token` is still
+    // parked on the barrier inside the blocking pool.
+    assert!(store.load_token().await.is_none());
+    // Fresh write lands while the slow load is still pending.
+    store.store_token("new-token").await.unwrap();
+    // Release the sync `load_token`; its completion task must refuse to
+    // clobber the fresher Cached slot (the load_id no longer matches).
+    barrier.wait();
+    // Give the completion task time to run and observe the mismatch.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        store.load_token().await,
+        Some("new-token".to_string()),
+        "intervening store_token must win against a delayed load result"
+    );
 }

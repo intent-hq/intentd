@@ -17,7 +17,8 @@ use intent_services::{
 use intent_store::Store;
 use intent_transport::{
     detect_has_display, ensure_tls_certificate, generate_token, get_or_create_token, serve_uds,
-    CertStatus, KeyringTokenStore, SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
+    AsyncTokenStore, CertStatus, KeyringTokenStore, SystemControl, SystemStatus, TokenStore,
+    WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
 
@@ -130,7 +131,7 @@ async fn main() -> ExitCode {
         Command::Service { action } => to_exit(cmd_service(&action)),
         Command::McpBridge { connect } => to_exit(cmd_mcp_bridge(&connect).await),
         Command::Import { from } => to_exit(cmd_import(&from).await),
-        Command::Token { rotate } => to_exit(cmd_token(rotate)),
+        Command::Token { rotate } => to_exit(cmd_token(rotate).await),
     }
 }
 
@@ -142,22 +143,26 @@ async fn main() -> ExitCode {
 /// `INTENTD_AUTH_TOKEN` is set the token is fixed by the env var and cannot be
 /// rotated: a note is written to stderr and the env token is printed unchanged.
 /// The token is never logged via `tracing`; both lines go to stdout.
-fn cmd_token(rotate: bool) -> anyhow::Result<()> {
+async fn cmd_token(rotate: bool) -> anyhow::Result<()> {
     let config = resolve_config()?;
     std::fs::create_dir_all(&config.data_dir)?;
-    let store = resolve_token_store();
+    let store = AsyncTokenStore::new(resolve_token_store());
     let env_fixed = std::env::var("INTENTD_AUTH_TOKEN")
         .map(|t| !t.is_empty())
         .unwrap_or(false);
     let token = if rotate && !env_fixed {
-        generate_token(&*store).map_err(|e| anyhow::anyhow!(e.to_string()))?
+        generate_token(&store)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
     } else {
         if rotate {
             eprintln!(
                 "note: INTENTD_AUTH_TOKEN is set; the token is fixed by the env var and cannot be rotated"
             );
         }
-        get_or_create_token(&*store).map_err(|e| anyhow::anyhow!(e.to_string()))?
+        get_or_create_token(&store)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
     };
     let tls =
         ensure_tls_certificate(&config.data_dir).map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -374,7 +379,9 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             let tls = ensure_tls_certificate(&config.data_dir)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             let token_store = resolve_token_store();
-            get_or_create_token(&*token_store).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            get_or_create_token(&AsyncTokenStore::new(token_store.clone()))
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, ws_options)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?
         };

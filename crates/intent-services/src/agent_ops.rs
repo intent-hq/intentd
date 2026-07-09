@@ -1215,7 +1215,10 @@ impl Services {
             }
         }
         session.updated_at = now_iso();
-        self.store.update_agent_session(&session).await?;
+        let workspace_id = session.workspace_id.clone();
+        self.store
+            .update_agent_session(&workspace_id, &session)
+            .await?;
         let event_type = if mutated_only_name {
             intent_core::events::AGENT_RENAMED
         } else {
@@ -1710,7 +1713,10 @@ impl Services {
         session.completion_report = Some(report_text.clone());
         session.completion_report_timestamp = Some(saved_at.clone());
         session.updated_at = saved_at.clone();
-        self.store.update_agent_session(&session).await?;
+        let workspace_id = session.workspace_id.clone();
+        self.store
+            .update_agent_session(&workspace_id, &session)
+            .await?;
         self.publish_agent_mutation_event(
             &session.workspace_id,
             &caller,

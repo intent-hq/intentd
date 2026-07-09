@@ -28,13 +28,17 @@ pub(crate) fn map_sentry_err(e: intent_sentry::Error) -> Error {
 /// Resolve the active [`SentryEngine`]: the injected handle (tests / explicit
 /// wiring) else the registry-built engine from default settings (org/token
 /// from `SENTRY_ORG` / `SENTRY_API_TOKEN` / keychain, §5.29). A missing pair
-/// yields `Internal` (graceful "not configured"), never a panic.
-pub(crate) fn resolve_engine(
+/// yields `Internal` (graceful "not configured"), never a panic. Async
+/// because the keychain lookup runs on the blocking pool with a bounded
+/// timeout so a wedged OS keychain never blocks the async runtime.
+pub(crate) async fn resolve_engine(
     injected: Option<Arc<dyn SentryEngine>>,
 ) -> Result<Arc<dyn SentryEngine>> {
     match injected {
         Some(engine) => Ok(engine),
-        None => SentryRegistry::from_settings(&SentrySettings::default()).map_err(map_sentry_err),
+        None => SentryRegistry::from_settings(&SentrySettings::default())
+            .await
+            .map_err(map_sentry_err),
     }
 }
 
