@@ -1362,6 +1362,26 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Auto-subscribe a parent agent to a child's completion: register a
+    /// oneShot parent→child completion watch (the TS
+    /// `subscribeCallerToAgentCompletion`). Called by the MCP `create_agent`
+    /// front door after the child session exists and before its first turn
+    /// starts. Returns `{ ok, subscriptionId }`; `ok: false` (no watch) when
+    /// the parent session is deleted.
+    fn agent_watch_completion(
+        &self,
+        workspace_id: WorkspaceId,
+        parent_agent_id: AgentId,
+        child_agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, parent_agent_id, child_agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_watch_completion not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.cancelSubscriptions`: cancel all of an agent's subscriptions;
     /// `{ success: true }` (PROTOCOL §5.5).
     fn agent_cancel_subscriptions(

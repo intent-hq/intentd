@@ -422,11 +422,33 @@ impl WorkspaceMcpServer {
                         .assign_agent(ws.clone(), NoteId::from_string(tn), agent_id.clone())
                         .await;
                 }
+                let child = AgentId::from(agent_id.as_str());
+                // Auto-subscribe the caller to the child's completion (AS-5,
+                // TS `CreateAgentTool` / `subscribeCallerToAgentCompletion`):
+                // register the oneShot watch BEFORE the child's first turn
+                // starts so a fast child cannot complete in the gap. Failure
+                // is non-fatal: the child still runs.
+                let mut subscription_id: Option<String> = None;
+                if let Some(caller) = self.caller_agent_id.clone() {
+                    match api
+                        .agent_watch_completion(ws.clone(), caller, child.clone())
+                        .await
+                    {
+                        Ok(v) => {
+                            subscription_id = v
+                                .get("subscriptionId")
+                                .and_then(|s| s.as_str())
+                                .map(String::from);
+                        }
+                        Err(e) => {
+                            tracing::warn!(agent = %agent_id, error = %e, "create_agent: failed to register completion watch");
+                        }
+                    }
+                }
                 // Deliver the initial message so the child actually starts its
                 // first turn (the services impl routes through the runtime
                 // `AgentManager`, exactly like `agent_delegate_op`). Delivery
                 // failure is non-fatal: the session already exists.
-                let child = AgentId::from(agent_id.as_str());
                 if let Err(e) = api
                     .agent_send_message(
                         ws,
@@ -449,6 +471,7 @@ impl WorkspaceMcpServer {
                     "ok": true,
                     "agentId": agent_id,
                     "name": agent_name,
+                    "subscriptionId": subscription_id,
                 })))
             }
             // No idempotency key here: `agent.delegate` reaches the create op

@@ -242,9 +242,17 @@ static ALL_TOOLS: &[ToolDef] = &[
     // ---- Agent creation tools ----
     ToolDef {
         name: "create_agent",
-        description: "Create a new agent to work on a task; it starts working immediately. \
-                      `createLinkedNote`/`noteContent`/`parentNoteId` are accepted for wire \
-                      parity but linked-note creation is not yet supported by the daemon.",
+        description: "Create a new agent to work on a task. The new agent runs independently \
+                      and starts working immediately. You are automatically subscribed to its \
+                      completion events: end your turn and you will be woken up when the agent \
+                      completes. This allows you to create multiple agents in parallel and be \
+                      notified as each finishes. Use `specialist` to auto-configure model and \
+                      behavior (\"implementor\" for implementation tasks, \"verifier\" for \
+                      verification/review); explicit `model`/`behaviorPrompt` override it. \
+                      Agents are background by default (set `isBackground=false` for \
+                      foreground). `createLinkedNote`/`noteContent`/`parentNoteId` are accepted \
+                      for wire parity but linked-note creation is not yet supported by the \
+                      daemon.",
         params: &[
             p("name", "string", true),
             p("initialMessage", "string", true),
@@ -260,7 +268,17 @@ static ALL_TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "delegate_task",
-        description: "Delegate a task to a new agent.",
+        description: "Delegate an existing task to a new agent. Specify the task by \
+                      `taskNoteId` (preferred; extract from intent://local/task/{id} links) or \
+                      by `noteId` + `taskText` matching a checkbox in a parent note. The agent \
+                      starts working immediately and you are automatically subscribed to its \
+                      completion events: end your turn and you will be woken up when the agent \
+                      completes. `waitMode`: \"immediate\" (default) wakes you when EACH \
+                      delegated agent completes; \"after_all\" wakes you once when ALL agents \
+                      delegated with after_all in the same turn complete — use it when \
+                      delegating multiple related tasks to review all results at once. Use \
+                      `specialist` (\"implementor\"/\"verifier\") to auto-configure model and \
+                      behavior; explicit `model`/`behaviorPrompt` override it.",
         params: &[
             p("taskNoteId", "string", false),
             p("noteId", "string", false),

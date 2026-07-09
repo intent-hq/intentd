@@ -513,6 +513,8 @@ mod mcp_tests {
         pub(super) sent: Mutex<Vec<(String, String)>>,
         /// Recorded `assign_agent` calls: (note_id, agent_id).
         pub(super) assigned: Mutex<Vec<(String, String)>>,
+        /// Recorded `agent_watch_completion` calls: (parent_id, child_id).
+        pub(super) watched: Mutex<Vec<(String, String)>>,
     }
 
     impl WorkspaceApi for MockApi {
@@ -669,6 +671,19 @@ mod mcp_tests {
                 })
             })
         }
+
+        fn agent_watch_completion(
+            &self,
+            _workspace_id: WorkspaceId,
+            parent_agent_id: AgentId,
+            child_agent_id: AgentId,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.watched.lock().unwrap().push((
+                parent_agent_id.as_str().to_string(),
+                child_agent_id.as_str().to_string(),
+            ));
+            Box::pin(async { Ok(json!({ "ok": true, "subscriptionId": "sub-watch-1" })) })
+        }
     }
 
     fn server(api: Arc<MockApi>) -> WorkspaceMcpServer {
@@ -795,6 +810,7 @@ mod mcp_tests {
         assert_eq!(parsed["ok"], json!(true));
         assert_eq!(parsed["agentId"], json!("agent-child"));
         assert_eq!(parsed["name"], json!("Bug Fixer"));
+        assert_eq!(parsed["subscriptionId"], json!("sub-watch-1"));
 
         // The create op was parent-attributed to the MCP caller, carried the
         // specialist through, and minted a fresh idempotency key.
@@ -818,11 +834,41 @@ mod mcp_tests {
             *api.assigned.lock().unwrap(),
             vec![("n-task".to_string(), "agent-child".to_string())]
         );
+        // …the caller was auto-subscribed to the child's completion (AS-5)…
+        assert_eq!(
+            *api.watched.lock().unwrap(),
+            vec![("agent-77".to_string(), "agent-child".to_string())]
+        );
         // …and its first turn was started via the initial message.
         assert_eq!(
             *api.sent.lock().unwrap(),
             vec![("agent-child".to_string(), "fix the bug".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn create_agent_without_caller_registers_no_watch() {
+        // No MCP caller (e.g. tooling contexts without an agent): the child is
+        // created and started, but there is no parent to auto-subscribe.
+        let api = Arc::new(MockApi::default());
+        let srv = server(api.clone());
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                "params": {
+                    "name": "create_agent",
+                    "arguments": { "name": "Solo", "initialMessage": "go" }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["ok"], json!(true));
+        assert_eq!(parsed["subscriptionId"], Value::Null);
+        assert!(api.watched.lock().unwrap().is_empty());
+        assert_eq!(api.sent.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -7518,6 +7518,18 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_watch_completion(
+        &self,
+        workspace_id: WorkspaceId,
+        parent_agent_id: AgentId,
+        child_agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_watch_completion_op(workspace_id, parent_agent_id, child_agent_id)
+                .await
+        })
+    }
+
     fn agent_diagnostics(
         &self,
         workspace_id: WorkspaceId,
