@@ -5583,7 +5583,7 @@ mod script {
         let id = create(&h, "echo", "echo run-once-output", ScriptMode::Command).await;
         let out = h
             .services
-            .script_run(id, None, Some(10))
+            .script_run(h.ws.clone(), id, None, Some(10))
             .await
             .expect("run");
         assert_eq!(out["timedOut"], false);
@@ -5611,7 +5611,10 @@ mod script {
             ScriptMode::Service,
         )
         .await;
-        h.services.script_start(id.clone()).await.expect("start");
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
         drain_until(&mut sub, Duration::from_secs(5), |v| {
             if v["type"] == "script:output" {
                 let bytes = v["data"]["chunk"].as_str().map(decode).unwrap_or_default();
@@ -5624,7 +5627,7 @@ mod script {
 
         let out = h
             .services
-            .script_output(id.clone(), Some(10), None, None)
+            .script_output(h.ws.clone(), id.clone(), Some(10), None, None)
             .await
             .expect("output");
         let text = out
@@ -5639,7 +5642,10 @@ mod script {
             text.contains("OUTPUT-PARITY-MARK"),
             "buffer text included: {text:?}"
         );
-        h.services.script_stop(id).await.expect("stop");
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
     }
 
     /// `script.output` on a script that never produced output returns the bare
@@ -5650,7 +5656,7 @@ mod script {
         let id = create(&h, "idle", "echo never-started", ScriptMode::Command).await;
         let out = h
             .services
-            .script_output(id, None, None, None)
+            .script_output(h.ws.clone(), id, None, None, None)
             .await
             .expect("output");
         assert_eq!(out, Value::String("No output yet.".to_string()));
@@ -5669,7 +5675,10 @@ mod script {
         let h = harness().await;
         let mut sub = subscribe(&h);
         let id = create(&h, "boom", "echo boom", ScriptMode::Service).await;
-        h.services.script_start(id.clone()).await.expect("start");
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
         drain_until(&mut sub, Duration::from_secs(5), |v| {
             (v["type"] == "script:state" && v["data"]["status"] == "exited").then_some(())
         })
@@ -5697,7 +5706,11 @@ mod script {
                 }
             }
         }
-        let st = h.services.script_status(id).await.expect("status");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id)
+            .await
+            .expect("status");
         assert_eq!(st["status"], "exited");
         assert_eq!(st["restartCount"], 0);
     }
@@ -5709,7 +5722,10 @@ mod script {
         let h = harness().await;
         let mut sub = subscribe(&h);
         let id = create(&h, "svc", "sleep 2.1", ScriptMode::Service).await;
-        h.services.script_start(id.clone()).await.expect("start");
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
         drain_until(&mut sub, Duration::from_secs(12), |v| {
             (v["type"] == "script:state"
                 && v["data"]["status"] == "running"
@@ -5717,9 +5733,16 @@ mod script {
                 .then_some(())
         })
         .await;
-        let st = h.services.script_status(id.clone()).await.expect("status");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
         assert_eq!(st["restartCount"], 1);
-        h.services.script_stop(id).await.expect("stop");
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
     }
 
     /// A service whose output prints a local dev-server URL surfaces it on
@@ -5735,7 +5758,10 @@ mod script {
             ScriptMode::Service,
         )
         .await;
-        h.services.script_start(id.clone()).await.expect("start");
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
         let (url, _) = drain_until(&mut sub, Duration::from_secs(5), |v| {
             if v["type"] == "script:state" {
                 v["data"]["detectedUrl"].as_str().map(str::to_string)
@@ -5745,7 +5771,10 @@ mod script {
         })
         .await;
         assert!(url.contains("localhost:3000"), "detected url: {url}");
-        h.services.script_stop(id).await.expect("stop");
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
     }
 
     /// The unified host: a running script's PTY is visible to `terminal.list` and
@@ -5762,7 +5791,10 @@ mod script {
             ScriptMode::Service,
         )
         .await;
-        h.services.script_start(id.clone()).await.expect("start");
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
         // Wait until the marker has streamed (so it is in the PTY scrollback).
         drain_until(&mut sub, Duration::from_secs(5), |v| {
             if v["type"] == "script:output" {
@@ -5796,7 +5828,10 @@ mod script {
             contains(&bytes, b"SCRIPT-PTY-MARK"),
             "terminal reads the running script's PTY output"
         );
-        h.services.script_stop(id).await.expect("stop");
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
     }
 }
 

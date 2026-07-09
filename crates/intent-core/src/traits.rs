@@ -3627,9 +3627,15 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `script.remove`: stop (if running) and forget a script; returns
-    /// `{ ok, scriptId }` (PROTOCOL §5.8).
-    fn script_remove(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = script_id;
+    /// `{ ok, scriptId }` (PROTOCOL §5.8). Workspace-scoped: the callee
+    /// looks up the script under `(workspace_id, script_id)` so a script id
+    /// owned by another workspace surfaces as `NotFound`.
+    fn script_remove(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_remove not implemented".to_string(),
@@ -3639,8 +3645,13 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `script.start`: spawn the script on the PTY host (service mode auto-
     /// restarts per policy); returns `{ ok, scriptId }` (PROTOCOL §5.8).
-    fn script_start(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = script_id;
+    /// Workspace-scoped.
+    fn script_start(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_start not implemented".to_string(),
@@ -3649,9 +3660,13 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `script.stop`: stop a running script (cancels pending auto-restart);
-    /// returns `{ ok, scriptId }` (PROTOCOL §5.8).
-    fn script_stop(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = script_id;
+    /// returns `{ ok, scriptId }` (PROTOCOL §5.8). Workspace-scoped.
+    fn script_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_stop not implemented".to_string(),
@@ -3660,9 +3675,13 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `script.restart`: stop then start, resetting the restart counter; returns
-    /// `{ ok, scriptId }` (PROTOCOL §5.8).
-    fn script_restart(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = script_id;
+    /// `{ ok, scriptId }` (PROTOCOL §5.8). Workspace-scoped.
+    fn script_restart(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_restart not implemented".to_string(),
@@ -3673,14 +3692,16 @@ pub trait WorkspaceApi: Send + Sync {
     /// `script.output`: the script's current PTY scrollback as plaintext
     /// output-buffer text (optionally trailing `maxLines`, default 100); returns
     /// a bare string (`"No output yet."` when empty), not an object (§5.8).
+    /// Workspace-scoped.
     fn script_output(
         &self,
+        workspace_id: WorkspaceId,
         script_id: String,
         max_lines: Option<i64>,
         paginate: Option<bool>,
         page_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (script_id, max_lines, paginate, page_token);
+        let _ = (workspace_id, script_id, max_lines, paginate, page_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_output not implemented".to_string(),
@@ -3689,9 +3710,13 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `script.status`: the script's [`ScriptRuntimeState`](crate::model::ScriptRuntimeState)
-    /// (PROTOCOL §5.8).
-    fn script_status(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = script_id;
+    /// (PROTOCOL §5.8). Workspace-scoped.
+    fn script_status(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_status not implemented".to_string(),
@@ -3701,14 +3726,15 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `script.run`: run a command-mode script to completion (optional
     /// `timeoutSeconds`), returning `{ exitCode?, output, timedOut?, warning? }`;
-    /// service-mode scripts return a `warning` (PROTOCOL §5.8).
+    /// service-mode scripts return a `warning` (PROTOCOL §5.8). Workspace-scoped.
     fn script_run(
         &self,
+        workspace_id: WorkspaceId,
         script_id: String,
         max_lines: Option<i64>,
         timeout_seconds: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (script_id, max_lines, timeout_seconds);
+        let _ = (workspace_id, script_id, max_lines, timeout_seconds);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_run not implemented".to_string(),

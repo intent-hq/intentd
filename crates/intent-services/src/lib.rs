@@ -3679,52 +3679,83 @@ impl WorkspaceApi for Services {
         Box::pin(async move { mgr.create(workspace_id, params).await })
     }
 
-    fn script_remove(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+    fn script_remove(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.remove(&script_id).await })
+        Box::pin(async move { mgr.remove(&workspace_id, &script_id).await })
     }
 
-    fn script_start(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+    fn script_start(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.start(&script_id).await })
+        Box::pin(async move { mgr.start(&workspace_id, &script_id).await })
     }
 
-    fn script_stop(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+    fn script_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.stop(&script_id).await })
+        Box::pin(async move { mgr.stop(&workspace_id, &script_id).await })
     }
 
-    fn script_restart(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+    fn script_restart(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.restart(&script_id).await })
+        Box::pin(async move { mgr.restart(&workspace_id, &script_id).await })
     }
 
     fn script_output(
         &self,
+        workspace_id: WorkspaceId,
         script_id: String,
         max_lines: Option<i64>,
         paginate: Option<bool>,
         page_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(
-            async move { mgr.output(&script_id, max_lines, paginate.unwrap_or(false), page_token) },
-        )
+        Box::pin(async move {
+            mgr.output(
+                &workspace_id,
+                &script_id,
+                max_lines,
+                paginate.unwrap_or(false),
+                page_token,
+            )
+        })
     }
 
-    fn script_status(&self, script_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+    fn script_status(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.status(&script_id) })
+        Box::pin(async move { mgr.status(&workspace_id, &script_id) })
     }
 
     fn script_run(
         &self,
+        workspace_id: WorkspaceId,
         script_id: String,
         max_lines: Option<i64>,
         timeout_seconds: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.run(&script_id, max_lines, timeout_seconds).await })
+        Box::pin(async move {
+            mgr.run(&workspace_id, &script_id, max_lines, timeout_seconds)
+                .await
+        })
     }
 
     fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {

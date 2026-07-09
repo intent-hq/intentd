@@ -2344,41 +2344,54 @@ async fn dispatch(
             api.script_create(ws, create).await.map_err(domain_to_rpc)
         }
         "script.remove" => {
+            let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
-            api.script_remove(script_id).await.map_err(domain_to_rpc)
+            api.script_remove(ws, script_id)
+                .await
+                .map_err(domain_to_rpc)
         }
         "script.start" => {
+            let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
-            api.script_start(script_id).await.map_err(domain_to_rpc)
+            api.script_start(ws, script_id).await.map_err(domain_to_rpc)
         }
         "script.stop" => {
+            let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
-            api.script_stop(script_id).await.map_err(domain_to_rpc)
+            api.script_stop(ws, script_id).await.map_err(domain_to_rpc)
         }
         "script.restart" => {
+            let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
-            api.script_restart(script_id).await.map_err(domain_to_rpc)
+            api.script_restart(ws, script_id)
+                .await
+                .map_err(domain_to_rpc)
         }
         "script.output" => {
+            let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             let max_lines = opt_int(params, "maxLines");
             let paginate = params.get("paginate").and_then(Value::as_bool);
             let page_token = opt_str(params, "nextToken");
-            api.script_output(script_id, max_lines, paginate, page_token)
+            api.script_output(ws, script_id, max_lines, paginate, page_token)
                 .await
                 .map_err(domain_to_rpc)
         }
         "script.status" => {
+            let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
-            api.script_status(script_id).await.map_err(domain_to_rpc)
+            api.script_status(ws, script_id)
+                .await
+                .map_err(domain_to_rpc)
         }
         "script.run" => {
+            let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             let max_lines = opt_int(params, "maxLines");
             // `timeoutSeconds` with the `timeout` alias (PROTOCOL §5.8).
             let timeout_seconds =
                 opt_int(params, "timeoutSeconds").or_else(|| opt_int(params, "timeout"));
-            api.script_run(script_id, max_lines, timeout_seconds)
+            api.script_run(ws, script_id, max_lines, timeout_seconds)
                 .await
                 .map_err(domain_to_rpc)
         }

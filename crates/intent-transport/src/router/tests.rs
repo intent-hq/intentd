@@ -1322,24 +1322,65 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn script_remove(&self, script_id: String) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "scriptId": script_id })) })
+    fn script_remove(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true,
+                "scriptId": script_id,
+                "workspaceId": workspace_id.as_str(),
+            }))
+        })
     }
 
-    fn script_start(&self, script_id: String) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "scriptId": script_id })) })
+    fn script_start(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true,
+                "scriptId": script_id,
+                "workspaceId": workspace_id.as_str(),
+            }))
+        })
     }
 
-    fn script_stop(&self, script_id: String) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "scriptId": script_id })) })
+    fn script_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true,
+                "scriptId": script_id,
+                "workspaceId": workspace_id.as_str(),
+            }))
+        })
     }
 
-    fn script_restart(&self, script_id: String) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "scriptId": script_id })) })
+    fn script_restart(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true,
+                "scriptId": script_id,
+                "workspaceId": workspace_id.as_str(),
+            }))
+        })
     }
 
     fn script_output(
         &self,
+        workspace_id: WorkspaceId,
         script_id: String,
         max_lines: Option<i64>,
         _paginate: Option<bool>,
@@ -1349,7 +1390,7 @@ impl WorkspaceApi for FakeApi {
             // `script.output` returns plaintext buffer text (a bare string), not
             // an object (§5.8). Echo `scriptId`/`maxLines` into the string so the
             // dispatch test can still assert they were threaded through.
-            let _ = script_id;
+            let _ = (script_id, workspace_id);
             Ok(Value::String(format!(
                 "[1 lines]\nmaxLines={}",
                 max_lines.unwrap_or(-1)
@@ -1357,12 +1398,23 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn script_status(&self, script_id: String) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async move { Ok(serde_json::json!({ "scriptId": script_id, "status": "idle" })) })
+    fn script_status(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "scriptId": script_id,
+                "workspaceId": workspace_id.as_str(),
+                "status": "idle",
+            }))
+        })
     }
 
     fn script_run(
         &self,
+        workspace_id: WorkspaceId,
         script_id: String,
         max_lines: Option<i64>,
         timeout_seconds: Option<i64>,
@@ -1370,6 +1422,7 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async move {
             Ok(serde_json::json!({
                 "scriptId": script_id,
+                "workspaceId": workspace_id.as_str(),
                 "maxLines": max_lines,
                 "timeoutSeconds": timeout_seconds,
             }))
@@ -3642,7 +3695,7 @@ async fn script_lifecycle_and_run_dispatch() {
         "script.remove",
     ] {
         let msg = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"scriptId":"s-1"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"workspaceId":"ws-1","scriptId":"s-1"}}}}"#
         );
         let v = call(&msg).await.unwrap();
         assert_eq!(v["result"]["ok"], serde_json::json!(true), "{method}");
@@ -3651,21 +3704,27 @@ async fn script_lifecycle_and_run_dispatch() {
             serde_json::json!("s-1"),
             "{method}"
         );
+        assert_eq!(
+            v["result"]["workspaceId"],
+            serde_json::json!("ws-1"),
+            "{method} threads workspaceId"
+        );
     }
 
     // script.run accepts the `timeout` alias for `timeoutSeconds`.
     let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"script.run","params":{"scriptId":"s-1","maxLines":50,"timeout":30}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"script.run","params":{"workspaceId":"ws-1","scriptId":"s-1","maxLines":50,"timeout":30}}"#,
     )
     .await
     .unwrap();
     assert_eq!(v["result"]["maxLines"], serde_json::json!(50));
     assert_eq!(v["result"]["timeoutSeconds"], serde_json::json!(30));
+    assert_eq!(v["result"]["workspaceId"], serde_json::json!("ws-1"));
 
     // script.output passes maxLines and its result is a bare plaintext string
     // (a header line + text), not an object (§5.8).
     let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"script.output","params":{"scriptId":"s-1","maxLines":10}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"script.output","params":{"workspaceId":"ws-1","scriptId":"s-1","maxLines":10}}"#,
     )
     .await
     .unwrap();
@@ -3676,7 +3735,14 @@ async fn script_lifecycle_and_run_dispatch() {
     assert!(out.contains("maxLines=10"), "maxLines threaded: {out:?}");
 
     // Missing scriptId → -32602.
-    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"script.start","params":{}}"#)
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"script.start","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // Missing workspaceId → -32602 (every mutating script.* op is workspace-scoped).
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"script.start","params":{"scriptId":"s-1"}}"#)
         .await
         .unwrap();
     assert_eq!(err_code(&v), -32602);
