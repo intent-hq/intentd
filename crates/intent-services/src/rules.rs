@@ -218,11 +218,11 @@ pub(crate) async fn get_specialization_rules(
 }
 
 /// Specialist inputs for the spawn-prompt injection (PP-1, reference
-/// `instruction-service.ts` layers 2 and 9): the resolved behavior prompt is
-/// wrapped in a `<specialist_role>` section right after the base prompt, and
-/// the role identity feeds a `## Role Reminder` footer at the very end of the
-/// prompt (recency). All fields optional: a behavior prompt without a
-/// specialist name yields the section but no footer, and vice versa.
+/// `instruction-service.ts` layers 4.8 and 9): the resolved behavior prompt is
+/// wrapped in a `<specialist_role>` section after specialization and user
+/// rules, and the role identity feeds a `## Role Reminder` footer at the very
+/// end of the prompt (recency). All fields optional: a behavior prompt without
+/// a specialist name yields the section but no footer, and vice versa.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SpecialistPromptInjection {
     pub behavior_prompt: Option<String>,
@@ -231,14 +231,15 @@ pub(crate) struct SpecialistPromptInjection {
 }
 
 /// Assemble the effective system prompt (the **internal** injection pipeline,
-/// §18.1) in documented precedence: base-system-prompt override → specialist
-/// role section (PP-1, when the session has one) → specialization rules (the
-/// 3-tier resolver: agent-type override → workspace
+/// §18.1) in documented precedence: base-system-prompt override →
+/// specialization rules (the 3-tier resolver: agent-type override → workspace
 /// `.augment/agent-rules/{type}.md` → bundled built-in) → workspace override →
-/// live workspace rule files → specialist role-reminder footer (recency; the
-/// reference `getMandatoryActionsFooter`). The specialization slot is always
-/// populated (tier 3 always resolves), so this returns `None` only in the
-/// unreachable case where even the bundled specialization is empty.
+/// live workspace rule files → specialist role section (PP-1, reference layer
+/// 4.8: after specialization/user rules, when the session has one) →
+/// specialist role-reminder footer (recency; the reference
+/// `getMandatoryActionsFooter`). The specialization slot is always populated
+/// (tier 3 always resolves), so this returns `None` only in the unreachable
+/// case where even the bundled specialization is empty.
 pub(crate) async fn assemble_system_prompt(
     store: &Store,
     workspace_path: Option<&Path>,
@@ -249,19 +250,6 @@ pub(crate) async fn assemble_system_prompt(
     let mut parts: Vec<String> = Vec::new();
     if let Some(c) = enabled_override(&overrides, "base-system-prompt") {
         parts.push(c);
-    }
-    // Specialist role section (reference layer 2: right after the base
-    // prompt, before specialization/user rules).
-    if let Some(bp) = specialist
-        .and_then(|s| s.behavior_prompt.as_deref())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        parts.push(format!(
-            "# Your Specialist Role\n\n<specialist_role>\n{bp}\n</specialist_role>\n\n\
-             The instructions in <specialist_role> define your primary function. \
-             Prioritize them above general guidance."
-        ));
     }
     let specialization = get_specialization_rules(store, workspace_path, agent_type).await;
     if !specialization.trim().is_empty() {
@@ -276,6 +264,19 @@ pub(crate) async fn assemble_system_prompt(
                 parts.push(format_user_rules_for_context(&content, &source));
             }
         }
+    }
+    // Specialist role section (reference layer 4.8: after specialization
+    // rules, user rules, and skills — before the parent-only layers).
+    if let Some(bp) = specialist
+        .and_then(|s| s.behavior_prompt.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        parts.push(format!(
+            "# Your Specialist Role\n\n<specialist_role>\n{bp}\n</specialist_role>\n\n\
+             The instructions in <specialist_role> define your primary function. \
+             Prioritize them above general guidance."
+        ));
     }
     // Role-reminder footer (reference layer 9: the VERY END of the prompt to
     // leverage recency bias). The per-turn `[Role Reminder: …]` prefix in

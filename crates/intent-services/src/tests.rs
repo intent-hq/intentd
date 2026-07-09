@@ -6284,16 +6284,16 @@ mod rules {
         .expect("assembled prompt");
 
         // Section wraps the behavior prompt in <specialist_role> tags, placed
-        // after the base prompt and before specialization/user rules.
+        // after specialization and user rules (reference layer 4.8).
         let base = prompt.find("BASE_BODY").expect("base body");
-        let role = prompt
-            .find("# Your Specialist Role")
-            .expect("specialist role section");
         let spec = prompt.find("# Task Loop Agent").expect("specialization");
         let rules = prompt
             .find("ALWAYS run the linter.")
             .expect("workspace rules");
-        assert!(base < role && role < spec && spec < rules, "section order");
+        let role = prompt
+            .find("# Your Specialist Role")
+            .expect("specialist role section");
+        assert!(base < spec && spec < rules && rules < role, "section order");
         assert!(
             prompt.contains("<specialist_role>\nImplement your assigned task.\n</specialist_role>")
         );
