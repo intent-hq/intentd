@@ -728,14 +728,24 @@ impl AgentManager {
 
         // Assemble the effective system prompt (the §18.1 injection pipeline:
         // base/specialization/workspace user overrides + live workspace rule
-        // files) into a temp `--rules` file when the caller supplies none. The
-        // handle owns the temp file so it outlives the child that reads it.
+        // files, plus — for specialist agents — the PP-1 `<specialist_role>`
+        // section and role-reminder footer) into a temp `--rules` file when
+        // the caller supplies none. The handle owns the temp file so it
+        // outlives the child that reads it.
         let mut rules_config: Option<TempConfigFile> = None;
         let mut rules_file_path: Option<String> = None;
         if opts.rules_file.is_none() {
-            if let Some(prompt) =
-                crate::rules::assemble_system_prompt(&self.services.store, Some(&cwd), agent_type)
-                    .await
+            let specialist = self
+                .services
+                .agent_specialist_injection(&agent_id, Some(&cwd))
+                .await;
+            if let Some(prompt) = crate::rules::assemble_system_prompt(
+                &self.services.store,
+                Some(&cwd),
+                agent_type,
+                specialist.as_ref(),
+            )
+            .await
             {
                 let path =
                     std::env::temp_dir().join(format!("intentd-rules-{}.md", Uuid::new_v4()));
@@ -2545,5 +2555,61 @@ mod role_reminder_tests {
             "unexpected ordering: {text:?}"
         );
         assert!(text.ends_with("do it"));
+    }
+
+    // ---- Spawn-prompt specialist injection (PP-1) ----
+
+    #[tokio::test]
+    async fn specialist_injection_resolves_prompt_from_file() {
+        let dir = write_specialist(
+            "implementor",
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nImplement the task.",
+        );
+        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let inj = mgr
+            .services
+            .agent_specialist_injection(&agent_id, None)
+            .await
+            .expect("injection for specialist agent");
+        assert_eq!(inj.behavior_prompt.as_deref(), Some("Implement the task."));
+        assert_eq!(inj.specialist_name.as_deref(), Some("Implementor"));
+        assert_eq!(inj.role_reminder.as_deref(), Some("Stay in scope."));
+    }
+
+    #[tokio::test]
+    async fn specialist_injection_metadata_behavior_prompt_wins() {
+        // The session's persisted `metadata.behaviorPrompt` override wins over
+        // the specialist file's body; name/reminder still come from the file.
+        let dir = write_specialist(
+            "implementor",
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nFile body.",
+        );
+        let (mgr, _first) = manager_with(Some("implementor"), Some(dir)).await;
+        let agent_id = AgentId::from("agent-2");
+        let mut s = session(&agent_id, &WorkspaceId::from("ws-1"), Some("implementor"));
+        s.metadata = Some(serde_json::json!({ "behaviorPrompt": "Custom override." }));
+        mgr.services
+            .store
+            .insert_agent_session(&s)
+            .await
+            .expect("insert session");
+        let inj = mgr
+            .services
+            .agent_specialist_injection(&agent_id, None)
+            .await
+            .expect("injection");
+        assert_eq!(inj.behavior_prompt.as_deref(), Some("Custom override."));
+        assert_eq!(inj.specialist_name.as_deref(), Some("Implementor"));
+        assert_eq!(inj.role_reminder.as_deref(), Some("Stay in scope."));
+    }
+
+    #[tokio::test]
+    async fn specialist_injection_none_for_plain_agent() {
+        let (mgr, agent_id) = manager_with(None, None).await;
+        assert!(mgr
+            .services
+            .agent_specialist_injection(&agent_id, None)
+            .await
+            .is_none());
     }
 }

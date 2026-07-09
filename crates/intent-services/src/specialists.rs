@@ -460,6 +460,42 @@ impl SpecialistsService {
         Some((name, reminder))
     }
 
+    /// Resolve the spawn-prompt injection fields for a specialist id (PP-1):
+    /// `(behaviorPrompt body, display name, roleReminder)`. The reminder falls
+    /// back to the auto-generated one (same policy as
+    /// [`Self::resolve_role_reminder`]); empty values resolve to `None`.
+    /// Returns `None` when the specialist is unknown.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn resolve_prompt_injection(
+        &self,
+        id: &str,
+        workspace_path: Option<&Path>,
+    ) -> Option<(Option<String>, String, Option<String>)> {
+        let def = self.resolve(id, workspace_path)?;
+        let behavior_prompt = def
+            .get("behaviorPrompt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let name = def
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(id)
+            .to_string();
+        let reminder = def
+            .get("roleReminder")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let auto = auto_generate_role_reminder(behavior_prompt.as_deref().unwrap_or(""));
+                (!auto.is_empty()).then_some(auto)
+            });
+        Some((behavior_prompt, name, reminder))
+    }
+
     /// Resolve the writable directory for `scope`, creating it; `project`
     /// requires a `workspace_path`.
     fn writable_dir(&self, scope: &str, workspace_path: Option<&Path>) -> Result<PathBuf> {

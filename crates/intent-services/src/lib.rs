@@ -389,6 +389,47 @@ impl Services {
         Some(format!("[Role Reminder: You are a {name}. {reminder}]"))
     }
 
+    /// Resolve the spawn-prompt specialist injection for an agent (PP-1): the
+    /// behavior prompt (the session's persisted `metadata.behaviorPrompt`
+    /// override wins over the specialist file's body — the TS
+    /// `resolveSpecialistConfig` precedence) plus the specialist's display name
+    /// and role reminder for the footer. `None` for non-specialist agents with
+    /// no behavior-prompt override, leaving their prompt unchanged.
+    pub(crate) async fn agent_specialist_injection(
+        &self,
+        agent_id: &AgentId,
+        workspace_path: Option<&Path>,
+    ) -> Option<crate::rules::SpecialistPromptInjection> {
+        let session = self.store.get_agent_session(agent_id).await.ok()?;
+        let override_bp = session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("behaviorPrompt"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let resolved = session.specialist.as_deref().and_then(|id| {
+            self.specialists_service()
+                .resolve_prompt_injection(id, workspace_path)
+        });
+        match (override_bp, resolved) {
+            (bp_override, Some((bp_file, name, reminder))) => {
+                Some(crate::rules::SpecialistPromptInjection {
+                    behavior_prompt: bp_override.or(bp_file),
+                    specialist_name: Some(name),
+                    role_reminder: reminder,
+                })
+            }
+            (Some(bp), None) => Some(crate::rules::SpecialistPromptInjection {
+                behavior_prompt: Some(bp),
+                specialist_name: None,
+                role_reminder: None,
+            }),
+            (None, None) => None,
+        }
+    }
+
     /// Build a [`SettingsService`](settings::SettingsService) view over the store
     /// and secret store for one `settings.*` call. The secret store is cloned
     /// as an `Arc` so `SettingsService` can move it into `spawn_blocking` for

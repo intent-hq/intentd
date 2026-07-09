@@ -6062,7 +6062,7 @@ mod rules {
         .await
         .unwrap();
 
-        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop")
+        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop", None)
             .await
             .expect("assembled prompt");
 
@@ -6093,7 +6093,7 @@ mod rules {
         )
         .await
         .unwrap();
-        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop")
+        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop", None)
             .await
             .expect("assembled prompt (file still applies)");
         assert!(!prompt.contains("HIDDEN_BODY"));
@@ -6157,7 +6157,7 @@ mod rules {
     async fn assembly_uses_bundled_specialization_when_no_override() {
         let tree = worktree();
         let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
-        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop")
+        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop", None)
             .await
             .expect("assembled prompt");
         // Bundled specialization is injected, and the live workspace file still applies.
@@ -6169,6 +6169,82 @@ mod rules {
             prompt.contains("ALWAYS run the linter."),
             "live workspace file"
         );
+        // Non-specialist assembly (no injection): no specialist artifacts.
+        assert!(!prompt.contains("<specialist_role>"));
+        assert!(!prompt.contains("## Role Reminder"));
+    }
+
+    #[tokio::test]
+    async fn assembly_injects_specialist_role_section_and_footer() {
+        let tree = worktree();
+        let (_tmp, store, svc, ws) = setup(&tree.0).await;
+        svc.rules_update(
+            ws.clone(),
+            "base-system-prompt".into(),
+            "BASE_BODY".into(),
+            None,
+        )
+        .await
+        .unwrap();
+        let injection = crate::rules::SpecialistPromptInjection {
+            behavior_prompt: Some("Implement your assigned task.".into()),
+            specialist_name: Some("Implementor".into()),
+            role_reminder: Some("Stay in scope.".into()),
+        };
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+        )
+        .await
+        .expect("assembled prompt");
+
+        // Section wraps the behavior prompt in <specialist_role> tags, placed
+        // after the base prompt and before specialization/user rules.
+        let base = prompt.find("BASE_BODY").expect("base body");
+        let role = prompt
+            .find("# Your Specialist Role")
+            .expect("specialist role section");
+        let spec = prompt.find("# Task Loop Agent").expect("specialization");
+        let rules = prompt
+            .find("ALWAYS run the linter.")
+            .expect("workspace rules");
+        assert!(base < role && role < spec && spec < rules, "section order");
+        assert!(
+            prompt.contains("<specialist_role>\nImplement your assigned task.\n</specialist_role>")
+        );
+        assert!(
+            prompt.contains("The instructions in <specialist_role> define your primary function.")
+        );
+        // Role-reminder footer sits at the very end (recency).
+        assert!(
+            prompt.ends_with("## Role Reminder\n\nYou are a Implementor. Stay in scope."),
+            "footer at end: {:?}",
+            &prompt[prompt.len().saturating_sub(120)..]
+        );
+    }
+
+    #[tokio::test]
+    async fn assembly_footer_falls_back_without_role_reminder() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+        let injection = crate::rules::SpecialistPromptInjection {
+            behavior_prompt: Some("Verify things.".into()),
+            specialist_name: Some("Verifier".into()),
+            role_reminder: None,
+        };
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+        )
+        .await
+        .expect("assembled prompt");
+        assert!(prompt.ends_with(
+            "## Role Reminder\n\nYou are a Verifier. Follow the instructions in <specialist_role> above."
+        ));
     }
 
     #[tokio::test]
