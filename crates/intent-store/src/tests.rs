@@ -87,14 +87,14 @@ async fn migration_status_reports_current_after_open() {
         status.expected,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31
+            25, 26, 27, 28, 29, 30, 31, 32
         ]
     );
     assert_eq!(
         status.applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31
+            25, 26, 27, 28, 29, 30, 31, 32
         ]
     );
 }
@@ -253,6 +253,51 @@ async fn workspace_get_update_delete() {
         store.delete_workspace(&id).await,
         Err(intent_core::Error::NotFound(_))
     ));
+}
+
+/// `delete_workspace` records a tombstone so `workspace_id_ever_used` keeps
+/// reporting the id as used after the row is gone — `workspace.create` relies
+/// on this to never recycle a deleted workspace id.
+#[tokio::test]
+async fn delete_workspace_tombstones_id() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::from("auth-fix");
+    assert!(
+        !store.workspace_id_ever_used(&id).await.expect("unused"),
+        "never-created id reports unused"
+    );
+
+    store
+        .insert_workspace(&sample_workspace(&id, "WS", false))
+        .await
+        .expect("insert");
+    assert!(
+        store.workspace_id_ever_used(&id).await.expect("live"),
+        "live row reports used"
+    );
+
+    store.delete_workspace(&id).await.expect("delete");
+    assert!(matches!(
+        store.get_workspace(&id).await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+    assert!(
+        store.workspace_id_ever_used(&id).await.expect("tombstone"),
+        "deleted id stays used via the tombstone"
+    );
+
+    // A NotFound delete records no tombstone for a never-created id.
+    let ghost = WorkspaceId::from("ghost-id");
+    assert!(matches!(
+        store.delete_workspace(&ghost).await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+    assert!(
+        !store.workspace_id_ever_used(&ghost).await.expect("ghost"),
+        "failed delete of an unknown id leaves it unused"
+    );
 }
 
 #[tokio::test]

@@ -1820,9 +1820,17 @@ fn assert_hermetic_root_absent() {
 /// Resolve a workspace-id slug for `workspace.create`, porting the TS
 /// `generateLocalSlug` behavior (`workspace.service.ts`): extract from the
 /// `initialAgent.prompt` when possible, else fall back to a random
-/// adjective-animal pair. Uniquified against existing workspace rows with a
-/// `-N` suffix on collision (mirrors `ensure_unique_branch_name`).
-async fn derive_workspace_id(store: &Store, input: &WorkspaceCreate) -> WorkspaceId {
+/// adjective-animal pair. Uniquified with a `-N` suffix whenever the candidate
+/// id was **ever** used — a live row, a delete tombstone
+/// (`deleted_workspace_id`), or a leftover `<workspaces_root>/<id>` directory
+/// on disk — so ids are never recycled across delete/recreate (FE
+/// `recentlyDeletedWorkspaces` parity: reuse would collide the old
+/// workspace's agent streams and file paths with the new one's).
+async fn derive_workspace_id(
+    store: &Store,
+    input: &WorkspaceCreate,
+    workspaces_root: &Path,
+) -> WorkspaceId {
     let base = input
         .initial_agent
         .as_ref()
@@ -1830,16 +1838,28 @@ async fn derive_workspace_id(store: &Store, input: &WorkspaceCreate) -> Workspac
         .and_then(intent_core::slug::extract_local_slug)
         .unwrap_or_else(intent_core::slug::generate_workspace_slug);
     let candidate = WorkspaceId::from_string(base.clone());
-    if store.get_workspace(&candidate).await.is_err() {
+    if workspace_id_available(store, workspaces_root, &candidate).await {
         return candidate;
     }
     let mut n: u32 = 2;
     loop {
-        let candidate = WorkspaceId::from_string(format!("{base}-{n}"));
-        if store.get_workspace(&candidate).await.is_err() {
+        let candidate = WorkspaceId::from_string(intent_core::slug::append_slug_suffix(&base, n));
+        if workspace_id_available(store, workspaces_root, &candidate).await {
             return candidate;
         }
         n += 1;
+    }
+}
+
+/// A workspace id is available for `workspace.create` only when it was never
+/// used before: no live row, no `deleted_workspace_id` tombstone, and no
+/// existing `<workspaces_root>/<id>` directory (covers pre-tombstone deletes
+/// and orphaned dirs). A store error counts as "used" — colliding is safer
+/// than recycling.
+async fn workspace_id_available(store: &Store, workspaces_root: &Path, id: &WorkspaceId) -> bool {
+    match store.workspace_id_ever_used(id).await {
+        Ok(false) => !workspaces_root.join(id.as_str()).exists(),
+        _ => false,
     }
 }
 
@@ -3833,12 +3853,16 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
+                    let workspaces_root =
+                        workspaces_root.unwrap_or_else(default_workspaces_root);
                     // Workspace id derivation (TS `generateLocalSlug` parity):
                     // slug from the initial-agent prompt when possible, else a
-                    // random adjective-animal pair; uniquified against
-                    // existing rows with a `-N` suffix on collision so the
-                    // on-disk directory reflects intent, not opaque UUIDs.
-                    let id = derive_workspace_id(&store, &input).await;
+                    // random adjective-animal pair; uniquified with a `-N`
+                    // suffix whenever the id was ever used (live row, delete
+                    // tombstone, or leftover directory) so the on-disk
+                    // directory reflects intent and deleted ids are never
+                    // recycled.
+                    let id = derive_workspace_id(&store, &input, &workspaces_root).await;
                     // Clone orchestration (PROTOCOL §5.1): when `githubUrl` is
                     // set and `repositoryPath` is not already a local git
                     // repo, clone it *before* branch naming so the branch
@@ -3868,8 +3892,6 @@ impl WorkspaceApi for Services {
                             let target = match input.clone_path.as_deref() {
                                 Some(p) if !p.trim().is_empty() => PathBuf::from(p),
                                 _ => workspaces_root
-                                    .clone()
-                                    .unwrap_or_else(default_workspaces_root)
                                     .join("clones")
                                     .join(clone_ops::derive_default_target(url)),
                             };
@@ -4042,9 +4064,7 @@ impl WorkspaceApi for Services {
                         .as_deref()
                         .filter(|p| !p.is_empty())
                         .map(PathBuf::from);
-                    let workspaces_root_pathbuf = workspaces_root
-                        .clone()
-                        .unwrap_or_else(default_workspaces_root);
+                    let workspaces_root_pathbuf = workspaces_root.clone();
                     if let Some(repo_dir) = repo_dir {
                         if !ws.is_remote && !ws.skip_worktree && !has_worktree {
                             if repo_dir.join(".git").exists() {

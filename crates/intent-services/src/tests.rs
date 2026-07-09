@@ -6843,6 +6843,88 @@ mod worktree_provisioning {
         assert_eq!(second.id.0, "auth-fix-2");
     }
 
+    /// Workspace ids are never recycled across delete/recreate (LEAK-2): a
+    /// deleted workspace leaves a tombstone, so re-creating with the same
+    /// prompt yields a *different* (suffixed) id — reusing the id would
+    /// collide the old workspace's agent streams and file paths with the new
+    /// one's (FE `recentlyDeletedWorkspaces` parity).
+    #[tokio::test]
+    async fn create_never_recycles_deleted_workspace_id() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-idrecycle-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let make = |prompt: &str| WorkspaceCreate {
+            skip_worktree: Some(true),
+            initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                prompt: Some(prompt.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let first = svc
+            .create_workspace(make("fix the auth flow"), None)
+            .await
+            .expect("first create")
+            .workspace;
+        assert_eq!(first.id.0, "auth-fix");
+
+        svc.delete_workspace(first.id.clone())
+            .await
+            .expect("delete");
+
+        let second = svc
+            .create_workspace(make("fix the auth flow"), None)
+            .await
+            .expect("recreate")
+            .workspace;
+        assert_ne!(second.id, first.id, "deleted id must not be recycled");
+        assert_eq!(second.id.0, "auth-fix-2");
+
+        // Delete the suffixed one too: the next create must skip *both*
+        // tombstoned ids.
+        svc.delete_workspace(second.id.clone())
+            .await
+            .expect("delete second");
+        let third = svc
+            .create_workspace(make("fix the auth flow"), None)
+            .await
+            .expect("third create")
+            .workspace;
+        assert_eq!(third.id.0, "auth-fix-3");
+    }
+
+    /// A leftover `<workspaces_root>/<id>` directory (orphaned/pre-tombstone
+    /// state) also blocks id reuse: `workspace.create` uniquifies past it.
+    #[tokio::test]
+    async fn create_skips_workspace_id_with_leftover_directory() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-iddir-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        std::fs::create_dir_all(root.0.join("auth-fix")).expect("seed leftover dir");
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    skip_worktree: Some(true),
+                    initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                        prompt: Some("fix the auth flow".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(ws.id.0, "auth-fix-2");
+    }
+
     /// When no initial-agent prompt is supplied, `workspace.create` falls back
     /// to a random adjective-animal slug (never a raw UUID). The resulting id
     /// must satisfy the FE `word-word` shape (`isValidWorkspaceId`).
