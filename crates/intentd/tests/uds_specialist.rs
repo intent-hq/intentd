@@ -193,14 +193,21 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     let mut r = BufReader::new(read);
     let wp = h.work_dir.to_string_lossy().to_string();
 
-    // list — bundled tier visible (no workspaceId required).
+    // list — bundled tier visible (no workspaceId required). The nine embedded
+    // reference specialists (PP-2) are always present; the two dir-seeded files
+    // override the embedded copies for the same ids.
     let list = ok(&mut w, &mut r, 1, "specialist.list", json!({})).await;
     let specs = list["specialists"].as_array().expect("specialists array");
-    assert_eq!(specs.len(), 2, "two bundled specialists");
+    assert_eq!(specs.len(), 9, "nine embedded ids, two overridden from dir");
     let imp = specs.iter().find(|s| s["id"] == "implementor").unwrap();
     assert_eq!(imp["source"], "bundled");
     assert_eq!(imp["name"], "Implementor");
+    assert_eq!(imp["description"], "Bundled implementor", "dir file wins");
     assert!(imp.get("path").is_none(), "bundled exposes no path");
+    assert!(
+        specs.iter().any(|s| s["id"] == "chief-of-staff"),
+        "embedded-only id listed"
+    );
 
     // get — resolved view of a bundled id.
     let got = ok(
