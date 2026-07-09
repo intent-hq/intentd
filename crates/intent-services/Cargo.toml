@@ -25,7 +25,6 @@ tokio = { workspace = true }
 notify = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
-keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
 time = { workspace = true, features = ["formatting"] }
 similar = { version = "2.7.0", default-features = false }
 yrs = "0.27.2"

@@ -17,7 +17,7 @@ use intent_services::{
 use intent_store::Store;
 use intent_transport::{
     detect_has_display, ensure_tls_certificate, generate_token, get_or_create_token, serve_uds,
-    AsyncTokenStore, CertStatus, KeyringTokenStore, SystemControl, SystemStatus, TokenStore,
+    AsyncTokenStore, CertStatus, FileTokenStore, SystemControl, SystemStatus, TokenStore,
     WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
@@ -137,7 +137,7 @@ async fn main() -> ExitCode {
 
 /// Print the WSS pairing credentials (§5.2/§5.3): the bearer token a client
 /// sends and the TLS cert fingerprint it pins. Resolves the token via
-/// [`resolve_token_store`] (env seam ⇒ keychain) and the fingerprint via
+/// [`resolve_token_store`] (env seam ⇒ secrets file) and the fingerprint via
 /// [`ensure_tls_certificate`] (the same cert `serve` reuses, so it is stable to
 /// pin). `rotate` mints+persists a NEW token first — but when
 /// `INTENTD_AUTH_TOKEN` is set the token is fixed by the env var and cannot be
@@ -503,8 +503,8 @@ impl SystemControl for DaemonControl {
 
 /// Fixed-token [`TokenStore`] selected only when `INTENTD_AUTH_TOKEN` is set.
 /// TEST-ONLY SEAM (§13.1 E2E): lets the E2E suite authenticate a real `intentd
-/// serve --listen tcp/both` daemon hermetically, without touching the OS
-/// keychain. Production always uses [`KeyringTokenStore`].
+/// serve --listen tcp/both` daemon hermetically, without touching the shared
+/// secrets file. Production always uses [`FileTokenStore`].
 struct EnvTokenStore(String);
 
 impl TokenStore for EnvTokenStore {
@@ -517,11 +517,12 @@ impl TokenStore for EnvTokenStore {
 }
 
 /// Select the WSS token store: a fixed env token when `INTENTD_AUTH_TOKEN` is
-/// set (test-only hermetic seam, §13.1), otherwise the OS keychain.
+/// set (test-only hermetic seam, §13.1), otherwise the file-backed secrets
+/// store.
 fn resolve_token_store() -> Arc<dyn TokenStore> {
     match std::env::var("INTENTD_AUTH_TOKEN") {
         Ok(t) if !t.is_empty() => Arc::new(EnvTokenStore(t)),
-        _ => Arc::new(KeyringTokenStore),
+        _ => Arc::new(FileTokenStore::default()),
     }
 }
 

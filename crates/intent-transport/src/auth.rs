@@ -2,17 +2,17 @@
 //!
 //! Ports `src/main/websocket-auth.ts` and `isAllowedWebSocketApiOrigin`
 //! (`src/main/websocket-api-server.ts`). The bearer token is 32 random bytes
-//! hex-encoded (64 chars) and persisted in the OS keychain via the `keyring`
-//! crate under account `server.auth.token` (sensitive — never logged, never
-//! returned in plaintext over the wire). [`validate_token`] is length-checked
-//! first then compared in constant time. The HTTP-upgrade wiring that *uses*
-//! these helpers (401 bad token, 403 when disabled, socket destroy) is M5.3.
+//! hex-encoded (64 chars) and persisted in the shared file-backed secrets
+//! store ([`intent_core::FileSecretStore`], `~/intent/secrets.json`) under
+//! account `server.auth.token` (sensitive — never logged, never returned in
+//! plaintext over the wire). [`validate_token`] is length-checked first then
+//! compared in constant time. The HTTP-upgrade wiring that *uses* these
+//! helpers (401 bad token, 403 when disabled, socket destroy) is M5.3.
 //!
-//! Every backing keychain call runs on the tokio blocking pool with a bounded
-//! timeout so a wedged OS keychain (e.g. a pending macOS auth prompt) never
-//! blocks an async worker. The in-memory TTL cache on [`AsyncTokenStore`]
-//! keeps repeat WSS upgrades cheap and caps how many blocking-pool threads a
-//! stuck keychain can pile up.
+//! Every backing secret-store call runs on the tokio blocking pool with a
+//! bounded timeout so a stalled backing store never blocks an async worker.
+//! The in-memory TTL cache on [`AsyncTokenStore`] keeps repeat WSS upgrades
+//! cheap and caps how many blocking-pool threads a stuck store can pile up.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,34 +23,31 @@ use tokio::time::timeout;
 
 use intent_core::{Error, Result};
 
-/// Keychain service name used for `intentd` secrets (matches `intent-sourcecontrol`).
-const KEYRING_SERVICE: &str = "intentd";
-/// Keychain account/key for the bearer token (`server.auth.token`).
-const KEYRING_ACCOUNT: &str = "server.auth.token";
+/// Secrets-store account/key for the bearer token (`server.auth.token`).
+const TOKEN_ACCOUNT: &str = "server.auth.token";
 /// Token length in raw bytes; hex-encoded this yields a 64-char token.
 const TOKEN_BYTES: usize = 32;
 
 /// Default bounded wait for a token **read** before the caller gives up.
-/// Mirrors `intent-services::AsyncSecretStore` so a stuck OS keychain never
-/// wedges the WSS upgrade path.
+/// Mirrors `intent-services::AsyncSecretStore` so a stalled backing store
+/// never wedges the WSS upgrade path.
 const DEFAULT_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
-/// Default bounded wait for a token **write**. Longer than the read budget
-/// because a first-time write can prompt the user for keychain approval; still
-/// must not block the runtime forever.
+/// Default bounded wait for a token **write**. Longer than the read budget so
+/// a slow disk never spuriously fails a persist; still must not block the
+/// runtime forever.
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a load result (present or absent) is served from the in-process
 /// cache before the next call re-consults the backing store. Keeps repeat WSS
 /// upgrades cheap without turning token rotations into a long propagation
 /// window.
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
-/// Rate-limit window for the `keychain load/write timed out` warning so a
-/// wedged keychain doesn't drown the daemon log.
+/// Rate-limit window for the `secret-store load/write timed out` warning so a
+/// wedged backing store doesn't drown the daemon log.
 const DEFAULT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Abstraction over secret token persistence. The production implementation is
-/// [`KeyringTokenStore`]; tests use an in-memory store so they never touch the
-/// real user keychain. This is a test seam over the *same* `keyring` crate, not
-/// a second keychain abstraction.
+/// [`FileTokenStore`]; tests use an in-memory store so they never touch the
+/// real secrets file.
 pub trait TokenStore: Send + Sync {
     /// Return the stored token, or `None` if unset/unavailable.
     fn load_token(&self) -> Option<String>;
@@ -58,31 +55,30 @@ pub trait TokenStore: Send + Sync {
     fn store_token(&self, token: &str) -> Result<()>;
 }
 
-/// OS-keychain-backed [`TokenStore`] (the production default).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct KeyringTokenStore;
+/// File-backed [`TokenStore`] (the production default): delegates to the
+/// shared [`intent_core::FileSecretStore`] (`~/intent/secrets.json`) under
+/// account `server.auth.token` — the same entry `settings.*` redacts.
+#[derive(Debug, Default, Clone)]
+pub struct FileTokenStore {
+    secrets: intent_core::FileSecretStore,
+}
 
-impl TokenStore for KeyringTokenStore {
+impl TokenStore for FileTokenStore {
     fn load_token(&self) -> Option<String> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).ok()?;
-        entry.get_password().ok().filter(|t| !t.is_empty())
+        self.secrets.load(TOKEN_ACCOUNT)
     }
 
     fn store_token(&self, token: &str) -> Result<()> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-            .map_err(|e| Error::Internal(format!("keychain unavailable: {e}")))?;
-        entry
-            .set_password(token)
-            .map_err(|e| Error::Internal(format!("failed to persist auth token: {e}")))
+        self.secrets.store(TOKEN_ACCOUNT, token)
     }
 }
 
 /// Async, single-flight, TTL-cached wrapper around a synchronous [`TokenStore`]
-/// so blocking OS keychain calls never wedge the tokio runtime. Every backing
+/// so blocking secret-store calls never wedge the tokio runtime. Every backing
 /// call runs on the blocking pool via [`tokio::task::spawn_blocking`]; reads
 /// are bounded by a short timeout and coalesced via single-flight (mirroring
-/// `AsyncSecretStore`'s tokio-watch pattern) so a hung keychain occupies at
-/// most one blocking-pool thread total. Cache entries are invalidated on
+/// `AsyncSecretStore`'s tokio-watch pattern) so a hung backing store occupies
+/// at most one blocking-pool thread total. Cache entries are invalidated on
 /// successful writes and expire on TTL. Cheap to clone (state behind `Arc`).
 #[derive(Clone)]
 pub struct AsyncTokenStore {
@@ -120,7 +116,7 @@ enum Entry {
         load_id: u64,
     },
     /// A resolved value cached in-process; served without touching the
-    /// keychain until `expires_at`.
+    /// backing store until `expires_at`.
     Cached {
         value: Option<String>,
         expires_at: Instant,
@@ -209,7 +205,7 @@ impl AsyncTokenStore {
     /// Persist `token`, replacing any existing value. Runs the blocking write
     /// off the async runtime with a bounded timeout, then refreshes the cache
     /// so subsequent loads observe the new value without re-hitting the
-    /// keychain. Timeouts / backing errors surface as [`Error::Internal`].
+    /// backing store. Timeouts / backing errors surface as [`Error::Internal`].
     pub async fn store_token(&self, token: &str) -> Result<()> {
         let inner = self.inner.clone();
         let value_owned = token.to_string();
@@ -225,11 +221,11 @@ impl AsyncTokenStore {
             }
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(join_err)) => Err(Error::Internal(format!(
-                "keychain write task panicked: {join_err}"
+                "secret-store write task panicked: {join_err}"
             ))),
             Err(_) => {
-                self.warn_timeout("keychain write timed out");
-                Err(Error::Internal("keychain write timed out".to_string()))
+                self.warn_timeout("secret-store write timed out");
+                Err(Error::Internal("secret-store write timed out".to_string()))
             }
         }
     }
@@ -251,7 +247,7 @@ impl AsyncTokenStore {
                 match tokio::task::spawn_blocking(move || inner.load_token()).await {
                     Ok(v) => v.filter(|t| !t.is_empty()),
                     Err(join_err) => {
-                        tracing::warn!(error = %join_err, "keychain load task panicked");
+                        tracing::warn!(error = %join_err, "secret-store load task panicked");
                         None
                     }
                 };
@@ -285,14 +281,14 @@ impl AsyncTokenStore {
             return v;
         }
         if remaining.is_zero() {
-            self.warn_timeout("keychain load timed out");
+            self.warn_timeout("secret-store load timed out");
             return None;
         }
         let start = Instant::now();
         loop {
             let left = remaining.saturating_sub(start.elapsed());
             if left.is_zero() {
-                self.warn_timeout("keychain load timed out");
+                self.warn_timeout("secret-store load timed out");
                 return None;
             }
             match timeout(left, rx.changed()).await {
@@ -303,15 +299,15 @@ impl AsyncTokenStore {
                 }
                 Ok(Err(_)) => return None,
                 Err(_) => {
-                    self.warn_timeout("keychain load timed out");
+                    self.warn_timeout("secret-store load timed out");
                     return None;
                 }
             }
         }
     }
 
-    /// Emit a rate-limited WARN when a keychain call times out, so a wedged
-    /// keychain surfaces in the daemon log without spamming.
+    /// Emit a rate-limited WARN when a secret-store call times out, so a wedged
+    /// backing store surfaces in the daemon log without spamming.
     fn warn_timeout(&self, msg: &str) {
         let should = {
             let mut guard = self.state.lock().unwrap();
@@ -325,7 +321,7 @@ impl AsyncTokenStore {
             }
         };
         if should {
-            tracing::warn!(account = %KEYRING_ACCOUNT, "{msg}");
+            tracing::warn!(account = %TOKEN_ACCOUNT, "{msg}");
         }
     }
 }
