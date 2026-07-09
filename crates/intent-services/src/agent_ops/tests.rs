@@ -1690,7 +1690,7 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "delegate_task_workspace-mcp",
+                "name": "delegate_task",
                 "arguments": { "agentInstructions": "do work" }
             }
         }))
@@ -1725,7 +1725,9 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
 /// End-to-end parent-tracking loop driven entirely through the MCP front door
 /// (`WorkspaceMcpServer` dispatch -> `Services` -> `Store`): a parent delegates a
 /// child (caller set, so the child's `parentAgentId` == parent), then the child
-/// reports back via `report_to_parent_workspace-mcp` (caller-aware) and the
+/// reports back via `report_to_parent` (caller-aware; the registry/dispatch name
+/// is bare — agents still see `report_to_parent_workspace-mcp` because the
+/// provider appends the server suffix) and the
 /// report lands in the parent's transcript. The same report tool through a
 /// caller-less server (the RPC / no-caller path) yields a `-32603` JSON-RPC
 /// error. This is the service-level integration coverage chosen over a
@@ -1746,7 +1748,7 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "delegate_task_workspace-mcp",
+                "name": "delegate_task",
                 "arguments": { "agentInstructions": "do work" }
             }
         }))
@@ -1776,7 +1778,7 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
             "id": 2,
             "method": "tools/call",
             "params": {
-                "name": "report_to_parent_workspace-mcp",
+                "name": "report_to_parent",
                 "arguments": { "report": report }
             }
         }))
@@ -1813,7 +1815,7 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
             "id": 3,
             "method": "tools/call",
             "params": {
-                "name": "report_to_parent_workspace-mcp",
+                "name": "report_to_parent",
                 "arguments": { "report": "orphan" }
             }
         }))
@@ -1980,7 +1982,7 @@ async fn mcp_delegate_immediate_registers_oneshot_watch() {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "delegate_task_workspace-mcp",
+                "name": "delegate_task",
                 "arguments": { "agentInstructions": "do work" }
             }
         }))

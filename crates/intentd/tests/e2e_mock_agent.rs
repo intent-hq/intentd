@@ -136,7 +136,7 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
         ..*intent_providers::find_provider("mock").unwrap()
     };
     let behavior = serde_json::json!({
-        "toolCall": { "name": "add_to_note_workspace-mcp", "arguments": { "noteId": note.id.0, "content": MARKER } },
+        "toolCall": { "name": "add_to_note", "arguments": { "noteId": note.id.0, "content": MARKER } },
         "response": "added via mcp",
     })
     .to_string();

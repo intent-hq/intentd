@@ -1,6 +1,9 @@
-//! Workspace MCP tool registry: each entry maps a `*_workspace-mcp` tool name
-//! (matching the §18.4 denylist naming) to the `WorkspaceApi` method dispatched
-//! in [`super::dispatch`]. Tool names mirror the TS workspace MCP server.
+//! Workspace MCP tool registry: each entry maps a bare tool name (matching the
+//! §18.4 denylist naming) to the `WorkspaceApi` method dispatched in
+//! [`super::dispatch`]. Tool names mirror the TS workspace MCP server. Names
+//! carry NO `_workspace-mcp` suffix: ACP providers (auggie) already suffix
+//! every tool with its MCP server name, so agents see `<name>_workspace-mcp`;
+//! baking the suffix in here would double it.
 
 use serde_json::{json, Map, Value};
 
@@ -20,7 +23,8 @@ const fn p(name: &'static str, ty: &'static str, required: bool) -> Param {
 
 /// A tool definition: name, human description, and its parameter list.
 pub struct ToolDef {
-    /// Tool name as agents see it (e.g. `add_to_note_workspace-mcp`).
+    /// Registry tool name (e.g. `add_to_note`); agents see it with the
+    /// provider-appended server suffix (`add_to_note_workspace-mcp`).
     pub name: &'static str,
     /// Short human description.
     pub description: &'static str,
@@ -60,28 +64,28 @@ pub fn all_tools() -> &'static [ToolDef] {
 static ALL_TOOLS: &[ToolDef] = &[
     // ---- Read tools (never restricted) ----
     ToolDef {
-        name: "list_notes_workspace-mcp",
+        name: "list_notes",
         description: "List all notes in the workspace.",
         params: &[],
     },
     ToolDef {
-        name: "get_note_workspace-mcp",
+        name: "get_note",
         description: "Read a note by id.",
         params: &[p("noteId", "string", true)],
     },
     ToolDef {
-        name: "list_note_tasks_workspace-mcp",
+        name: "list_note_tasks",
         description: "List checkbox tasks parsed from a note.",
         params: &[p("noteId", "string", true)],
     },
     ToolDef {
-        name: "get_workspace_details_workspace-mcp",
+        name: "get_workspace_details",
         description: "Read workspace metadata (id, title, hasTitle, status, statusMessage,                       branch, repositoryName, tags).",
         params: &[],
     },
     // ---- Note write tools ----
     ToolDef {
-        name: "create_note_workspace-mcp",
+        name: "create_note",
         description: "Create a new note.",
         params: &[
             p("title", "string", true),
@@ -90,7 +94,7 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "add_to_note_workspace-mcp",
+        name: "add_to_note",
         description: "Append, prepend, or insert content into a note.",
         params: &[
             p("noteId", "string", true),
@@ -100,7 +104,7 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "set_note_content_workspace-mcp",
+        name: "set_note_content",
         description: "Replace the entire content of a note.",
         params: &[
             p("noteId", "string", true),
@@ -109,7 +113,7 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "edit_note_workspace-mcp",
+        name: "edit_note",
         description: "Replace the first exact-match occurrence in a note.",
         params: &[
             p("noteId", "string", true),
@@ -118,7 +122,7 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "edit_note_lines_workspace-mcp",
+        name: "edit_note_lines",
         description: "Replace/delete/insert by 1-based inclusive line range.",
         params: &[
             p("noteId", "string", true),
@@ -128,7 +132,7 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "update_note_metadata_workspace-mcp",
+        name: "update_note_metadata",
         description: "Update a note's title and/or tags.",
         params: &[
             p("noteId", "string", true),
@@ -138,23 +142,23 @@ static ALL_TOOLS: &[ToolDef] = &[
     },
     // ---- Workspace metadata write tools ----
     ToolDef {
-        name: "set_workspace_title_workspace-mcp",
+        name: "set_workspace_title",
         description: "Set the workspace title (1-5 words describing the task). Skips when                       the workspace already has a custom title (title different from its id).",
         params: &[p("title", "string", true)],
     },
     ToolDef {
-        name: "set_workspace_status_message_workspace-mcp",
+        name: "set_workspace_status_message",
         description: "Set or clear the workspace status message (1-2 sentence user-facing                       work summary). Pass an empty string to clear.",
         params: &[p("statusMessage", "string", false)],
     },
     ToolDef {
-        name: "delete_note_workspace-mcp",
+        name: "delete_note",
         description: "Delete a note.",
         params: &[p("noteId", "string", true)],
     },
     // ---- Task write tools ----
     ToolDef {
-        name: "update_task_status_workspace-mcp",
+        name: "update_task_status",
         description: "Flip a checkbox by exact task text.",
         params: &[
             p("noteId", "string", true),
@@ -163,12 +167,12 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "update_note_task_status_workspace-mcp",
+        name: "update_note_task_status",
         description: "Set a task note's metadata status.",
         params: &[p("noteId", "string", true), p("status", "string", true)],
     },
     ToolDef {
-        name: "update_task_workspace-mcp",
+        name: "update_task",
         description: "Atomically edit a single task line.",
         params: &[
             p("noteId", "string", true),
@@ -179,7 +183,7 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "mark_as_task_workspace-mcp",
+        name: "mark_as_task",
         description: "Attach or replace task metadata on a note.",
         params: &[
             p("noteId", "string", true),
@@ -189,12 +193,12 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "convert_task_blocks_workspace-mcp",
+        name: "convert_task_blocks",
         description: "Convert @@@task blocks into linked child task notes.",
         params: &[p("noteId", "string", true)],
     },
     ToolDef {
-        name: "create_prerequisite_workspace-mcp",
+        name: "create_prerequisite",
         description: "Create a prerequisite child task note.",
         params: &[
             p("noteId", "string", true),
@@ -204,13 +208,13 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "assign_agent_workspace-mcp",
+        name: "assign_agent",
         description: "Append an agent to a task's assignee list.",
         params: &[p("noteId", "string", true), p("agentId", "string", true)],
     },
     // ---- Comment write tools ----
     ToolDef {
-        name: "add_note_comment_workspace-mcp",
+        name: "add_note_comment",
         description: "Add a text-anchored comment to a note.",
         params: &[
             p("noteId", "string", true),
@@ -222,7 +226,7 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "respond_to_comment_thread_workspace-mcp",
+        name: "respond_to_comment_thread",
         description: "Reply to an existing comment thread.",
         params: &[
             p("noteId", "string", true),
@@ -237,7 +241,7 @@ static ALL_TOOLS: &[ToolDef] = &[
     },
     // ---- Agent creation tools ----
     ToolDef {
-        name: "create_agent_workspace-mcp",
+        name: "create_agent",
         description: "Create a new agent to work on a task; it starts working immediately. \
                       `createLinkedNote`/`noteContent`/`parentNoteId` are accepted for wire \
                       parity but linked-note creation is not yet supported by the daemon.",
@@ -255,7 +259,7 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "delegate_task_workspace-mcp",
+        name: "delegate_task",
         description: "Delegate a task to a new agent.",
         params: &[
             p("taskNoteId", "string", false),
@@ -270,12 +274,12 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "report_to_parent_workspace-mcp",
+        name: "report_to_parent",
         description: "Send a completion report to your parent agent (delegated agents only).",
         params: &[p("report", "string", true)],
     },
     ToolDef {
-        name: "send_message_to_agent_workspace-mcp",
+        name: "send_message_to_agent",
         description: "Send a message to another agent; `priority: \"interrupt\"` stops the target mid-turn.",
         params: &[
             p("agentId", "string", true),
@@ -284,7 +288,7 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "send_message_to_task_agent_workspace-mcp",
+        name: "send_message_to_task_agent",
         description: "Follow up with the agent assigned to a task note by ID.",
         params: &[
             p("taskNoteId", "string", true),
@@ -293,7 +297,7 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "wake_or_create_task_agent_workspace-mcp",
+        name: "wake_or_create_task_agent",
         description: "Ensure a task has a working agent: resume the assigned one or create a new agent for the task.",
         params: &[
             p("taskNoteId", "string", true),
@@ -303,17 +307,17 @@ static ALL_TOOLS: &[ToolDef] = &[
     },
     // ---- Agent read tools (never restricted) ----
     ToolDef {
-        name: "list_agents_workspace-mcp",
+        name: "list_agents",
         description: "List agents in this workspace; completed agents are omitted unless requested.",
         params: &[p("includeCompleted", "boolean", false)],
     },
     ToolDef {
-        name: "get_agent_status_workspace-mcp",
+        name: "get_agent_status",
         description: "Detailed status for one agent including task linkage and activity timestamps.",
         params: &[p("agentId", "string", true)],
     },
     ToolDef {
-        name: "read_agent_conversation_workspace-mcp",
+        name: "read_agent_conversation",
         description: "Read another agent's conversation transcript.",
         params: &[
             p("agentId", "string", true),
@@ -322,12 +326,12 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "get_agent_summary_workspace-mcp",
+        name: "get_agent_summary",
         description: "Quick summary of what another agent did.",
         params: &[p("agentId", "string", true)],
     },
     ToolDef {
-        name: "get_agent_diagnostics_workspace-mcp",
+        name: "get_agent_diagnostics",
         description: "Sanitized snapshot of agent statuses, subscriptions, delegation groups, and stuck-risk signals.",
         params: &[
             p("agentId", "string", false),
@@ -337,7 +341,7 @@ static ALL_TOOLS: &[ToolDef] = &[
     },
     // ---- Event subscription tools ----
     ToolDef {
-        name: "subscribe_to_events_workspace-mcp",
+        name: "subscribe_to_events",
         description: "Subscribe to batched workspace events (service-style; not the WSS streaming surface).",
         params: &[
             p("eventTypes", "array", true),
@@ -346,13 +350,13 @@ static ALL_TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "unsubscribe_from_events_workspace-mcp",
+        name: "unsubscribe_from_events",
         description: "Cancel one event subscription by id.",
         params: &[p("subscriptionId", "string", true)],
     },
     // ---- Git write tools ----
     ToolDef {
-        name: "git_commit_workspace-mcp",
+        name: "git_commit",
         description: "Stage and commit the agent's changes, recording an Agent-Id attribution \
                       trailer from the calling agent's context.",
         params: &[

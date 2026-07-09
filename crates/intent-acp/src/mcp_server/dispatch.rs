@@ -61,13 +61,11 @@ impl WorkspaceMcpServer {
         let api = &self.api;
         match name {
             // ---- Read tools ----
-            "list_notes_workspace-mcp" => val(api.list_notes(&ws).await),
-            "get_note_workspace-mcp" => val(api.get_note(ws, note_id(args, "noteId")?).await),
-            "list_note_tasks_workspace-mcp" => {
-                val(api.list_note_tasks(ws, note_id(args, "noteId")?).await)
-            }
+            "list_notes" => val(api.list_notes(&ws).await),
+            "get_note" => val(api.get_note(ws, note_id(args, "noteId")?).await),
+            "list_note_tasks" => val(api.list_note_tasks(ws, note_id(args, "noteId")?).await),
             // ---- Workspace metadata tools ----
-            "get_workspace_details_workspace-mcp" => {
+            "get_workspace_details" => {
                 let ws_row = api.get_workspace(ws).await?;
                 let title = ws_row.title.trim();
                 let has_title = !title.is_empty() && title != ws_row.id.as_str();
@@ -87,7 +85,7 @@ impl WorkspaceMcpServer {
                     "tags": ws_row.tags,
                 })))
             }
-            "set_workspace_title_workspace-mcp" => {
+            "set_workspace_title" => {
                 // Skip-if-custom-titled: mirrors `ws-workspace-api.ts` — a
                 // workspace whose stored `title` is non-empty and different
                 // from its id already carries a human title, so the initial
@@ -121,7 +119,7 @@ impl WorkspaceMcpServer {
                     "branch": updated.branch,
                 })))
             }
-            "set_workspace_status_message_workspace-mcp" => {
+            "set_workspace_status_message" => {
                 // Optional `statusMessage`: empty string / whitespace clears
                 // it, matching the reference `setStatusMessage(null)` clear
                 // semantics. Over-length input surfaces InvalidParams per the
@@ -152,7 +150,7 @@ impl WorkspaceMcpServer {
             // `note.create` is an idempotent method (TB-0 §5): the daemon is the
             // caller here, so mint a fresh key when the tool arguments carry
             // none rather than tripping the services-layer soft-launch warn.
-            "create_note_workspace-mcp" => val(api
+            "create_note" => val(api
                 .create_note(
                     ws,
                     NoteCreate {
@@ -165,7 +163,7 @@ impl WorkspaceMcpServer {
                         .or_else(|| Some(uuid::Uuid::new_v4().to_string())),
                 )
                 .await),
-            "add_to_note_workspace-mcp" => {
+            "add_to_note" => {
                 let id = note_id(args, "noteId")?;
                 val(api
                     .add_to_note(
@@ -179,7 +177,7 @@ impl WorkspaceMcpServer {
                     )
                     .await)
             }
-            "set_note_content_workspace-mcp" => {
+            "set_note_content" => {
                 let id = note_id(args, "noteId")?;
                 val(api
                     .set_note_content(
@@ -191,7 +189,7 @@ impl WorkspaceMcpServer {
                     )
                     .await)
             }
-            "edit_note_workspace-mcp" => {
+            "edit_note" => {
                 let id = note_id(args, "noteId")?;
                 val(api
                     .edit_note(
@@ -204,7 +202,7 @@ impl WorkspaceMcpServer {
                     )
                     .await)
             }
-            "edit_note_lines_workspace-mcp" => {
+            "edit_note_lines" => {
                 let id = note_id(args, "noteId")?;
                 val(api
                     .edit_note_lines(
@@ -218,7 +216,7 @@ impl WorkspaceMcpServer {
                     )
                     .await)
             }
-            "update_note_metadata_workspace-mcp" => {
+            "update_note_metadata" => {
                 let id = note_id(args, "noteId")?;
                 let r: Result<NoteUpdateMetadataResult> = api
                     .update_note_metadata(
@@ -231,9 +229,7 @@ impl WorkspaceMcpServer {
                     .await;
                 val(r)
             }
-            "delete_note_workspace-mcp" => {
-                val(api.delete_note(ws, note_id(args, "noteId")?, None).await)
-            }
+            "delete_note" => val(api.delete_note(ws, note_id(args, "noteId")?, None).await),
             other => self.dispatch_more(other, args).await,
         }
     }
@@ -244,7 +240,7 @@ impl WorkspaceMcpServer {
         let api = &self.api;
         match name {
             // ---- Task write tools ----
-            "update_task_status_workspace-mcp" => {
+            "update_task_status" => {
                 let id = note_id(args, "noteId")?;
                 val(api
                     .task_update_status(
@@ -255,7 +251,7 @@ impl WorkspaceMcpServer {
                     )
                     .await)
             }
-            "update_note_task_status_workspace-mcp" => {
+            "update_note_task_status" => {
                 let id = note_id(args, "noteId")?;
                 val(api
                     .task_update_note_status(
@@ -266,7 +262,7 @@ impl WorkspaceMcpServer {
                     )
                     .await)
             }
-            "update_task_workspace-mcp" => {
+            "update_task" => {
                 let id = note_id(args, "noteId")?;
                 val(api
                     .task_update(
@@ -279,7 +275,7 @@ impl WorkspaceMcpServer {
                     )
                     .await)
             }
-            "mark_as_task_workspace-mcp" => {
+            "mark_as_task" => {
                 let id = note_id(args, "noteId")?;
                 val(api
                     .mark_as_task(
@@ -291,10 +287,10 @@ impl WorkspaceMcpServer {
                     )
                     .await)
             }
-            "convert_task_blocks_workspace-mcp" => {
+            "convert_task_blocks" => {
                 val(api.convert_task_blocks(ws, note_id(args, "noteId")?).await)
             }
-            "create_prerequisite_workspace-mcp" => {
+            "create_prerequisite" => {
                 let id = note_id(args, "noteId")?;
                 val(api
                     .create_prerequisite(
@@ -306,12 +302,12 @@ impl WorkspaceMcpServer {
                     )
                     .await)
             }
-            "assign_agent_workspace-mcp" => {
+            "assign_agent" => {
                 let id = note_id(args, "noteId")?;
                 val(api.assign_agent(ws, id, req_str(args, "agentId")?).await)
             }
             // ---- Comment write tools ----
-            "add_note_comment_workspace-mcp" => {
+            "add_note_comment" => {
                 let id = note_id(args, "noteId")?;
                 val(api
                     .comment_add(
@@ -325,7 +321,7 @@ impl WorkspaceMcpServer {
                     )
                     .await)
             }
-            "respond_to_comment_thread_workspace-mcp" => {
+            "respond_to_comment_thread" => {
                 let id = note_id(args, "noteId")?;
                 val(api
                     .comment_respond(
@@ -350,7 +346,7 @@ impl WorkspaceMcpServer {
             // block; `createLinkedNote`/`noteContent`/`parentNoteId` are
             // accepted for wire parity but not acted on (linked-note creation
             // is not ported).
-            "create_agent_workspace-mcp" => {
+            "create_agent" => {
                 let name = req_str(args, "name")?;
                 let initial_message = req_str(args, "initialMessage")?;
                 // Depth guard (reference `MAX_DELEGATION_DEPTH`, mirroring the
@@ -458,7 +454,7 @@ impl WorkspaceMcpServer {
             // No idempotency key here: `agent.delegate` reaches the create op
             // directly inside services (an explicit internal caller), so it
             // never crosses the `agent.create` soft-launch warn.
-            "delegate_task_workspace-mcp" => val(api
+            "delegate_task" => val(api
                 .agent_delegate(
                     ws,
                     AgentDelegateInput {
@@ -475,7 +471,7 @@ impl WorkspaceMcpServer {
                     self.caller_agent_id.clone(),
                 )
                 .await),
-            "report_to_parent_workspace-mcp" => {
+            "report_to_parent" => {
                 let report = args.get("report").cloned().ok_or_else(|| {
                     Error::InvalidParams("missing required parameter: report".to_string())
                 })?;
@@ -483,7 +479,7 @@ impl WorkspaceMcpServer {
                     .agent_report_to_parent(ws, report, self.caller_agent_id.clone())
                     .await)
             }
-            "send_message_to_agent_workspace-mcp" => {
+            "send_message_to_agent" => {
                 let agent_id = AgentId::from(req_str(args, "agentId")?.as_str());
                 val(api
                     .agent_send_message(
@@ -501,7 +497,7 @@ impl WorkspaceMcpServer {
                     )
                     .await)
             }
-            "send_message_to_task_agent_workspace-mcp" => val(api
+            "send_message_to_task_agent" => val(api
                 .agent_send_to_task(
                     ws,
                     note_id(args, "taskNoteId")?,
@@ -509,7 +505,7 @@ impl WorkspaceMcpServer {
                     opt_str(args, "priority"),
                 )
                 .await),
-            "wake_or_create_task_agent_workspace-mcp" => {
+            "wake_or_create_task_agent" => {
                 // Reference `WakeOrCreateTaskAgentTool` guards against the caller
                 // exceeding `MAX_DELEGATION_DEPTH` before the tool may create a
                 // new agent for the task (the depth-check on the delegate path
@@ -538,7 +534,7 @@ impl WorkspaceMcpServer {
                     .await)
             }
             // ---- Agent read tools (never restricted) ----
-            "list_agents_workspace-mcp" => {
+            "list_agents" => {
                 // `includeCompleted` is accepted for wire parity with the
                 // reference `ListAgentsTool` (§18.4). Filtering completed
                 // agents lives in the services impl; the parameter is passed
@@ -546,11 +542,11 @@ impl WorkspaceMcpServer {
                 let _include_completed = opt_bool(args, "includeCompleted").unwrap_or(false);
                 val(api.agent_list(ws).await)
             }
-            "get_agent_status_workspace-mcp" => {
+            "get_agent_status" => {
                 let agent_id = AgentId::from(req_str(args, "agentId")?.as_str());
                 val(api.agent_get(agent_id, Some(ws)).await)
             }
-            "read_agent_conversation_workspace-mcp" => {
+            "read_agent_conversation" => {
                 let agent_id = AgentId::from(req_str(args, "agentId")?.as_str());
                 val(api
                     .agent_get_conversation(
@@ -561,11 +557,11 @@ impl WorkspaceMcpServer {
                     )
                     .await)
             }
-            "get_agent_summary_workspace-mcp" => {
+            "get_agent_summary" => {
                 let agent_id = AgentId::from(req_str(args, "agentId")?.as_str());
                 val(api.agent_summary(ws, agent_id).await)
             }
-            "get_agent_diagnostics_workspace-mcp" => {
+            "get_agent_diagnostics" => {
                 let agent_id = opt_str(args, "agentId").map(|s| AgentId::from(s.as_str()));
                 let task_note_id = opt_str(args, "taskNoteId").map(NoteId::from_string);
                 val(api
@@ -579,7 +575,7 @@ impl WorkspaceMcpServer {
             }
             // ---- Event subscription tools (deprecated aliases; the WSS
             // streaming surface lives on `events.subscribe`) ----
-            "subscribe_to_events_workspace-mcp" => {
+            "subscribe_to_events" => {
                 let event_types = opt_vec_str(args, "eventTypes").ok_or_else(|| {
                     Error::InvalidParams("missing required parameter: eventTypes".to_string())
                 })?;
@@ -592,11 +588,11 @@ impl WorkspaceMcpServer {
                     )
                     .await)
             }
-            "unsubscribe_from_events_workspace-mcp" => val(api
+            "unsubscribe_from_events" => val(api
                 .agent_unsubscribe(ws, req_str(args, "subscriptionId")?)
                 .await),
             // ---- Git write tools ----
-            "git_commit_workspace-mcp" => {
+            "git_commit" => {
                 // Attribution is sourced from the MCP caller context (Option B,
                 // matching the reference `ws-git-api.ts` agentCommit). Without an
                 // agent context there is nothing to attribute the commit to.

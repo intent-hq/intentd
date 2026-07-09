@@ -2480,7 +2480,7 @@ mod mcp_callback {
             .handle_message(&json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {
-                    "name": "add_to_note_workspace-mcp",
+                    "name": "add_to_note",
                     "arguments": { "noteId": "n1", "content": "more" }
                 }
             }))
