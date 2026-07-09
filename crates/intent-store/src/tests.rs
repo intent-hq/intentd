@@ -112,6 +112,7 @@ async fn backfill_repository_name_from_path_basename() {
     let legacy_id = WorkspaceId::new();
     let named_id = WorkspaceId::new();
     let pathless_id = WorkspaceId::new();
+    let windows_id = WorkspaceId::new();
     let mut legacy = sample_workspace(&legacy_id, "legacy", false);
     legacy.repository_path = Some("/Users/me/src/describe-workspace".to_string());
     legacy.repository_name = None;
@@ -119,7 +120,10 @@ async fn backfill_repository_name_from_path_basename() {
     let mut pathless = sample_workspace(&pathless_id, "pathless", false);
     pathless.repository_path = None;
     pathless.repository_name = None;
-    for ws in [&legacy, &named, &pathless] {
+    let mut windows = sample_workspace(&windows_id, "windows", false);
+    windows.repository_path = Some(r"C:\Users\me\src\describe-workspace".to_string());
+    windows.repository_name = None;
+    for ws in [&legacy, &named, &pathless, &windows] {
         store.insert_workspace(ws).await.expect("insert");
     }
 
@@ -148,6 +152,11 @@ async fn backfill_repository_name_from_path_basename() {
         get_name(pathless_id).await,
         None,
         "no repository_path stays NULL"
+    );
+    assert_eq!(
+        get_name(windows_id).await.as_deref(),
+        Some("describe-workspace"),
+        "Windows-style `\\` separators backfill to the basename too"
     );
 }
 #[tokio::test]

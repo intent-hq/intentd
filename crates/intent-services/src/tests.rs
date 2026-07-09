@@ -6349,6 +6349,19 @@ mod known_repo {
             .await
             .expect("create pathless");
         assert_eq!(pathless.workspace.repository_name, None);
+
+        // Windows-style `\` separators derive the basename too.
+        let windows = svc
+            .create_workspace(
+                create(Some(r"C:\Users\me\src\describe-workspace"), None),
+                None,
+            )
+            .await
+            .expect("create windows");
+        assert_eq!(
+            windows.workspace.repository_name.as_deref(),
+            Some("describe-workspace")
+        );
     }
 }
 

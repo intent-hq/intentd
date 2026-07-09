@@ -1766,9 +1766,10 @@ fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
 /// Derive a repository display name from a local `repositoryPath` basename,
 /// mirroring the `known_repo_name` fallback — but returning `None` instead of
 /// an `"Unknown"` placeholder when the path has no usable basename, so an
-/// underivable name stays NULL on the workspace row.
+/// underivable name stays NULL on the workspace row. Splits on both `/` and
+/// `\` so Windows-style paths (`C:\src\repo`) derive correctly.
 fn derive_repo_name_from_path(path: &str) -> Option<String> {
-    let base = path.rsplit('/').next().unwrap_or("");
+    let base = path.rsplit(['/', '\\']).next().unwrap_or("");
     (!base.is_empty()).then(|| base.to_string())
 }
 
