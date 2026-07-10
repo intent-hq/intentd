@@ -64,6 +64,7 @@ impl WorkspaceMcpServer {
             "list_notes" => val(api.list_notes(&ws).await),
             "get_note" => val(api.get_note(ws, note_id(args, "noteId")?).await),
             "list_note_tasks" => val(api.list_note_tasks(ws, note_id(args, "noteId")?).await),
+            "get_my_task" => val(api.get_my_task(ws, note_id(args, "taskNoteId")?).await),
             // ---- Workspace metadata tools ----
             "get_workspace_details" => {
                 let ws_row = api.get_workspace(ws).await?;

@@ -468,9 +468,9 @@ mod mcp_tests {
     use std::sync::{Arc, Mutex};
 
     use intent_core::{
-        AgentCreateExtra, AgentId, BoxFuture, GitAgentCommitResult, Note, NoteAddInput,
-        NoteAddResult, NoteCreate, NoteId, Result, TaskAssignAgentResult, WorkspaceApi,
-        WorkspaceId,
+        AgentCreateExtra, AgentId, BoxFuture, Error, GitAgentCommitResult, Note, NoteAddInput,
+        NoteAddResult, NoteCreate, NoteId, Result, TaskAssignAgentResult, TaskGetMyTaskResult,
+        TaskMetadata, TaskStatus, TaskSubtask, WorkspaceApi, WorkspaceId,
     };
     use serde_json::{json, Value};
 
@@ -515,6 +515,8 @@ mod mcp_tests {
         pub(super) assigned: Mutex<Vec<(String, String)>>,
         /// Recorded `agent_watch_completion` calls: (parent_id, child_id).
         pub(super) watched: Mutex<Vec<(String, String)>>,
+        /// Recorded `get_my_task` calls: task_note_id.
+        pub(super) get_my_task_calls: Mutex<Vec<String>>,
     }
 
     impl WorkspaceApi for MockApi {
@@ -683,6 +685,44 @@ mod mcp_tests {
                 child_agent_id.as_str().to_string(),
             ));
             Box::pin(async { Ok(json!({ "ok": true, "subscriptionId": "sub-watch-1" })) })
+        }
+
+        fn get_my_task(
+            &self,
+            _workspace_id: WorkspaceId,
+            task_note_id: NoteId,
+        ) -> BoxFuture<'_, Result<TaskGetMyTaskResult>> {
+            let key = task_note_id.as_str().to_string();
+            self.get_my_task_calls.lock().unwrap().push(key.clone());
+            Box::pin(async move {
+                if key == "task-missing" {
+                    // Mirrors the services impl, which wraps the store's
+                    // NotFound as Error::Internal("Task note not found").
+                    return Err(Error::Internal("Task note not found".to_string()));
+                }
+                let task = TaskMetadata {
+                    status: TaskStatus::InProgress,
+                    assigned_agent_ids: vec![AgentId::from_string("agent-77")],
+                    acceptance_criteria: vec!["criterion-a".to_string()],
+                    estimated_effort: Some("small".to_string()),
+                    ..TaskMetadata::default()
+                };
+                Ok(TaskGetMyTaskResult {
+                    note_id: task_note_id.clone(),
+                    title: "My Task".to_string(),
+                    content: "task body".to_string(),
+                    status: TaskStatus::InProgress,
+                    parent_id: Some(NoteId::from_string("spec")),
+                    subtasks: vec![TaskSubtask {
+                        id: NoteId::from_string("child-1"),
+                        title: "Child".to_string(),
+                        status: "not_started".to_string(),
+                    }],
+                    assigned_agents: task.assigned_agent_ids.clone(),
+                    task_metadata: task,
+                    rev: 3,
+                })
+            })
         }
     }
 
@@ -1838,7 +1878,7 @@ mod dispatch_unit_tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    use intent_core::WorkspaceId;
+    use intent_core::{TaskGetMyTaskResult, TaskStatus, WorkspaceId};
 
     use super::mcp_tests::{mock_api, MockApi};
     use crate::WorkspaceMcpServer;
@@ -1924,6 +1964,7 @@ mod dispatch_unit_tests {
         let cases: &[(&str, serde_json::Value, &str)] = &[
             ("get_note", json!({}), "noteId"),
             ("list_note_tasks", json!({}), "noteId"),
+            ("get_my_task", json!({}), "taskNoteId"),
             ("create_note", json!({}), "title"),
             ("add_to_note", json!({ "noteId": "n" }), "content"),
             ("set_note_content", json!({ "noteId": "n" }), "content"),
@@ -2023,6 +2064,9 @@ mod dispatch_unit_tests {
         let valid_args: &[(&str, serde_json::Value)] = &[
             ("get_note", json!({ "noteId": "n" })),
             ("list_note_tasks", json!({ "noteId": "n" })),
+            // `get_my_task` is absent here: `MockApi` overrides it (for the
+            // dedicated happy-path / not-found tests below), so its arm is
+            // proven by `get_my_task_arm_reaches_workspace_api`.
             (
                 "set_note_content",
                 json!({ "noteId": "n", "content": "c", "confirmReplacement": true, "expectedVersion": 3 }),
@@ -2154,6 +2198,38 @@ mod dispatch_unit_tests {
         assert_eq!(
             *api.sent.lock().unwrap(),
             vec![("agent-1".to_string(), "hi".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_my_task_arm_reaches_workspace_api() {
+        let (srv, api) = server();
+        let resp = call(&srv, "get_my_task", json!({ "taskNoteId": "tn-1" })).await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let result: TaskGetMyTaskResult = serde_json::from_str(text).unwrap();
+        assert_eq!(result.note_id.as_str(), "tn-1");
+        assert_eq!(result.status, TaskStatus::InProgress);
+        assert_eq!(result.title, "My Task");
+        assert_eq!(
+            *api.get_my_task_calls.lock().unwrap(),
+            vec!["tn-1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_my_task_arm_surfaces_not_found_error() {
+        let (srv, api) = server();
+        let resp = call(&srv, "get_my_task", json!({ "taskNoteId": "task-missing" })).await;
+        // Error::Internal → -32603 (matches services impl wrapping).
+        assert_eq!(resp["error"]["code"], json!(-32603));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Task note not found"));
+        assert_eq!(
+            *api.get_my_task_calls.lock().unwrap(),
+            vec!["task-missing".to_string()]
         );
     }
 
