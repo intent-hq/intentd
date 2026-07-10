@@ -6022,7 +6022,7 @@ impl WorkspaceApi for Services {
                         &note.id,
                         previous_status,
                         TaskStatus::InProgress,
-                        &now_iso(),
+                        &now,
                     ),
                 )
                 .await;

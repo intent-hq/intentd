@@ -1106,8 +1106,11 @@ async fn convert_blocks_creates_children_idempotently() {
 // TASKFLOW-1: auto-convert @@@task blocks on every note content-write path
 // (reference parity with `notes.service.ts` update path L633-647). Each write
 // method that mutates a note's content invokes `convert_task_blocks` when the
-// resulting content contains a `@@@task` fence, and surfaces the conversion
-// counts + fence-free content in its response payload.
+// resulting content contains a `@@@task` fence. `note.add` / `note.edit` /
+// `note.editLines` / `note.setContent` surface the conversion counts +
+// fence-free content in their result payloads; `note.create` / `note.update`
+// return the refetched `Note` (fence-free content, fresh rev/updated_at)
+// without count fields.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

@@ -409,9 +409,10 @@ async fn workspace_delete_emits_workspace_deleted_over_wss() {
 /// an `@@@task` block auto-converts the fence into a linked child task note
 /// (fence-free parent + `note:created` for the child + `note:updated` for the
 /// rewritten parent), `note.listTasks` surfaces the linked task, and
-/// `task.assignAgent` flips the `not_started` task to `in_progress` with a
-/// `task:status-changed` emission (PROTOCOL.md §6.5) — author → list →
-/// delegate → in-progress without any follow-up reads.
+/// `task.assignAgent` flips the `not_started` task to `in_progress` with
+/// `task:status-changed` + `task:ready-tasks-changed` emissions
+/// (PROTOCOL.md §6.5) — author → list → delegate → in-progress without any
+/// follow-up reads.
 #[tokio::test]
 async fn task_block_author_list_assign_flow_over_wss() {
     let (daemon, port, cfg) = boot().await;
@@ -436,7 +437,12 @@ async fn task_block_author_list_assign_flow_over_wss() {
         1,
         "events.subscribe",
         json!({
-            "eventTypes": ["note:created", "note:updated", "task:status-changed"],
+            "eventTypes": [
+                "note:created",
+                "note:updated",
+                "task:status-changed",
+                "task:ready-tasks-changed",
+            ],
             "workspaceId": ws_id,
         }),
     )
@@ -522,6 +528,29 @@ async fn task_block_author_list_assign_flow_over_wss() {
     assert_eq!(evt["data"]["previousStatus"], json!("not_started"));
     assert_eq!(evt["data"]["newStatus"], json!("in_progress"));
     assert!(evt["data"]["changedAt"].is_string(), "changedAt: {evt}");
+    let changed_at = evt["data"]["changedAt"].clone();
+
+    // The transition also recomputes the ready-task set: the now-in-progress
+    // task drops out of `readyTaskIds`, and `computedAt` matches the
+    // triggering status change's timestamp.
+    let evt = next_event(&mut sub, &["task:ready-tasks-changed"], 10).await;
+    assert_eq!(evt["data"]["triggeredBy"]["noteId"], json!(task_id));
+    assert_eq!(
+        evt["data"]["triggeredBy"]["previousStatus"],
+        json!("not_started")
+    );
+    assert_eq!(
+        evt["data"]["triggeredBy"]["newStatus"],
+        json!("in_progress")
+    );
+    let ready = evt["data"]["readyTaskIds"]
+        .as_array()
+        .expect("readyTaskIds array");
+    assert!(
+        !ready.iter().any(|v| v == &json!(task_id)),
+        "in-progress task still ready: {evt}"
+    );
+    assert_eq!(evt["data"]["computedAt"], changed_at, "computedAt: {evt}");
 
     // In-progress: the task note reflects the transition and the assignment.
     let got = wss_rpc(
