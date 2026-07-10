@@ -6,20 +6,28 @@ use rquickjs::{
 
 use crate::{EvalOptions, HostFn, JsError, OUTER_SAFETY_MARGIN};
 
-/// JS bridge exposed to user code when a host function is provided. It hides
-/// the JSON stringification round-trip and turns a `{ok:false, error}` frame
-/// back into a JS `Error`.
+/// JS bridge exposed to user code when a host function is provided. It captures
+/// the raw host function in a closure (so it never sits on `globalThis` where
+/// user code could bypass the wrapper), rejects non-JSON-serializable arguments
+/// with a clear `TypeError`, and turns a `{ok:false, error}` frame back into a
+/// JS `Error`.
 const HOST_BRIDGE_JS: &str = r#"
-    globalThis.host = async function host(arg) {
-        const raw = await globalThis.__hostRaw(
-            JSON.stringify(arg === undefined ? null : arg)
-        );
-        const frame = raw == null ? { ok: true, value: null } : JSON.parse(raw);
-        if (!frame.ok) {
-            throw new Error(String(frame.error ?? "host call failed"));
-        }
-        return frame.value;
-    };
+    (() => {
+        const raw = globalThis.__hostRaw;
+        delete globalThis.__hostRaw;
+        globalThis.host = async function host(arg) {
+            const stringified = JSON.stringify(arg === undefined ? null : arg);
+            if (typeof stringified !== "string") {
+                throw new TypeError("host(arg): argument is not JSON-serializable");
+            }
+            const reply = await raw(stringified);
+            const frame = reply == null ? { ok: true, value: null } : JSON.parse(reply);
+            if (!frame.ok) {
+                throw new Error(String(frame.error ?? "host call failed"));
+            }
+            return frame.value;
+        };
+    })();
 "#;
 
 /// Evaluate a snippet of user JavaScript inside a fresh QuickJS context.
@@ -43,7 +51,11 @@ pub async fn eval(
 ) -> Result<serde_json::Value, JsError> {
     let rt = AsyncRuntime::new().map_err(|e| JsError::Engine(e.to_string()))?;
 
-    let deadline = Instant::now() + opts.timeout;
+    // Guard against pathological timeouts (e.g. CLI users passing an
+    // overflowing millisecond value): `Instant + Duration` panics on overflow.
+    let deadline = Instant::now()
+        .checked_add(opts.timeout)
+        .ok_or_else(|| JsError::Engine("timeout is too large: Instant overflow".into()))?;
     rt.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)))
         .await;
 
@@ -122,21 +134,34 @@ async fn run_user_code<'js>(
     ctx: rquickjs::Ctx<'js>,
     code: &str,
 ) -> Result<serde_json::Value, String> {
+    // `undefined` and non-JSON-serializable results are surfaced as distinct
+    // JSON envelopes so the host can tell "no return" from "unserializable
+    // return" (which otherwise both become `undefined`).
     let wrapped = format!(
-        "(async () => {{ const __r = await (async () => {{ {code} }})(); return __r === undefined ? null : JSON.stringify(__r); }})()"
+        "(async () => {{ const __r = await (async () => {{ {code} }})(); \
+         if (__r === undefined) return '{{\"kind\":\"undefined\"}}'; \
+         const __s = JSON.stringify(__r); \
+         if (typeof __s !== 'string') throw new TypeError('result is not JSON-serializable'); \
+         return '{{\"kind\":\"value\",\"json\":' + __s + '}}'; }})()"
     );
     let val: rquickjs::Value<'js> = ctx
         .eval(wrapped.as_bytes())
         .catch(&ctx)
         .map_err(|e| format!("{e}"))?;
     let promise: Promise<'js> = Promise::from_value(val).map_err(stringify_js_err)?;
-    let s: Option<String> = promise
+    let envelope: String = promise
         .into_future()
         .await
         .catch(&ctx)
         .map_err(|e| format!("{e}"))?;
-    Ok(match s {
-        Some(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
-        None => serde_json::Value::Null,
-    })
+    let parsed: serde_json::Value =
+        serde_json::from_str(&envelope).map_err(|e| format!("engine: bad result envelope: {e}"))?;
+    match parsed.get("kind").and_then(|k| k.as_str()) {
+        Some("undefined") => Ok(serde_json::Value::Null),
+        Some("value") => Ok(parsed
+            .get("json")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)),
+        _ => Err("engine: unknown result envelope".into()),
+    }
 }

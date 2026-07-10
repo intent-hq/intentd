@@ -156,3 +156,30 @@ async fn host_error_surfaces_as_js_error() {
         other => panic!("expected Runtime, got {other:?}"),
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_json_serializable_return_throws() {
+    let err = eval("return () => 1;", &EvalOptions::default(), None)
+        .await
+        .expect_err("returning a function must fail");
+    match err {
+        JsError::Runtime(msg) => assert!(
+            msg.contains("JSON-serializable") || msg.contains("TypeError"),
+            "expected serialization error, got: {msg}"
+        ),
+        other => panic!("expected Runtime, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_raw_is_removed_from_globals() {
+    let host: HostFn = Arc::new(|_| Box::pin(async { Ok(serde_json::json!(1)) }));
+    let out = eval(
+        "return typeof globalThis.__hostRaw;",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("eval succeeds");
+    assert_eq!(out, "undefined", "raw bridge must not leak onto globalThis");
+}

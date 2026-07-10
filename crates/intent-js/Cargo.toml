@@ -9,10 +9,8 @@ description = "JavaScript execution engine for agent-supplied code (QuickJS via 
 [dependencies]
 rquickjs = { version = "0.9", default-features = false, features = ["futures", "macro"] }
 tokio = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

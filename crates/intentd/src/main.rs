@@ -162,7 +162,7 @@ async fn cmd_js_eval(code: &str, timeout_ms: u64) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&v)?);
             Ok(())
         }
-        Err(e) => Err(anyhow::anyhow!(e.to_string())),
+        Err(e) => Err(anyhow::Error::from(e)),
     }
 }
 
