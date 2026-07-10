@@ -5151,7 +5151,10 @@ impl WorkspaceApi for Services {
             let outcome = services
                 .auto_convert_task_blocks_after_write(&note.workspace_id, &note.id, &clean)
                 .await;
-            let final_content = outcome.refetched_note.map(|n| n.content).unwrap_or(clean);
+            let (final_content, final_updated_at) = match outcome.refetched_note {
+                Some(n) => (n.content, n.updated_at),
+                None => (clean, now),
+            };
             publish_event(
                 &bus,
                 note_change_event(
@@ -5168,7 +5171,7 @@ impl WorkspaceApi for Services {
                 title: note.title,
                 note_id: note.id,
                 previous_title: Some(previous_title),
-                updated_at: now,
+                updated_at: final_updated_at,
                 old_content: Some(old_content),
                 new_content: final_content,
                 converted_count: outcome.converted_count,

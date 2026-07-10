@@ -1270,6 +1270,9 @@ async fn set_note_content_with_task_block_auto_converts() {
         .contains("- [ ] [From SetContent](intent://local/task/"));
     let persisted = svc.get_note(ws, id).await.expect("get");
     assert_eq!(persisted.content, r.new_content);
+    // The conversion performs a second store write; the response must carry
+    // the refetched note's timestamp, not the pre-conversion write time.
+    assert_eq!(r.updated_at, persisted.updated_at);
 }
 
 #[tokio::test]
