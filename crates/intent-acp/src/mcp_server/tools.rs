@@ -83,10 +83,10 @@ static ALL_TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "get_my_task",
-        description: "Read a task note's title, content, task metadata (status, effort, \
-                      acceptance criteria, dependencies), parent, subtasks, and assigned \
-                      agents. Use this to load your own task note by id (from \
-                      intent://local/task/{id} links) at the start of a task.",
+        description: "Read a task note's title, content, and task metadata (status, \
+                      assigned agents, acceptance criteria, effort), along with its \
+                      parent id and subtasks. Use this to load your own task note by id \
+                      (from intent://local/task/{id} links) at the start of a task.",
         params: &[p("taskNoteId", "string", true)],
     },
     ToolDef {
