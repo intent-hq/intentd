@@ -371,6 +371,15 @@ async fn prompt_turn_streams_events_and_accumulates() {
     assert_eq!(idle.data["finishReason"], json!("end_turn"));
     assert_eq!(idle.data["status"], json!("idle"));
     assert_eq!(idle.data["lastResponseSummary"], json!("Hello world"));
+    // DELIV-1: `agent:idle` MUST carry `agentName` so subscribers don't fall
+    // back to a generic label; `completion_report` is `None` on this session,
+    // so `report` is absent (only present when a delegated child called
+    // `agent.reportToParent`).
+    assert_eq!(idle.data["agentName"], json!("Builder"));
+    assert!(
+        idle.data.get("report").is_none(),
+        "no completion_report was set on this session"
+    );
 
     let tool = events
         .iter()
@@ -417,6 +426,63 @@ async fn prompt_turn_streams_events_and_accumulates() {
     assert_eq!(tool.data["blockId"], json!(format!("{mid}:1")));
     assert_eq!(tool.data["blockIndex"], json!(1));
     assert_eq!(tool.data["messageId"], json!(mid));
+}
+
+/// DELIV-1: when the session carries a `completion_report` (persisted by
+/// `agent.reportToParent` on a delegated child), the terminal
+/// `agent:idle` payload includes it as `report` alongside the enriched
+/// `agentName`, so subscribers see the child's report without a
+/// follow-up `agent.get` round-trip.
+#[tokio::test]
+async fn agent_idle_payload_carries_agent_name_and_completion_report() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // Seed a completion_report on the session BEFORE the turn (the FE-side
+    // ordering: a delegated child calls `agent.reportToParent` before its
+    // last turn ends).
+    let mut session = services
+        .store()
+        .get_agent_session(&agent_id)
+        .await
+        .expect("load session");
+    let saved = now_iso();
+    session.completion_report = Some("wrote fix + tests, green".into());
+    session.completion_report_timestamp = Some(saved.clone());
+    session.updated_at = saved;
+    services
+        .store()
+        .update_agent_session(&workspace_id, &session)
+        .await
+        .expect("persist completion_report");
+
+    let (conn, mut note_rx, _agent) = connect();
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec!["agent:idle".to_string()],
+        ..Default::default()
+    });
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+        )
+        .await
+        .expect("turn completes");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
+    let idle = batch
+        .iter()
+        .find(|e| e.event_type == "agent:idle")
+        .expect("agent:idle emitted");
+    assert_eq!(idle.data["agentId"], json!("agent-1"));
+    assert_eq!(idle.data["agentName"], json!("Builder"));
+    assert_eq!(idle.data["report"], json!("wrote fix + tests, green"));
 }
 
 /// A `session/update` notification shaped like the prior-conversation replay

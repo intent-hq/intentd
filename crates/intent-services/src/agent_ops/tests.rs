@@ -3826,6 +3826,221 @@ async fn wake_or_create_delivers_message_metadata_on_block() {
     assert_eq!(block["messageMetadata"]["type"], "task_wake");
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// DELIV-1 regression: wake / send-to-task delivery must drive a REAL turn
+// when the runtime `AgentManager` is attached. Both call sites previously
+// persisted the user message store-only (never spawning a worker), so the
+// coordinator's follow-up sends silently no-op'd — the "lost sends + empty
+// idle wakes" signature. We attach a manager over a hermetic store, drive
+// the widened op, and prove the runtime routing by observing the
+// `agent:status-changed[active]` event emitted from the runtime's
+// `try_begin` slot claim.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Helpers shared by the DELIV-1 regression tests: build a wired
+/// (`Services` + attached `AgentManager` + subscription) harness over a
+/// hermetic temp DB, and wait for a specific `agent:status-changed` value.
+async fn setup_with_manager() -> (
+    TempDb,
+    Services,
+    Arc<crate::agent_manager::AgentManager>,
+    EventBus,
+    WorkspaceId,
+) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn intent_acp::EventSink> = Arc::new(crate::BusEventSink::new(bus.clone()));
+    let manager = Arc::new(crate::agent_manager::AgentManager::new(
+        services.clone(),
+        sink,
+        4,
+    ));
+    services.attach_agent_manager(&manager);
+    (tmp, services, manager, bus, ws)
+}
+
+/// Subscribe to `agent:status-changed` up front so the check captures the
+/// live-only broadcast events emitted during the following op.
+fn subscribe_status(bus: &EventBus) -> crate::events::Subscription {
+    bus.subscribe(SubscriptionFilter {
+        event_types: vec!["agent:status-changed".to_string()],
+        ..Default::default()
+    })
+}
+
+async fn expect_status(
+    sub: &mut crate::events::Subscription,
+    agent_id: &AgentId,
+    status: &str,
+    within: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(remaining, sub.recv()).await {
+            Ok(Some(batch)) => {
+                for ev in batch {
+                    if ev.event_type == "agent:status-changed"
+                        && ev.data.get("agentId").and_then(serde_json::Value::as_str)
+                            == Some(agent_id.0.as_str())
+                        && ev.data.get("status").and_then(serde_json::Value::as_str) == Some(status)
+                    {
+                        return true;
+                    }
+                }
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// DELIV-1: `agent.wakeOrCreate` MUST route through the runtime
+/// `AgentManager` when one is attached. The pre-fix store-only path
+/// persisted the wake context message without ever triggering a turn —
+/// the coordinator's follow-up looked "sent" but no work happened. Proof:
+/// the runtime's `try_begin` slot claim emits `agent:status-changed`
+/// with `status: "active"`; that event MUST appear on the create branch.
+#[tokio::test]
+async fn deliv1_wake_or_create_drives_turn_via_runtime() {
+    let (_t, svc, manager, bus, ws) = setup_with_manager().await;
+    let note_id = seed_task(&svc, &ws, "DELIV-1 wake").await;
+    // Subscribe BEFORE the op so we catch the live-only broadcast events.
+    let mut sub = subscribe_status(&bus);
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "kickoff".into(), wake_input(None))
+        .await
+        .expect("wake");
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["created"], true);
+    let agent_id = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    assert!(
+        expect_status(&mut sub, &agent_id, "active", Duration::from_secs(3)).await,
+        "wakeOrCreate MUST emit agent:status-changed[active] via runtime"
+    );
+
+    // Tear the worker down so its background spawn attempt (which errors
+    // without a provider available) doesn't outlive the test.
+    manager.stop(&agent_id).await;
+}
+
+/// DELIV-1: the wake branch (existing live assignment) also drives a turn
+/// via the runtime — not just the create branch — so a re-woken agent
+/// actually processes the follow-up context message instead of silently
+/// storing it. Same evidence: `agent:status-changed[active]` fires on
+/// each wake.
+#[tokio::test]
+async fn deliv1_wake_existing_drives_turn_via_runtime() {
+    let (_t, svc, manager, bus, ws) = setup_with_manager().await;
+    let note_id = seed_task(&svc, &ws, "DELIV-1 wake-existing").await;
+
+    // First wake creates + assigns; drain the "active" transition from the
+    // create branch so the follow-up wake's "active" is unambiguously the
+    // one we're testing.
+    let mut sub = subscribe_status(&bus);
+    let create = svc
+        .agent_wake_or_create_op(
+            ws.clone(),
+            note_id.clone(),
+            "kickoff".into(),
+            wake_input(None),
+        )
+        .await
+        .expect("create");
+    let agent_id = AgentId::from(create["agentId"].as_str().expect("agentId"));
+    assert!(
+        expect_status(&mut sub, &agent_id, "active", Duration::from_secs(3)).await,
+        "create branch active"
+    );
+    // Let the create-branch worker finish (its ensure_started fails without
+    // a provider) before we drive the wake-existing branch.
+    manager.stop(&agent_id).await;
+    // Drop the old sub so its buffered "runtime_idle" transitions from the
+    // stop() call above don't shadow the fresh "active" we're testing next.
+    drop(sub);
+    let mut sub = subscribe_status(&bus);
+
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "resume".into(), wake_input(None))
+        .await
+        .expect("wake");
+    assert_eq!(resp["created"], false);
+    assert_eq!(resp["action"], "woke_existing");
+    assert!(
+        expect_status(&mut sub, &agent_id, "active", Duration::from_secs(3)).await,
+        "wake_existing MUST re-drive a turn via runtime"
+    );
+    manager.stop(&agent_id).await;
+}
+
+/// DELIV-1: `agent.sendToTask` with the default (non-interrupt) priority
+/// MUST route through the runtime `AgentManager`. The pre-fix branch
+/// called the store-only `agent_send_message_op` unconditionally, so
+/// coordinator follow-ups over a task note silently no-op'd. Interrupt
+/// priority already routed correctly; this test locks in the default.
+#[tokio::test]
+async fn deliv1_send_to_task_non_interrupt_drives_turn_via_runtime() {
+    let (_t, svc, manager, bus, ws) = setup_with_manager().await;
+    let agent_id = create_agent(&svc, &ws, "Follow-up target").await;
+    let note_id = seed_task(&svc, &ws, "DELIV-1 send-to-task").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), agent_id.0.clone())
+        .await
+        .expect("assign");
+
+    let mut sub = subscribe_status(&bus);
+    let resp = svc
+        .agent_send_to_task_op(ws.clone(), note_id, "follow up".into(), None)
+        .await
+        .expect("send_to_task");
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["agentId"], agent_id.0);
+
+    assert!(
+        expect_status(&mut sub, &agent_id, "active", Duration::from_secs(3)).await,
+        "send_to_task (non-interrupt) MUST drive a turn via runtime"
+    );
+    manager.stop(&agent_id).await;
+}
+
+/// DELIV-1: the wake path preserves the wire contract — the delivered
+/// user block still carries `messageMetadata` verbatim so
+/// `agent.getConversation` consumers see the FE `task_wake` tag — while
+/// ALSO driving a turn via the runtime. Guards against a regression that
+/// might trade block-embedded metadata for row-level metadata when
+/// routing through `agent_manager.send_message`.
+#[tokio::test]
+async fn deliv1_wake_or_create_persists_block_metadata_alongside_runtime_drive() {
+    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let note_id = seed_task(&svc, &ws, "Tag").await;
+    let input = AgentWakeOrCreateInput {
+        message_metadata: Some(json!({ "type": "task_wake", "source": "wake" })),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws, note_id, "hello".into(), input)
+        .await
+        .expect("wake");
+    let agent_id = AgentId::from(resp["agentId"].as_str().unwrap());
+    let conv = svc
+        .agent_get_conversation_op(agent_id.clone(), None, None, None)
+        .await
+        .expect("conv");
+    let msg = &conv["messages"][0];
+    assert_eq!(msg["role"], "user");
+    let block = &msg["contentBlocks"][0];
+    assert_eq!(block["text"], "hello");
+    assert_eq!(block["messageMetadata"]["type"], "task_wake");
+    manager.stop(&agent_id).await;
+}
+
 /// Cross-workspace bare-id probes must NOT observe an agent that lives in a
 /// different workspace: `agent_get_op` / `agent_get_conversation_op` /
 /// `agent_get_queue_op` / `agent_get_session_stats_op` / `agent_delete_op` all
