@@ -42,6 +42,28 @@ fn parse_args_rejects_non_string_tab_id() {
 }
 
 #[test]
+fn parse_args_rejects_non_string_agent_id() {
+    let err = parse_args(&params_of(json!({
+        "actions": [{ "action": "listTabs" }],
+        "agentId": 42,
+    })))
+    .expect_err("agentId must be a string");
+    assert_eq!(err.code, INVALID_PARAMS);
+    assert!(err.message.contains("agentId"));
+}
+
+#[test]
+fn parse_args_rejects_non_string_workspace_id() {
+    let err = parse_args(&params_of(json!({
+        "actions": [{ "action": "listTabs" }],
+        "workspaceId": { "id": "ws-1" },
+    })))
+    .expect_err("workspaceId must be a string");
+    assert_eq!(err.code, INVALID_PARAMS);
+    assert!(err.message.contains("workspaceId"));
+}
+
+#[test]
 fn parse_args_accepts_full_envelope() {
     let args = parse_args(&params_of(json!({
         "actions": [{ "action": "listTabs" }, { "action": "screenshot" }],
