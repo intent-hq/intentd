@@ -117,11 +117,13 @@ pub fn build_forward_params(args: &BrowserExecArgs) -> Value {
 
 /// Reshape the FE's raw `{ success, results, error? }` envelope into the wire
 /// result the caller expects. Reference parity (`BrowserExecTool.execute`):
-/// a single-action batch yields the lone action's `result`; a multi-action
-/// batch yields the raw `results[]` array. A `success: false` envelope with a
-/// top-level `error` string surfaces as `-32603` so the caller sees the FE's
-/// context. Missing / malformed `results` also surfaces as `-32603` — the
-/// daemon cannot invent a shape it did not receive.
+/// a single-action batch yields the lone action's envelope unchanged (see
+/// [`single_result_payload`] — the caller unwraps `.result` / `.error`
+/// itself); a multi-action batch yields `{ "results": [...] }`. A
+/// `success: false` envelope with a top-level `error` string surfaces as
+/// `-32603` so the caller sees the FE's context. Missing / malformed `results`
+/// also surfaces as `-32603` — the daemon cannot invent a shape it did not
+/// receive.
 pub fn shape_result(fe_response: Value) -> Result<Value, BrowserExecError> {
     let obj = fe_response.as_object().ok_or_else(|| {
         BrowserExecError::internal("browser.exec: frontend returned a non-object response")
