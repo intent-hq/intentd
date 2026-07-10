@@ -18,7 +18,7 @@ use tokio::time::timeout;
 
 use intent_core::events::{
     AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE, AGENT_RENAMED,
-    AGENT_SESSION_STATS_CHANGED, AGENT_UPDATED,
+    AGENT_SESSION_STATS_CHANGED, AGENT_SUBSCRIPTIONS_CHANGED, AGENT_UPDATED,
 };
 use intent_core::{ActorType, Event, EventActor, SessionStats};
 
@@ -2473,6 +2473,143 @@ async fn group_no_double_fire() {
     ))
     .await;
     assert_eq!(parent_message_count(&svc, &parent).await, 1);
+}
+
+/// Watch-set changes emit `agent:subscriptions-changed` carrying the parent's
+/// refreshed waiting flags: `true` + the child id on registration (delegate),
+/// `false` + empty after the aggregated wake clears the group watches.
+#[tokio::test]
+async fn watch_set_changes_emit_subscriptions_changed() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_SUBSCRIPTIONS_CHANGED.to_string()],
+        ..Default::default()
+    });
+
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("subscriptions-changed after delegate")
+        .expect("batch");
+    assert_eq!(batch[0].event_type, AGENT_SUBSCRIPTIONS_CHANGED);
+    assert_eq!(batch[0].data["agentId"], json!(parent.0));
+    assert_eq!(batch[0].data["isWaitingForOtherAgents"], json!(true));
+    assert_eq!(batch[0].data["waitingForAgentIds"], json!([c1.0]));
+
+    // Settle the group: child idles, then the parent idles (seal + fire). The
+    // group clear emits the refreshed (now empty) flags.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c1,
+        json!({ "agentId": c1.0 }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("subscriptions-changed after group clear")
+        .expect("batch");
+    let last = batch.last().expect("event");
+    assert_eq!(last.data["agentId"], json!(parent.0));
+    assert_eq!(last.data["isWaitingForOtherAgents"], json!(false));
+    assert_eq!(last.data["waitingForAgentIds"], json!([]));
+}
+
+/// `reportToParent` from a child enrolled in an undelivered after_all group is
+/// suppressed: no immediate parent message, the report is still persisted, and
+/// it reaches the parent only inside the single aggregated wake (as that
+/// child's `Report:` line).
+#[tokio::test]
+async fn report_to_parent_suppressed_for_after_all_group_child() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let c2 = delegate_after_all(&svc, &ws, &parent).await;
+
+    let r1 = svc
+        .agent_report_to_parent_op(ws.clone(), json!("report one"), Some(c1.clone()))
+        .await
+        .expect("report c1");
+    assert_eq!(r1["ok"], json!(true));
+    let r2 = svc
+        .agent_report_to_parent_op(ws.clone(), json!("report two"), Some(c2.clone()))
+        .await
+        .expect("report c2");
+    assert_eq!(r2["ok"], json!(true));
+    // Suppressed: no immediate parent sends for grouped children.
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    // The reports are still persisted on the child sessions.
+    for (c, expected) in [(&c1, "report one"), (&c2, "report two")] {
+        let session = svc.store().get_agent_session(c).await.expect("child");
+        assert_eq!(session.completion_report.as_deref(), Some(expected));
+    }
+
+    // Settle the group: both children idle, then the parent idles (seal+fire).
+    for c in [&c1, &c2] {
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            c,
+            json!({ "agentId": c.0, "lastResponseSummary": "turn summary" }),
+        ))
+        .await;
+    }
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+
+    // Exactly one aggregated wake carrying BOTH reports (Report: wins over
+    // the event's lastResponseSummary).
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(text.contains("Report: report one"), "wake text: {text}");
+    assert!(text.contains("Report: report two"), "wake text: {text}");
+    assert!(!text.contains("turn summary"), "wake text: {text}");
+}
+
+/// After the group has fired (delivered + removed), a late `reportToParent`
+/// from a former group child is no longer suppressed and delivers immediately.
+#[tokio::test]
+async fn report_to_parent_immediate_after_group_delivery() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c1,
+        json!({ "agentId": c1.0 }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+
+    let r = svc
+        .agent_report_to_parent_op(ws.clone(), json!("late report"), Some(c1))
+        .await
+        .expect("late report");
+    assert_eq!(r["ok"], json!(true));
+    assert_eq!(parent_message_count(&svc, &parent).await, 2);
 }
 
 // ===========================================================================

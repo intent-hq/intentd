@@ -1837,6 +1837,260 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
     );
 }
 
+/// WAKE-1: `after_all` delegation fan-in over WSS, end to end. A parent fires
+/// TWO MCP `delegate_task` calls with `waitMode: "after_all"`; each child
+/// reports via `report_to_parent` (suppressed — no immediate parent message)
+/// and completes. Asserts (PROTOCOL §5.5/§6.5):
+/// - the parent transcript carries EXACTLY ONE `[WORKSPACE EVENTS]` wake with
+///   BOTH child reports aggregated, and zero individual report deliveries;
+/// - the wake runs a REAL parent turn — `agent:stream:chunk` + one
+///   `agent:stream:end` + a trailing `agent:idle`, all keyed by the parent;
+/// - `isWaitingForOtherAgents` is true (with both child ids) while waiting and
+///   false after delivery, with `agent:subscriptions-changed` watch-change
+///   events observed on the wire for both transitions.
+#[tokio::test]
+async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
+    let Some(script) = gate("WSS after_all aggregated wake E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    const CHILD_A: &str = "WAKE1_CHILD_ALPHA";
+    const CHILD_B: &str = "WAKE1_CHILD_BETA";
+    const REPORT_A: &str = "REPORT_ALPHA finished the alpha task";
+    const REPORT_B: &str = "REPORT_BETA finished the beta task";
+    const PARENT_GO: &str = "WAKE1_PARENT_GO";
+    // One behavior, prompt-matched rules: children (matched by their delegated
+    // instructions) delay so the parent's waiting window is observable, then
+    // report + finish; the parent delegates both children after_all; the wake
+    // turn (matched on the [WORKSPACE EVENTS] framing) just acknowledges.
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": CHILD_A,
+                "delayMs": 8000,
+                "toolCall": { "name": "report_to_parent", "arguments": { "report": REPORT_A } },
+                "response": "alpha child done",
+            },
+            {
+                "ifPromptContains": CHILD_B,
+                "delayMs": 8000,
+                "toolCall": { "name": "report_to_parent", "arguments": { "report": REPORT_B } },
+                "response": "beta child done",
+            },
+            {
+                "ifPromptContains": "[WORKSPACE EVENTS]",
+                "response": "parent acknowledged the aggregated wake",
+            },
+            {
+                "ifPromptContains": PARENT_GO,
+                "toolCalls": [
+                    { "name": "delegate_task", "arguments": {
+                        "agentInstructions": CHILD_A, "waitMode": "after_all", "model": "mock:default" } },
+                    { "name": "delegate_task", "arguments": {
+                        "agentInstructions": CHILD_B, "waitMode": "after_all", "model": "mock:default" } },
+                ],
+                "response": "parent delegated two after_all children",
+            },
+        ],
+    })
+    .to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE the turn so we miss no events.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let parent = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+    )
+    .await;
+    let parent_id = parent["agent"]["id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent_id, "content": PARENT_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Phase 1 — the parent's delegating turn: both delegate_task registrations
+    // push agent:subscriptions-changed with the waiting flags; the turn ends
+    // with the parent's first agent:idle (which seals the group).
+    let mut saw_waiting_true_event = false;
+    let mut parent_idle = false;
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub, 60).await;
+        let ev = &frame["params"]["event"];
+        let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+        if ev["type"] == "agent:subscriptions-changed"
+            && ev_agent == parent_id
+            && ev["data"]["isWaitingForOtherAgents"] == json!(true)
+        {
+            saw_waiting_true_event = true;
+        }
+        if ev["type"] == "agent:idle" && ev_agent == parent_id {
+            parent_idle = true;
+            break;
+        }
+    }
+    assert!(parent_idle, "parent went idle after delegating");
+    assert!(
+        saw_waiting_true_event,
+        "watch registration pushed agent:subscriptions-changed with isWaitingForOtherAgents=true"
+    );
+
+    // While the (delayed) children are still running, the parent's AgentLite
+    // reports the waiting flags with BOTH child ids (PROTOCOL §5.5/§7.1).
+    let lite = wss_rpc(&mut rpc, 12, "agent.get", json!({ "agentId": parent_id })).await;
+    let lite = &lite["agent"];
+    assert_eq!(lite["isWaitingForOtherAgents"], true, "waiting: {lite}");
+    let waiting = lite["waitingForAgentIds"]
+        .as_array()
+        .expect("waitingForAgentIds");
+    assert_eq!(waiting.len(), 2, "waiting on both children: {lite}");
+    assert!(
+        waiting
+            .iter()
+            .all(|id| id.as_str().unwrap_or_default() != parent_id),
+        "waiting ids are the children, not the parent: {lite}"
+    );
+
+    // Phase 2 — children finish; the group fires ONE aggregated wake that runs
+    // a real parent turn (stream lifecycle keyed by the parent, trailing idle)
+    // and the group clear pushes the refreshed (false/empty) waiting flags.
+    let mut saw_waiting_false_event = false;
+    let mut wake_chunks = 0u32;
+    let mut wake_ends = 0u32;
+    let mut parent_idle_again = false;
+    for _ in 0..400 {
+        let frame = wss_event(&mut sub, 90).await;
+        let ev = &frame["params"]["event"];
+        let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+        if ev_agent != parent_id {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:subscriptions-changed")
+                if ev["data"]["isWaitingForOtherAgents"] == json!(false) =>
+            {
+                saw_waiting_false_event = true;
+            }
+            Some("agent:stream:chunk") => wake_chunks += 1,
+            Some("agent:stream:end") => wake_ends += 1,
+            Some("agent:idle") => {
+                parent_idle_again = true;
+            }
+            _ => {}
+        }
+        if parent_idle_again && wake_ends >= 1 {
+            break;
+        }
+    }
+    assert!(
+        saw_waiting_false_event,
+        "group clear pushed agent:subscriptions-changed with isWaitingForOtherAgents=false"
+    );
+    assert!(
+        wake_chunks >= 1,
+        "wake turn streamed ≥1 chunk for the parent"
+    );
+    assert_eq!(
+        wake_ends, 1,
+        "exactly one wake-turn stream:end for the parent"
+    );
+    assert!(parent_idle_again, "parent idled again after the wake turn");
+
+    // After delivery the waiting flags are cleared on the projection too.
+    let lite = wss_rpc(&mut rpc, 13, "agent.get", json!({ "agentId": parent_id })).await;
+    let lite = &lite["agent"];
+    assert_eq!(lite["isWaitingForOtherAgents"], false, "cleared: {lite}");
+    assert_eq!(lite["waitingForAgentIds"], json!([]), "cleared: {lite}");
+
+    // The parent transcript carries EXACTLY ONE [WORKSPACE EVENTS] wake with
+    // both reports aggregated — and the reports appear NOWHERE else (the
+    // individual reportToParent sends were suppressed).
+    let conv = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.getConversation",
+        json!({ "agentId": parent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let texts: Vec<String> = messages
+        .iter()
+        .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
+        .collect();
+    let wakes: Vec<&String> = texts
+        .iter()
+        .filter(|t| t.contains("[WORKSPACE EVENTS]"))
+        .collect();
+    assert_eq!(wakes.len(), 1, "exactly one wake message: {conv}");
+    let wake = wakes[0];
+    assert!(
+        wake.contains("All 2 delegated child agent(s) settled"),
+        "aggregated wake header: {wake}"
+    );
+    assert!(
+        wake.contains(REPORT_A),
+        "wake carries the alpha report: {wake}"
+    );
+    assert!(
+        wake.contains(REPORT_B),
+        "wake carries the beta report: {wake}"
+    );
+    assert_eq!(
+        texts.iter().filter(|t| t.contains(REPORT_A)).count(),
+        1,
+        "alpha report appears only inside the wake: {conv}"
+    );
+    assert_eq!(
+        texts.iter().filter(|t| t.contains(REPORT_B)).count(),
+        1,
+        "beta report appears only inside the wake: {conv}"
+    );
+}
+
 /// Pre-seed the daemon's SQLite store with a workspace + target note for the
 /// MCP tool call (the daemon opens the same data dir on launch).
 async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {

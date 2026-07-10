@@ -1107,14 +1107,24 @@ impl Services {
                 // delegation group instead of waking immediately. The group's own
                 // fire path removes these watches once it settles (AS-4).
                 let deleted = event.event_type == AGENT_DELETED;
-                let summary = format_group_child_line(child_id, event);
+                // Prefer the child's persisted completionReport (set by
+                // `agent.reportToParent`, whose immediate send is suppressed for
+                // grouped children) over the event's lastResponseSummary,
+                // mirroring the TS event-notification formatter.
+                let report = self
+                    .store
+                    .get_agent_session(child_id)
+                    .await
+                    .ok()
+                    .and_then(|s| s.completion_report);
+                let summary = format_group_child_line(child_id, event, report.as_deref());
                 self.record_group_child_completion(workspace_id, &gid, child_id, deleted, summary);
                 self.try_fire_group(workspace_id, &gid).await;
                 continue;
             }
             let wake = format_completion_wake(child_id, event);
             if let Err(e) = self
-                .agent_send_message_op(watch.parent_agent_id.clone(), wake, None)
+                .deliver_parent_wake(workspace_id, watch.parent_agent_id.clone(), wake)
                 .await
             {
                 tracing::warn!(
@@ -1126,6 +1136,8 @@ impl Services {
             }
             if watch.one_shot {
                 self.remove_watch(workspace_id, &watch.id);
+                self.publish_subscriptions_changed(workspace_id, &watch.parent_agent_id)
+                    .await;
             }
         }
     }
@@ -1141,7 +1153,7 @@ impl Services {
         };
         let wake = format_group_wake(&group);
         if let Err(e) = self
-            .agent_send_message_op(group.parent_agent_id.clone(), wake, None)
+            .deliver_parent_wake(workspace_id, group.parent_agent_id.clone(), wake)
             .await
         {
             tracing::warn!(
@@ -1152,6 +1164,39 @@ impl Services {
             );
         }
         self.remove_group_watches(workspace_id, group_id);
+        self.publish_subscriptions_changed(workspace_id, &group.parent_agent_id)
+            .await;
+    }
+
+    /// Deliver an internal parent wake through the runtime [`AgentManager`]
+    /// when attached — the proven `agent.sendMessage` path: persist + spawn the
+    /// turn worker, so the parent runs a REAL turn with the normal stream/idle
+    /// event lifecycle (`agent:stream:*` chunks, `agent:idle` at end); a busy
+    /// parent gets the wake queued and drained at turn end. Read-only/test
+    /// wiring falls back to the store-only persist.
+    pub(crate) async fn deliver_parent_wake(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        content: String,
+    ) -> Result<serde_json::Value> {
+        match self.agent_manager() {
+            Some(manager) => {
+                manager
+                    .send_message(
+                        parent_agent_id,
+                        workspace_id.clone(),
+                        content,
+                        None,
+                        crate::agent_manager::TurnOptions::default(),
+                    )
+                    .await
+            }
+            None => {
+                self.agent_send_message_op(parent_agent_id, content, None)
+                    .await
+            }
+        }
     }
 }
 
@@ -2726,8 +2771,15 @@ fn format_completion_wake(child_id: &AgentId, event: &Event) -> String {
 
 /// Build one per-child summary line for a delegation group's aggregated wake.
 /// A compact sibling of [`format_completion_wake`] without the standalone
-/// `[WORKSPACE EVENTS]` framing, since the group header carries that.
-fn format_group_child_line(child_id: &AgentId, event: &Event) -> String {
+/// `[WORKSPACE EVENTS]` framing, since the group header carries that. A
+/// non-empty `completion_report` (the child's persisted
+/// `metadata.completionReport`) wins over the event's `lastResponseSummary`,
+/// mirroring the TS event-notification formatter.
+fn format_group_child_line(
+    child_id: &AgentId,
+    event: &Event,
+    completion_report: Option<&str>,
+) -> String {
     let kind = match event.event_type.as_str() {
         AGENT_IDLE => "completed",
         AGENT_FAILED => "failed",
@@ -2742,7 +2794,9 @@ fn format_group_child_line(child_id: &AgentId, event: &Event) -> String {
         .map(|name| format!("{name} ({})", child_id.0))
         .unwrap_or_else(|| child_id.0.clone());
     let mut line = format!("- {label} {kind}.");
-    if let Some(summary) = event
+    if let Some(report) = completion_report.filter(|r| !r.is_empty()) {
+        line.push_str(&format!(" Report: {report}"));
+    } else if let Some(summary) = event
         .data
         .get("lastResponseSummary")
         .and_then(|v| v.as_str())
