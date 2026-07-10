@@ -27,6 +27,7 @@ pub use tls::{cert_fingerprint, ensure_tls_certificate, inspect_cert, CertStatus
 pub use ws::{WsApiServer, WsOptions};
 
 pub mod auth;
+pub(crate) mod browser;
 mod client;
 mod conn;
 pub mod control;
