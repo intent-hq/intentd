@@ -3,9 +3,10 @@
 //!
 //! `browser.exec` is a **client-callable trigger** whose real work happens on
 //! the connected frontend: the daemon validates the payload, forwards it as an
-//! FE-served reverse RPC (`browser.exec` in the `rev-<n>` namespace, mirroring
-//! `host.openInEditor` / `host.pickApplication`), and echoes the FE's result
-//! back to the caller. No CDP logic runs in Rust — the daemon is a thin proxy.
+//! FE-served reverse RPC — method name unchanged (`browser.exec`), with a
+//! `rev-<n>` request id (mirroring `host.openInEditor` /
+//! `host.pickApplication`) — and echoes the FE's result back to the caller.
+//! No CDP logic runs in Rust — the daemon is a thin proxy.
 //!
 //! This module owns the two pure pieces of that flow: (1) parsing/validating
 //! the params into [`BrowserExecArgs`] and (2) reshaping the FE's raw
