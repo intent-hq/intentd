@@ -19,9 +19,12 @@ use intent_acp::session::{
 };
 use intent_acp::{Connection, IncomingNotification};
 use intent_core::events::{
-    AGENT_FAILED, AGENT_IDLE, AGENT_STREAM_CHUNK, AGENT_STREAM_END, AGENT_TOOL_CALL,
+    AGENT_FAILED, AGENT_IDLE, AGENT_STREAM_CHUNK, AGENT_STREAM_END, AGENT_STREAM_STATUS,
+    AGENT_TOOL_CALL,
 };
-use intent_core::{now_iso, ActorType, AgentId, Error, EventActor, Result, WorkspaceId};
+use intent_core::{
+    now_epoch_ms, now_iso, ActorType, AgentId, Error, EventActor, Result, WorkspaceId,
+};
 use intent_store::NewEvent;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -342,6 +345,14 @@ impl Services {
         // defense-in-depth guard). This call is only reached after the caller
         // resolved this agent id inside a workspace-scoped path.
         let workspace_id = self.store.get_agent_session(agent_id).await?.workspace_id;
+        self.publish_status_event(
+            &workspace_id,
+            agent_id,
+            "session-create",
+            "Creating session\u{2026}",
+            "info",
+        )
+        .await;
         let resp = session::new_session(conn, cwd, mcp_servers)
             .await
             .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
@@ -376,6 +387,14 @@ impl Services {
         // Load the session up front so the CAS replace is scoped to the owning
         // workspace (see [`open_acp_session`]).
         let workspace_id = self.store.get_agent_session(agent_id).await?.workspace_id;
+        self.publish_status_event(
+            &workspace_id,
+            agent_id,
+            "session-create",
+            "Creating session\u{2026}",
+            "info",
+        )
+        .await;
         let resp = session::new_session(conn, cwd, mcp_servers)
             .await
             .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
@@ -410,12 +429,21 @@ impl Services {
         mcp_servers: Vec<McpServer>,
     ) -> Result<Option<AcpSessionOpened>> {
         let stored = self.store.get_agent_session(agent_id).await?;
+        let workspace_id = stored.workspace_id.clone();
         let Some(acp_session_id) = stored.acp_session_id else {
             return Ok(None);
         };
         if !session::supports_load_session(init) {
             return Ok(None);
         }
+        self.publish_status_event(
+            &workspace_id,
+            agent_id,
+            "session-load",
+            "Resuming session\u{2026}",
+            "info",
+        )
+        .await;
         let resp = session::load_session(conn, &acp_session_id, cwd, mcp_servers)
             .await
             .map_err(|e| Error::Internal(format!("session/load failed: {e}")))?;
@@ -483,6 +511,17 @@ impl Services {
         // ANY exit — including the interrupt/abort path that drops this worker
         // before `stream:end` — so subscribers never see a stale in-flight turn.
         let _live_guard = self.begin_live_turn(agent_id, &message_id);
+        // Pre-first-token turn-startup hint: the FE renders "Sent prompt…" next
+        // to the spinner until the first `agent:stream:chunk` clears it. Emitted
+        // exactly once per turn immediately before dispatching `session/prompt`.
+        self.publish_status_event(
+            workspace_id,
+            agent_id,
+            "prompt",
+            "Sent prompt\u{2026}",
+            "info",
+        )
+        .await;
         let prompt_fut = session::prompt(conn, acp_session_id, prompt);
         tokio::pin!(prompt_fut);
         let mut closed = false;
@@ -657,6 +696,37 @@ impl Services {
         // Refresh the live-turn slot with the partial transcript so a mid-turn
         // `chat.subscribe` snapshot reflects content streamed so far (CS-0 D5).
         self.update_live_turn(agent_id, transcript);
+    }
+
+    /// Publish an `agent:stream:status` turn-startup hint on the bus (PROTOCOL
+    /// §6.5 / §7). Mirrors the TS reference `acp-provider.ts` `emitStatus()`
+    /// call sites: the FE renders the phase message next to the pre-first-token
+    /// spinner and clears it on the first chunk / `agent:stream:end` /
+    /// `agent:failed`. Self-sufficient payload — no follow-up fetch required.
+    /// `pub(crate)` so the [`AgentManager`] `launch` / `init` emit sites can
+    /// hit the same helper.
+    pub(crate) async fn publish_status_event(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        phase: &str,
+        message: &str,
+        level: &str,
+    ) {
+        self.publish_agent_event(
+            workspace_id,
+            agent_id,
+            AGENT_STREAM_STATUS,
+            json!({
+                "agentId": agent_id.0,
+                "workspaceId": workspace_id,
+                "phase": phase,
+                "message": message,
+                "level": level,
+                "timestamp": now_epoch_ms(),
+            }),
+        )
+        .await;
     }
 
     /// Build and publish an agent streaming event onto the bus (§6.6/§10).

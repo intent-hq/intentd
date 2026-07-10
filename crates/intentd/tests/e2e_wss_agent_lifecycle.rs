@@ -415,17 +415,30 @@ async fn mock_agent_full_turn_over_wss() {
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
     // Collect events until terminal: ≥1 chunk, exactly one stream:end, ≥1
-    // note:updated (from the MCP tool's domain event).
+    // note:updated (from the MCP tool's domain event). Also record every
+    // `agent:stream:status` frame (STAT-1 / PROTOCOL §6.5) with its arrival
+    // ordinal so we can assert the pre-first-token status hints land on the
+    // real WSS transport AND arrive before the first `agent:stream:chunk`.
     let mut chunks = 0u32;
     let mut ends = 0u32;
     let mut saw_note_updated = false;
-    for _ in 0..80 {
+    let mut first_chunk_at: Option<usize> = None;
+    let mut status_frames: Vec<(usize, Value)> = Vec::new();
+    for i in 0..80 {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:chunk") => chunks += 1,
+            Some("agent:stream:chunk") => {
+                chunks += 1;
+                if first_chunk_at.is_none() {
+                    first_chunk_at = Some(i);
+                }
+            }
             Some("agent:stream:end") => {
                 ends += 1;
                 break;
+            }
+            Some("agent:stream:status") => {
+                status_frames.push((i, frame["params"]["event"].clone()));
             }
             Some("note:updated") => saw_note_updated = true,
             _ => {}
@@ -436,6 +449,64 @@ async fn mock_agent_full_turn_over_wss() {
     assert!(
         saw_note_updated,
         "tool's note:updated domain event delivered over WSS"
+    );
+
+    // STAT-1 — pre-first-token status hints must reach the FE over the real
+    // WSS transport and MUST all arrive before the first `agent:stream:chunk`
+    // (that's the whole point: they populate the spinner *before* streaming
+    // starts, then the chunk-reducer clears them). The daemon emits at four
+    // real turn-startup transitions for a brand-new agent's first turn:
+    // `launch` (spawn), `init` (handshake), `session-create` (session/new),
+    // `prompt` (session/prompt). At least the last one — `prompt` — MUST land
+    // before the first chunk on the same subscription.
+    let first_chunk_at =
+        first_chunk_at.expect("at least one agent:stream:chunk observed to anchor ordering");
+    assert!(
+        !status_frames.is_empty(),
+        "expected >=1 agent:stream:status frame over WSS before the first chunk"
+    );
+    for (ord, ev) in &status_frames {
+        assert!(
+            *ord < first_chunk_at,
+            "agent:stream:status at ordinal {ord} arrived AT/AFTER first agent:stream:chunk \
+             (ordinal {first_chunk_at}) -- startup hints MUST precede streaming: {ev}"
+        );
+        let data = &ev["data"];
+        assert_eq!(
+            data["agentId"].as_str(),
+            Some(agent_id.as_str()),
+            "agent:stream:status.agentId must match: {ev}"
+        );
+        assert_eq!(
+            data["workspaceId"].as_str(),
+            Some(ws_id.as_str()),
+            "agent:stream:status.workspaceId must match (self-sufficient payload sec 6.7): {ev}"
+        );
+        assert!(
+            data["phase"].as_str().is_some(),
+            "agent:stream:status.phase required: {ev}"
+        );
+        assert!(
+            data["message"].as_str().is_some(),
+            "agent:stream:status.message required: {ev}"
+        );
+        assert!(
+            data["level"].as_str().is_some(),
+            "agent:stream:status.level required: {ev}"
+        );
+        assert!(
+            data["timestamp"].as_u64().is_some(),
+            "agent:stream:status.timestamp (epoch-ms) required: {ev}"
+        );
+    }
+    let phases: Vec<&str> = status_frames
+        .iter()
+        .filter_map(|(_, e)| e["data"]["phase"].as_str())
+        .collect();
+    assert!(
+        phases.contains(&"prompt"),
+        "expected a 'prompt' status hint (\"Sent prompt\u{2026}\") before the first chunk; \
+         observed phases: {phases:?}"
     );
 
     // BE state mutated via the real agent→BE MCP loop.

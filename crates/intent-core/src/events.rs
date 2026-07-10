@@ -55,6 +55,15 @@ pub const AGENT_STREAM_END: &str = "agent:stream:end";
 pub const AGENT_STREAM_MESSAGE: &str = "agent:stream:message";
 pub const AGENT_STREAM_TOOL_USE: &str = "agent:stream:tool_use";
 pub const AGENT_STREAM_TOOL_RESULT: &str = "agent:stream:tool_result";
+// Pre-first-token turn-startup status hints (new in intentd; PROTOCOL §6.5 /
+// §7). Emitted while an agent turn is starting so the chat spinner can show
+// the current phase (`launch` / `init` / `session-create` / `session-load` /
+// `prompt`) before the first `agent:stream:chunk` arrives; cleared by the FE
+// on the first chunk / `agent:stream:end` / `agent:failed`. Self-sufficient
+// payload `{ agentId, workspaceId, phase, message, level, timestamp }` so a
+// thin client renders the hint directly without a follow-up fetch. Mirrors
+// the TS reference `acp-provider.ts` `emitStatus()` call sites.
+pub const AGENT_STREAM_STATUS: &str = "agent:stream:status";
 
 // Agent queue events (for the WebSocket API).
 pub const AGENT_QUEUE_UPDATED: &str = "agent:queue:updated";
@@ -277,6 +286,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_STREAM_MESSAGE,
     AGENT_STREAM_TOOL_USE,
     AGENT_STREAM_TOOL_RESULT,
+    AGENT_STREAM_STATUS,
     AGENT_QUEUE_UPDATED,
     AGENT_QUEUE_PROCESSING,
     AGENT_QUEUE_PROCESSING_CANCELLED,

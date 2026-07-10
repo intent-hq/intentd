@@ -306,8 +306,11 @@ async fn prompt_turn_streams_events_and_accumulates() {
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
 
     // Collect the published events (default filter → one event per batch).
+    // The turn also emits a `prompt` status hint before the first chunk
+    // (STAT-1 / PROTOCOL §7 pre-first-token status family), so expect one
+    // extra frame ahead of the chunk/tool/end/idle sequence.
     let mut events = Vec::new();
-    while events.len() < 5 {
+    while events.len() < 6 {
         let batch = timeout(Duration::from_secs(2), sub.recv())
             .await
             .expect("recv timed out")
@@ -318,13 +321,29 @@ async fn prompt_turn_streams_events_and_accumulates() {
     assert_eq!(
         types,
         vec![
+            "agent:stream:status",
             "agent:stream:chunk",
             "agent:stream:chunk",
             "agent:tool:call",
             "agent:stream:end",
             "agent:idle",
         ],
-        "a normal turn emits exactly one agent:idle after the terminal stream:end"
+        "a normal turn emits the `prompt` status hint before the first chunk and exactly one agent:idle after the terminal stream:end"
+    );
+
+    // The pre-first-token status hint carries the "Sent prompt…" phrase and
+    // arrives BEFORE any `agent:stream:chunk` so the FE spinner can render it
+    // while the turn is starting.
+    let status = &events[0];
+    assert_eq!(status.event_type, "agent:stream:status");
+    assert_eq!(status.data["agentId"], json!("agent-1"));
+    assert_eq!(status.data["workspaceId"], json!("ws-1"));
+    assert_eq!(status.data["phase"], json!("prompt"));
+    assert_eq!(status.data["message"], json!("Sent prompt\u{2026}"));
+    assert_eq!(status.data["level"], json!("info"));
+    assert!(
+        status.data["timestamp"].is_u64(),
+        "status timestamp is an epoch-ms integer"
     );
     assert_eq!(
         events
@@ -485,7 +504,7 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
 
     let mut events = Vec::new();
-    while events.len() < 5 {
+    while events.len() < 6 {
         let batch = timeout(Duration::from_secs(2), sub.recv())
             .await
             .expect("recv timed out")
@@ -496,13 +515,14 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
     assert_eq!(
         types,
         vec![
+            "agent:stream:status",
             "agent:stream:chunk",
             "agent:stream:chunk",
             "agent:tool:call",
             "agent:stream:end",
             "agent:idle",
         ],
-        "the real turn streams its own updates (then goes idle) after the replay was dropped"
+        "the real turn emits the pre-first-token `prompt` status hint, streams its own updates (then goes idle) after the replay was dropped"
     );
 
     let messages = bus
@@ -546,9 +566,9 @@ async fn tool_call_then_update_persists_use_and_result_blocks() {
         .await
         .expect("turn completes");
 
-    // chunk, tool_call, tool_call_update, stream:end, idle.
+    // status, chunk, tool_call, tool_call_update, stream:end, idle.
     let mut events = Vec::new();
-    while events.len() < 5 {
+    while events.len() < 6 {
         let batch = timeout(Duration::from_secs(2), sub.recv())
             .await
             .expect("recv timed out")
@@ -600,6 +620,7 @@ async fn tool_call_then_update_persists_use_and_result_blocks() {
 async fn open_acp_session_persists_id() {
     let (_tmp, services, bus, agent_id, _ws) = setup().await;
     let (conn, _rx, _agent) = connect();
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
     let opened = services
         .open_acp_session(&conn, &agent_id, "/tmp/ws", Vec::new())
         .await
@@ -607,6 +628,23 @@ async fn open_acp_session_persists_id() {
     assert_eq!(opened.session_id, ACP_SID);
     let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
     assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
+
+    // `session-create` status hint fires ahead of the `session/new` wire call
+    // (STAT-1 / PROTOCOL §7) so the FE spinner can render "Creating session…"
+    // while the provider spins up the session.
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
+    let status = batch
+        .iter()
+        .find(|e| e.event_type == "agent:stream:status")
+        .expect("status event on the wire");
+    assert_eq!(status.data["agentId"], json!("agent-1"));
+    assert_eq!(status.data["workspaceId"], json!("ws-1"));
+    assert_eq!(status.data["phase"], json!("session-create"));
+    assert_eq!(status.data["message"], json!("Creating session\u{2026}"));
+    assert_eq!(status.data["level"], json!("info"));
 }
 
 #[tokio::test]
@@ -685,4 +723,70 @@ async fn recreate_acp_session_replaces_stored_id() {
     );
     let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
     assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
+}
+
+/// `resume_acp_session` on the happy path emits the `session-load` status
+/// hint ahead of the `session/load` wire call so the pre-first-token spinner
+/// can render "Resuming session…" (STAT-1 / PROTOCOL §7).
+#[tokio::test]
+async fn resume_acp_session_emits_session_load_status() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let (conn, _rx, _agent) = connect();
+    bus.store()
+        .set_acp_session_id(&ws, &agent_id, ACP_SID)
+        .await
+        .unwrap();
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let opened = services
+        .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
+        .await
+        .unwrap()
+        .expect("resume yields opened session");
+    assert_eq!(opened.session_id, ACP_SID);
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
+    let status = batch
+        .iter()
+        .find(|e| e.event_type == "agent:stream:status")
+        .expect("status event on the wire");
+    assert_eq!(status.data["phase"], json!("session-load"));
+    assert_eq!(status.data["message"], json!("Resuming session\u{2026}"));
+    assert_eq!(status.data["level"], json!("info"));
+    assert_eq!(status.data["agentId"], json!("agent-1"));
+    assert_eq!(status.data["workspaceId"], json!("ws-1"));
+}
+
+/// `recreate_acp_session` (the resume-impossible fallback) emits the
+/// `session-create` status hint ahead of the `session/new` wire call — the
+/// FE renders the same "Creating session…" phase as the brand-new-agent path.
+#[tokio::test]
+async fn recreate_acp_session_emits_session_create_status() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let (conn, _rx, _agent) = connect();
+    bus.store()
+        .set_acp_session_id(&ws, &agent_id, "stale-id")
+        .await
+        .unwrap();
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let opened = services
+        .recreate_acp_session(&conn, &agent_id, "stale-id", "/tmp/ws", Vec::new())
+        .await
+        .expect("recreate session");
+    assert_eq!(opened.session_id, ACP_SID);
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
+    let status = batch
+        .iter()
+        .find(|e| e.event_type == "agent:stream:status")
+        .expect("status event on the wire");
+    assert_eq!(status.data["phase"], json!("session-create"));
+    assert_eq!(status.data["message"], json!("Creating session\u{2026}"));
 }
