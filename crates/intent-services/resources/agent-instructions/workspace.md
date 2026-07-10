@@ -52,10 +52,10 @@ Keep the workspace `statusMessage` current when the high-level work status chang
 ## Agent Collaboration
 
 - `delegate_task({ taskNoteId, specialist?, waitMode?, ... })` — Delegate an existing task note to a new agent
-- `create_agent(name, initialMessage, opts?)` — Spawn a new agent for a subtask (`name` and `initialMessage` are required)
+- `create_agent({ name, initialMessage, ... })` — Spawn a new agent for a subtask (`name` and `initialMessage` are required)
 - `send_message_to_agent(agentId, message, priority?)` — Message another agent
 - `send_message_to_task_agent(taskNoteId, message, priority?)` — Message the agent assigned to a task note
 - `list_agents()` — List all agents and their status
 - `read_agent_conversation(agentId, lastN?, pageToken?)` — Read another agent's chat history (flat params)
 - `list_notes()` — List all notes in the space
-- `get_note("<id>")` — Read a note (use `"spec"` for the specification)
+- `get_note({ noteId })` — Read a note (use `noteId: "spec"` for the specification)

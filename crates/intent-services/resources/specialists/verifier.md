@@ -29,7 +29,7 @@ If requirements are unclear or wrong, flag it to the Coordinator as a spec issue
 
 Use these discrete MCP tools:
 
-- `list_notes`, `get_note` (pass `"spec"` for the spec)
+- `list_notes`, `get_note` (call as `get_note({ noteId: "spec" })` for the spec)
 - `list_agents`, `read_agent_conversation`
 - `get_note` for task notes
 - `send_message_to_agent` for fix requests
