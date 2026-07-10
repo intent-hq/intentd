@@ -1049,19 +1049,17 @@ impl AgentManager {
                 .connection
                 .clone()
         };
+        // Load the agent session record once and reuse both `workspace_id` (for
+        // the pre-handshake status hint) and `acp_session_id` (for the resume
+        // branch decision below) from the same struct.
+        let session_record = self.services.store.get_agent_session(agent_id).await?;
         // Pre-first-token turn-startup hint: the ACP `initialize` handshake is
-        // about to run for this agent (STAT-1 / PROTOCOL §7). Resolve the owning
-        // workspace from the store so the status payload carries `workspaceId`
-        // (the FE routes hints per-agent but callers key the timeline on it).
-        let workspace_id = self
-            .services
-            .store
-            .get_agent_session(agent_id)
-            .await?
-            .workspace_id;
+        // about to run for this agent (STAT-1 / PROTOCOL §7). The status payload
+        // carries `workspaceId` (the FE routes hints per-agent but callers key
+        // the timeline on it).
         self.services
             .publish_status_event(
-                &workspace_id,
+                &session_record.workspace_id,
                 agent_id,
                 "init",
                 "Initializing protocol\u{2026}",
@@ -1075,12 +1073,7 @@ impl AgentManager {
         // The persisted id (if any) decides the no-resume branch: a brand-new
         // agent (no id) opens a first session; an agent with a lost id recreates
         // (CAS-replacing exactly this id) and resends history.
-        let stored_id = self
-            .services
-            .store
-            .get_agent_session(agent_id)
-            .await?
-            .acp_session_id;
+        let stored_id = session_record.acp_session_id;
 
         // 1) Try to resume the persisted session (gated on stored id + capability).
         match self
