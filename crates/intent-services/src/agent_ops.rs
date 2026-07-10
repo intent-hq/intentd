@@ -1749,8 +1749,10 @@ impl Services {
         )
         .await;
         if !self.child_in_undelivered_group(&workspace_id, &parent, &caller) {
+            // Non-grouped (immediate-mode) children deliver right away, through
+            // the runtime send-message path so the parent runs a real turn.
             let _ = self
-                .agent_send_message_op(parent.clone(), report_text, None)
+                .deliver_parent_wake(&workspace_id, parent.clone(), report_text)
                 .await?;
         }
         Ok(json!({

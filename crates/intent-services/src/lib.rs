@@ -1124,7 +1124,7 @@ impl Services {
             }
             let wake = format_completion_wake(child_id, event);
             if let Err(e) = self
-                .agent_send_message_op(watch.parent_agent_id.clone(), wake, None)
+                .deliver_parent_wake(workspace_id, watch.parent_agent_id.clone(), wake)
                 .await
             {
                 tracing::warn!(
@@ -1151,7 +1151,7 @@ impl Services {
         };
         let wake = format_group_wake(&group);
         if let Err(e) = self
-            .agent_send_message_op(group.parent_agent_id.clone(), wake, None)
+            .deliver_parent_wake(workspace_id, group.parent_agent_id.clone(), wake)
             .await
         {
             tracing::warn!(
@@ -1162,6 +1162,37 @@ impl Services {
             );
         }
         self.remove_group_watches(workspace_id, group_id);
+    }
+
+    /// Deliver an internal parent wake through the runtime [`AgentManager`]
+    /// when attached — the proven `agent.sendMessage` path: persist + spawn the
+    /// turn worker, so the parent runs a REAL turn with the normal stream/idle
+    /// event lifecycle (`agent:stream:*` chunks, `agent:idle` at end); a busy
+    /// parent gets the wake queued and drained at turn end. Read-only/test
+    /// wiring falls back to the store-only persist.
+    pub(crate) async fn deliver_parent_wake(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        content: String,
+    ) -> Result<serde_json::Value> {
+        match self.agent_manager() {
+            Some(manager) => {
+                manager
+                    .send_message(
+                        parent_agent_id,
+                        workspace_id.clone(),
+                        content,
+                        None,
+                        crate::agent_manager::TurnOptions::default(),
+                    )
+                    .await
+            }
+            None => {
+                self.agent_send_message_op(parent_agent_id, content, None)
+                    .await
+            }
+        }
     }
 }
 
