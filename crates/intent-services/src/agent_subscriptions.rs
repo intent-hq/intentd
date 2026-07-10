@@ -255,6 +255,30 @@ impl Services {
         Some(g.group_id.clone())
     }
 
+    /// Whether `child_id` is enrolled in an undelivered `after_all` delegation
+    /// group parented by `parent_id`. Used by `agent.reportToParent` to suppress
+    /// the immediate parent send: a grouped child's report reaches the parent
+    /// only inside the group's single aggregated wake.
+    pub(crate) fn child_in_undelivered_group(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_id: &AgentId,
+        child_id: &AgentId,
+    ) -> bool {
+        self.agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .get(workspace_id)
+            .map(|w| {
+                w.delegation_groups.iter().any(|g| {
+                    &g.parent_agent_id == parent_id
+                        && !g.delivered
+                        && g.expected_agent_ids.contains(child_id)
+                })
+            })
+            .unwrap_or(false)
+    }
+
     /// Record one child's completion in its group (idempotent): adds it to the
     /// completed or deleted set and pushes a summary line. No-ops if the child is
     /// not expected or already recorded, or if the group no longer exists.

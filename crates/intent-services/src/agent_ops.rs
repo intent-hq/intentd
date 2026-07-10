@@ -1706,7 +1706,12 @@ impl Services {
     /// `-32603`. Otherwise the report is persisted on the child session
     /// (`metadata.completionReport` / `completionReportTimestamp`, the TS
     /// parity; P3-1.2b) — emitting `agent:updated` — and delivered to the
-    /// parent by reusing the send-message path.
+    /// parent by reusing the send-message path. When the caller is enrolled in
+    /// an undelivered `after_all` delegation group parented by its parent, the
+    /// immediate send is suppressed (AS-4): the persisted report reaches the
+    /// parent only inside the group's single aggregated wake, matching the TS
+    /// reference where `reportToParent` stores metadata and delivery happens
+    /// via the group notification.
     pub(crate) async fn agent_report_to_parent_op(
         &self,
         _workspace_id: WorkspaceId,
@@ -1743,9 +1748,11 @@ impl Services {
             json!({ "agentId": caller.0, "completionReportLength": report_len }),
         )
         .await;
-        let _ = self
-            .agent_send_message_op(parent.clone(), report_text, None)
-            .await?;
+        if !self.child_in_undelivered_group(&workspace_id, &parent, &caller) {
+            let _ = self
+                .agent_send_message_op(parent.clone(), report_text, None)
+                .await?;
+        }
         Ok(json!({
             "ok": true,
             "parentAgentId": parent,
