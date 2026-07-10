@@ -3761,3 +3761,205 @@ async fn workspace_create_clones_github_url_over_wss() {
     // Cleanup the seed source (best-effort).
     let _ = std::fs::remove_dir_all(&source);
 }
+
+/// DELIV-1 regression: neither `agent.wakeOrCreate`'s wake-message delivery
+/// nor `agent.sendToTask`'s default-priority delivery can bypass the runtime
+/// `AgentManager`. Before the fix, both entry points persisted the user
+/// message directly to the store without spawning a turn worker — the agent
+/// row stayed `pending`, no `agent:idle` fired, and the transcript projection
+/// showed a wake-tagged user block with no matching assistant response.
+///
+/// This e2e drives the fixed path end-to-end over the real WSS transport:
+///   1. `agent.wakeOrCreate` creates + delivers the first message via
+///      `Services::deliver_wake_message` (now routed through
+///      `AgentManager::try_spawn_turn_for_prepersisted`), producing an
+///      `agent:idle` enriched with `agentName` + first assistant response.
+///   2. `agent.sendToTask` (default priority) delivers a follow-up via
+///      `Services::agent_send_to_task_op` (now routed through
+///      `AgentManager::send_message`), producing a second `agent:idle`.
+///   3. The persisted transcript shows BOTH user prompts AND both matching
+///      assistant responses — no lost messages across the cycle.
+#[tokio::test]
+async fn deliv1_no_lost_messages_wake_or_create_then_send_to_task_over_wss() {
+    let Some(script) = gate("WSS DELIV-1 no-lost-messages E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    // Distinct responses per turn keyed on prompt text so the transcript
+    // assertion below can prove BOTH turns actually ran (not just one).
+    let behavior = json!({
+        "rules": [
+            { "ifPromptContains": "kickoff", "response": "first-turn-ok" },
+            { "ifPromptContains": "follow-up", "response": "second-turn-ok" },
+        ],
+        "response": "fallback"
+    })
+    .to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // Subscribe BEFORE any RPC that could publish `agent:idle` so no event
+    // races past the subscription window.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let marked = wss_rpc(
+        &mut rpc,
+        10,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+
+    // Step 1 — `agent.wakeOrCreate` MUST drive a real turn. The `contextMessage`
+    // reaches the mock agent's prompt text, matches the first rule, and streams
+    // `first-turn-ok` back through `agent:stream:*` culminating in `agent:idle`.
+    let wake = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.wakeOrCreate",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": note_id,
+            "contextMessage": "kickoff",
+            "create": { "model": "mock:default" },
+        }),
+    )
+    .await;
+    assert_eq!(wake["ok"], true, "wakeOrCreate ok: {wake}");
+    assert_eq!(
+        wake["created"], true,
+        "created a fresh agent for the task: {wake}"
+    );
+    let agent_id = wake["agentId"].as_str().expect("agentId").to_string();
+
+    // Drain events until the first `agent:idle` for our agent lands.
+    let mut first_idle_payload: Option<Value> = None;
+    for _ in 0..160 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:idle" && ev["data"]["agentId"].as_str() == Some(agent_id.as_str()) {
+            first_idle_payload = Some(ev.clone());
+            break;
+        }
+    }
+    let first_idle = first_idle_payload
+        .expect("first agent:idle fired after wakeOrCreate (DELIV-1: turn was driven)");
+    // Enrichment (DELIV-1 payload fix): `agentName` MUST be present so
+    // subscribers don't fall back to a generic label.
+    assert!(
+        first_idle["data"]["agentName"]
+            .as_str()
+            .is_some_and(|n| !n.is_empty()),
+        "agent:idle carries non-empty agentName: {first_idle}"
+    );
+
+    // Step 2 — follow-up via `agent.sendToTask` with DEFAULT priority. This
+    // is the DELIV-1 fix under test: before, the non-interrupt branch persisted
+    // the user message to the store WITHOUT spawning a turn; now it routes
+    // through `AgentManager::send_message`, so a second `agent:idle` fires.
+    let follow_up = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendToTask",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": note_id,
+            "message": "follow-up",
+        }),
+    )
+    .await;
+    assert_eq!(follow_up["ok"], true, "sendToTask ok: {follow_up}");
+    assert_eq!(
+        follow_up["agentId"].as_str().unwrap_or_default(),
+        agent_id,
+        "sendToTask resolved the task assignee"
+    );
+
+    let mut second_idle_payload: Option<Value> = None;
+    for _ in 0..160 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:idle" && ev["data"]["agentId"].as_str() == Some(agent_id.as_str()) {
+            second_idle_payload = Some(ev.clone());
+            break;
+        }
+    }
+    let second_idle = second_idle_payload
+        .expect("second agent:idle fired after sendToTask (DELIV-1: follow-up drove a turn)");
+    assert!(
+        second_idle["data"]["agentName"]
+            .as_str()
+            .is_some_and(|n| !n.is_empty()),
+        "second agent:idle carries agentName: {second_idle}"
+    );
+
+    // Step 3 — the transcript holds BOTH user prompts + BOTH assistant
+    // responses. Zero-length or missing rows would mean a lost message.
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    assert!(
+        !messages.is_empty(),
+        "transcript populated after wake+follow-up: {conv}"
+    );
+    let concat_text: String = messages
+        .iter()
+        .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        concat_text.contains("kickoff"),
+        "first user prompt persisted (transcript: {concat_text})"
+    );
+    assert!(
+        concat_text.contains("first-turn-ok"),
+        "first assistant response persisted -- NOT lost (transcript: {concat_text})"
+    );
+    assert!(
+        concat_text.contains("follow-up"),
+        "second user prompt persisted (transcript: {concat_text})"
+    );
+    assert!(
+        concat_text.contains("second-turn-ok"),
+        "second assistant response persisted -- NOT lost (transcript: {concat_text})"
+    );
+}

@@ -391,9 +391,16 @@ async fn wake_or_create_widened_wire_contract_over_wss() {
     assert!(create_res.get("cleanedUpAgentIds").is_none());
 
     // (2) Wake branch: a subsequent call finds the just-created agent as the
-    //     newest resumable assignment. `created: false`, `action:
-    //     woke_existing`, and the response echoes the same agent id / task
-    //     title so clients don't need a follow-up `agent.get`.
+    //     newest resumable assignment. `created: false` and the response
+    //     echoes the same agent id / task title so clients don't need a
+    //     follow-up `agent.get`.
+    //
+    //     `action` is `woke_existing` when the assignee's in-flight slot has
+    //     been released, or `message_queued_to_active_agent` when the earlier
+    //     wake's runtime worker is still holding the slot (DELIV-1: the wake
+    //     now routes through the `AgentManager` so a same-tick follow-up
+    //     legitimately queues while the drain loop is running). Both action
+    //     codes represent successful delivery.
     let wake_res = wss_rpc(
         &mut rpc,
         2,
@@ -407,7 +414,11 @@ async fn wake_or_create_widened_wire_contract_over_wss() {
     .await;
     assert_eq!(wake_res["ok"], true);
     assert_eq!(wake_res["created"], false);
-    assert_eq!(wake_res["action"], "woke_existing");
+    let wake_action = wake_res["action"].as_str().unwrap_or_default();
+    assert!(
+        wake_action == "woke_existing" || wake_action == "message_queued_to_active_agent",
+        "wake action must be a live-assignee code (DELIV-1): {wake_res}"
+    );
     assert_eq!(wake_res["agentId"], agent_id);
     assert_eq!(wake_res["taskTitle"], "WOC Task");
 
