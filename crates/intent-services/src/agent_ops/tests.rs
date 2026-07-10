@@ -2260,6 +2260,196 @@ async fn delegate_without_message_source_delivers_nothing() {
     assert_eq!(conv["totalMessages"], 0, "no message delivered");
 }
 
+/// NAME-1: delegating with a `taskNoteId` names the child from the resolved
+/// task note's title (reference `DelegateTaskTool` taskNoteId path) and leaves
+/// `nameExplicitlySet` unset so the child's opening-turn
+/// `ws.workspace.setAgentName` (`skipIfExplicitlySet: true`) can still rename
+/// it. Without this the child inherits the generic `Agent xxxxxx` fallback
+/// that leaks into the waiting panel and `agent:idle` wake reports.
+#[tokio::test]
+async fn delegate_names_child_from_task_note_title() {
+    let (_t, svc, ws) = setup().await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Port frobnicator to Rust".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    let input = AgentDelegateInput {
+        task_note_id: Some(note.id.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    assert_eq!(resp["name"], "Port frobnicator to Rust");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let got = svc.agent_get_op(child, None).await.expect("get child");
+    assert_eq!(got.name, "Port frobnicator to Rust");
+    assert!(
+        !got.name_explicitly_set,
+        "delegated child must stay renameable by the setAgentName opening turn"
+    );
+}
+
+/// NAME-1: the taskText delegate path names the child from the task text,
+/// matching the reference `DelegateTaskTool` taskText branch. `taskText` wins
+/// over the linked note's title when both are present.
+#[tokio::test]
+async fn delegate_names_child_from_task_text() {
+    let (_t, svc, ws) = setup().await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Parent note title".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    let input = AgentDelegateInput {
+        note_id: Some(note.id.clone()),
+        task_text: Some("Fix the flaky delegate test".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    assert_eq!(resp["name"], "Fix the flaky delegate test");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let got = svc.agent_get_op(child, None).await.expect("get child");
+    assert_eq!(got.name, "Fix the flaky delegate test");
+    assert!(!got.name_explicitly_set);
+}
+
+/// NAME-1: task-derived names longer than 100 chars are truncated to the
+/// first 97 chars + "..." (reference: `taskText.length > 100 ? taskText
+/// .substring(0, 97) + '...' : taskText`). Boundary: len == 100 is untouched.
+#[tokio::test]
+async fn delegate_truncates_long_task_derived_names() {
+    let (_t, svc, ws) = setup().await;
+    // 150-char task text -> first 97 chars + "..." = 100 chars total.
+    let long_text: String = "a".repeat(150);
+    let input = AgentDelegateInput {
+        task_text: Some(long_text.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let name = resp["name"].as_str().expect("name").to_string();
+    assert_eq!(name.chars().count(), 100);
+    let expected_prefix: String = "a".repeat(97);
+    assert_eq!(name, format!("{expected_prefix}..."));
+
+    // Boundary: exactly 100 chars stays intact.
+    let boundary: String = "b".repeat(100);
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                task_text: Some(boundary.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    assert_eq!(resp["name"], boundary);
+
+    // UTF-16 parity with the reference: non-BMP chars (e.g. emoji) count
+    // as 2 code units under JS `.length`/`.substring`. 51 emoji = 102
+    // UTF-16 units > 100, so the truncated name is 97 UTF-16 units + "..."
+    // and never contains a lone surrogate.
+    let emoji_text: String = "\u{1F600}".repeat(51);
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                task_text: Some(emoji_text),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let name = resp["name"].as_str().expect("name");
+    // 97 UTF-16 units of surrogate-paired emoji = 48 whole emoji (96 units)
+    // + one lone high surrogate which we strip -> 48 emoji + "..." total.
+    assert_eq!(name, format!("{}...", "\u{1F600}".repeat(48)));
+    // Sanity: the string is valid UTF-8 (no U+FFFD replacement chars).
+    assert!(!name.contains('\u{FFFD}'));
+}
+
+/// NAME-1: because delegate keeps `nameExplicitlySet = false`, a subsequent
+/// skip-guarded rename (the FE `ws.workspace.setAgentName` path uses
+/// `skipIfExplicitlySet: true`) still applies to the delegated child.
+#[tokio::test]
+async fn delegate_leaves_child_renameable_by_skip_guarded_rename() {
+    let (_t, svc, ws) = setup().await;
+    let input = AgentDelegateInput {
+        task_text: Some("Initial task-derived name".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let r = svc
+        .agent_rename_op(child.clone(), "Chosen by naming instruction".into(), true)
+        .await
+        .expect("skip-guarded rename");
+    assert!(r.get("skipped").is_none(), "rename must not be skipped");
+    assert_eq!(r["name"], "Chosen by naming instruction");
+    let got = svc.agent_get_op(child, None).await.expect("get");
+    assert_eq!(got.name, "Chosen by naming instruction");
+    assert!(got.name_explicitly_set);
+}
+
+/// NAME-1: an explicit `agent.create` with no name still gets the generic
+/// `Agent xxxxxx` fallback (out of delegate scope, unchanged behavior).
+#[tokio::test]
+async fn create_without_name_keeps_generic_agent_fallback() {
+    let (_t, svc, ws) = setup().await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create");
+    let name = created["agent"]["name"].as_str().expect("name").to_string();
+    assert!(
+        name.starts_with("Agent ") && name.len() == "Agent ".len() + 6,
+        "expected generic fallback name, got {name:?}"
+    );
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let got = svc.agent_get_op(id, None).await.expect("get");
+    assert!(!got.name_explicitly_set);
+}
+
 // ===========================================================================
 // AS-4: after_all delegation groups (aggregate + single wake)
 // ===========================================================================

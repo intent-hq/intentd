@@ -1743,6 +1743,14 @@ pub struct AgentCreateExtra {
     pub context_references: Option<serde_json::Value>,
     pub image_blocks: Option<serde_json::Value>,
     pub is_background: Option<bool>,
+    /// Internal override for the created session's `nameExplicitlySet` flag.
+    /// Not accepted from the wire (`#[serde(skip)]`): `agent_delegate_op`
+    /// sets `Some(false)` so a delegated child keeps its task-derived name
+    /// while remaining renameable by the `ws.workspace.setAgentName`
+    /// (`skipIfExplicitlySet: true`) opening-turn self-rename. `None`
+    /// preserves the default `name.is_some()` behavior.
+    #[serde(skip)]
+    pub name_explicitly_set: Option<bool>,
 }
 
 /// Wire input for `agent.delegate` (PROTOCOL §5.5). `workspaceId` is passed

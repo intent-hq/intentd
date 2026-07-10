@@ -898,7 +898,13 @@ impl Services {
             }
         }
         let now = now_iso();
-        let name_explicitly_set = name.is_some();
+        // `name_explicitly_set` defaults to `name.is_some()` so an explicit
+        // `agent.create` with a client-supplied name still becomes
+        // renameable-with-guard. Delegate flows override to `Some(false)`
+        // via `AgentCreateExtra.name_explicitly_set` so their task-derived
+        // name stays renameable by the child's opening-turn
+        // `ws.workspace.setAgentName` (which uses `skipIfExplicitlySet: true`).
+        let name_explicitly_set = extra.name_explicitly_set.unwrap_or_else(|| name.is_some());
         let name =
             name.unwrap_or_else(|| format!("Agent {}", &Uuid::new_v4().simple().to_string()[..6]));
         let id = match requested_agent_id {
@@ -922,6 +928,7 @@ impl Services {
             context_references,
             image_blocks,
             is_background,
+            name_explicitly_set: _,
         } = extra;
         // Harvest the persistence-gap fields the FE writer kept under
         // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
@@ -1817,18 +1824,64 @@ impl Services {
             let trimmed = s.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         }
+        let task_text_msg = input.task_text.as_deref().and_then(first_nonempty);
         let mut message = input
             .agent_instructions
             .as_deref()
             .and_then(first_nonempty)
-            .or_else(|| input.task_text.as_deref().and_then(first_nonempty));
+            .or_else(|| task_text_msg.clone());
+        // Load the linked task note only when we still need it: either the
+        // message hasn't been resolved from agentInstructions/taskText, or
+        // there's no taskText to derive the child name from. Callers on the
+        // common path (`taskText` + `taskNoteId` supplied together) skip the
+        // store read entirely (Copilot #84 review).
+        let task_note = match session_task_note_id.as_ref() {
+            Some(note_id) if message.is_none() || task_text_msg.is_none() => {
+                self.store.get_note(note_id).await.ok()
+            }
+            _ => None,
+        };
         if message.is_none() {
-            if let Some(note_id) = input.task_note_id.clone().or(input.note_id.clone()) {
-                if let Ok(note) = self.store.get_note(&note_id).await {
-                    message = first_nonempty(&note.content).or_else(|| first_nonempty(&note.title));
-                }
+            if let Some(note) = task_note.as_ref() {
+                message = first_nonempty(&note.content).or_else(|| first_nonempty(&note.title));
             }
         }
+        // Resolve the child agent's name to match the reference `DelegateTaskTool`
+        // (agent-interaction-tools.ts): the taskText path uses `taskText`, the
+        // taskNoteId path uses the note's title. Both truncate to 100 chars
+        // (`len > 100 ? substring(0,97) + "..." : text`). Without this the
+        // child inherits the generic `Agent xxxxxx` fallback from
+        // `agent_create_op`, which then leaks into the waiting panel, agent
+        // cards, and `agent:idle` wake reports (NAME-1).
+        fn truncate_agent_name(name: String) -> String {
+            // The reference uses JS `.length` / `.substring(0, 97)`, which
+            // count UTF-16 code units — non-BMP characters (e.g. emoji)
+            // count as 2. Match that to avoid off-by-one divergences on
+            // emoji-heavy task titles (Copilot #84 review).
+            let u16_len = name.encode_utf16().count();
+            if u16_len > 100 {
+                let units: Vec<u16> = name.encode_utf16().take(97).collect();
+                // `substring(0, 97)` can split a surrogate pair; drop a
+                // trailing lone high surrogate so the resulting Rust string
+                // stays valid UTF-8 instead of embedding a U+FFFD replacement.
+                let cutoff = if units
+                    .last()
+                    .is_some_and(|&u| (0xD800..=0xDBFF).contains(&u))
+                {
+                    units.len() - 1
+                } else {
+                    units.len()
+                };
+                let mut truncated = String::from_utf16_lossy(&units[..cutoff]);
+                truncated.push_str("...");
+                truncated
+            } else {
+                name
+            }
+        }
+        let child_name = task_text_msg
+            .or_else(|| task_note.as_ref().and_then(|n| first_nonempty(&n.title)))
+            .map(truncate_agent_name);
         // Load the delegating parent once: it feeds the child's
         // `delegationDepth` (parent depth + 1; P3-1.2b), the depth-limit guard
         // below, and the completion-watch registration.
@@ -1870,12 +1923,17 @@ impl Services {
         extra_metadata.insert("isBackground".to_string(), json!(true));
         let extra = AgentCreateExtra {
             metadata: (!extra_metadata.is_empty()).then_some(Value::Object(extra_metadata)),
+            // Delegated agents carry a task-derived name but stay renameable
+            // by the child's opening-turn `ws.workspace.setAgentName`
+            // (`skipIfExplicitlySet: true`) — mirror the reference which
+            // does not set `nameExplicitlySet` at delegate-time creation.
+            name_explicitly_set: Some(false),
             ..AgentCreateExtra::default()
         };
         let created = self
             .agent_create_op(
                 workspace_id.clone(),
-                None,
+                child_name,
                 input.model,
                 input.specialist,
                 parent_agent_id.clone(),
@@ -2643,6 +2701,7 @@ impl Services {
             context_references: None,
             image_blocks: None,
             is_background: None,
+            name_explicitly_set: None,
         };
         let created = self
             .agent_create_op(
