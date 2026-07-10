@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rquickjs::{
     async_with, function::Async, AsyncContext, AsyncRuntime, CatchResultExt, Function, Promise,
@@ -71,7 +71,7 @@ pub async fn eval(
     let host_for_bind = host.clone();
 
     let inner: Result<Result<serde_json::Value, String>, ()> =
-        tokio::time::timeout(opts.timeout + OUTER_SAFETY_MARGIN, async {
+        tokio::time::timeout(opts.timeout.saturating_add(OUTER_SAFETY_MARGIN), async {
             let out: Result<serde_json::Value, String> = async_with!(ctx => |ctx| {
                 if let Some(h) = host_for_bind {
                     bind_host(ctx.clone(), h).map_err(stringify_js_err)?;
@@ -92,16 +92,22 @@ pub async fn eval(
             // classify as Timeout rather than Runtime.
             if Instant::now() >= deadline {
                 Err(JsError::Timeout {
-                    ms: opts.timeout.as_millis() as u64,
+                    ms: timeout_ms(opts.timeout),
                 })
             } else {
                 Err(JsError::Runtime(msg))
             }
         }
         Err(()) => Err(JsError::Timeout {
-            ms: opts.timeout.as_millis() as u64,
+            ms: timeout_ms(opts.timeout),
         }),
     }
+}
+
+/// Millisecond count for `JsError::Timeout`, clamped to `u64::MAX` rather
+/// than truncating the `u128` returned by `Duration::as_millis`.
+fn timeout_ms(timeout: Duration) -> u64 {
+    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn stringify_js_err<E: std::fmt::Display>(e: E) -> String {
@@ -163,5 +169,25 @@ async fn run_user_code<'js>(
             .cloned()
             .unwrap_or(serde_json::Value::Null)),
         _ => Err("engine: unknown result envelope".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_ms_passes_through_small_values() {
+        assert_eq!(timeout_ms(Duration::from_millis(1500)), 1500);
+    }
+
+    #[test]
+    fn timeout_ms_clamps_instead_of_truncating() {
+        // Duration::MAX yields ~5.9e35 ms — far past u64::MAX. An `as u64`
+        // cast would silently truncate; the clamp must saturate instead.
+        assert_eq!(timeout_ms(Duration::MAX), u64::MAX);
+        // One past u64::MAX ms would truncate to 0 with a plain cast.
+        let just_over = Duration::from_millis(u64::MAX).saturating_add(Duration::from_millis(1));
+        assert_eq!(timeout_ms(just_over), u64::MAX);
     }
 }

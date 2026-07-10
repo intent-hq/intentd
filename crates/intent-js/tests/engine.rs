@@ -89,6 +89,23 @@ async fn pending_promise_is_killed_by_timeout() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlarge_timeout_errors_instead_of_panicking() {
+    // A pathological budget must be rejected up front (`Instant` overflow),
+    // not panic inside `Instant + Duration` / `Duration + Duration`.
+    let opts = EvalOptions {
+        timeout: Duration::MAX,
+        memory_limit_bytes: None,
+    };
+    let err = eval("return 1;", &opts, None)
+        .await
+        .expect_err("overlarge timeout should be rejected");
+    match err {
+        JsError::Engine(msg) => assert!(msg.contains("overflow"), "got: {msg}"),
+        other => panic!("expected Engine, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sequential_evals_do_not_share_globals() {
     let first = eval(
         "globalThis.__leak = 'from first call'; return globalThis.__leak;",
