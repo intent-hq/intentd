@@ -1786,8 +1786,11 @@ async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
 /// create the child AND start its turn, with every `agent:stream:*` event keyed
 /// by the CHILD `agentId` (PROTOCOL §5.5/§6.5). Drives the RPC front door
 /// (caller-less) so the child is the only agent that ever runs — proving the
-/// streamed output belongs to the child's session, not a parent's. Asserts: a
-/// non-empty `agentId` in the result, ≥1 `agent:stream:chunk` + exactly one
+/// streamed output belongs to the child's session, not a parent's. Also passes
+/// `taskText` so the child gets a task-derived `name` (NAME-1); the wire
+/// contract exposes the derived name in the `agent.delegate` result. Asserts:
+/// a non-empty `agentId` in the result, `name == taskText` (task-derived, not
+/// the generic `Agent xxxxxx` fallback), ≥1 `agent:stream:chunk` + exactly one
 /// terminal `agent:stream:end` + an `agent:idle` all carrying the child id, and
 /// the child transcript carrying the delivered instructions + an assistant reply.
 #[tokio::test]
@@ -1836,7 +1839,9 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
     );
 
     // RPC conn — delegate with instructions; the child runs the mock provider.
+    // `taskText` exercises the NAME-1 task-derived naming path over the wire.
     let mut rpc = connect_ws(port, cfg.clone()).await;
+    let task_text = "delegated child task title";
     let delegated = wss_rpc(
         &mut rpc,
         10,
@@ -1844,6 +1849,7 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
         json!({
             "workspaceId": ws_id,
             "agentInstructions": "do the delegated work",
+            "taskText": task_text,
             "model": "mock:default",
         }),
     )
@@ -1854,6 +1860,13 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
         .expect("child agent id")
         .to_string();
     assert!(!child_id.is_empty(), "non-empty child agentId");
+    // NAME-1: the wire result carries the task-derived name, not the generic
+    // `Agent xxxxxx` uuid-suffix fallback that used to leak into the FE.
+    assert_eq!(
+        delegated["name"].as_str(),
+        Some(task_text),
+        "delegated child name is task-derived over WSS: {delegated}"
+    );
 
     // Every stream event must carry the CHILD id; collect past the terminal
     // stream:end to the trailing agent:idle (idle is emitted AFTER stream:end
