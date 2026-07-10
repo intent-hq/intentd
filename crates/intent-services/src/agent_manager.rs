@@ -1837,6 +1837,36 @@ impl AgentManager {
         self.workers.lock().unwrap().insert(agent_id, handle);
     }
 
+    /// Drive a pre-persisted user message as a fresh turn: try to claim the
+    /// in-flight slot and spawn the worker on success. The caller is expected
+    /// to have already persisted the user message row (with any bespoke content
+    /// block shape it needs — e.g. wake-tagged `messageMetadata` embedded in
+    /// the block); the worker path does NOT re-persist the initial `content`.
+    /// Returns `true` when the slot was claimed and the worker started, `false`
+    /// when a turn was already in flight (the caller must enqueue instead).
+    pub(crate) async fn try_spawn_turn_for_prepersisted(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        content: String,
+        options: TurnOptions,
+    ) -> bool {
+        if !self.try_begin(&agent_id, &workspace_id).await {
+            return false;
+        }
+        self.spawn_worker(agent_id, workspace_id, content, options);
+        true
+    }
+
+    /// Release the in-flight slot held by a delivery-side fallback that could
+    /// not persist its pre-composed message row (companion to
+    /// [`try_spawn_turn_for_prepersisted`]). Public-in-crate seam so
+    /// `Services::deliver_wake_message` can hand control back to the drain
+    /// loop after a store error, mirroring the `send_message` self-drain path.
+    pub(crate) async fn release_slot(&self, agent_id: &AgentId) {
+        self.end_turn(agent_id).await;
+    }
+
     /// Ensure the agent's child process + ACP session exist, spawning lazily on
     /// first turn (the TS spawn-on-first-message semantics) and reusing the live
     /// session otherwise. Returns the `acpSessionId` to drive the turn.

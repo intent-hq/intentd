@@ -594,6 +594,18 @@ impl Services {
                 if let Some(summary) = last_response_summary {
                     data["lastResponseSummary"] = Value::String(summary);
                 }
+                // DELIV-1: enrich the idle payload with `agentName` (so
+                // subscribers don't fall back to a generic "Agent" label)
+                // and — when the child persisted one via `agent.reportToParent`
+                // — the completion `report`. The lookup is a single indexed
+                // row read per idle event; a store error is swallowed and the
+                // event still fires with the base payload.
+                if let Ok(session) = self.store.get_agent_session(agent_id).await {
+                    data["agentName"] = Value::String(session.name);
+                    if let Some(report) = session.completion_report {
+                        data["report"] = Value::String(report);
+                    }
+                }
                 self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
                     .await;
             }

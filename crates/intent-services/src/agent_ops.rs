@@ -2539,8 +2539,18 @@ impl Services {
                 json!({ "ok": false, "delivered": false, "error": "No agent assigned to task" }),
             );
         };
-        let result = match self.agent_manager() {
-            Some(manager) if is_interrupt_priority(priority.as_deref()) => {
+        // DELIV-1: non-interrupt priority MUST also drive a real turn when
+        // the runtime is attached — the store-only `agent_send_message_op`
+        // fallback would persist the message without ever prompting the
+        // assignee (the "coordinator send silently lost" bug). Mirror the
+        // `agent_send_message` (WorkspaceApi) routing: the manager path
+        // spawns the turn worker; only the read-only wiring with no
+        // manager falls back to the store-only op.
+        let result = match (
+            self.agent_manager(),
+            is_interrupt_priority(priority.as_deref()),
+        ) {
+            (Some(manager), true) => {
                 manager
                     .interrupt_send_message(
                         agent.clone(),
@@ -2551,7 +2561,18 @@ impl Services {
                     )
                     .await?
             }
-            _ => {
+            (Some(manager), false) => {
+                manager
+                    .send_message(
+                        agent.clone(),
+                        workspace_id,
+                        message,
+                        None,
+                        crate::agent_manager::TurnOptions::default(),
+                    )
+                    .await?
+            }
+            (None, _) => {
                 self.agent_send_message_op(agent.clone(), message, None)
                     .await?
             }
@@ -2631,7 +2652,12 @@ impl Services {
             let agent_id = session.id.clone();
             let agent_name = session.name.clone();
             let result = self
-                .deliver_wake_message(&agent_id, &context_message, input.message_metadata.as_ref())
+                .deliver_wake_message(
+                    &workspace_id,
+                    &agent_id,
+                    &context_message,
+                    input.message_metadata.as_ref(),
+                )
                 .await?;
             self.remove_agent_ids_from_workspace_tasks(&workspace_id, &cleaned_up)
                 .await?;
@@ -2729,10 +2755,15 @@ impl Services {
             .to_string();
         let agent = AgentId::from(agent_id_str.as_str());
         let _ = self
-            .assign_agent(workspace_id, task_note_id, agent_id_str)
+            .assign_agent(workspace_id.clone(), task_note_id, agent_id_str)
             .await;
         let result = self
-            .deliver_wake_message(&agent, &context_message, input.message_metadata.as_ref())
+            .deliver_wake_message(
+                &workspace_id,
+                &agent,
+                &context_message,
+                input.message_metadata.as_ref(),
+            )
             .await?;
         Ok(build_wake_response(
             agent,
@@ -2780,20 +2811,99 @@ impl Services {
     /// block as `messageMetadata` so subscribers/`agent.getConversation`
     /// consumers see the FE tag (`{type:'task_wake', source, taskNoteId,
     /// callerAgentId}`) verbatim; when `None`, the block matches the plain
-    /// `agent.sendMessage` shape. Auto-queue-on-store-failure mirrors
+    /// `agent.sendMessage` shape.
+    ///
+    /// **Runtime drive (DELIV-1).** When the [`AgentManager`] is attached,
+    /// the context message is delivered as a real turn (the proven
+    /// `agent.sendMessage` shape: try to claim the in-flight slot, persist
+    /// the wake-tagged user block, spawn the turn worker) so the newly
+    /// woken/created agent actually processes the message. A busy assignee
+    /// gets the wake enqueued behind the running turn — its drain loop
+    /// picks the message up at turn end (the FE `messageMetadata` tag is
+    /// lost from the queued re-persist on this rare in-flight path, but
+    /// turn delivery is preserved). Read-only/test wiring with no manager
+    /// falls back to the pre-DELIV-1 store-only persist so hermetic tests
+    /// keep working. Auto-queue-on-store-failure mirrors
     /// [`Services::agent_send_message_op`].
     async fn deliver_wake_message(
         &self,
+        workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         content: &str,
         message_metadata: Option<&Value>,
     ) -> Result<Value> {
-        let message_id = new_message_id();
-        let block = match message_metadata {
+        let build_block = || match message_metadata {
             Some(md) => json!({ "type": "text", "text": content, "messageMetadata": md }),
             None => json!({ "type": "text", "text": content }),
         };
-        let blocks = json!([block]);
+        let Some(manager) = self.agent_manager() else {
+            return self
+                .deliver_wake_message_store_only(agent_id, content, build_block)
+                .await;
+        };
+        // Runtime path: claim the slot BEFORE persisting so a busy assignee
+        // takes the enqueue branch (`send_message` ordering). Losing the
+        // wake tag on the queued re-persist is documented above.
+        let content_owned = content.to_string();
+        let workspace_id_owned = workspace_id.clone();
+        let agent_id_owned = agent_id.clone();
+        if !manager
+            .clone()
+            .try_spawn_turn_for_prepersisted(
+                agent_id_owned.clone(),
+                workspace_id_owned.clone(),
+                content_owned.clone(),
+                crate::agent_manager::TurnOptions::default(),
+            )
+            .await
+        {
+            // Fast enqueue branch: the manager is already draining a turn.
+            let (queued, position) = self.enqueue_message(agent_id, content_owned, None, None);
+            self.publish_queue_updated(agent_id).await;
+            return Ok(json!({
+                "success": true,
+                "queued": true,
+                "queuedMessage": queued.to_value(position),
+            }));
+        }
+        // Slot claimed + worker spawned. Now persist the wake-tagged user
+        // block so `agent.getConversation` surfaces the FE tag verbatim.
+        // On store failure, release the slot and fall back to the enqueue
+        // path so the message still reaches the drain loop.
+        let message_id = new_message_id();
+        let blocks = json!([build_block()]);
+        if self
+            .store
+            .append_agent_message(agent_id, "user", &blocks, &now_iso())
+            .await
+            .is_err()
+        {
+            manager.release_slot(agent_id).await;
+            let (queued, position) = self.enqueue_message(agent_id, content_owned, None, None);
+            self.publish_queue_updated(agent_id).await;
+            return Ok(json!({
+                "success": true,
+                "queued": true,
+                "queuedMessage": queued.to_value(position),
+            }));
+        }
+        Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+    }
+
+    /// Pre-DELIV-1 store-only delivery for the read-only/test path (no
+    /// [`AgentManager`] attached): persist the wake-tagged block, and on
+    /// store failure fall back to an in-memory enqueue with `queued: true`.
+    async fn deliver_wake_message_store_only<F>(
+        &self,
+        agent_id: &AgentId,
+        content: &str,
+        build_block: F,
+    ) -> Result<Value>
+    where
+        F: Fn() -> Value,
+    {
+        let message_id = new_message_id();
+        let blocks = json!([build_block()]);
         match self
             .store
             .append_agent_message(agent_id, "user", &blocks, &now_iso())
