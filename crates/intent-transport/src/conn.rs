@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::browser;
 use crate::client;
 use crate::control::{self, SystemControl};
 use crate::drafts;
@@ -144,6 +145,20 @@ pub(crate) async fn process_frame(
                 if let Some(frame) =
                     host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse).await
                 {
+                    let _ = out.send(frame).await;
+                }
+            });
+            return true;
+        }
+        if let Some(req) = browser::classify(&value) {
+            // Slow path: `browser.exec` awaits an FE-served reverse RPC on this
+            // same connection (§12.4), so run it off the read loop for the same
+            // reason as `host::classify` — inline would block frame reads until
+            // the reverse timeout.
+            let out = out_tx.clone();
+            let reverse = reverse.clone();
+            tokio::spawn(async move {
+                if let Some(frame) = browser::handle(req, &reverse).await {
                     let _ = out.send(frame).await;
                 }
             });

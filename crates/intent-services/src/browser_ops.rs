@@ -1,0 +1,192 @@
+//! Envelope validation + result-shaping for `browser.exec` (PROTOCOL §5.14,
+//! §12.4).
+//!
+//! `browser.exec` is a **client-callable trigger** whose real work happens on
+//! the connected frontend: the daemon validates the payload, forwards it as an
+//! FE-served reverse RPC (`browser.exec` in the `rev-<n>` namespace, mirroring
+//! `host.openInEditor` / `host.pickApplication`), and echoes the FE's result
+//! back to the caller. No CDP logic runs in Rust — the daemon is a thin proxy.
+//!
+//! This module owns the two pure pieces of that flow: (1) parsing/validating
+//! the params into [`BrowserExecArgs`] and (2) reshaping the FE's raw
+//! `{ success, results, error? }` envelope into the wire result the caller
+//! expects (single action → one result, multiple → `results[]` — reference
+//! parity with the FE MCP tool). The transport layer handles the reverse-RPC
+//! wire hop and is the only piece that needs the per-connection reverse channel.
+
+use serde_json::{json, Map, Value};
+
+/// Wire error codes surfaced by `browser.exec` (PROTOCOL §9: `-32602` for
+/// invalid params, `-32603` for internal / proxy failures).
+pub const INVALID_PARAMS: i32 = -32602;
+pub const INTERNAL_ERROR: i32 = -32603;
+
+/// A `browser.exec` failure with the error code the transport should surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserExecError {
+    pub code: i32,
+    pub message: String,
+}
+
+impl BrowserExecError {
+    fn invalid(msg: impl Into<String>) -> Self {
+        Self {
+            code: INVALID_PARAMS,
+            message: msg.into(),
+        }
+    }
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Self {
+            code: INTERNAL_ERROR,
+            message: msg.into(),
+        }
+    }
+}
+
+/// Parsed `browser.exec` params. `actions` is the validated (non-empty) action
+/// batch; the trailing optional fields carry the reverse-intent envelope so
+/// the FE handler can attribute the batch to a caller / workspace without a
+/// second round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserExecArgs {
+    /// Ordered action sequence, opaque to the daemon (validated shape only).
+    pub actions: Vec<Value>,
+    /// Optional default tab id the FE applies to actions that omit their own.
+    pub tab_id: Option<String>,
+    /// Attribution: agent id of the caller (from the ws.browser.exec binding).
+    pub agent_id: Option<String>,
+    /// Attribution: workspace id of the caller (from the ws.browser.exec binding).
+    pub workspace_id: Option<String>,
+}
+
+/// Parse a JSON-RPC params object into [`BrowserExecArgs`]. Enforces the two
+/// invariants the daemon can check without touching the FE:
+///   * `actions` is present, an array, and non-empty (`-32602` otherwise);
+///   * `tabId` / `agentId` / `workspaceId`, when supplied, are strings.
+pub fn parse_args(params: &Map<String, Value>) -> Result<BrowserExecArgs, BrowserExecError> {
+    let actions = match params.get("actions") {
+        Some(Value::Array(a)) => a.clone(),
+        Some(Value::Null) | None => {
+            return Err(BrowserExecError::invalid(
+                "Missing required parameter: actions",
+            ))
+        }
+        Some(_) => {
+            return Err(BrowserExecError::invalid(
+                "Invalid parameter: actions must be an array",
+            ))
+        }
+    };
+    if actions.is_empty() {
+        return Err(BrowserExecError::invalid(
+            "Invalid parameter: actions must not be empty",
+        ));
+    }
+    let tab_id = optional_string(params, "tabId")?;
+    let agent_id = optional_string(params, "agentId")?;
+    let workspace_id = optional_string(params, "workspaceId")?;
+    Ok(BrowserExecArgs {
+        actions,
+        tab_id,
+        agent_id,
+        workspace_id,
+    })
+}
+
+/// Build the params object the daemon dispatches on the FE-served reverse
+/// intent (`browser.exec`). Optional envelope fields are omitted when absent
+/// so the wire payload stays minimal.
+pub fn build_forward_params(args: &BrowserExecArgs) -> Value {
+    let mut out = Map::new();
+    out.insert("actions".to_string(), Value::Array(args.actions.clone()));
+    if let Some(tab_id) = &args.tab_id {
+        out.insert("tabId".to_string(), Value::String(tab_id.clone()));
+    }
+    if let Some(agent_id) = &args.agent_id {
+        out.insert("agentId".to_string(), Value::String(agent_id.clone()));
+    }
+    if let Some(workspace_id) = &args.workspace_id {
+        out.insert(
+            "workspaceId".to_string(),
+            Value::String(workspace_id.clone()),
+        );
+    }
+    Value::Object(out)
+}
+
+/// Reshape the FE's raw `{ success, results, error? }` envelope into the wire
+/// result the caller expects. Reference parity (`BrowserExecTool.execute`):
+/// a single-action batch yields the lone action's `result`; a multi-action
+/// batch yields the raw `results[]` array. A `success: false` envelope with a
+/// top-level `error` string surfaces as `-32603` so the caller sees the FE's
+/// context. Missing / malformed `results` also surfaces as `-32603` — the
+/// daemon cannot invent a shape it did not receive.
+pub fn shape_result(fe_response: Value) -> Result<Value, BrowserExecError> {
+    let obj = fe_response.as_object().ok_or_else(|| {
+        BrowserExecError::internal("browser.exec: frontend returned a non-object response")
+    })?;
+    // Explicit failure envelope: surface the FE's `error` string verbatim.
+    if obj.get("success").and_then(Value::as_bool) == Some(false) {
+        let message = obj
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("browser.exec: frontend reported failure")
+            .to_string();
+        return Err(BrowserExecError::internal(format!(
+            "browser.exec failed: {message}"
+        )));
+    }
+    let results = obj
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            BrowserExecError::internal("browser.exec: frontend response missing results array")
+        })?;
+    match results.len() {
+        // A validated non-empty batch that came back with zero results is a
+        // protocol violation on the FE side — surface it rather than fabricate.
+        0 => Err(BrowserExecError::internal(
+            "browser.exec: frontend returned an empty results array",
+        )),
+        1 => Ok(single_result_payload(&results[0])),
+        _ => Ok(json!({ "results": results })),
+    }
+}
+
+/// Build the wire payload for the single-action case. Mirrors the reference
+/// MCP tool's format: return the action's `result` under `result` when the
+/// action succeeded, or surface the action-level `error` string as `-32603`
+/// context via the outer envelope's `success:false` — but the daemon does not
+/// invent action-level errors, it just forwards what the FE gave us. We keep
+/// the shape self-describing so the FE binding (WSAPI-6) can render either.
+fn single_result_payload(action: &Value) -> Value {
+    // Preserve `action` (the tool name), `success`, and `result` / `error` as
+    // the FE emitted them. Consumers that expect just the payload can read
+    // `.result`; consumers that need the failure reason read `.error`.
+    action.clone()
+}
+
+/// Extract an optional string param; rejects non-string, non-null values so a
+/// typo (`tabId: 42`) surfaces as `-32602` instead of being silently dropped.
+fn optional_string(
+    params: &Map<String, Value>,
+    key: &'static str,
+) -> Result<Option<String>, BrowserExecError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Some(_) => Err(BrowserExecError::invalid(format!(
+            "Invalid parameter: {key} must be a string"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests;

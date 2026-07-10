@@ -48,6 +48,7 @@ mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
 mod auto_commit;
+pub mod browser_ops;
 mod clone_ops;
 mod complete_ops;
 mod crdt_notes;
