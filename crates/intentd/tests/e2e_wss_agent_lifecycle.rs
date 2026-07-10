@@ -1867,6 +1867,23 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
         Some(task_text),
         "delegated child name is task-derived over WSS: {delegated}"
     );
+    // NAME-1: `agent.get` must expose `nameExplicitlySet == false` so a later
+    // `agent.rename` with `skipIfExplicitlySet: true` (the opening-turn
+    // `ws.workspace.setAgentName` self-rename) still applies. Asserting this
+    // over the wire guards the rename-guard behavior against regressions where
+    // the derived name is correct but the flag flips to `true`.
+    let got = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.get",
+        json!({ "agentId": child_id, "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        got["agent"]["nameExplicitlySet"].as_bool(),
+        Some(false),
+        "delegated child stays renameable-with-guard over WSS: {got}"
+    );
 
     // Every stream event must carry the CHILD id; collect past the terminal
     // stream:end to the trailing agent:idle (idle is emitted AFTER stream:end
