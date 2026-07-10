@@ -1136,6 +1136,8 @@ impl Services {
             }
             if watch.one_shot {
                 self.remove_watch(workspace_id, &watch.id);
+                self.publish_subscriptions_changed(workspace_id, &watch.parent_agent_id)
+                    .await;
             }
         }
     }
@@ -1162,6 +1164,8 @@ impl Services {
             );
         }
         self.remove_group_watches(workspace_id, group_id);
+        self.publish_subscriptions_changed(workspace_id, &group.parent_agent_id)
+            .await;
     }
 
     /// Deliver an internal parent wake through the runtime [`AgentManager`]

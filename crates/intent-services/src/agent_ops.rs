@@ -807,6 +807,38 @@ impl Services {
         .await;
     }
 
+    /// Publish `agent:subscriptions-changed` for `parent_agent_id`, carrying the
+    /// refreshed waiting flags derived from its live completion-watch set
+    /// (`isWaitingForOtherAgents` / `waitingForAgentIds`, the same projection
+    /// `agent.get` serves) so clients converge on watch-set changes without
+    /// polling (PROTOCOL §6.5). Emitted when watches are added (delegate /
+    /// watchCompletion) and when wake delivery removes them (oneShot /
+    /// delegation-group clear).
+    pub(crate) async fn publish_subscriptions_changed(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_agent_id: &AgentId,
+    ) {
+        let watches = self.list_watches_for_parent(workspace_id, parent_agent_id);
+        let mut waiting: Vec<AgentId> = Vec::with_capacity(watches.len());
+        for w in &watches {
+            if !waiting.contains(&w.child_agent_id) {
+                waiting.push(w.child_agent_id.clone());
+            }
+        }
+        self.publish_agent_mutation_event(
+            workspace_id,
+            parent_agent_id,
+            intent_core::events::AGENT_SUBSCRIPTIONS_CHANGED,
+            json!({
+                "agentId": parent_agent_id.0,
+                "isWaitingForOtherAgents": !waiting.is_empty(),
+                "waitingForAgentIds": waiting,
+            }),
+        )
+        .await;
+    }
+
     /// `agent.create`: persist a new session; the process spawns lazily on first
     /// turn (PROTOCOL §5.5). `task_note_id`/`skip_auto_commit` are set by
     /// `agent.delegate` so the auto-commit-on-idle subscriber (LNI-1) can
@@ -1889,7 +1921,7 @@ impl Services {
                     self.enroll_child_in_group(&workspace_id, &gid, &child);
                     self.register_completion_watch(
                         &workspace_id,
-                        parent,
+                        parent.clone(),
                         parent_name,
                         child,
                         false,
@@ -1898,13 +1930,15 @@ impl Services {
                 } else {
                     self.register_completion_watch(
                         &workspace_id,
-                        parent,
+                        parent.clone(),
                         parent_name,
                         child,
                         true,
                         None,
                     );
                 }
+                self.publish_subscriptions_changed(&workspace_id, &parent)
+                    .await;
             }
         }
         // Deliver the child's first message (resolved above, persisted as
@@ -1961,12 +1995,14 @@ impl Services {
         let parent_name = parent_session.map(|s| s.name).unwrap_or_default();
         let id = self.register_completion_watch(
             &workspace_id,
-            parent_agent_id,
+            parent_agent_id.clone(),
             parent_name,
             child_agent_id,
             true,
             None,
         );
+        self.publish_subscriptions_changed(&workspace_id, &parent_agent_id)
+            .await;
         Ok(json!({ "ok": true, "subscriptionId": id }))
     }
 
