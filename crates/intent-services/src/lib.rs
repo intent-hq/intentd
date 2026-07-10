@@ -2838,18 +2838,21 @@ fn format_group_wake(group: &agent_subscriptions::DelegationGroup) -> String {
 struct AutoConvertOutcome {
     converted_count: i64,
     created_note_ids: Vec<String>,
-    /// Post-conversion content when it differs from the write-time content
-    /// (i.e. placeholders got replaced or invalid blocks were stripped).
-    new_content: Option<String>,
+    /// The full note refetched from the store after the conversion ran.
+    /// `convert_task_blocks` performs a second store write (bumping `rev` and
+    /// `updated_at`), so callers must return this refetched note — not the
+    /// pre-conversion in-flight value — to match the reference, which
+    /// refetches the note after conversion.
+    refetched_note: Option<Note>,
 }
 
 impl Services {
     /// Best-effort auto-conversion of `@@@task` blocks after a successful
     /// note content write, matching the reference `notes.service.ts` update
     /// path (L633-647): if the just-written content contains a `@@@task`
-    /// fence, invoke `convert_task_blocks` and surface the post-conversion
-    /// content so callers can update their in-flight response. Never fails
-    /// the write — errors are logged and treated as no-op.
+    /// fence, invoke `convert_task_blocks` and refetch the stored note so
+    /// callers can return it in place of their in-flight (now stale) copy.
+    /// Never fails the write — errors are logged and treated as no-op.
     async fn auto_convert_task_blocks_after_write(
         &self,
         workspace_id: &WorkspaceId,
@@ -2864,18 +2867,14 @@ impl Services {
             .await
         {
             Ok(r) => {
-                let new_content = match self.store.get_note(note_id).await {
-                    Ok(n)
-                        if n.workspace_id == *workspace_id && n.content != content_after_write =>
-                    {
-                        Some(n.content)
-                    }
+                let refetched_note = match self.store.get_note(note_id).await {
+                    Ok(n) if n.workspace_id == *workspace_id => Some(n),
                     _ => None,
                 };
                 AutoConvertOutcome {
                     converted_count: r.converted_count,
                     created_note_ids: r.created_note_ids,
-                    new_content,
+                    refetched_note,
                 }
             }
             Err(e) => {
@@ -4835,8 +4834,8 @@ impl WorkspaceApi for Services {
                             &note.content,
                         )
                         .await;
-                    if let Some(new_content) = outcome.new_content {
-                        note.content = new_content;
+                    if let Some(refetched) = outcome.refetched_note {
+                        note = refetched;
                     }
                     publish_event(
                         &bus,
@@ -4905,8 +4904,8 @@ impl WorkspaceApi for Services {
                         &note.content,
                     )
                     .await;
-                if let Some(new_content) = outcome.new_content {
-                    note.content = new_content;
+                if let Some(refetched) = outcome.refetched_note {
+                    note = refetched;
                 }
             }
             publish_event(
@@ -4952,7 +4951,10 @@ impl WorkspaceApi for Services {
             let outcome = services
                 .auto_convert_task_blocks_after_write(&note.workspace_id, &note.id, &new_content)
                 .await;
-            let final_content = outcome.new_content.unwrap_or(new_content);
+            let final_content = outcome
+                .refetched_note
+                .map(|n| n.content)
+                .unwrap_or(new_content);
             publish_event(
                 &bus,
                 note_change_event(
@@ -5008,7 +5010,10 @@ impl WorkspaceApi for Services {
             let outcome = services
                 .auto_convert_task_blocks_after_write(&note.workspace_id, &note.id, &new_content)
                 .await;
-            let final_content = outcome.new_content.unwrap_or(new_content);
+            let final_content = outcome
+                .refetched_note
+                .map(|n| n.content)
+                .unwrap_or(new_content);
             publish_event(
                 &bus,
                 note_change_event(
@@ -5063,7 +5068,10 @@ impl WorkspaceApi for Services {
             let outcome = services
                 .auto_convert_task_blocks_after_write(&note.workspace_id, &note.id, &new_content)
                 .await;
-            let final_content = outcome.new_content.unwrap_or(new_content);
+            let final_content = outcome
+                .refetched_note
+                .map(|n| n.content)
+                .unwrap_or(new_content);
             let total_lines_after = final_content.split('\n').count();
             publish_event(
                 &bus,
@@ -5143,7 +5151,7 @@ impl WorkspaceApi for Services {
             let outcome = services
                 .auto_convert_task_blocks_after_write(&note.workspace_id, &note.id, &clean)
                 .await;
-            let final_content = outcome.new_content.unwrap_or(clean);
+            let final_content = outcome.refetched_note.map(|n| n.content).unwrap_or(clean);
             publish_event(
                 &bus,
                 note_change_event(

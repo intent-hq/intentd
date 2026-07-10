@@ -1135,8 +1135,13 @@ async fn create_note_with_task_block_auto_converts() {
     assert!(created
         .content
         .contains("- [ ] [Child One](intent://local/task/"));
-    let persisted = svc.get_note(ws, created.id).await.expect("get");
+    let persisted = svc.get_note(ws, created.id.clone()).await.expect("get");
     assert!(!persisted.content.contains("@@@task"));
+    // The conversion performs a second store write; the response must carry
+    // the refetched note, so rev/updated_at match the stored note.
+    assert_eq!(created.rev, persisted.rev);
+    assert_eq!(created.updated_at, persisted.updated_at);
+    assert_eq!(created.content, persisted.content);
 }
 
 #[tokio::test]
@@ -1159,6 +1164,12 @@ async fn update_note_full_content_with_task_block_auto_converts() {
     assert!(updated
         .content
         .contains("- [ ] [From Update](intent://local/task/"));
+    // The conversion performs a second store write; the response must carry
+    // the refetched note, so rev/updated_at match the stored note.
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(updated.rev, persisted.rev);
+    assert_eq!(updated.updated_at, persisted.updated_at);
+    assert_eq!(updated.content, persisted.content);
 }
 
 #[tokio::test]
