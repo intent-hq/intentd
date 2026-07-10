@@ -7,7 +7,11 @@
 // generated `--mcp-config`, spawns the `workspace-mcp` server command from it
 // (the `intentd mcp-bridge` proxy), and issues an MCP `tools/call` so the BE
 // state changes — NOT an in-process shortcut. Behavior is driven by the JSON in
-// MOCK_AGENT_BEHAVIOR: { toolCall: { name, arguments }, response }.
+// MOCK_AGENT_BEHAVIOR: { toolCall: { name, arguments }, response }. An optional
+// `rules` array of prompt-matched variants ({ ifPromptContains, toolCall?,
+// toolCalls?, response?, delayMs? }) lets ONE behavior drive a delegating
+// parent and several distinct children (first matching rule wins; falls back
+// to the top-level behavior).
 import readline from 'node:readline';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -101,6 +105,23 @@ function extractPromptText(params) {
     .join(' ');
 }
 
+// First `rules` entry whose `ifPromptContains` marker appears in the prompt
+// text wins; otherwise the top-level behavior applies.
+function selectBehavior(behavior, promptText) {
+  if (Array.isArray(behavior.rules)) {
+    for (const rule of behavior.rules) {
+      if (
+        typeof rule.ifPromptContains === 'string' &&
+        rule.ifPromptContains.length > 0 &&
+        promptText.includes(rule.ifPromptContains)
+      ) {
+        return rule;
+      }
+    }
+  }
+  return behavior;
+}
+
 async function handlePrompt(id, params) {
   promptCount += 1;
   let behavior = {};
@@ -133,16 +154,29 @@ async function handlePrompt(id, params) {
     pendingPromptIds.push(id);
     return;
   }
-  if (behavior.toolCall) {
+  const active = selectBehavior(behavior, promptText);
+  // Optional per-rule delay BEFORE the tool calls so a test can observe
+  // intermediate state (e.g. a parent's waiting flags) while this agent's
+  // turn is still in flight.
+  const ruleDelayMs = Number.isFinite(active.delayMs) ? active.delayMs : 0;
+  if (ruleDelayMs > 0) {
+    await new Promise((r) => setTimeout(r, ruleDelayMs));
+  }
+  const toolCalls = Array.isArray(active.toolCalls)
+    ? active.toolCalls
+    : active.toolCall
+      ? [active.toolCall]
+      : [];
+  for (const toolCall of toolCalls) {
     try {
-      const res = await callWorkspaceTool(behavior.toolCall);
+      const res = await callWorkspaceTool(toolCall);
       log(`tool call ok: ${JSON.stringify(res).slice(0, 120)}`);
     } catch (err) {
       log(`tool call failed: ${err.message}`);
       return result(id, { stopReason: 'refusal' });
     }
   }
-  const base = behavior.response || 'Mock agent completed.';
+  const base = active.response || behavior.response || 'Mock agent completed.';
   // In keep-alive mode, stamp the turn count so a resumed follow-up turn is
   // distinguishable from a fresh spawn (which would report `turn=1`).
   const text = behavior.blockUntilCancel ? `${base} turn=${promptCount}` : base;
