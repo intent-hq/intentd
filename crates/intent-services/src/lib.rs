@@ -2830,7 +2830,66 @@ fn format_group_wake(group: &agent_subscriptions::DelegationGroup) -> String {
     msg
 }
 
+/// Outcome of the best-effort auto-conversion of `@@@task` blocks that runs
+/// after every note content-write path (reference `notes.service.ts` parity,
+/// L633-647): populated when the just-written content contained at least one
+/// `@@@task` fence and the conversion succeeded.
+#[derive(Default)]
+struct AutoConvertOutcome {
+    converted_count: i64,
+    created_note_ids: Vec<String>,
+    /// Post-conversion content when it differs from the write-time content
+    /// (i.e. placeholders got replaced or invalid blocks were stripped).
+    new_content: Option<String>,
+}
+
 impl Services {
+    /// Best-effort auto-conversion of `@@@task` blocks after a successful
+    /// note content write, matching the reference `notes.service.ts` update
+    /// path (L633-647): if the just-written content contains a `@@@task`
+    /// fence, invoke `convert_task_blocks` and surface the post-conversion
+    /// content so callers can update their in-flight response. Never fails
+    /// the write — errors are logged and treated as no-op.
+    async fn auto_convert_task_blocks_after_write(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        content_after_write: &str,
+    ) -> AutoConvertOutcome {
+        if !note_ops::has_task_blocks(content_after_write) {
+            return AutoConvertOutcome::default();
+        }
+        match self
+            .convert_task_blocks(workspace_id.clone(), note_id.clone())
+            .await
+        {
+            Ok(r) => {
+                let new_content = match self.store.get_note(note_id).await {
+                    Ok(n)
+                        if n.workspace_id == *workspace_id && n.content != content_after_write =>
+                    {
+                        Some(n.content)
+                    }
+                    _ => None,
+                };
+                AutoConvertOutcome {
+                    converted_count: r.converted_count,
+                    created_note_ids: r.created_note_ids,
+                    new_content,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    workspace_id = %workspace_id,
+                    note_id = %note_id,
+                    "auto-conversion of task blocks after note write failed"
+                );
+                AutoConvertOutcome::default()
+            }
+        }
+    }
+
     /// Create a child task note nested under `parent_id`, marking it a task with
     /// `status` (and optional `peer_order`). Shared by `createPrerequisite` and
     /// `convertBlocks`.
@@ -2862,6 +2921,20 @@ impl Services {
             updated_at: now,
         };
         self.store.insert_note(&note).await?;
+        // Emit `note:created` so task-channel subscribers (spec UI) pick up
+        // the new child task note live (TS parity: `createPrerequisiteNote`
+        // routes through `createNote`, which emits `note:created`).
+        publish_event(
+            &self.event_bus,
+            note_change_event(
+                &note.workspace_id,
+                &note.id,
+                &note.title,
+                NOTE_CREATED,
+                "create",
+            ),
+        )
+        .await;
         Ok(note)
     }
 
@@ -4754,6 +4827,17 @@ impl WorkspaceApi for Services {
                         note.workspace_id.clone(),
                         note.id.clone(),
                     );
+                    let mut note = note;
+                    let outcome = services
+                        .auto_convert_task_blocks_after_write(
+                            &note.workspace_id,
+                            &note.id,
+                            &note.content,
+                        )
+                        .await;
+                    if let Some(new_content) = outcome.new_content {
+                        note.content = new_content;
+                    }
                     publish_event(
                         &bus,
                         note_change_event(
@@ -4814,6 +4898,16 @@ impl WorkspaceApi for Services {
                     note.workspace_id.clone(),
                     note.id.clone(),
                 );
+                let outcome = services
+                    .auto_convert_task_blocks_after_write(
+                        &note.workspace_id,
+                        &note.id,
+                        &note.content,
+                    )
+                    .await;
+                if let Some(new_content) = outcome.new_content {
+                    note.content = new_content;
+                }
             }
             publish_event(
                 &bus,
@@ -4855,6 +4949,10 @@ impl WorkspaceApi for Services {
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
+            let outcome = services
+                .auto_convert_task_blocks_after_write(&note.workspace_id, &note.id, &new_content)
+                .await;
+            let final_content = outcome.new_content.unwrap_or(new_content);
             publish_event(
                 &bus,
                 note_change_event(
@@ -4866,16 +4964,17 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            let total_length = final_content.chars().count();
             Ok(NoteAddResult {
                 ok: true,
                 note_id: note.id,
                 added_length: input.content.chars().count(),
-                total_length: new_content.chars().count(),
+                total_length,
                 position,
                 old_content,
-                new_content,
-                converted_count: 0,
-                created_task_note_ids: Vec::new(),
+                new_content: final_content,
+                converted_count: outcome.converted_count,
+                created_task_note_ids: outcome.created_note_ids,
             })
         })
     }
@@ -4906,6 +5005,10 @@ impl WorkspaceApi for Services {
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
+            let outcome = services
+                .auto_convert_task_blocks_after_write(&note.workspace_id, &note.id, &new_content)
+                .await;
+            let final_content = outcome.new_content.unwrap_or(new_content);
             publish_event(
                 &bus,
                 note_change_event(
@@ -4928,9 +5031,9 @@ impl WorkspaceApi for Services {
                 new_text_length: input.new.chars().count(),
                 match_position,
                 old_content,
-                new_content,
-                converted_count: 0,
-                created_task_note_ids: Vec::new(),
+                new_content: final_content,
+                converted_count: outcome.converted_count,
+                created_task_note_ids: outcome.created_note_ids,
             })
         })
     }
@@ -4950,7 +5053,6 @@ impl WorkspaceApi for Services {
             let new_content =
                 note_ops::apply_edit_lines(&old_content, input.start, input.end, &input.content)?;
             let total_lines_before = old_content.split('\n').count();
-            let total_lines_after = new_content.split('\n').count();
             note.content = new_content.clone();
             note.updated_at = now_iso();
             store.update_note(&note).await?;
@@ -4958,6 +5060,11 @@ impl WorkspaceApi for Services {
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
+            let outcome = services
+                .auto_convert_task_blocks_after_write(&note.workspace_id, &note.id, &new_content)
+                .await;
+            let final_content = outcome.new_content.unwrap_or(new_content);
+            let total_lines_after = final_content.split('\n').count();
             publish_event(
                 &bus,
                 note_change_event(
@@ -4977,9 +5084,9 @@ impl WorkspaceApi for Services {
                 total_lines_before,
                 total_lines_after,
                 old_content,
-                new_content,
-                converted_count: 0,
-                created_task_note_ids: Vec::new(),
+                new_content: final_content,
+                converted_count: outcome.converted_count,
+                created_task_note_ids: outcome.created_note_ids,
             })
         })
     }
@@ -5033,6 +5140,10 @@ impl WorkspaceApi for Services {
             capture_note_version(&store, &note).await?;
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
+            let outcome = services
+                .auto_convert_task_blocks_after_write(&note.workspace_id, &note.id, &clean)
+                .await;
+            let final_content = outcome.new_content.unwrap_or(clean);
             publish_event(
                 &bus,
                 note_change_event(
@@ -5051,9 +5162,9 @@ impl WorkspaceApi for Services {
                 previous_title: Some(previous_title),
                 updated_at: now,
                 old_content: Some(old_content),
-                new_content: clean,
-                converted_count: 0,
-                created_task_note_ids: Vec::new(),
+                new_content: final_content,
+                converted_count: outcome.converted_count,
+                created_task_note_ids: outcome.created_note_ids,
             })
         })
     }
@@ -5750,6 +5861,20 @@ impl WorkspaceApi for Services {
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
+            // Emit `note:updated` for the rewritten parent so subscribers
+            // refresh the fence-free content live (TS parity: the reference
+            // emits `note:updated` after saving the converted note).
+            publish_event(
+                &services.event_bus,
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
             Ok(TaskConvertBlocksResult {
                 ok: true,
                 converted_count: created_note_ids.len() as i64,
@@ -5807,6 +5932,7 @@ impl WorkspaceApi for Services {
         agent_id: String,
     ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             if !is_valid_agent_id(&agent_id) {
                 return Err(Error::Internal(format!(
@@ -5835,6 +5961,7 @@ impl WorkspaceApi for Services {
                 });
             }
             let now = now_iso();
+            let previous_status = task.status;
             if !already_assigned {
                 task.assigned_agent_ids.push(agent.clone());
             }
@@ -5842,8 +5969,53 @@ impl WorkspaceApi for Services {
                 apply_status_transition(&mut task, TaskStatus::InProgress, &now);
             }
             note.task = Some(task);
-            note.updated_at = now;
+            note.updated_at = now.clone();
             store.update_note(&note).await?;
+            // TS parity (`assignAgentToTask`): the assignment write routes
+            // through `updateNote` (→ `note:updated`) and the not_started →
+            // in_progress transition through `updateTaskStatus`
+            // (→ `task:status-changed` + ready-tasks recompute), so
+            // subscribers see the delegation live.
+            publish_event(
+                &bus,
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
+            if should_update_status {
+                publish_event(
+                    &bus,
+                    task_status_changed_event(
+                        &note.workspace_id,
+                        &note.id,
+                        &note.title,
+                        previous_status,
+                        TaskStatus::InProgress,
+                        &now,
+                        None,
+                    ),
+                )
+                .await;
+                let all = store.list_notes(&note.workspace_id).await?;
+                let ready_task_ids = compute_ready_task_ids(&all);
+                publish_event(
+                    &bus,
+                    ready_tasks_changed_event(
+                        &note.workspace_id,
+                        ready_task_ids,
+                        &note.id,
+                        previous_status,
+                        TaskStatus::InProgress,
+                        &now_iso(),
+                    ),
+                )
+                .await;
+            }
             Ok(TaskAssignAgentResult {
                 ok: true,
                 note_id,

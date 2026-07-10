@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use intent_core::{
-    now_iso, ContentType, Error, Note, NoteAddInput, NoteEditInput, NoteEditLinesInput, NoteId,
-    NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
+    now_iso, ContentType, Error, Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput,
+    NoteId, NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
@@ -1100,6 +1100,184 @@ async fn convert_blocks_creates_children_idempotently() {
         .expect("convertBlocks2");
     assert_eq!(r2.converted_count, 0);
     assert!(r2.created_note_ids.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// TASKFLOW-1: auto-convert @@@task blocks on every note content-write path
+// (reference parity with `notes.service.ts` update path L633-647). Each write
+// method that mutates a note's content invokes `convert_task_blocks` when the
+// resulting content contains a `@@@task` fence, and surfaces the conversion
+// counts + fence-free content in its response payload.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_note_with_task_block_auto_converts() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let svc = Services::new(store);
+
+    let created = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Parent".into(),
+                content: Some("intro\n@@@task\n# Child One\nbody\n@@@\ntail".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create");
+    assert!(!created.content.contains("@@@task"));
+    assert!(created
+        .content
+        .contains("- [ ] [Child One](intent://local/task/"));
+    let persisted = svc.get_note(ws, created.id).await.expect("get");
+    assert!(!persisted.content.contains("@@@task"));
+}
+
+#[tokio::test]
+async fn update_note_full_content_with_task_block_auto_converts() {
+    let (_tmp, svc, ws, id) = setup("original").await;
+    let updated = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("intro\n@@@task\n# From Update\nbody\n@@@".into()),
+                title: None,
+                tags: None,
+                expected_version: None,
+            },
+        )
+        .await
+        .expect("update");
+    assert!(!updated.content.contains("@@@task"));
+    assert!(updated
+        .content
+        .contains("- [ ] [From Update](intent://local/task/"));
+}
+
+#[tokio::test]
+async fn add_to_note_task_block_auto_converts() {
+    let (_tmp, svc, ws, id) = setup("# Head\nintro").await;
+    let r = svc
+        .add_to_note(
+            ws.clone(),
+            id.clone(),
+            NoteAddInput {
+                content: "@@@task\n# From Add\nbody\n@@@".into(),
+                heading: None,
+                position: Some("end".into()),
+            },
+        )
+        .await
+        .expect("add");
+    assert_eq!(r.converted_count, 1);
+    assert_eq!(r.created_task_note_ids.len(), 1);
+    assert!(!r.new_content.contains("@@@task"));
+    assert!(r
+        .new_content
+        .contains("- [ ] [From Add](intent://local/task/"));
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(persisted.content, r.new_content);
+}
+
+#[tokio::test]
+async fn edit_note_replacing_text_with_task_block_auto_converts() {
+    let (_tmp, svc, ws, id) = setup("intro PLACEHOLDER tail").await;
+    let r = svc
+        .edit_note(
+            ws.clone(),
+            id.clone(),
+            NoteEditInput {
+                old: "PLACEHOLDER".into(),
+                new: "\n@@@task\n# From Edit\nbody\n@@@\n".into(),
+            },
+        )
+        .await
+        .expect("edit");
+    assert_eq!(r.converted_count, 1);
+    assert_eq!(r.created_task_note_ids.len(), 1);
+    assert!(!r.new_content.contains("@@@task"));
+    assert!(r
+        .new_content
+        .contains("- [ ] [From Edit](intent://local/task/"));
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(persisted.content, r.new_content);
+}
+
+#[tokio::test]
+async fn edit_note_lines_inserting_task_block_auto_converts() {
+    let (_tmp, svc, ws, id) = setup("line1\nOLD\nline3").await;
+    let r = svc
+        .edit_note_lines(
+            ws.clone(),
+            id.clone(),
+            NoteEditLinesInput {
+                start: 2,
+                end: 2,
+                content: "@@@task\n# From EditLines\nbody\n@@@".into(),
+            },
+        )
+        .await
+        .expect("editLines");
+    assert_eq!(r.converted_count, 1);
+    assert_eq!(r.created_task_note_ids.len(), 1);
+    assert!(!r.new_content.contains("@@@task"));
+    assert!(r
+        .new_content
+        .contains("- [ ] [From EditLines](intent://local/task/"));
+    // total_lines_after reflects the post-conversion content, not the raw insert.
+    let expected_lines = r.new_content.split('\n').count();
+    assert_eq!(r.total_lines_after, expected_lines);
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(persisted.content, r.new_content);
+}
+
+#[tokio::test]
+async fn set_note_content_with_task_block_auto_converts() {
+    let (_tmp, svc, ws, id) = setup("original body content that is long enough").await;
+    let r = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "intro\n@@@task\n# From SetContent\nbody\n@@@\ntail".into(),
+            true,
+            None,
+        )
+        .await
+        .expect("setContent");
+    assert_eq!(r.converted_count, 1);
+    assert_eq!(r.created_task_note_ids.len(), 1);
+    assert!(!r.new_content.contains("@@@task"));
+    assert!(r
+        .new_content
+        .contains("- [ ] [From SetContent](intent://local/task/"));
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(persisted.content, r.new_content);
+}
+
+#[tokio::test]
+async fn write_without_task_block_reports_zero_conversions() {
+    let (_tmp, svc, ws, id) = setup("body").await;
+    let r = svc
+        .add_to_note(
+            ws,
+            id,
+            NoteAddInput {
+                content: "no fences here".into(),
+                heading: None,
+                position: Some("end".into()),
+            },
+        )
+        .await
+        .expect("add");
+    assert_eq!(r.converted_count, 0);
+    assert!(r.created_task_note_ids.is_empty());
 }
 
 // ---------------------------------------------------------------------------
