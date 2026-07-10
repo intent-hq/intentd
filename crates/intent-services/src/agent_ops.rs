@@ -2846,7 +2846,10 @@ impl Services {
         // worker is ever spawned for a row that failed to persist:
         //   1. Claim the in-flight slot (busy assignee → enqueue branch).
         //   2. Persist the wake-tagged user block. Slot released on failure
-        //      and the message enqueued so it still reaches the drain loop.
+        //      and the message enqueued, then a best-effort
+        //      `AgentManager::try_drain_queue` kick so the queued wake is
+        //      picked up while the agent is idle (mirrors the
+        //      `AgentManager::send_message` auto-queue fallback).
         //   3. Spawn the worker with the same content in-memory (the worker
         //      path does not re-persist).
         let content_owned = content.to_string();
@@ -2871,6 +2874,10 @@ impl Services {
             manager.release_slot(agent_id).await;
             let (queued, position) = self.enqueue_message(agent_id, content_owned, None, None);
             self.publish_queue_updated(agent_id).await;
+            manager
+                .clone()
+                .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                .await;
             return Ok(json!({
                 "success": true,
                 "queued": true,
