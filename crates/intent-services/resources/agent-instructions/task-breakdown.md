@@ -135,11 +135,7 @@ Each subtask should be:
 
 	- Create subtasks using separate task blocks (one subtask per block).
 	- Do not use markdown checkbox lists (- [ ] ...) to create tasks; checkboxes are progress markers only.
-	- When you are editing the spec note (noteId="spec") and the spec is stable, invoke the `workspace_api` tool with:
-
-	ws.task.convertBlocks("spec")
-
-	to materialize the task blocks into real Task Notes (assignable + trackable).
+	- When you are editing the spec note (noteId="spec") and the spec is stable, call the `convert_task_blocks` MCP tool with noteId `"spec"` to materialize the task blocks into real Task Notes (assignable + trackable).
 
 ### Before Finalizing Breakdown
 

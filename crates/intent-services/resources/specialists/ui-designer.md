@@ -96,4 +96,4 @@ Before delivering, verify:
 - [ ] No conflicting design systems introduced
 
 ## Completion (REQUIRED)
-Call `ws.agent.reportToParent` via the `workspace_api` tool with: summary of UI created, accessibility verification status, any design decisions or tradeoffs made.
+Call `report_to_parent` with: summary of UI created, accessibility verification status, any design decisions or tradeoffs made.

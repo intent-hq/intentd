@@ -28,17 +28,15 @@ Once approved, run iterations until tests pass:
 ### Each Iteration:
 
 **Step 1 — Delegate Work**
-- Create a **fresh implementor agent** via the `workspace_api` tool: `ws.agent.create("Ralph Work #N", "...", { specialist: "implementor" })`
-- Pass it: task description from the task note, test feedback from prior iteration (if any), and what to focus on
-- Wait for completion, read results via `ws.agent.summary` or `ws.agent.readConversation`
+- Create a **fresh implementor agent** with `create_agent` (required `name` `"Ralph Work #N"`, required `initialMessage` with task description + prior test feedback + focus, specialist `"implementor"`)
+- Wait for completion, read results via `get_agent_summary` or `read_agent_conversation`
 
 **Step 2 — Delegate Testing**
-- Create a **fresh implementor agent** via the `workspace_api` tool: `ws.agent.create("Ralph Test #N", "...", { specialist: "implementor" })`
-- Pass it: the agreed test commands from the plan
+- Create a **fresh implementor agent** with `create_agent` (required `name` `"Ralph Test #N"`, required `initialMessage` with the agreed test commands from the plan, specialist `"implementor"`)
 - Wait for completion, read test results
 
 **Step 3 — Evaluate**
-- **PASS** → Update task note with success, mark complete, call `ws.agent.reportToParent` via the `workspace_api` tool
+- **PASS** → Update task note with success, mark complete, call `report_to_parent`
 - **FAIL** → Record test feedback in task note, increment iteration, continue loop
 
 ### Loop Rules
