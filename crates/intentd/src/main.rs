@@ -102,6 +102,18 @@ enum Command {
         #[arg(long)]
         rotate: bool,
     },
+    /// WSAPI-1 spike: evaluate an `(async () => { <code> })()` snippet in an
+    /// isolated QuickJS context with a wall-clock timeout, and print the
+    /// JSON-serialized result. Present only when built with `--features js-engine`.
+    #[cfg(feature = "js-engine")]
+    #[command(hide = true)]
+    JsEval {
+        /// JavaScript source; the body of an implicit `async () => { … }`.
+        code: String,
+        /// Wall-clock budget in milliseconds (default 30000, matching the FE tool).
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
+    },
 }
 
 /// Sub-actions for `intentd service` (daemonization, §5.8).
@@ -132,6 +144,26 @@ async fn main() -> ExitCode {
         Command::McpBridge { connect } => to_exit(cmd_mcp_bridge(&connect).await),
         Command::Import { from } => to_exit(cmd_import(&from).await),
         Command::Token { rotate } => to_exit(cmd_token(rotate).await),
+        #[cfg(feature = "js-engine")]
+        Command::JsEval { code, timeout_ms } => to_exit(cmd_js_eval(&code, timeout_ms).await),
+    }
+}
+
+/// WSAPI-1 spike: run one JS snippet in a fresh QuickJS context, enforce a
+/// wall-clock timeout, and print the resulting JSON to stdout. This is the
+/// smoke test we point at from the PR write-up.
+#[cfg(feature = "js-engine")]
+async fn cmd_js_eval(code: &str, timeout_ms: u64) -> anyhow::Result<()> {
+    let opts = intent_js::EvalOptions {
+        timeout: Duration::from_millis(timeout_ms),
+        ..intent_js::EvalOptions::default()
+    };
+    match intent_js::eval(code, &opts, None).await {
+        Ok(v) => {
+            println!("{}", serde_json::to_string(&v)?);
+            Ok(())
+        }
+        Err(e) => Err(anyhow::Error::from(e)),
     }
 }
 
