@@ -25,6 +25,13 @@ intent-context = { path = "../intent-context" }
 intent-pty = { path = "../intent-pty" }
 intent-search = { path = "../intent-search" }
 intent-transport = { path = "../intent-transport" }
+intent-js = { path = "../intent-js", optional = true }
+
+[features]
+default = []
+# WSAPI-1 spike: link the QuickJS-backed JS engine. Off by default so the
+# baseline binary is unchanged; enable to measure size / build impact.
+js-engine = ["dep:intent-js"]
 
 [dev-dependencies]
 uuid = { workspace = true }
