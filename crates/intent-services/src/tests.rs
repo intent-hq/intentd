@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use intent_core::{
-    now_iso, ContentType, Error, Note, NoteAddInput, NoteEditInput, NoteEditLinesInput, NoteId,
-    NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
+    now_iso, ContentType, Error, Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput,
+    NoteId, NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
@@ -1093,13 +1093,224 @@ async fn convert_blocks_creates_children_idempotently() {
         .contains("- [ ] [Build API](intent://local/task/"));
     assert!(!updated.content.contains("@@@task"));
 
+    // The conversion write appends a version snapshot whose content matches
+    // the converted (fence-free) parent content (TS parity: the reference
+    // pushes a version as part of the conversion save).
+    let versions = svc.store.list_note_versions(&id).await.expect("versions");
+    assert_eq!(versions.len(), 1);
+    let v = svc
+        .store
+        .get_note_version(&id, versions[0].v)
+        .await
+        .expect("version");
+    assert_eq!(v.content, updated.content);
+
     // Re-running is idempotent: the existing child is reused, none created.
     let r2 = svc
-        .convert_task_blocks(ws, id)
+        .convert_task_blocks(ws, id.clone())
         .await
         .expect("convertBlocks2");
     assert_eq!(r2.converted_count, 0);
     assert!(r2.created_note_ids.is_empty());
+
+    // No-op re-run must not append another version.
+    let versions = svc.store.list_note_versions(&id).await.expect("versions");
+    assert_eq!(versions.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// TASKFLOW-1: auto-convert @@@task blocks on every note content-write path
+// (reference parity with `notes.service.ts` update path L633-647). Each write
+// method that mutates a note's content invokes `convert_task_blocks` when the
+// resulting content contains a `@@@task` fence. `note.add` / `note.edit` /
+// `note.editLines` / `note.setContent` surface the conversion counts +
+// fence-free content in their result payloads; `note.create` / `note.update`
+// return the refetched `Note` (fence-free content, fresh rev/updated_at)
+// without count fields.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_note_with_task_block_auto_converts() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let svc = Services::new(store);
+
+    let created = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Parent".into(),
+                content: Some("intro\n@@@task\n# Child One\nbody\n@@@\ntail".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create");
+    assert!(!created.content.contains("@@@task"));
+    assert!(created
+        .content
+        .contains("- [ ] [Child One](intent://local/task/"));
+    let persisted = svc.get_note(ws, created.id.clone()).await.expect("get");
+    assert!(!persisted.content.contains("@@@task"));
+    // The conversion performs a second store write; the response must carry
+    // the refetched note, so rev/updated_at match the stored note.
+    assert_eq!(created.rev, persisted.rev);
+    assert_eq!(created.updated_at, persisted.updated_at);
+    assert_eq!(created.content, persisted.content);
+}
+
+#[tokio::test]
+async fn update_note_full_content_with_task_block_auto_converts() {
+    let (_tmp, svc, ws, id) = setup("original").await;
+    let updated = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("intro\n@@@task\n# From Update\nbody\n@@@".into()),
+                title: None,
+                tags: None,
+                expected_version: None,
+            },
+        )
+        .await
+        .expect("update");
+    assert!(!updated.content.contains("@@@task"));
+    assert!(updated
+        .content
+        .contains("- [ ] [From Update](intent://local/task/"));
+    // The conversion performs a second store write; the response must carry
+    // the refetched note, so rev/updated_at match the stored note.
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(updated.rev, persisted.rev);
+    assert_eq!(updated.updated_at, persisted.updated_at);
+    assert_eq!(updated.content, persisted.content);
+}
+
+#[tokio::test]
+async fn add_to_note_task_block_auto_converts() {
+    let (_tmp, svc, ws, id) = setup("# Head\nintro").await;
+    let r = svc
+        .add_to_note(
+            ws.clone(),
+            id.clone(),
+            NoteAddInput {
+                content: "@@@task\n# From Add\nbody\n@@@".into(),
+                heading: None,
+                position: Some("end".into()),
+            },
+        )
+        .await
+        .expect("add");
+    assert_eq!(r.converted_count, 1);
+    assert_eq!(r.created_task_note_ids.len(), 1);
+    assert!(!r.new_content.contains("@@@task"));
+    assert!(r
+        .new_content
+        .contains("- [ ] [From Add](intent://local/task/"));
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(persisted.content, r.new_content);
+}
+
+#[tokio::test]
+async fn edit_note_replacing_text_with_task_block_auto_converts() {
+    let (_tmp, svc, ws, id) = setup("intro PLACEHOLDER tail").await;
+    let r = svc
+        .edit_note(
+            ws.clone(),
+            id.clone(),
+            NoteEditInput {
+                old: "PLACEHOLDER".into(),
+                new: "\n@@@task\n# From Edit\nbody\n@@@\n".into(),
+            },
+        )
+        .await
+        .expect("edit");
+    assert_eq!(r.converted_count, 1);
+    assert_eq!(r.created_task_note_ids.len(), 1);
+    assert!(!r.new_content.contains("@@@task"));
+    assert!(r
+        .new_content
+        .contains("- [ ] [From Edit](intent://local/task/"));
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(persisted.content, r.new_content);
+}
+
+#[tokio::test]
+async fn edit_note_lines_inserting_task_block_auto_converts() {
+    let (_tmp, svc, ws, id) = setup("line1\nOLD\nline3").await;
+    let r = svc
+        .edit_note_lines(
+            ws.clone(),
+            id.clone(),
+            NoteEditLinesInput {
+                start: 2,
+                end: 2,
+                content: "@@@task\n# From EditLines\nbody\n@@@".into(),
+            },
+        )
+        .await
+        .expect("editLines");
+    assert_eq!(r.converted_count, 1);
+    assert_eq!(r.created_task_note_ids.len(), 1);
+    assert!(!r.new_content.contains("@@@task"));
+    assert!(r
+        .new_content
+        .contains("- [ ] [From EditLines](intent://local/task/"));
+    // total_lines_after reflects the post-conversion content, not the raw insert.
+    let expected_lines = r.new_content.split('\n').count();
+    assert_eq!(r.total_lines_after, expected_lines);
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(persisted.content, r.new_content);
+}
+
+#[tokio::test]
+async fn set_note_content_with_task_block_auto_converts() {
+    let (_tmp, svc, ws, id) = setup("original body content that is long enough").await;
+    let r = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "intro\n@@@task\n# From SetContent\nbody\n@@@\ntail".into(),
+            true,
+            None,
+        )
+        .await
+        .expect("setContent");
+    assert_eq!(r.converted_count, 1);
+    assert_eq!(r.created_task_note_ids.len(), 1);
+    assert!(!r.new_content.contains("@@@task"));
+    assert!(r
+        .new_content
+        .contains("- [ ] [From SetContent](intent://local/task/"));
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(persisted.content, r.new_content);
+    // The conversion performs a second store write; the response must carry
+    // the refetched note's timestamp, not the pre-conversion write time.
+    assert_eq!(r.updated_at, persisted.updated_at);
+}
+
+#[tokio::test]
+async fn write_without_task_block_reports_zero_conversions() {
+    let (_tmp, svc, ws, id) = setup("body").await;
+    let r = svc
+        .add_to_note(
+            ws,
+            id,
+            NoteAddInput {
+                content: "no fences here".into(),
+                heading: None,
+                position: Some("end".into()),
+            },
+        )
+        .await
+        .expect("add");
+    assert_eq!(r.converted_count, 0);
+    assert!(r.created_task_note_ids.is_empty());
 }
 
 // ---------------------------------------------------------------------------
