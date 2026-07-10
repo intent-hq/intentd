@@ -53,9 +53,15 @@ async fn thrown_js_error_is_returned_as_err() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hot_loop_is_killed_by_timeout() {
     let started = Instant::now();
-    let err = eval("while (true) {}", &short_opts(150), None)
-        .await
-        .expect_err("hot loop should timeout");
+    // Test-level fail-safe: if the interrupt handler regresses, the test must
+    // fail fast rather than hang CI on the very mechanism under test.
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        eval("while (true) {}", &short_opts(150), None),
+    )
+    .await
+    .expect("fail-safe: eval must return before the test-level timeout")
+    .expect_err("hot loop should timeout");
     assert!(matches!(err, JsError::Timeout { .. }), "got {err:?}");
     assert!(
         started.elapsed() < Duration::from_secs(2),
@@ -77,9 +83,15 @@ async fn pending_promise_is_killed_by_timeout() {
         },
     );
     let started = Instant::now();
-    let err = eval("return await host(null);", &short_opts(150), Some(host))
-        .await
-        .expect_err("pending await should timeout");
+    // Test-level fail-safe: if the outer timeout regresses, the 30 s host
+    // sleep must not hang CI on the very mechanism under test.
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        eval("return await host(null);", &short_opts(150), Some(host)),
+    )
+    .await
+    .expect("fail-safe: eval must return before the test-level timeout")
+    .expect_err("pending await should timeout");
     assert!(matches!(err, JsError::Timeout { .. }), "got {err:?}");
     assert!(
         started.elapsed() < Duration::from_secs(2),
@@ -121,12 +133,18 @@ async fn memory_hog_is_killed_by_default_limit() {
     // Repeated string doubling blows past the 64 MB default cap within a few
     // dozen iterations — long before the 30 s wall-clock budget.
     let started = Instant::now();
-    let err = eval(
-        "let s = 'x'; while (true) { s += s; } return s.length;",
-        &EvalOptions::default(),
-        None,
+    // Test-level fail-safe: if the memory cap regresses, the hog loop would
+    // otherwise run until the 30 s wall clock — fail fast instead.
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        eval(
+            "let s = 'x'; while (true) { s += s; } return s.length;",
+            &EvalOptions::default(),
+            None,
+        ),
     )
     .await
+    .expect("fail-safe: eval must return before the test-level timeout")
     .expect_err("memory hog must be rejected by the default cap");
     assert!(matches!(err, JsError::Runtime(_)), "got {err:?}");
     assert!(
