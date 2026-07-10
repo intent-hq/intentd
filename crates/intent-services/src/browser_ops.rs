@@ -153,12 +153,11 @@ pub fn shape_result(fe_response: Value) -> Result<Value, BrowserExecError> {
     }
 }
 
-/// Build the wire payload for the single-action case. Mirrors the reference
-/// MCP tool's format: return the action's `result` under `result` when the
-/// action succeeded, or surface the action-level `error` string as `-32603`
-/// context via the outer envelope's `success:false` — but the daemon does not
-/// invent action-level errors, it just forwards what the FE gave us. We keep
-/// the shape self-describing so the FE binding (WSAPI-6) can render either.
+/// Build the wire payload for the single-action case: pass the FE's action
+/// envelope through unchanged. The daemon neither unwraps `result` nor
+/// re-maps action-level `error`s — it forwards exactly what the FE gave us.
+/// We keep the shape self-describing so the FE binding (WSAPI-6) can render
+/// either the success or the failure side.
 fn single_result_payload(action: &Value) -> Value {
     // Preserve `action` (the tool name), `success`, and `result` / `error` as
     // the FE emitted them. Consumers that expect just the payload can read

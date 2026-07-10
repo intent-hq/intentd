@@ -3,9 +3,9 @@
 //! `browser.exec` is a **client-callable trigger** whose real work happens on
 //! the connected frontend (Chrome DevTools Protocol against embedded browser
 //! tabs — no CDP logic runs in Rust). The daemon validates the envelope, then
-//! dispatches an FE-served reverse RPC (`browser.exec` in the `rev-<n>`
-//! namespace, mirroring `host.openInEditor` / `host.pickApplication`) and
-//! echoes the FE's result back to the caller.
+//! dispatches an FE-served reverse RPC — method name unchanged (`browser.exec`),
+//! with a `rev-<n>` request id (mirroring `host.openInEditor` /
+//! `host.pickApplication`) — and echoes the FE's result back to the caller.
 //!
 //! Wire shape (reference parity with the FE MCP tool `browser_exec`): a
 //! validated non-empty `actions` batch forwards `{ actions, tabId?, agentId?,
