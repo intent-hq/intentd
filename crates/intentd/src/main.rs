@@ -106,6 +106,7 @@ enum Command {
     /// isolated QuickJS context with a wall-clock timeout, and print the
     /// JSON-serialized result. Present only when built with `--features js-engine`.
     #[cfg(feature = "js-engine")]
+    #[command(hide = true)]
     JsEval {
         /// JavaScript source; the body of an implicit `async () => { … }`.
         code: String,
@@ -155,7 +156,7 @@ async fn main() -> ExitCode {
 async fn cmd_js_eval(code: &str, timeout_ms: u64) -> anyhow::Result<()> {
     let opts = intent_js::EvalOptions {
         timeout: Duration::from_millis(timeout_ms),
-        memory_limit_bytes: None,
+        ..intent_js::EvalOptions::default()
     };
     match intent_js::eval(code, &opts, None).await {
         Ok(v) => {
