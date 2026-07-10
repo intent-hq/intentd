@@ -5869,6 +5869,11 @@ impl WorkspaceApi for Services {
             note.content = working;
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            // TS parity: the reference pushes a version snapshot ("Converted
+            // task blocks to linked Task Notes") as part of the conversion
+            // save, so the newest stored version matches the fence-free
+            // content that line-attribution/history consumers diff against.
+            capture_note_version(store, &note).await?;
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());

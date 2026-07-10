@@ -1093,13 +1093,29 @@ async fn convert_blocks_creates_children_idempotently() {
         .contains("- [ ] [Build API](intent://local/task/"));
     assert!(!updated.content.contains("@@@task"));
 
+    // The conversion write appends a version snapshot whose content matches
+    // the converted (fence-free) parent content (TS parity: the reference
+    // pushes a version as part of the conversion save).
+    let versions = svc.store.list_note_versions(&id).await.expect("versions");
+    assert_eq!(versions.len(), 1);
+    let v = svc
+        .store
+        .get_note_version(&id, versions[0].v)
+        .await
+        .expect("version");
+    assert_eq!(v.content, updated.content);
+
     // Re-running is idempotent: the existing child is reused, none created.
     let r2 = svc
-        .convert_task_blocks(ws, id)
+        .convert_task_blocks(ws, id.clone())
         .await
         .expect("convertBlocks2");
     assert_eq!(r2.converted_count, 0);
     assert!(r2.created_note_ids.is_empty());
+
+    // No-op re-run must not append another version.
+    let versions = svc.store.list_note_versions(&id).await.expect("versions");
+    assert_eq!(versions.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
