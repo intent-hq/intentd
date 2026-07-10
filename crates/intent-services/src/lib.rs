@@ -7657,6 +7657,22 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_watch_completion_for_sender(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_watch_completion_for_sender_op(
+                workspace_id,
+                caller_agent_id,
+                target_agent_id,
+            )
+            .await
+        })
+    }
+
     fn agent_diagnostics(
         &self,
         workspace_id: WorkspaceId,

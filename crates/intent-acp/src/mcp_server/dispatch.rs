@@ -5,7 +5,7 @@
 use intent_core::model::AgentDelegateInput;
 use intent_core::{
     AgentCreateExtra, AgentId, Error, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput,
-    NoteId, NoteUpdateMetadataResult, Result, WorkspaceUpdate, MAX_DELEGATION_DEPTH,
+    NoteId, NoteUpdateMetadataResult, Result, WorkspaceId, WorkspaceUpdate, MAX_DELEGATION_DEPTH,
     WORKSPACE_STATUS_MESSAGE_MAX_LENGTH,
 };
 use serde::Serialize;
@@ -506,10 +506,10 @@ impl WorkspaceMcpServer {
             }
             "send_message_to_agent" => {
                 let agent_id = AgentId::from(req_str(args, "agentId")?.as_str());
-                val(api
+                let mut result = api
                     .agent_send_message(
-                        ws,
-                        agent_id,
+                        ws.clone(),
+                        agent_id.clone(),
                         req_str(args, "message")?,
                         None,
                         None,
@@ -520,16 +520,40 @@ impl WorkspaceMcpServer {
                         None,
                         None,
                     )
-                    .await)
+                    .await?;
+                // SUB-1: auto-subscribe the SENDER to the target's completion
+                // (TS `maybeSubscribeCallerToAgentCompletionForCoordination-
+                // Message`). Delegated background senders are skipped inside
+                // the services impl; failure is non-fatal — the message is
+                // already delivered.
+                if let Some(sub) = self.watch_completion_for_sender(ws, agent_id).await {
+                    result["subscriptionId"] = serde_json::json!(sub);
+                }
+                val::<Value>(Ok(result))
             }
-            "send_message_to_task_agent" => val(api
-                .agent_send_to_task(
-                    ws,
-                    note_id(args, "taskNoteId")?,
-                    req_str(args, "message")?,
-                    opt_str(args, "priority"),
-                )
-                .await),
+            "send_message_to_task_agent" => {
+                let mut result = api
+                    .agent_send_to_task(
+                        ws.clone(),
+                        note_id(args, "taskNoteId")?,
+                        req_str(args, "message")?,
+                        opt_str(args, "priority"),
+                    )
+                    .await?;
+                // SUB-1: same sender auto-subscribe as `send_message_to_agent`,
+                // against the task's assignee resolved by the op (`agentId` is
+                // only present when delivery succeeded).
+                let target = result
+                    .get("agentId")
+                    .and_then(Value::as_str)
+                    .map(AgentId::from);
+                if let Some(target) = target {
+                    if let Some(sub) = self.watch_completion_for_sender(ws, target).await {
+                        result["subscriptionId"] = serde_json::json!(sub);
+                    }
+                }
+                val::<Value>(Ok(result))
+            }
             "wake_or_create_task_agent" => {
                 // Reference `WakeOrCreateTaskAgentTool` guards against the caller
                 // exceeding `MAX_DELEGATION_DEPTH` before the tool may create a
@@ -546,6 +570,9 @@ impl WorkspaceMcpServer {
                         }
                     }
                 }
+                // SUB-1: thread the caller into the op so the woke-existing /
+                // queued-to-active branches auto-subscribe it to the target's
+                // completion (the op owns the branch-specific watch shapes).
                 val(api
                     .agent_wake_or_create(
                         ws,
@@ -553,6 +580,7 @@ impl WorkspaceMcpServer {
                         req_str(args, "contextMessage")?,
                         intent_core::AgentWakeOrCreateInput {
                             model: opt_str(args, "model"),
+                            caller_agent_id: self.caller_agent_id.clone(),
                             ..Default::default()
                         },
                     )
@@ -637,6 +665,34 @@ impl WorkspaceMcpServer {
                     .await)
             }
             other => Err(Error::InvalidParams(format!("Tool not found: {other}"))),
+        }
+    }
+
+    /// SUB-1 sender auto-subscribe shared by the two send tools: when this
+    /// server front-doors an agent, register the caller→target completion
+    /// watch through `agent_watch_completion_for_sender` (which owns the
+    /// delegated-background-sender skip) and surface the subscription id.
+    /// `None` for the caller-less front door, a skipped caller, or a
+    /// registration failure (non-fatal — the message is already delivered).
+    async fn watch_completion_for_sender(
+        &self,
+        workspace_id: WorkspaceId,
+        target: AgentId,
+    ) -> Option<String> {
+        let caller = self.caller_agent_id.clone()?;
+        match self
+            .api
+            .agent_watch_completion_for_sender(workspace_id, caller, target.clone())
+            .await
+        {
+            Ok(v) => v
+                .get("subscriptionId")
+                .and_then(Value::as_str)
+                .map(String::from),
+            Err(e) => {
+                tracing::warn!(target = %target.0, error = %e, "send tool: failed to register sender completion watch");
+                None
+            }
         }
     }
 }

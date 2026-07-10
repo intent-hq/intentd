@@ -1393,6 +1393,28 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Conditionally auto-subscribe a coordination-message SENDER to the
+    /// target agent's completion (SUB-1, the TS
+    /// `maybeSubscribeCallerToAgentCompletionForCoordinationMessage`). Called
+    /// by the MCP `send_message_to_agent` / `send_message_to_task_agent`
+    /// front doors after delivery. Foreground/coordinator senders get a
+    /// oneShot watch; delegated background task senders are skipped (their
+    /// sibling coordination messages would otherwise create noisy wakeups).
+    /// Returns `{ ok, subscriptionId }`; `ok: false` (null id) when skipped.
+    fn agent_watch_completion_for_sender(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, caller_agent_id, target_agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_watch_completion_for_sender not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.cancelSubscriptions`: cancel all of an agent's subscriptions;
     /// `{ success: true }` (PROTOCOL §5.5).
     fn agent_cancel_subscriptions(
