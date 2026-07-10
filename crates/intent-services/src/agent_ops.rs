@@ -32,6 +32,11 @@ const WAIT_MODE_AFTER_ALL: &str = "after_all";
 /// `agent.wakeOrCreate` (C1d-10a). Mirrors the FE tool's own tag so downstream
 /// consumers (activity feeds, filters) can trace provenance.
 const WAKE_OR_CREATE_SOURCE: &str = "wake_or_create_task_agent";
+
+/// Auto-cleanup window for the non-oneShot watch registered when
+/// `agent.wakeOrCreate` queues the context message to an active agent
+/// (SUB-1, mirrors the TS 5-minute `setTimeout` unsubscribe leak guard).
+const QUEUED_WATCH_CLEANUP: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 use intent_providers::models::PROVIDER_MODEL_TIERS;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -615,6 +620,26 @@ fn build_wake_response(
         out["cleanedUpAgentIds"] = json!(cleaned_up);
     }
     out
+}
+
+/// TS `isDelegatedBackgroundTaskSession`: a background session that was
+/// delegated by another agent onto a task note. Both the delegator id and the
+/// task linkage are read from the persisted `metadata` blob (the shape the
+/// delegate/create writers populate), matching the reference field-for-field.
+fn is_delegated_background_task_session(session: &AgentSession) -> bool {
+    let md = session.metadata.as_ref();
+    let md_is_background = md
+        .and_then(|m| m.get("isBackground"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let md_has_str = |key: &str| {
+        md.and_then(|m| m.get(key))
+            .and_then(Value::as_str)
+            .is_some()
+    };
+    (session.is_background || md_is_background)
+        && md_has_str("createdByAgentId")
+        && md_has_str("taskNoteId")
 }
 
 /// Project an [`AgentSession`] (with its loaded messages) into [`AgentLite`].
@@ -2064,6 +2089,63 @@ impl Services {
         Ok(json!({ "ok": true, "subscriptionId": id }))
     }
 
+    /// Conditionally auto-subscribe a coordination-message SENDER to the
+    /// target's completion (SUB-1, the TS
+    /// `maybeSubscribeCallerToAgentCompletionForCoordinationMessage`):
+    /// register a oneShot caller→target watch UNLESS the caller is a
+    /// delegated background task session — those often send sibling
+    /// coordination messages, and passively subscribing them creates noisy
+    /// wakeup cards unrelated to their own task.
+    pub(crate) async fn agent_watch_completion_for_sender_op(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+    ) -> Result<Value> {
+        let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
+        let skip = caller_session
+            .as_ref()
+            .map(is_delegated_background_task_session)
+            .unwrap_or(false);
+        if skip {
+            return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
+        }
+        let caller_name = caller_session.map(|s| s.name).unwrap_or_default();
+        let id = self.register_completion_watch(
+            &workspace_id,
+            caller_agent_id.clone(),
+            caller_name,
+            target_agent_id,
+            true,
+            None,
+        );
+        self.publish_subscriptions_changed(&workspace_id, &caller_agent_id)
+            .await;
+        Ok(json!({ "ok": true, "subscriptionId": id }))
+    }
+
+    /// Remove `subscription_id` after `after` elapses (SUB-1 leak guard for
+    /// the non-oneShot queued-message watch — mirrors the TS 5-minute
+    /// `setTimeout` unsubscribe). A watch already removed by delivery is a
+    /// no-op; only a real removal republishes the parent's subscriptions.
+    pub(crate) fn spawn_watch_cleanup(
+        &self,
+        workspace_id: WorkspaceId,
+        parent_agent_id: AgentId,
+        subscription_id: String,
+        after: std::time::Duration,
+    ) {
+        let services = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            if services.remove_watch(&workspace_id, &subscription_id) {
+                services
+                    .publish_subscriptions_changed(&workspace_id, &parent_agent_id)
+                    .await;
+            }
+        });
+    }
+
     /// `agent.getSubscriptions`: live completion-watch payload for `agent_id`
     /// from the AS-2/AS-4 registry, in the TS camelCase wire shape with the
     /// `subscriptions`, `delegationGroups`, and `agentStatuses` fields.
@@ -2651,6 +2733,10 @@ impl Services {
         if let Some(session) = live_session {
             let agent_id = session.id.clone();
             let agent_name = session.name.clone();
+            let agent_status = serde_json::to_value(session.status)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default();
             let result = self
                 .deliver_wake_message(
                     &workspace_id,
@@ -2663,18 +2749,76 @@ impl Services {
                 .await?;
             // B8: `action` distinguishes queued-to-active-agent from woke-existing
             // via the delivery's `queued` flag.
-            let action = if result
+            let queued = result
                 .get("queued")
                 .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
+                .unwrap_or(false);
+            let action = if queued {
                 "message_queued_to_active_agent"
             } else {
                 "woke_existing"
             };
-            return Ok(build_wake_response(
-                agent_id, agent_name, false, action, task_title, result, cleaned_up,
-            ));
+            let mut response = build_wake_response(
+                agent_id.clone(),
+                agent_name,
+                false,
+                action,
+                task_title.clone(),
+                result,
+                cleaned_up,
+            );
+            // SUB-1: auto-subscribe the waking caller to the target's
+            // completion (TS `WakeOrCreateTaskAgentTool`). Woke-existing gets
+            // a oneShot watch; a queued context message gets a NON-oneShot
+            // watch (the target's `agent:idle` for its CURRENT turn fires
+            // before the queued message is processed) with a 5-minute
+            // auto-cleanup so the watch never leaks. Response text mirrors
+            // the reference tool, including the notification line.
+            if let Some(caller) = input.caller_agent_id.clone() {
+                let caller_name = self
+                    .store
+                    .get_agent_session(&caller)
+                    .await
+                    .ok()
+                    .map(|s| s.name)
+                    .unwrap_or_default();
+                let subscription_id = self.register_completion_watch(
+                    &workspace_id,
+                    caller.clone(),
+                    caller_name,
+                    agent_id.clone(),
+                    !queued,
+                    None,
+                );
+                self.publish_subscriptions_changed(&workspace_id, &caller)
+                    .await;
+                if queued {
+                    self.spawn_watch_cleanup(
+                        workspace_id.clone(),
+                        caller,
+                        subscription_id.clone(),
+                        QUEUED_WATCH_CLEANUP,
+                    );
+                }
+                let message = if queued {
+                    format!(
+                        "Agent \"{}\" is already actively working on task \"{task_title}\".\n\
+                         Context message has been queued and will be delivered when the agent finishes its current response.\n\
+                         You will be notified when the agent responds.",
+                        agent_id.0
+                    )
+                } else {
+                    format!(
+                        "Woke existing agent \"{}\" for task \"{task_title}\".\n\
+                         Agent status: {agent_status}\n\
+                         Context message delivered.\nYou will be notified when the agent responds.",
+                        agent_id.0
+                    )
+                };
+                response["subscriptionId"] = json!(subscription_id);
+                response["message"] = json!(message);
+            }
+            return Ok(response);
         }
 
         // Create branch: no live session. Purge stale assignments first so the

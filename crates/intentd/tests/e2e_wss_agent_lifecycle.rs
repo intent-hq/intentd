@@ -3963,3 +3963,183 @@ async fn deliv1_no_lost_messages_wake_or_create_then_send_to_task_over_wss() {
         "second assistant response persisted -- NOT lost (transcript: {concat_text})"
     );
 }
+
+/// SUB-1: a coordinator that sends its context message to a working agent over
+/// the wire (`agent.wakeOrCreate` + `callerAgentId`) is auto-subscribed to the
+/// target's completion — when the target's turn finishes (`agent:idle`), the
+/// completion delivery worker wakes the SENDER. Asserts the widened response
+/// (`subscriptionId` + notification text, PROTOCOL §5.5) and the delivered
+/// `[WORKSPACE EVENTS]` completion wake in the coordinator's transcript.
+#[tokio::test]
+async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
+    let Some(script) = gate("WSS SUB-1 sender completion wake E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "response": "target finished the follow-up" }).to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE the wake so we miss no events.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // RPC conn — a coordinator (the sender) plus a target agent assigned to a
+    // task note.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let coordinator = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Coordinator", "model": "mock:default" }),
+    )
+    .await;
+    let coordinator_id = coordinator["agent"]["id"]
+        .as_str()
+        .expect("coordinator id")
+        .to_string();
+    let target = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Target", "model": "mock:default" }),
+    )
+    .await;
+    let target_id = target["agent"]["id"]
+        .as_str()
+        .expect("target id")
+        .to_string();
+
+    let note = wss_rpc(
+        &mut rpc,
+        12,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "SUB-1 task" }),
+    )
+    .await;
+    let note_id = note["note"]["id"].as_str().expect("note id").to_string();
+    wss_rpc(
+        &mut rpc,
+        13,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    wss_rpc(
+        &mut rpc,
+        14,
+        "task.assignAgent",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "agentId": target_id }),
+    )
+    .await;
+
+    // The coordinator sends its context message to the working agent via the
+    // widened wake composite, carrying its own id as `callerAgentId` (SUB-1).
+    let wake = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.wakeOrCreate",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": note_id,
+            "contextMessage": "please follow up",
+            "callerAgentId": coordinator_id,
+        }),
+    )
+    .await;
+    assert_eq!(wake["ok"], true, "wake ok: {wake}");
+    assert_eq!(
+        wake["agentId"],
+        json!(target_id),
+        "woke the assignee: {wake}"
+    );
+    let action = wake["action"].as_str().unwrap_or_default();
+    assert!(
+        action == "woke_existing" || action == "message_queued_to_active_agent",
+        "live-assignee action: {wake}"
+    );
+    assert!(
+        wake["subscriptionId"].is_string(),
+        "sender auto-subscribed: {wake}"
+    );
+    assert!(
+        wake["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("You will be notified when the agent responds."),
+        "notification text parity: {wake}"
+    );
+
+    // The target completes its woken turn (mock provider) → agent:idle.
+    let mut target_idle = false;
+    for _ in 0..120 {
+        let frame = wss_event(&mut sub, 60).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:idle" && ev["data"]["agentId"] == json!(target_id) {
+            target_idle = true;
+            break;
+        }
+    }
+    assert!(target_idle, "target completed its woken turn");
+
+    // The completion delivery worker wakes the SENDER: poll the coordinator's
+    // transcript for the `[WORKSPACE EVENTS]` completion message naming the
+    // target.
+    let mut delivered = false;
+    for attempt in 0..40i64 {
+        let conv = wss_rpc(
+            &mut rpc,
+            100 + attempt,
+            "agent.getConversation",
+            json!({ "agentId": coordinator_id }),
+        )
+        .await;
+        let text = serde_json::to_string(&conv["messages"]).unwrap_or_default();
+        if text.contains("[WORKSPACE EVENTS] Child agent") && text.contains(&target_id) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(delivered, "coordinator received the completion wake");
+
+    // Let the coordinator's wake turn wind down before teardown.
+    let _ = wss_rpc(
+        &mut rpc,
+        200,
+        "agent.stop",
+        json!({ "agentId": coordinator_id }),
+    )
+    .await;
+}

@@ -515,6 +515,8 @@ mod mcp_tests {
         pub(super) assigned: Mutex<Vec<(String, String)>>,
         /// Recorded `agent_watch_completion` calls: (parent_id, child_id).
         pub(super) watched: Mutex<Vec<(String, String)>>,
+        /// Recorded `agent_watch_completion_for_sender` calls: (caller_id, target_id).
+        pub(super) sender_watched: Mutex<Vec<(String, String)>>,
         /// Recorded `get_my_task` calls: task_note_id.
         pub(super) get_my_task_calls: Mutex<Vec<String>>,
     }
@@ -685,6 +687,31 @@ mod mcp_tests {
                 child_agent_id.as_str().to_string(),
             ));
             Box::pin(async { Ok(json!({ "ok": true, "subscriptionId": "sub-watch-1" })) })
+        }
+
+        fn agent_watch_completion_for_sender(
+            &self,
+            _workspace_id: WorkspaceId,
+            caller_agent_id: AgentId,
+            target_agent_id: AgentId,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.sender_watched.lock().unwrap().push((
+                caller_agent_id.as_str().to_string(),
+                target_agent_id.as_str().to_string(),
+            ));
+            Box::pin(async { Ok(json!({ "ok": true, "subscriptionId": "sub-sender-1" })) })
+        }
+
+        fn agent_send_to_task(
+            &self,
+            _workspace_id: WorkspaceId,
+            _task_note_id: NoteId,
+            _message: String,
+            _priority: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async {
+                Ok(json!({ "ok": true, "agentId": "agent-assignee", "result": { "ok": true } }))
+            })
         }
 
         fn get_my_task(
@@ -2126,10 +2153,9 @@ mod dispatch_unit_tests {
             // `send_message_to_agent` is absent here: `MockApi`
             // overrides `agent_send_message` (for the create_agent tests), so
             // its arm is proven by `send_message_arm_reaches_workspace_api`.
-            (
-                "send_message_to_task_agent",
-                json!({ "taskNoteId": "tn", "message": "hi" }),
-            ),
+            // `send_message_to_task_agent` is absent here: `MockApi` overrides
+            // `agent_send_to_task` (for the SUB-1 sender-watch tests), so its
+            // arm is proven by `send_to_task_arm_subscribes_caller_to_assignee`.
             (
                 "wake_or_create_task_agent",
                 json!({ "taskNoteId": "tn", "contextMessage": "ctx", "model": "opus" }),
@@ -2198,6 +2224,71 @@ mod dispatch_unit_tests {
         assert_eq!(
             *api.sent.lock().unwrap(),
             vec![("agent-1".to_string(), "hi".to_string())]
+        );
+    }
+
+    /// SUB-1: a caller-fronted `send_message_to_agent` registers the sender
+    /// watch via `agent_watch_completion_for_sender` and surfaces the
+    /// subscription id in the tool payload.
+    #[tokio::test]
+    async fn send_message_arm_subscribes_caller_to_target_completion() {
+        let api = mock_api();
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("ws-1"))
+            .with_caller_agent_id(Some(intent_core::AgentId::from_string("agent-77")));
+        let resp = call(
+            &srv,
+            "send_message_to_agent",
+            json!({ "agentId": "agent-1", "message": "hi" }),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["subscriptionId"], json!("sub-sender-1"));
+        assert_eq!(
+            *api.sender_watched.lock().unwrap(),
+            vec![("agent-77".to_string(), "agent-1".to_string())]
+        );
+    }
+
+    /// SUB-1: the caller-less front door (FE/RPC) registers no sender watch
+    /// and the payload stays in the pre-SUB-1 shape.
+    #[tokio::test]
+    async fn send_message_arm_skips_sender_watch_without_caller() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "send_message_to_agent",
+            json!({ "agentId": "agent-1", "message": "hi" }),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(payload.get("subscriptionId").is_none());
+        assert!(api.sender_watched.lock().unwrap().is_empty());
+    }
+
+    /// SUB-1: `send_message_to_task_agent` resolves the assignee from the op
+    /// result and registers the same sender watch against it.
+    #[tokio::test]
+    async fn send_to_task_arm_subscribes_caller_to_assignee() {
+        let api = mock_api();
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("ws-1"))
+            .with_caller_agent_id(Some(intent_core::AgentId::from_string("agent-77")));
+        let resp = call(
+            &srv,
+            "send_message_to_task_agent",
+            json!({ "taskNoteId": "tn-1", "message": "hi" }),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["subscriptionId"], json!("sub-sender-1"));
+        assert_eq!(
+            *api.sender_watched.lock().unwrap(),
+            vec![("agent-77".to_string(), "agent-assignee".to_string())]
         );
     }
 

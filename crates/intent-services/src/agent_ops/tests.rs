@@ -2081,6 +2081,206 @@ async fn watch_completion_skips_when_parent_deleted() {
     assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
 }
 
+// SUB-1 — sender auto-subscribe on the send/wake coordination paths.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A foreground/coordinator sender is auto-subscribed: exactly one oneShot
+/// caller→target watch, subscription id returned (the TS
+/// `maybeSubscribeCallerToAgentCompletionForCoordinationMessage`).
+#[tokio::test]
+async fn sender_watch_registers_oneshot_for_foreground_caller() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+
+    let resp = svc
+        .agent_watch_completion_for_sender_op(ws.clone(), caller.clone(), target.clone())
+        .await
+        .expect("sender watch");
+    assert_eq!(resp["ok"], serde_json::json!(true));
+    let sub_id = resp["subscriptionId"].as_str().expect("subscriptionId");
+
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].id, sub_id);
+    assert!(watches[0].one_shot);
+    assert!(watches[0].group_id.is_none());
+    assert_eq!(watches[0].child_agent_id, target);
+}
+
+/// A delegated background task sender (isBackground + metadata
+/// `createdByAgentId` + `taskNoteId`, the TS
+/// `isDelegatedBackgroundTaskSession`) is NOT passively subscribed:
+/// `ok: false`, no subscription id, no watch.
+#[tokio::test]
+async fn sender_watch_skips_delegated_background_caller() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Background child").await;
+    let target = create_agent(&svc, &ws, "Sibling").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    session.is_background = true;
+    session.metadata = Some(json!({
+        "createdByAgentId": "agent-parent",
+        "taskNoteId": "note-1",
+    }));
+    svc.store()
+        .update_agent_session(&session.workspace_id.clone(), &session)
+        .await
+        .expect("flag background");
+
+    let resp = svc
+        .agent_watch_completion_for_sender_op(ws.clone(), caller.clone(), target)
+        .await
+        .expect("sender watch");
+    assert_eq!(resp["ok"], serde_json::json!(false));
+    assert!(resp["subscriptionId"].is_null());
+    assert!(svc.list_watches_for_parent(&ws, &caller).is_empty());
+}
+
+/// `agent.wakeOrCreate` woke-existing with a caller: the caller gets a oneShot
+/// watch on the woken assignee; the response carries `subscriptionId` and the
+/// reference tool's notification text.
+#[tokio::test]
+async fn wake_or_create_woke_existing_subscribes_caller() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    let note_id = seed_task(&svc, &ws, "SUB-1 wake").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+        .await
+        .expect("assign");
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "resume".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "woke_existing");
+    let sub_id = resp["subscriptionId"].as_str().expect("subscriptionId");
+    let message = resp["message"].as_str().expect("message");
+    assert!(
+        message.contains("You will be notified when the agent responds."),
+        "notification text parity: {message}"
+    );
+
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].id, sub_id);
+    assert!(watches[0].one_shot);
+    assert_eq!(watches[0].child_agent_id, target);
+}
+
+/// The caller-less (FE/RPC) wake registers nothing and the response stays in
+/// the pre-SUB-1 shape (no `subscriptionId` / `message` keys).
+#[tokio::test]
+async fn wake_or_create_without_caller_registers_no_watch() {
+    let (_t, svc, ws) = setup().await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    let note_id = seed_task(&svc, &ws, "SUB-1 no caller").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+        .await
+        .expect("assign");
+
+    let resp = svc
+        .agent_wake_or_create_op(
+            ws.clone(),
+            note_id,
+            "resume".into(),
+            AgentWakeOrCreateInput::default(),
+        )
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "woke_existing");
+    assert!(resp.get("subscriptionId").is_none());
+    assert!(resp.get("message").is_none());
+    assert!(svc.find_watches_for_child(&ws, &target).is_empty());
+}
+
+/// Queued-to-active wake: the context message queues behind the assignee's
+/// in-flight turn, so the caller's watch is NON-oneShot (it must survive the
+/// current turn's `agent:idle`) and the response carries the queued text.
+#[tokio::test]
+async fn wake_or_create_queued_registers_non_oneshot_watch() {
+    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Busy assignee").await;
+    let note_id = seed_task(&svc, &ws, "SUB-1 queued").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+        .await
+        .expect("assign");
+    // Occupy the assignee's in-flight slot so `deliver_wake_message` takes the
+    // enqueue branch deterministically.
+    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "follow up".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "message_queued_to_active_agent");
+    let sub_id = resp["subscriptionId"].as_str().expect("subscriptionId");
+    let message = resp["message"].as_str().expect("message");
+    assert!(
+        message.contains("Context message has been queued"),
+        "queued text parity: {message}"
+    );
+    assert!(
+        message.contains("You will be notified when the agent responds."),
+        "notification text parity: {message}"
+    );
+
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].id, sub_id);
+    assert!(!watches[0].one_shot, "queued watch must survive agent:idle");
+    assert_eq!(watches[0].child_agent_id, target);
+
+    manager.release_slot(&target).await;
+}
+
+/// The queued watch's leak guard: `spawn_watch_cleanup` removes the watch
+/// after the timeout elapses (the TS 5-minute `setTimeout` unsubscribe).
+#[tokio::test]
+async fn spawn_watch_cleanup_removes_watch_after_timeout() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let sub_id = svc.register_completion_watch(
+        &ws,
+        caller.clone(),
+        "Coordinator".into(),
+        target.clone(),
+        false,
+        None,
+    );
+    assert_eq!(svc.list_watches_for_parent(&ws, &caller).len(), 1);
+
+    svc.spawn_watch_cleanup(
+        ws.clone(),
+        caller.clone(),
+        sub_id,
+        Duration::from_millis(50),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if svc.list_watches_for_parent(&ws, &caller).is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("cleanup did not remove the queued watch");
+}
+
 /// End-to-end through the MCP front door: delegating with a caller registers
 /// exactly one oneShot watch for the child returned by the tool.
 #[tokio::test]
