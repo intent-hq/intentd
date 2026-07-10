@@ -1824,17 +1824,22 @@ impl Services {
             let trimmed = s.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         }
+        let task_text_msg = input.task_text.as_deref().and_then(first_nonempty);
         let mut message = input
             .agent_instructions
             .as_deref()
             .and_then(first_nonempty)
-            .or_else(|| input.task_text.as_deref().and_then(first_nonempty));
-        // Load the linked task note once (if any): it feeds both the message
-        // fallback and the child's task-derived name below.
-        let task_note = if let Some(note_id) = session_task_note_id.as_ref() {
-            self.store.get_note(note_id).await.ok()
-        } else {
-            None
+            .or_else(|| task_text_msg.clone());
+        // Load the linked task note only when we still need it: either the
+        // message hasn't been resolved from agentInstructions/taskText, or
+        // there's no taskText to derive the child name from. Callers on the
+        // common path (`taskText` + `taskNoteId` supplied together) skip the
+        // store read entirely (Copilot #84 review).
+        let task_note = match session_task_note_id.as_ref() {
+            Some(note_id) if message.is_none() || task_text_msg.is_none() => {
+                self.store.get_note(note_id).await.ok()
+            }
+            _ => None,
         };
         if message.is_none() {
             if let Some(note) = task_note.as_ref() {
@@ -1849,19 +1854,32 @@ impl Services {
         // `agent_create_op`, which then leaks into the waiting panel, agent
         // cards, and `agent:idle` wake reports (NAME-1).
         fn truncate_agent_name(name: String) -> String {
-            let chars: Vec<char> = name.chars().collect();
-            if chars.len() > 100 {
-                let mut truncated: String = chars.into_iter().take(97).collect();
+            // The reference uses JS `.length` / `.substring(0, 97)`, which
+            // count UTF-16 code units — non-BMP characters (e.g. emoji)
+            // count as 2. Match that to avoid off-by-one divergences on
+            // emoji-heavy task titles (Copilot #84 review).
+            let u16_len = name.encode_utf16().count();
+            if u16_len > 100 {
+                let units: Vec<u16> = name.encode_utf16().take(97).collect();
+                // `substring(0, 97)` can split a surrogate pair; drop a
+                // trailing lone high surrogate so the resulting Rust string
+                // stays valid UTF-8 instead of embedding a U+FFFD replacement.
+                let cutoff = if units
+                    .last()
+                    .is_some_and(|&u| (0xD800..=0xDBFF).contains(&u))
+                {
+                    units.len() - 1
+                } else {
+                    units.len()
+                };
+                let mut truncated = String::from_utf16_lossy(&units[..cutoff]);
                 truncated.push_str("...");
                 truncated
             } else {
                 name
             }
         }
-        let child_name = input
-            .task_text
-            .as_deref()
-            .and_then(first_nonempty)
+        let child_name = task_text_msg
             .or_else(|| task_note.as_ref().and_then(|n| first_nonempty(&n.title)))
             .map(truncate_agent_name);
         // Load the delegating parent once: it feeds the child's

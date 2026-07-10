@@ -2370,6 +2370,29 @@ async fn delegate_truncates_long_task_derived_names() {
         .await
         .expect("delegate");
     assert_eq!(resp["name"], boundary);
+
+    // UTF-16 parity with the reference: non-BMP chars (e.g. emoji) count
+    // as 2 code units under JS `.length`/`.substring`. 51 emoji = 102
+    // UTF-16 units > 100, so the truncated name is 97 UTF-16 units + "..."
+    // and never contains a lone surrogate.
+    let emoji_text: String = "\u{1F600}".repeat(51);
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                task_text: Some(emoji_text),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let name = resp["name"].as_str().expect("name");
+    // 97 UTF-16 units of surrogate-paired emoji = 48 whole emoji (96 units)
+    // + one lone high surrogate which we strip -> 48 emoji + "..." total.
+    assert_eq!(name, format!("{}...", "\u{1F600}".repeat(48)));
+    // Sanity: the string is valid UTF-8 (no U+FFFD replacement chars).
+    assert!(!name.contains('\u{FFFD}'));
 }
 
 /// NAME-1: because delegate keeps `nameExplicitlySet = false`, a subsequent
