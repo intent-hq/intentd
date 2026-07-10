@@ -1837,31 +1837,43 @@ impl AgentManager {
         self.workers.lock().unwrap().insert(agent_id, handle);
     }
 
-    /// Drive a pre-persisted user message as a fresh turn: try to claim the
-    /// in-flight slot and spawn the worker on success. The caller is expected
-    /// to have already persisted the user message row (with any bespoke content
-    /// block shape it needs — e.g. wake-tagged `messageMetadata` embedded in
-    /// the block); the worker path does NOT re-persist the initial `content`.
-    /// Returns `true` when the slot was claimed and the worker started, `false`
-    /// when a turn was already in flight (the caller must enqueue instead).
-    pub(crate) async fn try_spawn_turn_for_prepersisted(
+    /// Claim the in-flight slot for a delivery-driven turn. Companion to
+    /// [`AgentManager::finish_prepersisted_turn_spawn`] and
+    /// [`AgentManager::release_slot`]: the caller uses this two-step protocol
+    /// so the user-message row is persisted BETWEEN slot claim and worker
+    /// spawn — a persist failure at that point releases the slot without ever
+    /// having launched a worker that could produce assistant output for a
+    /// row that isn't in the transcript.
+    ///
+    /// Returns `true` when the slot was claimed, `false` when a turn was
+    /// already in flight (the caller must enqueue instead).
+    pub(crate) async fn try_begin_turn(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> bool {
+        self.try_begin(agent_id, workspace_id).await
+    }
+
+    /// Spawn the background turn worker after the caller has already claimed
+    /// the in-flight slot via [`AgentManager::try_begin_turn`] AND persisted
+    /// the user-message row. The worker path does NOT re-persist the initial
+    /// `content` (it flows in-memory to `build_turn_prompt`), so the persist
+    /// MUST have succeeded before this call.
+    pub(crate) fn finish_prepersisted_turn_spawn(
         self: &Arc<Self>,
         agent_id: AgentId,
         workspace_id: WorkspaceId,
         content: String,
         options: TurnOptions,
-    ) -> bool {
-        if !self.try_begin(&agent_id, &workspace_id).await {
-            return false;
-        }
+    ) {
         self.spawn_worker(agent_id, workspace_id, content, options);
-        true
     }
 
-    /// Release the in-flight slot held by a delivery-side fallback that could
-    /// not persist its pre-composed message row (companion to
-    /// [`try_spawn_turn_for_prepersisted`]). Public-in-crate seam so
-    /// `Services::deliver_wake_message` can hand control back to the drain
+    /// Release an in-flight slot claimed via [`AgentManager::try_begin_turn`]
+    /// but not followed by a worker spawn (persist failed before
+    /// [`AgentManager::finish_prepersisted_turn_spawn`]). Public-in-crate seam
+    /// so `Services::deliver_wake_message` can hand control back to the drain
     /// loop after a store error, mirroring the `send_message` self-drain path.
     pub(crate) async fn release_slot(&self, agent_id: &AgentId) {
         self.end_turn(agent_id).await;

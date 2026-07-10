@@ -2841,22 +2841,16 @@ impl Services {
                 .deliver_wake_message_store_only(agent_id, content, build_block)
                 .await;
         };
-        // Runtime path: claim the slot BEFORE persisting so a busy assignee
-        // takes the enqueue branch (`send_message` ordering). Losing the
-        // wake tag on the queued re-persist is documented above.
+        // Runtime path (DELIV-1): two-step claim/persist/spawn so the
+        // user-message row is on disk BEFORE the turn worker starts, and no
+        // worker is ever spawned for a row that failed to persist:
+        //   1. Claim the in-flight slot (busy assignee → enqueue branch).
+        //   2. Persist the wake-tagged user block. Slot released on failure
+        //      and the message enqueued so it still reaches the drain loop.
+        //   3. Spawn the worker with the same content in-memory (the worker
+        //      path does not re-persist).
         let content_owned = content.to_string();
-        let workspace_id_owned = workspace_id.clone();
-        let agent_id_owned = agent_id.clone();
-        if !manager
-            .clone()
-            .try_spawn_turn_for_prepersisted(
-                agent_id_owned.clone(),
-                workspace_id_owned.clone(),
-                content_owned.clone(),
-                crate::agent_manager::TurnOptions::default(),
-            )
-            .await
-        {
+        if !manager.try_begin_turn(agent_id, workspace_id).await {
             // Fast enqueue branch: the manager is already draining a turn.
             let (queued, position) = self.enqueue_message(agent_id, content_owned, None, None);
             self.publish_queue_updated(agent_id).await;
@@ -2866,10 +2860,6 @@ impl Services {
                 "queuedMessage": queued.to_value(position),
             }));
         }
-        // Slot claimed + worker spawned. Now persist the wake-tagged user
-        // block so `agent.getConversation` surfaces the FE tag verbatim.
-        // On store failure, release the slot and fall back to the enqueue
-        // path so the message still reaches the drain loop.
         let message_id = new_message_id();
         let blocks = json!([build_block()]);
         if self
@@ -2887,6 +2877,12 @@ impl Services {
                 "queuedMessage": queued.to_value(position),
             }));
         }
+        manager.clone().finish_prepersisted_turn_spawn(
+            agent_id.clone(),
+            workspace_id.clone(),
+            content_owned,
+            crate::agent_manager::TurnOptions::default(),
+        );
         Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
     }
 
