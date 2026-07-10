@@ -779,6 +779,20 @@ impl AgentManager {
                 .map(|p| p.iter().map(|s| s.to_string()).collect())
                 .unwrap_or_default(),
         };
+        // Pre-first-token turn-startup hint: the child process is about to be
+        // spawned for this agent, so surface the `launch` phase before the
+        // (potentially slow) `spawn_provider` call blocks the turn (STAT-1 /
+        // PROTOCOL §7). Emitted whether or not a session is subsequently opened
+        // — the parent turn may still be gated on the child coming up.
+        self.services
+            .publish_status_event(
+                &workspace_id,
+                &agent_id,
+                "launch",
+                "Launching agent\u{2026}",
+                "info",
+            )
+            .await;
         let spawned = spawn_provider(&spawn_opts, hooks)
             .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
         let (child, connection) = spawned.into_parts();
@@ -1035,6 +1049,25 @@ impl AgentManager {
                 .connection
                 .clone()
         };
+        // Pre-first-token turn-startup hint: the ACP `initialize` handshake is
+        // about to run for this agent (STAT-1 / PROTOCOL §7). Resolve the owning
+        // workspace from the store so the status payload carries `workspaceId`
+        // (the FE routes hints per-agent but callers key the timeline on it).
+        let workspace_id = self
+            .services
+            .store
+            .get_agent_session(agent_id)
+            .await?
+            .workspace_id;
+        self.services
+            .publish_status_event(
+                &workspace_id,
+                agent_id,
+                "init",
+                "Initializing protocol\u{2026}",
+                "info",
+            )
+            .await;
         let handshake = handshake(conn.as_ref(), provider)
             .await
             .map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
