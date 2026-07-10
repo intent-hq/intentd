@@ -41,6 +41,11 @@ pub type HostFn = Arc<
 /// Default wall-clock timeout — mirrors the reference TS tool.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default QuickJS memory ceiling (64 MB). The engine executes untrusted-ish
+/// agent code, so the default must be bounded; unlimited memory is only
+/// reachable by explicitly setting `memory_limit_bytes: None`.
+pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
 /// Extra time the outer `tokio::time::timeout` waits past the interrupt
 /// deadline so the interrupt handler has a chance to raise an uncatchable
 /// JS exception before we drop the whole future.
@@ -67,7 +72,9 @@ pub struct EvalOptions {
     /// Wall-clock budget, enforced by both a QuickJS interrupt handler and
     /// an outer `tokio::time::timeout`.
     pub timeout: Duration,
-    /// Optional QuickJS memory ceiling; `None` = unlimited.
+    /// QuickJS memory ceiling; defaults to [`DEFAULT_MEMORY_LIMIT_BYTES`].
+    /// `None` disables the cap entirely — an explicit opt-out, never the
+    /// default.
     pub memory_limit_bytes: Option<usize>,
 }
 
@@ -75,7 +82,7 @@ impl Default for EvalOptions {
     fn default() -> Self {
         Self {
             timeout: DEFAULT_TIMEOUT,
-            memory_limit_bytes: None,
+            memory_limit_bytes: Some(DEFAULT_MEMORY_LIMIT_BYTES),
         }
     }
 }

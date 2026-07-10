@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use intent_js::{eval, BoxFuture, EvalOptions, HostFn, JsError};
+use intent_js::{eval, BoxFuture, EvalOptions, HostFn, JsError, DEFAULT_MEMORY_LIMIT_BYTES};
 
 fn short_opts(ms: u64) -> EvalOptions {
     EvalOptions {
@@ -103,6 +103,37 @@ async fn overlarge_timeout_errors_instead_of_panicking() {
         JsError::Engine(msg) => assert!(msg.contains("overflow"), "got: {msg}"),
         other => panic!("expected Engine, got {other:?}"),
     }
+}
+
+#[test]
+fn default_memory_limit_is_capped() {
+    // Untrusted-ish agent code must not run with unlimited memory by default;
+    // `None` (unlimited) is only reachable by explicit opt-out.
+    assert_eq!(
+        EvalOptions::default().memory_limit_bytes,
+        Some(DEFAULT_MEMORY_LIMIT_BYTES)
+    );
+    assert_eq!(DEFAULT_MEMORY_LIMIT_BYTES, 64 * 1024 * 1024);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_hog_is_killed_by_default_limit() {
+    // Repeated string doubling blows past the 64 MB default cap within a few
+    // dozen iterations — long before the 30 s wall-clock budget.
+    let started = Instant::now();
+    let err = eval(
+        "let s = 'x'; while (true) { s += s; } return s.length;",
+        &EvalOptions::default(),
+        None,
+    )
+    .await
+    .expect_err("memory hog must be rejected by the default cap");
+    assert!(matches!(err, JsError::Runtime(_)), "got {err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "memory cap should trip well before the wall clock: {:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
