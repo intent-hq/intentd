@@ -3970,6 +3970,13 @@ mod wsapi3_bindings_tests {
         let v = body(&resp);
         assert_eq!(v["isTask"], json!(true));
         assert_eq!(v["taskStatus"], json!("in_progress"));
+        // taskStatus / taskMetadata must be fully serialized (never a silent null
+        // fallback): the serializer errors would surface as a JS-visible error.
+        assert!(v["taskStatus"].is_string(), "taskStatus should be a string");
+        assert!(
+            v["taskMetadata"].is_object(),
+            "taskMetadata should be an object"
+        );
         let content = v["content"].as_str().unwrap();
         assert!(content.contains("--- Task Metadata ---"));
         assert!(content.contains("Acceptance Criteria:"));

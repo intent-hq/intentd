@@ -124,16 +124,14 @@ async fn read(
         "images": Vec::<Value>::new(),
     });
     if let Some(task) = note.task.as_ref() {
+        let task_status = serde_json::to_value(task.status)
+            .map_err(|e| format!("engine: serialize taskStatus failed: {e}"))?;
+        let task_metadata = serde_json::to_value(task)
+            .map_err(|e| format!("engine: serialize taskMetadata failed: {e}"))?;
         let obj = out.as_object_mut().unwrap();
         obj.insert("isTask".to_string(), Value::Bool(true));
-        obj.insert(
-            "taskStatus".to_string(),
-            serde_json::to_value(task.status).unwrap_or(Value::Null),
-        );
-        obj.insert(
-            "taskMetadata".to_string(),
-            serde_json::to_value(task).unwrap_or(Value::Null),
-        );
+        obj.insert("taskStatus".to_string(), task_status);
+        obj.insert("taskMetadata".to_string(), task_metadata);
         obj.insert("dependencies".to_string(), json!([]));
     }
     Ok(out)
