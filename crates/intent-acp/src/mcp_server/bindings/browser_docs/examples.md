@@ -1,0 +1,162 @@
+# Browser API Examples
+
+## Opening Local HTML Files
+
+You can open local files directly using file:// URLs:
+
+```json
+// Open a local HTML file
+{
+  "actions": [
+    { "action": "openTab", "url": "file:///Users/me/project/index.html" }
+  ]
+}
+
+// Navigate an existing tab to a different local file
+{
+  "actions": [
+    { "action": "navigate", "url": "file:///Users/me/project/other.html" }
+  ]
+}
+```
+
+## Debugging a Page Load
+
+```json
+// Capture everything from page load
+{
+  "actions": [
+    {
+      "action": "snapshot",
+      "workspaceId": "my-workspace-id",
+      "reload": true,
+      "waitFor": { "networkIdle": 2000 }
+    }
+  ]
+}
+// Returns: { dir, a11y, screenshot, console?, network?, metadata }
+
+// Then check summary for quick triage:
+{
+  "actions": [
+    { "action": "getSummary", "captureDir": "/path/from/snapshot/result" }
+  ]
+}
+```
+
+## Finding and Clicking Elements
+
+```json
+// Get accessibility tree to understand page structure
+{
+  "actions": [
+    { "action": "getAccessibilityTree" }
+  ]
+}
+
+// Find button by accessible name and click it
+{
+  "actions": [
+    {
+      "action": "evaluate",
+      "expression": "const buttons = document.querySelectorAll('button'); for (const btn of buttons) { if (btn.textContent.includes('Submit')) { btn.click(); break; } }"
+    },
+    { "action": "getAccessibilityTree" }
+  ]
+}
+```
+
+## Capturing a Login Flow
+
+```json
+// 1. Start session
+{
+  "actions": [
+    { "action": "startSession", "workspaceId": "my-workspace-id", "name": "login-flow" }
+  ]
+}
+// Returns: { id: "session-id", ... }
+
+// 2. Capture initial state
+{
+  "actions": [
+    { "action": "captureStep", "sessionId": "session-id", "stepName": "1-initial", "reload": true }
+  ]
+}
+
+// 3. Fill credentials and capture
+{
+  "actions": [
+    { "action": "startCapture", "sessionId": "session-id" },
+    { "action": "evaluate", "expression": "document.querySelector('#email').value = 'test@example.com'; document.querySelector('#password').value = 'password123';" },
+    { "action": "captureStep", "sessionId": "session-id", "stepName": "2-filled" },
+    { "action": "evaluate", "expression": "document.querySelector('#login-form').submit()" },
+    { "action": "captureStep", "sessionId": "session-id", "stepName": "3-after-submit", "waitFor": { "networkIdle": 2000 } },
+    { "action": "endCapture", "sessionId": "session-id" },
+    { "action": "endSession", "sessionId": "session-id" }
+  ]
+}
+```
+
+## Measuring Scroll Performance
+
+```json
+// Start session and trace
+{
+  "actions": [
+    { "action": "startSession", "workspaceId": "my-workspace-id", "name": "scroll-perf" }
+  ]
+}
+
+// Run trace (note: for loops need multiple calls or use evaluate)
+{
+  "actions": [
+    { "action": "startTrace", "sessionId": "session-id", "traceName": "scroll" },
+    { "action": "evaluate", "expression": "window.scrollBy(0, 2500)" },
+    { "action": "stopTrace", "sessionId": "session-id", "traceName": "scroll" },
+    { "action": "endSession", "sessionId": "session-id" }
+  ]
+}
+// Trace file saved to {session}/scroll.json - open in Chrome DevTools Performance tab
+```
+
+## Debugging Network Requests
+
+```json
+{
+  "actions": [
+    { "action": "startSession", "workspaceId": "my-workspace-id", "name": "api-debug" }
+  ]
+}
+
+{
+  "actions": [
+    { "action": "startCapture", "sessionId": "session-id" },
+    { "action": "evaluate", "expression": "fetch('/api/data').then(r => r.json())" },
+    { "action": "captureStep", "sessionId": "session-id", "stepName": "after-fetch", "waitFor": { "networkIdle": 2000 } },
+    { "action": "endCapture", "sessionId": "session-id" },
+    { "action": "endSession", "sessionId": "session-id" }
+  ]
+}
+// Network requests are in result.network (JSONL file)
+```
+
+## Comparing Before/After States
+
+```json
+{
+  "actions": [
+    { "action": "startSession", "workspaceId": "my-workspace-id", "name": "comparison" }
+  ]
+}
+
+{
+  "actions": [
+    { "action": "captureStep", "sessionId": "session-id", "stepName": "before" },
+    { "action": "evaluate", "expression": "document.body.style.fontSize = '20px'; document.querySelector('.sidebar').remove();" },
+    { "action": "captureStep", "sessionId": "session-id", "stepName": "after" },
+    { "action": "endSession", "sessionId": "session-id" }
+  ]
+}
+// Compare the a11y trees in before/ and after/ directories
+```
