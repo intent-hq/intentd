@@ -1867,10 +1867,16 @@ impl Services {
             return;
         };
         // Terminal statuses must not be downgraded (parity with the router
-        // path's own no-op-when-unchanged branch).
+        // path's own no-op-when-unchanged branch), and a task already in
+        // `review_required` must skip the writer entirely: TASK-B's
+        // `task_update_note_status` always persists (bumping `updated_at` and
+        // `rev`) before checking `previous_status != new_status`, so repeated
+        // `reportToParent` calls would otherwise churn the note on every hop.
         if matches!(
             task.status,
-            intent_core::TaskStatus::Complete | intent_core::TaskStatus::Cancelled
+            intent_core::TaskStatus::Complete
+                | intent_core::TaskStatus::Cancelled
+                | intent_core::TaskStatus::ReviewRequired
         ) {
             return;
         }
@@ -2208,6 +2214,13 @@ impl Services {
     /// the non-oneShot queued-message watch — mirrors the TS 5-minute
     /// `setTimeout` unsubscribe). A watch already removed by delivery is a
     /// no-op; only a real removal republishes the parent's subscriptions.
+    ///
+    /// SUB-2: repeated arm calls monotonically extend the effective deadline
+    /// via [`Services::bump_watch_cleanup_deadline`]. Each spawned task then
+    /// consults that shared deadline before deleting, so an earlier task
+    /// waking first cannot remove a watch whose deadline was pushed out by a
+    /// later call — the later task (spawned for the new deadline) is the one
+    /// that performs the removal.
     pub(crate) fn spawn_watch_cleanup(
         &self,
         workspace_id: WorkspaceId,
@@ -2215,10 +2228,12 @@ impl Services {
         subscription_id: String,
         after: std::time::Duration,
     ) {
+        let deadline = std::time::Instant::now() + after;
+        self.bump_watch_cleanup_deadline(&workspace_id, &subscription_id, deadline);
         let services = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(after).await;
-            if services.remove_watch(&workspace_id, &subscription_id) {
+            if services.remove_watch_if_deadline_passed(&workspace_id, &subscription_id) {
                 services
                     .publish_subscriptions_changed(&workspace_id, &parent_agent_id)
                     .await;
@@ -2862,8 +2877,17 @@ impl Services {
             // its 5-minute leak-guard by respawning the cleanup timer against
             // the reused subscription id.
             if let Some(caller) = input.caller_agent_id.clone() {
+                // SUB-2: only reuse a live ungrouped watch when its
+                // `one_shot` mode matches this call. A queued wake needs a
+                // non-oneShot watch (it must survive the assignee's current
+                // `agent:idle`), so it must never inherit an existing
+                // oneShot watch — and a non-queued wake must not degrade the
+                // registry by re-observing an existing non-oneShot watch as
+                // oneShot. Mismatched modes fall through to a fresh
+                // `register_completion_watch`.
+                let one_shot = !queued;
                 let (subscription_id, reused) = if let Some(existing) =
-                    self.find_ungrouped_watch(&workspace_id, &caller, &agent_id)
+                    self.find_ungrouped_watch(&workspace_id, &caller, &agent_id, one_shot)
                 {
                     (existing.id, true)
                 } else {
@@ -2879,7 +2903,7 @@ impl Services {
                         caller.clone(),
                         caller_name,
                         agent_id.clone(),
-                        !queued,
+                        one_shot,
                         None,
                     );
                     (new_id, false)

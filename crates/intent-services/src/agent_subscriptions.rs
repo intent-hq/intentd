@@ -12,6 +12,7 @@
 //! AS-3 concern; this module only owns the registry records and helpers.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use intent_core::{now_iso, AgentId, Event, WorkspaceId};
 use uuid::Uuid;
@@ -32,6 +33,14 @@ pub(crate) struct CompletionWatch {
     pub one_shot: bool,
     pub group_id: Option<String>,
     pub created_at: String,
+    /// SUB-2: monotonic cleanup deadline for the leak-guard timer. Set (and
+    /// bumped) by [`Services::bump_watch_cleanup_deadline`]; a spawned cleanup
+    /// task only removes the watch once this instant is in the past, so an
+    /// earlier-scheduled timer cannot delete a watch whose deadline was
+    /// extended by a later `spawn_watch_cleanup` call. `None` means "no
+    /// timed cleanup is armed" (the default for one-shot watches, which are
+    /// removed on delivery instead).
+    pub cleanup_deadline: Option<Instant>,
 }
 
 /// Fan-in table for `waitMode: "after_all"` delegation groups. All children a
@@ -90,6 +99,7 @@ impl Services {
             one_shot,
             group_id,
             created_at: now_iso(),
+            cleanup_deadline: None,
         };
         self.agent_subscriptions
             .lock()
@@ -124,15 +134,19 @@ impl Services {
     }
 
     /// SUB-2: find a live ungrouped (immediate-mode) watch for the given
-    /// caller→target pair, if one exists. Used by `agent.wakeOrCreate` to
-    /// reuse an existing watch instead of stacking duplicates on repeated
-    /// wake calls; grouped (`after_all`) watches are skipped since they are
-    /// owned by the delegation-group fan-in.
+    /// caller→target pair whose `one_shot` mode matches `one_shot`, if one
+    /// exists. Used by `agent.wakeOrCreate` to reuse an existing watch
+    /// instead of stacking duplicates on repeated wake calls; grouped
+    /// (`after_all`) watches are skipped since they are owned by the
+    /// delegation-group fan-in. The `one_shot` filter ensures a queued wake
+    /// (which needs a non-oneShot watch to survive the current
+    /// `agent:idle`) never reuses a oneShot watch, and vice versa.
     pub(crate) fn find_ungrouped_watch(
         &self,
         workspace_id: &WorkspaceId,
         parent_agent_id: &AgentId,
         child_agent_id: &AgentId,
+        one_shot: bool,
     ) -> Option<CompletionWatch> {
         self.agent_subscriptions
             .lock()
@@ -143,11 +157,70 @@ impl Services {
                     .iter()
                     .find(|s| {
                         s.group_id.is_none()
+                            && s.one_shot == one_shot
                             && &s.parent_agent_id == parent_agent_id
                             && &s.child_agent_id == child_agent_id
                     })
                     .cloned()
             })
+    }
+
+    /// SUB-2: monotonically bump a watch's cleanup deadline to at least
+    /// `new_deadline` (never shortens). Returns whether the watch was found.
+    /// Paired with [`Services::remove_watch_if_deadline_passed`] so that a
+    /// stale cleanup task spawned by an earlier call can no-op when a later
+    /// call has extended the deadline past its wake-up time.
+    pub(crate) fn bump_watch_cleanup_deadline(
+        &self,
+        workspace_id: &WorkspaceId,
+        subscription_id: &str,
+        new_deadline: Instant,
+    ) -> bool {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let Some(w) = guard.get_mut(workspace_id) else {
+            return false;
+        };
+        let Some(watch) = w.subscriptions.iter_mut().find(|s| s.id == subscription_id) else {
+            return false;
+        };
+        watch.cleanup_deadline = Some(match watch.cleanup_deadline {
+            Some(existing) => existing.max(new_deadline),
+            None => new_deadline,
+        });
+        true
+    }
+
+    /// SUB-2: atomically remove the watch iff its `cleanup_deadline` is set
+    /// and has already elapsed. Returns whether a removal happened. Called
+    /// by the cleanup task spawned in [`Services::spawn_watch_cleanup`]; a
+    /// task that wakes before the current deadline is a no-op and the later
+    /// task (spawned for the extended deadline) performs the removal.
+    pub(crate) fn remove_watch_if_deadline_passed(
+        &self,
+        workspace_id: &WorkspaceId,
+        subscription_id: &str,
+    ) -> bool {
+        let now = Instant::now();
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let Some(w) = guard.get_mut(workspace_id) else {
+            return false;
+        };
+        let Some(idx) = w.subscriptions.iter().position(|s| s.id == subscription_id) else {
+            return false;
+        };
+        match w.subscriptions[idx].cleanup_deadline {
+            Some(deadline) if deadline <= now => {
+                w.subscriptions.remove(idx);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// All watches registered by `parent_agent_id`.

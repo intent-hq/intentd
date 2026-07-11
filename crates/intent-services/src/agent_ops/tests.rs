@@ -1164,6 +1164,104 @@ async fn report_to_parent_does_not_overwrite_terminal_task_status() {
     );
 }
 
+/// TASK-B: repeated `reportToParent` calls for the same delegated child
+/// must not re-persist the linked task note once it has already been
+/// transitioned to `review_required`. `task.updateNoteStatus` always
+/// bumps `updated_at` and `rev` before checking for a status change, so
+/// short-circuiting on the current status is what keeps repeated
+/// child-reports from churning the note (unresolved copilot review
+/// thread PRRT_kwDOS9Wxuc6QIRcj on PR #104).
+#[tokio::test]
+async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Ship feature Y".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    svc.mark_as_task(
+        ws.clone(),
+        note.id.clone(),
+        "in_progress".into(),
+        vec![],
+        None,
+    )
+    .await
+    .expect("markAsTask");
+
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            Some(note.id.clone()),
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let before_rev = svc
+        .store()
+        .get_note(&note.id)
+        .await
+        .expect("initial note")
+        .rev;
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("first"), Some(child.clone()))
+        .await
+        .expect("first report");
+    let after_first = svc
+        .store()
+        .get_note(&note.id)
+        .await
+        .expect("note after first");
+    assert_eq!(
+        after_first.task.as_ref().expect("task").status,
+        intent_core::TaskStatus::ReviewRequired
+    );
+    assert!(
+        after_first.rev > before_rev,
+        "first reportToParent must persist the review_required transition (rev {before_rev} -> {})",
+        after_first.rev
+    );
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("second"), Some(child))
+        .await
+        .expect("second report");
+    let after_second = svc
+        .store()
+        .get_note(&note.id)
+        .await
+        .expect("note after second");
+    assert_eq!(
+        after_second.task.as_ref().expect("task").status,
+        intent_core::TaskStatus::ReviewRequired
+    );
+    assert_eq!(
+        after_second.rev, after_first.rev,
+        "second reportToParent must not re-persist the note (rev must not bump when already \
+         review_required)"
+    );
+    assert_eq!(
+        after_second.updated_at, after_first.updated_at,
+        "second reportToParent must not bump updated_at when already review_required"
+    );
+}
+
 /// TASK-B: an agent without a linked task note reports back without touching
 /// any task metadata — the report is persisted and the call succeeds.
 #[tokio::test]
@@ -2676,6 +2774,148 @@ async fn spawn_watch_cleanup_removes_watch_after_timeout() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("cleanup did not remove the queued watch");
+}
+
+/// SUB-2 (unresolved copilot review thread PRRT_kwDOS9Wxuc6QIRcq on PR #104):
+/// a queued wake must never reuse a pre-existing oneShot watch for the same
+/// caller/target pair, because a oneShot watch is removed on the first
+/// `agent:idle` — which is precisely the idle that a queued message needs to
+/// survive. The queued path must therefore register a fresh non-oneShot
+/// watch alongside the existing oneShot one. A pre-seeded oneShot watch
+/// (registered via [`Services::register_completion_watch`] to sidestep
+/// runtime turn-starting side effects) drives the queued wake through the
+/// mode-mismatch fall-through in [`Services::agent_wake_or_create_op`].
+#[tokio::test]
+async fn wake_or_create_queued_does_not_reuse_or_receive_oneshot_watch() {
+    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    let note_id = seed_task(&svc, &ws, "SUB-2 mode mismatch").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+        .await
+        .expect("assign");
+
+    // Seed a oneShot watch for this caller/target pair (as an earlier
+    // non-queued wake would have registered).
+    let oneshot_sub_id = svc.register_completion_watch(
+        &ws,
+        caller.clone(),
+        "Coordinator".into(),
+        target.clone(),
+        true,
+        None,
+    );
+
+    // Occupy the assignee's in-flight slot so the wakeOrCreate takes the
+    // queued branch deterministically.
+    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+
+    let queued = svc
+        .agent_wake_or_create_op(
+            ws.clone(),
+            note_id,
+            "follow up".into(),
+            AgentWakeOrCreateInput {
+                caller_agent_id: Some(caller.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("queued wake");
+    assert_eq!(queued["action"], "message_queued_to_active_agent");
+    let queued_sub_id = queued["subscriptionId"]
+        .as_str()
+        .expect("queued subscriptionId")
+        .to_string();
+
+    assert_ne!(
+        oneshot_sub_id, queued_sub_id,
+        "queued wake must not reuse the oneShot subscription id"
+    );
+
+    // Both watches now coexist: the oneShot watch is unchanged and a
+    // fresh non-oneShot watch was registered for the queued delivery.
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(
+        watches.len(),
+        2,
+        "queued must add a distinct watch: {watches:?}"
+    );
+    let oneshot = watches
+        .iter()
+        .find(|w| w.id == oneshot_sub_id)
+        .expect("original oneShot watch still present");
+    assert!(
+        oneshot.one_shot,
+        "existing oneShot watch must remain oneShot"
+    );
+    let queued_watch = watches
+        .iter()
+        .find(|w| w.id == queued_sub_id)
+        .expect("fresh queued watch present");
+    assert!(
+        !queued_watch.one_shot,
+        "queued watch must be non-oneShot so it survives the current agent:idle"
+    );
+
+    manager.release_slot(&target).await;
+}
+
+/// SUB-2 (unresolved copilot review thread PRRT_kwDOS9Wxuc6QIRcq on PR #104):
+/// reusing a queued watch across repeated `wakeOrCreate` calls must not
+/// shorten its effective cleanup deadline. An earlier-spawned cleanup task
+/// wakes first but must no-op because the deadline has been extended by a
+/// later call; the later task then performs the removal at the new deadline.
+#[tokio::test]
+async fn spawn_watch_cleanup_extension_defers_removal_to_the_later_deadline() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let sub_id = svc.register_completion_watch(
+        &ws,
+        caller.clone(),
+        "Coordinator".into(),
+        target.clone(),
+        false,
+        None,
+    );
+    assert_eq!(svc.list_watches_for_parent(&ws, &caller).len(), 1);
+
+    // Arm a short cleanup, then immediately extend it with a much later
+    // deadline before the first timer can fire.
+    svc.spawn_watch_cleanup(
+        ws.clone(),
+        caller.clone(),
+        sub_id.clone(),
+        Duration::from_millis(80),
+    );
+    svc.spawn_watch_cleanup(
+        ws.clone(),
+        caller.clone(),
+        sub_id.clone(),
+        Duration::from_millis(600),
+    );
+
+    // Wait past the original (short) deadline. If the earlier task removed
+    // the watch it would be gone here — that is the bug this test guards
+    // against.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(
+        watches.len(),
+        1,
+        "earlier cleanup task must not shorten an extended deadline (watches now: {watches:?})"
+    );
+
+    // Wait past the extended deadline; the later task must fire and remove.
+    let removal_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < removal_deadline {
+        if svc.list_watches_for_parent(&ws, &caller).is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("later cleanup task did not remove the watch after the extended deadline");
 }
 
 /// End-to-end through the MCP front door: delegating with a caller registers
