@@ -250,6 +250,121 @@ async fn completion_delivery_leaves_group_watch_for_as4() {
     assert_eq!(svc.find_watches_for_child(&ws, &child).len(), 1);
 }
 
+/// The immediate-path wake persists FE-shaped `event_notification` metadata on
+/// the parent's user-message row so `EventWakeupBanner` can render a real
+/// `eventCount` / `eventTypes` / per-agent `events` payload instead of the
+/// fallback "Subscription update — 0 events".
+#[tokio::test]
+async fn completion_delivery_attaches_event_notification_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        true,
+        None,
+    );
+
+    let event = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({
+            "agentId": child.0,
+            "lastResponseSummary": "shipped it",
+            "completionReport": "done",
+        }),
+    );
+    svc.handle_completion_event(&event).await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1);
+    let msg = &session.messages[0];
+    assert_eq!(msg.role, "user");
+    let metadata = msg
+        .metadata
+        .as_ref()
+        .expect("wake message carries event_notification metadata");
+    assert_eq!(metadata["type"], json!("event_notification"));
+    assert_eq!(metadata["eventCount"], json!(1));
+    assert_eq!(metadata["eventTypes"], json!([AGENT_IDLE]));
+    let events = metadata["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["id"], json!(event.id));
+    assert_eq!(events[0]["type"], json!(AGENT_IDLE));
+    assert_eq!(events[0]["timestamp"], json!(event.timestamp));
+    assert_eq!(events[0]["data"]["agentId"], json!(child.0));
+    assert_eq!(events[0]["data"]["completionReport"], json!("done"));
+    assert_eq!(events[0]["actor"]["type"], json!("agent"));
+    assert_eq!(events[0]["actor"]["id"], json!(child.0));
+}
+
+/// The aggregated after_all wake carries `event_notification` metadata whose
+/// `eventCount` equals the group size and whose `events` array preserves each
+/// child's raw completion event (id, type, data, timestamp, actor).
+#[tokio::test]
+async fn group_fire_attaches_event_notification_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let c2 = delegate_after_all(&svc, &ws, &parent).await;
+
+    let e1 = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c1,
+        json!({ "agentId": c1.0, "lastResponseSummary": "one" }),
+    );
+    let e2 = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c2,
+        json!({ "agentId": c2.0, "lastResponseSummary": "two" }),
+    );
+    svc.handle_completion_event(&e1).await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    svc.handle_completion_event(&e2).await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1);
+    let metadata = session.messages[0]
+        .metadata
+        .as_ref()
+        .expect("aggregated wake carries event_notification metadata");
+    assert_eq!(metadata["type"], json!("event_notification"));
+    assert_eq!(metadata["eventCount"], json!(2));
+    assert_eq!(metadata["eventTypes"], json!([AGENT_IDLE]));
+    let events = metadata["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 2);
+    let ids: Vec<&str> = events.iter().map(|e| e["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&e1.id.as_str()));
+    assert!(ids.contains(&e2.id.as_str()));
+    for e in events {
+        assert_eq!(e["type"], json!(AGENT_IDLE));
+        assert!(e["data"]["agentId"].is_string());
+        assert!(e["timestamp"].is_string());
+        assert_eq!(e["actor"]["type"], json!("agent"));
+    }
+}
+
 async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
     let created = svc
         .agent_create_op(
@@ -2710,7 +2825,8 @@ async fn parent_messages_text(svc: &Services, parent: &AgentId) -> String {
         .get_agent_session(parent)
         .await
         .expect("parent session");
-    serde_json::to_string(&session.messages).expect("serialize messages")
+    let blocks: Vec<_> = session.messages.iter().map(|m| &m.content).collect();
+    serde_json::to_string(&blocks).expect("serialize content blocks")
 }
 
 /// Two after_all delegates from one parent share a single group whose expected

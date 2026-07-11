@@ -1143,13 +1143,26 @@ impl Services {
                     .ok()
                     .and_then(|s| s.completion_report);
                 let summary = format_group_child_line(child_id, event, report.as_deref());
-                self.record_group_child_completion(workspace_id, &gid, child_id, deleted, summary);
+                self.record_group_child_completion(
+                    workspace_id,
+                    &gid,
+                    child_id,
+                    deleted,
+                    summary,
+                    event.clone(),
+                );
                 self.try_fire_group(workspace_id, &gid).await;
                 continue;
             }
             let wake = format_completion_wake(child_id, event);
+            let metadata = build_event_notification_metadata(&[event]);
             if let Err(e) = self
-                .deliver_parent_wake(workspace_id, watch.parent_agent_id.clone(), wake)
+                .deliver_parent_wake(
+                    workspace_id,
+                    watch.parent_agent_id.clone(),
+                    wake,
+                    Some(metadata),
+                )
                 .await
             {
                 tracing::warn!(
@@ -1177,8 +1190,15 @@ impl Services {
             return;
         };
         let wake = format_group_wake(&group);
+        let event_refs: Vec<&Event> = group.raw_events.iter().collect();
+        let metadata = build_event_notification_metadata(&event_refs);
         if let Err(e) = self
-            .deliver_parent_wake(workspace_id, group.parent_agent_id.clone(), wake)
+            .deliver_parent_wake(
+                workspace_id,
+                group.parent_agent_id.clone(),
+                wake,
+                Some(metadata),
+            )
             .await
         {
             tracing::warn!(
@@ -1198,12 +1218,15 @@ impl Services {
     /// turn worker, so the parent runs a REAL turn with the normal stream/idle
     /// event lifecycle (`agent:stream:*` chunks, `agent:idle` at end); a busy
     /// parent gets the wake queued and drained at turn end. Read-only/test
-    /// wiring falls back to the store-only persist.
+    /// wiring falls back to a store-only persist that carries the same metadata
+    /// so the FE `EventWakeupBanner` reads a real `eventCount` / `eventTypes`
+    /// instead of the fallback "Subscription update — 0 events".
     pub(crate) async fn deliver_parent_wake(
         &self,
         workspace_id: &WorkspaceId,
         parent_agent_id: AgentId,
         content: String,
+        message_metadata: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
         match self.agent_manager() {
             Some(manager) => {
@@ -1213,16 +1236,61 @@ impl Services {
                         workspace_id.clone(),
                         content,
                         None,
-                        crate::agent_manager::TurnOptions::default(),
+                        crate::agent_manager::TurnOptions {
+                            message_metadata,
+                            ..Default::default()
+                        },
                     )
                     .await
             }
             None => {
-                self.agent_send_message_op(parent_agent_id, content, None)
-                    .await
+                let blocks = serde_json::json!([{ "type": "text", "text": content }]);
+                self.store
+                    .append_agent_message_with_metadata(
+                        &parent_agent_id,
+                        "user",
+                        &blocks,
+                        message_metadata.as_ref(),
+                        &now_iso(),
+                    )
+                    .await?;
+                Ok(serde_json::json!({ "success": true, "queued": false }))
             }
         }
     }
+}
+
+/// Build the FE `event_notification` message metadata for a parent wake, matching
+/// the reference `delivery-saga.sendBackendMessage` shape: `type`, `eventCount`,
+/// unique `eventTypes` (order-preserving), and a compact per-event array
+/// carrying only `id`, `type`, `data`, `timestamp`, `actor`. Feeds
+/// `EventWakeupBanner` so it can render a real count / label / per-agent cards.
+fn build_event_notification_metadata(events: &[&Event]) -> serde_json::Value {
+    let mut seen = std::collections::HashSet::new();
+    let mut event_types: Vec<String> = Vec::new();
+    for e in events {
+        if seen.insert(e.event_type.clone()) {
+            event_types.push(e.event_type.clone());
+        }
+    }
+    let events_json: Vec<serde_json::Value> = events
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id,
+                "type": e.event_type,
+                "data": e.data,
+                "timestamp": e.timestamp,
+                "actor": e.actor,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "type": "event_notification",
+        "eventCount": events.len(),
+        "eventTypes": event_types,
+        "events": events_json,
+    })
 }
 
 /// Fetch a note scoped to `workspace_id`; `NotFound` if absent or in another

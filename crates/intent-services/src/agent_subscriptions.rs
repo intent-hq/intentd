@@ -11,7 +11,7 @@
 //! `['agent:idle','agent:failed','agent:deleted']`). The event-type wiring is an
 //! AS-3 concern; this module only owns the registry records and helpers.
 
-use intent_core::{now_iso, AgentId, WorkspaceId};
+use intent_core::{now_iso, AgentId, Event, WorkspaceId};
 use uuid::Uuid;
 
 use crate::Services;
@@ -52,6 +52,11 @@ pub(crate) struct DelegationGroup {
     pub sealed: bool,
     pub delivered: bool,
     pub event_summaries: Vec<String>,
+    /// Source completion events recorded per child (in the same order as
+    /// `event_summaries`), retained so the aggregated wake carries the FE
+    /// `event_notification` metadata (per-event `id`, `type`, `data`,
+    /// `timestamp`, `actor`) alongside the human-readable summary text.
+    pub raw_events: Vec<Event>,
 }
 
 /// Per-workspace registry state held behind the `Services` mutex.
@@ -206,6 +211,7 @@ impl Services {
             sealed: false,
             delivered: false,
             event_summaries: Vec::new(),
+            raw_events: Vec::new(),
         });
         group_id
     }
@@ -280,8 +286,10 @@ impl Services {
     }
 
     /// Record one child's completion in its group (idempotent): adds it to the
-    /// completed or deleted set and pushes a summary line. No-ops if the child is
-    /// not expected or already recorded, or if the group no longer exists.
+    /// completed or deleted set, pushes a summary line, and retains the source
+    /// event for the aggregated wake's `event_notification` metadata. No-ops if
+    /// the child is not expected or already recorded, or if the group no longer
+    /// exists.
     pub(crate) fn record_group_child_completion(
         &self,
         workspace_id: &WorkspaceId,
@@ -289,6 +297,7 @@ impl Services {
         child_id: &AgentId,
         deleted: bool,
         summary: String,
+        event: Event,
     ) {
         let mut guard = self
             .agent_subscriptions
@@ -316,6 +325,7 @@ impl Services {
             g.completed_agent_ids.push(child_id.clone());
         }
         g.event_summaries.push(summary);
+        g.raw_events.push(event);
     }
 
     /// Atomically claim a group for delivery if it is sealed, complete, and not

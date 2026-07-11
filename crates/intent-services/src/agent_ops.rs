@@ -1816,7 +1816,7 @@ impl Services {
             // Non-grouped (immediate-mode) children deliver right away, through
             // the runtime send-message path so the parent runs a real turn.
             let _ = self
-                .deliver_parent_wake(&workspace_id, parent.clone(), report_text)
+                .deliver_parent_wake(&workspace_id, parent.clone(), report_text, None)
                 .await?;
         }
         Ok(json!({

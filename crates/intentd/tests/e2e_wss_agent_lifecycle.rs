@@ -2208,6 +2208,40 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
         wake.contains("All 2 delegated child agent(s) settled"),
         "aggregated wake header: {wake}"
     );
+
+    // The wake user-message row carries FE `event_notification` metadata so
+    // `EventWakeupBanner` reads a real `eventCount` / `eventTypes` / `events`
+    // payload instead of the fallback "Subscription update — 0 events".
+    let wake_msg = messages
+        .iter()
+        .find(|m| {
+            serde_json::to_string(&m["contentBlocks"])
+                .unwrap_or_default()
+                .contains("[WORKSPACE EVENTS]")
+        })
+        .expect("wake message present");
+    let metadata = &wake_msg["metadata"];
+    assert_eq!(
+        metadata["type"], "event_notification",
+        "wake metadata type: {wake_msg}"
+    );
+    assert_eq!(
+        metadata["eventCount"], 2,
+        "wake metadata eventCount: {wake_msg}"
+    );
+    let event_types = metadata["eventTypes"].as_array().expect("eventTypes array");
+    assert!(
+        event_types.iter().any(|t| t == "agent:idle"),
+        "eventTypes contains agent:idle: {metadata}"
+    );
+    let events = metadata["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 2, "wake metadata events length: {metadata}");
+    for event in events {
+        assert!(event["id"].is_string(), "event.id string: {event}");
+        assert!(event["type"].is_string(), "event.type string: {event}");
+        assert!(event["timestamp"].is_string(), "event.timestamp: {event}");
+        assert!(event["actor"].is_object(), "event.actor object: {event}");
+    }
     assert!(
         wake.contains(REPORT_A),
         "wake carries the alpha report: {wake}"
