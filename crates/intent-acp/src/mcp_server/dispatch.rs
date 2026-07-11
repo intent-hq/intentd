@@ -13,6 +13,13 @@ use serde_json::Value;
 
 use super::WorkspaceMcpServer;
 
+/// SUB-1 parity blurb surfaced by `send_message_to_agent` /
+/// `send_message_to_task_agent` when a sender completion watch was registered.
+/// Mirrors the reference `SendMessageTool` (`agent-interaction-tools.ts`,
+/// TS `notificationMessage`) and the same line already emitted by
+/// `agent_wake_or_create_op`.
+const SENDER_WATCH_NOTIFICATION: &str = "You will be notified when the agent responds.";
+
 fn req_str(args: &Value, key: &str) -> Result<String> {
     args.get(key)
         .and_then(Value::as_str)
@@ -525,9 +532,12 @@ impl WorkspaceMcpServer {
                 // (TS `maybeSubscribeCallerToAgentCompletionForCoordination-
                 // Message`). Delegated background senders are skipped inside
                 // the services impl; failure is non-fatal — the message is
-                // already delivered.
+                // already delivered. Mirrors the reference `SendMessageTool`
+                // by surfacing the "You will be notified when the agent
+                // responds." hint alongside the subscription id.
                 if let Some(sub) = self.watch_completion_for_sender(ws, agent_id).await {
                     result["subscriptionId"] = serde_json::json!(sub);
+                    result["message"] = serde_json::json!(SENDER_WATCH_NOTIFICATION);
                 }
                 val::<Value>(Ok(result))
             }
@@ -550,6 +560,7 @@ impl WorkspaceMcpServer {
                 if let Some(target) = target {
                     if let Some(sub) = self.watch_completion_for_sender(ws, target).await {
                         result["subscriptionId"] = serde_json::json!(sub);
+                        result["message"] = serde_json::json!(SENDER_WATCH_NOTIFICATION);
                     }
                 }
                 val::<Value>(Ok(result))

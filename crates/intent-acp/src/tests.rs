@@ -2246,13 +2246,18 @@ mod dispatch_unit_tests {
         let payload: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(payload["subscriptionId"], json!("sub-sender-1"));
         assert_eq!(
+            payload["message"],
+            json!("You will be notified when the agent responds.")
+        );
+        assert_eq!(
             *api.sender_watched.lock().unwrap(),
             vec![("agent-77".to_string(), "agent-1".to_string())]
         );
     }
 
     /// SUB-1: the caller-less front door (FE/RPC) registers no sender watch
-    /// and the payload stays in the pre-SUB-1 shape.
+    /// and the payload stays in the pre-SUB-1 shape (no `subscriptionId` /
+    /// `message` keys).
     #[tokio::test]
     async fn send_message_arm_skips_sender_watch_without_caller() {
         let (srv, api) = server();
@@ -2266,6 +2271,7 @@ mod dispatch_unit_tests {
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let payload: serde_json::Value = serde_json::from_str(text).unwrap();
         assert!(payload.get("subscriptionId").is_none());
+        assert!(payload.get("message").is_none());
         assert!(api.sender_watched.lock().unwrap().is_empty());
     }
 
@@ -2286,6 +2292,10 @@ mod dispatch_unit_tests {
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let payload: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(payload["subscriptionId"], json!("sub-sender-1"));
+        assert_eq!(
+            payload["message"],
+            json!("You will be notified when the agent responds.")
+        );
         assert_eq!(
             *api.sender_watched.lock().unwrap(),
             vec![("agent-77".to_string(), "agent-assignee".to_string())]
