@@ -587,6 +587,64 @@ async fn git_stage_csv_string_splits_on_commas() {
 }
 
 #[tokio::test]
+async fn git_stage_blocks_stage_all_in_array_form() {
+    // Array-wrapped sentinels must be rejected too — the string-only guard
+    // in the reference is not enough to honor the documented contract.
+    for input in [
+        "['.']",
+        "['*']",
+        "['--all']",
+        "['a.txt', '.']",
+        "['a.txt', '*']",
+        "['a.txt', '--all']",
+    ] {
+        let (srv, api) = server();
+        let resp = call(&srv, &format!("return await ws.git.stage({input});")).await;
+        assert_eq!(
+            resp["result"]["isError"],
+            json!(true),
+            "expected error for {input}"
+        );
+        assert!(
+            text(&resp).contains("Staging all files is not allowed"),
+            "expected stage-all error text for {input}"
+        );
+        assert!(
+            api.stage_calls.lock().unwrap().is_empty(),
+            "daemon must not be called for {input}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn git_stage_all_error_message_matches_reference_verbatim() {
+    // Pin the exact wording so the `\`-continuation whitespace bug cannot
+    // regress: matches ws-git-api.ts word-for-word and the message portion
+    // itself contains no runs of spaces (the surrounding JS stack trace does).
+    let expected = "Staging all files is not allowed. Please specify individual file paths to \
+                    stage. Use git_status to see which files you have modified, then stage only \
+                    those specific files.";
+    let (srv, _api) = server();
+    let resp = call(&srv, "return await ws.git.stage('.');").await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    let got = text(&resp);
+    assert!(
+        got.contains(expected),
+        "message must match reference verbatim; got: {got:?}"
+    );
+    let start = got.find("Staging all files").expect("message present");
+    let end = got[start..]
+        .find("specific files.")
+        .expect("message end present")
+        + "specific files.".len();
+    let message = &got[start..start + end];
+    assert!(
+        !message.contains("  "),
+        "message must not contain runs of spaces; got: {message:?}"
+    );
+}
+
+#[tokio::test]
 async fn git_commit_appends_agent_id_when_caller_present() {
     let (srv, api) = server_with_caller("agent-9");
     let resp = call(&srv, "return await ws.git.commit('feat: x');").await;

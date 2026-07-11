@@ -49,6 +49,14 @@ async fn status(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, 
     serde_json::to_value(r).map_err(|e| e.to_string())
 }
 
+/// Canonical stage-all rejection message. Matches `ws-git-api.ts` word-for-word
+/// so agents that key off the wording behave the same against the port.
+const STAGE_ALL_REJECTED: &str = "Staging all files is not allowed. Please specify individual file paths to stage. Use git_status to see which files you have modified, then stage only those specific files.";
+
+fn is_stage_all_sentinel(p: &str) -> bool {
+    p == "." || p == "*" || p.contains("--all")
+}
+
 async fn stage(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -58,16 +66,12 @@ async fn stage(
         .get("paths")
         .cloned()
         .ok_or_else(|| "paths is required".to_string())?;
-    // Stage-all sentinels are rejected here — mirrors `ws-git-api.ts` verbatim
-    // so agents cannot bypass the guard via the tool-restrictions layer.
+    // Stage-all sentinels are rejected here — mirrors `ws-git-api.ts` for the
+    // string form and additionally rejects the same sentinels when passed via
+    // an array so agents cannot bypass the guard by wrapping in `["."]` etc.
     if let Some(s) = paths.as_str() {
-        if s == "." || s == "*" || s.contains("--all") {
-            return Err(
-                "Staging all files is not allowed. Please specify individual file paths to stage. \
-                 Use git_status to see which files you have modified, then stage only those \
-                 specific files."
-                    .to_string(),
-            );
+        if is_stage_all_sentinel(s) {
+            return Err(STAGE_ALL_REJECTED.to_string());
         }
     }
     let list: Vec<String> = if let Some(arr) = paths.as_array() {
@@ -84,6 +88,9 @@ async fn stage(
     } else {
         return Err("paths must be a string or array of strings".to_string());
     };
+    if list.iter().any(|p| is_stage_all_sentinel(p)) {
+        return Err(STAGE_ALL_REJECTED.to_string());
+    }
     if list.is_empty() {
         return Err(
             "No file paths provided. Please specify at least one file path to stage.".to_string(),
