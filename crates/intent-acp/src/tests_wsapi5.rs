@@ -254,7 +254,13 @@ impl WorkspaceApi for FakeApi {
 
     fn script_list(&self, _id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         *self.script_list_calls.lock().unwrap() += 1;
-        Box::pin(async { Ok(json!([{ "id": "s-1", "name": "dev" }])) })
+        // Mirror the production `WorkspaceApi::script_list` shape from
+        // `intent-services::ScriptManager::list`, which wraps the bare
+        // array in `{ "scripts": [...] }`. The binding is responsible for
+        // reshaping it to the reference bare-array contract before it
+        // reaches JS callers — returning the wrapped shape here keeps the
+        // test exercising that reshape.
+        Box::pin(async { Ok(json!({ "scripts": [{ "id": "s-1", "name": "dev" }] })) })
     }
 
     fn script_create(

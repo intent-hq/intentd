@@ -53,7 +53,18 @@ pub(crate) async fn dispatch(
 }
 
 async fn list(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
-    api.script_list(ws.clone()).await.map_err(map_err)
+    // The reference `ws.script.list()` (see `ws-script-api.ts`) returns a
+    // bare array of scripts, but the production `WorkspaceApi::script_list`
+    // (via `intent-services::ScriptManager::list`) wraps them as
+    // `{ "scripts": [...] }`. Unwrap the `scripts` field when present so
+    // JS callers get the documented shape; fall back to the raw value for
+    // forward-compatibility with any daemon that already returns a bare
+    // array.
+    let raw = api.script_list(ws.clone()).await.map_err(map_err)?;
+    if let Some(inner) = raw.get("scripts") {
+        return Ok(inner.clone());
+    }
+    Ok(raw)
 }
 
 async fn create(
