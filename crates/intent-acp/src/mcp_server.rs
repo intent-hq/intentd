@@ -145,18 +145,18 @@ impl WorkspaceMcpServer {
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return err(id, -32602, "Missing tool name");
         };
-        if self.denylist.contains(name) {
-            return err(id, -32602, &format!("Tool not available: {name}"));
-        }
-        if !tools::all_tools().iter().any(|t| t.name == name) {
-            return err(id, -32602, &format!("Tool not found: {name}"));
-        }
         // After the WSAPI-8 cutover `workspace_api` is the only tool the
-        // daemon dispatches; guard explicitly on the name so a future
-        // registry entry cannot silently mis-dispatch through the
-        // JS-eval path here.
+        // daemon registers or dispatches. Check registration BEFORE the
+        // denylist so that legacy discrete names or agent-provider built-ins
+        // that happen to also appear on the denylist surface the accurate
+        // "Tool not found" error rather than the misleading
+        // "Tool not available", and so that a future registry entry cannot
+        // silently mis-dispatch through the JS-eval path below.
         if name != "workspace_api" {
             return err(id, -32602, &format!("Tool not found: {name}"));
+        }
+        if self.denylist.contains(name) {
+            return err(id, -32602, &format!("Tool not available: {name}"));
         }
         let args = params
             .get("arguments")

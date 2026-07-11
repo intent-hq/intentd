@@ -2963,6 +2963,36 @@ mod workspace_api_tool_tests {
     }
 
     #[tokio::test]
+    async fn tools_call_denylisted_but_unregistered_name_reports_tool_not_found() {
+        // A denylist may carry legacy discrete tool names or agent-provider
+        // built-ins that were never registered in the WSAPI-8 singleton
+        // registry. The registration check runs before the denylist check,
+        // so those names surface the accurate "Tool not found" MCP error
+        // instead of the misleading "Tool not available".
+        let api = WorkspaceInfoMockApi::new("amber-forest", None);
+        let srv = WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"))
+            .with_denylist(["get_note"]);
+        assert!(srv.is_denied("get_note"));
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "get_note", "arguments": { "noteId": "n" } }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("Tool not found"),
+            "expected `Tool not found` for denylisted-but-unregistered name, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Tool not available"),
+            "denylisted-but-unregistered name must not surface `Tool not available`, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
     async fn workspace_api_missing_summary_returns_invalid_params() {
         // The schema declares `summary` required alongside `code`; a call
         // without `summary` must fail with a clear MCP error before the JS
