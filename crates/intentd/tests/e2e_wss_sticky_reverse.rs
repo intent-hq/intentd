@@ -13,6 +13,7 @@
 #![cfg(unix)]
 
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +24,7 @@ use intent_store::Store;
 use intent_transport::{PrimaryReverseRegistry, WsApiServer, WsOptions};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -37,16 +38,26 @@ fn free_port() -> u16 {
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// Owns the fixture's scratch directory and removes it on drop so a panicking
+/// test does not leak files under the system tempdir (matches the pattern
+/// used by `TempDir` in `uds_specialist.rs`).
+struct TempDir(PathBuf);
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 struct Fixture {
     ws: WsApiServer,
     api: Arc<dyn WorkspaceApi>,
     port: u16,
-    _dir: std::path::PathBuf,
+    _dir: TempDir,
 }
 
 async fn boot() -> Fixture {
     let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::path::Path::new("/tmp").join(format!("intentd-sticky-{}", &short[..8]));
+    let dir = std::env::temp_dir().join(format!("intentd-sticky-{}", &short[..8]));
     std::fs::create_dir_all(&dir).unwrap();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
@@ -70,7 +81,7 @@ async fn boot() -> Fixture {
         ws,
         api,
         port,
-        _dir: dir,
+        _dir: TempDir(dir),
     }
 }
 
@@ -84,9 +95,17 @@ async fn connect(port: u16) -> PlainWs {
 
 /// Read the next `Message::Text` frame, answering pings inline. Returns `None`
 /// if the deadline elapses so a caller can assert "no traffic on this socket".
+/// `dur` is the *total* budget across all frames (ping-answer loops included):
+/// each iteration recomputes the remaining time against a fixed deadline so a
+/// steady stream of pings can't extend the wait indefinitely.
 async fn try_read_text(ws: &mut PlainWs, dur: Duration) -> Option<Value> {
+    let deadline = Instant::now() + dur;
     loop {
-        match timeout(dur, ws.next()).await {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match timeout(remaining, ws.next()).await {
             Err(_) => return None,
             Ok(Some(Ok(Message::Text(text)))) => {
                 return Some(serde_json::from_str(&text).expect("json"));

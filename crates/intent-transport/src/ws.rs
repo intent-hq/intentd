@@ -247,8 +247,8 @@ impl WsApiServer {
 
     /// Swap the reverse-dispatch registry on the inner state. The `WsInner`
     /// carries interior-mutable state (mutexes, atomics), so it cannot be
-    /// cloned via `Arc::make_mut`; instead we rebuild the `Arc<WsInner>` by
-    /// unwrapping it — safe because the builder chain owns the sole strong
+    /// cloned via `Arc::make_mut`; instead we borrow it exclusively with
+    /// `Arc::get_mut` — safe because the builder chain owns the sole strong
     /// reference before [`start`](Self::start) publishes clones. Called only
     /// from the two `*_with_reverse` constructors.
     fn install_registry(server: &mut Self, reverse_registry: Arc<PrimaryReverseRegistry>) {
