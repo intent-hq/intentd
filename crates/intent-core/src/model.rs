@@ -452,8 +452,28 @@ pub struct WorkspaceUpdate {
     pub archived: Option<bool>,
 }
 
-/// Note entity (§9.1). `task` carries serialized task metadata when the note is
-/// a task; this slice treats it opaquely (stored as `task_json` TEXT).
+/// Additional per-note metadata that ships nested under `metadata` on the wire
+/// (§9.1). Mirrors the TS `NoteMetadata` shape; today only carries the optional
+/// [`TaskMetadata`] for task notes. Kept as its own struct so future fields
+/// (author, session, etc.) land under `metadata.*` rather than at the top level.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskMetadata>,
+}
+
+impl NoteMetadata {
+    /// True when no metadata field is populated; used by [`Note`]'s
+    /// `skip_serializing_if` so plain notes omit the `metadata` key entirely.
+    pub fn is_empty(&self) -> bool {
+        self.task.is_none()
+    }
+}
+
+/// Note entity (§9.1). `metadata.task` carries serialized task metadata when
+/// the note is a task; this slice treats it opaquely (stored as `task_json`
+/// TEXT).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Note {
@@ -468,8 +488,8 @@ pub struct Note {
     pub is_default: bool,
     pub parent_id: Option<NoteId>,
     pub visibility: NoteVisibility,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task: Option<TaskMetadata>,
+    #[serde(default, skip_serializing_if = "NoteMetadata::is_empty")]
+    pub metadata: NoteMetadata,
     pub created_at: String,
     /// Monotonic version counter (§8.3). Bumped on every write; used as the
     /// `expectedVersion` optimistic-concurrency token. Existing rows default `0`.

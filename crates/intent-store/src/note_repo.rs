@@ -1,6 +1,9 @@
 //! Note repository: insert + list, mapping rows ↔ [`Note`] (§9.2).
 
-use intent_core::{ContentType, Error, Note, NoteId, NoteVisibility, Result, WorkspaceId};
+use intent_core::{
+    ContentType, Error, Note, NoteId, NoteMetadata, NoteVisibility, Result, TaskMetadata,
+    WorkspaceId,
+};
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
@@ -10,10 +13,10 @@ const NOTE_COLUMNS: &str = "id, workspace_id, title, content, content_type, tags
     is_archived, is_default, parent_id, visibility, task_json, created_at, rev, updated_at";
 
 impl Store {
-    /// Insert a note row. `task` is stored opaquely as `task_json` TEXT.
+    /// Insert a note row. `metadata.task` is stored opaquely as `task_json` TEXT.
     pub async fn insert_note(&self, note: &Note) -> Result<()> {
         let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
-        let task_json = match &note.task {
+        let task_json = match &note.metadata.task {
             Some(v) => Some(
                 serde_json::to_string(v)
                     .map_err(|e| Error::Internal(format!("encode task_json failed: {e}")))?,
@@ -82,8 +85,8 @@ impl Store {
     }
 
     /// Update an existing note (full-row replace, except `id`), or `NotFound`.
-    /// Unconditional last-writer-wins bump of `rev`; `task` is stored opaquely
-    /// as `task_json` TEXT.
+    /// Unconditional last-writer-wins bump of `rev`; `metadata.task` is stored
+    /// opaquely as `task_json` TEXT.
     pub async fn update_note(&self, note: &Note) -> Result<()> {
         self.update_note_versioned(note, None).await
     }
@@ -101,7 +104,7 @@ impl Store {
         expected_version: Option<i64>,
     ) -> Result<()> {
         let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
-        let task_json = match &note.task {
+        let task_json = match &note.metadata.task {
             Some(v) => Some(
                 serde_json::to_string(v)
                     .map_err(|e| Error::Internal(format!("encode task_json failed: {e}")))?,
@@ -228,7 +231,7 @@ where
 fn map_note_row(row: &SqliteRow) -> Result<Note> {
     let parent_id: Option<String> = col(row, "parent_id")?;
     let task_json: Option<String> = col(row, "task_json")?;
-    let task = match task_json {
+    let task: Option<TaskMetadata> = match task_json {
         Some(s) => Some(
             serde_json::from_str(&s)
                 .map_err(|e| Error::Internal(format!("decode task_json failed: {e}")))?,
@@ -247,7 +250,7 @@ fn map_note_row(row: &SqliteRow) -> Result<Note> {
         is_default: col::<i64>(row, "is_default")? != 0,
         parent_id: parent_id.map(NoteId),
         visibility: enum_from_db::<NoteVisibility>(&col::<String>(row, "visibility")?)?,
-        task,
+        metadata: NoteMetadata { task },
         created_at: col(row, "created_at")?,
         rev: col::<i64>(row, "rev")?,
         updated_at: col(row, "updated_at")?,
