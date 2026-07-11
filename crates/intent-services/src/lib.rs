@@ -4472,7 +4472,11 @@ impl WorkspaceApi for Services {
                 ws.title = v;
             }
             if let Some(v) = update.status_message {
-                ws.status_message = Some(v);
+                // Reference `setStatusMessage` contract (§5 / ws-misc-api.ts): empty
+                // or whitespace-only strings clear the message. Normalize on write so
+                // `ws.workspace.details()` and every downstream reader see `None`
+                // instead of `Some("")` for a cleared value.
+                ws.status_message = if v.trim().is_empty() { None } else { Some(v) };
             }
             if let Some(v) = update.branch {
                 ws.branch = v;
