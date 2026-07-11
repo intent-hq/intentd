@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
-    now_iso, ContentType, Note, NoteId, NoteVisibility, Result as CoreResult, TaskMetadata,
-    TaskStatus, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    now_iso, ContentType, Note, NoteId, NoteMetadata, NoteVisibility, Result as CoreResult,
+    TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
+    WorkspaceId, WorkspaceStatus,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -1302,7 +1302,7 @@ fn fixture_note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
         is_default: false,
         parent_id: None,
         visibility: NoteVisibility::Workspace,
-        task: None,
+        metadata: NoteMetadata::default(),
         created_at: ts.clone(),
         rev: 0,
         updated_at: ts,
@@ -1343,7 +1343,7 @@ async fn wss_task_list_emits_stats_aggregate() {
         let mut n = fixture_note(&ws, id, "body");
         n.title = title.to_string();
         n.parent_id = Some(NoteId::from("spec"));
-        n.task = Some(TaskMetadata {
+        n.metadata.task = Some(TaskMetadata {
             status,
             ..Default::default()
         });
@@ -1485,7 +1485,7 @@ async fn wss_task_remove_agent_from_all_tasks_round_trip() {
 
     let mk_task = |id: &str, agents: Vec<AgentId>| {
         let mut n = fixture_note(&ws, id, "body");
-        n.task = Some(TaskMetadata {
+        n.metadata.task = Some(TaskMetadata {
             status: TaskStatus::InProgress,
             assigned_agent_ids: agents,
             ..Default::default()
@@ -1524,7 +1524,7 @@ async fn wss_task_remove_agent_from_all_tasks_round_trip() {
         .await
         .expect("get_note task-a");
     assert_eq!(
-        a.task.as_ref().unwrap().assigned_agent_ids,
+        a.metadata.task.as_ref().unwrap().assigned_agent_ids,
         vec![other.clone()]
     );
     let b = srv
@@ -1532,13 +1532,22 @@ async fn wss_task_remove_agent_from_all_tasks_round_trip() {
         .get_note(ws.clone(), NoteId::from("task-b"))
         .await
         .expect("get_note task-b");
-    assert_eq!(b.task.as_ref().unwrap().assigned_agent_ids, vec![other]);
+    assert_eq!(
+        b.metadata.task.as_ref().unwrap().assigned_agent_ids,
+        vec![other]
+    );
     let c = srv
         .api
         .get_note(ws.clone(), NoteId::from("task-c"))
         .await
         .expect("get_note task-c");
-    assert!(c.task.as_ref().unwrap().assigned_agent_ids.is_empty());
+    assert!(c
+        .metadata
+        .task
+        .as_ref()
+        .unwrap()
+        .assigned_agent_ids
+        .is_empty());
 
     // Replay is idempotent — the second call touches zero notes.
     let req2 = format!(

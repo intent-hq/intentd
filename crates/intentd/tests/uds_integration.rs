@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use intent_core::{
-    now_iso, Config, ContentType, Note, NoteId, NoteVisibility, Workspace, WorkspaceActivity,
-    WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, Config, ContentType, Note, NoteId, NoteMetadata, NoteVisibility, Workspace,
+    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -69,7 +69,7 @@ fn seed_note(ws: &WorkspaceId) -> Note {
         is_default: true,
         parent_id: None,
         visibility: NoteVisibility::Workspace,
-        task: None,
+        metadata: NoteMetadata::default(),
         created_at: ts.clone(),
         rev: 0,
         updated_at: ts,
@@ -468,7 +468,7 @@ async fn uds_slice_end_to_end() {
     assert_eq!(resp["result"]["ok"], json!(true));
     assert_eq!(resp["result"]["status"], json!("in_progress"));
     assert_eq!(
-        resp["result"]["note"]["task"]["status"],
+        resp["result"]["note"]["metadata"]["task"]["status"],
         json!("in_progress")
     );
 
