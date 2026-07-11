@@ -155,16 +155,11 @@ impl WorkspaceMcpServer {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        // `workspace_api` shapes its own MCP tool result (isError=true text
-        // bodies for JS-side failures — reference parity with the TS tool) so
-        // it bypasses the standard `Ok(value) -> tool_content` mapping.
-        if name == "workspace_api" {
-            return ok(id, self.dispatch_workspace_api(&args).await);
-        }
-        match self.dispatch(name, &args).await {
-            Ok(value) => ok(id, tool_content(&value)),
-            Err(e) => err(id, e.code(), &e.to_string()),
-        }
+        // After the WSAPI-8 cutover the only registered tool is
+        // `workspace_api`, which shapes its own MCP tool result (isError=true
+        // text bodies for JS-side failures — reference parity with the TS
+        // tool) instead of the discrete-tool `Ok(value) -> tool_content` map.
+        ok(id, self.dispatch_workspace_api(&args).await)
     }
 }
 
@@ -174,9 +169,4 @@ fn ok(id: &Value, result: Value) -> Value {
 
 fn err(id: &Value, code: i32, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
-}
-
-fn tool_content(value: &Value) -> Value {
-    let text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
-    json!({ "content": [{ "type": "text", "text": text }], "isError": false })
 }

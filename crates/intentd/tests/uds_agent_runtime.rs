@@ -225,8 +225,19 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
         note.id.0
     };
 
+    // Post-WSAPI-8: the daemon exposes exactly one MCP tool
+    // (`workspace_api`); the equivalent of the discrete `add_to_note` call
+    // is agent-supplied JS driving `ws.note.add`.
+    let js = format!(
+        "return await ws.note.add({}, {{ content: {} }});",
+        json!(note_id),
+        json!(MARKER),
+    );
     let behavior = json!({
-        "toolCall": { "name": "add_to_note", "arguments": { "noteId": note_id, "content": MARKER } },
+        "toolCall": {
+            "name": "workspace_api",
+            "arguments": { "code": js, "summary": "UDS E2E ws.note.add" }
+        },
         "response": "added via mcp over the wire",
     })
     .to_string();

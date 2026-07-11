@@ -335,10 +335,17 @@ async fn mock_agent_full_turn_over_wss() {
     // process starts so it gets a clean handle. Mirrors the UDS analogue.
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    // Post-WSAPI-8: agent-supplied JS via `workspace_api` replaces the
+    // discrete `add_to_note` tool.
+    let js = format!(
+        "return await ws.note.add({}, {{ content: {} }});",
+        json!(note_id),
+        json!(MARKER),
+    );
     let behavior = json!({
         "toolCall": {
-            "name": "add_to_note",
-            "arguments": { "noteId": note_id, "content": MARKER },
+            "name": "workspace_api",
+            "arguments": { "code": js, "summary": "WSS E2E ws.note.add" },
         },
         "response": "added via mcp over wss",
     })
@@ -1655,12 +1662,18 @@ async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
     // parent then returns end_turn and goes idle — the watch persists because
     // the child never completes.
     const CHILD_MARK: &str = "AUDIT_P2_1B_PARK_CHILD";
+    // Post-WSAPI-8: replace discrete `delegate_task` with the unified
+    // `workspace_api` tool routing through `ws.agent.delegate`.
+    let delegate_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        json!(CHILD_MARK),
+    );
     let behavior = json!({
         "toolCall": {
-            "name": "delegate_task",
+            "name": "workspace_api",
             "arguments": {
-                "agentInstructions": CHILD_MARK,
-                "model": "mock:default",
+                "code": delegate_js,
+                "summary": "AUDIT P2.1B parent delegates via ws.agent.delegate",
             },
         },
         "parkIfPromptContains": CHILD_MARK,
@@ -1962,6 +1975,19 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
     const REPORT_A: &str = "REPORT_ALPHA finished the alpha task";
     const REPORT_B: &str = "REPORT_BETA finished the beta task";
     const PARENT_GO: &str = "WAKE1_PARENT_GO";
+    // Post-WSAPI-8: agents drive the workspace through the unified
+    // `workspace_api` tool + `ws.*` bindings; the discrete
+    // `delegate_task` / `report_to_parent` tools are gone.
+    let report_a_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_A));
+    let report_b_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_B));
+    let delegate_a_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
+        json!(CHILD_A),
+    );
+    let delegate_b_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
+        json!(CHILD_B),
+    );
     // One behavior, prompt-matched rules: children (matched by their delegated
     // instructions) delay so the parent's waiting window is observable, then
     // report + finish; the parent delegates both children after_all; the wake
@@ -1971,13 +1997,19 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
             {
                 "ifPromptContains": CHILD_A,
                 "delayMs": 8000,
-                "toolCall": { "name": "report_to_parent", "arguments": { "report": REPORT_A } },
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": report_a_js, "summary": "alpha reportToParent" }
+                },
                 "response": "alpha child done",
             },
             {
                 "ifPromptContains": CHILD_B,
                 "delayMs": 8000,
-                "toolCall": { "name": "report_to_parent", "arguments": { "report": REPORT_B } },
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": report_b_js, "summary": "beta reportToParent" }
+                },
                 "response": "beta child done",
             },
             {
@@ -1987,10 +2019,14 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
             {
                 "ifPromptContains": PARENT_GO,
                 "toolCalls": [
-                    { "name": "delegate_task", "arguments": {
-                        "agentInstructions": CHILD_A, "waitMode": "after_all", "model": "mock:default" } },
-                    { "name": "delegate_task", "arguments": {
-                        "agentInstructions": CHILD_B, "waitMode": "after_all", "model": "mock:default" } },
+                    {
+                        "name": "workspace_api",
+                        "arguments": { "code": delegate_a_js, "summary": "delegate alpha after_all" }
+                    },
+                    {
+                        "name": "workspace_api",
+                        "arguments": { "code": delegate_b_js, "summary": "delegate beta after_all" }
+                    },
                 ],
                 "response": "parent delegated two after_all children",
             },
@@ -2744,10 +2780,16 @@ async fn subscription_filter_branches_over_wss() {
 
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    // Post-WSAPI-8: agents drive `add_to_note` via `workspace_api` +
+    // `ws.note.add`; the discrete tool is gone.
+    let filter_js = format!(
+        "return await ws.note.add({}, {{ content: 'filter-branch-marker' }});",
+        json!(note_id),
+    );
     let behavior = json!({
         "toolCall": {
-            "name": "add_to_note",
-            "arguments": { "noteId": note_id, "content": "filter-branch-marker" },
+            "name": "workspace_api",
+            "arguments": { "code": filter_js, "summary": "WSS-2 filter branches ws.note.add" },
         },
         "response": "filter-branch-response",
     })

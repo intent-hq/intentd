@@ -1746,14 +1746,20 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
     let api: Arc<dyn WorkspaceApi> = Arc::new(svc.clone());
     let server =
         WorkspaceMcpServer::new(api, ws.clone()).with_caller_agent_id(Some(caller.clone()));
+    // Post-WSAPI-8: discrete `delegate_task` is gone; route through the
+    // unified `workspace_api` tool + `ws.agent.delegate` binding, which
+    // reaches the same caller-aware `agent_delegate` op.
     let resp = server
         .handle_message(&json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "delegate_task",
-                "arguments": { "agentInstructions": "do work" }
+                "name": "workspace_api",
+                "arguments": {
+                    "code": "return await ws.agent.delegate({ agentInstructions: 'do work' });",
+                    "summary": "mcp delegate stamps parent"
+                }
             }
         }))
         .await
@@ -1810,8 +1816,11 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "delegate_task",
-                "arguments": { "agentInstructions": "do work" }
+                "name": "workspace_api",
+                "arguments": {
+                    "code": "return await ws.agent.delegate({ agentInstructions: 'do work' });",
+                    "summary": "parent delegates via ws.agent.delegate"
+                }
             }
         }))
         .await
@@ -1840,8 +1849,14 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
             "id": 2,
             "method": "tools/call",
             "params": {
-                "name": "report_to_parent",
-                "arguments": { "report": report }
+                "name": "workspace_api",
+                "arguments": {
+                    "code": format!(
+                        "return await ws.agent.reportToParent({});",
+                        serde_json::json!(report)
+                    ),
+                    "summary": "child reports via ws.agent.reportToParent"
+                }
             }
         }))
         .await
@@ -1869,7 +1884,10 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
         "parent transcript should contain the report text"
     );
 
-    // RPC / no-caller path: the report tool surfaces a -32603 JSON-RPC error.
+    // RPC / no-caller path: the report tool call surfaces the daemon
+    // error as an `isError: true` workspace_api tool result (workspace_api
+    // shapes JS-side failures as tool-result text bodies rather than
+    // JSON-RPC protocol errors — reference parity with the TS tool).
     let no_caller_server = WorkspaceMcpServer::new(api, ws.clone());
     let err_resp = no_caller_server
         .handle_message(&json!({
@@ -1877,13 +1895,16 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
             "id": 3,
             "method": "tools/call",
             "params": {
-                "name": "report_to_parent",
-                "arguments": { "report": "orphan" }
+                "name": "workspace_api",
+                "arguments": {
+                    "code": "return await ws.agent.reportToParent('orphan');",
+                    "summary": "orphan report"
+                }
             }
         }))
         .await
         .expect("error response");
-    assert_eq!(err_resp["error"]["code"], json!(-32603));
+    assert_eq!(err_resp["result"]["isError"], json!(true));
 }
 
 // ===========================================================================
@@ -2290,14 +2311,20 @@ async fn mcp_delegate_immediate_registers_oneshot_watch() {
     let api: Arc<dyn WorkspaceApi> = Arc::new(svc.clone());
     let server =
         WorkspaceMcpServer::new(api, ws.clone()).with_caller_agent_id(Some(caller.clone()));
+    // Post-WSAPI-8: discrete `delegate_task` is replaced by
+    // `workspace_api` + `ws.agent.delegate`; the caller-aware immediate
+    // watch registration still reaches the same op.
     let resp = server
         .handle_message(&json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "delegate_task",
-                "arguments": { "agentInstructions": "do work" }
+                "name": "workspace_api",
+                "arguments": {
+                    "code": "return await ws.agent.delegate({ agentInstructions: 'do work' });",
+                    "summary": "immediate delegate registers oneshot watch"
+                }
             }
         }))
         .await
