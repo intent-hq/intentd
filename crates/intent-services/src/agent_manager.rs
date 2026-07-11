@@ -765,10 +765,10 @@ impl AgentManager {
             {
                 let path =
                     std::env::temp_dir().join(format!("intentd-rules-{}.md", Uuid::new_v4()));
-                if std::fs::write(&path, prompt.as_bytes()).is_ok() {
-                    rules_file_path = Some(path.to_string_lossy().into_owned());
-                    rules_config = Some(TempConfigFile { path });
-                }
+                std::fs::write(&path, prompt.as_bytes())
+                    .map_err(|e| Error::Internal(format!("write rules file failed: {e}")))?;
+                rules_file_path = Some(path.to_string_lossy().into_owned());
+                rules_config = Some(TempConfigFile { path });
             }
         }
 
