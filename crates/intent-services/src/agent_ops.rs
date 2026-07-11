@@ -1884,7 +1884,7 @@ impl Services {
                 return;
             }
         };
-        let Some(task) = note.task.as_ref() else {
+        let Some(task) = note.metadata.task.as_ref() else {
             return;
         };
         // Terminal statuses must not be downgraded (parity with the router
@@ -3275,7 +3275,7 @@ impl Services {
         }
         let notes = self.store.list_notes(workspace_id).await?;
         for mut note in notes {
-            let Some(mut task) = note.task.clone() else {
+            let Some(mut task) = note.metadata.task.clone() else {
                 continue;
             };
             let before = task.assigned_agent_ids.len();
@@ -3284,7 +3284,7 @@ impl Services {
                 continue;
             }
             let now = now_iso();
-            note.task = Some(task);
+            note.metadata.task = Some(task);
             note.updated_at = now;
             self.store.update_note(&note).await?;
         }

@@ -1107,7 +1107,7 @@ async fn report_to_parent_transitions_linked_task_to_review_required() {
 
     let refreshed = svc.store().get_note(&note.id).await.expect("refresh note");
     assert_eq!(
-        refreshed.task.expect("task metadata").status,
+        refreshed.metadata.task.expect("task metadata").status,
         intent_core::TaskStatus::ReviewRequired
     );
 }
@@ -1158,7 +1158,7 @@ async fn report_to_parent_does_not_overwrite_terminal_task_status() {
 
     let refreshed = svc.store().get_note(&note.id).await.expect("refresh note");
     assert_eq!(
-        refreshed.task.expect("task metadata").status,
+        refreshed.metadata.task.expect("task metadata").status,
         intent_core::TaskStatus::Complete,
         "terminal status must not be downgraded to review_required"
     );
@@ -1230,7 +1230,7 @@ async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
         .await
         .expect("note after first");
     assert_eq!(
-        after_first.task.as_ref().expect("task").status,
+        after_first.metadata.task.as_ref().expect("task").status,
         intent_core::TaskStatus::ReviewRequired
     );
     assert!(
@@ -1248,7 +1248,7 @@ async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
         .await
         .expect("note after second");
     assert_eq!(
-        after_second.task.as_ref().expect("task").status,
+        after_second.metadata.task.as_ref().expect("task").status,
         intent_core::TaskStatus::ReviewRequired
     );
     assert_eq!(
@@ -1402,7 +1402,7 @@ async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
         .await
         .expect("initial foreign note");
     assert_eq!(
-        before.task.as_ref().expect("task").status,
+        before.metadata.task.as_ref().expect("task").status,
         intent_core::TaskStatus::InProgress
     );
 
@@ -1433,7 +1433,7 @@ async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
         .await
         .expect("refresh foreign note");
     assert_eq!(
-        after.task.as_ref().expect("task").status,
+        after.metadata.task.as_ref().expect("task").status,
         intent_core::TaskStatus::InProgress,
         "foreign-workspace task status must not be mutated by a cross-workspace reportToParent"
     );
@@ -5101,7 +5101,7 @@ async fn wake_or_create_skips_stale_and_reports_cleanup() {
 
     // Stale id is stripped from the task's assigned_agent_ids.
     let note = svc.get_note(ws, note_id).await.expect("note");
-    let task = note.task.expect("task");
+    let task = note.metadata.task.expect("task");
     assert!(task
         .assigned_agent_ids
         .iter()

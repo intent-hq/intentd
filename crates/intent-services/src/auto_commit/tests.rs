@@ -6,7 +6,8 @@ use git2::{Repository, Signature};
 use intent_core::events::AGENT_IDLE;
 use intent_core::{
     now_iso, AgentId, AgentSession, AgentStatus, ContentType, Event, EventActor, Note, NoteId,
-    NoteVisibility, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    NoteMetadata, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
+    WorkspaceStatus,
 };
 use intent_store::Store;
 use serde_json::json;
@@ -116,7 +117,7 @@ fn task_note(ws: &WorkspaceId, id: &str, title: &str) -> Note {
         is_default: false,
         parent_id: None,
         visibility: NoteVisibility::Workspace,
-        task: None,
+        metadata: NoteMetadata::default(),
         created_at: ts.clone(),
         updated_at: ts,
         rev: 0,

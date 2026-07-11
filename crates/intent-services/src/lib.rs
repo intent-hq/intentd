@@ -29,16 +29,17 @@ use intent_core::{
     EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity,
     LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData, LineAttributionInfo,
     Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteRestoreVersionResult,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
-    NoteVersionAuthor, NoteVersionSummary, NoteVisibility, ProjectType, ReadAssetResult,
-    SaveAssetResult, ScriptCreateParams, SessionStats, SetupScript, TaskAssignAgentResult,
-    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
-    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
-    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceEventSummary,
-    WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
+    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
+    ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams, SessionStats, SetupScript,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
+    TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceActivity,
+    WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
+    WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceEventSummary, WorkspaceId,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -1500,7 +1501,7 @@ async fn ensure_spec_note(
         is_default: true,
         parent_id: None,
         visibility: NoteVisibility::Workspace,
-        task: None,
+        metadata: NoteMetadata::default(),
         created_at: now.clone(),
         rev: 0,
         updated_at: now,
@@ -1672,7 +1673,9 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
     let mut seen = HashSet::new();
     let mut stats = WorkspaceTaskStats::default();
     for note in notes {
-        let Some(task) = &note.task else { continue };
+        let Some(task) = &note.metadata.task else {
+            continue;
+        };
         let id = note.id.as_str();
         if id == "spec" {
             continue;
@@ -1720,7 +1723,9 @@ fn workspace_task_list(notes: &[Note]) -> Vec<WorkspaceTask> {
     let mut seen = HashSet::new();
     let mut tasks = Vec::new();
     for note in notes {
-        let Some(task) = &note.task else { continue };
+        let Some(task) = &note.metadata.task else {
+            continue;
+        };
         let id = note.id.as_str();
         if id == "spec" {
             continue;
@@ -1752,7 +1757,7 @@ fn workspace_task_list(notes: &[Note]) -> Vec<WorkspaceTask> {
 /// `Untitled task` title fallback. Returns `Internal` when the note is not a
 /// task (mirrors `task.getMyTask`'s "Note is not a task" guard).
 fn note_to_workspace_task(note: &Note) -> Result<WorkspaceTask> {
-    let task = match &note.task {
+    let task = match &note.metadata.task {
         Some(t) => t,
         None => return Err(Error::Internal("Note is not a task".to_string())),
     };
@@ -2245,7 +2250,8 @@ fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
     // flattenTaskTree: only non-terminal task notes participate, keyed by parent.
     let mut children: HashMap<Option<&str>, Vec<&Note>> = HashMap::new();
     for n in notes {
-        if n.task
+        if n.metadata
+            .task
             .as_ref()
             .is_some_and(|t| !is_terminal_task_status(t.status))
         {
@@ -2259,8 +2265,18 @@ fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
     // Sort each sibling level by peerOrder (default 0), then createdAt (older first).
     for level in children.values_mut() {
         level.sort_by(|a, b| {
-            let ao = a.task.as_ref().and_then(|t| t.peer_order).unwrap_or(0);
-            let bo = b.task.as_ref().and_then(|t| t.peer_order).unwrap_or(0);
+            let ao = a
+                .metadata
+                .task
+                .as_ref()
+                .and_then(|t| t.peer_order)
+                .unwrap_or(0);
+            let bo = b
+                .metadata
+                .task
+                .as_ref()
+                .and_then(|t| t.peer_order)
+                .unwrap_or(0);
             ao.cmp(&bo).then_with(|| a.created_at.cmp(&b.created_at))
         });
     }
@@ -2284,7 +2300,7 @@ fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
     // terminal ones) is `complete`.
     let mut all_children: HashMap<&str, Vec<&Note>> = HashMap::new();
     for n in notes {
-        if n.task.is_some() {
+        if n.metadata.task.is_some() {
             if let Some(parent) = n.parent_id.as_ref() {
                 all_children.entry(parent.as_str()).or_default().push(n);
             }
@@ -2297,7 +2313,8 @@ fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
                 .get(n.id.as_str())
                 .map(|kids| {
                     kids.iter().all(|c| {
-                        c.task
+                        c.metadata
+                            .task
                             .as_ref()
                             .map(|t| t.status == TaskStatus::Complete)
                             .unwrap_or(true)
@@ -3018,7 +3035,9 @@ impl Services {
             is_default: false,
             parent_id: Some(parent_id.clone()),
             visibility: NoteVisibility::Workspace,
-            task: Some(fresh_task_metadata(status, &now, peer_order)),
+            metadata: NoteMetadata {
+                task: Some(fresh_task_metadata(status, &now, peer_order)),
+            },
             created_at: now.clone(),
             rev: 0,
             updated_at: now,
@@ -4923,7 +4942,7 @@ impl WorkspaceApi for Services {
                         is_default: false,
                         parent_id: input.parent_id.map(NoteId::from),
                         visibility: NoteVisibility::Workspace,
-                        task: None,
+                        metadata: NoteMetadata::default(),
                         created_at: now.clone(),
                         rev: 0,
                         updated_at: now,
@@ -5628,7 +5647,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let new_status = parse_task_status_strict(&status)?;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
-            let mut task = match note.task.clone() {
+            let mut task = match note.metadata.task.clone() {
                 Some(t) => t,
                 None => {
                     return Err(Error::Internal(
@@ -5639,7 +5658,7 @@ impl WorkspaceApi for Services {
             let previous_status = task.status;
             let now = now_iso();
             apply_status_transition(&mut task, new_status, &now);
-            note.task = Some(task);
+            note.metadata.task = Some(task);
             note.updated_at = now.clone();
             store.update_note_versioned(&note, expected_version).await?;
             // Mirror `notes.service.ts`: emit only when the status actually changed.
@@ -5818,18 +5837,19 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             };
-            let task = match note.task.clone() {
+            let task = match note.metadata.task.clone() {
                 Some(t) => t,
                 None => return Err(Error::Internal("Note is not a task".to_string())),
             };
             let all = store.list_notes(&workspace_id).await?;
             let subtasks = all
                 .iter()
-                .filter(|n| n.parent_id.as_ref() == Some(&note.id) && n.task.is_some())
+                .filter(|n| n.parent_id.as_ref() == Some(&note.id) && n.metadata.task.is_some())
                 .map(|n| TaskSubtask {
                     id: n.id.clone(),
                     title: n.title.clone(),
                     status: n
+                        .metadata
                         .task
                         .as_ref()
                         .map(|t| status_word(t.status))
@@ -5866,11 +5886,11 @@ impl WorkspaceApi for Services {
                     .map_err(|_| Error::Internal(format!("Invalid status: {status}")))?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let now = now_iso();
-            match note.task.clone() {
+            match note.metadata.task.clone() {
                 // Already a task with a changing status → preserve other fields.
                 Some(mut existing) if existing.status != new_status => {
                     apply_status_transition(&mut existing, new_status, &now);
-                    note.task = Some(existing);
+                    note.metadata.task = Some(existing);
                 }
                 // Fresh task (or same status) → set the markAsTask metadata.
                 _ => {
@@ -5881,7 +5901,7 @@ impl WorkspaceApi for Services {
                         ..Default::default()
                     };
                     apply_status_transition(&mut task, new_status, &now);
-                    note.task = Some(task);
+                    note.metadata.task = Some(task);
                 }
             }
             note.updated_at = now;
@@ -6070,7 +6090,7 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             };
-            let mut task = match note.task.clone() {
+            let mut task = match note.metadata.task.clone() {
                 Some(t) => t,
                 None => return Err(Error::Internal(format!("Note {note_id} is not a task"))),
             };
@@ -6092,7 +6112,7 @@ impl WorkspaceApi for Services {
             if should_update_status {
                 apply_status_transition(&mut task, TaskStatus::InProgress, &now);
             }
-            note.task = Some(task);
+            note.metadata.task = Some(task);
             note.updated_at = now.clone();
             store.update_note(&note).await?;
             // TS parity (`assignAgentToTask`): the assignment write routes
@@ -6159,14 +6179,14 @@ impl WorkspaceApi for Services {
             let now = now_iso();
             let mut updated_count: u32 = 0;
             for mut note in notes {
-                let Some(mut task) = note.task.clone() else {
+                let Some(mut task) = note.metadata.task.clone() else {
                     continue;
                 };
                 if !task.assigned_agent_ids.contains(&agent_id) {
                     continue;
                 }
                 task.assigned_agent_ids.retain(|id| id != &agent_id);
-                note.task = Some(task);
+                note.metadata.task = Some(task);
                 note.updated_at = now.clone();
                 store.update_note(&note).await?;
                 updated_count += 1;
