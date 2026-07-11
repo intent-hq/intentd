@@ -149,19 +149,31 @@ async fn create(
             .await;
     }
     let child = AgentId::from(agent_id.as_str());
+    // Auto-subscribe caller to child completion (AS-5) — parity with the
+    // WSAPI-2 `create_agent` tool path in `dispatch.rs`. Failure is
+    // non-fatal (the child still runs) but is logged so SUB/AS drops are
+    // diagnosable in production.
     let mut subscription_id: Option<String> = None;
     if let Some(c) = caller {
-        if let Ok(v) = api
+        match api
             .agent_watch_completion(ws.clone(), c.clone(), child.clone())
             .await
         {
-            subscription_id = v
-                .get("subscriptionId")
-                .and_then(Value::as_str)
-                .map(String::from);
+            Ok(v) => {
+                subscription_id = v
+                    .get("subscriptionId")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "agent.create: failed to register completion watch");
+            }
         }
     }
-    let _ = api
+    // Deliver the initial message so the child actually starts its first
+    // turn — parity with the WSAPI-2 path. Failure is non-fatal (the
+    // session already exists) but is logged.
+    if let Err(e) = api
         .agent_send_message(
             ws.clone(),
             child,
@@ -175,7 +187,10 @@ async fn create(
             None,
             None,
         )
-        .await;
+        .await
+    {
+        tracing::warn!(agent = %agent_id, error = %e, "agent.create: failed to start child turn");
+    }
     Ok(json!({
         "ok": true,
         "id": agent_id,
@@ -458,7 +473,10 @@ async fn watch_sender(
             .get("subscriptionId")
             .and_then(Value::as_str)
             .map(String::from),
-        Err(_) => None,
+        Err(e) => {
+            tracing::warn!(target = %target.0, error = %e, "agent.send: failed to register sender completion watch");
+            None
+        }
     }
 }
 
