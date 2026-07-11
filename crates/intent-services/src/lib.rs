@@ -1266,10 +1266,10 @@ impl Services {
 /// carrying only `id`, `type`, `data`, `timestamp`, `actor`. Feeds
 /// `EventWakeupBanner` so it can render a real count / label / per-agent cards.
 fn build_event_notification_metadata(events: &[&Event]) -> serde_json::Value {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut event_types: Vec<String> = Vec::new();
     for e in events {
-        if seen.insert(e.event_type.clone()) {
+        if seen.insert(e.event_type.as_str()) {
             event_types.push(e.event_type.clone());
         }
     }
