@@ -249,3 +249,39 @@ async fn host_raw_is_removed_from_globals() {
     .expect("eval succeeds");
     assert_eq!(out, "undefined", "raw bridge must not leak onto globalThis");
 }
+
+/// WSAPI-1 hardening (a), observable: the happy-path host round-trip must not
+/// silently coerce a well-formed argument to `null`. The Rust-side parse
+/// guard converts a malformed argument into an explicit engine-tagged error
+/// frame, but there is no user-reachable code path that produces malformed
+/// JSON (the bridge JS wrapper always `JSON.stringify`s the argument first);
+/// the negative branch is defence-in-depth against a future regression.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_argument_round_trips_without_silent_null_coercion() {
+    let host: HostFn = Arc::new(|arg| Box::pin(async move { Ok(arg) }));
+    let out = eval(
+        "return await host({ v: 42 });",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("host echo must succeed");
+    assert_eq!(out["v"], 42, "no silent null coercion on the happy path");
+}
+
+/// WSAPI-1 hardening (b), observable: the internal result envelope has exactly
+/// two documented shapes (`{kind:"undefined"}` and `{kind:"value","json":…}`).
+/// A malformed or unknown envelope now surfaces as `JsError::Engine`, not
+/// `Runtime`; the wrapper is fixed so neither case is user-reachable, but
+/// this test asserts the two documented shapes still round-trip cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn value_envelope_round_trips_and_undefined_maps_to_null() {
+    let none = eval("return undefined;", &EvalOptions::default(), None)
+        .await
+        .expect("undefined return must succeed");
+    assert!(none.is_null(), "undefined must map to null envelope");
+    let some = eval("return { a: 1 };", &EvalOptions::default(), None)
+        .await
+        .expect("value return must succeed");
+    assert_eq!(some["a"], 1, "value envelope must round-trip");
+}
