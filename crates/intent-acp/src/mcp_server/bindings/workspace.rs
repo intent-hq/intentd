@@ -79,12 +79,25 @@ async fn details(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value,
         Ok(w) => {
             let title = w.title.trim();
             let has_title = !title.is_empty() && title != w.id.as_str();
+            // Legacy rows persisted before the services-layer clear
+            // normalization (and any other writer that still emits `""`
+            // or whitespace) can leak an empty string here, which would
+            // break the documented clear contract (`empty/null ⇒ null`).
+            // Normalize on read so `details()` always surfaces `null`
+            // for a cleared status message.
+            let status_message = w
+                .status_message
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| Value::String(s.to_string()))
+                .unwrap_or(Value::Null);
             Ok(json!({
                 "id": w.id.as_str(),
                 "title": if title.is_empty() { "(untitled)" } else { title },
                 "hasTitle": has_title,
                 "status": w.status,
-                "statusMessage": w.status_message,
+                "statusMessage": status_message,
                 "branch": w.branch,
                 "repositoryName": w.repository_name,
                 "tags": w.tags,

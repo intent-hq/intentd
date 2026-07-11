@@ -503,6 +503,26 @@ async fn workspace_set_status_message_clears_on_empty() {
 }
 
 #[tokio::test]
+async fn workspace_details_normalizes_legacy_empty_status_message() {
+    // Rows persisted before the services-layer clear normalization (or by
+    // any other writer that still emits `""` / whitespace) can carry an
+    // empty string on read. The `details` binding must normalize on read
+    // so the documented clear contract (`empty/null ⇒ null`) still holds
+    // for legacy data. Seed the fake with an empty override and assert
+    // the read-back is `null`; repeat for a whitespace-only value.
+    let (srv, api) = server();
+    *api.status_message_state.lock().unwrap() = Some(Some(String::new()));
+    let resp = call(&srv, "return await ws.workspace.details();").await;
+    let d = body(&resp);
+    assert_eq!(d["statusMessage"], Value::Null);
+
+    *api.status_message_state.lock().unwrap() = Some(Some("   \t".to_string()));
+    let resp = call(&srv, "return await ws.workspace.details();").await;
+    let d = body(&resp);
+    assert_eq!(d["statusMessage"], Value::Null);
+}
+
+#[tokio::test]
 async fn workspace_set_status_message_over_length_errors() {
     let (srv, _api) = server();
     let code = "return await ws.workspace.setStatusMessage('a'.repeat(1000));";
@@ -806,6 +826,36 @@ async fn script_create_forwards_positional_signature() {
     assert_eq!(p.category.as_deref(), Some("dev"));
     assert_eq!(p.auto_start, Some(true));
     assert_eq!(p.script_id.as_deref(), Some("s-1"));
+}
+
+#[tokio::test]
+async fn script_create_rejects_non_string_env_value() {
+    // `ScriptCreateParams.env` is `BTreeMap<String, String>` — a numeric
+    // value must surface an input error rather than being silently
+    // dropped (previously `filter_map(Value::as_str)` turned
+    // `{ PORT: 3000 }` into `{}`).
+    let (srv, api) = server();
+    let code = "return await ws.script.create('n', 'c', 'service', { env: { PORT: 3000 } });";
+    let resp = call(&srv, code).await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    let t = text(&resp);
+    assert!(
+        t.contains("env.PORT") && t.contains("string"),
+        "unexpected: {t}"
+    );
+    assert!(api.script_create_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn script_create_rejects_non_object_env() {
+    // A non-object `env` (previously coerced to `None` via
+    // `and_then(Value::as_object)`) must be an input error.
+    let (srv, api) = server();
+    let code = "return await ws.script.create('n', 'c', 'service', { env: 'PORT=3000' });";
+    let resp = call(&srv, code).await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("env must be an object"));
+    assert!(api.script_create_calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

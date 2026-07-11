@@ -83,11 +83,29 @@ async fn create(
         "command" => ScriptMode::Command,
         _ => return Err("mode must be \"service\" or \"command\".".to_string()),
     };
-    let env = args.get("env").and_then(Value::as_object).map(|obj| {
-        obj.iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-            .collect::<BTreeMap<_, _>>()
-    });
+    // `ScriptCreateParams.env` is `BTreeMap<String, String>`, so surface an
+    // input error for non-object `env` or any non-string value rather than
+    // silently dropping entries (`{ PORT: 3000 } → {}`) or ignoring the
+    // whole field.
+    let env = match args.get("env") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(obj)) => {
+            let mut map = BTreeMap::new();
+            for (k, v) in obj {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| format!("env.{k} must be a string (got {})", type_name(v)))?;
+                map.insert(k.clone(), s.to_string());
+            }
+            Some(map)
+        }
+        Some(other) => {
+            return Err(format!(
+                "env must be an object of string values (got {})",
+                type_name(other)
+            ));
+        }
+    };
     let params = ScriptCreateParams {
         name,
         command,
@@ -176,4 +194,15 @@ async fn run(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, args: &Value) -> Res
     api.script_run(ws.clone(), script_id, max_lines, timeout_seconds)
         .await
         .map_err(map_err)
+}
+
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
