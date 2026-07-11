@@ -4325,11 +4325,17 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
         "expected `intentd-rules-*.md` to be written under the redirected TMPDIR \
          during agent spawn",
     );
+    // Debug tail walks forward to the next char boundary so the slice never
+    // lands mid-multi-byte (the rules text includes non-ASCII like "2–4").
+    let tail_from = body.len().saturating_sub(400);
+    let tail_start = (tail_from..=body.len())
+        .find(|i| body.is_char_boundary(*i))
+        .unwrap_or(0);
     assert!(
         body.contains("## Suggested Next Steps"),
         "SP-1: assembled rules file must contain the Suggested Next Steps directive; \
          body tail: {:?}",
-        &body[body.len().saturating_sub(400)..]
+        &body[tail_start..]
     );
     assert!(
         body.contains("<!-- suggested-prompts"),

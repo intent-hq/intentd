@@ -742,18 +742,19 @@ impl AgentManager {
                 .await;
             // Sub-agent gating: delegated children (`parent_agent_id` set) and
             // background workers (`is_background`) skip the suggested-prompts
-            // directive, matching the reference `isSubAgent` derivation.
-            let (is_sub_agent, auto_commit_enabled) =
-                match self.services.store.get_agent_session(&agent_id).await {
-                    Ok(s) => (
-                        s.parent_agent_id.is_some() || s.is_background,
-                        crate::settings::auto_commit_enabled(&self.services.store).await,
-                    ),
-                    Err(_) => (
-                        false,
-                        crate::settings::auto_commit_enabled(&self.services.store).await,
-                    ),
-                };
+            // directive, matching the reference `isSubAgent` derivation. The
+            // auto-commit lookup is workspace-scoped and independent of the
+            // session, so read it once regardless of whether the session lookup
+            // succeeds.
+            let auto_commit_enabled =
+                crate::settings::auto_commit_enabled(&self.services.store).await;
+            let is_sub_agent = self
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .map(|s| s.parent_agent_id.is_some() || s.is_background)
+                .unwrap_or(false);
             if let Some(prompt) = crate::rules::assemble_system_prompt(
                 &self.services.store,
                 Some(&cwd),

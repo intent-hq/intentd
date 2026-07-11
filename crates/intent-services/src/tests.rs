@@ -6610,12 +6610,19 @@ mod rules {
             "no auto-commit clause when auto-commit is off"
         );
         // Recency: the directive sits at the very end of the prompt.
+        // Debug tail walks forward to the next char boundary so the slice
+        // never lands mid-multi-byte (the Suggested Next Steps block includes
+        // non-ASCII like the en-dash in "2–4").
+        let tail_from = prompt.len().saturating_sub(200);
+        let tail_start = (tail_from..=prompt.len())
+            .find(|i| prompt.is_char_boundary(*i))
+            .unwrap_or(0);
         assert!(
             prompt
                 .trim_end()
                 .ends_with("something the user might say next."),
             "suggested-prompts block is the tail of the assembled prompt: {:?}",
-            &prompt[prompt.len().saturating_sub(200)..]
+            &prompt[tail_start..]
         );
     }
 

@@ -220,9 +220,12 @@ pub(crate) async fn get_specialization_rules(
 /// Specialist inputs for the spawn-prompt injection (PP-1, reference
 /// `instruction-service.ts` layers 4.8 and 9): the resolved behavior prompt is
 /// wrapped in a `<specialist_role>` section after specialization and user
-/// rules, and the role identity feeds a `## Role Reminder` footer at the very
-/// end of the prompt (recency). All fields optional: a behavior prompt without
-/// a specialist name yields the section but no footer, and vice versa.
+/// rules, and the role identity feeds a `## Role Reminder` footer near the end
+/// of the prompt (recency). For top-level (non-sub-agent) interactive agents
+/// the SP-1 `## Suggested Next Steps` directive is appended by
+/// `assemble_system_prompt` after the role reminder, so the reminder is the
+/// last section only for sub-agents. All fields optional: a behavior prompt
+/// without a specialist name yields the section but no footer, and vice versa.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SpecialistPromptInjection {
     pub behavior_prompt: Option<String>,
