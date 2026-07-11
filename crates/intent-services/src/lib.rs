@@ -278,9 +278,11 @@ pub struct Services {
     /// `ws.browser.exec` via the MCP front door there is no ambient client
     /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
     /// routes through this handle (the transport crate wires a shared
-    /// first-client-sticky registry). `None` when the composition root did not
-    /// wire a registry (unit tests, read-only wiring) — `browser_exec` then
-    /// falls back to the default `not implemented` behavior. Shared across
+    /// first-client-sticky registry). `None` when the composition root did
+    /// not wire a registry (unit tests, read-only wiring) — `browser_exec`
+    /// then short-circuits with `browser.exec: no client connected`
+    /// (JSON-RPC `-32603`), matching the closed-channel failure mode the
+    /// client-triggered `browser.exec` path already produces. Shared across
     /// clones so every service handle sees the same live-client set.
     reverse_dispatch: Option<Arc<dyn AgentReverseDispatch>>,
 }
@@ -9772,20 +9774,31 @@ impl WorkspaceApi for Services {
     /// there is no per-connection reverse channel to use (the caller is the
     /// daemon-hosted MCP server, not a client connection), so we route the
     /// batch to the first-registered live client via the injected
-    /// [`AgentReverseDispatch`]. Envelope validation and result shaping stay
-    /// in [`browser_ops`] (byte-for-byte parity with the FE tool); failure
-    /// modes surface as `Error::Internal` with the underlying reason so the
-    /// MCP caller can distinguish "no client connected" from a proxy-side
-    /// failure. When no dispatcher is wired (unit tests, read-only wiring)
-    /// the request short-circuits with `no client connected`.
+    /// [`AgentReverseDispatch`]. Attribution fields (`workspaceId`, `agentId`,
+    /// `tabId`) are threaded into the forwarded params so the FE sees the
+    /// same envelope shape the client-triggered path already emits. Result
+    /// shaping stays in [`browser_ops`] (byte-for-byte parity with the FE
+    /// tool); failure modes surface as `Error::Internal` with the underlying
+    /// reason so the MCP caller can distinguish "no client connected" from a
+    /// proxy-side failure. An empty `actions` batch is rejected with
+    /// `Error::InvalidParams` (JSON-RPC `-32602`) before any dispatch — the
+    /// FE tool has no meaningful behavior on an empty batch and the
+    /// client-triggered path already enforces the same guard. When no
+    /// dispatcher is wired (unit tests, read-only wiring) the request
+    /// short-circuits with `no client connected`.
     fn browser_exec(
         &self,
-        _workspace_id: WorkspaceId,
+        workspace_id: WorkspaceId,
         actions: Vec<serde_json::Value>,
         tab_id: Option<String>,
         agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if actions.is_empty() {
+                return Err(Error::InvalidParams(
+                    "browser.exec: actions must be a non-empty array".to_string(),
+                ));
+            }
             let Some(dispatch) = self.reverse_dispatch.clone() else {
                 return Err(Error::Internal(
                     "browser.exec: no client connected".to_string(),
@@ -9795,7 +9808,7 @@ impl WorkspaceApi for Services {
                 actions,
                 tab_id,
                 agent_id: agent_id.map(|a| a.as_str().to_string()),
-                workspace_id: None,
+                workspace_id: Some(workspace_id.as_str().to_string()),
             };
             let forwarded = browser_ops::build_forward_params(&args);
             let response =

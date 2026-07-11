@@ -146,6 +146,10 @@ async fn agent_browser_exec_routes_to_first_client_and_fails_over_on_disconnect(
     });
     let forwarded = answer_reverse(&mut a, Duration::from_secs(2), fe_result).await;
     assert_eq!(forwarded["params"]["tabId"], "tab-1");
+    // REV-1: attribution — the reverse-RPC params must carry `workspaceId`
+    // (mirrors the client-triggered `browser.exec` contract in PROTOCOL
+    // §5.14 so the FE sees a byte-identical envelope regardless of caller).
+    assert_eq!(forwarded["params"]["workspaceId"], "ws-1");
     assert!(
         try_read_text(&mut b, Duration::from_millis(200))
             .await
@@ -178,6 +182,7 @@ async fn agent_browser_exec_routes_to_first_client_and_fails_over_on_disconnect(
     });
     let forwarded = answer_reverse(&mut b, Duration::from_secs(2), fe_result).await;
     assert_eq!(forwarded["params"]["actions"][0]["action"], "screenshot");
+    assert_eq!(forwarded["params"]["workspaceId"], "ws-1");
     let out = call_b.await.expect("join").expect("ok");
     assert_eq!(out["action"], "screenshot");
 

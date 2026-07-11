@@ -8847,6 +8847,23 @@ mod browser_exec_reverse {
         assert_eq!(calls[0].0, "browser.exec");
         assert_eq!(calls[0].1["tabId"], "tab-1");
         assert_eq!(calls[0].1["actions"].as_array().unwrap().len(), 1);
+        // REV-1: attribution — the `WorkspaceId` argument must be threaded
+        // into the forwarded reverse-RPC params so the FE sees the same
+        // envelope shape the client-triggered `browser.exec` path emits.
+        assert_eq!(calls[0].1["workspaceId"], "ws-1");
+    }
+
+    #[tokio::test]
+    async fn browser_exec_rejects_empty_actions_with_invalid_params() {
+        let dispatch = RecordingDispatch::with_reply(json!({ "success": true, "results": [] }));
+        let (_tmp, _root, svc) = services_with(dispatch.clone()).await;
+        let err = svc
+            .browser_exec(WorkspaceId::from("ws-1"), vec![], None, None)
+            .await
+            .expect_err("empty batch");
+        assert!(matches!(err, Error::InvalidParams(m) if m.contains("non-empty")));
+        // Guard runs before dispatch, so nothing is forwarded downstream.
+        assert!(dispatch.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
