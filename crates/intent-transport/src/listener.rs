@@ -24,6 +24,7 @@ use intent_core::WorkspaceApi;
 use intent_services::EventBus;
 
 use crate::control::SystemControl;
+use crate::reverse::PrimaryReverseRegistry;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -45,12 +46,47 @@ use crate::reverse::ReverseChannel;
 /// in-process event bus that connection subscriptions are wired to. `control`,
 /// when present, exposes the `system.status`/`system.shutdown` control surface
 /// (§5.7) to local UDS clients (`intentd status`/`stop`).
+///
+/// This wrapper installs a fresh (empty) [`PrimaryReverseRegistry`] so tests
+/// and other lightweight callers stay one-liner. Composition roots that share
+/// a registry across the UDS + WSS listeners (REV-1) call
+/// [`serve_uds_with_reverse`] instead.
 #[cfg(unix)]
 pub async fn serve_uds<F>(
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
     socket_path: &Path,
     control: Option<Arc<dyn SystemControl>>,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()>,
+{
+    serve_uds_with_reverse(
+        api,
+        bus,
+        socket_path,
+        control,
+        Arc::new(PrimaryReverseRegistry::new()),
+        shutdown,
+    )
+    .await
+}
+
+/// Variant of [`serve_uds`] that threads the shared REV-1 primary registry
+/// through so every accepted connection registers its per-connection reverse
+/// channel with the sticky "first-client wins" target set used by
+/// agent-initiated reverse RPCs (§5.14/§12.4). Composition roots build ONE
+/// registry, hand it to both the UDS + WSS listeners, and hand it to
+/// `Services::with_reverse_dispatch` so agent-initiated `browser.exec` calls
+/// see the same live set of clients.
+#[cfg(unix)]
+pub async fn serve_uds_with_reverse<F>(
+    api: Arc<dyn WorkspaceApi>,
+    bus: EventBus,
+    socket_path: &Path,
+    control: Option<Arc<dyn SystemControl>>,
+    reverse_registry: Arc<PrimaryReverseRegistry>,
     shutdown: F,
 ) -> std::io::Result<()>
 where
@@ -77,8 +113,9 @@ where
                         let api = api.clone();
                         let bus = bus.clone();
                         let control = control.clone();
+                        let reverse_registry = reverse_registry.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, api, bus, control).await {
+                            if let Err(e) = handle_connection(stream, api, bus, control, reverse_registry).await {
                                 tracing::debug!(error = %e, "uds connection ended");
                             }
                         });
@@ -103,6 +140,7 @@ async fn handle_connection(
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
     control: Option<Arc<dyn SystemControl>>,
+    reverse_registry: Arc<PrimaryReverseRegistry>,
 ) -> std::io::Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -125,6 +163,12 @@ async fn handle_connection(
     let mut subs = ConnSubs::default();
     let mut forwards = ForwardRegistry::default();
     let reverse = ReverseChannel::new(out_tx.clone());
+    // REV-1: register this connection's reverse channel with the shared
+    // primary-target set so agent-initiated `browser.exec` calls can route to
+    // whichever client connected first. The guard drops when this function
+    // returns (normal exit, error, or panic-unwind) so failover is exactly the
+    // connection arrival order.
+    let _reverse_guard = reverse_registry.register(reverse.clone());
     // Per-connection logical-client binding (§16): `None` until `client.hello`.
     let mut client_id: Option<intent_core::ClientId> = None;
     let mut line = String::new();
@@ -175,6 +219,28 @@ pub async fn serve_uds<F>(
     _bus: EventBus,
     _socket_path: &Path,
     _control: Option<Arc<dyn SystemControl>>,
+    _shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()>,
+{
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "UDS transport is not supported on this platform",
+    ))
+}
+
+/// Non-Unix fallback for [`serve_uds_with_reverse`]: the composition root
+/// (`intentd/src/main.rs`) references this symbol unconditionally, so the
+/// crate must expose it on every platform. UDS is Unix-only; on non-Unix
+/// targets any attempt to serve reports an `Unsupported` error at runtime.
+#[cfg(not(unix))]
+pub async fn serve_uds_with_reverse<F>(
+    _api: Arc<dyn WorkspaceApi>,
+    _bus: EventBus,
+    _socket_path: &Path,
+    _control: Option<Arc<dyn SystemControl>>,
+    _reverse_registry: Arc<PrimaryReverseRegistry>,
     _shutdown: F,
 ) -> std::io::Result<()>
 where

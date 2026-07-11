@@ -8734,3 +8734,154 @@ mod line_attribution_hooks {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// REV-1: `browser.exec` routes through the injected `AgentReverseDispatch`.
+// ---------------------------------------------------------------------------
+mod browser_exec_reverse {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{
+        AgentReverseDispatch, BoxFuture, Error, ReverseDispatchError, WorkspaceApi, WorkspaceId,
+    };
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use super::{TempDb, WorkspacesRoot};
+    use crate::Services;
+
+    #[derive(Default)]
+    struct RecordingDispatch {
+        calls: Mutex<Vec<(String, Value)>>,
+        reply: Mutex<Option<Value>>,
+        err: Mutex<Option<ReverseDispatchError>>,
+    }
+
+    impl RecordingDispatch {
+        fn with_reply(reply: Value) -> Arc<Self> {
+            let d = Self::default();
+            *d.reply.lock().unwrap() = Some(reply);
+            Arc::new(d)
+        }
+        fn with_error(err: ReverseDispatchError) -> Arc<Self> {
+            let d = Self::default();
+            *d.err.lock().unwrap() = Some(err);
+            Arc::new(d)
+        }
+    }
+
+    impl AgentReverseDispatch for RecordingDispatch {
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn dispatch<'a>(
+            &'a self,
+            method: &'a str,
+            params: Value,
+        ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.to_string(), params.clone()));
+            let reply = self.reply.lock().unwrap().clone();
+            let err = self.err.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                Ok(reply.unwrap_or(json!({ "success": true, "results": [] })))
+            })
+        }
+    }
+
+    async fn services_with(
+        dispatch: Arc<dyn AgentReverseDispatch>,
+    ) -> (TempDb, WorkspacesRoot, Services) {
+        let tmp = TempDb::new();
+        let root = WorkspacesRoot::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store)
+            .with_workspaces_root(root.path().to_path_buf())
+            .with_reverse_dispatch(dispatch);
+        (tmp, root, svc)
+    }
+
+    #[tokio::test]
+    async fn browser_exec_without_dispatch_returns_no_client_error() {
+        let tmp = TempDb::new();
+        let root = WorkspacesRoot::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+        let err = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![json!({"action":"listTabs"})],
+                None,
+                None,
+            )
+            .await
+            .expect_err("no dispatch");
+        assert!(matches!(err, Error::Internal(m) if m.contains("no client connected")));
+    }
+
+    #[tokio::test]
+    async fn browser_exec_forwards_actions_and_returns_single_result_envelope() {
+        let dispatch = RecordingDispatch::with_reply(json!({
+            "success": true,
+            "results": [{ "action": "listTabs", "success": true, "result": [] }],
+        }));
+        let (_tmp, _root, svc) = services_with(dispatch.clone()).await;
+        let out = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![json!({ "action": "listTabs" })],
+                Some("tab-1".to_string()),
+                None,
+            )
+            .await
+            .expect("ok");
+        assert_eq!(out["action"], "listTabs");
+        assert_eq!(out["success"], true);
+        let calls = dispatch.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "browser.exec");
+        assert_eq!(calls[0].1["tabId"], "tab-1");
+        assert_eq!(calls[0].1["actions"].as_array().unwrap().len(), 1);
+        // REV-1: attribution — the `WorkspaceId` argument must be threaded
+        // into the forwarded reverse-RPC params so the FE sees the same
+        // envelope shape the client-triggered `browser.exec` path emits.
+        assert_eq!(calls[0].1["workspaceId"], "ws-1");
+    }
+
+    #[tokio::test]
+    async fn browser_exec_rejects_empty_actions_with_invalid_params() {
+        let dispatch = RecordingDispatch::with_reply(json!({ "success": true, "results": [] }));
+        let (_tmp, _root, svc) = services_with(dispatch.clone()).await;
+        let err = svc
+            .browser_exec(WorkspaceId::from("ws-1"), vec![], None, None)
+            .await
+            .expect_err("empty batch");
+        assert!(matches!(err, Error::InvalidParams(m) if m.contains("non-empty")));
+        // Guard runs before dispatch, so nothing is forwarded downstream.
+        assert!(dispatch.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn browser_exec_surfaces_transport_error() {
+        let dispatch = RecordingDispatch::with_error(ReverseDispatchError::Transport {
+            code: 0,
+            message: "timeout".into(),
+        });
+        let (_tmp, _root, svc) = services_with(dispatch).await;
+        let err = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                None,
+            )
+            .await
+            .expect_err("transport");
+        assert!(matches!(err, Error::Internal(m) if m.contains("timeout")));
+    }
+}

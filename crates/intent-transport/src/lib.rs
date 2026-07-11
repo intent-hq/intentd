@@ -20,8 +20,11 @@ pub use host::{
     EditorTarget, ExternalOpener, NoopAppPicker, OpenExternalError, OpenInEditorError,
     OsEditorLauncher, OsOpener, PickApplicationError, ResolvedEditor,
 };
-pub use listener::serve_uds;
-pub use reverse::{ReverseChannel, ReverseError, DEFAULT_REVERSE_TIMEOUT};
+pub use listener::{serve_uds, serve_uds_with_reverse};
+pub use reverse::{
+    PrimaryReverseGuard, PrimaryReverseRegistry, ReverseChannel, ReverseError,
+    DEFAULT_REVERSE_TIMEOUT,
+};
 pub use router::handle_message;
 pub use tls::{cert_fingerprint, ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
 pub use ws::{WsApiServer, WsOptions};
