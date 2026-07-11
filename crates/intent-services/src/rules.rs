@@ -220,9 +220,12 @@ pub(crate) async fn get_specialization_rules(
 /// Specialist inputs for the spawn-prompt injection (PP-1, reference
 /// `instruction-service.ts` layers 4.8 and 9): the resolved behavior prompt is
 /// wrapped in a `<specialist_role>` section after specialization and user
-/// rules, and the role identity feeds a `## Role Reminder` footer at the very
-/// end of the prompt (recency). All fields optional: a behavior prompt without
-/// a specialist name yields the section but no footer, and vice versa.
+/// rules, and the role identity feeds a `## Role Reminder` footer near the end
+/// of the prompt (recency). For top-level (non-sub-agent) interactive agents
+/// the SP-1 `## Suggested Next Steps` directive is appended by
+/// `assemble_system_prompt` after the role reminder, so the reminder is the
+/// last section only for sub-agents. All fields optional: a behavior prompt
+/// without a specialist name yields the section but no footer, and vice versa.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SpecialistPromptInjection {
     pub behavior_prompt: Option<String>,
@@ -236,15 +239,20 @@ pub(crate) struct SpecialistPromptInjection {
 /// `.augment/agent-rules/{type}.md` → bundled built-in) → workspace override →
 /// live workspace rule files → specialist role section (PP-1, reference layer
 /// 4.8: after specialization/user rules, when the session has one) →
-/// specialist role-reminder footer (recency; the reference
-/// `getMandatoryActionsFooter`). The specialization slot is always populated
-/// (tier 3 always resolves), so this returns `None` only in the unreachable
-/// case where even the bundled specialization is empty.
+/// mandatory-actions footer (recency; the reference `getMandatoryActionsFooter`)
+/// which contributes the `## Role Reminder` (specialist agents only) and — for
+/// top-level (non-sub-agent) interactive agents — the `## Suggested Next Steps`
+/// directive that tells the model to emit a `<!-- suggested-prompts ... -->`
+/// block at the end of user-facing responses. The specialization slot is always
+/// populated (tier 3 always resolves), so this returns `None` only in the
+/// unreachable case where even the bundled specialization is empty.
 pub(crate) async fn assemble_system_prompt(
     store: &Store,
     workspace_path: Option<&Path>,
     agent_type: &str,
     specialist: Option<&SpecialistPromptInjection>,
+    is_sub_agent: bool,
+    auto_commit_enabled: bool,
 ) -> Option<String> {
     let overrides = read_overrides(store).await;
     let mut parts: Vec<String> = Vec::new();
@@ -278,8 +286,12 @@ pub(crate) async fn assemble_system_prompt(
              Prioritize them above general guidance."
         ));
     }
-    // Role-reminder footer (reference layer 9: the VERY END of the prompt to
-    // leverage recency bias). The per-turn `[Role Reminder: …]` prefix in
+    // Mandatory-actions footer (reference layer 9 / `getMandatoryActionsFooter`,
+    // pinned to the VERY END of the prompt to leverage recency bias). Two
+    // independent sub-blocks, joined with `---` like every other layer:
+    //   1. Role Reminder — only for specialist agents.
+    //   2. Suggested Next Steps — only for top-level (non-sub-agent) agents.
+    // The per-turn `[Role Reminder: …]` prefix in
     // `agent_manager::build_turn_prompt` stays and is independent of this.
     if let Some(name) = specialist
         .and_then(|s| s.specialist_name.as_deref())
@@ -292,6 +304,34 @@ pub(crate) async fn assemble_system_prompt(
             .filter(|s| !s.is_empty())
             .unwrap_or("Follow the instructions in <specialist_role> above.");
         parts.push(format!("## Role Reminder\n\nYou are a {name}. {reminder}"));
+    }
+    // Suggested Next Steps — top-level interactive agents only. Sub-agents
+    // don't own a user-facing chat turn (they report to a parent), so they
+    // skip this block, matching the reference gating.
+    if !is_sub_agent {
+        let example_second_line = if auto_commit_enabled {
+            "Check the changes in the diff view."
+        } else {
+            "Review changes before committing."
+        };
+        let auto_commit_clause = if auto_commit_enabled {
+            " Auto-commit is enabled; do not include prompts about committing or reviewing changes before committing."
+        } else {
+            ""
+        };
+        parts.push(format!(
+            "## Suggested Next Steps\n\n\
+             At the end of your response, offer the user clear next actions as a \
+             `<!-- suggested-prompts ... -->` HTML comment block:\n\n\
+             ```\n\
+             <!-- suggested-prompts\n\
+             Run the tests to verify the implementation.\n\
+             {example_second_line}\n\
+             -->\n\
+             ```\n\n\
+             Write 2–4 prompts, each a short directive sentence phrased as \
+             something the user might say next.{auto_commit_clause}"
+        ));
     }
     if parts.is_empty() {
         None

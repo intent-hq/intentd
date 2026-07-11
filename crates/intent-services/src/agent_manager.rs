@@ -729,8 +729,9 @@ impl AgentManager {
         // Assemble the effective system prompt (the §18.1 injection pipeline:
         // base/specialization/workspace user overrides + live workspace rule
         // files, plus — for specialist agents — the PP-1 `<specialist_role>`
-        // section and role-reminder footer) into a temp `--rules` file when
-        // the caller supplies none. The handle owns the temp file so it
+        // section and role-reminder footer, and — for top-level agents — the
+        // SP-1 `## Suggested Next Steps` directive) into a temp `--rules` file
+        // when the caller supplies none. The handle owns the temp file so it
         // outlives the child that reads it.
         let mut rules_config: Option<TempConfigFile> = None;
         let mut rules_file_path: Option<String> = None;
@@ -739,20 +740,35 @@ impl AgentManager {
                 .services
                 .agent_specialist_injection(&agent_id, Some(&cwd))
                 .await;
+            // `git.autoCommit` is a global (non-workspace-scoped) setting, so
+            // this lookup is independent of the session and cheap to do here.
+            let auto_commit_enabled =
+                crate::settings::auto_commit_enabled(&self.services.store).await;
+            // Sub-agent gating: delegated children (`parent_agent_id` set) and
+            // background workers (`is_background`) skip the suggested-prompts
+            // directive, matching the reference `isSubAgent` derivation. The
+            // session was inserted by the caller before `create_agent` runs,
+            // so propagate any store error rather than silently defaulting to
+            // top-level (which would mis-scope the SP-1 footer and hide DB
+            // failures).
+            let session = self.services.store.get_agent_session(&agent_id).await?;
+            let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
             if let Some(prompt) = crate::rules::assemble_system_prompt(
                 &self.services.store,
                 Some(&cwd),
                 agent_type,
                 specialist.as_ref(),
+                is_sub_agent,
+                auto_commit_enabled,
             )
             .await
             {
                 let path =
                     std::env::temp_dir().join(format!("intentd-rules-{}.md", Uuid::new_v4()));
-                if std::fs::write(&path, prompt.as_bytes()).is_ok() {
-                    rules_file_path = Some(path.to_string_lossy().into_owned());
-                    rules_config = Some(TempConfigFile { path });
-                }
+                std::fs::write(&path, prompt.as_bytes())
+                    .map_err(|e| Error::Internal(format!("write rules file failed: {e}")))?;
+                rules_file_path = Some(path.to_string_lossy().into_owned());
+                rules_config = Some(TempConfigFile { path });
             }
         }
 

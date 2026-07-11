@@ -4222,3 +4222,126 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
     )
     .await;
 }
+
+/// SP-1 (Suggested Next Steps): the `--rules` file assembled by
+/// `agent_manager::create_agent` for a top-level (non-sub-agent) interactive
+/// agent MUST contain the `## Suggested Next Steps` heading — the directive
+/// that tells the model to emit a `<!-- suggested-prompts ... -->` block at
+/// the end of user-facing responses. The daemon writes the temp file into
+/// `std::env::temp_dir()` and keeps it alive for the lifetime of the agent
+/// handle, so we redirect the daemon's `TMPDIR` to a test-controlled
+/// directory and scan it after the first turn kicks off spawning.
+#[tokio::test]
+async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
+    let Some(script) = gate("WSS SP-1 rules-file E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // Dedicated TMPDIR so the daemon's `std::env::temp_dir()` writes the
+    // `intentd-rules-*.md` and `intentd-mcp-*.json` files where this test
+    // can inspect them.
+    let tmp_dir = data_dir.join("tmp");
+    std::fs::create_dir_all(&tmp_dir).expect("mkdir tmp dir");
+    let tmp_dir_s = tmp_dir.to_string_lossy().into_owned();
+
+    // Any behavior works — we don't care what the mock does after spawn,
+    // only that the daemon actually reached the rules-file assembly path.
+    let behavior = json!({ "response": "ok" }).to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("TMPDIR", &tmp_dir_s),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "SP-1 WSS", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // sendMessage triggers `ensure_started` → `create_agent`, which writes the
+    // assembled rules file into `std::env::temp_dir()` (redirected TMPDIR).
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hi" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Poll the redirected TMPDIR for the `intentd-rules-*.md` the daemon
+    // writes during spawn. Bounded wait so a hung spawn fails loudly.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut rules_body: Option<String> = None;
+    while std::time::Instant::now() < deadline {
+        let entries = std::fs::read_dir(&tmp_dir).expect("read TMPDIR");
+        let mut hit: Option<PathBuf> = None;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_s = name.to_string_lossy();
+            if name_s.starts_with("intentd-rules-") && name_s.ends_with(".md") {
+                hit = Some(entry.path());
+                break;
+            }
+        }
+        if let Some(path) = hit {
+            if let Ok(body) = std::fs::read_to_string(&path) {
+                if !body.trim().is_empty() {
+                    rules_body = Some(body);
+                    break;
+                }
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let body = rules_body.expect(
+        "expected `intentd-rules-*.md` to be written under the redirected TMPDIR \
+         during agent spawn",
+    );
+    // Debug tail walks forward to the next char boundary so the slice never
+    // lands mid-multi-byte (the rules text includes non-ASCII like "2–4").
+    let tail_from = body.len().saturating_sub(400);
+    let tail_start = (tail_from..=body.len())
+        .find(|i| body.is_char_boundary(*i))
+        .unwrap_or(0);
+    assert!(
+        body.contains("## Suggested Next Steps"),
+        "SP-1: assembled rules file must contain the Suggested Next Steps directive; \
+         body tail: {:?}",
+        &body[tail_start..]
+    );
+    assert!(
+        body.contains("<!-- suggested-prompts"),
+        "SP-1: rules file must embed the suggested-prompts template"
+    );
+
+    // Clean teardown so `AgentHandle::drop` reaps the child + temp file.
+    let _ = wss_rpc(&mut rpc, 13, "agent.stop", json!({ "agentId": agent_id })).await;
+}
