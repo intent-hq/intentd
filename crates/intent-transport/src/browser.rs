@@ -133,7 +133,7 @@ impl std::error::Error for BrowserExecError {}
 /// }`). A closed outbound channel ("no frontend connected") and a reverse-RPC
 /// timeout both surface as `-32603` with the underlying context so the caller
 /// can distinguish them from a validation failure.
-pub async fn exec(
+pub(crate) async fn exec(
     params: &Map<String, Value>,
     reverse: &ReverseChannel,
 ) -> Result<Value, BrowserExecError> {
