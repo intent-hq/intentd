@@ -149,8 +149,8 @@ async fn subscribe(
         );
     }
     let resolved = expand_wildcards(&event_types);
-    let v = api
-        .agent_subscribe(
+    let r = api
+        .event_subscribe(
             ws.clone(),
             resolved,
             opt_bool(args, "excludeSelf"),
@@ -158,7 +158,7 @@ async fn subscribe(
         )
         .await
         .map_err(map_err)?;
-    serde_json::to_value(v).map_err(|e| e.to_string())
+    serde_json::to_value(r).map_err(|e| e.to_string())
 }
 
 async fn unsubscribe(

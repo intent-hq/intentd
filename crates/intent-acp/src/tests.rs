@@ -5096,7 +5096,8 @@ mod wsapi4_bindings_tests {
 
     use intent_core::{
         AgentDelegateInput, AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture,
-        EventQueryParams, EventUnsubscribeResult, FileActivity, Result, WorkspaceApi, WorkspaceId,
+        EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, Result,
+        WorkspaceApi, WorkspaceId,
     };
     use serde_json::{json, Value};
 
@@ -5116,6 +5117,7 @@ mod wsapi4_bindings_tests {
         agent_delegate_calls: Mutex<Vec<DelegateCall>>,
         agent_subscribe_calls: Mutex<Vec<SubscribeCall>>,
         agent_unsubscribe_calls: Mutex<Vec<String>>,
+        event_subscribe_calls: Mutex<Vec<SubscribeCall>>,
         watch_sender_calls: Mutex<Vec<WatchSenderCall>>,
         report_to_parent_calls: Mutex<Vec<Option<String>>>,
         event_recent_files_calls: Mutex<Vec<Option<i64>>>,
@@ -5310,6 +5312,26 @@ mod wsapi4_bindings_tests {
         ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
             self.event_dir_calls.lock().unwrap().push((dir, limit));
             Box::pin(async move { Ok(vec![]) })
+        }
+
+        fn event_subscribe(
+            &self,
+            _ws: WorkspaceId,
+            event_types: Vec<String>,
+            exclude_self: Option<bool>,
+            batch_window: Option<i64>,
+        ) -> BoxFuture<'_, Result<EventSubscribeResult>> {
+            self.event_subscribe_calls.lock().unwrap().push((
+                event_types.clone(),
+                exclude_self,
+                batch_window,
+            ));
+            Box::pin(async move {
+                Ok(EventSubscribeResult {
+                    subscription_id: "sub-1".to_string(),
+                    event_types,
+                })
+            })
         }
 
         fn event_unsubscribe(
@@ -5548,7 +5570,7 @@ mod wsapi4_bindings_tests {
         let (srv, api) = server();
         let resp = call(&srv, "return await ws.event.subscribe(['*']);").await;
         assert_eq!(resp["result"]["isError"], json!(false));
-        let calls = api.agent_subscribe_calls.lock().unwrap();
+        let calls = api.event_subscribe_calls.lock().unwrap();
         let resolved = &calls[0].0;
         assert!(resolved.contains(&"agent:*".to_string()));
         assert!(resolved.contains(&"file:*".to_string()));
@@ -5565,7 +5587,7 @@ mod wsapi4_bindings_tests {
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
-        let calls = api.agent_subscribe_calls.lock().unwrap();
+        let calls = api.event_subscribe_calls.lock().unwrap();
         assert_eq!(
             calls[0].0,
             vec!["agent:idle".to_string(), "file:changed".to_string()]

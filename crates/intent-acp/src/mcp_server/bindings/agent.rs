@@ -129,7 +129,7 @@ async fn create(
             opt_str(args, "model"),
             opt_str(args, "specialist"),
             caller.cloned(),
-            Some(uuid::Uuid::new_v4().to_string()),
+            opt_str(args, "idempotencyKey").or_else(|| Some(uuid::Uuid::new_v4().to_string())),
             None,
             extra,
         )
