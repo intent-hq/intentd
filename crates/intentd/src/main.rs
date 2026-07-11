@@ -16,9 +16,9 @@ use intent_services::{
 };
 use intent_store::Store;
 use intent_transport::{
-    detect_has_display, ensure_tls_certificate, generate_token, get_or_create_token, serve_uds,
-    AsyncTokenStore, CertStatus, FileTokenStore, SystemControl, SystemStatus, TokenStore,
-    WsApiServer, WsOptions,
+    detect_has_display, ensure_tls_certificate, generate_token, get_or_create_token,
+    serve_uds_with_reverse, AsyncTokenStore, CertStatus, FileTokenStore, PrimaryReverseRegistry,
+    SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
 
@@ -284,12 +284,19 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     // Hold a store handle for the §5.4 idempotency reaper (same lifecycle root
     // as the retention sweep) before the store is moved into the services below.
     let idempotency_store = store.clone();
+    // REV-1: build the shared first-client-sticky reverse-dispatch registry
+    // BEFORE the services surface + listeners so both sides observe the same
+    // live-client set. Every accepted UDS/WSS connection registers its
+    // per-connection `ReverseChannel` here; agent-initiated `browser.exec`
+    // routes through the same registry via `Services::with_reverse_dispatch`.
+    let reverse_registry = Arc::new(PrimaryReverseRegistry::new());
     // The services surface publishes CRUD change events onto the same bus that
     // transport subscriptions read, so a mutation on one connection streams to
     // subscribers on another (§10).
     let services = Services::new(store)
         .with_assets_root(config.data_dir.join("assets"))
-        .with_event_bus(bus.clone());
+        .with_event_bus(bus.clone())
+        .with_reverse_dispatch(reverse_registry.clone());
     // The AgentManager multiplexes spawned agent processes over the ACP client
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming
@@ -406,7 +413,12 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
                 ws_options.bind_address,
                 ws_options.base_port
             );
-            WsApiServer::new_insecure(api.clone(), bus.clone(), ws_options)
+            WsApiServer::new_insecure_with_reverse(
+                api.clone(),
+                bus.clone(),
+                ws_options,
+                reverse_registry.clone(),
+            )
         } else {
             let tls = ensure_tls_certificate(&config.data_dir)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -414,8 +426,15 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             get_or_create_token(&AsyncTokenStore::new(token_store.clone()))
                 .await
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, ws_options)
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            WsApiServer::new_with_reverse(
+                api.clone(),
+                bus.clone(),
+                &tls,
+                token_store,
+                ws_options,
+                reverse_registry.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
         };
         let port = server.start().await?;
         match server.fingerprint() {
@@ -457,7 +476,15 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
 
     if serve_uds_enabled {
         tracing::info!(socket = %config.socket_path.display(), "starting intentd");
-        serve_uds(api, bus, &config.socket_path, Some(control), shutdown).await?;
+        serve_uds_with_reverse(
+            api,
+            bus,
+            &config.socket_path,
+            Some(control),
+            reverse_registry.clone(),
+            shutdown,
+        )
+        .await?;
     } else {
         // TCP-only: no local control transport, but the shutdown notify is still
         // wired so a future control path could trigger it. Wait for a signal.

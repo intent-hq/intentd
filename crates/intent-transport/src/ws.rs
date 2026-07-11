@@ -38,7 +38,7 @@ use crate::auth::{extract_token, is_allowed_origin, validate_token, AsyncTokenSt
 use crate::conn::{self, ConnSubs, OUTBOUND_CAPACITY};
 use crate::forward::ForwardRegistry;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
-use crate::reverse::ReverseChannel;
+use crate::reverse::{PrimaryReverseRegistry, ReverseChannel};
 use crate::tls::TlsCertificate;
 
 /// Maximum bytes accepted for an HTTP request head before `\r\n\r\n`.
@@ -127,6 +127,14 @@ pub(crate) struct WsInner {
     pub next_client_id: AtomicU64,
     pub external_stop_generation: AtomicU64,
     pub state: tokio::sync::Mutex<StartState>,
+    /// REV-1 first-client-sticky reverse-dispatch target set. Every accepted
+    /// connection registers its per-connection [`ReverseChannel`] here so
+    /// agent-initiated reverse RPCs (`browser.exec`) can be routed to the
+    /// first-connected live client. Defaults to a fresh (empty) registry, so
+    /// standalone / test wiring keeps the pre-REV-1 behavior (agent-initiated
+    /// reverse RPCs still surface `NoClient` when the composition root did not
+    /// share a registry across listeners).
+    pub reverse_registry: Arc<PrimaryReverseRegistry>,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -168,6 +176,7 @@ impl WsApiServer {
             next_client_id: AtomicU64::new(0),
             external_stop_generation: AtomicU64::new(0),
             state: tokio::sync::Mutex::new(StartState::default()),
+            reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -198,10 +207,54 @@ impl WsApiServer {
             next_client_id: AtomicU64::new(0),
             external_stop_generation: AtomicU64::new(0),
             state: tokio::sync::Mutex::new(StartState::default()),
+            reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
         };
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// [`new`](Self::new) variant that shares an existing REV-1 primary
+    /// reverse-dispatch registry across the UDS and WSS listeners of the same
+    /// daemon. Every accepted connection registers with `reverse_registry` so
+    /// agent-initiated reverse RPCs (`browser.exec`, PROTOCOL §5.14/§12.4)
+    /// see the union of both listeners' clients.
+    pub fn new_with_reverse(
+        api: Arc<dyn WorkspaceApi>,
+        bus: EventBus,
+        tls: &TlsCertificate,
+        token_store: Arc<dyn TokenStore>,
+        options: WsOptions,
+        reverse_registry: Arc<PrimaryReverseRegistry>,
+    ) -> Result<Self> {
+        let mut server = Self::new(api, bus, tls, token_store, options)?;
+        Self::install_registry(&mut server, reverse_registry);
+        Ok(server)
+    }
+
+    /// [`new_insecure`](Self::new_insecure) variant sharing the REV-1
+    /// primary reverse-dispatch registry (see [`new_with_reverse`](Self::new_with_reverse)).
+    pub fn new_insecure_with_reverse(
+        api: Arc<dyn WorkspaceApi>,
+        bus: EventBus,
+        options: WsOptions,
+        reverse_registry: Arc<PrimaryReverseRegistry>,
+    ) -> Self {
+        let mut server = Self::new_insecure(api, bus, options);
+        Self::install_registry(&mut server, reverse_registry);
+        server
+    }
+
+    /// Swap the reverse-dispatch registry on the inner state. The `WsInner`
+    /// carries interior-mutable state (mutexes, atomics), so it cannot be
+    /// cloned via `Arc::make_mut`; instead we rebuild the `Arc<WsInner>` by
+    /// unwrapping it — safe because the builder chain owns the sole strong
+    /// reference before [`start`](Self::start) publishes clones. Called only
+    /// from the two `*_with_reverse` constructors.
+    fn install_registry(server: &mut Self, reverse_registry: Arc<PrimaryReverseRegistry>) {
+        let inner = Arc::get_mut(&mut server.inner)
+            .expect("WsApiServer inner not yet shared before install_registry");
+        inner.reverse_registry = reverse_registry;
     }
 
     /// Start the listener, returning the bound port (single-flight).
@@ -450,6 +503,12 @@ impl WsInner {
         let mut subs = ConnSubs::default();
         let mut forwards = ForwardRegistry::default();
         let reverse = ReverseChannel::new(app_tx.clone());
+        // REV-1: register this connection's reverse channel with the shared
+        // primary-target set so agent-initiated `browser.exec` calls can route
+        // to whichever client connected first. Guard drops when this loop
+        // returns (normal exit, remote close, heartbeat timeout, shutdown), so
+        // failover is exactly the connection arrival order.
+        let _reverse_guard = self.reverse_registry.register(reverse.clone());
         // Per-connection logical-client binding (§16): `None` until `client.hello`.
         let mut client_id: Option<intent_core::ClientId> = None;
         loop {

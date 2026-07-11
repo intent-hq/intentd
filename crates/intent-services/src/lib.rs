@@ -19,6 +19,7 @@ use intent_core::events::{
     WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
     WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
 };
+use intent_core::AgentReverseDispatch;
 use intent_core::{
     iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId, AgentLite,
     AgentSession, AuthorType, BoxFuture, ClientId, Comment, CommentAddResult, CommentAnchor,
@@ -273,6 +274,15 @@ pub struct Services {
     /// reseeds from disk. Shared across clones like the other in-memory
     /// registries.
     crdt_notes: Arc<crdt_notes::CrdtNoteManager>,
+    /// REV-1 agent-initiated reverse-dispatch seam: when an agent calls
+    /// `ws.browser.exec` via the MCP front door there is no ambient client
+    /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
+    /// routes through this handle (the transport crate wires a shared
+    /// first-client-sticky registry). `None` when the composition root did not
+    /// wire a registry (unit tests, read-only wiring) — `browser_exec` then
+    /// falls back to the default `not implemented` behavior. Shared across
+    /// clones so every service handle sees the same live-client set.
+    reverse_dispatch: Option<Arc<dyn AgentReverseDispatch>>,
 }
 
 impl Services {
@@ -309,6 +319,7 @@ impl Services {
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
+            reverse_dispatch: None,
         }
     }
 
@@ -754,6 +765,17 @@ impl Services {
         // The MCP hub publishes `mcp.servers:status-changed` onto the same bus.
         self.mcp_hub.set_event_bus(bus.clone());
         self.event_bus = Some(bus);
+        self
+    }
+
+    /// REV-1: wire the agent-initiated reverse-dispatch seam so
+    /// [`WorkspaceApi::browser_exec`] can forward to the shared
+    /// first-client-sticky registry the transport listeners populate. The
+    /// composition root builds one [`intent_transport::PrimaryReverseRegistry`]
+    /// and hands it to both this method and every listener; test / read-only
+    /// wiring leaves it unset and `browser_exec` surfaces `no client connected`.
+    pub fn with_reverse_dispatch(mut self, dispatch: Arc<dyn AgentReverseDispatch>) -> Self {
+        self.reverse_dispatch = Some(dispatch);
         self
     }
 
@@ -9742,6 +9764,54 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<()>> {
         let svc = self.clone();
         Box::pin(async move { svc.drafts_clear(workspace_id, agent_id, client_id).await })
+    }
+
+    /// `browser.exec` — agent-initiated CDP forward (REV-1, PROTOCOL §5.14/§12.4).
+    ///
+    /// When an agent triggers this via the MCP `ws.browser.exec` binding
+    /// there is no per-connection reverse channel to use (the caller is the
+    /// daemon-hosted MCP server, not a client connection), so we route the
+    /// batch to the first-registered live client via the injected
+    /// [`AgentReverseDispatch`]. Envelope validation and result shaping stay
+    /// in [`browser_ops`] (byte-for-byte parity with the FE tool); failure
+    /// modes surface as `Error::Internal` with the underlying reason so the
+    /// MCP caller can distinguish "no client connected" from a proxy-side
+    /// failure. When no dispatcher is wired (unit tests, read-only wiring)
+    /// the request short-circuits with `no client connected`.
+    fn browser_exec(
+        &self,
+        _workspace_id: WorkspaceId,
+        actions: Vec<serde_json::Value>,
+        tab_id: Option<String>,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let Some(dispatch) = self.reverse_dispatch.clone() else {
+                return Err(Error::Internal(
+                    "browser.exec: no client connected".to_string(),
+                ));
+            };
+            let args = browser_ops::BrowserExecArgs {
+                actions,
+                tab_id,
+                agent_id: agent_id.map(|a| a.as_str().to_string()),
+                workspace_id: None,
+            };
+            let forwarded = browser_ops::build_forward_params(&args);
+            let response =
+                dispatch
+                    .dispatch("browser.exec", forwarded)
+                    .await
+                    .map_err(|e| match e {
+                        intent_core::ReverseDispatchError::NoClient => {
+                            Error::Internal("browser.exec: no client connected".to_string())
+                        }
+                        intent_core::ReverseDispatchError::Transport { message, .. } => {
+                            Error::Internal(format!("browser.exec: {message}"))
+                        }
+                    })?;
+            browser_ops::shape_result(response).map_err(|e| Error::Internal(e.message))
+        })
     }
 }
 

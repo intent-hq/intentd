@@ -149,5 +149,8 @@ impl ReverseChannel {
     }
 }
 
+pub mod primary;
+pub use primary::{PrimaryReverseGuard, PrimaryReverseRegistry};
+
 #[cfg(test)]
 mod tests;

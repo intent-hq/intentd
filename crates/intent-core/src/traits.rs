@@ -4293,3 +4293,56 @@ pub trait ContextEngine: Send + Sync {
         req: RetrieveRequest,
     ) -> std::result::Result<RetrieveResult, ContextError>;
 }
+
+/// Why an agent-initiated reverse RPC could not be delivered (REV-1). Kept as a
+/// small named enum so the service layer can distinguish "no client connected"
+/// from a transport-level failure without inspecting error strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReverseDispatchError {
+    /// No client is currently registered as the sticky reverse target — no
+    /// live connection to route the request to.
+    NoClient,
+    /// The reverse RPC reached a client but the client returned a failure
+    /// (timeout, closed connection, or a JSON-RPC error). The daemon does not
+    /// interpret `code`; it just carries whatever the client / transport
+    /// surfaced.
+    Transport { code: i64, message: String },
+}
+
+impl std::fmt::Display for ReverseDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReverseDispatchError::NoClient => f.write_str("no client connected"),
+            ReverseDispatchError::Transport { message, .. } => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ReverseDispatchError {}
+
+/// Agent-initiated daemon→client reverse-RPC seam (REV-1, PROTOCOL §5.14/§12.4).
+///
+/// Provides the sticky "first client wins" routing decision the service layer
+/// needs when an agent (not a per-connection client) triggers a reverse intent
+/// (currently `browser.exec`). The concrete implementation lives in
+/// `intent-transport` (a shared registry of live `ReverseChannel`s ordered by
+/// arrival); `intent-services` holds it as `Arc<dyn AgentReverseDispatch>` so
+/// the crate graph stays acyclic (§3.2).
+///
+/// Semantics: `dispatch` returns the same JSON `Value` the connected client
+/// echoed back verbatim, or a [`ReverseDispatchError`] describing why the
+/// request could not be delivered. `is_connected` is a cheap synchronous probe
+/// that lets the service surface a friendlier error before it composes the
+/// forward params.
+pub trait AgentReverseDispatch: Send + Sync {
+    /// Whether at least one client is currently registered as a reverse target.
+    fn is_connected(&self) -> bool;
+
+    /// Dispatch a reverse JSON-RPC request to the sticky primary client and
+    /// await its response.
+    fn dispatch<'a>(
+        &'a self,
+        method: &'a str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, std::result::Result<serde_json::Value, ReverseDispatchError>>;
+}
