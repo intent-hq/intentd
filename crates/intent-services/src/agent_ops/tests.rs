@@ -1884,10 +1884,12 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
         "parent transcript should contain the report text"
     );
 
-    // RPC / no-caller path: the report tool call surfaces the daemon
-    // error as an `isError: true` workspace_api tool result (workspace_api
-    // shapes JS-side failures as tool-result text bodies rather than
-    // JSON-RPC protocol errors — reference parity with the TS tool).
+    // RPC / no-caller path: after the WSAPI-8 cutover the report flows
+    // through the unified `workspace_api` tool executing
+    // `ws.agent.reportToParent`, and the daemon error surfaces as an
+    // `isError: true` workspace_api tool result (workspace_api shapes
+    // JS-side failures as tool-result text bodies rather than JSON-RPC
+    // protocol errors — reference parity with the TS tool).
     let no_caller_server = WorkspaceMcpServer::new(api, ws.clone());
     let err_resp = no_caller_server
         .handle_message(&json!({
