@@ -135,7 +135,7 @@ API:
 
   ws.primitive.addReference(noteId, semanticId, description, snapshot?) → { ok, primitiveId, noteId }  // Code reference primitive; `semanticId` examples: `src/file.ts#symbol:Foo` or `src/file.ts#L10-20`.
   ws.primitive.addCli(noteId, command, description, workingDirectory?) → { ok, primitiveId, noteId }  // CLI primitive; optional cwd is relative to workspace root.
-  ws.primitive.addPatch(noteId, filePath, diff, description) → { ok, primitiveId, noteId }  // Stores an applyable patch block in a note.
+  ws.primitive.addPatch(noteId, filePath, diff, description) → { ok, primitiveId, noteId }  // Stores a patch block that can be applied in a note.
   ws.primitive.addAgentAction(noteId, agentId, goal, description) → { ok, primitiveId, noteId }  // Adds a triggerable agent action block.
 
   ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create and start an agent immediately. You are auto-subscribed to its completion events and will be woken when it finishes.
@@ -210,7 +210,7 @@ API:
   ws.pr.listComments({ count? }?) → comments  // Lists conversation-level PR comments (not inline code comments).
   ws.pr.postComment(body) → { ... }  // Posts a conversation-level PR comment.
 
-Examples:
+Examples (the final one shows the N+1 pattern: list items first, then batch-read their details in a single Promise.all):
   return await ws.workspace.info()
 
   const [spec, tasks, agents] = await Promise.all([
@@ -226,7 +226,6 @@ Examples:
   }
   return await ws.workspace.details()
 
-  // N+1 pattern: list items, then batch-read details in one call
   const tasks = await ws.note.listTasks("spec")
   const taskNoteIds = tasks.filter(t => t.taskNoteId).map(t => t.taskNoteId)
   const taskNotes = await Promise.all(taskNoteIds.map(id => ws.task.getMyTask(id)))
@@ -645,10 +644,12 @@ mod tests {
     use std::collections::HashSet;
 
     // Source of every `ws.<ns>.<method>` binding actually dispatched by
-    // `super::super::bindings::<ns>::dispatch`. Keeping the per-namespace
-    // bindings source in-scope means the drift test cannot go stale if a
-    // dispatch arm is added or removed — the include_str! files change and
-    // the assertion re-evaluates.
+    // `super::super::bindings::<ns>::dispatch`, included verbatim so the two
+    // drift tests below re-evaluate whenever a dispatch arm is added or
+    // removed. `description_only_names_bound_methods` guards the forward
+    // direction (documented → bound); `every_bound_method_is_documented`
+    // guards the reverse (bound → documented). Together they fail on any
+    // drift in either direction, minus the `deferred()` exemptions.
     const BINDINGS_WORKSPACE: &str = include_str!("bindings/workspace.rs");
     const BINDINGS_NOTE: &str = include_str!("bindings/note.rs");
     const BINDINGS_TASK: &str = include_str!("bindings/task.rs");
@@ -664,29 +665,40 @@ mod tests {
     const BINDINGS_TERMINAL: &str = include_str!("bindings/terminal.rs");
     const BINDINGS_FILE: &str = include_str!("bindings/file.rs");
 
+    // The full set of `(namespace, bindings source)` pairs. Iterated by the
+    // reverse-direction drift test below so a NEW dispatch arm added without
+    // a description update fails the suite.
+    fn all_namespaces() -> &'static [(&'static str, &'static str)] {
+        &[
+            ("workspace", BINDINGS_WORKSPACE),
+            ("note", BINDINGS_NOTE),
+            ("task", BINDINGS_TASK),
+            ("comment", BINDINGS_COMMENT),
+            ("primitive", BINDINGS_PRIMITIVE),
+            ("crossWorkspace", BINDINGS_CROSS_WORKSPACE),
+            ("pr", BINDINGS_PR),
+            ("browser", BINDINGS_BROWSER),
+            ("agent", BINDINGS_AGENT),
+            ("event", BINDINGS_EVENT),
+            ("git", BINDINGS_GIT),
+            ("script", BINDINGS_SCRIPT),
+            ("terminal", BINDINGS_TERMINAL),
+            ("file", BINDINGS_FILE),
+        ]
+    }
+
     fn bindings_for(namespace: &str) -> &'static str {
-        match namespace {
-            "workspace" => BINDINGS_WORKSPACE,
-            "note" => BINDINGS_NOTE,
-            "task" => BINDINGS_TASK,
-            "comment" => BINDINGS_COMMENT,
-            "primitive" => BINDINGS_PRIMITIVE,
-            "crossWorkspace" => BINDINGS_CROSS_WORKSPACE,
-            "pr" => BINDINGS_PR,
-            "browser" => BINDINGS_BROWSER,
-            "agent" => BINDINGS_AGENT,
-            "event" => BINDINGS_EVENT,
-            "git" => BINDINGS_GIT,
-            "script" => BINDINGS_SCRIPT,
-            "terminal" => BINDINGS_TERMINAL,
-            "file" => BINDINGS_FILE,
-            _ => "",
-        }
+        all_namespaces()
+            .iter()
+            .find(|(ns, _)| *ns == namespace)
+            .map(|(_, src)| *src)
+            .unwrap_or("")
     }
 
     // Methods whose dispatch arm exists solely to surface a
     // "not yet available in this daemon port" error (WSAPI-5 report).
-    // If any of these creep into the tool description, the drift test fails.
+    // These are bound but MUST NOT appear in the tool description — both
+    // drift tests below use this set as an exemption in opposite directions.
     fn deferred() -> HashSet<(&'static str, &'static str)> {
         [
             ("workspace", "context"),
@@ -729,10 +741,41 @@ mod tests {
         out
     }
 
+    // Parse the top-level `match method { ... }` block of a bindings file's
+    // `dispatch` function and return the set of quoted method names bound in
+    // it. Stops at the wildcard `other =>` (or `_ =>`) arm so nested match
+    // blocks in helper functions further down the file (e.g. `browser::docs`
+    // topic matching, `script::create` mode matching) are not counted.
+    fn bound_methods(src: &str) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let Some(match_idx) = src.find("match method {") else {
+            return out;
+        };
+        let body = &src[match_idx + "match method {".len()..];
+        for raw_line in body.lines() {
+            let line = raw_line.trim_start();
+            if line.starts_with("other =>") || line.starts_with("_ =>") {
+                break;
+            }
+            let Some(rest) = line.strip_prefix('"') else {
+                continue;
+            };
+            let Some(end) = rest.find('"') else {
+                continue;
+            };
+            let name = &rest[..end];
+            let after = rest[end + 1..].trim_start();
+            if after.starts_with("=>") {
+                out.insert(name.to_string());
+            }
+        }
+        out
+    }
+
     // Every method reference in the tool description must correspond to a
-    // real dispatch arm in the matching bindings module — and must NOT be
-    // one of the deferred "not yet available" arms. This is the drift guard
-    // called out in the WSAPI-7 task's Definition of Done.
+    // real top-level dispatch arm in the matching bindings module — and must
+    // NOT be one of the deferred "not yet available" arms. Guards against
+    // hallucinated method names in the description.
     #[test]
     fn description_only_names_bound_methods() {
         let deferred = deferred();
@@ -747,11 +790,32 @@ mod tests {
                 !src.is_empty(),
                 "description mentions ws.{ns}.{method} but no bindings module `{ns}` exists",
             );
-            let needle = format!("\"{method}\" =>");
+            let bound = bound_methods(src);
             assert!(
-                src.contains(&needle),
-                "description mentions ws.{ns}.{method} but bindings/{ns}.rs has no `{needle}` arm",
+                bound.contains(&method),
+                "description mentions ws.{ns}.{method} but bindings/{ns}.rs has no matching top-level dispatch arm",
             );
+        }
+    }
+
+    // Reverse direction: every top-level dispatch arm in every bindings
+    // module (except the deferred stubs) must be advertised in the tool
+    // description. Guards against a new binding shipping without a doc
+    // entry, which would silently reduce agent-visible surface.
+    #[test]
+    fn every_bound_method_is_documented() {
+        let deferred = deferred();
+        let documented = extract_ws_methods(WORKSPACE_API_DESCRIPTION);
+        for (ns, src) in all_namespaces() {
+            for method in bound_methods(src) {
+                if deferred.contains(&(*ns, method.as_str())) {
+                    continue;
+                }
+                assert!(
+                    documented.contains(&((*ns).to_string(), method.clone())),
+                    "bindings/{ns}.rs binds ws.{ns}.{method} but the tool description does not advertise it",
+                );
+            }
         }
     }
 
