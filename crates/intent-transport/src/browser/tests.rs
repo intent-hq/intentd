@@ -10,14 +10,20 @@ use crate::reverse::ReverseChannel;
 
 /// Spawn a mock FE that reads one reverse-RPC frame off `out_rx` and replies
 /// with `reply` (already carrying the right `id`). Returns the join handle so
-/// the test can assert on the request the daemon actually forwarded.
+/// the test can assert on the request the daemon actually forwarded. The
+/// `out_rx.recv()` is wrapped in a fail-safe `tokio::time::timeout` (repo
+/// convention) so a bug that never forwards the frame surfaces as a clear
+/// test failure instead of hanging the runtime.
 fn mock_fe_replies_with(
     mut out_rx: mpsc::Receiver<String>,
     reverse: ReverseChannel,
     reply: Value,
 ) -> tokio::task::JoinHandle<Value> {
     tokio::spawn(async move {
-        let frame = out_rx.recv().await.expect("daemon forwarded a reverse RPC");
+        let frame = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .expect("daemon did not forward a reverse RPC within 2s")
+            .expect("daemon forwarded a reverse RPC");
         let req: Value = serde_json::from_str(&frame).expect("valid JSON frame");
         let id = req["id"]
             .as_str()
