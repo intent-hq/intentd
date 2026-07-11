@@ -409,10 +409,11 @@ async fn workspace_delete_emits_workspace_deleted_over_wss() {
 /// an `@@@task` block auto-converts the fence into a linked child task note
 /// (fence-free parent + `note:created` for the child + `note:updated` for the
 /// rewritten parent), `note.listTasks` surfaces the linked task, and
-/// `task.assignAgent` flips the `not_started` task to `in_progress` with
-/// `task:status-changed` + `task:ready-tasks-changed` emissions
-/// (PROTOCOL.md §6.5) — author → list → delegate → in-progress without any
-/// follow-up reads.
+/// `task.assignAgent` flips the `not_started` task to `in_progress` with a
+/// `note:updated` (assignment write) + `task:status-changed` +
+/// `task:ready-tasks-changed` fan-out (PROTOCOL.md §6.5) — author → list →
+/// delegate → in-progress, driven end-to-end over WSS with subscribers seeing
+/// every emission live and one confirming `task.get` at the end.
 #[tokio::test]
 async fn task_block_author_list_assign_flow_over_wss() {
     let (daemon, port, cfg) = boot().await;
@@ -522,6 +523,15 @@ async fn task_block_author_list_assign_flow_over_wss() {
     assert_eq!(assign["ok"], json!(true), "assign: {assign}");
     assert_eq!(assign["noteId"], json!(task_id));
     assert_eq!(assign["agentId"], json!(agent));
+
+    // The assignment write routes through `updateNote` (TS parity), publishing
+    // a `note:updated` for the task note before the status transition fires.
+    let evt = next_event(&mut sub, &["note:updated"], 10).await;
+    assert_eq!(
+        evt["data"]["noteId"],
+        json!(task_id),
+        "assign updated: {evt}"
+    );
 
     let evt = next_event(&mut sub, &["task:status-changed"], 10).await;
     assert_eq!(evt["data"]["noteId"], json!(task_id));
