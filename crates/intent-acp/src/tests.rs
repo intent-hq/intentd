@@ -1700,8 +1700,8 @@ mod tool_registry_tests {
             );
             let names: Vec<&str> = srv.available_tools().iter().map(|t| t.name).collect();
             assert!(
-                !names.contains(&"workspace_api"),
-                "{ty} must deny workspace_api"
+                names.is_empty(),
+                "{ty} must expose no tools (denies workspace_api), got {names:?}"
             );
         }
     }
@@ -1718,9 +1718,14 @@ mod tool_registry_tests {
                 ty,
             );
             let names: Vec<&str> = srv.available_tools().iter().map(|t| t.name).collect();
-            assert!(
-                names.contains(&"workspace_api"),
-                "{ty} must keep workspace_api"
+            assert_eq!(
+                names.len(),
+                1,
+                "{ty} must expose exactly one tool (singleton registry), got {names:?}"
+            );
+            assert_eq!(
+                names[0], "workspace_api",
+                "{ty} must keep workspace_api as the sole registered tool, got {names:?}"
             );
         }
         // Sanity: background_agent_types() enumerates exactly these seven types
