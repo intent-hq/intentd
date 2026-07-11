@@ -28,16 +28,16 @@ const SENDER_WATCH_NOTIFICATION: &str = "You will be notified when the agent res
 /// timeout in the reference `workspace-js-api-tool.ts`.
 const WORKSPACE_API_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// JS prelude installed before user code (WSAPI-2 skeleton). Only wires the
-/// `ws.workspace.info()` binding as proof of the end-to-end path; the full
-/// `ws.*` surface is filled out incrementally by later WSAPI tasks. Real
-/// bindings go through `host({ method, args })`, which the Rust bridge
-/// routes to the shared `WorkspaceApi`.
-const WORKSPACE_API_PRELUDE: &str = r#"
-    globalThis.ws = {
-        workspace: {
-            info: () => host({ method: 'workspace.info' }),
-        },
+/// JS prelude installed before user code. The WSAPI-2 fragment wires the
+/// `ws.workspace.info()` proof point; the WSAPI-3+ per-namespace fragments
+/// (owned by `super::bindings`) attach the note/task/comment/primitive
+/// surfaces to the same `ws` object. Real bindings go through
+/// `host({ method, args })`, which the Rust bridge routes to the shared
+/// `WorkspaceApi`.
+const WORKSPACE_API_WORKSPACE_PRELUDE: &str = r#"
+    globalThis.ws = globalThis.ws || {};
+    ws.workspace = ws.workspace || {
+        info: () => host({ method: 'workspace.info' }),
     };
 "#;
 
@@ -746,8 +746,9 @@ impl WorkspaceMcpServer {
         // `serde_json::Value` cannot represent on its own. `__k` is `"u"` for
         // an undefined return (prints "(no return value)") and `"v"` for a
         // JSON-serializable value (prints as pretty JSON, including `null`).
+        let bindings_prelude = super::bindings::prelude();
         let full_code = format!(
-            "{WORKSPACE_API_PRELUDE}\n\
+            "{WORKSPACE_API_WORKSPACE_PRELUDE}\n{bindings_prelude}\n\
              const __wsapi_user = await (async () => {{ {code}\n}})();\n\
              return {{ __k: __wsapi_user === undefined ? 'u' : 'v', __v: __wsapi_user }};"
         );
@@ -784,8 +785,9 @@ fn make_workspace_host(api: Arc<dyn WorkspaceApi>, workspace_id: WorkspaceId) ->
 }
 
 /// Route one `host({method, args})` frame to a `WorkspaceApi` method. The
-/// WSAPI-2 skeleton only implements `workspace.info` — the binding proof
-/// point. Additional method names surface as a JS-visible error.
+/// WSAPI-2 handler covers `workspace.info`; anything else is delegated to
+/// [`super::bindings::try_dispatch`] (WSAPI-3+), which owns the per-namespace
+/// method → trait mapping.
 async fn workspace_host_dispatch(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -795,22 +797,24 @@ async fn workspace_host_dispatch(
         .get("method")
         .and_then(Value::as_str)
         .ok_or_else(|| "host: `method` is required".to_string())?;
-    match method {
-        "workspace.info" => {
-            let ws = api
-                .get_workspace(workspace_id.clone())
-                .await
-                .map_err(|e| e.to_string())?;
-            // `path` prefers the on-disk workspace root, falling back to the
-            // worktree path; both are optional on the domain model.
-            let path = ws.path.clone().or(ws.worktree_path.clone());
-            Ok(json!({
-                "id": workspace_id.as_str(),
-                "path": path,
-            }))
-        }
-        other => Err(format!("host: unknown method `{other}`")),
+    let args = arg.get("args").cloned().unwrap_or(Value::Null);
+    if method == "workspace.info" {
+        let ws = api
+            .get_workspace(workspace_id.clone())
+            .await
+            .map_err(|e| e.to_string())?;
+        // `path` prefers the on-disk workspace root, falling back to the
+        // worktree path; both are optional on the domain model.
+        let path = ws.path.clone().or(ws.worktree_path.clone());
+        return Ok(json!({
+            "id": workspace_id.as_str(),
+            "path": path,
+        }));
     }
+    if let Some(v) = super::bindings::try_dispatch(&api, &workspace_id, method, &args).await? {
+        return Ok(v);
+    }
+    Err(format!("host: unknown method `{method}`"))
 }
 
 /// Success MCP tool result for `workspace_api`: a single text content block

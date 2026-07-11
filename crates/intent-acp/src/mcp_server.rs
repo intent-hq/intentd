@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use crate::tool_restrictions::get_tool_denylist_for_agent_type;
 
+mod bindings;
 mod dispatch;
 mod tools;
 

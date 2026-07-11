@@ -3095,3 +3095,1343 @@ mod workspace_api_tool_tests {
         );
     }
 }
+
+/// WSAPI-3 per-namespace bindings: `ws.note.*`, `ws.task.*`, `ws.comment.*`,
+/// `ws.primitive.*`. Each namespace is exercised through the real JS engine
+/// (no engine mocking) — the tool call round-trips a `workspace_api` request
+/// against a fake [`WorkspaceApi`] that only stubs the trait methods the
+/// bindings touch, so a happy-path and one error-path per namespace prove
+/// the JS→Rust dispatch, argument peel, and result serialization. A
+/// `Promise.all` batching test proves multiple bindings can share one
+/// `workspace_api` invocation.
+#[cfg(test)]
+mod wsapi3_bindings_tests {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{
+        AgentId, BoxFuture, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
+        CommentListResult, CommentLocation, CommentRespondResult, CommentRespondThread,
+        CommentType, CommentWire, Error, Note, NoteAddInput, NoteAddResult, NoteCreate,
+        NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+        NoteId, NoteSetContentResult, NoteTaskRow, NoteUpdateMetadataResult, ReadAssetResult,
+        Result, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+        TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata, TaskStatus,
+        TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, WorkspaceApi,
+        WorkspaceId,
+    };
+    use serde_json::{json, Value};
+
+    use crate::WorkspaceMcpServer;
+
+    // Type aliases keep clippy's `type_complexity` lint quiet for the many
+    // per-method argument-tuple recorders below.
+    type CreateNoteCall = (String, Option<String>, Option<Vec<String>>);
+    type AddCall = (String, String, Option<String>, Option<String>);
+    type EditLinesCall = (String, i64, i64, String);
+    type UpdateMetadataCall = (String, Option<String>, Option<Vec<String>>);
+    type TaskUpdateCall = (String, i64, Option<String>, Option<String>, Option<String>);
+    type MarkAsTaskCall = (String, String, Vec<String>, Option<String>);
+    type CreatePrereqCall = (String, String, Option<String>, Option<String>);
+    type CommentAddCall = (String, String, String, String);
+    type CommentGetThreadCall = (String, Option<String>, Option<String>);
+    type CommentRespondCall = (String, Option<String>, String);
+
+    /// A fake `WorkspaceApi` that stubs just enough for the WSAPI-3 host
+    /// frames to complete. Every method records the arguments it saw so a
+    /// test can inspect the peel result; unknown noteIds surface `NotFound`
+    /// so the error-path tests can prove JS-visible failures.
+    #[derive(Default)]
+    struct FakeApi {
+        get_note_calls: Mutex<Vec<String>>,
+        create_note_calls: Mutex<Vec<CreateNoteCall>>,
+        list_note_tasks_calls: Mutex<Vec<String>>,
+        read_asset_calls: Mutex<Vec<String>>,
+        set_content_calls: Mutex<Vec<(String, String, bool)>>,
+        add_calls: Mutex<Vec<AddCall>>,
+        edit_calls: Mutex<Vec<(String, String, String)>>,
+        edit_lines_calls: Mutex<Vec<EditLinesCall>>,
+        update_metadata_calls: Mutex<Vec<UpdateMetadataCall>>,
+        delete_calls: Mutex<Vec<String>>,
+        list_notes_calls: Mutex<u32>,
+        task_update_status_calls: Mutex<Vec<(String, String, String)>>,
+        task_update_note_status_calls: Mutex<Vec<(String, String)>>,
+        task_update_calls: Mutex<Vec<TaskUpdateCall>>,
+        get_my_task_calls: Mutex<Vec<String>>,
+        mark_as_task_calls: Mutex<Vec<MarkAsTaskCall>>,
+        convert_blocks_calls: Mutex<Vec<String>>,
+        create_prereq_calls: Mutex<Vec<CreatePrereqCall>>,
+        assign_agent_calls: Mutex<Vec<(String, String)>>,
+        comment_add_calls: Mutex<Vec<CommentAddCall>>,
+        comment_list_calls: Mutex<Vec<String>>,
+        comment_get_thread_calls: Mutex<Vec<CommentGetThreadCall>>,
+        comment_respond_calls: Mutex<Vec<CommentRespondCall>>,
+        comment_delete_calls: Mutex<Vec<(String, String)>>,
+        primitive_calls: Mutex<Vec<String>>,
+    }
+
+    fn stub_note(id: &str, ws: &WorkspaceId, task: Option<TaskMetadata>) -> Note {
+        Note {
+            id: NoteId::from_string(id),
+            workspace_id: ws.clone(),
+            title: format!("title-{id}"),
+            content: "line one\nline two\n![alt](workspace-asset://ws/asset-1)".to_string(),
+            content_type: Default::default(),
+            tags: vec!["a".to_string()],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: None,
+            visibility: Default::default(),
+            task,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            rev: 1,
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    impl WorkspaceApi for FakeApi {
+        // ---- note.* ----
+        fn get_note(
+            &self,
+            workspace_id: WorkspaceId,
+            note_id: NoteId,
+        ) -> BoxFuture<'_, Result<Note>> {
+            let id = note_id.as_str().to_string();
+            self.get_note_calls.lock().unwrap().push(id.clone());
+            Box::pin(async move {
+                if id == "missing" {
+                    return Err(Error::NotFound(format!("Note not found: {id}")));
+                }
+                let mut task = None;
+                if id == "task-1" {
+                    task = Some(TaskMetadata {
+                        status: TaskStatus::InProgress,
+                        acceptance_criteria: vec!["A".to_string(), "B".to_string()],
+                        estimated_effort: Some("1h".to_string()),
+                        ..Default::default()
+                    });
+                }
+                Ok(stub_note(&id, &workspace_id, task))
+            })
+        }
+
+        fn list_notes<'a>(&'a self, _ws: &'a WorkspaceId) -> BoxFuture<'a, Result<Vec<Note>>> {
+            *self.list_notes_calls.lock().unwrap() += 1;
+            let ws = WorkspaceId::from_string("amber-forest");
+            Box::pin(async move {
+                Ok(vec![
+                    Note {
+                        id: NoteId::from_string("n-1"),
+                        workspace_id: ws.clone(),
+                        title: "First".to_string(),
+                        content: String::new(),
+                        content_type: Default::default(),
+                        tags: vec!["red".to_string()],
+                        is_pinned: false,
+                        is_archived: false,
+                        is_default: false,
+                        parent_id: None,
+                        visibility: Default::default(),
+                        task: None,
+                        created_at: "2026-01-01T00:00:00Z".to_string(),
+                        rev: 1,
+                        updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    },
+                    Note {
+                        id: NoteId::from_string("n-2"),
+                        workspace_id: ws,
+                        title: "Second".to_string(),
+                        content: String::new(),
+                        content_type: Default::default(),
+                        tags: vec!["blue".to_string()],
+                        is_pinned: false,
+                        is_archived: false,
+                        is_default: false,
+                        parent_id: None,
+                        visibility: Default::default(),
+                        task: None,
+                        created_at: "2026-01-01T00:00:00Z".to_string(),
+                        rev: 1,
+                        updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    },
+                ])
+            })
+        }
+
+        fn create_note(
+            &self,
+            workspace_id: WorkspaceId,
+            input: NoteCreate,
+            _idempotency_key: Option<String>,
+        ) -> BoxFuture<'_, Result<Note>> {
+            self.create_note_calls.lock().unwrap().push((
+                input.title.clone(),
+                input.content.clone(),
+                input.tags.clone(),
+            ));
+            Box::pin(async move {
+                Ok(Note {
+                    id: NoteId::from_string("n-new"),
+                    workspace_id,
+                    title: input.title,
+                    content: input.content.unwrap_or_default(),
+                    content_type: Default::default(),
+                    tags: input.tags.unwrap_or_default(),
+                    is_pinned: false,
+                    is_archived: false,
+                    is_default: false,
+                    parent_id: None,
+                    visibility: Default::default(),
+                    task: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    rev: 1,
+                    updated_at: "2026-01-01T00:00:00Z".to_string(),
+                })
+            })
+        }
+
+        fn list_note_tasks(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+        ) -> BoxFuture<'_, Result<Vec<NoteTaskRow>>> {
+            self.list_note_tasks_calls
+                .lock()
+                .unwrap()
+                .push(note_id.as_str().to_string());
+            Box::pin(async move {
+                Ok(vec![NoteTaskRow {
+                    line_number: 3,
+                    text: "do the thing".to_string(),
+                    status: "todo".to_string(),
+                    task_note_id: None,
+                    linked_task_note_id: None,
+                }])
+            })
+        }
+
+        fn read_asset(
+            &self,
+            _ws: WorkspaceId,
+            asset: String,
+        ) -> BoxFuture<'_, Result<ReadAssetResult>> {
+            self.read_asset_calls.lock().unwrap().push(asset.clone());
+            Box::pin(async move {
+                Ok(ReadAssetResult {
+                    asset_id: asset,
+                    mime_type: "image/png".to_string(),
+                    data: "AAAA".to_string(),
+                    size_kb: 1,
+                })
+            })
+        }
+
+        fn set_note_content(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            content: String,
+            confirm_replacement: bool,
+            _expected_version: Option<i64>,
+        ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
+            self.set_content_calls.lock().unwrap().push((
+                note_id.as_str().to_string(),
+                content.clone(),
+                confirm_replacement,
+            ));
+            Box::pin(async move {
+                Ok(NoteSetContentResult {
+                    ok: true,
+                    note_id,
+                    title: "t".to_string(),
+                    previous_title: None,
+                    updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    old_content: None,
+                    new_content: content,
+                    converted_count: 0,
+                    created_task_note_ids: Vec::new(),
+                })
+            })
+        }
+
+        fn add_to_note(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            input: NoteAddInput,
+        ) -> BoxFuture<'_, Result<NoteAddResult>> {
+            self.add_calls.lock().unwrap().push((
+                note_id.as_str().to_string(),
+                input.content.clone(),
+                input.heading.clone(),
+                input.position.clone(),
+            ));
+            Box::pin(async move {
+                let n = input.content.len();
+                Ok(NoteAddResult {
+                    ok: true,
+                    note_id,
+                    added_length: n,
+                    total_length: n,
+                    position: input.position.unwrap_or_else(|| "at end".to_string()),
+                    old_content: String::new(),
+                    new_content: input.content,
+                    converted_count: 0,
+                    created_task_note_ids: Vec::new(),
+                })
+            })
+        }
+
+        fn edit_note(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            input: NoteEditInput,
+        ) -> BoxFuture<'_, Result<NoteEditResult>> {
+            self.edit_calls.lock().unwrap().push((
+                note_id.as_str().to_string(),
+                input.old.clone(),
+                input.new.clone(),
+            ));
+            Box::pin(async move {
+                Ok(NoteEditResult {
+                    ok: true,
+                    note_id,
+                    old_text_length: input.old.len(),
+                    new_text_length: input.new.len(),
+                    match_position: 0,
+                    old_content: input.old,
+                    new_content: input.new,
+                    converted_count: 0,
+                    created_task_note_ids: Vec::new(),
+                })
+            })
+        }
+
+        fn edit_note_lines(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            input: NoteEditLinesInput,
+        ) -> BoxFuture<'_, Result<NoteEditLinesResult>> {
+            self.edit_lines_calls.lock().unwrap().push((
+                note_id.as_str().to_string(),
+                input.start,
+                input.end,
+                input.content.clone(),
+            ));
+            Box::pin(async move {
+                Ok(NoteEditLinesResult {
+                    ok: true,
+                    note_id,
+                    start_line: input.start,
+                    end_line: input.end,
+                    total_lines_before: 3,
+                    total_lines_after: 3,
+                    old_content: String::new(),
+                    new_content: input.content,
+                    converted_count: 0,
+                    created_task_note_ids: Vec::new(),
+                })
+            })
+        }
+
+        fn update_note_metadata(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            title: Option<String>,
+            tags: Option<Vec<String>>,
+            _expected_version: Option<i64>,
+        ) -> BoxFuture<'_, Result<NoteUpdateMetadataResult>> {
+            self.update_metadata_calls.lock().unwrap().push((
+                note_id.as_str().to_string(),
+                title.clone(),
+                tags.clone(),
+            ));
+            Box::pin(async move {
+                Ok(NoteUpdateMetadataResult {
+                    ok: true,
+                    note_id,
+                    title,
+                    tags,
+                    updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+                    skipped: None,
+                    reason: None,
+                })
+            })
+        }
+
+        fn delete_note(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            _expected_version: Option<i64>,
+        ) -> BoxFuture<'_, Result<NoteDeleteResult>> {
+            self.delete_calls
+                .lock()
+                .unwrap()
+                .push(note_id.as_str().to_string());
+            Box::pin(async move {
+                Ok(NoteDeleteResult {
+                    ok: true,
+                    note_id,
+                    deleted: true,
+                })
+            })
+        }
+
+        // ---- task.* ----
+        fn task_update_status(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            task_text: String,
+            status: String,
+        ) -> BoxFuture<'_, Result<TaskUpdateStatusResult>> {
+            self.task_update_status_calls.lock().unwrap().push((
+                note_id.as_str().to_string(),
+                task_text.clone(),
+                status.clone(),
+            ));
+            Box::pin(async move {
+                Ok(TaskUpdateStatusResult {
+                    ok: true,
+                    note_id,
+                    task_text,
+                    status,
+                })
+            })
+        }
+
+        fn task_update_note_status(
+            &self,
+            workspace_id: WorkspaceId,
+            note_id: NoteId,
+            status: String,
+            _expected_version: Option<i64>,
+            _caller_agent_id: Option<AgentId>,
+        ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
+            self.task_update_note_status_calls
+                .lock()
+                .unwrap()
+                .push((note_id.as_str().to_string(), status.clone()));
+            let note = stub_note(note_id.as_str(), &workspace_id, None);
+            Box::pin(async move {
+                let parsed: TaskStatus =
+                    serde_json::from_value(Value::String(status)).unwrap_or_default();
+                Ok(TaskUpdateNoteStatusResult {
+                    ok: true,
+                    note_id,
+                    status: parsed,
+                    note,
+                })
+            })
+        }
+
+        fn task_update(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            line: i64,
+            text: Option<String>,
+            status: Option<String>,
+            expected: Option<String>,
+        ) -> BoxFuture<'_, Result<TaskUpdateResult>> {
+            self.task_update_calls.lock().unwrap().push((
+                note_id.as_str().to_string(),
+                line,
+                text.clone(),
+                status.clone(),
+                expected,
+            ));
+            Box::pin(async move {
+                Ok(TaskUpdateResult {
+                    ok: true,
+                    note_id,
+                    line_number: line,
+                    previous_text: "old".to_string(),
+                    new_text: text.unwrap_or_else(|| "old".to_string()),
+                    status: status.unwrap_or_else(|| "todo".to_string()),
+                })
+            })
+        }
+
+        fn get_my_task(
+            &self,
+            _workspace_id: WorkspaceId,
+            task_note_id: NoteId,
+        ) -> BoxFuture<'_, Result<TaskGetMyTaskResult>> {
+            self.get_my_task_calls
+                .lock()
+                .unwrap()
+                .push(task_note_id.as_str().to_string());
+            Box::pin(async move {
+                Ok(TaskGetMyTaskResult {
+                    note_id: task_note_id,
+                    title: "task title".to_string(),
+                    content: "body".to_string(),
+                    status: TaskStatus::InProgress,
+                    task_metadata: TaskMetadata {
+                        status: TaskStatus::InProgress,
+                        ..Default::default()
+                    },
+                    parent_id: None,
+                    subtasks: Vec::new(),
+                    assigned_agents: Vec::new(),
+                    rev: 1,
+                })
+            })
+        }
+
+        fn mark_as_task(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            status: String,
+            acceptance_criteria: Vec<String>,
+            effort: Option<String>,
+        ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
+            self.mark_as_task_calls.lock().unwrap().push((
+                note_id.as_str().to_string(),
+                status.clone(),
+                acceptance_criteria,
+                effort,
+            ));
+            let parsed: TaskStatus =
+                serde_json::from_value(Value::String(status)).unwrap_or_default();
+            Box::pin(async move {
+                Ok(TaskMarkAsTaskResult {
+                    ok: true,
+                    note_id,
+                    status: parsed,
+                })
+            })
+        }
+
+        fn convert_task_blocks(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+        ) -> BoxFuture<'_, Result<TaskConvertBlocksResult>> {
+            self.convert_blocks_calls
+                .lock()
+                .unwrap()
+                .push(note_id.as_str().to_string());
+            Box::pin(async move {
+                Ok(TaskConvertBlocksResult {
+                    ok: true,
+                    converted_count: 0,
+                    created_note_ids: Vec::new(),
+                })
+            })
+        }
+
+        fn create_prerequisite(
+            &self,
+            _ws: WorkspaceId,
+            dependent_note_id: NoteId,
+            title: String,
+            content: Option<String>,
+            status: Option<String>,
+        ) -> BoxFuture<'_, Result<TaskCreatePrerequisiteResult>> {
+            self.create_prereq_calls.lock().unwrap().push((
+                dependent_note_id.as_str().to_string(),
+                title.clone(),
+                content,
+                status,
+            ));
+            Box::pin(async move {
+                Ok(TaskCreatePrerequisiteResult {
+                    ok: true,
+                    prerequisite_note_id: NoteId::from_string("prereq-1"),
+                    dependent_note_id,
+                    title,
+                })
+            })
+        }
+
+        fn assign_agent(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            agent_id: String,
+        ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
+            self.assign_agent_calls
+                .lock()
+                .unwrap()
+                .push((note_id.as_str().to_string(), agent_id.clone()));
+            Box::pin(async move {
+                Ok(TaskAssignAgentResult {
+                    ok: true,
+                    note_id,
+                    agent_id: AgentId::from(agent_id.as_str()),
+                })
+            })
+        }
+
+        // ---- comment.* ----
+        #[allow(clippy::too_many_arguments)]
+        fn comment_add(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            search_context: String,
+            comment_target: String,
+            comment: String,
+            _kind: Option<String>,
+            _author: Option<String>,
+        ) -> BoxFuture<'_, Result<CommentAddResult>> {
+            self.comment_add_calls.lock().unwrap().push((
+                note_id.as_str().to_string(),
+                search_context,
+                comment_target.clone(),
+                comment,
+            ));
+            Box::pin(async move {
+                Ok(CommentAddResult {
+                    success: true,
+                    message: format!("Comment anchored to \"{comment_target}\""),
+                    comment_id: "c-1".to_string(),
+                    anchored: true,
+                    location: CommentLocation {
+                        line: 1,
+                        anchored_text: comment_target,
+                    },
+                })
+            })
+        }
+
+        fn comment_list(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            _since: Option<String>,
+            _author_type: Option<String>,
+            _status: Option<String>,
+            _include_comments: bool,
+        ) -> BoxFuture<'_, Result<CommentListResult>> {
+            self.comment_list_calls
+                .lock()
+                .unwrap()
+                .push(note_id.as_str().to_string());
+            Box::pin(async move {
+                Ok(CommentListResult {
+                    threads: Vec::new(),
+                    total_threads: 0,
+                    total_comments: 0,
+                })
+            })
+        }
+
+        fn comment_get_thread(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            thread_id: Option<String>,
+            comment_id: Option<String>,
+        ) -> BoxFuture<'_, Result<CommentGetThreadResult>> {
+            self.comment_get_thread_calls.lock().unwrap().push((
+                note_id.as_str().to_string(),
+                thread_id.clone(),
+                comment_id,
+            ));
+            Box::pin(async move {
+                let tid = thread_id.unwrap_or_else(|| "t-1".to_string());
+                Ok(CommentGetThreadResult {
+                    thread_id: tid.clone(),
+                    note_id,
+                    root_comment: CommentWire {
+                        id: "c-root".to_string(),
+                        thread_id: tid,
+                        note_id: None,
+                        kind: CommentType::Comment,
+                        content: "root".to_string(),
+                        author: "Agent".to_string(),
+                        author_type: Default::default(),
+                        status: Default::default(),
+                        parent_id: None,
+                        anchor: Default::default(),
+                        anchor_text: None,
+                        anchor_context: None,
+                        suggestion_diff: None,
+                        agent_id: None,
+                        created_at: "2026-01-01T00:00:00Z".to_string(),
+                        updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    },
+                    replies: Vec::new(),
+                    total_comments: 1,
+                    status: "open".to_string(),
+                })
+            })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn comment_respond(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            thread_id: Option<String>,
+            _comment_id: Option<String>,
+            comment: String,
+            _kind: Option<String>,
+            _author: Option<String>,
+            _suggestion_original: Option<String>,
+            _suggestion_proposed: Option<String>,
+        ) -> BoxFuture<'_, Result<CommentRespondResult>> {
+            self.comment_respond_calls.lock().unwrap().push((
+                note_id.as_str().to_string(),
+                thread_id.clone(),
+                comment.clone(),
+            ));
+            Box::pin(async move {
+                let tid = thread_id.unwrap_or_else(|| "t-1".to_string());
+                Ok(CommentRespondResult {
+                    success: true,
+                    message: "reply".to_string(),
+                    comment: CommentWire {
+                        id: "c-reply".to_string(),
+                        thread_id: tid.clone(),
+                        note_id: None,
+                        kind: CommentType::Comment,
+                        content: comment,
+                        author: "Agent".to_string(),
+                        author_type: Default::default(),
+                        status: Default::default(),
+                        parent_id: None,
+                        anchor: Default::default(),
+                        anchor_text: None,
+                        anchor_context: None,
+                        suggestion_diff: None,
+                        agent_id: None,
+                        created_at: "2026-01-01T00:00:00Z".to_string(),
+                        updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    },
+                    thread: CommentRespondThread {
+                        thread_id: tid,
+                        total_comments: 2,
+                    },
+                })
+            })
+        }
+
+        fn comment_delete(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            comment_id: String,
+        ) -> BoxFuture<'_, Result<CommentDeleteResult>> {
+            self.comment_delete_calls
+                .lock()
+                .unwrap()
+                .push((note_id.as_str().to_string(), comment_id.clone()));
+            Box::pin(async move {
+                Ok(CommentDeleteResult {
+                    success: true,
+                    message: format!("Comment {comment_id} deleted"),
+                })
+            })
+        }
+
+        // ---- primitive.* ----
+        fn primitive_add_reference(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            _semantic_id: String,
+            _description: String,
+            _snapshot: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.primitive_calls
+                .lock()
+                .unwrap()
+                .push(format!("reference:{}", note_id.as_str()));
+            Box::pin(async move {
+                Ok(
+                    json!({ "ok": true, "primitiveId": "p-1", "noteId": note_id.as_str(), "content": "" }),
+                )
+            })
+        }
+
+        fn primitive_add_cli(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            _command: String,
+            _description: String,
+            _working_directory: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.primitive_calls
+                .lock()
+                .unwrap()
+                .push(format!("cli:{}", note_id.as_str()));
+            Box::pin(async move {
+                Ok(
+                    json!({ "ok": true, "primitiveId": "p-2", "noteId": note_id.as_str(), "content": "" }),
+                )
+            })
+        }
+
+        fn primitive_add_patch(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            _file_path: String,
+            _diff: String,
+            _description: String,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.primitive_calls
+                .lock()
+                .unwrap()
+                .push(format!("patch:{}", note_id.as_str()));
+            Box::pin(async move {
+                Ok(
+                    json!({ "ok": true, "primitiveId": "p-3", "noteId": note_id.as_str(), "content": "" }),
+                )
+            })
+        }
+
+        fn primitive_add_agent_action(
+            &self,
+            _ws: WorkspaceId,
+            note_id: NoteId,
+            _agent_id: String,
+            _goal: String,
+            _description: String,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.primitive_calls
+                .lock()
+                .unwrap()
+                .push(format!("agent_action:{}", note_id.as_str()));
+            Box::pin(async move {
+                Ok(
+                    json!({ "ok": true, "primitiveId": "p-4", "noteId": note_id.as_str(), "content": "" }),
+                )
+            })
+        }
+    }
+
+    fn server() -> (WorkspaceMcpServer, Arc<FakeApi>) {
+        let api = Arc::new(FakeApi::default());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
+        (srv, api)
+    }
+
+    async fn call(srv: &WorkspaceMcpServer, code: &str) -> Value {
+        srv.handle_message(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "workspace_api",
+                "arguments": { "code": code, "summary": "wsapi3 unit test" }
+            }
+        }))
+        .await
+        .expect("tools/call must produce a response")
+    }
+
+    fn body(resp: &Value) -> Value {
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).expect("workspace_api body must be JSON")
+    }
+
+    fn text(resp: &Value) -> String {
+        resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    // ================================================================
+    // note.*
+    // ================================================================
+
+    #[tokio::test]
+    async fn note_read_happy_returns_shaped_body_with_line_numbers() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.note.read('n-1');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["id"], json!("n-1"));
+        assert_eq!(v["title"], json!("title-n-1"));
+        assert_eq!(v["totalLines"], json!(3));
+        assert_eq!(v["imageCount"], json!(0));
+        let content = v["content"].as_str().unwrap();
+        // First line is padded to width 4 (`   1 | line one`).
+        assert!(content.starts_with("   1 | line one"), "content: {content}");
+        assert!(content.contains("   2 | line two"));
+        assert_eq!(api.get_note_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn note_read_task_note_appends_task_metadata_footer() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.note.read('task-1');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["isTask"], json!(true));
+        assert_eq!(v["taskStatus"], json!("in_progress"));
+        // taskStatus / taskMetadata must be fully serialized (never a silent null
+        // fallback): the serializer errors would surface as a JS-visible error.
+        assert!(v["taskStatus"].is_string(), "taskStatus should be a string");
+        assert!(
+            v["taskMetadata"].is_object(),
+            "taskMetadata should be an object"
+        );
+        let content = v["content"].as_str().unwrap();
+        assert!(content.contains("--- Task Metadata ---"));
+        assert!(content.contains("Acceptance Criteria:"));
+    }
+
+    #[tokio::test]
+    async fn note_read_missing_id_surfaces_js_error() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.note.read();").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("Note ID is required"));
+    }
+
+    #[tokio::test]
+    async fn note_read_not_found_surfaces_daemon_error_verbatim() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.note.read('missing');").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("Note not found"));
+    }
+
+    #[tokio::test]
+    async fn note_create_returns_link_and_markdown_link() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.note.create('Hello', 'world', ['a', 'b']);",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["id"], json!("n-new"));
+        assert_eq!(v["title"], json!("Hello"));
+        assert_eq!(v["tags"], json!(["a", "b"]));
+        assert_eq!(v["link"], json!("intent://local/amber-forest/note/n-new"));
+        assert_eq!(
+            v["markdownLink"],
+            json!("[Hello](intent://local/amber-forest/note/n-new)")
+        );
+        let created = api.create_note_calls.lock().unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].0, "Hello");
+        assert_eq!(created[0].1.as_deref(), Some("world"));
+    }
+
+    #[tokio::test]
+    async fn note_create_missing_content_surfaces_reference_error() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.note.create('Hello');").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("Title and content are required"));
+    }
+
+    #[tokio::test]
+    async fn note_list_filters_by_tag_and_projects_summary() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.note.list();").await;
+        let v = body(&resp);
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], json!("n-1"));
+
+        let resp = call(&srv, "return await ws.note.list('blue');").await;
+        let arr = body(&resp);
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], json!("n-2"));
+    }
+
+    #[tokio::test]
+    async fn note_list_tasks_returns_task_rows() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.note.listTasks('n-1');").await;
+        let v = body(&resp);
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["lineNumber"], json!(3));
+        assert_eq!(arr[0]["status"], json!("todo"));
+    }
+
+    #[tokio::test]
+    async fn note_read_asset_forwards_asset_id_to_daemon() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.note.readAsset('workspace-asset://amber-forest/img-1');",
+        )
+        .await;
+        let v = body(&resp);
+        assert_eq!(v["mimeType"], json!("image/png"));
+        assert_eq!(v["sizeKb"], json!(1));
+        assert_eq!(
+            api.read_asset_calls.lock().unwrap()[0],
+            "workspace-asset://amber-forest/img-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn note_set_content_threads_confirm_replacement_true() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.note.setContent('n-1', 'new body', true);",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.set_content_calls.lock().unwrap();
+        assert_eq!(calls[0], ("n-1".to_string(), "new body".to_string(), true));
+    }
+
+    #[tokio::test]
+    async fn note_add_threads_position_option_object() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.note.add('n-1', { content: 'X', position: 'start' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.add_calls.lock().unwrap();
+        assert_eq!(calls[0].2, None);
+        assert_eq!(calls[0].3.as_deref(), Some("start"));
+    }
+
+    #[tokio::test]
+    async fn note_edit_missing_new_surfaces_js_error() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.note.edit('n-1', { old: 'a' });").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("new is required"));
+    }
+
+    #[tokio::test]
+    async fn note_edit_lines_rejects_reversed_range() {
+        let (srv, _api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.note.editLines('n-1', { start: 5, end: 2, content: 'x' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("start cannot be greater than end"));
+    }
+
+    #[tokio::test]
+    async fn note_update_metadata_requires_title_or_tags() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.note.updateMetadata('n-1', {});").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("At least one of title or tags"));
+    }
+
+    #[tokio::test]
+    async fn note_delete_records_daemon_call() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.note.delete('n-1');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(api.delete_calls.lock().unwrap()[0], "n-1");
+    }
+
+    // ================================================================
+    // task.*
+    // ================================================================
+
+    #[tokio::test]
+    async fn task_update_status_happy_path() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.task.updateStatus('n-1', 'do it', 'done');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["status"], json!("done"));
+        assert_eq!(
+            api.task_update_status_calls.lock().unwrap()[0],
+            ("n-1".to_string(), "do it".to_string(), "done".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn task_update_status_rejects_invalid_status() {
+        let (srv, _api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.task.updateStatus('n-1', 'do it', 'unknown');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("'done', 'todo', or 'in-progress'"));
+    }
+
+    #[tokio::test]
+    async fn task_update_note_status_forwards_status() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.task.updateNoteStatus('n-1', 'complete');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["status"], json!("complete"));
+        assert_eq!(
+            api.task_update_note_status_calls.lock().unwrap()[0],
+            ("n-1".to_string(), "complete".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn task_update_requires_text_or_status() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.task.update('n-1', 3, {});").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("Either text or status"));
+    }
+
+    #[tokio::test]
+    async fn task_update_happy_path() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.task.update('n-1', 3, { text: 'new text', status: 'done' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(api.task_update_calls.lock().unwrap()[0].1, 3);
+    }
+
+    #[tokio::test]
+    async fn task_get_my_task_returns_shaped_body() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.task.getMyTask('task-1');").await;
+        let v = body(&resp);
+        assert_eq!(v["title"], json!("task title"));
+        assert_eq!(v["status"], json!("in_progress"));
+        assert_eq!(api.get_my_task_calls.lock().unwrap()[0], "task-1");
+    }
+
+    #[tokio::test]
+    async fn task_mark_as_task_forwards_acceptance_criteria() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.task.markAsTask('n-1', 'in_progress', { acceptanceCriteria: ['A', 'B'], effort: '2h' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.mark_as_task_calls.lock().unwrap();
+        assert_eq!(calls[0].2, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(calls[0].3.as_deref(), Some("2h"));
+    }
+
+    #[tokio::test]
+    async fn task_convert_blocks_forwards_note_id() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.task.convertBlocks('n-1');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(api.convert_blocks_calls.lock().unwrap()[0], "n-1");
+    }
+
+    #[tokio::test]
+    async fn task_create_prerequisite_forwards_content_and_status() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.task.createPrerequisite('n-1', 'Prereq', { content: 'body', status: 'not_started' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.create_prereq_calls.lock().unwrap();
+        assert_eq!(calls[0].2.as_deref(), Some("body"));
+        assert_eq!(calls[0].3.as_deref(), Some("not_started"));
+    }
+
+    #[tokio::test]
+    async fn task_assign_agent_rejects_malformed_id() {
+        let (srv, _api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.task.assignAgent('n-1', 'not-a-uuid');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("Invalid agentId format"));
+    }
+
+    #[tokio::test]
+    async fn task_assign_agent_happy_path() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.task.assignAgent('n-1', 'agent-b0a8044a-5eac-4b52-8456-15d3b784decb');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(
+            api.assign_agent_calls.lock().unwrap()[0].1,
+            "agent-b0a8044a-5eac-4b52-8456-15d3b784decb"
+        );
+    }
+
+    // ================================================================
+    // comment.*
+    // ================================================================
+
+    #[tokio::test]
+    async fn comment_add_happy_path() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.comment.add('n-1', { searchContext: 'ctx', commentTarget: 'ctx', comment: 'looks good' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["commentId"], json!("c-1"));
+        assert_eq!(api.comment_add_calls.lock().unwrap()[0].3, "looks good");
+    }
+
+    #[tokio::test]
+    async fn comment_add_empty_comment_surfaces_reference_error() {
+        let (srv, _api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.comment.add('n-1', { searchContext: 'ctx', commentTarget: 'ctx', comment: '   ' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("Comment text is required"));
+    }
+
+    #[tokio::test]
+    async fn comment_list_forwards_note_id() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.comment.list('n-1');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(api.comment_list_calls.lock().unwrap()[0], "n-1");
+    }
+
+    #[tokio::test]
+    async fn comment_get_thread_requires_id() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.comment.getThread('n-1', {});").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("Either threadId or commentId"));
+    }
+
+    #[tokio::test]
+    async fn comment_respond_happy_path() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.comment.respond('n-1', { threadId: 't-1', comment: 'ok' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(
+            api.comment_respond_calls.lock().unwrap()[0].1.as_deref(),
+            Some("t-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_delete_forwards_ids() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.comment.delete('n-1', 'c-1');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(
+            api.comment_delete_calls.lock().unwrap()[0],
+            ("n-1".to_string(), "c-1".to_string())
+        );
+    }
+
+    // ================================================================
+    // primitive.*
+    // ================================================================
+
+    #[tokio::test]
+    async fn primitive_add_reference_happy_path() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.primitive.addReference('n-1', 'src/foo.rs#L1-2', 'a range');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert!(api.primitive_calls.lock().unwrap()[0].starts_with("reference:"));
+    }
+
+    #[tokio::test]
+    async fn primitive_add_cli_forwards_working_directory() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.primitive.addCli('n-1', 'ls', 'listing', '/tmp');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert!(api.primitive_calls.lock().unwrap()[0].starts_with("cli:"));
+    }
+
+    #[tokio::test]
+    async fn primitive_add_patch_missing_description_errors() {
+        let (srv, _api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.primitive.addPatch('n-1', 'src/foo.rs', 'diff');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("description is required"));
+    }
+
+    #[tokio::test]
+    async fn primitive_add_agent_action_happy_path() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.primitive.addAgentAction('n-1', 'agent-1', 'do it', 'why');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert!(api.primitive_calls.lock().unwrap()[0].starts_with("agent_action:"));
+    }
+
+    // ================================================================
+    // Batching — one `workspace_api` call, multiple concurrent host frames.
+    // ================================================================
+
+    #[tokio::test]
+    async fn promise_all_batches_multiple_bindings_in_one_invocation() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            r#"
+            const [a, b, c] = await Promise.all([
+                ws.note.list(),
+                ws.note.listTasks('n-1'),
+                ws.task.getMyTask('task-1'),
+            ]);
+            return { listLen: a.length, taskRows: b.length, taskTitle: c.title };
+            "#,
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["listLen"], json!(2));
+        assert_eq!(v["taskRows"], json!(1));
+        assert_eq!(v["taskTitle"], json!("task title"));
+        assert_eq!(*api.list_notes_calls.lock().unwrap(), 1);
+        assert_eq!(api.list_note_tasks_calls.lock().unwrap().len(), 1);
+        assert_eq!(api.get_my_task_calls.lock().unwrap().len(), 1);
+    }
+}
