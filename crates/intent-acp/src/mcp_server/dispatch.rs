@@ -28,18 +28,11 @@ const SENDER_WATCH_NOTIFICATION: &str = "You will be notified when the agent res
 /// timeout in the reference `workspace-js-api-tool.ts`.
 const WORKSPACE_API_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// JS prelude installed before user code. The WSAPI-2 fragment wires the
-/// `ws.workspace.info()` proof point; the WSAPI-3+ per-namespace fragments
-/// (owned by `super::bindings`) attach the note/task/comment/primitive
-/// surfaces to the same `ws` object. Real bindings go through
-/// `host({ method, args })`, which the Rust bridge routes to the shared
-/// `WorkspaceApi`.
-const WORKSPACE_API_WORKSPACE_PRELUDE: &str = r#"
-    globalThis.ws = globalThis.ws || {};
-    ws.workspace = ws.workspace || {
-        info: () => host({ method: 'workspace.info' }),
-    };
-"#;
+// WSAPI-5+: the workspace namespace (formerly WSAPI-2's inline stub) now lives
+// in `super::bindings::workspace`; the shared `bindings::prelude()` builder
+// installs it alongside the note/task/comment/primitive/git/script/terminal/
+// file fragments. Real bindings go through `host({ method, args })`, which the
+// Rust bridge routes to the shared `WorkspaceApi`.
 
 fn req_str(args: &Value, key: &str) -> Result<String> {
     args.get(key)
@@ -752,7 +745,7 @@ impl WorkspaceMcpServer {
         // JSON-serializable value (prints as pretty JSON, including `null`).
         let bindings_prelude = super::bindings::prelude();
         let full_code = format!(
-            "{WORKSPACE_API_WORKSPACE_PRELUDE}\n{bindings_prelude}\n\
+            "{bindings_prelude}\n\
              const __wsapi_user = await (async () => {{ {code}\n}})();\n\
              return {{ __k: __wsapi_user === undefined ? 'u' : 'v', __v: __wsapi_user }};"
         );
@@ -777,10 +770,11 @@ impl WorkspaceMcpServer {
 }
 
 /// Build the `HostFn` bridging JS `host({ method, args })` calls back into
-/// the shared `WorkspaceApi`. The skeleton only routes `workspace.info`;
+/// the shared `WorkspaceApi`. Every namespace lives in `super::bindings`;
 /// unknown methods surface as a JS-visible error frame. `caller_agent_id`
 /// is forwarded to bindings that attribute their calls back to the spawning
-/// agent (`ws.browser.exec` and the caller-aware `ws.agent.*` methods).
+/// agent (e.g. `workspace.setAgentName`, `git.commit`, `git.agentCommit`,
+/// `ws.browser.exec`, and the caller-aware `ws.agent.*` methods).
 fn make_workspace_host(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -795,10 +789,9 @@ fn make_workspace_host(
     })
 }
 
-/// Route one `host({method, args})` frame to a `WorkspaceApi` method. The
-/// WSAPI-2 handler covers `workspace.info`; anything else is delegated to
-/// [`super::bindings::try_dispatch`] (WSAPI-3+), which owns the per-namespace
-/// method → trait mapping.
+/// Route one `host({method, args})` frame to a `WorkspaceApi` method via
+/// [`super::bindings::try_dispatch`], which owns the per-namespace method →
+/// trait mapping.
 async fn workspace_host_dispatch(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -810,19 +803,6 @@ async fn workspace_host_dispatch(
         .and_then(Value::as_str)
         .ok_or_else(|| "host: `method` is required".to_string())?;
     let args = arg.get("args").cloned().unwrap_or(Value::Null);
-    if method == "workspace.info" {
-        let ws = api
-            .get_workspace(workspace_id.clone())
-            .await
-            .map_err(|e| e.to_string())?;
-        // `path` prefers the on-disk workspace root, falling back to the
-        // worktree path; both are optional on the domain model.
-        let path = ws.path.clone().or(ws.worktree_path.clone());
-        return Ok(json!({
-            "id": workspace_id.as_str(),
-            "path": path,
-        }));
-    }
     if let Some(v) =
         super::bindings::try_dispatch(&api, &workspace_id, &caller_agent_id, method, &args).await?
     {

@@ -68,6 +68,9 @@ pub use transport::{
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod tests_wsapi5;
+
 /// ACP client handle. Holds the `WorkspaceApi` callback supplied by the
 /// composition root (§6.8). Provider configuration is resolved on demand from
 /// the static `intent_providers` registry (§6.9).
