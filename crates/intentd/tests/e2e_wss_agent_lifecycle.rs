@@ -2657,33 +2657,61 @@ async fn terminal_create_env_over_wss() {
         .expect("terminalId in terminal.create result")
         .to_string();
 
-    // Collect `terminal:data` chunks (base64) until the marker appears; stop
-    // on `terminal:exit` — the child exits naturally after printing its env.
+    // Collect `terminal:data` chunks (base64) until we've seen both the env
+    // marker AND the child's `terminal:exit`, or a single 30s total budget
+    // elapses. On slow CI runners the `env` dump can dribble in as many small
+    // chunks, so a fixed iteration cap can trip the assert with a truncated
+    // buffer — track one overall deadline and recompute the remaining wait
+    // each loop, matching the `try_read_text` pattern in
+    // `e2e_wss_sticky_reverse.rs`.
     let mut acc: Vec<u8> = Vec::new();
     let mut saw_exit = false;
-    for _ in 0..40 {
-        let frame = wss_event(&mut sub, 10).await;
-        let event = &frame["params"]["event"];
-        if event["data"]["terminalId"].as_str() != Some(&terminal_id) {
-            continue;
+    let mut saw_marker = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_marker && saw_exit) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
         }
-        match event["type"].as_str() {
-            Some("terminal:data") => {
-                if let Some(chunk) = event["data"]["chunk"].as_str() {
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(chunk)
-                        .expect("valid base64 in terminal:data.chunk");
-                    acc.extend_from_slice(&bytes);
+        let next = match timeout(remaining, sub.next()).await {
+            Ok(next) => next,
+            Err(_) => break,
+        };
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let frame: Value = serde_json::from_str(&text).expect("json frame");
+                if frame["method"] != "events.event" {
+                    continue;
+                }
+                let event = &frame["params"]["event"];
+                if event["data"]["terminalId"].as_str() != Some(&terminal_id) {
+                    continue;
+                }
+                match event["type"].as_str() {
+                    Some("terminal:data") => {
+                        if let Some(chunk) = event["data"]["chunk"].as_str() {
+                            let bytes = base64::engine::general_purpose::STANDARD
+                                .decode(chunk)
+                                .expect("valid base64 in terminal:data.chunk");
+                            acc.extend_from_slice(&bytes);
+                        }
+                    }
+                    Some("terminal:exit") => {
+                        saw_exit = true;
+                    }
+                    _ => {}
+                }
+                if !saw_marker
+                    && String::from_utf8_lossy(&acc).contains("MY_TEST_VAR=PROT_MARKER_env_wss")
+                {
+                    saw_marker = true;
                 }
             }
-            Some("terminal:exit") => {
-                saw_exit = true;
+            Some(Ok(Message::Ping(p))) => {
+                let _ = sub.send(Message::Pong(p)).await;
             }
-            _ => {}
-        }
-        let text = String::from_utf8_lossy(&acc);
-        if text.contains("MY_TEST_VAR=PROT_MARKER_env_wss") {
-            break;
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
         }
     }
     let text = String::from_utf8_lossy(&acc);

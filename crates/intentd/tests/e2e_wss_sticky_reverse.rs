@@ -52,6 +52,10 @@ struct Fixture {
     ws: WsApiServer,
     api: Arc<dyn WorkspaceApi>,
     port: u16,
+    /// Shared handle to the daemon's reverse-dispatch registry so the failover
+    /// test can poll `len()` until the closing client's guard has actually
+    /// dropped, instead of waiting on an arbitrary sleep.
+    registry: Arc<PrimaryReverseRegistry>,
     _dir: TempDir,
 }
 
@@ -75,12 +79,13 @@ async fn boot() -> Fixture {
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws = WsApiServer::new_insecure_with_reverse(api.clone(), bus, opts, registry);
+    let ws = WsApiServer::new_insecure_with_reverse(api.clone(), bus, opts, registry.clone());
     let port = ws.start().await.expect("start");
     Fixture {
         ws,
         api,
         port,
+        registry,
         _dir: TempDir(dir),
     }
 }
@@ -91,6 +96,63 @@ async fn connect(port: u16) -> PlainWs {
         .await
         .expect("plain ws handshake");
     sock
+}
+
+/// One bounded JSON-RPC round-trip on `ws`: send `method`/`params` with the
+/// caller-supplied `id`, then wait (max 5s) for the matching response frame,
+/// echoing pings inline. Used as a lightweight barrier — a successful reply
+/// proves the server-side `connection_loop` is running past the point where
+/// it registered its reverse channel with `PrimaryReverseRegistry`, so pairing
+/// two sequential `client.hello` calls yields a deterministic arrival order.
+async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+    ws.send(Message::Text(req.to_string())).await.unwrap();
+    loop {
+        match timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("wss_rpc timed out waiting for response")
+        {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json");
+                if v.get("id") == Some(&json!(id)) {
+                    return v;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("unexpected ws frame: {other:?}"),
+        }
+    }
+}
+
+/// Drive `ws.next()` until the peer's close reply / EOF (or `dur` elapses),
+/// echoing pings inline so heartbeat traffic doesn't stall the drain. Used
+/// after `ws.close(None).await` to prove the server-side `connection_loop`
+/// has observed our close and exited its read arm.
+async fn drain_until_close(ws: &mut PlainWs, dur: Duration) {
+    let deadline = Instant::now() + dur;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match timeout(remaining, ws.next()).await {
+            Err(_) | Ok(None) => return,
+            Ok(Some(Ok(Message::Close(_)))) => return,
+            Ok(Some(Err(_))) => return,
+            Ok(Some(Ok(Message::Ping(p)))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Ok(Some(Ok(_))) => continue,
+        }
+    }
 }
 
 /// Read the next `Message::Text` frame, answering pings inline. Returns `None`
@@ -140,10 +202,20 @@ async fn answer_reverse(ws: &mut PlainWs, dur: Duration, result: Value) -> Value
 #[tokio::test]
 async fn agent_browser_exec_routes_to_first_client_and_fails_over_on_disconnect() {
     let fx = boot().await;
+    // Deterministic arrival-order barrier: connect A and complete a
+    // lightweight `client.hello` round-trip before B is even dialled. A
+    // successful reply on A guarantees its `connection_loop` has run past
+    // `PrimaryReverseRegistry::register`, so B (dialled and hello-ed second)
+    // must land behind A in the sticky queue — no sleep needed.
     let mut a = connect(fx.port).await;
+    let _ = wss_rpc(&mut a, 1, "client.hello", json!({ "name": "sticky-a" })).await;
     let mut b = connect(fx.port).await;
-    // Give the server a moment to register both connections in arrival order.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = wss_rpc(&mut b, 1, "client.hello", json!({ "name": "sticky-b" })).await;
+    assert_eq!(
+        fx.registry.len(),
+        2,
+        "both connections must be registered before the first reverse dispatch",
+    );
 
     // First round: call from the "agent" side. Client A is primary and must
     // see the reverse RPC; client B must see nothing.
@@ -178,11 +250,29 @@ async fn agent_browser_exec_routes_to_first_client_and_fails_over_on_disconnect(
     let out = call_a.await.expect("join").expect("ok");
     assert_eq!(out["action"], "listTabs");
 
-    // Failover: drop client A and let the server observe the close, then call
-    // again. Client B is now primary.
+    // Failover: close client A and wait for the server to actually
+    // deregister it from the sticky queue before dispatching again. We drive
+    // `a` to close/EOF so the connection loop breaks its read arm, then poll
+    // the shared registry until its length drops below 2 — the definitive
+    // signal that A's `PrimaryReverseGuard` has been dropped and B is now
+    // the sole primary. Both waits share a single 2s deadline instead of the
+    // former arbitrary 300ms sleep.
     let _ = a.close(None).await;
+    drain_until_close(&mut a, Duration::from_secs(2)).await;
     drop(a);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let dereg_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if fx.registry.len() < 2 {
+            break;
+        }
+        if Instant::now() >= dereg_deadline {
+            panic!(
+                "sticky registry did not deregister client A within deadline (len={})",
+                fx.registry.len()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let call_b = tokio::spawn({
         let api = fx.api.clone();
         async move {
