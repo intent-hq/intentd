@@ -1190,7 +1190,7 @@ impl Services {
             return;
         };
         let wake = format_group_wake(&group);
-        let event_refs: Vec<&Event> = group.raw_events.iter().collect();
+        let event_refs: Vec<&Event> = group.raw_events.iter().map(|e| e.as_ref()).collect();
         let metadata = build_event_notification_metadata(&event_refs);
         if let Err(e) = self
             .deliver_parent_wake(

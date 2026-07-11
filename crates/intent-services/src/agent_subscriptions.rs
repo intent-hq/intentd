@@ -11,6 +11,8 @@
 //! `['agent:idle','agent:failed','agent:deleted']`). The event-type wiring is an
 //! AS-3 concern; this module only owns the registry records and helpers.
 
+use std::sync::Arc;
+
 use intent_core::{now_iso, AgentId, Event, WorkspaceId};
 use uuid::Uuid;
 
@@ -56,7 +58,9 @@ pub(crate) struct DelegationGroup {
     /// `event_summaries`), retained so the aggregated wake carries the FE
     /// `event_notification` metadata (per-event `id`, `type`, `data`,
     /// `timestamp`, `actor`) alongside the human-readable summary text.
-    pub raw_events: Vec<Event>,
+    /// Held as `Arc<Event>` so snapshot clones of `DelegationGroup` for
+    /// `agent.getSubscriptions` / `agent.diagnostics` stay cheap.
+    pub raw_events: Vec<Arc<Event>>,
 }
 
 /// Per-workspace registry state held behind the `Services` mutex.
@@ -325,7 +329,7 @@ impl Services {
             g.completed_agent_ids.push(child_id.clone());
         }
         g.event_summaries.push(summary);
-        g.raw_events.push(event);
+        g.raw_events.push(Arc::new(event));
     }
 
     /// Atomically claim a group for delivery if it is sealed, complete, and not
