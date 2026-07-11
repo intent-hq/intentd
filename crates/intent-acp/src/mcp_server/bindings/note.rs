@@ -190,8 +190,8 @@ async fn list(
                 "id": n.id.as_str(),
                 "title": n.title,
                 "tags": n.tags,
-                "created_at": n.created_at,
-                "updated_at": n.updated_at,
+                "createdAt": n.created_at,
+                "updatedAt": n.updated_at,
             })
         })
         .collect();

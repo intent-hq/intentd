@@ -8,9 +8,23 @@
 use std::sync::Arc;
 
 use intent_core::{NoteId, WorkspaceApi, WorkspaceId};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::{map_err, opt_str, opt_vec_str, req_i64, req_str};
+
+/// Canonical `TaskStatus` values accepted by the daemon. Kept in one place so
+/// pre-flight validation stays consistent between `updateNoteStatus` and
+/// `markAsTask` (both hit the same `parse_task_status_strict` in the service
+/// layer, which reports internal-looking errors on unknown values).
+const VALID_TASK_STATUSES: &[&str] = &[
+    "not_started",
+    "waiting",
+    "discussion_needed",
+    "in_progress",
+    "review_required",
+    "complete",
+    "cancelled",
+];
 
 pub(crate) const PRELUDE: &str = r#"
     globalThis.ws = globalThis.ws || {};
@@ -83,19 +97,10 @@ async fn update_note_status(
 ) -> Result<Value, String> {
     let note_id = req_str(args, "noteId").map_err(|_| "Note ID is required".to_string())?;
     let status = req_str(args, "status")?;
-    const VALID: &[&str] = &[
-        "not_started",
-        "waiting",
-        "discussion_needed",
-        "in_progress",
-        "review_required",
-        "complete",
-        "cancelled",
-    ];
-    if !VALID.contains(&status.as_str()) {
+    if !VALID_TASK_STATUSES.contains(&status.as_str()) {
         return Err(format!(
             "Invalid status: {status}. Must be one of: {}",
-            VALID.join(", ")
+            VALID_TASK_STATUSES.join(", ")
         ));
     }
     let r = api
@@ -166,6 +171,12 @@ async fn mark_as_task(
 ) -> Result<Value, String> {
     let note_id = req_str(args, "noteId")?;
     let status = req_str(args, "status")?;
+    if !VALID_TASK_STATUSES.contains(&status.as_str()) {
+        return Err(format!(
+            "Invalid status: {status}. Must be one of: {}",
+            VALID_TASK_STATUSES.join(", ")
+        ));
+    }
     let acceptance_criteria = opt_vec_str(args, "acceptanceCriteria").unwrap_or_default();
     let effort = opt_str(args, "effort");
     let r = api
@@ -233,11 +244,11 @@ async fn assign_agent(
         ));
     }
     let r = api
-        .assign_agent(ws.clone(), NoteId::from_string(&note_id), agent_id.clone())
+        .assign_agent(ws.clone(), NoteId::from_string(&note_id), agent_id)
         .await
         .map_err(map_err)?;
-    // Wire shape mirrors the reference peer.
-    let _ = json!({ "ok": true, "noteId": note_id, "agentId": agent_id });
+    // Return the daemon's canonical `TaskAssignAgentResult`; its serde
+    // rename matches the reference peer's `{ ok, noteId, agentId }` shape.
     serde_json::to_value(r).map_err(|e| e.to_string())
 }
 
