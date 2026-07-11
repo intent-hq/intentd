@@ -150,7 +150,11 @@ async fn set_status_message(
         _ => return Err("statusMessage must be a string or null".to_string()),
     };
     let trimmed = raw.trim().to_string();
-    if trimmed.len() > WORKSPACE_STATUS_MESSAGE_MAX_LENGTH {
+    // The reference contract (`WORKSPACE_STATUS_MESSAGE_MAX_LENGTH`,
+    // `src/shared/types.ts`) is a *character* limit, not a byte limit —
+    // count Unicode scalars via `chars()` so multi-byte characters (emoji,
+    // CJK, etc.) are not rejected well below 500 characters.
+    if trimmed.chars().count() > WORKSPACE_STATUS_MESSAGE_MAX_LENGTH {
         return Err(format!(
             "statusMessage must be {WORKSPACE_STATUS_MESSAGE_MAX_LENGTH} characters or fewer"
         ));

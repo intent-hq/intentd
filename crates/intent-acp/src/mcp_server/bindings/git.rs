@@ -126,8 +126,16 @@ async fn commit(
 ) -> Result<Value, String> {
     let message = req_str(args, "message").map_err(|_| "message is required".to_string())?;
     // Match the reference: append the caller's `Agent-Id` trailer when present.
+    // `AgentId` is a transparent wrapper over `String` with no validation, so
+    // reject a caller id containing embedded `\n`/`\r` before formatting to
+    // prevent trailer injection (agents cannot smuggle additional lines /
+    // trailers into the commit message via a crafted id).
     let full_message = if let Some(agent) = caller_agent_id {
-        format!("{message}\n\nAgent-Id: {}", agent.as_str())
+        let id = agent.as_str();
+        if id.contains('\n') || id.contains('\r') {
+            return Err("agent id must not contain newline characters".to_string());
+        }
+        format!("{message}\n\nAgent-Id: {id}")
     } else {
         message
     };

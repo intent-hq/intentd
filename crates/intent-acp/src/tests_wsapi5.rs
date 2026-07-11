@@ -506,6 +506,18 @@ async fn workspace_set_status_message_over_length_errors() {
 }
 
 #[tokio::test]
+async fn workspace_set_status_message_counts_chars_not_bytes() {
+    // The 500 cap is a *character* limit per the FE contract
+    // (`WORKSPACE_STATUS_MESSAGE_MAX_LENGTH` in `src/shared/types.ts`).
+    // A string with 500 multi-byte characters (here 4-byte per char) must
+    // pass — earlier byte-length code would reject at ~125 chars.
+    let (srv, _api) = server();
+    let code = "return await ws.workspace.setStatusMessage('🙂'.repeat(500));";
+    let resp = call(&srv, code).await;
+    assert_eq!(resp["result"]["isError"], json!(false), "{}", text(&resp));
+}
+
+#[tokio::test]
 async fn workspace_set_agent_name_requires_caller_context() {
     let (srv, _api) = server();
     let resp = call(&srv, "return await ws.workspace.setAgentName('Fresh');").await;
@@ -696,6 +708,19 @@ async fn git_commit_appends_agent_id_when_caller_present() {
     assert_eq!(v["hash"], json!("abc123"));
     let msgs = api.commit_calls.lock().unwrap();
     assert!(msgs[0].contains("Agent-Id: agent-9"));
+}
+
+#[tokio::test]
+async fn git_commit_rejects_caller_id_with_newline() {
+    // `AgentId` is a transparent `String` wrapper with no validation, so an
+    // id containing `\n` could inject an extra commit trailer via the
+    // `Agent-Id:` line. The binding must reject the caller id before
+    // formatting; nothing should reach the underlying `git_commit`.
+    let (srv, api) = server_with_caller("agent-9\nAgent-Id: attacker");
+    let resp = call(&srv, "return await ws.git.commit('feat: x');").await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("newline"));
+    assert!(api.commit_calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
