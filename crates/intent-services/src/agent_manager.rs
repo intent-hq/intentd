@@ -729,8 +729,9 @@ impl AgentManager {
         // Assemble the effective system prompt (the §18.1 injection pipeline:
         // base/specialization/workspace user overrides + live workspace rule
         // files, plus — for specialist agents — the PP-1 `<specialist_role>`
-        // section and role-reminder footer) into a temp `--rules` file when
-        // the caller supplies none. The handle owns the temp file so it
+        // section and role-reminder footer, and — for top-level agents — the
+        // SP-1 `## Suggested Next Steps` directive) into a temp `--rules` file
+        // when the caller supplies none. The handle owns the temp file so it
         // outlives the child that reads it.
         let mut rules_config: Option<TempConfigFile> = None;
         let mut rules_file_path: Option<String> = None;
@@ -739,11 +740,27 @@ impl AgentManager {
                 .services
                 .agent_specialist_injection(&agent_id, Some(&cwd))
                 .await;
+            // Sub-agent gating: delegated children (`parent_agent_id` set) and
+            // background workers (`is_background`) skip the suggested-prompts
+            // directive, matching the reference `isSubAgent` derivation.
+            let (is_sub_agent, auto_commit_enabled) =
+                match self.services.store.get_agent_session(&agent_id).await {
+                    Ok(s) => (
+                        s.parent_agent_id.is_some() || s.is_background,
+                        crate::settings::auto_commit_enabled(&self.services.store).await,
+                    ),
+                    Err(_) => (
+                        false,
+                        crate::settings::auto_commit_enabled(&self.services.store).await,
+                    ),
+                };
             if let Some(prompt) = crate::rules::assemble_system_prompt(
                 &self.services.store,
                 Some(&cwd),
                 agent_type,
                 specialist.as_ref(),
+                is_sub_agent,
+                auto_commit_enabled,
             )
             .await
             {

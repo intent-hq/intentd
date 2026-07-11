@@ -6362,9 +6362,16 @@ mod rules {
         .await
         .unwrap();
 
-        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop", None)
-            .await
-            .expect("assembled prompt");
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect("assembled prompt");
 
         let base = prompt.find("BASE_BODY").expect("base body");
         let spec = prompt.find("SPEC_BODY").expect("specialization body");
@@ -6393,9 +6400,16 @@ mod rules {
         )
         .await
         .unwrap();
-        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop", None)
-            .await
-            .expect("assembled prompt (file still applies)");
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect("assembled prompt (file still applies)");
         assert!(!prompt.contains("HIDDEN_BODY"));
         assert!(prompt.contains("ALWAYS run the linter."));
     }
@@ -6457,9 +6471,18 @@ mod rules {
     async fn assembly_uses_bundled_specialization_when_no_override() {
         let tree = worktree();
         let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
-        let prompt = crate::rules::assemble_system_prompt(&store, Some(&tree.0), "task-loop", None)
-            .await
-            .expect("assembled prompt");
+        // Assemble as a sub-agent so the SP-1 Suggested Next Steps directive
+        // stays out and this test remains focused on specialization precedence.
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            None,
+            true,
+            false,
+        )
+        .await
+        .expect("assembled prompt");
         // Bundled specialization is injected, and the live workspace file still applies.
         assert!(
             prompt.contains("# Task Loop Agent"),
@@ -6491,11 +6514,15 @@ mod rules {
             specialist_name: Some("Implementor".into()),
             role_reminder: Some("Stay in scope.".into()),
         };
+        // Assemble as a sub-agent so this test asserts only the specialist
+        // section + Role Reminder footer (no Suggested Next Steps directive).
         let prompt = crate::rules::assemble_system_prompt(
             &store,
             Some(&tree.0),
             "task-loop",
             Some(&injection),
+            true,
+            false,
         )
         .await
         .expect("assembled prompt");
@@ -6517,7 +6544,7 @@ mod rules {
         assert!(
             prompt.contains("The instructions in <specialist_role> define your primary function.")
         );
-        // Role-reminder footer sits at the very end (recency).
+        // Role-reminder footer sits at the very end (recency) for sub-agents.
         assert!(
             prompt.ends_with("## Role Reminder\n\nYou are a Implementor. Stay in scope."),
             "footer at end: {:?}",
@@ -6534,17 +6561,125 @@ mod rules {
             specialist_name: Some("Verifier".into()),
             role_reminder: None,
         };
+        // Sub-agent so the fallback reminder is still last in the prompt.
         let prompt = crate::rules::assemble_system_prompt(
             &store,
             Some(&tree.0),
             "task-loop",
             Some(&injection),
+            true,
+            false,
         )
         .await
         .expect("assembled prompt");
         assert!(prompt.ends_with(
             "## Role Reminder\n\nYou are a Verifier. Follow the instructions in <specialist_role> above."
         ));
+    }
+
+    /// SP-1: top-level (non-sub-agent) interactive agents get the
+    /// `## Suggested Next Steps` directive at the very end of the assembled
+    /// prompt so the model reliably emits a `<!-- suggested-prompts ... -->`
+    /// block. The default (`auto_commit_enabled = false`) variant uses the
+    /// "Review changes before committing." example line and appends no
+    /// auto-commit clause.
+    #[tokio::test]
+    async fn assembly_appends_suggested_prompts_for_top_level_agent() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect("assembled prompt");
+        assert!(
+            prompt.contains("## Suggested Next Steps"),
+            "SP-1 directive present for non-sub-agent"
+        );
+        assert!(
+            prompt.contains("Review changes before committing."),
+            "auto-commit-off example line"
+        );
+        assert!(
+            !prompt.contains("Auto-commit is enabled;"),
+            "no auto-commit clause when auto-commit is off"
+        );
+        // Recency: the directive sits at the very end of the prompt.
+        assert!(
+            prompt
+                .trim_end()
+                .ends_with("something the user might say next."),
+            "suggested-prompts block is the tail of the assembled prompt: {:?}",
+            &prompt[prompt.len().saturating_sub(200)..]
+        );
+    }
+
+    /// SP-1: sub-agents (delegated children or background workers) skip the
+    /// `## Suggested Next Steps` directive entirely — they report to a parent,
+    /// not to a user-facing chat turn. This matches the reference `isSubAgent`
+    /// gate in `getMandatoryActionsFooter`.
+    #[tokio::test]
+    async fn assembly_omits_suggested_prompts_for_sub_agent() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            None,
+            true,
+            false,
+        )
+        .await
+        .expect("assembled prompt");
+        assert!(
+            !prompt.contains("## Suggested Next Steps"),
+            "SP-1 directive absent for sub-agent"
+        );
+        assert!(
+            !prompt.contains("<!-- suggested-prompts"),
+            "no suggested-prompts template for sub-agent"
+        );
+    }
+
+    /// SP-1: when auto-commit is enabled the directive swaps the example
+    /// second-line (`Check the changes in the diff view.`) and appends the
+    /// auto-commit clause that tells the model not to propose commit-review
+    /// prompts, matching the reference `autoCommitEnabled` branch.
+    #[tokio::test]
+    async fn assembly_suggested_prompts_toggles_auto_commit_clause() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            None,
+            false,
+            true,
+        )
+        .await
+        .expect("assembled prompt");
+        assert!(prompt.contains("## Suggested Next Steps"));
+        assert!(
+            prompt.contains("Check the changes in the diff view."),
+            "auto-commit-on example line"
+        );
+        assert!(
+            !prompt.contains("Review changes before committing."),
+            "auto-commit-off example line must not appear when auto-commit is on"
+        );
+        assert!(
+            prompt.contains(
+                "Auto-commit is enabled; do not include prompts about committing or reviewing changes before committing."
+            ),
+            "auto-commit clause appended"
+        );
     }
 
     #[tokio::test]
