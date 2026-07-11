@@ -99,11 +99,14 @@ async fn connect(port: u16) -> PlainWs {
 }
 
 /// One bounded JSON-RPC round-trip on `ws`: send `method`/`params` with the
-/// caller-supplied `id`, then wait (max 5s) for the matching response frame,
-/// echoing pings inline. Used as a lightweight barrier — a successful reply
-/// proves the server-side `connection_loop` is running past the point where
-/// it registered its reverse channel with `PrimaryReverseRegistry`, so pairing
-/// two sequential `client.hello` calls yields a deterministic arrival order.
+/// caller-supplied `id`, then wait for the matching response frame under a
+/// single 5s overall deadline, echoing pings inline. Used as a lightweight
+/// barrier — a successful reply proves the server-side `connection_loop` is
+/// running past the point where it registered its reverse channel with
+/// `PrimaryReverseRegistry`, so pairing two sequential `client.hello` calls
+/// yields a deterministic arrival order. The 5s is a *total* budget across
+/// all frames (ping / unrelated notification loops included), matching the
+/// `try_read_text` pattern below so pings can't extend the wait indefinitely.
 async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({
         "jsonrpc": "2.0",
@@ -112,11 +115,15 @@ async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Valu
         "params": params,
     });
     ws.send(Message::Text(req.to_string())).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match timeout(Duration::from_secs(5), ws.next())
-            .await
-            .expect("wss_rpc timed out waiting for response")
-        {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("wss_rpc timed out waiting for response to id={id} method={method}");
+        }
+        match timeout(remaining, ws.next()).await.unwrap_or_else(|_| {
+            panic!("wss_rpc timed out waiting for response to id={id} method={method}")
+        }) {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json");
                 if v.get("id") == Some(&json!(id)) {

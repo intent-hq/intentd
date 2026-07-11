@@ -4302,10 +4302,14 @@ pub enum ReverseDispatchError {
     /// No client is currently registered as the sticky reverse target — no
     /// live connection to route the request to.
     NoClient,
-    /// The reverse RPC reached a client but the client returned a failure
-    /// (timeout, closed connection, or a JSON-RPC error). The daemon does not
-    /// interpret `code`; it just carries whatever the client / transport
-    /// surfaced.
+    /// The reverse RPC could not be completed successfully — covers delivery
+    /// failures (e.g. the outbound queue was closed before the request left
+    /// the daemon), transport-level failures (timeout waiting for the
+    /// response, connection dropped in-flight), and JSON-RPC error replies
+    /// returned by the client. In other words: anything that isn't
+    /// [`NoClient`](Self::NoClient) and isn't a successful `result`. The
+    /// daemon does not interpret `code`; it just carries whatever the client
+    /// / transport surfaced.
     Transport { code: i64, message: String },
 }
 

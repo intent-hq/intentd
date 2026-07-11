@@ -2715,6 +2715,15 @@ async fn terminal_create_env_over_wss() {
         }
     }
     let text = String::from_utf8_lossy(&acc);
+    // `saw_exit` is a required post-condition — the child prints its env and
+    // exits, so a missed `terminal:exit` means the loop bailed on the 30s
+    // deadline with a partial buffer, not a successful drain. Assert it
+    // explicitly so a truncated marker never silently passes.
+    assert!(
+        saw_exit,
+        "terminal.create must emit `terminal:exit` after the child prints its env \
+         (PROTOCOL §5.13); output was: {text:?}"
+    );
     assert!(
         text.contains("MY_TEST_VAR=PROT_MARKER_env_wss"),
         "terminal.create must overlay the caller's env onto the spawned child \
