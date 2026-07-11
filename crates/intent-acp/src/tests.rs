@@ -2938,6 +2938,74 @@ mod workspace_api_tool_tests {
             "expected timeout message, got: {text}"
         );
     }
+
+    #[tokio::test]
+    async fn tools_call_unknown_name_is_rejected_as_tool_not_found() {
+        // Regression for the WSAPI-8 singleton assumption: a tool name that
+        // is not `workspace_api` must be rejected as `Tool not found` and
+        // must NOT be silently mis-dispatched to `dispatch_workspace_api`.
+        let srv = server("amber-forest", None);
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "not_a_real_tool",
+                    "arguments": { "code": "return 1;", "summary": "unit test" }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Tool not found"));
+    }
+
+    #[tokio::test]
+    async fn workspace_api_missing_summary_returns_invalid_params() {
+        // The schema declares `summary` required alongside `code`; a call
+        // without `summary` must fail with a clear MCP error before the JS
+        // engine is invoked.
+        let srv = server("amber-forest", None);
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "workspace_api",
+                    "arguments": { "code": "return 1;" }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("`summary` is required"));
+    }
+
+    #[tokio::test]
+    async fn workspace_api_non_string_summary_returns_invalid_params() {
+        // Reject non-string `summary` values with the same MCP error rather
+        // than coercing or silently ignoring them.
+        let srv = server("amber-forest", None);
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "workspace_api",
+                    "arguments": { "code": "return 1;", "summary": 42 }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("`summary` is required and must be a string"));
+    }
 }
 
 /// WSAPI-3 per-namespace bindings: `ws.note.*`, `ws.task.*`, `ws.comment.*`,

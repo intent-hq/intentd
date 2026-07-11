@@ -151,12 +151,26 @@ impl WorkspaceMcpServer {
         if !tools::all_tools().iter().any(|t| t.name == name) {
             return err(id, -32602, &format!("Tool not found: {name}"));
         }
+        // After the WSAPI-8 cutover `workspace_api` is the only tool the
+        // daemon dispatches; guard explicitly on the name so a future
+        // registry entry cannot silently mis-dispatch through the
+        // JS-eval path here.
+        if name != "workspace_api" {
+            return err(id, -32602, &format!("Tool not found: {name}"));
+        }
         let args = params
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        // After the WSAPI-8 cutover the only registered tool is
-        // `workspace_api`, which shapes its own MCP tool result (isError=true
+        // The `workspace_api` input schema declares both `code` and `summary`
+        // as required; `code` is validated inside `dispatch_workspace_api`,
+        // and `summary` is enforced here so malformed calls fail with a clear
+        // MCP error before we spin up the JS engine (reference parity with
+        // the TS `workspace-js-api-tool`, which lists both as required).
+        if !args.get("summary").is_some_and(Value::is_string) {
+            return err(id, -32602, "`summary` is required and must be a string");
+        }
+        // `workspace_api` shapes its own MCP tool result (isError=true
         // text bodies for JS-side failures — reference parity with the TS
         // tool) instead of the discrete-tool `Ok(value) -> tool_content` map.
         ok(id, self.dispatch_workspace_api(&args).await)
