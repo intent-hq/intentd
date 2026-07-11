@@ -17,9 +17,11 @@ use std::sync::Arc;
 use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
+pub(crate) mod agent;
 pub(crate) mod browser;
 pub(crate) mod comment;
 pub(crate) mod cross_workspace;
+pub(crate) mod event;
 pub(crate) mod note;
 pub(crate) mod pr;
 pub(crate) mod primitive;
@@ -33,7 +35,7 @@ pub(crate) mod task;
 /// and `concat!` only accepts literals.
 pub(crate) fn prelude() -> String {
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
         note::PRELUDE,
         task::PRELUDE,
         comment::PRELUDE,
@@ -41,6 +43,8 @@ pub(crate) fn prelude() -> String {
         cross_workspace::PRELUDE,
         pr::PRELUDE,
         browser::PRELUDE,
+        agent::PRELUDE,
+        event::PRELUDE,
     )
 }
 
@@ -49,7 +53,9 @@ pub(crate) fn prelude() -> String {
 /// owned here (the caller then falls back to the WSAPI-2 handler); `Ok(Some(v))`
 /// on success and `Err(msg)` on a JS-visible failure. `caller_agent_id`
 /// is forwarded to bindings that attribute their calls back to the spawning
-/// agent (`ws.browser.exec`).
+/// agent (`ws.browser.exec`, and the caller-aware `ws.agent.*` methods —
+/// `create`, `delegate`, `send`, `sendToTask`, `wakeOrCreate`,
+/// `reportToParent`).
 pub(crate) async fn try_dispatch(
     api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
@@ -87,6 +93,16 @@ pub(crate) async fn try_dispatch(
     }
     if let Some(rest) = method.strip_prefix("browser.") {
         return browser::dispatch(api, workspace_id, caller_agent_id, rest, args)
+            .await
+            .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("agent.") {
+        return agent::dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args)
+            .await
+            .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("event.") {
+        return event::dispatch(api, workspace_id, rest, args)
             .await
             .map(Some);
     }
