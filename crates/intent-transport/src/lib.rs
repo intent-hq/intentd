@@ -20,9 +20,7 @@ pub use host::{
     EditorTarget, ExternalOpener, NoopAppPicker, OpenExternalError, OpenInEditorError,
     OsEditorLauncher, OsOpener, PickApplicationError, ResolvedEditor,
 };
-pub use listener::serve_uds;
-#[cfg(unix)]
-pub use listener::serve_uds_with_reverse;
+pub use listener::{serve_uds, serve_uds_with_reverse};
 pub use reverse::{
     PrimaryReverseGuard, PrimaryReverseRegistry, ReverseChannel, ReverseError,
     DEFAULT_REVERSE_TIMEOUT,

@@ -229,3 +229,25 @@ where
         "UDS transport is not supported on this platform",
     ))
 }
+
+/// Non-Unix fallback for [`serve_uds_with_reverse`]: the composition root
+/// (`intentd/src/main.rs`) references this symbol unconditionally, so the
+/// crate must expose it on every platform. UDS is Unix-only; on non-Unix
+/// targets any attempt to serve reports an `Unsupported` error at runtime.
+#[cfg(not(unix))]
+pub async fn serve_uds_with_reverse<F>(
+    _api: Arc<dyn WorkspaceApi>,
+    _bus: EventBus,
+    _socket_path: &Path,
+    _control: Option<Arc<dyn SystemControl>>,
+    _reverse_registry: Arc<PrimaryReverseRegistry>,
+    _shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()>,
+{
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "UDS transport is not supported on this platform",
+    ))
+}
