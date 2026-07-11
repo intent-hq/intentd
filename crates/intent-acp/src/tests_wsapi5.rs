@@ -609,6 +609,18 @@ async fn git_stage_accepts_array_of_paths() {
 }
 
 #[tokio::test]
+async fn git_stage_rejects_non_string_array_entries() {
+    // The array form must reject any non-string element instead of silently
+    // dropping it (`filter_map(Value::as_str)` would let e.g. `['a.txt', 123]`
+    // stage only `a.txt`). Pin the "array of strings" contract explicitly.
+    let (srv, api) = server();
+    let resp = call(&srv, "return await ws.git.stage(['a.txt', 123]);").await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("array of strings"));
+    assert!(api.stage_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn git_stage_csv_string_splits_on_commas() {
     let (srv, _api) = server();
     let resp = call(&srv, "return await ws.git.stage('a.txt, b.txt');").await;

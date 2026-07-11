@@ -75,11 +75,23 @@ async fn stage(
         }
     }
     let list: Vec<String> = if let Some(arr) = paths.as_array() {
-        arr.iter()
-            .filter_map(Value::as_str)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
+        // Reject any non-string element in the array. Silently dropping them
+        // via `filter_map(Value::as_str)` would allow surprising partial
+        // staging (e.g. `["a.txt", 123]` stages only `a.txt`) and produces a
+        // misleading `No file paths provided` when the array contains no
+        // strings. The contract error text says "array of strings" — enforce
+        // it.
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            let s = v
+                .as_str()
+                .ok_or_else(|| "paths must be a string or array of strings".to_string())?;
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
+            }
+        }
+        out
     } else if let Some(s) = paths.as_str() {
         s.split(',')
             .map(|p| p.trim().to_string())

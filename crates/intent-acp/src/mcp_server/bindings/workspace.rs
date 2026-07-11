@@ -163,11 +163,15 @@ async fn set_status_message(
         .update_workspace(ws.clone(), update)
         .await
         .map_err(map_err)?;
-    let out = if trimmed.is_empty() {
-        Value::Null
-    } else {
-        Value::String(updated.status_message.unwrap_or_default())
-    };
+    // Preserve the `Option<String>` shape end-to-end: `None` maps to
+    // `Value::Null`, `Some(v)` to `Value::String(v)`. Never collapse to `""`
+    // via `unwrap_or_default()` — that would conflate a cleared value with
+    // an explicitly empty string and reintroduce the exact empty-vs-null
+    // mismatch the services-side clear normalization is fixing.
+    let out = updated
+        .status_message
+        .map(Value::String)
+        .unwrap_or(Value::Null);
     Ok(json!({ "ok": true, "statusMessage": out }))
 }
 
