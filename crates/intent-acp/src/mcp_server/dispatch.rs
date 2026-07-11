@@ -740,7 +740,11 @@ impl WorkspaceMcpServer {
         // `summary` is required by the input schema but is not fed into the
         // engine — it is a UI hint for the caller, not part of the eval
         // environment. Accept and ignore for now.
-        let host = make_workspace_host(self.api.clone(), self.workspace_id.clone());
+        let host = make_workspace_host(
+            self.api.clone(),
+            self.workspace_id.clone(),
+            self.caller_agent_id.clone(),
+        );
         // Wrap user code so the engine sees a small `{__k, __v}` envelope,
         // preserving the `undefined` vs `null` distinction that
         // `serde_json::Value` cannot represent on its own. `__k` is `"u"` for
@@ -774,12 +778,19 @@ impl WorkspaceMcpServer {
 
 /// Build the `HostFn` bridging JS `host({ method, args })` calls back into
 /// the shared `WorkspaceApi`. The skeleton only routes `workspace.info`;
-/// unknown methods surface as a JS-visible error frame.
-fn make_workspace_host(api: Arc<dyn WorkspaceApi>, workspace_id: WorkspaceId) -> HostFn {
+/// unknown methods surface as a JS-visible error frame. `caller_agent_id`
+/// is forwarded to bindings that attribute their calls back to the spawning
+/// agent (e.g. `ws.browser.exec`).
+fn make_workspace_host(
+    api: Arc<dyn WorkspaceApi>,
+    workspace_id: WorkspaceId,
+    caller_agent_id: Option<AgentId>,
+) -> HostFn {
     Arc::new(move |arg| {
         let api = api.clone();
         let workspace_id = workspace_id.clone();
-        Box::pin(async move { workspace_host_dispatch(api, workspace_id, arg).await })
+        let caller = caller_agent_id.clone();
+        Box::pin(async move { workspace_host_dispatch(api, workspace_id, caller, arg).await })
             as BoxFuture<'static, std::result::Result<Value, String>>
     })
 }
@@ -791,6 +802,7 @@ fn make_workspace_host(api: Arc<dyn WorkspaceApi>, workspace_id: WorkspaceId) ->
 async fn workspace_host_dispatch(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
+    caller_agent_id: Option<AgentId>,
     arg: Value,
 ) -> std::result::Result<Value, String> {
     let method = arg
@@ -811,7 +823,9 @@ async fn workspace_host_dispatch(
             "path": path,
         }));
     }
-    if let Some(v) = super::bindings::try_dispatch(&api, &workspace_id, method, &args).await? {
+    if let Some(v) =
+        super::bindings::try_dispatch(&api, &workspace_id, &caller_agent_id, method, &args).await?
+    {
         return Ok(v);
     }
     Err(format!("host: unknown method `{method}`"))

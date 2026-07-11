@@ -4435,3 +4435,652 @@ mod wsapi3_bindings_tests {
         assert_eq!(api.get_my_task_calls.lock().unwrap().len(), 1);
     }
 }
+
+/// WSAPI-6 per-namespace bindings: `ws.pr.*`, `ws.crossWorkspace.*`,
+/// `ws.browser.*`. Each namespace round-trips a `workspace_api` request
+/// against a fake [`WorkspaceApi`] that mocks the trait methods the
+/// bindings touch. For `ws.browser.exec` the fake stands in for the FE-served
+/// reverse channel — it records the forwarded envelope and returns the
+/// pre-shaped `Value` the transport layer would echo back.
+#[cfg(test)]
+mod wsapi6_bindings_tests {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{AgentId, BoxFuture, Error, NoteId, Result, WorkspaceApi, WorkspaceId};
+    use serde_json::{json, Value};
+
+    use crate::WorkspaceMcpServer;
+
+    type PrMergeCall = (Option<String>, Option<String>, Option<String>);
+    type PrReviewCommentsCall = (Option<String>, Option<String>);
+    type PrWaitCall = (Option<i64>, Option<i64>, Option<String>);
+    type PrResolveThreadCall = (String, Option<String>);
+    type PrReplyCall = (u64, String);
+    type CrossReadCall = (String, String);
+    type BrowserExecCall = (Vec<Value>, Option<String>, Option<String>);
+
+    #[derive(Default)]
+    struct FakeApi {
+        pr_status_calls: Mutex<u32>,
+        pr_merge_calls: Mutex<Vec<PrMergeCall>>,
+        pr_update_branch_calls: Mutex<u32>,
+        pr_list_review_comments_calls: Mutex<Vec<PrReviewCommentsCall>>,
+        pr_reply_calls: Mutex<Vec<PrReplyCall>>,
+        pr_resolve_thread_calls: Mutex<Vec<PrResolveThreadCall>>,
+        pr_list_comments_calls: Mutex<Vec<Option<i64>>>,
+        pr_post_comment_calls: Mutex<Vec<String>>,
+        pr_wait_calls: Mutex<Vec<PrWaitCall>>,
+        cross_list_siblings_calls: Mutex<u32>,
+        cross_read_note_calls: Mutex<Vec<CrossReadCall>>,
+        cross_list_notes_calls: Mutex<Vec<String>>,
+        browser_exec_calls: Mutex<Vec<BrowserExecCall>>,
+        /// When set, `pr_status` returns this instead of the default shape.
+        pr_status_result: Mutex<Option<Value>>,
+        /// When set, `pr_status` returns this error.
+        pr_status_error: Mutex<Option<String>>,
+    }
+
+    impl WorkspaceApi for FakeApi {
+        fn pr_status(&self, _ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+            *self.pr_status_calls.lock().unwrap() += 1;
+            let result = self.pr_status_result.lock().unwrap().clone();
+            let error = self.pr_status_error.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some(e) = error {
+                    return Err(Error::Internal(e));
+                }
+                Ok(result.unwrap_or_else(|| {
+                    json!({
+                        "prNumber": 42,
+                        "title": "T",
+                        "url": "https://example.com/pr/42",
+                        "state": "open",
+                        "mergeable": true,
+                        "mergeableState": "clean",
+                        "hasConflicts": false,
+                        "isDraft": false,
+                        "isMerged": false,
+                        "isClosed": false,
+                        "summary": "✅ PR is mergeable with no conflicts.",
+                    })
+                }))
+            })
+        }
+
+        fn pr_merge(
+            &self,
+            _ws: WorkspaceId,
+            merge_method: Option<String>,
+            commit_title: Option<String>,
+            commit_message: Option<String>,
+            _idempotency_key: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.pr_merge_calls.lock().unwrap().push((
+                merge_method.clone(),
+                commit_title,
+                commit_message,
+            ));
+            Box::pin(async move {
+                Ok(json!({
+                    "merged": true,
+                    "sha": "deadbeef",
+                    "mergeMethod": merge_method.unwrap_or_else(|| "merge".to_string()),
+                    "message": "ok",
+                    "prNumber": 42,
+                }))
+            })
+        }
+
+        fn pr_update_branch(&self, _ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+            *self.pr_update_branch_calls.lock().unwrap() += 1;
+            Box::pin(async {
+                Ok(json!({
+                    "method": "merge",
+                    "alreadyUpToDate": false,
+                    "message": "PR branch updated.",
+                    "url": null,
+                }))
+            })
+        }
+
+        fn pr_wait_for_changes(
+            &self,
+            _ws: WorkspaceId,
+            timeout_seconds: Option<i64>,
+            poll_interval_seconds: Option<i64>,
+            watch: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.pr_wait_calls.lock().unwrap().push((
+                timeout_seconds,
+                poll_interval_seconds,
+                watch,
+            ));
+            Box::pin(async {
+                Ok(json!({
+                    "changed": false,
+                    "elapsedSeconds": 0,
+                    "iterations": 0,
+                    "summary": "no changes",
+                }))
+            })
+        }
+
+        fn pr_list_review_comments(
+            &self,
+            _ws: WorkspaceId,
+            path: Option<String>,
+            status: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.pr_list_review_comments_calls
+                .lock()
+                .unwrap()
+                .push((path, status));
+            Box::pin(async {
+                Ok(json!({
+                    "threads": [],
+                    "threadCount": 0,
+                    "usingFallback": false,
+                    "pagination": null,
+                    "filter": { "path": null, "status": "unresolved" },
+                    "note": null,
+                }))
+            })
+        }
+
+        fn pr_reply_to_review_comment(
+            &self,
+            _ws: WorkspaceId,
+            comment_id: u64,
+            body: String,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.pr_reply_calls.lock().unwrap().push((comment_id, body));
+            Box::pin(async { Ok(json!({ "id": 999, "htmlUrl": "https://example.com/c/999" })) })
+        }
+
+        fn pr_resolve_thread(
+            &self,
+            _ws: WorkspaceId,
+            thread_id: String,
+            action: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.pr_resolve_thread_calls
+                .lock()
+                .unwrap()
+                .push((thread_id.clone(), action.clone()));
+            Box::pin(async move {
+                Ok(json!({
+                    "ok": true,
+                    "threadId": thread_id,
+                    "action": action.unwrap_or_else(|| "resolve".to_string()),
+                }))
+            })
+        }
+
+        fn pr_list_comments(
+            &self,
+            _ws: WorkspaceId,
+            count: Option<i64>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.pr_list_comments_calls.lock().unwrap().push(count);
+            Box::pin(async { Ok(json!({ "count": 0, "comments": [] })) })
+        }
+
+        fn pr_post_comment(&self, _ws: WorkspaceId, body: String) -> BoxFuture<'_, Result<Value>> {
+            self.pr_post_comment_calls.lock().unwrap().push(body);
+            Box::pin(async { Ok(json!({ "id": 1234, "htmlUrl": "https://example.com/c/1234" })) })
+        }
+
+        fn cross_workspace_list_siblings(&self, _ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+            *self.cross_list_siblings_calls.lock().unwrap() += 1;
+            Box::pin(async {
+                Ok(json!([
+                    { "id": "sibling-1", "title": "Sib One", "branch": "b/1", "status": "active" },
+                ]))
+            })
+        }
+
+        fn cross_workspace_read_note(
+            &self,
+            _ws: WorkspaceId,
+            target: WorkspaceId,
+            note_id: NoteId,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.cross_read_note_calls
+                .lock()
+                .unwrap()
+                .push((target.as_str().to_string(), note_id.as_str().to_string()));
+            Box::pin(async move {
+                Ok(json!({
+                    "id": note_id.as_str(),
+                    "title": "cross-title",
+                    "content": "hello\nworld",
+                    "numberedContent": "   1 | hello\n   2 | world",
+                    "sourceWorkspaceId": target.as_str(),
+                    "sourceWorkspaceTitle": "Sib One",
+                    "branch": "b/1",
+                    "lineCount": 2,
+                }))
+            })
+        }
+
+        fn cross_workspace_list_notes(
+            &self,
+            _ws: WorkspaceId,
+            target: WorkspaceId,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.cross_list_notes_calls
+                .lock()
+                .unwrap()
+                .push(target.as_str().to_string());
+            Box::pin(async {
+                Ok(json!([
+                    { "id": "n-1", "title": "t1", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z" },
+                ]))
+            })
+        }
+
+        fn browser_exec(
+            &self,
+            _ws: WorkspaceId,
+            actions: Vec<Value>,
+            tab_id: Option<String>,
+            agent_id: Option<AgentId>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.browser_exec_calls.lock().unwrap().push((
+                actions.clone(),
+                tab_id,
+                agent_id.map(|a| a.as_str().to_string()),
+            ));
+            // Reference parity: a single-action batch yields the sole action's
+            // envelope; multi-action yields `{ results: [...] }`. The fake
+            // stands in for what the reverse channel would have returned.
+            Box::pin(async move {
+                if actions.len() == 1 {
+                    Ok(json!({
+                        "action": "listTabs",
+                        "success": true,
+                        "result": { "tabs": [] }
+                    }))
+                } else {
+                    Ok(json!({
+                        "results": actions
+                            .iter()
+                            .map(|a| json!({
+                                "action": a.get("action").cloned().unwrap_or(Value::Null),
+                                "success": true,
+                                "result": {}
+                            }))
+                            .collect::<Vec<_>>()
+                    }))
+                }
+            })
+        }
+    }
+
+    fn server() -> (WorkspaceMcpServer, Arc<FakeApi>) {
+        let api = Arc::new(FakeApi::default());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
+        (srv, api)
+    }
+
+    fn server_with_caller(agent_id: &str) -> (WorkspaceMcpServer, Arc<FakeApi>) {
+        let api = Arc::new(FakeApi::default());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+            .with_caller_agent_id(Some(AgentId::from_string(agent_id)));
+        (srv, api)
+    }
+
+    async fn call(srv: &WorkspaceMcpServer, code: &str) -> Value {
+        srv.handle_message(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "workspace_api",
+                "arguments": { "code": code, "summary": "wsapi6 unit test" }
+            }
+        }))
+        .await
+        .expect("tools/call must produce a response")
+    }
+
+    fn body(resp: &Value) -> Value {
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).expect("workspace_api body must be JSON")
+    }
+
+    fn text(resp: &Value) -> String {
+        resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    // ================================================================
+    // crossWorkspace.*
+    // ================================================================
+
+    #[tokio::test]
+    async fn cross_workspace_list_siblings_returns_sibling_array() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.crossWorkspace.listSiblings();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert!(v.is_array());
+        assert_eq!(v[0]["id"], json!("sibling-1"));
+        assert_eq!(*api.cross_list_siblings_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn cross_workspace_read_note_forwards_target_and_note_ids() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.crossWorkspace.readNote('sibling-1', 'n-1');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["id"], json!("n-1"));
+        assert_eq!(v["sourceWorkspaceId"], json!("sibling-1"));
+        assert_eq!(v["lineCount"], json!(2));
+        assert_eq!(
+            *api.cross_read_note_calls.lock().unwrap(),
+            vec![("sibling-1".to_string(), "n-1".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_workspace_read_note_missing_note_id_errors() {
+        let (srv, _api) = server();
+        // Reference parity: both fields required, single error string.
+        let resp = call(
+            &srv,
+            "return await ws.crossWorkspace.readNote('sib', null);",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("Both workspaceId and noteId are required"));
+    }
+
+    #[tokio::test]
+    async fn cross_workspace_list_notes_forwards_target_workspace_id() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.crossWorkspace.listNotes('sibling-1');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert!(v.is_array());
+        assert_eq!(v[0]["id"], json!("n-1"));
+        assert_eq!(
+            *api.cross_list_notes_calls.lock().unwrap(),
+            vec!["sibling-1".to_string()]
+        );
+    }
+
+    // ================================================================
+    // pr.*
+    // ================================================================
+
+    #[tokio::test]
+    async fn pr_status_returns_shape_from_trait() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.pr.status();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["prNumber"], json!(42));
+        assert_eq!(v["state"], json!("open"));
+        assert_eq!(*api.pr_status_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn pr_status_surfaces_no_active_pr_error() {
+        let (srv, api) = server();
+        // Simulate the daemon's "No active PR" error surface — parity with
+        // `requirePrContext()` in `ws-pr-api.ts`.
+        *api.pr_status_error.lock().unwrap() = Some("No active PR".to_string());
+        let resp = call(&srv, "return await ws.pr.status();").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("No active PR"));
+    }
+
+    #[tokio::test]
+    async fn pr_merge_forwards_options_and_defaults_merge_method() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.pr.merge({ commitTitle: 'ct', commitMessage: 'cm' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["merged"], json!(true));
+        assert_eq!(v["mergeMethod"], json!("merge"));
+        let calls = api.pr_merge_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            (None, Some("ct".to_string()), Some("cm".to_string()),)
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_merge_rejects_invalid_merge_method() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.pr.merge({ mergeMethod: 'bogus' });").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("mergeMethod must be one of"));
+        assert!(api.pr_merge_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pr_update_branch_calls_trait() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.pr.updateBranch();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(*api.pr_update_branch_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn pr_wait_for_changes_validates_watch_mode() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.pr.waitForChanges({ watch: 'bogus' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("watch must be one of"));
+        assert!(api.pr_wait_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pr_wait_for_changes_forwards_options() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.pr.waitForChanges({ timeoutSeconds: 60, pollIntervalSeconds: 15, watch: 'checks' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.pr_wait_calls.lock().unwrap();
+        assert_eq!(calls[0], (Some(60), Some(15), Some("checks".to_string())));
+    }
+
+    #[tokio::test]
+    async fn pr_list_review_comments_validates_status() {
+        let (srv, _api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.pr.listReviewComments({ status: 'bogus' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("status must be one of"));
+    }
+
+    #[tokio::test]
+    async fn pr_list_review_comments_forwards_path_and_status() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.pr.listReviewComments({ path: 'src/x.rs', status: 'resolved' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.pr_list_review_comments_calls.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            (Some("src/x.rs".to_string()), Some("resolved".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_reply_to_review_comment_forwards_id_and_body() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.pr.replyToReviewComment(123, 'thanks');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["id"], json!(999));
+        assert_eq!(
+            *api.pr_reply_calls.lock().unwrap(),
+            vec![(123u64, "thanks".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_resolve_thread_defaults_action_and_validates() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.pr.resolveThread('th-1');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        // Invalid action surfaces before the trait method is called.
+        let bad = call(&srv, "return await ws.pr.resolveThread('th-1', 'bogus');").await;
+        assert_eq!(bad["result"]["isError"], json!(true));
+        assert!(text(&bad).contains("action must be one of"));
+        // The valid call was recorded; the invalid one was not.
+        assert_eq!(api.pr_resolve_thread_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pr_list_comments_forwards_count() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.pr.listComments({ count: 5 });").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(*api.pr_list_comments_calls.lock().unwrap(), vec![Some(5)]);
+    }
+
+    #[tokio::test]
+    async fn pr_post_comment_rejects_empty_body() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.pr.postComment('');").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(api.pr_post_comment_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pr_post_comment_forwards_body() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.pr.postComment('hi there');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(
+            *api.pr_post_comment_calls.lock().unwrap(),
+            vec!["hi there".to_string()]
+        );
+    }
+
+    // ================================================================
+    // browser.*
+    // ================================================================
+
+    #[tokio::test]
+    async fn browser_exec_forwards_actions_and_shapes_single_result() {
+        let (srv, api) = server_with_caller("agent-77");
+        let resp = call(
+            &srv,
+            r#"return await ws.browser.exec([{ action: 'listTabs' }], 'tab-1');"#,
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        // Reference parity for a 1-action batch: single envelope, not wrapped.
+        assert_eq!(v["action"], json!("listTabs"));
+        assert_eq!(v["success"], json!(true));
+
+        let calls = api.browser_exec_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (actions, tab_id, agent_id) = &calls[0];
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["action"], json!("listTabs"));
+        assert_eq!(tab_id.as_deref(), Some("tab-1"));
+        // caller_agent_id is threaded through for FE-side attribution.
+        assert_eq!(agent_id.as_deref(), Some("agent-77"));
+    }
+
+    #[tokio::test]
+    async fn browser_exec_multi_action_batch_returns_results_array() {
+        let (srv, _api) = server();
+        let resp = call(
+            &srv,
+            r#"return await ws.browser.exec([
+                { action: 'listTabs' },
+                { action: 'screenshot' }
+            ]);"#,
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        // Multi-action batch → { results: [...] } passthrough from the fake
+        // reverse channel; matches transport `shape_result` behaviour.
+        assert_eq!(v["results"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn browser_exec_missing_actions_errors_without_calling_trait() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.browser.exec();").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("actions parameter is required"));
+        assert!(api.browser_exec_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn browser_exec_empty_actions_errors_without_calling_trait() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.browser.exec([]);").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("actions array cannot be empty"));
+        assert!(api.browser_exec_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn browser_docs_returns_topic_text_verbatim() {
+        let (srv, _api) = server();
+        for topic in ["overview", "capture", "examples"] {
+            let resp = call(&srv, &format!("return await ws.browser.docs('{topic}');")).await;
+            assert_eq!(
+                resp["result"]["isError"],
+                json!(false),
+                "topic {topic} should succeed"
+            );
+            let v = body(&resp);
+            let doc = v.as_str().expect("docs return string");
+            assert!(!doc.is_empty(), "topic {topic} should return non-empty");
+            // First line is the topic heading (`# Browser ...`).
+            assert!(doc.starts_with("# Browser"), "topic {topic}: {doc:.40}");
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_docs_rejects_unknown_topic() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.browser.docs('bogus');").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("Unknown topic"));
+        assert!(text(&resp).contains("overview, capture, examples"));
+    }
+}

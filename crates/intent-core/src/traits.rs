@@ -4180,6 +4180,28 @@ pub trait WorkspaceApi: Send + Sync {
             ))
         })
     }
+
+    /// `browser.exec` (PROTOCOL §5.14): validate + forward a batch of CDP
+    /// actions to the connected frontend and reshape the reply. The MCP
+    /// binding (`ws.browser.exec`) calls this; the concrete implementation
+    /// wraps a per-connection reverse channel (owned by `intent-transport`).
+    /// The default returns an internal error so units of the codebase that
+    /// have no reverse channel available (agent-MCP without a wired FE) fail
+    /// loudly rather than silently drop the call.
+    fn browser_exec(
+        &self,
+        workspace_id: WorkspaceId,
+        actions: Vec<serde_json::Value>,
+        tab_id: Option<String>,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, actions, tab_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::browser_exec not implemented".to_string(),
+            ))
+        })
+    }
 }
 
 /// Whether a context engine is usable right now (§8.1). `Unavailable` is a
