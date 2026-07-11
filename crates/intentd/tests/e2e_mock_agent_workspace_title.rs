@@ -130,10 +130,17 @@ async fn mock_agent_renames_workspace_via_mcp_set_title_tool() {
         mcp_config_flag: Some("--mcp-config"),
         ..*intent_providers::find_provider("mock").unwrap()
     };
+    // Post-WSAPI-8: the daemon exposes exactly one MCP tool
+    // (`workspace_api`); the equivalent of the discrete
+    // `set_workspace_title` call is agent-supplied JS driving
+    // `ws.workspace.setTitle`.
     let behavior = serde_json::json!({
         "toolCall": {
-            "name": "set_workspace_title",
-            "arguments": { "title": "Add dark mode support" }
+            "name": "workspace_api",
+            "arguments": {
+                "code": "return await ws.workspace.setTitle('Add dark mode support');",
+                "summary": "mock-agent E2E workspace.setTitle"
+            }
         },
         "response": "renamed the workspace",
     })

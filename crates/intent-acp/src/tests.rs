@@ -777,82 +777,15 @@ mod mcp_tests {
         );
     }
 
-    #[tokio::test]
-    async fn tool_call_dispatches_to_workspace_api() {
-        let api = Arc::new(MockApi::default());
-        let srv = server(api.clone());
-        let resp = srv
-            .handle_message(&json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": "add_to_note",
-                    "arguments": { "noteId": "n1", "content": "hello" }
-                }
-            }))
-            .await
-            .unwrap();
-        // The BE state changed: the mock recorded the add.
-        assert_eq!(
-            *api.added.lock().unwrap(),
-            vec![("n1".to_string(), "hello".to_string())]
-        );
-        // The MCP result wraps the service result as text content.
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        let parsed: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(parsed["ok"], json!(true));
-        assert_eq!(parsed["newContent"], json!("hello"));
-    }
-
-    #[tokio::test]
-    async fn git_commit_threads_caller_agent_id_as_attribution() {
-        let api = Arc::new(MockApi::default());
-        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("ws-1"))
-            .with_caller_agent_id(Some(AgentId::from_string("agent-77")));
-        let resp = srv
-            .handle_message(&json!({
-                "jsonrpc": "2.0", "id": 9, "method": "tools/call",
-                "params": {
-                    "name": "git_commit",
-                    "arguments": { "message": "Add a" }
-                }
-            }))
-            .await
-            .unwrap();
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let committed = api.committed.lock().unwrap();
-        assert_eq!(
-            *committed,
-            vec![("Add a".to_string(), Some("agent-77".to_string()), None)]
-        );
-    }
-
-    #[tokio::test]
-    async fn git_commit_without_agent_context_errors() {
-        let api = Arc::new(MockApi::default());
-        let srv = server(api.clone());
-        let resp = srv
-            .handle_message(&json!({
-                "jsonrpc": "2.0", "id": 10, "method": "tools/call",
-                "params": {
-                    "name": "git_commit",
-                    "arguments": { "message": "Add a" }
-                }
-            }))
-            .await
-            .unwrap();
-        assert_eq!(resp["error"]["code"], json!(-32602));
-        assert!(resp["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("This tool must be called by an agent."));
-        assert!(api.committed.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_agent_creates_assigns_and_starts_first_turn() {
+    // Discrete-tool dispatch tests (`add_to_note`, `git_commit`,
+    // `create_agent`, `send_message_to_*`) were removed in WSAPI-8: those
+    // tools are no longer registered, and their bindings are exercised
+    // through `workspace_api` in the `wsapi{3,4,5,6}_bindings_tests`
+    // modules. The tests below are gated out via `cfg(any())` so the file
+    // history stays legible; they will be removed outright once the
+    // cutover has settled.
+    #[cfg(all(test, any()))]
+    async fn _dead_create_agent_creates_assigns_and_starts_first_turn() {
         let api = Arc::new(MockApi::default());
         let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("ws-1"))
             .with_caller_agent_id(Some(AgentId::from_string("agent-77")));
@@ -914,50 +847,6 @@ mod mcp_tests {
     }
 
     #[tokio::test]
-    async fn create_agent_without_caller_registers_no_watch() {
-        // No MCP caller (e.g. tooling contexts without an agent): the child is
-        // created and started, but there is no parent to auto-subscribe.
-        let api = Arc::new(MockApi::default());
-        let srv = server(api.clone());
-        let resp = srv
-            .handle_message(&json!({
-                "jsonrpc": "2.0", "id": 11, "method": "tools/call",
-                "params": {
-                    "name": "create_agent",
-                    "arguments": { "name": "Solo", "initialMessage": "go" }
-                }
-            }))
-            .await
-            .unwrap();
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        let parsed: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(parsed["ok"], json!(true));
-        assert_eq!(parsed["subscriptionId"], Value::Null);
-        assert!(api.watched.lock().unwrap().is_empty());
-        assert_eq!(api.sent.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn create_agent_requires_name_and_initial_message() {
-        let api = Arc::new(MockApi::default());
-        let srv = server(api.clone());
-        let resp = srv
-            .handle_message(&json!({
-                "jsonrpc": "2.0", "id": 12, "method": "tools/call",
-                "params": {
-                    "name": "create_agent",
-                    "arguments": { "name": "No Message" }
-                }
-            }))
-            .await
-            .unwrap();
-        assert_eq!(resp["error"]["code"], json!(-32602));
-        assert!(api.agent_creates.lock().unwrap().is_empty());
-        assert!(api.sent.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn notification_yields_no_response() {
         let srv = server(Arc::new(MockApi::default()));
         let resp = srv
@@ -980,8 +869,11 @@ mod mcp_tests {
     }
 
     #[tokio::test]
-    async fn denylist_filters_tools_list_and_blocks_calls() {
-        // commit-message denies every write category, including note writes.
+    async fn denylist_filters_workspace_api_and_blocks_calls() {
+        // Pure-text background agents (commit-message here) deny the unified
+        // `workspace_api` tool via `UNIFIED_WORKSPACE_TOOLS`, so the exposed
+        // registry drops to empty and a tools/call attempt is refused with
+        // the standard "Tool not available" error.
         let srv = WorkspaceMcpServer::for_agent_type(
             Arc::new(MockApi::default()),
             WorkspaceId::from_string("ws-1"),
@@ -992,20 +884,23 @@ mod mcp_tests {
             .iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert!(!names.contains(&"add_to_note".to_string()));
-        assert!(!names.contains(&"delegate_task".to_string()));
-        assert!(!names.contains(&"create_agent".to_string()));
-        // Read tools remain available.
-        assert!(names.contains(&"get_note".to_string()));
+        assert!(!names.contains(&"workspace_api".to_string()));
 
         let resp = srv
             .handle_message(&json!({
                 "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-                "params": { "name": "add_to_note", "arguments": { "noteId": "n1", "content": "x" } }
+                "params": {
+                    "name": "workspace_api",
+                    "arguments": { "code": "return 1;", "summary": "x" }
+                }
             }))
             .await
             .unwrap();
         assert_eq!(resp["error"]["code"], json!(-32602));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Tool not available"));
     }
 
     #[test]
@@ -1014,9 +909,9 @@ mod mcp_tests {
         assert_eq!(deny, SUBAGENT_TOOLS.to_vec());
         // Interactive/foreground agents are unrestricted.
         assert!(get_tool_denylist_for_agent_type("interactive").is_empty());
-        // Pure text agents deny note writes and file writes.
+        // Pure text agents deny the unified workspace tool and file writes.
         let cm = get_tool_denylist_for_agent_type("commit-message");
-        assert!(cm.contains(&"add_to_note"));
+        assert!(cm.contains(&"workspace_api"));
         assert!(cm.contains(&"str-replace-editor"));
     }
 
@@ -1735,7 +1630,10 @@ mod tool_restriction_tests {
     }
 }
 
-/// Schema synthesis + tool-registry shape.
+/// Schema synthesis + tool-registry shape after the WSAPI-8 cutover: the
+/// daemon exposes exactly one MCP tool (`workspace_api`), so the assertions
+/// here reduce to "the registry is a singleton with the expected schema"
+/// and denylist filtering is tested against that single entry.
 mod tool_registry_tests {
     use crate::mcp_server::ToolDef;
     use crate::tool_restrictions::background_agent_types;
@@ -1753,107 +1651,42 @@ mod tool_registry_tests {
     }
 
     #[test]
-    fn schema_marks_required_and_injects_array_items() {
-        // Pick a tool with mixed required/optional/array params: create_note has
-        // required `title`, optional `content`, and an `array` `tags`.
+    fn registry_is_workspace_api_singleton_with_required_params() {
+        // Post-cutover the daemon exposes exactly one MCP tool. Both `code`
+        // and `summary` are declared required by the schema; the bare tool
+        // name carries no `_workspace-mcp` suffix (the ACP provider appends
+        // that server suffix on its side).
         let tools = unrestricted_tools();
-        let def = tools
-            .iter()
-            .find(|t| t.name == "create_note")
-            .expect("create_note tool present");
+        assert_eq!(tools.len(), 1, "registry should be a single-tool surface");
+        let def = tools[0];
+        assert_eq!(def.name, "workspace_api");
+        assert!(
+            !def.name.ends_with("_workspace-mcp"),
+            "tool name must be bare (provider appends the server suffix)"
+        );
         let schema = def.schema();
         assert_eq!(schema["type"], serde_json::json!("object"));
         let required = schema["required"].as_array().expect("required array");
         let req_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-        assert_eq!(req_names, vec!["title"]);
-        // Array params get `items: { type: "string" }`.
+        assert!(req_names.contains(&"code"));
+        assert!(req_names.contains(&"summary"));
         assert_eq!(
-            schema["properties"]["tags"]["items"]["type"],
+            schema["properties"]["code"]["type"],
             serde_json::json!("string")
         );
-        // Scalars do not get `items` synthesized.
-        assert!(schema["properties"]["content"].get("items").is_none());
         assert_eq!(
-            schema["properties"]["title"]["type"],
+            schema["properties"]["summary"]["type"],
             serde_json::json!("string")
         );
     }
 
     #[test]
-    fn schema_for_tool_without_params_is_empty_object() {
-        let tools = unrestricted_tools();
-        let def = tools
-            .iter()
-            .find(|t| t.name == "list_notes")
-            .expect("list_notes tool present");
-        let schema = def.schema();
-        assert_eq!(schema["type"], serde_json::json!("object"));
-        assert!(schema["properties"]
-            .as_object()
-            .map(|m| m.is_empty())
-            .unwrap_or(false));
-        assert_eq!(schema["required"], serde_json::json!([]));
-    }
-
-    #[test]
-    fn registry_has_unique_tool_names_and_includes_expected_set() {
-        let tools = unrestricted_tools();
-        let names: Vec<&'static str> = tools.iter().map(|t| t.name).collect();
-        let mut sorted = names.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(
-            sorted.len(),
-            names.len(),
-            "duplicate tool names in registry"
-        );
-        // Registry names are bare (no server suffix); the ACP provider (auggie)
-        // appends `_workspace-mcp` on its side, so agents still see
-        // `<name>_workspace-mcp`.
-        for n in &names {
-            assert!(
-                !n.ends_with("_workspace-mcp"),
-                "tool name {n} must be bare (provider appends the server suffix)"
-            );
-        }
-        // A representative read, write, agent-creation, and git tool are all present.
-        for required in [
-            "list_notes",
-            "add_to_note",
-            "create_agent",
-            "delegate_task",
-            "git_commit",
-            "report_to_parent",
-            // Agent coordination surface (D-batch 3): send/wake/list/read tools
-            // that let agents cooperate over the MCP front door.
-            "send_message_to_agent",
-            "send_message_to_task_agent",
-            "wake_or_create_task_agent",
-            "list_agents",
-            "get_agent_status",
-            "read_agent_conversation",
-            "get_agent_summary",
-            "get_agent_diagnostics",
-            "subscribe_to_events",
-            "unsubscribe_from_events",
-            // Workspace metadata surface (TS parity for `ws.workspace.*`).
-            "get_workspace_details",
-            "set_workspace_title",
-            "set_workspace_status_message",
-        ] {
-            assert!(names.contains(&required), "missing {required}");
-        }
-    }
-
-    #[test]
-    fn pure_text_agent_types_strictly_shrink_registry() {
-        // Pure-text background agents (commit-message, pr-description, code-review,
-        // code-walkthrough) deny note/task/agent/git/workspace-write tools that DO
-        // live in the workspace-MCP registry, so their available set must be
-        // strictly smaller than the unrestricted set. The other background types
-        // (task-loop / ralph-loop / chat) only deny auggie subagent tools that
-        // are intentionally absent from this registry.
-        let full = unrestricted_tools().len();
+    fn pure_text_agent_types_deny_the_unified_workspace_tool() {
+        // Pure-text background agents (commit-message, pr-description,
+        // code-review, code-walkthrough) deny the unified `workspace_api`
+        // surface, so their available set is empty. The other background
+        // types (task-loop / ralph-loop / chat) only deny auggie subagent
+        // tools that are intentionally absent from this registry.
         for ty in [
             "commit-message",
             "pr-description",
@@ -1865,30 +1698,35 @@ mod tool_registry_tests {
                 intent_core::WorkspaceId::from_string("ws-1"),
                 ty,
             );
-            let available = srv.available_tools().len();
-            assert!(
-                available < full,
-                "{ty} did not filter any tools ({available}/{full})"
-            );
-            // Read tools survive.
             let names: Vec<&str> = srv.available_tools().iter().map(|t| t.name).collect();
-            assert!(names.contains(&"get_note"), "{ty}");
-            assert!(names.contains(&"list_notes"), "{ty}");
+            assert!(
+                names.is_empty(),
+                "{ty} must expose no tools (denies workspace_api), got {names:?}"
+            );
         }
     }
 
     #[test]
-    fn working_agent_types_keep_full_registry() {
-        // task-loop / ralph-loop / chat only deny auggie subagent tools that are
-        // not in the workspace-MCP registry, so the available set is unchanged.
-        let full = unrestricted_tools().len();
+    fn working_agent_types_keep_the_workspace_api_tool() {
+        // task-loop / ralph-loop / chat only deny auggie subagent tools that
+        // are not in the workspace-MCP registry, so `workspace_api` stays
+        // available.
         for ty in ["task-loop", "ralph-loop", "chat"] {
             let srv = WorkspaceMcpServer::for_agent_type(
                 super::mcp_tests::mock_api(),
                 intent_core::WorkspaceId::from_string("ws-1"),
                 ty,
             );
-            assert_eq!(srv.available_tools().len(), full, "{ty}");
+            let names: Vec<&str> = srv.available_tools().iter().map(|t| t.name).collect();
+            assert_eq!(
+                names.len(),
+                1,
+                "{ty} must expose exactly one tool (singleton registry), got {names:?}"
+            );
+            assert_eq!(
+                names[0], "workspace_api",
+                "{ty} must keep workspace_api as the sole registered tool, got {names:?}"
+            );
         }
         // Sanity: background_agent_types() enumerates exactly these seven types
         // (4 pure-text + 3 working), keeping the two branches of this pair test
@@ -1898,10 +1736,12 @@ mod tool_registry_tests {
     }
 }
 
-/// Additional dispatch coverage: each tool arm hits its `WorkspaceApi` method
-/// (default `Internal` from the mock when unoverridden, `InvalidParams` for
-/// missing required parameters) and the catch-all `Tool not found` branch.
-mod dispatch_unit_tests {
+// Discrete-tool dispatch coverage removed in WSAPI-8: `dispatch()` and its
+// per-tool arms no longer exist. Coverage for tool-call error framing now
+// lives in `workspace_api_tool_tests`; parameter parsing is covered by the
+// per-namespace binding tests (`wsapi3_bindings_tests` etc.).
+#[cfg(all(test, any()))]
+mod _dead_dispatch_unit_tests {
     use serde_json::json;
     use std::sync::Arc;
 
@@ -2582,17 +2422,18 @@ mod mcp_bridge_tests {
     }
 }
 
-/// Workspace-metadata tool arms: `get_workspace_details` / `set_workspace_title` /
-/// `set_workspace_status_message` — TS parity with `ws-workspace-api.ts`.
-///
-/// A dedicated mock is used here because [`super::mcp_tests::MockApi`] deliberately
-/// keeps `get_workspace` / `update_workspace` at their trait-default `Internal`
-/// so the coverage-sweep test can prove every dispatch arm reaches the API. The
-/// mock below records `update_workspace` calls and lets tests seed the starting
-/// workspace row (title/branch) so both the "skip when custom-titled" branch
-/// and the "apply update when still a slug" branch can be exercised.
+// Discrete workspace-metadata tool tests removed in WSAPI-8: the daemon no
+// longer registers `get_workspace_details` / `set_workspace_title` /
+// `set_workspace_status_message`. Their bindings are exercised through
+// `workspace_api` inside `wsapi3_bindings_tests` and friends.
 #[cfg(test)]
-mod workspace_metadata_tool_tests {
+mod _removed_workspace_metadata_tool_tests {
+    // Intentionally empty — module preserved as a landing pad for the docs
+    // comment above. The original tests targeted discrete daemon tools that
+    // no longer exist post-cutover.
+}
+#[cfg(all(test, any()))]
+mod _dead_workspace_metadata_tool_tests {
     use std::sync::{Arc, Mutex};
 
     use intent_core::{
@@ -3101,6 +2942,104 @@ mod workspace_api_tool_tests {
             text.contains("timed out"),
             "expected timeout message, got: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn tools_call_unknown_name_is_rejected_as_tool_not_found() {
+        // Regression for the WSAPI-8 singleton assumption: a tool name that
+        // is not `workspace_api` must be rejected as `Tool not found` and
+        // must NOT be silently mis-dispatched to `dispatch_workspace_api`.
+        let srv = server("amber-forest", None);
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "not_a_real_tool",
+                    "arguments": { "code": "return 1;", "summary": "unit test" }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Tool not found"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_denylisted_but_unregistered_name_reports_tool_not_found() {
+        // A denylist may carry legacy discrete tool names or agent-provider
+        // built-ins that were never registered in the WSAPI-8 singleton
+        // registry. The registration check runs before the denylist check,
+        // so those names surface the accurate "Tool not found" MCP error
+        // instead of the misleading "Tool not available".
+        let api = WorkspaceInfoMockApi::new("amber-forest", None);
+        let srv = WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"))
+            .with_denylist(["get_note"]);
+        assert!(srv.is_denied("get_note"));
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "get_note", "arguments": { "noteId": "n" } }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("Tool not found"),
+            "expected `Tool not found` for denylisted-but-unregistered name, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Tool not available"),
+            "denylisted-but-unregistered name must not surface `Tool not available`, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_api_missing_summary_returns_invalid_params() {
+        // The schema declares `summary` required alongside `code`; a call
+        // without `summary` must fail with a clear MCP error before the JS
+        // engine is invoked.
+        let srv = server("amber-forest", None);
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "workspace_api",
+                    "arguments": { "code": "return 1;" }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("`summary` is required"));
+    }
+
+    #[tokio::test]
+    async fn workspace_api_non_string_summary_returns_invalid_params() {
+        // Reject non-string `summary` values with the same MCP error rather
+        // than coercing or silently ignoring them.
+        let srv = server("amber-forest", None);
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "workspace_api",
+                    "arguments": { "code": "return 1;", "summary": 42 }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["error"]["code"], json!(-32602));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("`summary` is required and must be a string"));
     }
 }
 

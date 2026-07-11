@@ -2770,12 +2770,18 @@ mod mcp_callback {
         let api: Arc<dyn WorkspaceApi> = Arc::new(services);
         let server = WorkspaceMcpServer::new(api.clone(), ws.clone());
 
+        // After the WSAPI-8 cutover the MCP front door only exposes
+        // `workspace_api`; the discrete `add_to_note` tool is gone. Route
+        // the equivalent state change through `ws.note.add`.
         let resp = server
             .handle_message(&json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {
-                    "name": "add_to_note",
-                    "arguments": { "noteId": "n1", "content": "more" }
+                    "name": "workspace_api",
+                    "arguments": {
+                        "code": "return await ws.note.add('n1', { content: 'more' });",
+                        "summary": "test add_to_note via ws.note.add"
+                    }
                 }
             }))
             .await

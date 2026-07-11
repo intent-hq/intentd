@@ -3,7 +3,8 @@
 //!
 //! The mock node child reaches the in-process [`WorkspaceMcpServer`] over the
 //! generated `--mcp-config` (the `intentd mcp-bridge` proxy → per-agent loopback
-//! listener), mutates BE state via `add_to_note`, and the turn streams chunks and
+//! listener), mutates BE state via the unified `workspace_api` tool
+//! (agent-supplied JS driving `ws.note.add`), and the turn streams chunks and
 //! ends once. We assert the note changed, the conversation persisted, and exactly
 //! one `agent:stream:end` fired — NOT an in-process `handle_message` shortcut.
 //!
@@ -135,8 +136,19 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
         mcp_config_flag: Some("--mcp-config"),
         ..*intent_providers::find_provider("mock").unwrap()
     };
+    // Post-WSAPI-8: the daemon exposes exactly one MCP tool
+    // (`workspace_api`); the equivalent of the discrete `add_to_note` call
+    // is agent-supplied JS driving the `ws.note.add` binding.
+    let js = format!(
+        "return await ws.note.add({}, {{ content: {} }});",
+        serde_json::json!(note.id.0),
+        serde_json::json!(MARKER),
+    );
     let behavior = serde_json::json!({
-        "toolCall": { "name": "add_to_note", "arguments": { "noteId": note.id.0, "content": MARKER } },
+        "toolCall": {
+            "name": "workspace_api",
+            "arguments": { "code": js, "summary": "mock-agent E2E note.add" }
+        },
         "response": "added via mcp",
     })
     .to_string();

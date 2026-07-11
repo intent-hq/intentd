@@ -145,26 +145,35 @@ impl WorkspaceMcpServer {
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return err(id, -32602, "Missing tool name");
         };
+        // After the WSAPI-8 cutover `workspace_api` is the only tool the
+        // daemon registers or dispatches. Check registration BEFORE the
+        // denylist so that legacy discrete names or agent-provider built-ins
+        // that happen to also appear on the denylist surface the accurate
+        // "Tool not found" error rather than the misleading
+        // "Tool not available", and so that a future registry entry cannot
+        // silently mis-dispatch through the JS-eval path below.
+        if name != "workspace_api" {
+            return err(id, -32602, &format!("Tool not found: {name}"));
+        }
         if self.denylist.contains(name) {
             return err(id, -32602, &format!("Tool not available: {name}"));
-        }
-        if !tools::all_tools().iter().any(|t| t.name == name) {
-            return err(id, -32602, &format!("Tool not found: {name}"));
         }
         let args = params
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        // `workspace_api` shapes its own MCP tool result (isError=true text
-        // bodies for JS-side failures — reference parity with the TS tool) so
-        // it bypasses the standard `Ok(value) -> tool_content` mapping.
-        if name == "workspace_api" {
-            return ok(id, self.dispatch_workspace_api(&args).await);
+        // The `workspace_api` input schema declares both `code` and `summary`
+        // as required; `code` is validated inside `dispatch_workspace_api`,
+        // and `summary` is enforced here so malformed calls fail with a clear
+        // MCP error before we spin up the JS engine (reference parity with
+        // the TS `workspace-js-api-tool`, which lists both as required).
+        if !args.get("summary").is_some_and(Value::is_string) {
+            return err(id, -32602, "`summary` is required and must be a string");
         }
-        match self.dispatch(name, &args).await {
-            Ok(value) => ok(id, tool_content(&value)),
-            Err(e) => err(id, e.code(), &e.to_string()),
-        }
+        // `workspace_api` shapes its own MCP tool result (isError=true
+        // text bodies for JS-side failures — reference parity with the TS
+        // tool) instead of the discrete-tool `Ok(value) -> tool_content` map.
+        ok(id, self.dispatch_workspace_api(&args).await)
     }
 }
 
@@ -174,9 +183,4 @@ fn ok(id: &Value, result: Value) -> Value {
 
 fn err(id: &Value, code: i32, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
-}
-
-fn tool_content(value: &Value) -> Value {
-    let text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
-    json!({ "content": [{ "type": "text", "text": text }], "isError": false })
 }
