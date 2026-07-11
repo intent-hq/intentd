@@ -5084,3 +5084,523 @@ mod wsapi6_bindings_tests {
         assert!(text(&resp).contains("overview, capture, examples"));
     }
 }
+/// WSAPI-4 per-namespace bindings: `ws.agent.*` and `ws.event.*`. Each
+/// namespace is exercised through the real JS engine — the tool call
+/// round-trips a `workspace_api` request against a fake [`WorkspaceApi`]
+/// that only stubs the trait methods the bindings touch. Caller
+/// attribution (SUB-1 sender auto-subscribe on `agent.send`) is exercised
+/// by wiring the server through `with_caller_agent_id`.
+#[cfg(test)]
+mod wsapi4_bindings_tests {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{
+        AgentDelegateInput, AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture,
+        EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, Result,
+        WorkspaceApi, WorkspaceId,
+    };
+    use serde_json::{json, Value};
+
+    use crate::WorkspaceMcpServer;
+
+    type SendCall = (String, String, Option<String>);
+    type WatchSenderCall = (String, String);
+    type SubscribeCall = (Vec<String>, Option<bool>, Option<i64>);
+    type DelegateCall = (Option<String>, Option<String>);
+    type DirCall = (String, Option<i64>);
+
+    #[derive(Default)]
+    struct FakeApi {
+        agent_list_calls: Mutex<u32>,
+        agent_get_calls: Mutex<Vec<String>>,
+        agent_send_calls: Mutex<Vec<SendCall>>,
+        agent_delegate_calls: Mutex<Vec<DelegateCall>>,
+        agent_subscribe_calls: Mutex<Vec<SubscribeCall>>,
+        agent_unsubscribe_calls: Mutex<Vec<String>>,
+        event_subscribe_calls: Mutex<Vec<SubscribeCall>>,
+        watch_sender_calls: Mutex<Vec<WatchSenderCall>>,
+        report_to_parent_calls: Mutex<Vec<Option<String>>>,
+        event_recent_files_calls: Mutex<Vec<Option<i64>>>,
+        event_query_calls: Mutex<Vec<EventQueryParams>>,
+        event_dir_calls: Mutex<Vec<DirCall>>,
+    }
+
+    fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
+        AgentLite {
+            id: AgentId::from(id),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: format!("agent-{id}"),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            status: AgentStatus::Idle,
+            is_active: false,
+            is_streaming: false,
+            is_processing: false,
+            is_responding: false,
+            is_waiting_on_tool: false,
+            is_waiting_for_other_agents: false,
+            waiting_for_agent_ids: vec![],
+            stats: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: None,
+            message_count: 0,
+            digest: None,
+            last_agent_response: None,
+            last_user_message: None,
+            context_references: None,
+            image_blocks: None,
+            metadata: AgentMetadata {
+                is_background: false,
+                specialist: None,
+                created_by_agent_id: None,
+                task_note_id: None,
+                completion_report: None,
+                completion_report_timestamp: None,
+                delegation_depth: None,
+                initial_message: None,
+            },
+        }
+    }
+
+    impl WorkspaceApi for FakeApi {
+        fn agent_list(&self, ws: WorkspaceId) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+            *self.agent_list_calls.lock().unwrap() += 1;
+            Box::pin(async move { Ok(vec![stub_agent("a-1", &ws), stub_agent("a-2", &ws)]) })
+        }
+
+        fn agent_get(
+            &self,
+            agent_id: AgentId,
+            workspace_id: Option<WorkspaceId>,
+        ) -> BoxFuture<'_, Result<AgentLite>> {
+            let id = agent_id.as_str().to_string();
+            self.agent_get_calls.lock().unwrap().push(id.clone());
+            let ws = workspace_id.unwrap_or_else(|| WorkspaceId::from_string("amber-forest"));
+            Box::pin(async move { Ok(stub_agent(&id, &ws)) })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn agent_send_message(
+            &self,
+            _ws: WorkspaceId,
+            agent_id: AgentId,
+            content: String,
+            _message_id: Option<String>,
+            _image_blocks: Option<Value>,
+            _file_blocks: Option<Value>,
+            priority: Option<String>,
+            _note_ids: Option<Value>,
+            _stdin_context: Option<String>,
+            _context_references: Option<Value>,
+            _message_metadata: Option<Value>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.agent_send_calls.lock().unwrap().push((
+                agent_id.as_str().to_string(),
+                content,
+                priority,
+            ));
+            Box::pin(async move { Ok(json!({ "success": true, "queued": false })) })
+        }
+
+        fn agent_delegate(
+            &self,
+            _ws: WorkspaceId,
+            input: AgentDelegateInput,
+            caller: Option<AgentId>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.agent_delegate_calls.lock().unwrap().push((
+                input.wait_mode.clone(),
+                caller.as_ref().map(|c| c.as_str().to_string()),
+            ));
+            Box::pin(async move { Ok(json!({ "agent": { "id": "child-1", "name": "child" } })) })
+        }
+
+        fn agent_subscribe(
+            &self,
+            _ws: WorkspaceId,
+            event_types: Vec<String>,
+            exclude_self: Option<bool>,
+            batch_window: Option<i64>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.agent_subscribe_calls.lock().unwrap().push((
+                event_types.clone(),
+                exclude_self,
+                batch_window,
+            ));
+            Box::pin(
+                async move { Ok(json!({ "subscriptionId": "sub-1", "eventTypes": event_types })) },
+            )
+        }
+
+        fn agent_unsubscribe(
+            &self,
+            _ws: WorkspaceId,
+            subscription_id: String,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.agent_unsubscribe_calls
+                .lock()
+                .unwrap()
+                .push(subscription_id);
+            Box::pin(async move { Ok(json!({ "ok": true })) })
+        }
+
+        fn agent_watch_completion_for_sender(
+            &self,
+            _ws: WorkspaceId,
+            caller: AgentId,
+            target: AgentId,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.watch_sender_calls
+                .lock()
+                .unwrap()
+                .push((caller.as_str().to_string(), target.as_str().to_string()));
+            Box::pin(async move { Ok(json!({ "ok": true, "subscriptionId": "sender-watch-1" })) })
+        }
+
+        fn agent_report_to_parent(
+            &self,
+            _ws: WorkspaceId,
+            report: Value,
+            caller: Option<AgentId>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.report_to_parent_calls
+                .lock()
+                .unwrap()
+                .push(caller.as_ref().map(|c| c.as_str().to_string()));
+            let _ = report;
+            Box::pin(async move { Ok(json!({ "success": true })) })
+        }
+
+        fn event_recent_files(
+            &self,
+            _ws: WorkspaceId,
+            limit: Option<i64>,
+        ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
+            self.event_recent_files_calls.lock().unwrap().push(limit);
+            Box::pin(async move {
+                Ok(vec![FileActivity {
+                    path: "/tmp/foo.rs".to_string(),
+                    relative_path: "foo.rs".to_string(),
+                    action: "modified".to_string(),
+                    timestamp: "2026-01-01T00:00:00Z".to_string(),
+                    actor: Some("agent:test".to_string()),
+                    additions: None,
+                    deletions: None,
+                }])
+            })
+        }
+
+        fn event_query(
+            &self,
+            _ws: WorkspaceId,
+            params: EventQueryParams,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.event_query_calls.lock().unwrap().push(params);
+            Box::pin(async move { Ok(json!([])) })
+        }
+
+        fn event_directory_changes(
+            &self,
+            _ws: WorkspaceId,
+            dir: String,
+            limit: Option<i64>,
+        ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
+            self.event_dir_calls.lock().unwrap().push((dir, limit));
+            Box::pin(async move { Ok(vec![]) })
+        }
+
+        fn event_subscribe(
+            &self,
+            _ws: WorkspaceId,
+            event_types: Vec<String>,
+            exclude_self: Option<bool>,
+            batch_window: Option<i64>,
+        ) -> BoxFuture<'_, Result<EventSubscribeResult>> {
+            self.event_subscribe_calls.lock().unwrap().push((
+                event_types.clone(),
+                exclude_self,
+                batch_window,
+            ));
+            Box::pin(async move {
+                Ok(EventSubscribeResult {
+                    subscription_id: "sub-1".to_string(),
+                    event_types,
+                })
+            })
+        }
+
+        fn event_unsubscribe(
+            &self,
+            _ws: WorkspaceId,
+            subscription_id: String,
+        ) -> BoxFuture<'_, Result<EventUnsubscribeResult>> {
+            Box::pin(async move {
+                Ok(EventUnsubscribeResult {
+                    ok: true,
+                    subscription_id,
+                })
+            })
+        }
+    }
+
+    fn server() -> (WorkspaceMcpServer, Arc<FakeApi>) {
+        let api = Arc::new(FakeApi::default());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
+        (srv, api)
+    }
+
+    fn server_with_caller(caller: &str) -> (WorkspaceMcpServer, Arc<FakeApi>) {
+        let api = Arc::new(FakeApi::default());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+            .with_caller_agent_id(Some(AgentId::from(caller)));
+        (srv, api)
+    }
+
+    async fn call(srv: &WorkspaceMcpServer, code: &str) -> Value {
+        srv.handle_message(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "workspace_api",
+                "arguments": { "code": code, "summary": "wsapi4 unit test" }
+            }
+        }))
+        .await
+        .expect("tools/call must produce a response")
+    }
+
+    fn body(resp: &Value) -> Value {
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).expect("workspace_api body must be JSON")
+    }
+
+    fn text(resp: &Value) -> String {
+        resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    // ================================================================
+    // agent.*
+    // ================================================================
+
+    #[tokio::test]
+    async fn agent_list_returns_projected_rows() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.list();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], json!("a-1"));
+        assert_eq!(*api.agent_list_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_status_forwards_agent_id() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.status('a-42');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["id"], json!("a-42"));
+        assert_eq!(api.agent_get_calls.lock().unwrap()[0], "a-42");
+    }
+
+    #[tokio::test]
+    async fn agent_send_priority_interrupt_forwards_to_daemon() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'stop', 'interrupt');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["agentId"], json!("a-1"));
+        assert_eq!(v["ok"], json!(true));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(calls[0].2.as_deref(), Some("interrupt"));
+    }
+
+    #[tokio::test]
+    async fn agent_send_with_caller_registers_sub1_watch() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["subscriptionId"], json!("sender-watch-1"));
+        let calls = api.watch_sender_calls.lock().unwrap();
+        assert_eq!(calls[0], ("caller-1".to_string(), "a-1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn agent_send_without_caller_skips_sub1_watch() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert!(v.get("subscriptionId").map(|v| v.is_null()).unwrap_or(true));
+        assert!(api.watch_sender_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_send_missing_message_surfaces_reference_error() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.agent.send('a-1');").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("message is required"));
+    }
+
+    #[tokio::test]
+    async fn agent_delegate_threads_wait_mode_and_caller() {
+        let (srv, api) = server_with_caller("coord-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.delegate({ taskNoteId: 't-1', waitMode: 'after_all' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_delegate_calls.lock().unwrap();
+        assert_eq!(calls[0].0.as_deref(), Some("after_all"));
+        assert_eq!(calls[0].1.as_deref(), Some("coord-1"));
+    }
+
+    #[tokio::test]
+    async fn agent_subscribe_missing_event_types_surfaces_error() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.agent.subscribe();").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("eventTypes is required"));
+    }
+
+    #[tokio::test]
+    async fn agent_subscribe_forwards_options() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.agent.subscribe(['agent:idle'], { excludeSelf: false, batchWindow: 250 });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_subscribe_calls.lock().unwrap();
+        assert_eq!(calls[0].0, vec!["agent:idle".to_string()]);
+        assert_eq!(calls[0].1, Some(false));
+        assert_eq!(calls[0].2, Some(250));
+    }
+
+    #[tokio::test]
+    async fn agent_unsubscribe_returns_subscription_id() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.unsubscribe('sub-9');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["subscriptionId"], json!("sub-9"));
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(api.agent_unsubscribe_calls.lock().unwrap()[0], "sub-9");
+    }
+
+    #[tokio::test]
+    async fn agent_report_to_parent_threads_caller() {
+        let (srv, api) = server_with_caller("child-99");
+        let resp = call(&srv, "return await ws.agent.reportToParent('done');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(
+            api.report_to_parent_calls.lock().unwrap()[0].as_deref(),
+            Some("child-99")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_report_to_parent_missing_report_errors() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.agent.reportToParent();").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("report is required"));
+    }
+
+    // ================================================================
+    // event.*
+    // ================================================================
+
+    #[tokio::test]
+    async fn event_recent_files_forwards_limit() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.event.recentFiles(5);").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr[0]["relativePath"], json!("foo.rs"));
+        assert_eq!(api.event_recent_files_calls.lock().unwrap()[0], Some(5));
+    }
+
+    #[tokio::test]
+    async fn event_directory_changes_requires_dir() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.event.directoryChanges();").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("Directory path is required"));
+    }
+
+    #[tokio::test]
+    async fn event_query_threads_all_options() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.event.query({ eventType: 'file:changed', actorType: 'agent', actorId: 'a-1', path: 'src/', minutesAgo: 10, limit: 25 });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.event_query_calls.lock().unwrap();
+        let p = &calls[0];
+        assert_eq!(p.event_type.as_deref(), Some("file:changed"));
+        assert_eq!(p.actor_type.as_deref(), Some("agent"));
+        assert_eq!(p.actor_id.as_deref(), Some("a-1"));
+        assert_eq!(p.path.as_deref(), Some("src/"));
+        assert_eq!(p.minutes_ago, Some(10));
+        assert_eq!(p.limit, Some(25));
+    }
+
+    #[tokio::test]
+    async fn event_subscribe_expands_wildcard_star() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.event.subscribe(['*']);").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.event_subscribe_calls.lock().unwrap();
+        let resolved = &calls[0].0;
+        assert!(resolved.contains(&"agent:*".to_string()));
+        assert!(resolved.contains(&"file:*".to_string()));
+        assert!(resolved.contains(&"comment:*".to_string()));
+        assert_eq!(resolved.len(), 12);
+    }
+
+    #[tokio::test]
+    async fn event_subscribe_passes_specific_types_verbatim() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.event.subscribe(['agent:idle', 'file:changed']);",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.event_subscribe_calls.lock().unwrap();
+        assert_eq!(
+            calls[0].0,
+            vec!["agent:idle".to_string(), "file:changed".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn event_unsubscribe_returns_shape() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.event.unsubscribe('sub-5');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["subscriptionId"], json!("sub-5"));
+        assert_eq!(v["ok"], json!(true));
+    }
+}

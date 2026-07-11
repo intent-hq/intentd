@@ -780,7 +780,7 @@ impl WorkspaceMcpServer {
 /// the shared `WorkspaceApi`. The skeleton only routes `workspace.info`;
 /// unknown methods surface as a JS-visible error frame. `caller_agent_id`
 /// is forwarded to bindings that attribute their calls back to the spawning
-/// agent (e.g. `ws.browser.exec`).
+/// agent (`ws.browser.exec` and the caller-aware `ws.agent.*` methods).
 fn make_workspace_host(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
