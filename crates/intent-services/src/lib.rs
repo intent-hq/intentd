@@ -2828,8 +2828,12 @@ fn completion_event_child_id(event: &Event) -> Option<String> {
 
 /// Build a concise, human-readable wake string describing a child agent's
 /// completion for its parent. A minimal port of the TS formatEventNotification
-/// intent: it names the child, the completion kind, and any lastResponseSummary
-/// or error carried on the event.
+/// intent: it names the child, the completion kind, and any completion
+/// `report` (persisted by `agent.reportToParent` and forwarded on
+/// `agent:idle`) or `lastResponseSummary` / error carried on the event. A
+/// non-empty completion report wins over `lastResponseSummary` (SUB-2,
+/// mirroring `format_group_child_line`) so the single agent:idle-driven wake
+/// carries the child's `reportToParent` text end-to-end.
 fn format_completion_wake(child_id: &AgentId, event: &Event) -> String {
     let kind = match event.event_type.as_str() {
         AGENT_IDLE => "completed",
@@ -2845,7 +2849,14 @@ fn format_completion_wake(child_id: &AgentId, event: &Event) -> String {
         .map(|name| format!("{name} ({})", child_id.0))
         .unwrap_or_else(|| child_id.0.clone());
     let mut msg = format!("[WORKSPACE EVENTS] Child agent {label} {kind}.");
-    if let Some(summary) = event
+    if let Some(report) = event
+        .data
+        .get("report")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        msg.push_str(&format!(" Report: {report}"));
+    } else if let Some(summary) = event
         .data
         .get("lastResponseSummary")
         .and_then(|v| v.as_str())

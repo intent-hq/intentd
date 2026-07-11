@@ -1055,6 +1055,247 @@ async fn report_to_parent_persists_completion_report() {
     assert_eq!(v["metadata"]["completionReportTimestamp"], r["savedAt"]);
 }
 
+/// TASK-B: on `agent.reportToParent`, the caller's linked task note
+/// transitions from a non-terminal status (`in_progress`) to
+/// `review_required`, mirroring the reference reportToParent writer.
+#[tokio::test]
+async fn report_to_parent_transitions_linked_task_to_review_required() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Ship feature X".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    svc.mark_as_task(
+        ws.clone(),
+        note.id.clone(),
+        "in_progress".into(),
+        vec![],
+        None,
+    )
+    .await
+    .expect("markAsTask");
+
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            Some(note.id.clone()),
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("done"), Some(child))
+        .await
+        .expect("report");
+
+    let refreshed = svc.store().get_note(&note.id).await.expect("refresh note");
+    assert_eq!(
+        refreshed.task.expect("task metadata").status,
+        intent_core::TaskStatus::ReviewRequired
+    );
+}
+
+/// TASK-B: terminal task statuses (`complete`, `cancelled`) MUST NOT be
+/// overwritten by a late `reportToParent` — the reference writer is a strict
+/// upgrade, never a downgrade of a done/cancelled task.
+#[tokio::test]
+async fn report_to_parent_does_not_overwrite_terminal_task_status() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Already done".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    svc.mark_as_task(ws.clone(), note.id.clone(), "complete".into(), vec![], None)
+        .await
+        .expect("markAsTask");
+
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            Some(note.id.clone()),
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("late"), Some(child))
+        .await
+        .expect("report");
+
+    let refreshed = svc.store().get_note(&note.id).await.expect("refresh note");
+    assert_eq!(
+        refreshed.task.expect("task metadata").status,
+        intent_core::TaskStatus::Complete,
+        "terminal status must not be downgraded to review_required"
+    );
+}
+
+/// TASK-B: an agent without a linked task note reports back without touching
+/// any task metadata — the report is persisted and the call succeeds.
+#[tokio::test]
+async fn report_to_parent_without_linked_task_is_status_noop() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let r = svc
+        .agent_report_to_parent_op(ws.clone(), json!("no task"), Some(child.clone()))
+        .await
+        .expect("report");
+    assert_eq!(r["ok"], json!(true));
+    let session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    assert!(session.task_note_id.is_none());
+    assert_eq!(session.completion_report.as_deref(), Some("no task"));
+}
+
+/// SUB-2 end-to-end: `agent.reportToParent` emits zero immediate wakes; the
+/// single parent wake is delivered by the child's terminal `agent:idle` via
+/// the still-armed completion watch, and the wake text carries the persisted
+/// completion report (Report:...).
+#[tokio::test]
+async fn report_to_parent_metadata_only_no_immediate_wake_then_idle_delivers_one() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    // Immediate-mode delegation arms a oneShot completion watch on the child.
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    // The child's delegate-time first message is already in the parent's
+    // transcript queue path via the child (not the parent). Baseline: the
+    // parent has no messages yet.
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    let report = "shipped it";
+    svc.agent_report_to_parent_op(ws.clone(), json!(report), Some(child.clone()))
+        .await
+        .expect("report");
+    // SUB-2: zero immediate wakes.
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline);
+
+    // Drive the child's `agent:idle` (mirrors the turn worker's
+    // stream-complete branch, which enriches the payload with `report` from
+    // the persisted `completionReport`). Exactly one wake fires, carrying
+    // `Report:` text.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "report": report }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains(&format!("Report: {report}")),
+        "wake text must carry the persisted completion report: {text}"
+    );
+    // The oneShot watch is consumed after delivery.
+    assert!(svc.find_watches_for_child(&ws, &child).is_empty());
+}
+
+/// SUB-2: repeated `agent.wakeOrCreate` for the same caller/target reuses the
+/// live ungrouped watch instead of stacking duplicates. A single terminal
+/// `agent:idle` then produces exactly one parent wake.
+#[tokio::test]
+async fn wake_or_create_reuses_existing_watch_no_duplicate() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    let note_id = seed_task(&svc, &ws, "SUB-2 dedupe").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+        .await
+        .expect("assign");
+
+    let input = || AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let r1 = svc
+        .agent_wake_or_create_op(ws.clone(), note_id.clone(), "resume 1".into(), input())
+        .await
+        .expect("wake 1");
+    let r2 = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "resume 2".into(), input())
+        .await
+        .expect("wake 2");
+    // The second wake reuses the first watch's subscription id.
+    assert_eq!(r1["subscriptionId"], r2["subscriptionId"]);
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1, "no duplicate watches: {watches:?}");
+
+    // A single terminal agent:idle produces exactly one parent wake.
+    let baseline = parent_message_count(&svc, &caller).await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &target,
+        json!({ "agentId": target.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &caller).await, baseline + 1);
+}
+
 /// `agent.delegate` persists the resolved first message as
 /// `metadata.initialMessage` and the child's `metadata.delegationDepth`
 /// (parent depth + 1) so a wake-up can resume (P3-1.2b). Delegated children
@@ -1668,8 +1909,13 @@ async fn subscribe_then_unsubscribe_roundtrips() {
     assert!(matches!(err, Error::Internal(_)));
 }
 
-/// A delegated caller (child whose `parentAgentId` is set) delivers the report
-/// to the parent via the send-message path and returns the TS-shaped result.
+/// SUB-2: a delegated caller's `reportToParent` is now metadata-only — the
+/// report is persisted on the child session (`completion_report`) and the
+/// TS-shaped result is returned, but no immediate parent wake is issued. The
+/// single parent wake is delivered later by the child's terminal
+/// `agent:idle` (via the still-armed completion watch), which is asserted by
+/// the sibling `report_to_parent_metadata_only_no_immediate_wake_then_idle_delivers_one`
+/// test.
 #[tokio::test]
 async fn report_to_parent_delivers_for_delegated_caller() {
     let (_t, svc, ws) = setup().await;
@@ -1692,7 +1938,7 @@ async fn report_to_parent_delivers_for_delegated_caller() {
 
     let report = "done: shipped the thing";
     let result = svc
-        .agent_report_to_parent_op(ws.clone(), json!(report), Some(child))
+        .agent_report_to_parent_op(ws.clone(), json!(report), Some(child.clone()))
         .await
         .expect("report delivered");
     assert_eq!(result["ok"], json!(true));
@@ -1700,13 +1946,20 @@ async fn report_to_parent_delivers_for_delegated_caller() {
     assert_eq!(result["reportLength"], json!(report.chars().count() as i64));
     assert!(result["savedAt"].is_string());
 
-    // The report reached the parent's transcript via agent_send_message_op.
+    // SUB-2: no immediate wake to the parent — reportToParent is
+    // metadata-only. The report is persisted on the child session.
     let parent_session = svc
         .store()
         .get_agent_session(&parent)
         .await
         .expect("parent session");
-    assert_eq!(parent_session.messages.len(), 1);
+    assert_eq!(parent_session.messages.len(), 0);
+    let child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    assert_eq!(child_session.completion_report.as_deref(), Some(report));
 }
 
 /// A non-delegated caller (created directly, no `parentAgentId`) is rejected
@@ -1910,12 +2163,14 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
 /// child (caller set, so the child's `parentAgentId` == parent), then the child
 /// reports back via `report_to_parent` (caller-aware; the registry/dispatch name
 /// is bare — agents still see `report_to_parent_workspace-mcp` because the
-/// provider appends the server suffix) and the
-/// report lands in the parent's transcript. The same report tool through a
-/// caller-less server (the RPC / no-caller path) yields a `-32603` JSON-RPC
-/// error. This is the service-level integration coverage chosen over a
-/// node-gated UDS E2E so the full loop is exercised deterministically without an
-/// external `node` dependency.
+/// provider appends the server suffix). SUB-2: reportToParent is metadata-only
+/// (no immediate parent wake); the report is persisted on the child session
+/// and reaches the parent later through the child's terminal `agent:idle`. The
+/// same report tool through a caller-less server (the RPC / no-caller path)
+/// yields an `isError: true` workspace_api tool result. This is the
+/// service-level integration coverage chosen over a node-gated UDS E2E so the
+/// full loop is exercised deterministically without an external `node`
+/// dependency.
 #[tokio::test]
 async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
     let (_t, svc, ws) = setup().await;
@@ -1986,18 +2241,22 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
         Some(parent.0.as_str())
     );
 
-    // The report reached the parent's transcript via the send-message path.
+    // SUB-2: reportToParent is metadata-only — the parent transcript stays
+    // empty at report-time. The report is persisted on the child session and
+    // reaches the parent later via the child's `agent:idle` (covered by the
+    // sibling `handle_completion_event`-driven tests).
     let parent_session = svc
         .store()
         .get_agent_session(&parent)
         .await
         .expect("parent session");
-    assert_eq!(parent_session.messages.len(), 1);
-    let delivered = serde_json::to_string(&parent_session.messages).expect("serialize messages");
-    assert!(
-        delivered.contains(report),
-        "parent transcript should contain the report text"
-    );
+    assert_eq!(parent_session.messages.len(), 0);
+    let child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    assert_eq!(child_session.completion_report.as_deref(), Some(report));
 
     // RPC / no-caller path: after the WSAPI-8 cutover the report flows
     // through the unified `workspace_api` tool executing
@@ -2586,6 +2845,134 @@ async fn delegate_falls_back_to_task_note_content_for_child_first_message() {
         .contains("note content body"));
 }
 
+/// TASK-C: `agent.delegate` with a linked task note prepends the reference
+/// `DelegateTaskTool` preamble ("Your Task Note" + scope contract) to the
+/// child's first message. The task title and note id appear verbatim so the
+/// child can self-mark the note complete when done.
+#[tokio::test]
+async fn delegate_prepends_task_note_preamble_to_first_message() {
+    let (_t, svc, ws) = setup().await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Port frobnicator".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    let input = AgentDelegateInput {
+        task_note_id: Some(note.id.clone()),
+        agent_instructions: Some("do the work".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let body = child_session_messages_json(&svc, &child).await;
+    assert!(
+        body.contains("**Your Task Note:**"),
+        "preamble marker missing: {body}"
+    );
+    assert!(
+        body.contains("Port frobnicator"),
+        "task title missing from preamble: {body}"
+    );
+    assert!(
+        body.contains(note.id.as_str()),
+        "task note id missing from preamble: {body}"
+    );
+    assert!(
+        body.contains("**SCOPE: Complete THIS task only.**"),
+        "scope contract missing: {body}"
+    );
+    // The original instructions are preserved below the preamble.
+    assert!(
+        body.contains("do the work"),
+        "explicit instructions must survive the preamble: {body}"
+    );
+}
+
+/// TASK-C: delegating with a linked task note but no explicit
+/// `agentInstructions` / `taskText` still injects the preamble (the note's
+/// body/title fallback slots in beneath it).
+#[tokio::test]
+async fn delegate_task_note_only_injects_preamble_above_note_body() {
+    let (_t, svc, ws) = setup().await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Task title".into(),
+                content: Some("note content body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    let input = AgentDelegateInput {
+        task_note_id: Some(note.id.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let body = child_session_messages_json(&svc, &child).await;
+    assert!(body.contains("**Your Task Note:**"), "preamble: {body}");
+    assert!(body.contains("Task title"), "title: {body}");
+    assert!(body.contains(note.id.as_str()), "note id: {body}");
+    assert!(body.contains("note content body"), "note body: {body}");
+    // Preamble sits ABOVE the note body.
+    let preamble_idx = body.find("**Your Task Note:**").expect("preamble idx");
+    let body_idx = body.find("note content body").expect("body idx");
+    assert!(
+        preamble_idx < body_idx,
+        "preamble must precede the note body"
+    );
+}
+
+/// TASK-C: delegations without a task note deliver the message verbatim —
+/// no preamble is injected.
+#[tokio::test]
+async fn delegate_without_task_note_omits_preamble() {
+    let (_t, svc, ws) = setup().await;
+    let input = AgentDelegateInput {
+        agent_instructions: Some("just do it".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let body = child_session_messages_json(&svc, &child).await;
+    assert!(
+        body.contains("just do it"),
+        "instructions delivered: {body}"
+    );
+    assert!(
+        !body.contains("**Your Task Note:**"),
+        "no preamble without a task note: {body}"
+    );
+    assert!(
+        !body.contains("**SCOPE:"),
+        "no scope contract without a task note: {body}"
+    );
+}
+
 /// A bare delegate (no instructions, no task text, no task note) creates the
 /// child but delivers no first message — there is nothing to send.
 #[tokio::test]
@@ -3115,8 +3502,12 @@ async fn report_to_parent_suppressed_for_after_all_group_child() {
     assert!(!text.contains("turn summary"), "wake text: {text}");
 }
 
-/// After the group has fired (delivered + removed), a late `reportToParent`
-/// from a former group child is no longer suppressed and delivers immediately.
+/// SUB-2: `reportToParent` is metadata-only after SUB-2, so a late report
+/// from a former group child (after the group has fired + removed) still
+/// does not push an immediate wake — it just persists the fresh
+/// `completion_report`. The wake belongs to the child's next `agent:idle`;
+/// with the group + watches already gone there is no watch to fire, matching
+/// the reference where `reportToParent` never issues a standalone wake.
 #[tokio::test]
 async fn report_to_parent_immediate_after_group_delivery() {
     let (_t, svc, ws) = setup().await;
@@ -3140,11 +3531,22 @@ async fn report_to_parent_immediate_after_group_delivery() {
     assert_eq!(parent_message_count(&svc, &parent).await, 1);
 
     let r = svc
-        .agent_report_to_parent_op(ws.clone(), json!("late report"), Some(c1))
+        .agent_report_to_parent_op(ws.clone(), json!("late report"), Some(c1.clone()))
         .await
         .expect("late report");
     assert_eq!(r["ok"], json!(true));
-    assert_eq!(parent_message_count(&svc, &parent).await, 2);
+    // SUB-2: metadata-only — no additional immediate parent wake. The report
+    // is persisted on the child session and would ride the next agent:idle.
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    let child_session = svc
+        .store()
+        .get_agent_session(&c1)
+        .await
+        .expect("child session");
+    assert_eq!(
+        child_session.completion_report.as_deref(),
+        Some("late report")
+    );
 }
 
 // ===========================================================================

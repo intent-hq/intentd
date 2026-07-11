@@ -1769,13 +1769,14 @@ impl Services {
     /// caller has no `parentAgentId` (created directly by a user), this is also
     /// `-32603`. Otherwise the report is persisted on the child session
     /// (`metadata.completionReport` / `completionReportTimestamp`, the TS
-    /// parity; P3-1.2b) — emitting `agent:updated` — and delivered to the
-    /// parent by reusing the send-message path. When the caller is enrolled in
-    /// an undelivered `after_all` delegation group parented by its parent, the
-    /// immediate send is suppressed (AS-4): the persisted report reaches the
-    /// parent only inside the group's single aggregated wake, matching the TS
-    /// reference where `reportToParent` stores metadata and delivery happens
-    /// via the group notification.
+    /// parity; P3-1.2b) — emitting `agent:updated` — and, when the caller has a
+    /// linked task note whose current status is non-terminal, the note is
+    /// transitioned to `review_required` (TASK-B, mirroring the reference
+    /// `reportToParent` writer). No immediate parent wake is issued (SUB-2):
+    /// the child's `agent:idle` (via the still-armed completion watch)
+    /// delivers the single wake, whose formatted text/metadata includes the
+    /// persisted `completionReport`. `after_all` grouping path is unchanged —
+    /// the group's aggregated wake still folds this child's report in.
     pub(crate) async fn agent_report_to_parent_op(
         &self,
         _workspace_id: WorkspaceId,
@@ -1802,6 +1803,7 @@ impl Services {
         session.completion_report_timestamp = Some(saved_at.clone());
         session.updated_at = saved_at.clone();
         let workspace_id = session.workspace_id.clone();
+        let task_note_id = session.task_note_id.clone();
         self.store
             .update_agent_session(&workspace_id, &session)
             .await?;
@@ -1812,19 +1814,82 @@ impl Services {
             json!({ "agentId": caller.0, "completionReportLength": report_len }),
         )
         .await;
-        if !self.child_in_undelivered_group(&workspace_id, &parent, &caller) {
-            // Non-grouped (immediate-mode) children deliver right away, through
-            // the runtime send-message path so the parent runs a real turn.
-            let _ = self
-                .deliver_parent_wake(&workspace_id, parent.clone(), report_text, None)
-                .await?;
+        // TASK-B: move the linked task note to `review_required` so the FE
+        // reflects the child's completion. Terminal statuses (`complete`,
+        // `cancelled`) are never overwritten; agents without a linked note are
+        // a no-op. Errors from the store lookup or the status writer are
+        // logged and swallowed — the report itself is already persisted, and
+        // the caller's response must not depend on FE-facing task metadata.
+        if let Some(note_id) = task_note_id {
+            self.transition_linked_task_to_review_required(&workspace_id, note_id, caller.clone())
+                .await;
         }
+        // SUB-2: no immediate `deliver_parent_wake` here. The parent wake is
+        // driven by the child's terminal `agent:idle` (delivered by the
+        // completion-delivery worker armed at delegate-time), so every child
+        // completion yields exactly one wake. Grouped (`after_all`) children
+        // continue to fold their persisted `completionReport` into the group's
+        // aggregated wake via `format_group_child_line`.
         Ok(json!({
             "ok": true,
             "parentAgentId": parent,
             "reportLength": report_len,
             "savedAt": saved_at,
         }))
+    }
+
+    /// TASK-B helper: transition the caller's linked task note to
+    /// `review_required` iff its current status is non-terminal (i.e. not
+    /// `complete`/`cancelled`). Uses the same `task.updateNoteStatus` writer
+    /// the router path uses, so it publishes `task:status-changed` +
+    /// `notes:ready-tasks-changed` with the caller as `agentId`. All errors
+    /// are logged and swallowed: the persisted completion report is the
+    /// contract of `agent.reportToParent`, and the FE-facing status update is
+    /// best-effort.
+    async fn transition_linked_task_to_review_required(
+        &self,
+        workspace_id: &WorkspaceId,
+        task_note_id: NoteId,
+        caller: AgentId,
+    ) {
+        let note = match self.store.get_note(&task_note_id).await {
+            Ok(note) => note,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    note = %task_note_id,
+                    "report_to_parent: failed to load linked task note for status transition"
+                );
+                return;
+            }
+        };
+        let Some(task) = note.task.as_ref() else {
+            return;
+        };
+        // Terminal statuses must not be downgraded (parity with the router
+        // path's own no-op-when-unchanged branch).
+        if matches!(
+            task.status,
+            intent_core::TaskStatus::Complete | intent_core::TaskStatus::Cancelled
+        ) {
+            return;
+        }
+        if let Err(e) = WorkspaceApi::task_update_note_status(
+            self,
+            workspace_id.clone(),
+            task_note_id.clone(),
+            "review_required".into(),
+            None,
+            Some(caller),
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %e,
+                note = %task_note_id,
+                "report_to_parent: failed to transition linked task to review_required"
+            );
+        }
     }
 
     /// `agent.delegate`: create a session and (best-effort) assign it to the
@@ -1855,21 +1920,36 @@ impl Services {
             .as_deref()
             .and_then(first_nonempty)
             .or_else(|| task_text_msg.clone());
-        // Load the linked task note only when we still need it: either the
-        // message hasn't been resolved from agentInstructions/taskText, or
-        // there's no taskText to derive the child name from. Callers on the
-        // common path (`taskText` + `taskNoteId` supplied together) skip the
-        // store read entirely (Copilot #84 review).
+        // Load the linked task note whenever the delegation names one: the
+        // note's title/body feeds the message fallback, the child name
+        // derivation, and the TASK-C reference preamble that prefixes the
+        // child's first message when a task is linked.
         let task_note = match session_task_note_id.as_ref() {
-            Some(note_id) if message.is_none() || task_text_msg.is_none() => {
-                self.store.get_note(note_id).await.ok()
-            }
-            _ => None,
+            Some(note_id) => self.store.get_note(note_id).await.ok(),
+            None => None,
         };
         if message.is_none() {
             if let Some(note) = task_note.as_ref() {
                 message = first_nonempty(&note.content).or_else(|| first_nonempty(&note.title));
             }
+        }
+        // TASK-C: mirror the reference `DelegateTaskTool` preamble
+        // (agent-interaction-tools.ts). When the delegation links a task note,
+        // prepend the standard "Your Task Note" block so the child knows its
+        // note ID/title and the single-task scope contract; without a linked
+        // note the message is delivered verbatim.
+        if let (Some(note), Some(note_id)) = (task_note.as_ref(), session_task_note_id.as_ref()) {
+            let title = first_nonempty(&note.title).unwrap_or_default();
+            let preamble = format!(
+                "**Your Task Note:** \"{title}\" (ID: {note_id})\n\
+                 This note is your workspace for this task. Update it with your progress, findings, and deliverables.\n\
+                 \n\
+                 **SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks."
+            );
+            message = Some(match message {
+                Some(body) if !body.is_empty() => format!("{preamble}\n\n{body}"),
+                _ => preamble,
+            });
         }
         // Resolve the child agent's name to match the reference `DelegateTaskTool`
         // (agent-interaction-tools.ts): the taskText path uses `taskText`, the
@@ -2774,24 +2854,40 @@ impl Services {
             // before the queued message is processed) with a 5-minute
             // auto-cleanup so the watch never leaks. Response text mirrors
             // the reference tool, including the notification line.
+            //
+            // SUB-2: repeated `wakeOrCreate` calls for the same caller/target
+            // pair must not stack duplicate watches (which would multiply the
+            // parent wakes on the next `agent:idle`). Reuse any existing live
+            // ungrouped watch for this pair; for the queued branch, extend
+            // its 5-minute leak-guard by respawning the cleanup timer against
+            // the reused subscription id.
             if let Some(caller) = input.caller_agent_id.clone() {
-                let caller_name = self
-                    .store
-                    .get_agent_session(&caller)
-                    .await
-                    .ok()
-                    .map(|s| s.name)
-                    .unwrap_or_default();
-                let subscription_id = self.register_completion_watch(
-                    &workspace_id,
-                    caller.clone(),
-                    caller_name,
-                    agent_id.clone(),
-                    !queued,
-                    None,
-                );
-                self.publish_subscriptions_changed(&workspace_id, &caller)
-                    .await;
+                let (subscription_id, reused) = if let Some(existing) =
+                    self.find_ungrouped_watch(&workspace_id, &caller, &agent_id)
+                {
+                    (existing.id, true)
+                } else {
+                    let caller_name = self
+                        .store
+                        .get_agent_session(&caller)
+                        .await
+                        .ok()
+                        .map(|s| s.name)
+                        .unwrap_or_default();
+                    let new_id = self.register_completion_watch(
+                        &workspace_id,
+                        caller.clone(),
+                        caller_name,
+                        agent_id.clone(),
+                        !queued,
+                        None,
+                    );
+                    (new_id, false)
+                };
+                if !reused {
+                    self.publish_subscriptions_changed(&workspace_id, &caller)
+                        .await;
+                }
                 if queued {
                     self.spawn_watch_cleanup(
                         workspace_id.clone(),

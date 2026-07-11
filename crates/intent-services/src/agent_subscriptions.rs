@@ -123,6 +123,33 @@ impl Services {
             .unwrap_or_default()
     }
 
+    /// SUB-2: find a live ungrouped (immediate-mode) watch for the given
+    /// caller→target pair, if one exists. Used by `agent.wakeOrCreate` to
+    /// reuse an existing watch instead of stacking duplicates on repeated
+    /// wake calls; grouped (`after_all`) watches are skipped since they are
+    /// owned by the delegation-group fan-in.
+    pub(crate) fn find_ungrouped_watch(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+    ) -> Option<CompletionWatch> {
+        self.agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .get(workspace_id)
+            .and_then(|w| {
+                w.subscriptions
+                    .iter()
+                    .find(|s| {
+                        s.group_id.is_none()
+                            && &s.parent_agent_id == parent_agent_id
+                            && &s.child_agent_id == child_agent_id
+                    })
+                    .cloned()
+            })
+    }
+
     /// All watches registered by `parent_agent_id`.
     // TODO(AS-3/AS-4): consumed by `agent.getSubscriptions` + delivery/cleanup.
     #[allow(dead_code)]
@@ -266,9 +293,11 @@ impl Services {
     }
 
     /// Whether `child_id` is enrolled in an undelivered `after_all` delegation
-    /// group parented by `parent_id`. Used by `agent.reportToParent` to suppress
-    /// the immediate parent send: a grouped child's report reaches the parent
-    /// only inside the group's single aggregated wake.
+    /// group parented by `parent_id`. Retained for tests and future callers;
+    /// the immediate-mode `reportToParent` suppression has moved to SUB-2
+    /// (the child's `agent:idle` drives the single wake, so grouped children
+    /// no longer need the pre-persist branch this predicate used to gate).
+    #[allow(dead_code)]
     pub(crate) fn child_in_undelivered_group(
         &self,
         workspace_id: &WorkspaceId,
