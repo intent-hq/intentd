@@ -1852,7 +1852,7 @@ impl Services {
         task_note_id: NoteId,
         caller: AgentId,
     ) {
-        let note = match self.store.get_note(&task_note_id).await {
+        let note = match crate::fetch_note(&self.store, workspace_id, &task_note_id).await {
             Ok(note) => note,
             Err(e) => {
                 tracing::warn!(
@@ -1931,7 +1931,9 @@ impl Services {
         // derivation, and the TASK-C reference preamble that prefixes the
         // child's first message when a task is linked.
         let task_note = match session_task_note_id.as_ref() {
-            Some(note_id) => self.store.get_note(note_id).await.ok(),
+            Some(note_id) => crate::fetch_note(&self.store, &workspace_id, note_id)
+                .await
+                .ok(),
             None => None,
         };
         if message.is_none() {

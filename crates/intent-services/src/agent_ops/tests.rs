@@ -1298,6 +1298,156 @@ async fn report_to_parent_without_linked_task_is_status_noop() {
     assert_eq!(session.completion_report.as_deref(), Some("no task"));
 }
 
+/// Workspace-scoping (Copilot review PRRT_kwDOS9Wxuc6QIaRJ on PR #104):
+/// `agent.delegate` loads the linked task note via `crate::fetch_note`, which
+/// is workspace-scoped. Passing a `taskNoteId` that belongs to another
+/// workspace must NOT leak the foreign note's title/content into the TASK-C
+/// preamble injected as the child's first message; the preamble is skipped and
+/// the message falls back to the caller-supplied `agentInstructions`.
+#[tokio::test]
+async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("insert ws_b");
+
+    let foreign = svc
+        .create_note(
+            ws_b.clone(),
+            NoteCreate {
+                title: "CROSS-WORKSPACE-SECRET-TITLE".into(),
+                content: Some("CROSS-WORKSPACE-SECRET-BODY".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create foreign note");
+
+    let input = AgentDelegateInput {
+        task_note_id: Some(foreign.id.clone()),
+        agent_instructions: Some("do the work".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws_a.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let body = child_session_messages_json(&svc, &child).await;
+    assert!(
+        body.contains("do the work"),
+        "explicit instructions must still reach the child: {body}"
+    );
+    assert!(
+        !body.contains("CROSS-WORKSPACE-SECRET-TITLE"),
+        "foreign note title must not leak into preamble: {body}"
+    );
+    assert!(
+        !body.contains("CROSS-WORKSPACE-SECRET-BODY"),
+        "foreign note body must not leak into preamble: {body}"
+    );
+    assert!(
+        !body.contains("**Your Task Note:**"),
+        "preamble must be skipped when the linked note is out of workspace: {body}"
+    );
+}
+
+/// Workspace-scoping (Copilot review PRRT_kwDOS9Wxuc6QIaRP on PR #104):
+/// `transition_linked_task_to_review_required` must load the linked task note
+/// via the workspace-scoped `crate::fetch_note` accessor. When a session is
+/// linked to a task note that lives in a different workspace, the fetch
+/// returns `NotFound` and the transition is a silent no-op: the foreign note's
+/// task metadata is left untouched (no cross-workspace read, no cross-workspace
+/// write).
+#[tokio::test]
+async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("insert ws_b");
+
+    let foreign = svc
+        .create_note(
+            ws_b.clone(),
+            NoteCreate {
+                title: "Foreign task".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create foreign note");
+    svc.mark_as_task(
+        ws_b.clone(),
+        foreign.id.clone(),
+        "in_progress".into(),
+        vec![],
+        None,
+    )
+    .await
+    .expect("markAsTask on foreign");
+
+    let before = svc
+        .store()
+        .get_note(&foreign.id)
+        .await
+        .expect("initial foreign note");
+    assert_eq!(
+        before.task.as_ref().expect("task").status,
+        intent_core::TaskStatus::InProgress
+    );
+
+    let parent = create_agent(&svc, &ws_a, "Parent").await;
+    let created = svc
+        .agent_create_op(
+            ws_a.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            Some(foreign.id.clone()),
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    svc.agent_report_to_parent_op(ws_a.clone(), json!("done"), Some(child))
+        .await
+        .expect("report");
+
+    let after = svc
+        .store()
+        .get_note(&foreign.id)
+        .await
+        .expect("refresh foreign note");
+    assert_eq!(
+        after.task.as_ref().expect("task").status,
+        intent_core::TaskStatus::InProgress,
+        "foreign-workspace task status must not be mutated by a cross-workspace reportToParent"
+    );
+    assert_eq!(
+        after.rev, before.rev,
+        "foreign-workspace note rev must not be bumped (no cross-workspace write): {} -> {}",
+        before.rev, after.rev
+    );
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "foreign-workspace note updated_at must not be bumped"
+    );
+}
+
 /// SUB-2 end-to-end: `agent.reportToParent` emits zero immediate wakes; the
 /// single parent wake is delivered by the child's terminal `agent:idle` via
 /// the still-armed completion watch, and the wake text carries the persisted
