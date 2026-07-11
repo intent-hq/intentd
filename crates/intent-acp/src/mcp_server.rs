@@ -154,6 +154,12 @@ impl WorkspaceMcpServer {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        // `workspace_api` shapes its own MCP tool result (isError=true text
+        // bodies for JS-side failures — reference parity with the TS tool) so
+        // it bypasses the standard `Ok(value) -> tool_content` mapping.
+        if name == "workspace_api" {
+            return ok(id, self.dispatch_workspace_api(&args).await);
+        }
         match self.dispatch(name, &args).await {
             Ok(value) => ok(id, tool_content(&value)),
             Err(e) => err(id, e.code(), &e.to_string()),

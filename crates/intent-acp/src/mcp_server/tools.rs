@@ -62,6 +62,20 @@ pub fn all_tools() -> &'static [ToolDef] {
 }
 
 static ALL_TOOLS: &[ToolDef] = &[
+    // ---- Unified workspace API (WSAPI-2 skeleton) ----
+    // A single MCP tool that evaluates agent-supplied JavaScript against a
+    // `ws.*` API. Coexists with the discrete tools below during the porting
+    // arc; the discrete tools are removed in WSAPI-8. Full description text
+    // (the reference `workspace-js-api-tool.ts` prose) is deferred to WSAPI-7.
+    ToolDef {
+        name: "workspace_api",
+        description: "Execute JavaScript against the workspace API. Your code runs as an async \
+                      function — use `return` to send results back. `code` (required) is the JS \
+                      to evaluate, wrapped in `(async () => { ... })()`. `summary` (required) is \
+                      a short human-readable description shown in the UI. Skeleton binding: \
+                      `ws.workspace.info()` returns `{ id, path }` for the current workspace.",
+        params: &[p("code", "string", true), p("summary", "string", true)],
+    },
     // ---- Read tools (never restricted) ----
     ToolDef {
         name: "list_notes",
