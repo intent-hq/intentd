@@ -7,7 +7,11 @@ repository.workspace = true
 description = "JavaScript execution engine for agent-supplied code (QuickJS via rquickjs), with async host bindings and wall-clock timeouts"
 
 [dependencies]
-rquickjs = { version = "0.9", default-features = false, features = ["futures", "macro"] }
+# `parallel` marks the async runtime + context as `Send` so the eval future
+# (which captures both) can cross an `await` point in a `tokio::spawn`ed
+# task — required by the MCP dispatch path in `intent-acp`. `futures` +
+# `macro` remain for the async_with!/Async host-fn wiring.
+rquickjs = { version = "0.9", default-features = false, features = ["futures", "macro", "parallel"] }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

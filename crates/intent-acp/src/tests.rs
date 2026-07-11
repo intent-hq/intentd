@@ -2867,3 +2867,231 @@ mod workspace_metadata_tool_tests {
         }
     }
 }
+
+/// WSAPI-2 `workspace_api` MCP tool: agent-supplied JavaScript against the
+/// workspace API. This module exercises the tool registration, the
+/// dispatch's envelope semantics (success / undefined / JS error) and the
+/// `ws.workspace.info()` binding proof.
+#[cfg(test)]
+mod workspace_api_tool_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use intent_core::{
+        BoxFuture, Result, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
+        WorkspaceId, WorkspaceStatus,
+    };
+    use serde_json::{json, Value};
+
+    use crate::WorkspaceMcpServer;
+
+    struct WorkspaceInfoMockApi {
+        ws: Mutex<Workspace>,
+    }
+
+    impl WorkspaceInfoMockApi {
+        fn new(id: &str, path: Option<&str>) -> Arc<Self> {
+            let now = "2026-01-01T00:00:00Z".to_string();
+            let ws = Workspace {
+                id: WorkspaceId::from_string(id),
+                title: id.to_string(),
+                branch: id.to_string(),
+                base_ref: None,
+                base_commit_sha: None,
+                status: WorkspaceStatus::Active,
+                status_message: None,
+                activity: WorkspaceActivity::Idle,
+                attention: WorkspaceAttention::None,
+                created_at: now.clone(),
+                updated_at: now,
+                last_activity: None,
+                tags: Vec::new(),
+                path: path.map(str::to_string),
+                repository_path: None,
+                repository_owner: None,
+                repository_name: None,
+                worktree_path: None,
+                scope: None,
+                skip_worktree: false,
+                setup_script: None,
+                is_remote: false,
+                default_model: None,
+                pr_number: None,
+                pr_url: None,
+                pr_status: None,
+                active_pull_request: None,
+                archived: false,
+                archived_at: None,
+                task_stats: None,
+                agent_summary: None,
+                diff_summary: None,
+                token_usage: None,
+            };
+            Arc::new(Self { ws: Mutex::new(ws) })
+        }
+    }
+
+    impl WorkspaceApi for WorkspaceInfoMockApi {
+        fn get_workspace(&self, _id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            let snapshot = self.ws.lock().unwrap().clone();
+            Box::pin(async move { Ok(snapshot) })
+        }
+    }
+
+    fn server(id: &str, path: Option<&str>) -> WorkspaceMcpServer {
+        let api = WorkspaceInfoMockApi::new(id, path);
+        WorkspaceMcpServer::new(api, WorkspaceId::from_string(id))
+    }
+
+    async fn call_workspace_api(srv: &WorkspaceMcpServer, code: &str) -> Value {
+        srv.handle_message(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "workspace_api",
+                "arguments": { "code": code, "summary": "unit test" }
+            }
+        }))
+        .await
+        .expect("tools/call must produce a response")
+    }
+
+    fn tool_text(resp: &Value) -> &str {
+        resp["result"]["content"][0]["text"].as_str().unwrap()
+    }
+
+    #[tokio::test]
+    async fn workspace_api_tool_is_registered_in_tools_list() {
+        let srv = server("amber-forest", None);
+        let resp = srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "workspace_api")
+            .expect("workspace_api must appear in tools/list");
+        // Both `code` and `summary` are required per the reference schema.
+        let required = tool["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "code"));
+        assert!(required.iter().any(|v| v == "summary"));
+    }
+
+    #[tokio::test]
+    async fn workspace_api_returns_plain_expression_as_pretty_json() {
+        // Sanity: an ordinary `return 1 + 1;` round-trips as JSON text.
+        let srv = server("amber-forest", None);
+        let resp = call_workspace_api(&srv, "return 1 + 1;").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(tool_text(&resp), "2");
+    }
+
+    #[tokio::test]
+    async fn workspace_api_undefined_return_reports_no_return_value() {
+        // Reference parity: user code with no return prints the sentinel
+        // string instead of `null` / `undefined`.
+        let srv = server("amber-forest", None);
+        let resp = call_workspace_api(&srv, "/* nothing */").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(tool_text(&resp), "(no return value)");
+    }
+
+    #[tokio::test]
+    async fn workspace_api_explicit_null_return_prints_json_null() {
+        // Reference parity: `return null;` prints JSON `null`, not the
+        // "(no return value)" sentinel reserved for `undefined`.
+        let srv = server("amber-forest", None);
+        let resp = call_workspace_api(&srv, "return null;").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(tool_text(&resp), "null");
+    }
+
+    #[tokio::test]
+    async fn workspace_api_info_binding_returns_real_workspace_id_and_path() {
+        // The `ws.workspace.info()` binding is the WSAPI-2 proof point:
+        // it must return the real per-call workspace id + path threaded
+        // through the dispatch.
+        let srv = server("amber-forest", Some("/tmp/amber-forest"));
+        let resp = call_workspace_api(&srv, "return await ws.workspace.info();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
+        assert_eq!(body["id"], json!("amber-forest"));
+        assert_eq!(body["path"], json!("/tmp/amber-forest"));
+    }
+
+    #[tokio::test]
+    async fn workspace_api_info_binding_returns_null_path_when_workspace_has_none() {
+        // `Workspace.path` is optional (§9.1); a workspace without a
+        // resolved on-disk path returns `path: null` rather than erroring.
+        let srv = server("amber-forest", None);
+        let resp = call_workspace_api(&srv, "return await ws.workspace.info();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
+        assert_eq!(body["id"], json!("amber-forest"));
+        assert_eq!(body["path"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn workspace_api_syntax_error_returns_readable_is_error_result() {
+        let srv = server("amber-forest", None);
+        let resp = call_workspace_api(&srv, "return (").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("SyntaxError"),
+            "expected SyntaxError message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_api_thrown_error_returns_readable_is_error_result() {
+        let srv = server("amber-forest", None);
+        let resp = call_workspace_api(&srv, "throw new Error('boom');").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("boom"),
+            "expected thrown message in output, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_api_missing_code_returns_is_error_result() {
+        // `code` is declared required by the input schema; the dispatch also
+        // guards defensively so an omitted argument surfaces as a friendly
+        // tool-result error instead of a protocol error.
+        let srv = server("amber-forest", None);
+        let resp = srv
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "workspace_api", "arguments": { "summary": "" } }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("`code` is required"),
+            "expected friendly missing-code message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_api_hot_loop_hits_timeout() {
+        // Fail-safe: if the engine's interrupt handler regresses, the test
+        // must bail out well before the 30s tool timeout instead of hanging.
+        let srv = server("amber-forest", None);
+        let resp = tokio::time::timeout(
+            Duration::from_secs(45),
+            call_workspace_api(&srv, "while (true) {}"),
+        )
+        .await
+        .expect("workspace_api hot loop must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("timed out"),
+            "expected timeout message, got: {text}"
+        );
+    }
+}

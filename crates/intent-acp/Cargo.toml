@@ -9,6 +9,11 @@ description = "ACP client, session multiplexing, and agent→BE MCP server"
 [dependencies]
 intent-core = { path = "../intent-core" }
 intent-providers = { path = "../intent-providers" }
+# WSAPI-2: the workspace_api MCP tool runs agent-supplied JavaScript through
+# the QuickJS engine in intent-js. Non-optional so the tool is always wired
+# on the daemon MCP server (the intentd binary's own `js-engine` feature
+# separately gates its `js-eval` CLI subcommand only).
+intent-js = { path = "../intent-js" }
 agent-client-protocol = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

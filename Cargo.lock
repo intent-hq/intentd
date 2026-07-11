@@ -1798,6 +1798,7 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "intent-core",
+ "intent-js",
  "intent-providers",
  "intent-pty",
  "serde",

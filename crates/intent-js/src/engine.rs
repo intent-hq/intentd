@@ -30,6 +30,14 @@ const HOST_BRIDGE_JS: &str = r#"
     })();
 "#;
 
+/// Distinguish user-code failures (surfaced as [`JsError::Runtime`]) from
+/// engine-internal failures (surfaced as [`JsError::Engine`]) inside the
+/// per-eval runner. Kept private to this module.
+enum RunErr {
+    Runtime(String),
+    Engine(String),
+}
+
 /// Evaluate a snippet of user JavaScript inside a fresh QuickJS context.
 ///
 /// User `code` is wrapped as `(async () => { <code> })()`, its resolved value
@@ -70,11 +78,11 @@ pub async fn eval(
     let code_owned = code.to_string();
     let host_for_bind = host.clone();
 
-    let inner: Result<Result<serde_json::Value, String>, ()> =
+    let inner: Result<Result<serde_json::Value, RunErr>, ()> =
         tokio::time::timeout(opts.timeout.saturating_add(OUTER_SAFETY_MARGIN), async {
-            let out: Result<serde_json::Value, String> = async_with!(ctx => |ctx| {
+            let out: Result<serde_json::Value, RunErr> = async_with!(ctx => |ctx| {
                 if let Some(h) = host_for_bind {
-                    bind_host(ctx.clone(), h).map_err(stringify_js_err)?;
+                    bind_host(ctx.clone(), h).map_err(|e| RunErr::Engine(stringify_js_err(e)))?;
                 }
                 run_user_code(ctx, &code_owned).await
             })
@@ -87,7 +95,7 @@ pub async fn eval(
 
     match inner {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(msg)) => {
+        Ok(Err(RunErr::Runtime(msg))) => {
             // Interrupt-driven exceptions land here; if we've blown the budget
             // classify as Timeout rather than Runtime.
             if Instant::now() >= deadline {
@@ -98,6 +106,7 @@ pub async fn eval(
                 Err(JsError::Runtime(msg))
             }
         }
+        Ok(Err(RunErr::Engine(msg))) => Err(JsError::Engine(msg)),
         Err(()) => Err(JsError::Timeout {
             ms: timeout_ms(opts.timeout),
         }),
@@ -121,8 +130,22 @@ fn bind_host<'js>(ctx: rquickjs::Ctx<'js>, host: HostFn) -> rquickjs::Result<()>
         Async(move |arg_json: String| {
             let h = host_arc.clone();
             async move {
-                let value: serde_json::Value =
-                    serde_json::from_str(&arg_json).unwrap_or(serde_json::Value::Null);
+                // A malformed argument frame is an engine-internal invariant
+                // violation (the JS wrapper always calls `JSON.stringify`), so
+                // surface it explicitly rather than silently coercing to null:
+                // the bridge JS turns the `{ok:false, error}` frame back into a
+                // JS `Error`, so the failure lands on the caller instead of
+                // silently substituting `null`.
+                let value = match serde_json::from_str::<serde_json::Value>(&arg_json) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let frame = serde_json::json!({
+                            "ok": false,
+                            "error": format!("engine: host received non-JSON argument: {e}"),
+                        });
+                        return Ok::<String, rquickjs::Error>(frame.to_string());
+                    }
+                };
                 let frame = match h(value).await {
                     Ok(v) => serde_json::json!({ "ok": true, "value": v }),
                     Err(msg) => serde_json::json!({ "ok": false, "error": msg }),
@@ -139,10 +162,12 @@ fn bind_host<'js>(ctx: rquickjs::Ctx<'js>, host: HostFn) -> rquickjs::Result<()>
 async fn run_user_code<'js>(
     ctx: rquickjs::Ctx<'js>,
     code: &str,
-) -> Result<serde_json::Value, String> {
-    // `undefined` and non-JSON-serializable results are surfaced as distinct
-    // JSON envelopes so the host can tell "no return" from "unserializable
-    // return" (which otherwise both become `undefined`).
+) -> Result<serde_json::Value, RunErr> {
+    // The wrapper distinguishes two shapes internally: `{"kind":"undefined"}`
+    // when the user code returned `undefined`, and `{"kind":"value","json":<v>}`
+    // otherwise. A non-JSON-serializable return (e.g. a function) trips the
+    // `JSON.stringify` check inside the wrapper and throws `TypeError`, which
+    // lands on the caller as a `RunErr::Runtime`.
     let wrapped = format!(
         "(async () => {{ const __r = await (async () => {{ {code} }})(); \
          if (__r === undefined) return '{{\"kind\":\"undefined\"}}'; \
@@ -153,22 +178,28 @@ async fn run_user_code<'js>(
     let val: rquickjs::Value<'js> = ctx
         .eval(wrapped.as_bytes())
         .catch(&ctx)
-        .map_err(|e| format!("{e}"))?;
-    let promise: Promise<'js> = Promise::from_value(val).map_err(stringify_js_err)?;
+        .map_err(|e| RunErr::Runtime(format!("{e}")))?;
+    let promise: Promise<'js> =
+        Promise::from_value(val).map_err(|e| RunErr::Engine(stringify_js_err(e)))?;
     let envelope: String = promise
         .into_future()
         .await
         .catch(&ctx)
-        .map_err(|e| format!("{e}"))?;
-    let parsed: serde_json::Value =
-        serde_json::from_str(&envelope).map_err(|e| format!("engine: bad result envelope: {e}"))?;
+        .map_err(|e| RunErr::Runtime(format!("{e}")))?;
+    // Envelope-parse and unknown-kind failures are engine-internal invariant
+    // violations (the wrapper above is fixed): surface as `Engine` so the
+    // caller does not confuse them with user-thrown JS errors.
+    let parsed: serde_json::Value = serde_json::from_str(&envelope)
+        .map_err(|e| RunErr::Engine(format!("engine: bad result envelope: {e}")))?;
     match parsed.get("kind").and_then(|k| k.as_str()) {
         Some("undefined") => Ok(serde_json::Value::Null),
         Some("value") => Ok(parsed
             .get("json")
             .cloned()
             .unwrap_or(serde_json::Value::Null)),
-        _ => Err("engine: unknown result envelope".into()),
+        other => Err(RunErr::Engine(format!(
+            "engine: unknown result envelope kind: {other:?}"
+        ))),
     }
 }
 
