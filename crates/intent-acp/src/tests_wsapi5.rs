@@ -42,6 +42,10 @@ struct FakeApi {
     update_calls: Mutex<Vec<WorkspaceUpdate>>,
     rename_calls: Mutex<Vec<(String, String, bool)>>,
     workspace_variant: Mutex<WorkspaceVariant>,
+    // `None` = no override (use the `make_workspace` default `Some("hi")`);
+    // `Some(Some(x))` or `Some(None)` = the value the last `update_workspace`
+    // call landed on after empty/whitespace-clear normalization.
+    status_message_state: Mutex<Option<Option<String>>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -98,12 +102,19 @@ fn make_workspace(id: &str, variant: WorkspaceVariant) -> Workspace {
 impl WorkspaceApi for FakeApi {
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let variant = *self.workspace_variant.lock().unwrap();
+        let override_sm = self.status_message_state.lock().unwrap().clone();
         Box::pin(async move {
             match variant {
                 WorkspaceVariant::NotFound => {
                     Err(Error::NotFound(format!("workspace {}", id.as_str())))
                 }
-                v => Ok(make_workspace(id.as_str(), v)),
+                v => {
+                    let mut w = make_workspace(id.as_str(), v);
+                    if let Some(sm) = override_sm {
+                        w.status_message = sm;
+                    }
+                    Ok(w)
+                }
             }
         })
     }
@@ -114,13 +125,26 @@ impl WorkspaceApi for FakeApi {
         update: WorkspaceUpdate,
     ) -> BoxFuture<'_, Result<Workspace>> {
         self.update_calls.lock().unwrap().push(update.clone());
+        if let Some(ref s) = update.status_message {
+            // Mirror `intent-services::update_workspace`: an empty or
+            // whitespace-only `status_message` clears to `None`. Persist the
+            // normalized value so a follow-up `get_workspace` (i.e.
+            // `ws.workspace.details()`) reflects the clear.
+            let normalized = if s.trim().is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            };
+            *self.status_message_state.lock().unwrap() = Some(normalized);
+        }
+        let override_sm = self.status_message_state.lock().unwrap().clone();
         Box::pin(async move {
             let mut w = make_workspace(id.as_str(), WorkspaceVariant::Titled);
             if let Some(t) = update.title {
                 w.title = t;
             }
-            if let Some(s) = update.status_message {
-                w.status_message = if s.is_empty() { None } else { Some(s) };
+            if let Some(sm) = override_sm {
+                w.status_message = sm;
             }
             Ok(w)
         })
@@ -463,6 +487,13 @@ async fn workspace_set_status_message_clears_on_empty() {
     assert_eq!(v["ok"], json!(true));
     assert_eq!(v["statusMessage"], Value::Null);
     assert_eq!(api.update_calls.lock().unwrap().len(), 1);
+    // `ws.workspace.details()` after the clear must surface `null`, not
+    // `""` — the empty-string-vs-null representation only shows up on the
+    // read-back path, so pin it here so regressions in either services'
+    // update normalization or the binding's `details` shaping get caught.
+    let after = call(&srv, "return await ws.workspace.details();").await;
+    let d = body(&after);
+    assert_eq!(d["statusMessage"], Value::Null);
 }
 
 #[tokio::test]

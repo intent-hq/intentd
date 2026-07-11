@@ -2670,7 +2670,10 @@ mod workspace_metadata_tool_tests {
                 ws.title = t;
             }
             if let Some(m) = update.status_message {
-                ws.status_message = Some(m);
+                // Mirror `intent-services::update_workspace`: empty or
+                // whitespace-only `status_message` clears to `None` so the
+                // discrete MCP tool's clear semantics read back correctly.
+                ws.status_message = if m.trim().is_empty() { None } else { Some(m) };
             }
             let snapshot = ws.clone();
             Box::pin(async move { Ok(snapshot) })
@@ -2815,7 +2818,12 @@ mod workspace_metadata_tool_tests {
         assert_eq!(body["statusMessage"], Value::Null);
         let updates = api.updates.lock().unwrap();
         assert_eq!(updates.len(), 1);
+        // The MCP tool still passes the empty string through in the delta;
+        // the services layer (and the mock, mirroring it) is what normalizes
+        // to `None` on write. Pin both: the input delta stays `Some("")`,
+        // and the stored `status_message` reads back as `None`.
         assert_eq!(updates[0].status_message.as_deref(), Some(""));
+        assert!(api.ws.lock().unwrap().status_message.is_none());
     }
 
     #[tokio::test]
