@@ -740,21 +740,19 @@ impl AgentManager {
                 .services
                 .agent_specialist_injection(&agent_id, Some(&cwd))
                 .await;
+            // `git.autoCommit` is a global (non-workspace-scoped) setting, so
+            // this lookup is independent of the session and cheap to do here.
+            let auto_commit_enabled =
+                crate::settings::auto_commit_enabled(&self.services.store).await;
             // Sub-agent gating: delegated children (`parent_agent_id` set) and
             // background workers (`is_background`) skip the suggested-prompts
             // directive, matching the reference `isSubAgent` derivation. The
-            // auto-commit lookup is workspace-scoped and independent of the
-            // session, so read it once regardless of whether the session lookup
-            // succeeds.
-            let auto_commit_enabled =
-                crate::settings::auto_commit_enabled(&self.services.store).await;
-            let is_sub_agent = self
-                .services
-                .store
-                .get_agent_session(&agent_id)
-                .await
-                .map(|s| s.parent_agent_id.is_some() || s.is_background)
-                .unwrap_or(false);
+            // session was inserted by the caller before `create_agent` runs,
+            // so propagate any store error rather than silently defaulting to
+            // top-level (which would mis-scope the SP-1 footer and hide DB
+            // failures).
+            let session = self.services.store.get_agent_session(&agent_id).await?;
+            let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
             if let Some(prompt) = crate::rules::assemble_system_prompt(
                 &self.services.store,
                 Some(&cwd),
