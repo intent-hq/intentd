@@ -3124,6 +3124,26 @@ async fn child_session_messages_json(svc: &Services, child: &AgentId) -> String 
     serde_json::to_string(&session.messages).expect("serialize child messages")
 }
 
+/// Text of the child's first (delegated) message, joining every text content
+/// block in order. Used for byte-exact assertions on the reference
+/// `DelegateTaskTool` preamble.
+async fn child_session_first_message_text(svc: &Services, child: &AgentId) -> String {
+    let session = svc
+        .store()
+        .get_agent_session(child)
+        .await
+        .expect("child session");
+    let first = session.messages.first().expect("first message");
+    first
+        .content
+        .as_array()
+        .expect("contentBlocks array")
+        .iter()
+        .filter_map(|b| b.get("text").and_then(|t| t.as_str()).map(str::to_owned))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 /// Explicit `agentInstructions` become the child's first message.
 #[tokio::test]
 async fn delegate_delivers_agent_instructions_as_child_first_message() {
@@ -3287,6 +3307,24 @@ async fn delegate_prepends_task_note_preamble_to_first_message() {
     assert!(
         body.contains("do the work"),
         "explicit instructions must survive the preamble: {body}"
+    );
+    // Exact first-message bytes: mirrors the reference `DelegateTaskTool`
+    // preamble (`agent-interaction-tools.ts`) verbatim, with no stray
+    // leading whitespace on the continuation lines, followed by a blank
+    // line and the caller's `agentInstructions`.
+    let expected_first_message = format!(
+        "**Your Task Note:** \"Port frobnicator\" (ID: {note_id})\n\
+This note is your workspace for this task. Update it with your progress, findings, and deliverables.\n\
+\n\
+**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.\n\
+\n\
+do the work",
+        note_id = note.id.as_str(),
+    );
+    let first_message_text = child_session_first_message_text(&svc, &child).await;
+    assert_eq!(
+        first_message_text, expected_first_message,
+        "first message must be byte-exact"
     );
 }
 

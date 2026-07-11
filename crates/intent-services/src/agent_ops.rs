@@ -1948,11 +1948,20 @@ impl Services {
         // note the message is delivered verbatim.
         if let (Some(note), Some(note_id)) = (task_note.as_ref(), session_task_note_id.as_ref()) {
             let title = first_nonempty(&note.title).unwrap_or_default();
+            // Build the preamble from adjacent string literals (via `concat!`)
+            // so no source-level indentation leaks into the emitted bytes. Every
+            // `\n` is explicit; the resulting string is byte-for-byte the
+            // reference `DelegateTaskTool` preamble
+            // (`agent-interaction-tools.ts`).
             let preamble = format!(
-                "**Your Task Note:** \"{title}\" (ID: {note_id})\n\
-                 This note is your workspace for this task. Update it with your progress, findings, and deliverables.\n\
-                 \n\
-                 **SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks."
+                concat!(
+                    "**Your Task Note:** \"{title}\" (ID: {note_id})\n",
+                    "This note is your workspace for this task. Update it with your progress, findings, and deliverables.\n",
+                    "\n",
+                    "**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.",
+                ),
+                title = title,
+                note_id = note_id,
             );
             message = Some(match message {
                 Some(body) if !body.is_empty() => format!("{preamble}\n\n{body}"),
@@ -2230,7 +2239,7 @@ impl Services {
         subscription_id: String,
         after: std::time::Duration,
     ) {
-        let deadline = std::time::Instant::now() + after;
+        let deadline = tokio::time::Instant::now() + after;
         self.bump_watch_cleanup_deadline(&workspace_id, &subscription_id, deadline);
         let services = self.clone();
         tokio::spawn(async move {

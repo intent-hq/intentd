@@ -12,7 +12,13 @@
 //! AS-3 concern; this module only owns the registry records and helpers.
 
 use std::sync::Arc;
-use std::time::Instant;
+
+// Use `tokio::time::Instant` (not `std::time::Instant`) for the cleanup
+// deadline: the timer is driven by `tokio::time::sleep`, which advances
+// under a paused tokio clock (see `tokio::time::pause`) while
+// `std::time::Instant::now()` does not — mixing the two would let a
+// paused-clock test's cleanup task race against a real-time deadline.
+use tokio::time::Instant;
 
 use intent_core::{now_iso, AgentId, Event, WorkspaceId};
 use uuid::Uuid;
