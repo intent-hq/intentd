@@ -985,7 +985,27 @@ impl Services {
             provider,
             system_prompt: None,
             specialist,
-            status: AgentStatus::Pending,
+            // Reference parity: `agent-factory.ts:435` persists `AgentStatus.Idle`
+            // — the legacy capitalized `"Idle"` variant — on session creation, so
+            // a freshly persisted session must be `Idle`, not `Pending`. On
+            // `agent.get`/`agent.list` the `AgentLite.status` field is serialized
+            // directly by serde, so `Pending` surfaces on the wire as `"pending"`
+            // (not `"waiting"` — the `"waiting"` string only comes from the
+            // separate `agent_status_wire` normalization used by the diagnostics
+            // / subscription snapshots); the FE's session hydration and idle
+            // selectors treat `"pending"` as a non-idle initial state, whereas
+            // `Idle` correctly hydrates as idle. Both idle wire values,
+            // capitalized `"Idle"` (`AgentStatus.Idle`) and lowercase `"idle"`
+            // (`AgentStatus.RuntimeIdle`), are accepted equivalently by the FE
+            // (see `consolidated-backend.service.ts:1207`
+            // `status === AgentStatus.Idle || status === AgentStatus.RuntimeIdle`),
+            // so persisting `Idle` here and later rewriting to `RuntimeIdle` at
+            // end-of-turn presents a single idle state to the UI. Heal-on-
+            // startup is unaffected: `is_stale_in_flight_status` only matches
+            // `Active`/`Processing`/`Waiting`, so `Idle` (like the former
+            // `Pending`) is left untouched by the sweep at
+            // `crates/intent-services/src/lib.rs:653`.
+            status: AgentStatus::Idle,
             is_active: false,
             messages: Vec::new(),
             stats: None,
