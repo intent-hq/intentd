@@ -6505,7 +6505,13 @@ impl WorkspaceApi for Services {
                 ));
             }
             fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let all = store.list_comments(&note_id).await?;
+            // Workspace-scoped so a caller-supplied `commentId` cannot match a
+            // comment belonging to a same-`note_id` note in a different
+            // workspace (e.g. the well-known `spec` id), which would let the
+            // reply's `parent_id` chain into that other workspace.
+            let all = store
+                .list_comments_in_workspace(&workspace_id, &note_id)
+                .await?;
             let (target, parent_from_id) = match thread_id {
                 Some(t) => (t, None),
                 None => {

@@ -1621,6 +1621,114 @@ async fn comment_ops_reject_cross_workspace_bare_id_writes() {
         .expect("owner delete succeeds");
 }
 
+/// A cross-workspace `commentId` probe on `comment.respond` must be rejected
+/// with no side effects, even when both workspaces have a note that shares the
+/// same `note_id` (a real scenario for well-known ids like `spec`). Without the
+/// workspace-scoped `list_comments_in_workspace` lookup, the parent lookup
+/// would leak a match from the other workspace and attach a reply whose
+/// `parent_id` chains cross-workspace.
+#[tokio::test]
+async fn comment_respond_rejects_cross_workspace_comment_id_probe() {
+    use intent_core::{
+        AuthorType, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentType,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    // Two workspaces, each with a note carrying the same `note_id` string —
+    // the same-`note_id`-across-workspaces case (e.g. the well-known `spec`
+    // id) that made the un-scoped `list_comments(&note_id)` lookup leak a
+    // cross-workspace parent match into `comment_respond`.
+    let ws_a = WorkspaceId::new();
+    let ws_b = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&ws_a))
+        .await
+        .expect("ws_a");
+    store
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("ws_b");
+    let shared = NoteId::from("spec");
+    store
+        .insert_note(&note(&ws_a, "spec", "ws_a body"))
+        .await
+        .expect("note_a");
+    store
+        .insert_note(&note(&ws_b, "spec", "ws_b body"))
+        .await
+        .expect("note_b");
+
+    // Seed a comment in ws_a directly via the store so we bypass any
+    // note-mutating side effects of `comment_add` and keep the fixture focused
+    // on the residual parent-lookup guard.
+    let now = now_iso();
+    let seeded_a = Comment {
+        id: uuid::Uuid::new_v4().to_string(),
+        thread_id: uuid::Uuid::new_v4().to_string(),
+        note_id: Some(shared.clone()),
+        kind: CommentType::Comment,
+        content: "ws_a original".to_string(),
+        author: "A".to_string(),
+        author_type: AuthorType::User,
+        status: CommentStatus::Open,
+        parent_id: None,
+        anchor: CommentAnchor {
+            kind: CommentAnchorType::Range,
+            start_id: None,
+            end_id: None,
+            point_id: None,
+        },
+        anchor_text: None,
+        anchor_before: None,
+        anchor_after: None,
+        suggestion_original: None,
+        suggestion_proposed: None,
+        agent_id: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    store
+        .insert_comment(&ws_a, &seeded_a)
+        .await
+        .expect("seed ws_a comment");
+    let svc = Services::new(store);
+
+    // ws_b, using its own same-`note_id` note, probes with ws_a's commentId.
+    // The reply must not be created and no cross-workspace parent must leak.
+    let err = svc
+        .comment_respond(
+            ws_b.clone(),
+            shared.clone(),
+            None,
+            Some(seeded_a.id.clone()),
+            "leaked reply".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("cross-ws commentId probe must be rejected");
+    assert!(matches!(err, Error::Internal(_)), "respond: {err:?}");
+
+    // No side effects: neither workspace's comment set changed.
+    let a_after = svc
+        .store()
+        .list_comments_in_workspace(&ws_a, &shared)
+        .await
+        .expect("list ws_a");
+    assert_eq!(a_after.len(), 1, "ws_a still has just its seeded comment");
+    assert_eq!(a_after[0].id, seeded_a.id);
+    let b_after = svc
+        .store()
+        .list_comments_in_workspace(&ws_b, &shared)
+        .await
+        .expect("list ws_b");
+    assert!(b_after.is_empty(), "ws_b has no comments after the probe");
+}
+
 // ---- event.* query/aggregation methods (M2.4) ----
 
 use intent_core::{ActorType, EventActor};

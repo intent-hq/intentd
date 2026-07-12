@@ -186,6 +186,29 @@ impl Store {
         rows.iter().map(map_comment_row).collect()
     }
 
+    /// List a note's comments scoped to `workspace_id`, ordered by creation
+    /// time. Callers that resolve a caller-supplied `comment_id` from the
+    /// result set must use this variant so a cross-workspace bare-id probe
+    /// cannot match a comment belonging to a different workspace's note that
+    /// happens to share the same `note_id` (e.g. the well-known `spec` id).
+    pub async fn list_comments_in_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+    ) -> Result<Vec<Comment>> {
+        let sql = format!(
+            "SELECT {COMMENT_COLUMNS} FROM comment \
+             WHERE note_id = ? AND workspace_id = ? ORDER BY created_at, id"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&note_id.0)
+            .bind(&workspace_id.0)
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list comments failed: {e}")))?;
+        rows.iter().map(map_comment_row).collect()
+    }
+
     /// List the comments in one thread, ordered by creation time.
     pub async fn list_thread_comments(&self, thread_id: &str) -> Result<Vec<Comment>> {
         let sql = format!(
