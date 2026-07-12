@@ -1464,13 +1464,16 @@ impl Services {
     }
 }
 
-/// Seed the well-known `spec` note on `workspace.create` (reference parity with
-/// `notes.service.ts ensureSpecExists`). Idempotent: if a spec note already
-/// exists in this workspace, this is a no-op; otherwise it inserts the default
-/// Spec (empty markdown, pinned, default, workspace visibility), captures the
-/// initial version, and publishes `note:created`. Note identity is composite
-/// (`(id, workspace_id)`, migration 0030), so every workspace owns its own
-/// spec — no cross-workspace collision is possible.
+/// Seed the well-known `spec` note for a workspace (reference parity with
+/// `notes.service.ts ensureSpecExists`). Called from both `workspace.create`
+/// (initial seed) and `note.list` (lazy self-heal for workspaces whose spec
+/// went missing, e.g. rows created before the composite-PK migration).
+/// Idempotent: if a spec note already exists in this workspace, this is a
+/// no-op; otherwise it inserts the default Spec (empty markdown, pinned,
+/// default, workspace visibility), captures the initial version, and publishes
+/// `note:created` exactly once. Note identity is composite (`(id,
+/// workspace_id)`, migration 0030), so every workspace owns its own spec — no
+/// cross-workspace collision is possible.
 async fn ensure_spec_note(
     store: &Store,
     bus: &Option<EventBus>,
@@ -5017,8 +5020,22 @@ impl WorkspaceApi for Services {
 
     fn list_notes<'a>(&'a self, workspace_id: &'a WorkspaceId) -> BoxFuture<'a, Result<Vec<Note>>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         let id = workspace_id.clone();
-        Box::pin(async move { store.list_notes(&id).await })
+        Box::pin(async move {
+            // Self-heal parity with `notes.service.ts getNotes`: if the
+            // well-known `spec` note is missing for this workspace, reseed it
+            // before listing so pre-#110 workspaces (and any that lost their
+            // spec) come back with the default. `ensure_spec_note` is
+            // idempotent — no-op when the spec already exists, no spurious
+            // events, no extra writes. Chief is virtual (no workspace row, no
+            // FK target), so skip the reseed; `store.list_notes` returns an
+            // empty vec for it naturally.
+            if !id.is_chief() {
+                ensure_spec_note(&store, &bus, &id).await?;
+            }
+            store.list_notes(&id).await
+        })
     }
 
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {

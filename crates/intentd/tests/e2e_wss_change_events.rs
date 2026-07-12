@@ -572,3 +572,68 @@ async fn task_block_author_list_assign_flow_over_wss() {
     .await;
     assert_eq!(got["task"]["status"], json!("in_progress"), "task: {got}");
 }
+
+/// End-to-end reference-parity self-heal: a workspace whose `spec` note has
+/// been deleted gets it reseeded on the next `note.list` (reference:
+/// `notes.service.ts getNotes` → `ensureSpecExists`). The reseed emits a
+/// single `note:created` for `noteId=spec`, and the WSS `note.list` response
+/// includes the freshly-seeded spec in the returned `notes` array.
+#[tokio::test]
+async fn note_list_reseeds_missing_spec_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    // Bootstrap the workspace and delete the initial spec off the UDS so the
+    // WSS event stream only carries the reseed emission.
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "SpecHeal", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let del = uds_rpc(
+        &socket,
+        3,
+        "note.delete",
+        json!({ "workspaceId": ws_id, "noteId": "spec" }),
+    )
+    .await;
+    assert_eq!(del["result"]["ok"], json!(true), "delete spec: {del}");
+
+    // Subscribe over WSS before invoking `note.list` so the reseed emission is
+    // guaranteed to be observed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["note:created"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Drive `note.list` over a separate WSS RPC connection.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let list = wss_rpc(&mut rpc, 2, "note.list", json!({ "workspaceId": ws_id })).await;
+    let notes = list["notes"].as_array().expect("notes array");
+    let spec = notes
+        .iter()
+        .find(|n| n["id"] == json!("spec"))
+        .expect("spec present in response");
+    assert_eq!(spec["workspaceId"], json!(ws_id));
+    assert_eq!(spec["title"], json!("Spec"));
+    assert_eq!(spec["content"], json!(""));
+    assert_eq!(spec["isPinned"], json!(true));
+    assert_eq!(spec["isDefault"], json!(true));
+
+    let evt = next_event(&mut sub, &["note:created"], 10).await;
+    assert_eq!(evt["workspaceId"], ws_id.as_str());
+    assert_eq!(evt["data"]["noteId"], json!("spec"));
+    assert_eq!(evt["data"]["title"], json!("Spec"));
+    assert_eq!(evt["data"]["action"], json!("create"));
+}
