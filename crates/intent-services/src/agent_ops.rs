@@ -985,18 +985,23 @@ impl Services {
             provider,
             system_prompt: None,
             specialist,
-            // Reference parity (`agent-factory.ts:435` persists `AgentStatus.Idle`
-            // — the legacy capitalized `"Idle"` variant — on session creation):
-            // a freshly persisted session is `Idle`, not `Pending`. Both values
-            // are recognized as idle by the FE (see `consolidated-backend.service.ts`
-            // where `status === AgentStatus.Idle || status === AgentStatus.RuntimeIdle`
-            // gates the same code paths), so waiting/idle-gating selectors behave
-            // identically to the TS reference. End-of-turn later rewrites the
-            // status to `AgentStatus::RuntimeIdle` (lowercase `"idle"`), which
-            // is the modern wire form. Heal-on-startup is unaffected:
-            // `is_stale_in_flight_status` only matches `Active`/`Processing`/
-            // `Waiting`, so `Idle` (like the former `Pending`) is left untouched
-            // by the sweep at `crates/intent-services/src/lib.rs:653`.
+            // Reference parity: `agent-factory.ts:435` persists `AgentStatus.Idle`
+            // — the legacy capitalized `"Idle"` variant — on session creation.
+            // A freshly persisted session must be `Idle`, not `Pending`, so the
+            // FE's idle-gating selectors treat brand-new agents as idle and
+            // match the reference (whereas `Pending` would project as
+            // `"waiting"` per `agent_status_wire` below and drive the UI's
+            // waiting spinner on fresh sessions). Both idle wire values,
+            // capitalized `"Idle"` (`AgentStatus.Idle`) and lowercase `"idle"`
+            // (`AgentStatus.RuntimeIdle`), are accepted equivalently by the FE
+            // (see `consolidated-backend.service.ts:1207`
+            // `status === AgentStatus.Idle || status === AgentStatus.RuntimeIdle`),
+            // so persisting `Idle` here and later rewriting to `RuntimeIdle` at
+            // end-of-turn presents a single idle state to the UI. Heal-on-
+            // startup is unaffected: `is_stale_in_flight_status` only matches
+            // `Active`/`Processing`/`Waiting`, so `Idle` (like the former
+            // `Pending`) is left untouched by the sweep at
+            // `crates/intent-services/src/lib.rs:653`.
             status: AgentStatus::Idle,
             is_active: false,
             messages: Vec::new(),
