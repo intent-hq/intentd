@@ -4679,7 +4679,18 @@ impl WorkspaceApi for Services {
             // `saveWorkspaceUpdates` parity — return the applied delta layered
             // over the synthesized shape without persisting). Still emit
             // `workspace:updated` so subscribers see the delta.
-            if !ws.id.is_chief() {
+            if ws.id.is_chief() {
+                // Chief's canonical shape pins createdAt/updatedAt/lastActivity
+                // (`CHIEF_WORKSPACE_TIMESTAMP` in `chief_workspace()`). Restore
+                // the invariants so the update response matches the shape
+                // `workspace.get` returns — a caller-supplied `lastActivity` or
+                // the auto-touched `updatedAt` above must not leak through and
+                // diverge Chief's timestamps from `chief_workspace()`.
+                let pinned = chief_workspace();
+                ws.created_at = pinned.created_at;
+                ws.updated_at = pinned.updated_at;
+                ws.last_activity = pinned.last_activity;
+            } else {
                 store.update_workspace(&ws).await?;
             }
             // Self-sufficient `workspace:updated` payload (§6.5) so every

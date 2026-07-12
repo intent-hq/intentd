@@ -155,12 +155,30 @@ async fn chief_workspace_over_uds() {
         ),
     )
     .await;
+    let updated = &resp["result"]["workspace"];
     assert_eq!(
-        resp["result"]["workspace"]["id"],
+        updated["id"],
         json!(CHIEF_WORKSPACE_ID),
         "update returns Chief shape: {resp}"
     );
-    assert_eq!(resp["result"]["workspace"]["statusMessage"], json!("hello"));
+    assert_eq!(updated["statusMessage"], json!("hello"));
+    // Chief's canonical timestamps are pinned to `CHIEF_WORKSPACE_TIMESTAMP` —
+    // even `workspace.update` must not diverge them from `workspace.get`.
+    assert_eq!(
+        updated["createdAt"],
+        json!(CHIEF_WORKSPACE_TIMESTAMP),
+        "update response pins createdAt: {resp}"
+    );
+    assert_eq!(
+        updated["updatedAt"],
+        json!(CHIEF_WORKSPACE_TIMESTAMP),
+        "update response pins updatedAt: {resp}"
+    );
+    assert_eq!(
+        updated["lastActivity"],
+        json!(CHIEF_WORKSPACE_TIMESTAMP),
+        "update response pins lastActivity: {resp}"
+    );
     let resp = send(
         &config.socket_path,
         &format!(
@@ -176,15 +194,12 @@ async fn chief_workspace_over_uds() {
 
     // (e) Archive / delete on Chief are safe no-ops — the seeded row is never
     //     torn down or flipped to `archived = 1` and Chief remains reachable
-    //     via `workspace.get` after both. Transport-wire responses are
-    //     `{ success: true }` for archive/delete (PROTOCOL §5.1); we assert on
-    //     that shape and then re-`get` to verify Chief's synthesized shape is
-    //     unchanged.
-    for (id, method) in [
-        (7, "workspace.archive"),
-        (8, "workspace.dismissAttention"),
-        (9, "workspace.delete"),
-    ] {
+    //     via `workspace.get` after both. `workspace.archive` and
+    //     `workspace.delete` respond with `{ success: true }`
+    //     (`intent-transport/src/router.rs` §5.1); `dismissAttention` returns
+    //     `{ workspace: ... }` (the synthesized Chief shape). We assert on
+    //     each exact envelope, then re-`get` to verify Chief is unchanged.
+    for (id, method) in [(7, "workspace.archive"), (8, "workspace.delete")] {
         let resp = send(
             &config.socket_path,
             &format!(
@@ -193,10 +208,32 @@ async fn chief_workspace_over_uds() {
         )
         .await;
         assert!(
-            resp["error"].is_null() || resp.get("error").is_none(),
+            resp.get("error").is_none() || resp["error"].is_null(),
             "{method} on Chief must succeed: {resp}"
         );
+        assert_eq!(
+            resp["result"]["success"],
+            json!(true),
+            "{method} returns {{success:true}}: {resp}"
+        );
     }
+    // dismissAttention returns the synthesized Chief workspace, not
+    // { success: true } — assert the workspace envelope + pinned invariants.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"workspace.dismissAttention","params":{{"workspaceId":"{CHIEF_WORKSPACE_ID}"}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none() || resp["error"].is_null(),
+        "workspace.dismissAttention on Chief must succeed: {resp}"
+    );
+    let dismissed = &resp["result"]["workspace"];
+    assert_eq!(dismissed["id"], json!(CHIEF_WORKSPACE_ID));
+    assert_eq!(dismissed["attention"], json!("none"));
+    assert_eq!(dismissed["updatedAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
     let resp = send(
         &config.socket_path,
         &format!(
@@ -212,6 +249,7 @@ async fn chief_workspace_over_uds() {
     );
     assert_eq!(ws["archived"], json!(false), "Chief is never archived");
     assert_eq!(ws["status"], json!("Active"));
+    assert_eq!(ws["updatedAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
 
     let _ = tx.send(());
     let _ = server.await;
