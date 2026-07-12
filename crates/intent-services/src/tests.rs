@@ -669,6 +669,138 @@ async fn list_tasks_and_delete_and_scoping() {
     ));
 }
 
+/// `note.delete` cascade parity with the reference `deleteNote` in
+/// `src/features/notes/main/notes.service.ts` (which delegates to
+/// `NotesRepository.delete`, unlinking the comments file alongside the note).
+/// Migration 0030 encodes both cleanups at the schema layer: an `ON DELETE
+/// CASCADE` composite FK on `comment(note_id, workspace_id)` and the
+/// `note_parent_set_null_on_delete` trigger clearing children's `parent_id`
+/// scoped to the same workspace. This regression pins that when a note is
+/// deleted, (a) its comments are removed, (b) its children (e.g. linked task
+/// notes) survive with `parent_id = NULL`, and (c) an unrelated note in the
+/// same workspace is untouched.
+#[tokio::test]
+async fn delete_note_cascades_comments_and_unlinks_children() {
+    use intent_core::{
+        AuthorType, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentType,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+    // Parent note that will be deleted.
+    let parent_id = NoteId::from("parent");
+    store
+        .insert_note(&note(&ws, "parent", "parent body"))
+        .await
+        .expect("insert parent");
+
+    // Child (task) note linked via `parent_id` — reference semantics leave
+    // linked child task notes alone, so we expect the row to survive with a
+    // cleared `parent_id`, not to be deleted.
+    let child_id = NoteId::from("child");
+    let mut child = note(&ws, "child", "child body");
+    child.parent_id = Some(parent_id.clone());
+    store.insert_note(&child).await.expect("insert child");
+
+    // Unrelated note in the same workspace: no link, no comments; it must not
+    // be touched by the parent's delete.
+    let other_id = NoteId::from("other");
+    store
+        .insert_note(&note(&ws, "other", "other body"))
+        .await
+        .expect("insert other");
+
+    // Two comments on the parent, exercising the composite FK cascade.
+    let now = now_iso();
+    let mk_comment = |id: &str, thread: &str| Comment {
+        id: id.to_string(),
+        thread_id: thread.to_string(),
+        note_id: Some(parent_id.clone()),
+        kind: CommentType::Comment,
+        content: format!("{id} body"),
+        author: "alice".to_string(),
+        author_type: AuthorType::User,
+        status: CommentStatus::Open,
+        parent_id: None,
+        anchor: CommentAnchor {
+            kind: CommentAnchorType::Range,
+            start_id: None,
+            end_id: None,
+            point_id: None,
+        },
+        anchor_text: None,
+        anchor_before: None,
+        anchor_after: None,
+        suggestion_original: None,
+        suggestion_proposed: None,
+        agent_id: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let c1 = mk_comment("c1", "t1");
+    let c2 = mk_comment("c2", "t1");
+    store.insert_comment(&ws, &c1).await.expect("insert c1");
+    store.insert_comment(&ws, &c2).await.expect("insert c2");
+
+    let svc = Services::new(store);
+    assert_eq!(
+        svc.store()
+            .list_comments(&parent_id)
+            .await
+            .expect("pre-delete comments")
+            .len(),
+        2,
+    );
+
+    let del = svc
+        .delete_note(ws.clone(), parent_id.clone(), None)
+        .await
+        .expect("delete parent");
+    assert!(del.deleted);
+
+    // Parent row is gone.
+    assert!(matches!(
+        svc.get_note(ws.clone(), parent_id.clone()).await,
+        Err(Error::NotFound(_))
+    ));
+
+    // Comments cascaded away via the 0030 composite FK.
+    assert!(
+        svc.store()
+            .list_comments(&parent_id)
+            .await
+            .expect("post-delete comments")
+            .is_empty(),
+        "comments must cascade with the deleted note",
+    );
+    assert!(matches!(
+        svc.store().get_comment("c1").await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        svc.store().get_comment("c2").await,
+        Err(Error::NotFound(_))
+    ));
+
+    // Child (linked task) note survives with `parent_id` cleared by the 0030
+    // trigger — the reference deleteNote leaves child task notes untouched.
+    let child_after = svc
+        .get_note(ws.clone(), child_id.clone())
+        .await
+        .expect("child survives parent delete");
+    assert_eq!(child_after.parent_id, None);
+
+    // Unrelated note in the same workspace is untouched.
+    let other_after = svc
+        .get_note(ws, other_id)
+        .await
+        .expect("unrelated note untouched");
+    assert_eq!(other_after.content, "other body");
+}
+
 #[tokio::test]
 async fn update_metadata_expected_version_gate_hit_and_miss() {
     let (_tmp, svc, ws, id) = setup("body").await;
