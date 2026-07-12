@@ -21,15 +21,15 @@ use intent_core::events::{
 };
 use intent_core::AgentReverseDispatch;
 use intent_core::{
-    iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId, AgentLite,
-    AgentSession, AuthorType, BoxFuture, ClientId, Comment, CommentAddResult, CommentAnchor,
-    CommentAnchorType, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
-    CommentLocation, CommentResolveThreadResult, CommentRespondResult, CommentRespondThread,
-    CommentStatus, CommentThreadSummary, CommentType, CommentWire, ContentType, Draft, Event,
-    EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity,
-    LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData, LineAttributionInfo,
-    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
+    chief_workspace, iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId,
+    AgentLite, AgentSession, AuthorType, BoxFuture, ClientId, Comment, CommentAddResult,
+    CommentAnchor, CommentAnchorType, CommentDeleteResult, CommentGetThreadResult,
+    CommentListResult, CommentLocation, CommentResolveThreadResult, CommentRespondResult,
+    CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType, CommentWire,
+    ContentType, Draft, Event, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
+    FileActivity, LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData,
+    LineAttributionInfo, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
+    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
     ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams, SessionStats, SetupScript,
@@ -4129,6 +4129,16 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let this = self.clone();
         Box::pin(async move {
+            // Chief is synthesized on read (TS `workspace.service.getWorkspace`
+            // parity): return the canonical `chief_workspace()` shape rather
+            // than whatever the seeded row holds. `activity` still tracks live
+            // Chief-of-Staff agents; card aggregates stay omitted (Chief has
+            // no notes/tasks/PRs/diff to roll up).
+            if id.is_chief() {
+                let mut ws = chief_workspace();
+                ws.activity = this.workspace_activity(&id);
+                return Ok(ws);
+            }
             let mut ws = store.get_workspace(&id).await?;
             // `activity` is derived from live agent state, never persisted (§9.9);
             // the card aggregates are computed fresh on the emit path (§9.1).
@@ -4589,7 +4599,11 @@ impl WorkspaceApi for Services {
         // applied delta (reference-parity FE emitter, §6.5).
         let changes = serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
         Box::pin(async move {
-            let mut ws = store.get_workspace(&id).await?;
+            let mut ws = if id.is_chief() {
+                chief_workspace()
+            } else {
+                store.get_workspace(&id).await?
+            };
             if let Some(v) = update.title {
                 ws.title = v;
             }
@@ -4661,7 +4675,24 @@ impl WorkspaceApi for Services {
                 ws.archived = v;
             }
             ws.updated_at = now_iso();
-            store.update_workspace(&ws).await?;
+            // Chief is virtual: the seeded row is never mutated (TS
+            // `saveWorkspaceUpdates` parity — return the applied delta layered
+            // over the synthesized shape without persisting). Still emit
+            // `workspace:updated` so subscribers see the delta.
+            if ws.id.is_chief() {
+                // Chief's canonical shape pins createdAt/updatedAt/lastActivity
+                // (`CHIEF_WORKSPACE_TIMESTAMP` in `chief_workspace()`). Restore
+                // the invariants so the update response matches the shape
+                // `workspace.get` returns — a caller-supplied `lastActivity` or
+                // the auto-touched `updatedAt` above must not leak through and
+                // diverge Chief's timestamps from `chief_workspace()`.
+                let pinned = chief_workspace();
+                ws.created_at = pinned.created_at;
+                ws.updated_at = pinned.updated_at;
+                ws.last_activity = pinned.last_activity;
+            } else {
+                store.update_workspace(&ws).await?;
+            }
             // Self-sufficient `workspace:updated` payload (§6.5) so every
             // client mirrors the delta without a follow-up read.
             publish_event(&bus, workspace_updated_event(&ws.id, changes)).await;
@@ -4686,6 +4717,12 @@ impl WorkspaceApi for Services {
         let live_turns = self.live_turns.clone();
         let agent_subscriptions = self.agent_subscriptions.clone();
         Box::pin(async move {
+            // Chief is virtual and never appears in `workspace.list`; delete is
+            // a no-op success (TS `workspace.repository.delete` / virtual-guard
+            // parity — the seeded row is not torn down and no cascade fires).
+            if id.is_chief() {
+                return Ok(());
+            }
             // Terminate live agent sessions BEFORE the store cascade drops
             // their rows. A same-slug recreate hitting `agent.list` after the
             // delete would otherwise surface ghost sessions whose workers are
@@ -4852,6 +4889,12 @@ impl WorkspaceApi for Services {
     fn archive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         Box::pin(async move {
+            // Chief cannot be archived: it is a fixed virtual workspace, so
+            // return the synthesized shape unchanged rather than mutating the
+            // seeded row (TS virtual-workspace guard parity).
+            if id.is_chief() {
+                return Ok(chief_workspace());
+            }
             let mut ws = store.get_workspace(&id).await?;
             let now = now_iso();
             ws.status = WorkspaceStatus::Archived;
@@ -4866,6 +4909,9 @@ impl WorkspaceApi for Services {
     fn unarchive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         Box::pin(async move {
+            if id.is_chief() {
+                return Ok(chief_workspace());
+            }
             let mut ws = store.get_workspace(&id).await?;
             ws.status = WorkspaceStatus::Active;
             ws.archived = false;
@@ -4880,6 +4926,10 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            // Chief has no attention state to dismiss (synthesized as `None`).
+            if id.is_chief() {
+                return Ok(chief_workspace());
+            }
             let mut ws = store.get_workspace(&id).await?;
             let changed = ws.attention != WorkspaceAttention::None;
             ws.attention = WorkspaceAttention::None;
@@ -4898,6 +4948,9 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            if id.is_chief() {
+                return Ok(chief_workspace());
+            }
             let mut ws = store.get_workspace(&id).await?;
             // "Seen" clears the unread flag; review-required attention persists.
             if ws.attention == WorkspaceAttention::Unread {

@@ -1,0 +1,450 @@
+//! WSS end-to-end coverage for the daemon-known virtual "Chief of Staff"
+//! workspace (TS `CHIEF_WORKSPACE_ID = '__chief__'` in
+//! `shared/types/branded-ids.ts`). Complements the UDS analogue in
+//! `uds_chief_workspace.rs` and satisfies the WSS-e2e requirement from
+//! `packages/intentd/AGENTS.md` — every method that lands in the router
+//! also has to be exercised over the real `/ws` upgrade, byte-for-byte,
+//! against the JSON-RPC contract in `docs/00_initial_porting/PROTOCOL.md`.
+//!
+//! Drives a real pinned-TLS WebSocket against a live `intentd serve
+//! --listen both` and asserts the exact envelope + payload shapes for:
+//! - `workspace.get({ workspaceId: "__chief__" })` → synthesized shape
+//!   (pinned title / timestamps, empty branch, no repo / worktree).
+//! - `workspace.list` → does not surface Chief (TS `findAll` parity).
+//! - `agent.create({ workspaceId: "__chief__", … })` → succeeds; a
+//!   subsequent `agent.list` sees the row. This is the `agent_session ↦
+//!   workspace(id)` FK-satisfaction test on the real wire path.
+//! - `workspace.update({ workspaceId: "__chief__", … })` → returns the
+//!   applied delta layered over the synthesized shape without persisting;
+//!   pinned timestamps are preserved.
+//! - `workspace.archive` / `workspace.delete` → `{ success: true }`;
+//!   `workspace.dismissAttention` → `{ workspace: … }` with the
+//!   synthesized shape. Chief remains reachable via `workspace.get`.
+
+#![cfg(unix)]
+
+use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use intent_core::{CHIEF_WORKSPACE_ID, CHIEF_WORKSPACE_TIMESTAMP};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpStream, UnixStream};
+use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
+use uuid::Uuid;
+
+const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+
+struct Daemon {
+    child: Child,
+    data_dir: PathBuf,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.data_dir);
+    }
+}
+
+fn free_port() -> u16 {
+    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn temp_data_dir() -> PathBuf {
+    let id = Uuid::new_v4().simple().to_string();
+    let dir = PathBuf::from("/tmp").join(format!("itd-wss-chief-{}", &id[..8]));
+    std::fs::create_dir_all(&dir).expect("mkdir data dir");
+    dir
+}
+
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+    let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd.arg("serve")
+        .arg("--listen")
+        .arg(listen)
+        .env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log));
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.spawn().expect("spawn intentd serve")
+}
+
+async fn await_uds(socket: &Path) -> bool {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if UnixStream::connect(socket).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
+    let stream = UnixStream::connect(socket).await.expect("connect uds");
+    let (read_half, mut write_half) = stream.into_split();
+    let mut line = serde_json::to_string(
+        &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+    )
+    .unwrap();
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await.unwrap();
+    write_half.flush().await.unwrap();
+    let mut reader = BufReader::new(read_half);
+    let mut buf = String::new();
+    timeout(Duration::from_secs(5), reader.read_line(&mut buf))
+        .await
+        .expect("uds rpc timed out")
+        .expect("read uds response");
+    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
+}
+
+#[derive(Debug)]
+struct PinnedVerifier {
+    fingerprint: String,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for PinnedVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let fp = Sha256::digest(end_entity.as_ref())
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        if fp == self.fingerprint {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("fingerprint mismatch".into()))
+        }
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedVerifier {
+            fingerprint: fingerprint.to_string(),
+            provider,
+        }))
+        .with_no_client_auth();
+    Arc::new(config)
+}
+
+async fn connect_ws(
+    port: u16,
+    cfg: Arc<ClientConfig>,
+) -> WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>> {
+    let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .expect("tcp connect");
+    let name = ServerName::try_from("localhost").unwrap();
+    let tls = TlsConnector::from(cfg)
+        .connect(name, tcp)
+        .await
+        .expect("tls connect");
+    let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
+    let (ws, _resp) = tokio_tungstenite::client_async(url, tls)
+        .await
+        .expect("ws handshake");
+    ws
+}
+
+/// Send one JSON-RPC frame and return the full envelope whose id matches;
+/// out-of-band notifications are ignored. Callers assert on `id`, `jsonrpc`,
+/// `result` / `error` themselves so the wire contract stays visible.
+async fn wss_rpc_envelope<S>(
+    ws: &mut WebSocketStream<S>,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    ws.send(Message::Text(frame.to_string()))
+        .await
+        .expect("send rpc frame");
+    loop {
+        let next = timeout(Duration::from_secs(15), ws.next())
+            .await
+            .expect("wss rpc timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["id"] == json!(id) {
+                    return v;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// Full Chief-workspace slice over the real WSS transport. Asserts every
+/// envelope on the wire matches the JSON-RPC contract (`id`, `jsonrpc`, no
+/// `error`, exact `result` payload) so an FE regressing against the
+/// synthesized shape / FK guarantee is caught on the transport CI path,
+/// not just at the service layer.
+#[tokio::test]
+async fn chief_workspace_over_wss() {
+    let data_dir = temp_data_dir();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut ws = connect_ws(port, cfg).await;
+
+    // (a) `workspace.get({ workspaceId: "__chief__" })` returns the
+    //     synthesized Chief shape (TS `getChiefWorkspace` parity).
+    let resp = wss_rpc_envelope(
+        &mut ws,
+        2,
+        "workspace.get",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID }),
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], json!("2.0"));
+    assert_eq!(resp["id"], json!(2));
+    assert!(resp.get("error").is_none(), "workspace.get errored: {resp}");
+    let chief = &resp["result"]["workspace"];
+    assert_eq!(chief["id"], json!(CHIEF_WORKSPACE_ID));
+    assert_eq!(chief["title"], json!("Chief of Staff"));
+    assert_eq!(chief["branch"], json!(""));
+    assert_eq!(chief["status"], json!("Active"));
+    assert_eq!(chief["attention"], json!("none"));
+    assert_eq!(chief["archived"], json!(false));
+    assert_eq!(chief["createdAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
+    assert_eq!(chief["updatedAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
+    assert_eq!(chief["lastActivity"], json!(CHIEF_WORKSPACE_TIMESTAMP));
+    assert!(chief.get("path").map(Value::is_null).unwrap_or(true));
+    assert!(chief
+        .get("worktreePath")
+        .map(Value::is_null)
+        .unwrap_or(true));
+    assert!(chief
+        .get("repositoryName")
+        .map(Value::is_null)
+        .unwrap_or(true));
+
+    // (b) `workspace.list` MUST NOT include `__chief__`.
+    let resp = wss_rpc_envelope(&mut ws, 3, "workspace.list", json!({})).await;
+    assert!(
+        resp.get("error").is_none(),
+        "workspace.list errored: {resp}"
+    );
+    let list = resp["result"]["workspaces"]
+        .as_array()
+        .expect("workspaces array");
+    assert!(
+        !list.iter().any(|w| w["id"] == json!(CHIEF_WORKSPACE_ID)),
+        "workspace.list must not surface Chief: {list:?}"
+    );
+
+    // (c) `agent.create({ workspaceId: "__chief__", … })` succeeds over the
+    //     real WSS transport — the FK-satisfaction path that migration 0033
+    //     unblocks. Regressing the migration would surface here as an
+    //     `error` envelope from the daemon.
+    let resp = wss_rpc_envelope(
+        &mut ws,
+        4,
+        "agent.create",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "name": "Chief Assistant",
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "agent.create on Chief must succeed over WSS: {resp}"
+    );
+    let agent = &resp["result"]["agent"];
+    assert_eq!(agent["workspaceId"], json!(CHIEF_WORKSPACE_ID));
+    assert_eq!(agent["name"], json!("Chief Assistant"));
+    let agent_id = agent["id"].as_str().expect("agent id").to_string();
+
+    let resp = wss_rpc_envelope(
+        &mut ws,
+        5,
+        "agent.list",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID }),
+    )
+    .await;
+    let agents = resp["result"]["agents"]
+        .as_array()
+        .expect("agents array under Chief");
+    assert!(
+        agents.iter().any(|a| a["id"] == json!(agent_id)),
+        "created Chief agent must appear in agent.list over WSS: {agents:?}"
+    );
+
+    // (d) `workspace.update` on Chief returns the applied delta layered
+    //     over the synthesized shape without persisting; pinned timestamps
+    //     are preserved (they diverge if the update path forgets to reset
+    //     `updatedAt`/`lastActivity` for Chief).
+    let resp = wss_rpc_envelope(
+        &mut ws,
+        6,
+        "workspace.update",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID, "statusMessage": "hello wss" }),
+    )
+    .await;
+    let updated = &resp["result"]["workspace"];
+    assert_eq!(updated["id"], json!(CHIEF_WORKSPACE_ID));
+    assert_eq!(updated["statusMessage"], json!("hello wss"));
+    assert_eq!(updated["createdAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
+    assert_eq!(updated["updatedAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
+    assert_eq!(updated["lastActivity"], json!(CHIEF_WORKSPACE_TIMESTAMP));
+    // Not persisted: a follow-up `workspace.get` sees no `statusMessage`.
+    let resp = wss_rpc_envelope(
+        &mut ws,
+        7,
+        "workspace.get",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID }),
+    )
+    .await;
+    assert!(resp["result"]["workspace"]
+        .get("statusMessage")
+        .map(Value::is_null)
+        .unwrap_or(true));
+
+    // (e) `workspace.archive` / `workspace.delete` return `{ success: true }`
+    //     on Chief; the seeded row is not torn down.
+    for (id, method) in [(8, "workspace.archive"), (9, "workspace.delete")] {
+        let resp = wss_rpc_envelope(
+            &mut ws,
+            id,
+            method,
+            json!({ "workspaceId": CHIEF_WORKSPACE_ID }),
+        )
+        .await;
+        assert!(
+            resp.get("error").is_none(),
+            "{method} on Chief must succeed over WSS: {resp}"
+        );
+        assert_eq!(
+            resp["result"]["success"],
+            json!(true),
+            "{method} returns {{success:true}} over WSS: {resp}"
+        );
+    }
+    // `workspace.dismissAttention` returns `{ workspace: ... }` — the
+    // synthesized Chief shape, not `{ success: true }`.
+    let resp = wss_rpc_envelope(
+        &mut ws,
+        10,
+        "workspace.dismissAttention",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "dismissAttention errored: {resp}"
+    );
+    let dismissed = &resp["result"]["workspace"];
+    assert_eq!(dismissed["id"], json!(CHIEF_WORKSPACE_ID));
+    assert_eq!(dismissed["attention"], json!("none"));
+    assert_eq!(dismissed["updatedAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
+
+    // Chief remains reachable via `workspace.get` — never torn down.
+    let resp = wss_rpc_envelope(
+        &mut ws,
+        11,
+        "workspace.get",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID }),
+    )
+    .await;
+    let after = &resp["result"]["workspace"];
+    assert_eq!(after["id"], json!(CHIEF_WORKSPACE_ID));
+    assert_eq!(after["archived"], json!(false));
+    assert_eq!(after["status"], json!("Active"));
+    assert_eq!(after["updatedAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
+}

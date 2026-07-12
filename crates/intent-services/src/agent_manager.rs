@@ -2230,10 +2230,21 @@ fn resolve_spawn(
         .as_ref()
         .map(|m| intent_providers::parse_compound_model_id(m).1)
         .filter(|m| !m.is_empty());
+    // Chief has no worktree/repo on disk; the TS `agent-factory` fallback
+    // (`workspace.id === CHIEF_WORKSPACE_ID ? '/tmp' : undefined`) pins its
+    // spawn `cwd` to `/tmp` so provider processes have a stable, existing
+    // working directory instead of `std::env::temp_dir()`'s longer
+    // `/var/folders/…/T/` path.
     let cwd = workspace
         .and_then(|w| w.path.clone().or_else(|| w.worktree_path.clone()))
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
+        .or_else(|| {
+            workspace
+                .filter(|w| w.id.is_chief())
+                .map(|_| PathBuf::from("/tmp"))
+                .filter(|p| p.is_dir())
+        })
         .unwrap_or_else(std::env::temp_dir);
 
     let mut extra_env = BTreeMap::new();

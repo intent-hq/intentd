@@ -2,7 +2,7 @@
 
 use intent_core::{
     now_iso, Error, PullRequestInfo, Result, SetupScript, TokenUsage, Workspace, WorkspaceActivity,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus, CHIEF_WORKSPACE_ID,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -205,15 +205,19 @@ impl Store {
     }
 
     /// List workspaces, filtering archived rows unless `include_archived`.
+    /// The seeded virtual [`CHIEF_WORKSPACE_ID`] row is always excluded — Chief
+    /// is synthesized on read by the service layer and never surfaces via
+    /// `workspace.list` (TS `findAll` parity, `workspace.repository.ts`).
     pub async fn list_workspaces(&self, include_archived: bool) -> Result<Vec<Workspace>> {
         let sql = if include_archived {
-            format!("SELECT {WORKSPACE_COLUMNS} FROM workspace ORDER BY created_at")
+            format!("SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? ORDER BY created_at")
         } else {
             format!(
-                "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE archived = 0 ORDER BY created_at"
+                "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND archived = 0 ORDER BY created_at"
             )
         };
         let rows = sqlx::query(&sql)
+            .bind(CHIEF_WORKSPACE_ID)
             .fetch_all(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("list workspaces failed: {e}")))?;
