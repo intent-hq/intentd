@@ -351,7 +351,7 @@ async fn note_round_trip() {
         Some(TaskStatus::InProgress)
     );
 
-    let fetched = store.get_note(&note.id).await.expect("get note");
+    let fetched = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(fetched.id, note.id);
 }
 
@@ -403,7 +403,7 @@ async fn note_version_append_list_get_and_prune() {
     }
 
     let versions = store
-        .list_note_versions(&note.id)
+        .list_note_versions(&ws_id, &note.id)
         .await
         .expect("list versions");
     assert_eq!(versions.len(), MAX_NOTE_VERSIONS as usize);
@@ -416,19 +416,25 @@ async fn note_version_append_list_get_and_prune() {
     );
 
     let got = store
-        .get_note_version(&note.id, 6)
+        .get_note_version(&ws_id, &note.id, 6)
         .await
         .expect("get version 6");
     assert_eq!(got.content, "content v6");
     assert_eq!(got.author.author_type, "system");
     // Pruned and never-existing versions are NotFound.
-    assert!(store.get_note_version(&note.id, 5).await.is_err());
-    assert!(store.get_note_version(&note.id, total + 1).await.is_err());
+    assert!(store.get_note_version(&ws_id, &note.id, 5).await.is_err());
+    assert!(store
+        .get_note_version(&ws_id, &note.id, total + 1)
+        .await
+        .is_err());
 
     // Deleting the note cascades to its versions.
-    store.delete_note(&note.id).await.expect("delete note");
+    store
+        .delete_note(&ws_id, &note.id)
+        .await
+        .expect("delete note");
     let after = store
-        .list_note_versions(&note.id)
+        .list_note_versions(&ws_id, &note.id)
         .await
         .expect("list after delete");
     assert!(after.is_empty(), "note delete cascades to note_version");
@@ -466,21 +472,21 @@ async fn note_rev_increments_on_update() {
     store.insert_note(&note).await.expect("insert note");
 
     // Fresh insert starts at rev 0.
-    let after_insert = store.get_note(&note.id).await.expect("get note");
+    let after_insert = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(after_insert.rev, 0);
 
     // First update bumps rev → 1 (the bump is store-owned, ignoring the stale
     // in-memory `rev` carried by the passed-in note).
     note.content = "# Hello v2".to_string();
     store.update_note(&note).await.expect("update note");
-    let after_first = store.get_note(&note.id).await.expect("get note");
+    let after_first = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(after_first.rev, 1);
     assert_eq!(after_first.content, "# Hello v2");
 
     // A second update bumps again → 2 (monotonic).
     note.content = "# Hello v3".to_string();
     store.update_note(&note).await.expect("update note");
-    let after_second = store.get_note(&note.id).await.expect("get note");
+    let after_second = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(after_second.rev, 2);
 }
 
@@ -521,7 +527,7 @@ async fn update_note_versioned_hit_miss_and_absent() {
         .update_note_versioned(&note, Some(0))
         .await
         .expect("versioned hit");
-    let after_hit = store.get_note(&note.id).await.expect("get note");
+    let after_hit = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(after_hit.rev, 1);
     assert_eq!(after_hit.content, "v1");
 
@@ -538,7 +544,7 @@ async fn update_note_versioned_hit_miss_and_absent() {
         other => panic!("expected Conflict, got {other:?}"),
     }
     // The failed conditional write must not have persisted or bumped.
-    let after_miss = store.get_note(&note.id).await.expect("get note");
+    let after_miss = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(after_miss.rev, 1);
     assert_eq!(after_miss.content, "v1");
 
@@ -548,7 +554,7 @@ async fn update_note_versioned_hit_miss_and_absent() {
         .update_note_versioned(&note, None)
         .await
         .expect("absent degrades to last-writer-wins");
-    let after_absent = store.get_note(&note.id).await.expect("get note");
+    let after_absent = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(after_absent.rev, 2);
     assert_eq!(after_absent.content, "v2");
 
@@ -594,7 +600,7 @@ async fn delete_note_versioned_hit_miss_and_absent() {
 
     // MISS: stale expected_version (5, but stored rev is 0) → Conflict carrying
     // the current entity snapshot prior to deletion; the row survives.
-    let conflict = store.delete_note_versioned(&note.id, Some(5)).await;
+    let conflict = store.delete_note_versioned(&ws_id, &note.id, Some(5)).await;
     match conflict {
         Err(intent_core::Error::Conflict { current }) => {
             assert_eq!(current["rev"], 0);
@@ -602,20 +608,20 @@ async fn delete_note_versioned_hit_miss_and_absent() {
         }
         other => panic!("expected Conflict, got {other:?}"),
     }
-    assert!(store.get_note(&note.id).await.is_ok());
+    assert!(store.get_note(&ws_id, &note.id).await.is_ok());
 
     // HIT: expected_version matches the stored rev (0) → row deleted.
     store
-        .delete_note_versioned(&note.id, Some(0))
+        .delete_note_versioned(&ws_id, &note.id, Some(0))
         .await
         .expect("versioned delete hit");
-    match store.get_note(&note.id).await {
+    match store.get_note(&ws_id, &note.id).await {
         Err(intent_core::Error::NotFound(_)) => {}
         other => panic!("expected NotFound after delete, got {other:?}"),
     }
 
     // A versioned delete against a missing row is NotFound (not Conflict).
-    match store.delete_note_versioned(&note.id, Some(0)).await {
+    match store.delete_note_versioned(&ws_id, &note.id, Some(0)).await {
         Err(intent_core::Error::NotFound(_)) => {}
         other => panic!("expected NotFound for absent row, got {other:?}"),
     }
@@ -630,10 +636,10 @@ async fn delete_note_versioned_hit_miss_and_absent() {
     };
     store.insert_note(&other).await.expect("insert note 2");
     store
-        .delete_note_versioned(&other.id, None)
+        .delete_note_versioned(&ws_id, &other.id, None)
         .await
         .expect("unconditional delete");
-    match store.get_note(&other.id).await {
+    match store.get_note(&ws_id, &other.id).await {
         Err(intent_core::Error::NotFound(_)) => {}
         other => panic!("expected NotFound after unconditional delete, got {other:?}"),
     }

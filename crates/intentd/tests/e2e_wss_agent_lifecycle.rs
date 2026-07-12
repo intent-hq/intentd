@@ -3992,6 +3992,86 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
     assert_eq!(user_count, 1, "replay delivered no second prompt: {conv}");
 }
 
+/// Regression for the composite `(id, workspace_id)` note PK (migration 0030
+/// + `feat(services): workspace-scope note lookups + seed spec per workspace`):
+/// two `workspace.create` calls each seed their own `spec` note. Over the
+/// real WSS transport the client can call `note.get {noteId: "spec"}` against
+/// either workspace and receive a distinct row scoped to that workspace, with
+/// no cross-workspace bleed of body, title, or `workspaceId`.
+#[tokio::test]
+async fn workspace_create_seeds_per_workspace_spec_over_wss() {
+    let data_dir = temp_data_dir();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    let ws_a = wss_rpc(
+        &mut rpc,
+        10,
+        "workspace.create",
+        json!({ "title": "Alpha", "branch": "feat/spec-ws-a" }),
+    )
+    .await;
+    let ws_a_id = ws_a["workspace"]["id"]
+        .as_str()
+        .expect("ws_a id")
+        .to_string();
+    let ws_b = wss_rpc(
+        &mut rpc,
+        11,
+        "workspace.create",
+        json!({ "title": "Beta", "branch": "feat/spec-ws-b" }),
+    )
+    .await;
+    let ws_b_id = ws_b["workspace"]["id"]
+        .as_str()
+        .expect("ws_b id")
+        .to_string();
+    assert_ne!(ws_a_id, ws_b_id, "two distinct workspaces created");
+
+    let spec_a = wss_rpc(
+        &mut rpc,
+        12,
+        "note.get",
+        json!({ "workspaceId": ws_a_id, "noteId": "spec" }),
+    )
+    .await;
+    let spec_b = wss_rpc(
+        &mut rpc,
+        13,
+        "note.get",
+        json!({ "workspaceId": ws_b_id, "noteId": "spec" }),
+    )
+    .await;
+    let note_a = &spec_a["note"];
+    let note_b = &spec_b["note"];
+    assert_eq!(note_a["id"], "spec", "ws_a spec addressable: {spec_a}");
+    assert_eq!(note_b["id"], "spec", "ws_b spec addressable: {spec_b}");
+    assert_eq!(note_a["workspaceId"], ws_a_id, "ws_a spec scoped to ws_a");
+    assert_eq!(note_b["workspaceId"], ws_b_id, "ws_b spec scoped to ws_b");
+    for note in [note_a, note_b] {
+        assert_eq!(note["title"], "Spec");
+        assert_eq!(note["content"], "");
+        assert_eq!(note["tags"], json!(["spec"]));
+        assert_eq!(note["isPinned"], true);
+        assert_eq!(note["isDefault"], true);
+    }
+}
+
 /// Init a small local git repo (one commit) and return its on-disk path. Used
 /// by the WSS clone-orchestration e2e as a `file://` source. Skips the test
 /// when `git` is unavailable on `PATH` by returning `None`.

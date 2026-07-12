@@ -705,8 +705,12 @@ impl Services {
         };
         let mut out: Vec<(String, String)> = Vec::new();
         for note_id in note_ids {
-            let note = match self.store.get_note(&NoteId::from(note_id.as_str())).await {
-                Ok(n) if &n.workspace_id == workspace_id => n,
+            let note = match self
+                .store
+                .get_note(workspace_id, &NoteId::from(note_id.as_str()))
+                .await
+            {
+                Ok(n) => n,
                 _ => continue,
             };
             for url in extract_markdown_image_urls(&note.content) {
@@ -1294,14 +1298,11 @@ fn build_event_notification_metadata(events: &[&Event]) -> serde_json::Value {
     })
 }
 
-/// Fetch a note scoped to `workspace_id`; `NotFound` if absent or in another
-/// workspace. Used by the CRUD `note.get`/`note.update` paths.
+/// Fetch a note scoped to `workspace_id`; `NotFound` if absent. Note identity
+/// is composite (`(id, workspace_id)`, migration 0030), so the store call is
+/// already workspace-safe — this helper stays for call-site clarity.
 async fn fetch_note(store: &Store, workspace_id: &WorkspaceId, note_id: &NoteId) -> Result<Note> {
-    match store.get_note(note_id).await {
-        Ok(n) if &n.workspace_id == workspace_id => Ok(n),
-        Ok(_) | Err(Error::NotFound(_)) => Err(Error::NotFound(format!("note {note_id}"))),
-        Err(e) => Err(e),
-    }
+    store.get_note(workspace_id, note_id).await
 }
 
 /// Author stamp for daemon-captured note versions. `note.*` writes carry no
@@ -1368,10 +1369,14 @@ impl Services {
         note_id: &NoteId,
     ) -> Result<LineAttributionData> {
         let note = fetch_note(&self.store, workspace_id, note_id).await?;
-        let summaries = self.store.list_note_versions(note_id).await?;
+        let summaries = self.store.list_note_versions(workspace_id, note_id).await?;
         let mut versions: Vec<NoteVersion> = Vec::with_capacity(summaries.len());
         for summary in &summaries {
-            versions.push(self.store.get_note_version(note_id, summary.v).await?);
+            versions.push(
+                self.store
+                    .get_note_version(workspace_id, note_id, summary.v)
+                    .await?,
+            );
         }
         let attributions = line_attribution::attribute_lines(&note.content, &versions);
         let mut map: std::collections::BTreeMap<String, LineAttributionInfo> =
@@ -1463,12 +1468,9 @@ impl Services {
 /// `notes.service.ts ensureSpecExists`). Idempotent: if a spec note already
 /// exists in this workspace, this is a no-op; otherwise it inserts the default
 /// Spec (empty markdown, pinned, default, workspace visibility), captures the
-/// initial version, and publishes `note:created`.
-///
-/// The `note` table's primary key is globally unique, so if a spec row already
-/// exists under a *different* workspace the insert is skipped with a warning:
-/// per-workspace scoping of well-known ids is a pre-existing store limitation
-/// (tracked separately) and must not fail the workspace create.
+/// initial version, and publishes `note:created`. Note identity is composite
+/// (`(id, workspace_id)`, migration 0030), so every workspace owns its own
+/// spec — no cross-workspace collision is possible.
 async fn ensure_spec_note(
     store: &Store,
     bus: &Option<EventBus>,
@@ -1479,14 +1481,6 @@ async fn ensure_spec_note(
         Ok(_) => return Ok(()),
         Err(Error::NotFound(_)) => {}
         Err(e) => return Err(e),
-    }
-    if let Ok(existing) = store.get_note(&spec_id).await {
-        tracing::warn!(
-            workspace = %workspace_id.as_str(),
-            other_workspace = %existing.workspace_id.as_str(),
-            "workspace.create: spec note already owned by another workspace; skipping seed"
-        );
-        return Ok(());
     }
     let now = now_iso();
     let note = Note {
@@ -1529,11 +1523,9 @@ async fn fetch_note_peer(
     workspace_id: &WorkspaceId,
     note_id: &NoteId,
 ) -> Result<Note> {
-    match store.get_note(note_id).await {
-        Ok(n) if &n.workspace_id == workspace_id => Ok(n),
-        Ok(_) | Err(Error::NotFound(_)) => {
-            Err(Error::Internal(format!("Note not found: {note_id}")))
-        }
+    match store.get_note(workspace_id, note_id).await {
+        Ok(n) => Ok(n),
+        Err(Error::NotFound(_)) => Err(Error::Internal(format!("Note not found: {note_id}"))),
         Err(e) => Err(e),
     }
 }
@@ -2988,10 +2980,7 @@ impl Services {
             .await
         {
             Ok(r) => {
-                let refetched_note = match self.store.get_note(note_id).await {
-                    Ok(n) if n.workspace_id == *workspace_id => Some(n),
-                    _ => None,
-                };
+                let refetched_note = self.store.get_note(workspace_id, note_id).await.ok();
                 AutoConvertOutcome {
                     converted_count: r.converted_count,
                     created_note_ids: r.created_note_ids,
@@ -3993,9 +3982,9 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let target =
                 sibling_workspace_or_throw(&store, &workspace_id, &target_workspace_id).await?;
-            let note = match store.get_note(&note_id).await {
-                Ok(n) if n.workspace_id == target_workspace_id => n,
-                Ok(_) | Err(Error::NotFound(_)) => {
+            let note = match store.get_note(&target_workspace_id, &note_id).await {
+                Ok(n) => n,
+                Err(Error::NotFound(_)) => {
                     return Err(Error::Internal(format!(
                         "Note not found: {note_id} in workspace {target_workspace_id}"
                     )));
@@ -5514,7 +5503,7 @@ impl WorkspaceApi for Services {
             // Scope-check first so a foreign/absent note yields the peer message.
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             store
-                .delete_note_versioned(&note_id, expected_version)
+                .delete_note_versioned(&workspace_id, &note_id, expected_version)
                 .await?;
             services.crdt_notes.remove(&workspace_id, &note_id);
             publish_event(
@@ -5623,7 +5612,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             // Scope check: 404 if the note is missing or in another workspace.
             fetch_note(&store, &workspace_id, &note_id).await?;
-            store.list_note_versions(&note_id).await
+            store.list_note_versions(&workspace_id, &note_id).await
         })
     }
 
@@ -5636,7 +5625,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             fetch_note(&store, &workspace_id, &note_id).await?;
-            store.get_note_version(&note_id, v).await
+            store.get_note_version(&workspace_id, &note_id, v).await
         })
     }
 
@@ -5651,7 +5640,7 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
-            let version = store.get_note_version(&note_id, v).await?;
+            let version = store.get_note_version(&workspace_id, &note_id, v).await?;
             note.title = version.title;
             note.content = version.content;
             note.updated_at = now_iso();
@@ -5939,9 +5928,9 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<WorkspaceTask>> {
         let store = self.store.clone();
         Box::pin(async move {
-            let note = match store.get_note(&task_note_id).await {
-                Ok(n) if n.workspace_id == workspace_id => n,
-                Ok(_) | Err(Error::NotFound(_)) => {
+            let note = match store.get_note(&workspace_id, &task_note_id).await {
+                Ok(n) => n,
+                Err(Error::NotFound(_)) => {
                     return Err(Error::NotFound(format!("task note {task_note_id}")))
                 }
                 Err(e) => return Err(e),
@@ -5957,9 +5946,9 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<TaskGetMyTaskResult>> {
         let store = self.store.clone();
         Box::pin(async move {
-            let note = match store.get_note(&task_note_id).await {
-                Ok(n) if n.workspace_id == workspace_id => n,
-                Ok(_) | Err(Error::NotFound(_)) => {
+            let note = match store.get_note(&workspace_id, &task_note_id).await {
+                Ok(n) => n,
+                Err(Error::NotFound(_)) => {
                     return Err(Error::Internal("Task note not found".to_string()))
                 }
                 Err(e) => return Err(e),
@@ -6166,9 +6155,9 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let store = &services.store;
             // Verify the dependent note exists in this workspace.
-            match store.get_note(&dependent_note_id).await {
-                Ok(n) if n.workspace_id == workspace_id => {}
-                Ok(_) | Err(Error::NotFound(_)) => {
+            match store.get_note(&workspace_id, &dependent_note_id).await {
+                Ok(_) => {}
+                Err(Error::NotFound(_)) => {
                     return Err(Error::Internal(format!(
                         "Dependent note not found: {dependent_note_id}"
                     )))
@@ -6210,9 +6199,9 @@ impl WorkspaceApi for Services {
                     "Invalid agentId format: \"{agent_id}\". Agent IDs must be in format \"agent-{{uuid}}\" (e.g., \"agent-b0a8044a-5eac-4b52-8456-15d3b784decb\"). To create a new agent and assign it to this task, use create_agent with taskNoteId=\"{note_id}\" instead."
                 )));
             }
-            let mut note = match store.get_note(&note_id).await {
-                Ok(n) if n.workspace_id == workspace_id => n,
-                Ok(_) | Err(Error::NotFound(_)) => {
+            let mut note = match store.get_note(&workspace_id, &note_id).await {
+                Ok(n) => n,
+                Err(Error::NotFound(_)) => {
                     return Err(Error::Internal(format!("Note not found: {note_id}")))
                 }
                 Err(e) => return Err(e),

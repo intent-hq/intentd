@@ -1106,25 +1106,33 @@ async fn convert_blocks_creates_children_idempotently() {
     // The conversion write appends a version snapshot whose content matches
     // the converted (fence-free) parent content (TS parity: the reference
     // pushes a version as part of the conversion save).
-    let versions = svc.store.list_note_versions(&id).await.expect("versions");
+    let versions = svc
+        .store
+        .list_note_versions(&ws, &id)
+        .await
+        .expect("versions");
     assert_eq!(versions.len(), 1);
     let v = svc
         .store
-        .get_note_version(&id, versions[0].v)
+        .get_note_version(&ws, &id, versions[0].v)
         .await
         .expect("version");
     assert_eq!(v.content, updated.content);
 
     // Re-running is idempotent: the existing child is reused, none created.
     let r2 = svc
-        .convert_task_blocks(ws, id.clone())
+        .convert_task_blocks(ws.clone(), id.clone())
         .await
         .expect("convertBlocks2");
     assert_eq!(r2.converted_count, 0);
     assert!(r2.created_note_ids.is_empty());
 
     // No-op re-run must not append another version.
-    let versions = svc.store.list_note_versions(&id).await.expect("versions");
+    let versions = svc
+        .store
+        .list_note_versions(&ws, &id)
+        .await
+        .expect("versions");
     assert_eq!(versions.len(), 1);
 }
 
@@ -2726,7 +2734,7 @@ mod change_event_parity {
         // Persisted spec matches the reference default.
         let spec = h
             .store
-            .get_note(&NoteId::from("spec"))
+            .get_note(&created.id, &NoteId::from("spec"))
             .await
             .expect("spec exists");
         assert_eq!(spec.workspace_id, created.id);
@@ -2742,7 +2750,7 @@ mod change_event_parity {
         // Initial version snapshot captured.
         let versions = h
             .store
-            .list_note_versions(&NoteId::from("spec"))
+            .list_note_versions(&created.id, &NoteId::from("spec"))
             .await
             .expect("versions");
         assert_eq!(versions.len(), 1);
@@ -2759,8 +2767,6 @@ mod change_event_parity {
 
     /// Spec seeding is idempotent inside the create scope: a replay with the
     /// same `idempotencyKey` short-circuits and does not attempt to reinsert.
-    /// (Cross-workspace collision under the current globally-unique `note.id`
-    /// schema is exercised in `spec_seed_skips_when_owned_by_another_workspace`.)
     #[tokio::test]
     async fn workspace_create_spec_seed_replay_no_duplicate() {
         use intent_core::{NoteId, WorkspaceCreate};
@@ -2793,24 +2799,24 @@ mod change_event_parity {
             .expect("replay create");
         let spec = h
             .store
-            .get_note(&NoteId::from("spec"))
+            .get_note(&first.id, &NoteId::from("spec"))
             .await
             .expect("spec exists");
         assert_eq!(spec.workspace_id, first.id);
         let versions = h
             .store
-            .list_note_versions(&NoteId::from("spec"))
+            .list_note_versions(&first.id, &NoteId::from("spec"))
             .await
             .expect("versions");
         assert_eq!(versions.len(), 1, "replay must not append a second version");
     }
 
-    /// Under the current schema (`note.id` is globally unique), a second
-    /// workspace's spec seed is skipped with a warning rather than failing
-    /// `workspace.create`. Documents the known limitation exercised by this
-    /// path so a future schema fix has a regression anchor.
+    /// Note identity is composite (`(id, workspace_id)`, migration 0030): each
+    /// workspace owns its own `spec` note. Two separate `workspace.create`
+    /// calls each seed a fresh spec scoped to their workspace; there is no
+    /// cross-workspace collision on the well-known `spec` id.
     #[tokio::test]
-    async fn spec_seed_skips_when_owned_by_another_workspace() {
+    async fn spec_seed_is_workspace_scoped_no_cross_workspace_collision() {
         use intent_core::{NoteId, WorkspaceCreate};
         let h = harness().await;
         let first = h
@@ -2840,12 +2846,18 @@ mod change_event_parity {
             .expect("second create")
             .workspace;
         assert_ne!(second.id, first.id);
-        let spec = h
+        let spec_a = h
             .store
-            .get_note(&NoteId::from("spec"))
+            .get_note(&first.id, &NoteId::from("spec"))
             .await
-            .expect("spec exists");
-        assert_eq!(spec.workspace_id, first.id, "spec stays with first ws");
+            .expect("first spec exists");
+        assert_eq!(spec_a.workspace_id, first.id);
+        let spec_b = h
+            .store
+            .get_note(&second.id, &NoteId::from("spec"))
+            .await
+            .expect("second spec exists");
+        assert_eq!(spec_b.workspace_id, second.id);
     }
 }
 

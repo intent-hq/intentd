@@ -70,11 +70,15 @@ impl Store {
         rows.iter().map(map_note_row).collect()
     }
 
-    /// Fetch a single note by id, or `NotFound`.
-    pub async fn get_note(&self, id: &NoteId) -> Result<Note> {
-        let sql = format!("SELECT {NOTE_COLUMNS} FROM note WHERE id = ?");
+    /// Fetch a single note by (workspace, id), or `NotFound`. Note identity is
+    /// composite (`(id, workspace_id)`, migration 0030) so callers must supply
+    /// both halves; bare-id lookups would silently match a same-id note owned
+    /// by another workspace.
+    pub async fn get_note(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<Note> {
+        let sql = format!("SELECT {NOTE_COLUMNS} FROM note WHERE id = ? AND workspace_id = ?");
         let row = sqlx::query(&sql)
             .bind(&id.0)
+            .bind(&workspace_id.0)
             .fetch_optional(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("get note failed: {e}")))?;
@@ -84,20 +88,24 @@ impl Store {
         }
     }
 
-    /// Update an existing note (full-row replace, except `id`), or `NotFound`.
-    /// Unconditional last-writer-wins bump of `rev`; `metadata.task` is stored
-    /// opaquely as `task_json` TEXT.
+    /// Update an existing note (full-row replace, except `id` and
+    /// `workspace_id`), or `NotFound`. Unconditional last-writer-wins bump of
+    /// `rev`; `metadata.task` is stored opaquely as `task_json` TEXT. The write
+    /// is scoped by the note's own `workspace_id` so same-id notes across
+    /// workspaces never collide.
     pub async fn update_note(&self, note: &Note) -> Result<()> {
         self.update_note_versioned(note, None).await
     }
 
     /// Update an existing note, optionally gating on `expected_version`
-    /// (optimistic concurrency, PROTOCOL §5.6). When `expected_version` is
-    /// `Some(rev)`, the write is a conditional `... WHERE id = ? AND rev = ?`
-    /// that only succeeds if the stored `rev` matches; on a 0-row result the row
-    /// is re-read to distinguish a [`Error::Conflict`] (row present, carrying the
-    /// current entity) from a [`Error::NotFound`] (row absent). When `None`, this
-    /// is the unconditional last-writer-wins bump. In all cases `rev` increments.
+    /// (optimistic concurrency, PROTOCOL §5.6). Scoped by
+    /// `(id, workspace_id)` (migration 0030 composite PK). When
+    /// `expected_version` is `Some(rev)`, the write is a conditional
+    /// `... WHERE id = ? AND workspace_id = ? AND rev = ?` that only succeeds
+    /// if the stored `rev` matches; on a 0-row result the row is re-read to
+    /// distinguish a [`Error::Conflict`] (row present, carrying the current
+    /// entity) from a [`Error::NotFound`] (row absent). When `None`, this is
+    /// the unconditional last-writer-wins bump. In all cases `rev` increments.
     pub async fn update_note_versioned(
         &self,
         note: &Note,
@@ -112,15 +120,14 @@ impl Store {
             None => None,
         };
         let mut sql = String::from(
-            "UPDATE note SET workspace_id=?, title=?, content=?, content_type=?, tags=?, \
+            "UPDATE note SET title=?, content=?, content_type=?, tags=?, \
              is_pinned=?, is_archived=?, is_default=?, parent_id=?, visibility=?, task_json=?, \
-             created_at=?, updated_at=?, rev = rev + 1 WHERE id=?",
+             created_at=?, updated_at=?, rev = rev + 1 WHERE id=? AND workspace_id=?",
         );
         if expected_version.is_some() {
             sql.push_str(" AND rev=?");
         }
         let mut query = sqlx::query(&sql)
-            .bind(&note.workspace_id.0)
             .bind(&note.title)
             .bind(&note.content)
             .bind(enum_to_db(&note.content_type)?)
@@ -133,7 +140,8 @@ impl Store {
             .bind(task_json)
             .bind(&note.created_at)
             .bind(&note.updated_at)
-            .bind(&note.id.0);
+            .bind(&note.id.0)
+            .bind(&note.workspace_id.0);
         if let Some(rev) = expected_version {
             query = query.bind(rev);
         }
@@ -142,9 +150,10 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("update note failed: {e}")))?;
         if res.rows_affected() == 0 {
-            // Re-read by id: a present row means the `expected_version` gate
-            // failed (conflict); an absent row is a genuine not-found.
-            return match self.get_note(&note.id).await {
+            // Re-read by composite key: a present row means the
+            // `expected_version` gate failed (conflict); an absent row is a
+            // genuine not-found.
+            return match self.get_note(&note.workspace_id, &note.id).await {
                 Ok(current) => {
                     let current = serde_json::to_value(&current)
                         .map_err(|e| Error::Internal(format!("encode current note failed: {e}")))?;
@@ -157,41 +166,47 @@ impl Store {
         Ok(())
     }
 
-    /// Delete a note by id (unconditional), or `NotFound`.
-    pub async fn delete_note(&self, id: &NoteId) -> Result<()> {
-        self.delete_note_versioned(id, None).await
+    /// Delete a note by (workspace, id), unconditional. `NotFound` if absent.
+    pub async fn delete_note(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<()> {
+        self.delete_note_versioned(workspace_id, id, None).await
     }
 
     /// Delete a note, optionally gating on `expected_version` (optimistic
-    /// concurrency, PROTOCOL §5.6). When `expected_version` is `Some(rev)`, the
-    /// delete is conditional (`... WHERE id = ? AND rev = ?`); on a 0-row result
-    /// the row is re-read to distinguish a [`Error::Conflict`] (row present,
-    /// carrying the current entity snapshot prior to deletion) from a
-    /// [`Error::NotFound`] (row absent). When `None`, this is the unconditional
-    /// delete.
+    /// concurrency, PROTOCOL §5.6). Scoped by `(id, workspace_id)` (migration
+    /// 0030 composite PK). When `expected_version` is `Some(rev)`, the delete
+    /// is conditional (`... WHERE id = ? AND workspace_id = ? AND rev = ?`);
+    /// on a 0-row result the row is re-read to distinguish a
+    /// [`Error::Conflict`] (row present, carrying the current entity snapshot
+    /// prior to deletion) from a [`Error::NotFound`] (row absent). When
+    /// `None`, this is the unconditional delete.
     pub async fn delete_note_versioned(
         &self,
+        workspace_id: &WorkspaceId,
         id: &NoteId,
         expected_version: Option<i64>,
     ) -> Result<()> {
         let res = match expected_version {
-            Some(rev) => sqlx::query("DELETE FROM note WHERE id = ? AND rev = ?")
+            Some(rev) => {
+                sqlx::query("DELETE FROM note WHERE id = ? AND workspace_id = ? AND rev = ?")
+                    .bind(&id.0)
+                    .bind(&workspace_id.0)
+                    .bind(rev)
+                    .execute(self.pool())
+                    .await
+                    .map_err(|e| Error::Internal(format!("delete note failed: {e}")))?
+            }
+            None => sqlx::query("DELETE FROM note WHERE id = ? AND workspace_id = ?")
                 .bind(&id.0)
-                .bind(rev)
-                .execute(self.pool())
-                .await
-                .map_err(|e| Error::Internal(format!("delete note failed: {e}")))?,
-            None => sqlx::query("DELETE FROM note WHERE id = ?")
-                .bind(&id.0)
+                .bind(&workspace_id.0)
                 .execute(self.pool())
                 .await
                 .map_err(|e| Error::Internal(format!("delete note failed: {e}")))?,
         };
         if res.rows_affected() == 0 {
-            // Re-read by id: a present row means the `expected_version` gate
-            // failed (conflict, carrying the current snapshot); an absent row is
-            // a genuine not-found.
-            return match self.get_note(id).await {
+            // Re-read by composite key: a present row means the
+            // `expected_version` gate failed (conflict, carrying the current
+            // snapshot); an absent row is a genuine not-found.
+            return match self.get_note(workspace_id, id).await {
                 Ok(current) => {
                     let current = serde_json::to_value(&current)
                         .map_err(|e| Error::Internal(format!("encode current note failed: {e}")))?;
