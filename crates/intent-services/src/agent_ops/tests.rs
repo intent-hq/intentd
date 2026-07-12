@@ -1448,6 +1448,94 @@ async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
     );
 }
 
+/// Copilot #104 (thread PRRT_kwDOS9Wxuc6QKTPK): `agent.reportToParent` must
+/// scope-guard the caller-supplied `workspace_id` the same way `agent.get` /
+/// `agent.getConversation` do — a call whose `workspace_id` does not match
+/// the caller session's own workspace is rejected with `NotFound` before any
+/// state changes (completion-report persistence, `review_required`
+/// transition, subscription notification). The child session must remain
+/// untouched (no `completionReport`, no `updated_at` bump).
+#[tokio::test]
+async fn report_to_parent_cross_workspace_rejected_and_has_no_side_effects() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("insert ws_b");
+
+    let parent = create_agent(&svc, &ws_a, "Parent").await;
+    let created = svc
+        .agent_create_op(
+            ws_a.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let before = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("load child before");
+    assert!(before.completion_report.is_none());
+    assert!(before.completion_report_timestamp.is_none());
+
+    // Cross-workspace call: the child lives in ws_a but the caller supplies
+    // ws_b. The scope guard mirrors `agent_get_op` / `agent_get_conversation_op`
+    // and returns `NotFound`.
+    let err = svc
+        .agent_report_to_parent_op(ws_b.clone(), json!("cross-workspace"), Some(child.clone()))
+        .await
+        .expect_err("cross-workspace reportToParent must be rejected");
+    match err {
+        Error::NotFound(msg) => assert!(
+            msg.contains(child.0.as_str()),
+            "NotFound message should reference the child agent id: {msg}"
+        ),
+        other => panic!("expected Error::NotFound, got {other:?}"),
+    }
+
+    // No side effects: the persisted session is byte-identical to `before`.
+    let after = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("load child after");
+    assert!(
+        after.completion_report.is_none(),
+        "completion_report must not be persisted on a rejected cross-workspace call: {:?}",
+        after.completion_report
+    );
+    assert!(
+        after.completion_report_timestamp.is_none(),
+        "completion_report_timestamp must not be set on a rejected cross-workspace call: {:?}",
+        after.completion_report_timestamp
+    );
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "child session updated_at must not be bumped on rejection: {} -> {}",
+        before.updated_at, after.updated_at
+    );
+
+    // Same-workspace call still succeeds (the guard is a scope check, not a
+    // regression to the normal path).
+    let ok = svc
+        .agent_report_to_parent_op(ws_a.clone(), json!("in-workspace"), Some(child.clone()))
+        .await
+        .expect("in-workspace reportToParent must succeed");
+    assert_eq!(ok["ok"], json!(true));
+    assert_eq!(ok["parentAgentId"].as_str(), Some(parent.0.as_str()));
+}
+
 /// SUB-2 end-to-end: `agent.reportToParent` emits zero immediate wakes; the
 /// single parent wake is delivered by the child's terminal `agent:idle` via
 /// the still-armed completion watch, and the wake text carries the persisted

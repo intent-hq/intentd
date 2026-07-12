@@ -1779,7 +1779,7 @@ impl Services {
     /// the group's aggregated wake still folds this child's report in.
     pub(crate) async fn agent_report_to_parent_op(
         &self,
-        _workspace_id: WorkspaceId,
+        workspace_id: WorkspaceId,
         report: Value,
         caller_agent_id: Option<AgentId>,
     ) -> Result<Value> {
@@ -1788,6 +1788,16 @@ impl Services {
         };
         let caller = caller_agent_id.ok_or_else(not_delegated)?;
         let mut session = self.load_session_internal(&caller).await?;
+        // Copilot #104 (thread PRRT_kwDOS9Wxuc6QKTPK): scope-guard the
+        // caller-supplied `workspace_id` the same way `agent_get_op` /
+        // `agent_get_conversation_op` do — reject a cross-workspace mismatch
+        // with `NotFound` before any state changes (report persistence,
+        // `review_required` transition, subscription notification), so a
+        // request targeting the wrong workspace never mutates the session's
+        // actual workspace by side effect.
+        if session.workspace_id != workspace_id {
+            return Err(Error::NotFound(format!("agent session {caller}")));
+        }
         let parent = session.parent_agent_id.clone().ok_or_else(not_delegated)?;
         // `report` is declared as a string on the MCP surface; coerce other
         // JSON shapes to their textual form for delivery.
