@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use intent_core::{
     now_iso, ContentType, Error, Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput,
-    NoteId, NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    NoteId, NoteMetadata, NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity,
+    WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
 
@@ -110,7 +110,7 @@ fn note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
         is_default: false,
         parent_id: None,
         visibility: NoteVisibility::Workspace,
-        task: None,
+        metadata: NoteMetadata::default(),
         created_at: ts.clone(),
         rev: 0,
         updated_at: ts,
@@ -156,7 +156,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     let mk_task = |id: &str, status: TaskStatus| {
         let mut tn = note(&ws, id, "body");
         tn.parent_id = Some(NoteId::from("spec"));
-        tn.task = Some(TaskMetadata {
+        tn.metadata.task = Some(TaskMetadata {
             status,
             ..Default::default()
         });
@@ -835,7 +835,14 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
         .await
         .expect("updateNoteStatus");
     assert_eq!(upd.status, intent_core::TaskStatus::InProgress);
-    assert!(upd.note.task.as_ref().unwrap().started_at.is_some());
+    assert!(upd
+        .note
+        .metadata
+        .task
+        .as_ref()
+        .unwrap()
+        .started_at
+        .is_some());
 
     // Invalid status string rejected with the TS-style message.
     assert!(svc
@@ -894,7 +901,7 @@ async fn task_list_and_get_project_workspace_tasks() {
         let mut tn = note(&ws, id, "body");
         tn.title = title.to_string();
         tn.parent_id = Some(NoteId::from("spec"));
-        tn.task = Some(TaskMetadata {
+        tn.metadata.task = Some(TaskMetadata {
             status,
             ..Default::default()
         });
@@ -994,7 +1001,7 @@ async fn assign_agent_validates_and_starts_task() {
         .expect("assignAgent");
     assert_eq!(r.agent_id.0, agent);
     let note = svc.get_note(ws, id).await.unwrap();
-    let task = note.task.unwrap();
+    let task = note.metadata.task.unwrap();
     assert_eq!(task.status, intent_core::TaskStatus::InProgress);
     assert_eq!(task.assigned_agent_ids[0].0, agent);
 }
@@ -1013,7 +1020,7 @@ async fn remove_agent_from_all_tasks_strips_id_only_from_matching_tasks() {
 
     // Task A: assigned to both `victim` and `other`.
     let mut a = note(&ws, "task-a", "a");
-    a.task = Some(TaskMetadata {
+    a.metadata.task = Some(TaskMetadata {
         status: TaskStatus::InProgress,
         assigned_agent_ids: vec![victim.clone(), other.clone()],
         ..Default::default()
@@ -1022,7 +1029,7 @@ async fn remove_agent_from_all_tasks_strips_id_only_from_matching_tasks() {
 
     // Task B: assigned only to `other` (must be left untouched).
     let mut b = note(&ws, "task-b", "b");
-    b.task = Some(TaskMetadata {
+    b.metadata.task = Some(TaskMetadata {
         status: TaskStatus::NotStarted,
         assigned_agent_ids: vec![other.clone()],
         ..Default::default()
@@ -1031,7 +1038,7 @@ async fn remove_agent_from_all_tasks_strips_id_only_from_matching_tasks() {
 
     // Task C: assigned only to `victim`.
     let mut c = note(&ws, "task-c", "c");
-    c.task = Some(TaskMetadata {
+    c.metadata.task = Some(TaskMetadata {
         status: TaskStatus::NotStarted,
         assigned_agent_ids: vec![victim.clone()],
         ..Default::default()
@@ -1056,17 +1063,20 @@ async fn remove_agent_from_all_tasks_strips_id_only_from_matching_tasks() {
         .get_note(ws.clone(), NoteId::from("task-a"))
         .await
         .unwrap();
-    assert_eq!(a.task.unwrap().assigned_agent_ids, vec![other.clone()]);
+    assert_eq!(
+        a.metadata.task.unwrap().assigned_agent_ids,
+        vec![other.clone()]
+    );
     let b = svc
         .get_note(ws.clone(), NoteId::from("task-b"))
         .await
         .unwrap();
-    assert_eq!(b.task.unwrap().assigned_agent_ids, vec![other]);
+    assert_eq!(b.metadata.task.unwrap().assigned_agent_ids, vec![other]);
     let c = svc
         .get_note(ws.clone(), NoteId::from("task-c"))
         .await
         .unwrap();
-    assert!(c.task.unwrap().assigned_agent_ids.is_empty());
+    assert!(c.metadata.task.unwrap().assigned_agent_ids.is_empty());
 
     // Idempotent: replaying with the now-absent id updates nothing.
     let r2 = svc
@@ -2125,7 +2135,7 @@ mod change_event_parity {
         // Pre-insert a task note directly (no event) so the only published event
         // is the status change.
         let mut tn = note(&h.ws, "task-1", "body");
-        tn.task = Some(TaskMetadata {
+        tn.metadata.task = Some(TaskMetadata {
             status: TaskStatus::NotStarted,
             ..Default::default()
         });
@@ -2156,7 +2166,7 @@ mod change_event_parity {
     async fn task_status_changed_carries_agent_id_when_agent_attributed() {
         let h = harness().await;
         let mut tn = note(&h.ws, "task-agent", "Agent Task");
-        tn.task = Some(TaskMetadata {
+        tn.metadata.task = Some(TaskMetadata {
             status: TaskStatus::NotStarted,
             ..Default::default()
         });
@@ -2224,13 +2234,13 @@ mod change_event_parity {
         // Parent task with one child; both start not_started. The parent is
         // blocked by its incomplete child, so neither is ready yet.
         let mut parent = note(&h.ws, "parent", "p");
-        parent.task = Some(TaskMetadata {
+        parent.metadata.task = Some(TaskMetadata {
             status: TaskStatus::NotStarted,
             ..Default::default()
         });
         let mut child = note(&h.ws, "child", "c");
         child.parent_id = Some(parent.id.clone());
-        child.task = Some(TaskMetadata {
+        child.metadata.task = Some(TaskMetadata {
             status: TaskStatus::NotStarted,
             ..Default::default()
         });
@@ -2619,7 +2629,7 @@ mod change_event_parity {
         assert!(spec.is_default);
         assert!(!spec.is_archived);
         assert_eq!(spec.visibility, NoteVisibility::Workspace);
-        assert!(spec.task.is_none());
+        assert!(spec.metadata.task.is_none());
 
         // Initial version snapshot captured.
         let versions = h

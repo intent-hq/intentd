@@ -83,7 +83,7 @@ async fn read(
             rendered.push_str(&format!("{:>4} | {line}", idx + 1));
         }
     }
-    if let Some(task) = note.task.as_ref() {
+    if let Some(task) = note.metadata.task.as_ref() {
         rendered.push_str("\n\n--- Task Metadata ---\n");
         rendered.push_str(&format!(
             "Status: {}",
@@ -123,7 +123,7 @@ async fn read(
         "imageCount": 0,
         "images": Vec::<Value>::new(),
     });
-    if let Some(task) = note.task.as_ref() {
+    if let Some(task) = note.metadata.task.as_ref() {
         let task_status = serde_json::to_value(task.status)
             .map_err(|e| format!("engine: serialize taskStatus failed: {e}"))?;
         let task_metadata = serde_json::to_value(task)

@@ -736,8 +736,8 @@ fn merge_live_turn_noop_when_snapshot_is_not_object() {
 mod task_delta_re_read {
     use super::*;
     use intent_core::{
-        BoxFuture, ContentType, Error, Note, NoteId, NoteVisibility, Result, TaskMetadata,
-        WorkspaceApi, WorkspaceId,
+        BoxFuture, ContentType, Error, Note, NoteId, NoteMetadata, NoteVisibility, Result,
+        TaskMetadata, WorkspaceApi, WorkspaceId,
     };
 
     /// Minimal `WorkspaceApi` that returns a pre-canned [`Note`] from `get_note`
@@ -774,7 +774,7 @@ mod task_delta_re_read {
             is_default: false,
             parent_id: None,
             visibility: NoteVisibility::Workspace,
-            task,
+            metadata: NoteMetadata { task },
             created_at: "t0".to_string(),
             rev: 0,
             updated_at: "t0".to_string(),

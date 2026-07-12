@@ -2362,7 +2362,7 @@ async fn build_turn_prompt_uses_context_references_when_stdin_context_is_absent(
 #[tokio::test]
 async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
     use base64::Engine as _;
-    use intent_core::{ContentType, Note, NoteId, NoteVisibility};
+    use intent_core::{ContentType, Note, NoteId, NoteMetadata, NoteVisibility};
 
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -2406,7 +2406,7 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
         is_default: false,
         parent_id: None,
         visibility: NoteVisibility::Workspace,
-        task: None,
+        metadata: NoteMetadata::default(),
         created_at: ts.clone(),
         rev: 0,
         updated_at: ts,

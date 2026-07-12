@@ -238,7 +238,7 @@ async fn task_channel_snapshot_then_updated_delta() {
         subscribe(&socket, "task.subscribe", json!({ "workspaceId": ws_id })).await;
     let task = find(&snap, &note_id).expect("task in snapshot");
     assert!(
-        task["task"].is_object(),
+        task["metadata"]["task"].is_object(),
         "task metadata present in snapshot"
     );
     assert!(
@@ -260,7 +260,7 @@ async fn task_channel_snapshot_then_updated_delta() {
     assert_eq!(d1["params"]["seq"], 1);
     assert_eq!(d1["params"]["delta"]["updated"][0]["id"], note_id.as_str());
     assert_eq!(
-        d1["params"]["delta"]["updated"][0]["task"]["status"],
+        d1["params"]["delta"]["updated"][0]["metadata"]["task"]["status"],
         "in_progress"
     );
     assert!(

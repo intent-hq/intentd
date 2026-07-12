@@ -7,11 +7,11 @@ use intent_core::{
     EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
     GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitStatus,
     Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteSetContentResult,
-    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult,
-    Result, ScriptCreateParams, ScriptMode, TaskUpdateResult, Workspace, WorkspaceActivity,
-    WorkspaceApi, WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary, WorkspaceId,
-    WorkspaceStatus, WorkspaceUpdate,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility,
+    ReadAssetResult, Result, ScriptCreateParams, ScriptMode, TaskUpdateResult, Workspace,
+    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary,
+    WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use serde_json::Value;
 
@@ -70,7 +70,7 @@ fn sample_note(ws: &WorkspaceId) -> Note {
         is_default: true,
         parent_id: None,
         visibility: NoteVisibility::Workspace,
-        task: None,
+        metadata: NoteMetadata::default(),
         created_at: "t0".to_string(),
         rev: 0,
         updated_at: "t0".to_string(),

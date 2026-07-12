@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use intent_core::{
     events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientId, Comment,
     CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, Error, EventActor,
-    Note, NoteId, NoteVersionAuthor, NoteVisibility, TaskMetadata, TaskStatus, Workspace,
-    WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    Note, NoteId, NoteMetadata, NoteVersionAuthor, NoteVisibility, TaskMetadata, TaskStatus,
+    Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use serde_json::json;
 
@@ -324,10 +324,12 @@ async fn note_round_trip() {
         is_default: true,
         parent_id: None,
         visibility: NoteVisibility::Workspace,
-        task: Some(TaskMetadata {
-            status: TaskStatus::InProgress,
-            ..Default::default()
-        }),
+        metadata: NoteMetadata {
+            task: Some(TaskMetadata {
+                status: TaskStatus::InProgress,
+                ..Default::default()
+            }),
+        },
         created_at: ts.clone(),
         rev: 0,
         updated_at: ts,
@@ -345,7 +347,7 @@ async fn note_round_trip() {
     assert!(got.is_pinned);
     assert!(got.is_default);
     assert_eq!(
-        got.task.as_ref().map(|t| t.status),
+        got.metadata.task.as_ref().map(|t| t.status),
         Some(TaskStatus::InProgress)
     );
 
@@ -377,7 +379,7 @@ async fn note_version_append_list_get_and_prune() {
         is_default: false,
         parent_id: None,
         visibility: NoteVisibility::Workspace,
-        task: None,
+        metadata: NoteMetadata::default(),
         created_at: ts.clone(),
         rev: 0,
         updated_at: ts.clone(),
@@ -456,7 +458,7 @@ async fn note_rev_increments_on_update() {
         is_default: false,
         parent_id: None,
         visibility: NoteVisibility::Workspace,
-        task: None,
+        metadata: NoteMetadata::default(),
         created_at: ts.clone(),
         rev: 0,
         updated_at: ts,
@@ -506,7 +508,7 @@ async fn update_note_versioned_hit_miss_and_absent() {
         is_default: false,
         parent_id: None,
         visibility: NoteVisibility::Workspace,
-        task: None,
+        metadata: NoteMetadata::default(),
         created_at: ts.clone(),
         rev: 0,
         updated_at: ts,
@@ -583,7 +585,7 @@ async fn delete_note_versioned_hit_miss_and_absent() {
         is_default: false,
         parent_id: None,
         visibility: NoteVisibility::Workspace,
-        task: None,
+        metadata: NoteMetadata::default(),
         created_at: ts.clone(),
         rev: 0,
         updated_at: ts,
@@ -651,7 +653,7 @@ fn task_note(ws_id: &WorkspaceId, title: &str, task: Option<TaskMetadata>) -> No
         is_default: false,
         parent_id: None,
         visibility: NoteVisibility::Workspace,
-        task,
+        metadata: NoteMetadata { task },
         created_at: ts.clone(),
         rev: 0,
         updated_at: ts,
@@ -690,7 +692,7 @@ async fn task_metadata_round_trip_and_list_tasks() {
 
     let tasks = store.list_tasks(&ws_id).await.expect("list tasks");
     assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].task, Some(meta));
+    assert_eq!(tasks[0].metadata.task, Some(meta));
 }
 
 fn sample_comment(note_id: &NoteId, thread_id: &str, id: &str) -> Comment {

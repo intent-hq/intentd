@@ -358,7 +358,10 @@ pub(crate) async fn channel_snapshot(
         },
         Channel::Task => match api.list_notes(workspace_id).await {
             Ok(notes) => {
-                let tasks: Vec<_> = notes.into_iter().filter(|n| n.task.is_some()).collect();
+                let tasks: Vec<_> = notes
+                    .into_iter()
+                    .filter(|n| n.metadata.task.is_some())
+                    .collect();
                 serde_json::to_value(tasks).unwrap_or_else(|_| empty())
             }
             Err(_) => empty(),
@@ -817,7 +820,7 @@ pub(crate) async fn task_delta(
                 .get_note(workspace_id.clone(), NoteId::from(note_id))
                 .await
                 .ok()?;
-            note.task.as_ref()?;
+            note.metadata.task.as_ref()?;
             Some(json!({ "added": [serde_json::to_value(note).ok()?] }))
         }
         NOTE_UPDATED | TASK_STATUS_CHANGED => {
@@ -825,7 +828,7 @@ pub(crate) async fn task_delta(
                 .get_note(workspace_id.clone(), NoteId::from(note_id))
                 .await
                 .ok()?;
-            if note.task.is_none() {
+            if note.metadata.task.is_none() {
                 return Some(json!({ "removedIds": [note_id] }));
             }
             Some(json!({ "updated": [serde_json::to_value(note).ok()?] }))
