@@ -5,7 +5,7 @@
 //! [`MAX_NOTE_VERSIONS`].
 
 use intent_core::{
-    Error, Note, NoteId, NoteVersion, NoteVersionAuthor, NoteVersionSummary, Result,
+    Error, Note, NoteId, NoteVersion, NoteVersionAuthor, NoteVersionSummary, Result, WorkspaceId,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -71,26 +71,41 @@ impl Store {
     }
 
     /// List a note's stored versions ascending by `v`, without content blobs
-    /// (`content_length` is computed in SQL).
-    pub async fn list_note_versions(&self, note_id: &NoteId) -> Result<Vec<NoteVersionSummary>> {
+    /// (`content_length` is computed in SQL). Scoped by
+    /// `(workspace_id, note_id)` (migration 0030 composite FK) so a same-id
+    /// note in another workspace cannot leak its version history.
+    pub async fn list_note_versions(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+    ) -> Result<Vec<NoteVersionSummary>> {
         let rows = sqlx::query(
             "SELECT v, date, author_id, author_name, author_type, title, \
-             LENGTH(content) AS content_length FROM note_version WHERE note_id = ? ORDER BY v",
+             LENGTH(content) AS content_length FROM note_version \
+             WHERE note_id = ? AND workspace_id = ? ORDER BY v",
         )
         .bind(&note_id.0)
+        .bind(&workspace_id.0)
         .fetch_all(self.pool())
         .await
         .map_err(|e| Error::Internal(format!("list note_versions failed: {e}")))?;
         rows.iter().map(map_summary_row).collect()
     }
 
-    /// Fetch one stored version (with content), or `NotFound`.
-    pub async fn get_note_version(&self, note_id: &NoteId, v: i64) -> Result<NoteVersion> {
+    /// Fetch one stored version (with content), or `NotFound`. Scoped by
+    /// `(workspace_id, note_id)`.
+    pub async fn get_note_version(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        v: i64,
+    ) -> Result<NoteVersion> {
         let row = sqlx::query(
             "SELECT v, date, author_id, author_name, author_type, title, content \
-             FROM note_version WHERE note_id = ? AND v = ?",
+             FROM note_version WHERE note_id = ? AND workspace_id = ? AND v = ?",
         )
         .bind(&note_id.0)
+        .bind(&workspace_id.0)
         .bind(v)
         .fetch_optional(self.pool())
         .await
