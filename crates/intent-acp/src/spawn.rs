@@ -37,6 +37,11 @@ pub struct SpawnOptions<'a> {
     pub provider_binary: Option<&'a Path>,
     /// Extra environment overrides applied last.
     pub extra_env: BTreeMap<String, String>,
+    /// Provider-native tools to strip via the provider's `--remove-tool`
+    /// equivalent (§18.4 CLI-side enforcement). Gated on
+    /// [`ProviderConfig::remove_tool_flag`] — providers that don't advertise a
+    /// flag silently ignore the input rather than receive an unknown arg.
+    pub tools_to_remove: Vec<&'static str>,
 }
 
 impl<'a> SpawnOptions<'a> {
@@ -51,6 +56,7 @@ impl<'a> SpawnOptions<'a> {
             quiet: false,
             provider_binary: None,
             extra_env: BTreeMap::new(),
+            tools_to_remove: Vec::new(),
         }
     }
 }
@@ -65,6 +71,7 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
             rules_file: opts.rules_file,
             mcp_config_file: opts.mcp_config_file,
             quiet: opts.quiet,
+            tools_to_remove: &opts.tools_to_remove,
         },
     );
     if opts.provider.id == "codex" {
@@ -152,4 +159,46 @@ pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<
         .map(|s| Box::new(s) as Box<dyn AsyncRead + Unpin + Send>);
     let connection = Connection::new(stdin, stdout, stderr, hooks);
     Ok(SpawnedAgent { child, connection })
+}
+
+#[cfg(test)]
+mod build_args_tests {
+    use super::*;
+
+    #[test]
+    fn build_args_propagates_tools_to_remove_for_auggie() {
+        let auggie = intent_providers::find_provider("auggie").unwrap();
+        let mut opts = SpawnOptions::new(auggie);
+        opts.tools_to_remove = vec!["str-replace-editor", "sub-agent-explore"];
+        let args = build_args(&opts);
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--remove-tool", "str-replace-editor"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--remove-tool", "sub-agent-explore"]));
+    }
+
+    #[test]
+    fn build_args_omits_remove_tool_flags_for_non_supporting_providers() {
+        // claude-code / codex etc. don't advertise --remove-tool support; the
+        // spawn layer must not leak an unknown flag to them.
+        for id in [
+            "claude-code",
+            "codex",
+            "cortex",
+            "opencode",
+            "droid",
+            "mock",
+        ] {
+            let provider = intent_providers::find_provider(id).unwrap();
+            let mut opts = SpawnOptions::new(provider);
+            opts.tools_to_remove = vec!["str-replace-editor"];
+            let args = build_args(&opts);
+            assert!(
+                !args.iter().any(|a| a == "--remove-tool"),
+                "{id} spawn args unexpectedly include --remove-tool: {args:?}"
+            );
+        }
+    }
 }

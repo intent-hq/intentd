@@ -35,6 +35,7 @@ fn registry_field_parity() {
     assert_eq!(auggie.rules_flag, Some("--rules"));
     assert_eq!(auggie.mcp_config_flag, Some("--mcp-config"));
     assert_eq!(auggie.quiet_flag, Some("--quiet"));
+    assert_eq!(auggie.remove_tool_flag, Some("--remove-tool"));
     assert!(auggie.supports_authenticate && auggie.supports_set_mode);
     assert!(auggie.supports_mcp_config && auggie.supports_rules_file);
     assert!(!auggie.can_be_disabled);
@@ -97,6 +98,7 @@ fn arg_assembly_auggie() {
             rules_file: Some("/tmp/rules.md"),
             mcp_config_file: Some("/tmp/mcp.json"),
             quiet: true,
+            ..Default::default()
         },
     );
     assert_eq!(
@@ -138,6 +140,7 @@ fn arg_assembly_respects_capabilities_and_sentinel() {
             rules_file: Some("/tmp/r.md"),
             mcp_config_file: Some("/tmp/m.json"),
             quiet: true,
+            ..Default::default()
         }
     )
     .is_empty());
@@ -152,6 +155,107 @@ fn arg_assembly_respects_capabilities_and_sentinel() {
             }
         ),
         vec!["acp"]
+    );
+}
+
+#[test]
+fn arg_assembly_emits_remove_tool_flags_for_auggie() {
+    let auggie = find_provider("auggie").unwrap();
+    let args = build_provider_args(
+        auggie,
+        &ArgInputs {
+            tools_to_remove: &["str-replace-editor", "sub-agent-explore"],
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        args,
+        vec![
+            "--acp",
+            "--allow-indexing",
+            "--remove-tool",
+            "str-replace-editor",
+            "--remove-tool",
+            "sub-agent-explore",
+        ]
+    );
+}
+
+#[test]
+fn arg_assembly_dedupes_remove_tool_names() {
+    let auggie = find_provider("auggie").unwrap();
+    let args = build_provider_args(
+        auggie,
+        &ArgInputs {
+            tools_to_remove: &["str-replace-editor", "str-replace-editor", ""],
+            ..Default::default()
+        },
+    );
+    // Empty names are skipped and duplicates are collapsed.
+    assert_eq!(
+        args,
+        vec![
+            "--acp",
+            "--allow-indexing",
+            "--remove-tool",
+            "str-replace-editor",
+        ]
+    );
+}
+
+#[test]
+fn arg_assembly_skips_remove_tool_for_providers_without_support() {
+    // Providers with `remove_tool_flag = None` silently drop the input — we
+    // never pass an unknown flag to claude/codex/cortex/opencode/droid.
+    for id in ["claude-code", "codex", "cortex", "opencode", "droid"] {
+        let provider = find_provider(id).unwrap();
+        assert!(
+            provider.remove_tool_flag.is_none(),
+            "{id} unexpectedly opted into --remove-tool"
+        );
+        let args = build_provider_args(
+            provider,
+            &ArgInputs {
+                tools_to_remove: &["str-replace-editor", "sub-agent-explore"],
+                ..Default::default()
+            },
+        );
+        assert!(
+            !args.iter().any(|a| a == "--remove-tool"),
+            "{id} unexpectedly received a --remove-tool flag: {args:?}"
+        );
+    }
+}
+
+#[test]
+fn arg_assembly_remove_tool_after_mcp_config() {
+    // Emission order: base → model → quiet → rules → mcp → remove-tool.
+    let auggie = find_provider("auggie").unwrap();
+    let args = build_provider_args(
+        auggie,
+        &ArgInputs {
+            model: Some("sonnet4.5"),
+            rules_file: Some("/tmp/rules.md"),
+            mcp_config_file: Some("/tmp/mcp.json"),
+            quiet: true,
+            tools_to_remove: &["str-replace-editor"],
+        },
+    );
+    assert_eq!(
+        args,
+        vec![
+            "--acp",
+            "--allow-indexing",
+            "--model",
+            "sonnet4.5",
+            "--quiet",
+            "--rules",
+            "/tmp/rules.md",
+            "--mcp-config",
+            "/tmp/mcp.json",
+            "--remove-tool",
+            "str-replace-editor",
+        ]
     );
 }
 

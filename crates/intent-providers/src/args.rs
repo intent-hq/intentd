@@ -29,6 +29,11 @@ pub struct ArgInputs<'a> {
     pub mcp_config_file: Option<&'a str>,
     /// Whether to append the provider's quiet flag (simple/background requests).
     pub quiet: bool,
+    /// Provider-native tools to strip via the provider's `--remove-tool`
+    /// equivalent. Emitted once per name, deduped, and gated on
+    /// [`ProviderConfig::remove_tool_flag`] — unknown providers ignore this
+    /// input rather than receive a flag they don't understand.
+    pub tools_to_remove: &'a [&'a str],
 }
 
 /// Assemble the launch arguments for a provider.
@@ -64,6 +69,19 @@ pub fn build_provider_args(config: &ProviderConfig, inputs: &ArgInputs) -> Vec<S
         if let (Some(flag), Some(path)) = (config.mcp_config_flag, inputs.mcp_config_file) {
             args.push(flag.to_string());
             args.push(path.to_string());
+        }
+    }
+
+    if let Some(flag) = config.remove_tool_flag {
+        // Dedupe by tool name so callers can safely concatenate lists.
+        let mut seen: Vec<&str> = Vec::new();
+        for tool in inputs.tools_to_remove {
+            if tool.is_empty() || seen.contains(tool) {
+                continue;
+            }
+            seen.push(tool);
+            args.push(flag.to_string());
+            args.push((*tool).to_string());
         }
     }
 
