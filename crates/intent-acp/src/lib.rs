@@ -57,9 +57,10 @@ pub use session::{MappedToolCall, MappedUpdate};
 pub use spawn::{spawn_provider, SpawnOptions, SpawnedAgent};
 pub use terminal::{TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo};
 pub use tool_restrictions::{
-    get_tool_denylist_for_agent_type, is_background_agent_type, AGENT_CREATION_TOOLS,
-    CONFLICTING_BUILTIN_TOOLS, EXECUTION_TOOLS, EXTERNAL_TOOLS, FILE_WRITE_TOOLS, GIT_TOOLS,
-    NOTE_WRITE_TOOLS, SUBAGENT_TOOLS, UNIFIED_WORKSPACE_TOOLS, WORKSPACE_WRITE_TOOLS,
+    get_tool_denylist_for_agent_type, get_tools_to_remove, is_background_agent_type,
+    AGENT_CREATION_TOOLS, CONFLICTING_BUILTIN_TOOLS, EXECUTION_TOOLS, EXTERNAL_TOOLS,
+    FILE_WRITE_TOOLS, GIT_TOOLS, NOTE_WRITE_TOOLS, SUBAGENT_TOOLS, UNIFIED_WORKSPACE_TOOLS,
+    WORKSPACE_WRITE_TOOLS,
 };
 pub use transport::{
     Connection, ConnectionHooks, IncomingNotification, IncomingRequest, DEFAULT_REQUEST_TIMEOUT,
