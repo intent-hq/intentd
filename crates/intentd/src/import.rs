@@ -259,9 +259,11 @@ async fn import_notes(store: &Store, dir: &Path, summary: &mut ImportSummary) {
     }
 }
 
-/// Upsert a note by id; `Ok(true)` when it already existed (updated).
+/// Upsert a note by `(workspace_id, id)`; `Ok(true)` when it already existed
+/// (updated). Note identity is composite (`(id, workspace_id)`, migration
+/// 0030), so the same `id` in different workspaces is a distinct row.
 async fn upsert_note(store: &Store, note: &Note) -> anyhow::Result<bool> {
-    match store.get_note(&note.id).await {
+    match store.get_note(&note.workspace_id, &note.id).await {
         Ok(_) => {
             store.update_note(note).await?;
             Ok(true)
@@ -482,7 +484,10 @@ mod tests {
         // Rows actually landed, including the self-FK parent link.
         let ws = WorkspaceId::from("ws-1");
         assert_eq!(store.list_notes(&ws).await.unwrap().len(), 2);
-        let child = store.get_note(&NoteId::from("note-child")).await.unwrap();
+        let child = store
+            .get_note(&ws, &NoteId::from("note-child"))
+            .await
+            .unwrap();
         assert_eq!(child.parent_id, Some(NoteId::from("note-parent")));
         let msgs = store
             .get_agent_messages(&AgentId::from("agent-1"), None)

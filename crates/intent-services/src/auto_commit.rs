@@ -176,7 +176,7 @@ impl Services {
         linked_note_id: &Option<NoteId>,
     ) -> String {
         if let Some(note_id) = linked_note_id {
-            if let Ok(note) = self.store().get_note(note_id).await {
+            if let Ok(note) = self.store().get_note(&session.workspace_id, note_id).await {
                 let title = note.title.trim();
                 if !title.is_empty() {
                     return normalize_subject(title);

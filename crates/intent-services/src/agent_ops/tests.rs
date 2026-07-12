@@ -1105,7 +1105,11 @@ async fn report_to_parent_transitions_linked_task_to_review_required() {
         .await
         .expect("report");
 
-    let refreshed = svc.store().get_note(&note.id).await.expect("refresh note");
+    let refreshed = svc
+        .store()
+        .get_note(&ws, &note.id)
+        .await
+        .expect("refresh note");
     assert_eq!(
         refreshed.metadata.task.expect("task metadata").status,
         intent_core::TaskStatus::ReviewRequired
@@ -1156,7 +1160,11 @@ async fn report_to_parent_does_not_overwrite_terminal_task_status() {
         .await
         .expect("report");
 
-    let refreshed = svc.store().get_note(&note.id).await.expect("refresh note");
+    let refreshed = svc
+        .store()
+        .get_note(&ws, &note.id)
+        .await
+        .expect("refresh note");
     assert_eq!(
         refreshed.metadata.task.expect("task metadata").status,
         intent_core::TaskStatus::Complete,
@@ -1216,7 +1224,7 @@ async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
 
     let before_rev = svc
         .store()
-        .get_note(&note.id)
+        .get_note(&ws, &note.id)
         .await
         .expect("initial note")
         .rev;
@@ -1226,7 +1234,7 @@ async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
         .expect("first report");
     let after_first = svc
         .store()
-        .get_note(&note.id)
+        .get_note(&ws, &note.id)
         .await
         .expect("note after first");
     assert_eq!(
@@ -1244,7 +1252,7 @@ async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
         .expect("second report");
     let after_second = svc
         .store()
-        .get_note(&note.id)
+        .get_note(&ws, &note.id)
         .await
         .expect("note after second");
     assert_eq!(
@@ -1398,7 +1406,7 @@ async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
 
     let before = svc
         .store()
-        .get_note(&foreign.id)
+        .get_note(&ws_b, &foreign.id)
         .await
         .expect("initial foreign note");
     assert_eq!(
@@ -1429,7 +1437,7 @@ async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
 
     let after = svc
         .store()
-        .get_note(&foreign.id)
+        .get_note(&ws_b, &foreign.id)
         .await
         .expect("refresh foreign note");
     assert_eq!(
