@@ -3256,6 +3256,91 @@ async fn spawn_watch_cleanup_extension_defers_removal_to_the_later_deadline() {
     panic!("later cleanup task did not remove the watch after the extended deadline");
 }
 
+/// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKWuM):
+/// `spawn_watch_cleanup` must not arm a sleeper task when the deadline
+/// bump misses (e.g. the watch was removed concurrently between the reuse
+/// find and the cleanup arm). The bump returns `false`, and no task is
+/// spawned; the return value from `spawn_watch_cleanup` surfaces that.
+#[tokio::test]
+async fn spawn_watch_cleanup_skips_when_deadline_bump_misses() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let sub_id = svc.register_completion_watch(
+        &ws,
+        caller.clone(),
+        "Coordinator".into(),
+        target.clone(),
+        false,
+        None,
+    );
+
+    // Stand in for a concurrent removal: drop the watch before the cleanup
+    // task would be armed.
+    assert!(svc.remove_watch(&ws, &sub_id), "seed removal");
+    assert!(svc.list_watches_for_parent(&ws, &caller).is_empty());
+
+    // The arm must observe the missing watch, skip the tokio::spawn, and
+    // report `false`. Waiting past the requested delay must not resurrect
+    // the empty registry or otherwise mutate state.
+    let armed = svc.spawn_watch_cleanup(
+        ws.clone(),
+        caller.clone(),
+        sub_id,
+        Duration::from_millis(30),
+    );
+    assert!(
+        !armed,
+        "no cleanup task must be spawned when the bump misses"
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        svc.list_watches_for_parent(&ws, &caller).is_empty(),
+        "registry stays empty; the skipped cleanup task cannot side-effect it",
+    );
+}
+
+/// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKWuU):
+/// when the caller's display name cannot be resolved
+/// (`store.get_agent_session` failed), the reuse path must still return
+/// the live subscription id — but must NOT overwrite the watch's stored
+/// `parent_agent_name` with an empty placeholder. Callers pass `None`
+/// through `find_and_refresh_ungrouped_watch` to signal the missing name.
+#[tokio::test]
+async fn find_and_refresh_ungrouped_watch_preserves_name_when_lookup_fails() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    let sub_id = svc.register_completion_watch(
+        &ws,
+        caller.clone(),
+        "Coordinator".into(),
+        target.clone(),
+        true,
+        None,
+    );
+
+    // Reuse with no resolved name: still returns the same subscription id
+    // (reuse proceeds), and the stored `parent_agent_name` is untouched.
+    let reused = svc.find_and_refresh_ungrouped_watch(&ws, &caller, &target, true, None);
+    assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(
+        watches[0].parent_agent_name, "Coordinator",
+        "failed name lookup must NOT overwrite an existing watch's parent_agent_name: {watches:?}"
+    );
+
+    // Sanity: a subsequent reuse with a real name still refreshes as
+    // before, so the `None` short-circuit is scoped to the lookup-failed
+    // case rather than disabling the refresh entirely.
+    let reused =
+        svc.find_and_refresh_ungrouped_watch(&ws, &caller, &target, true, Some("Renamed".into()));
+    assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches[0].parent_agent_name, "Renamed");
+}
+
 /// End-to-end through the MCP front door: delegating with a caller registers
 /// exactly one oneShot watch for the child returned by the tool.
 #[tokio::test]

@@ -157,13 +157,21 @@ impl Services {
     /// name keeps `agent.getSubscriptions` / [`describe_subscription`] in sync
     /// with any rename applied via `agent.rename` / `agent.update` since the
     /// watch was registered; a no-op when the name is already current.
+    ///
+    /// `new_parent_name` is `None` when the caller's current display name
+    /// could not be resolved (e.g. `store.get_agent_session` failed under
+    /// contention, Copilot #104 thread PRRT_kwDOS9Wxuc6QKWuU): the reuse and
+    /// the paired deadline bump still proceed, but the existing stored name
+    /// is left intact rather than overwritten with an empty placeholder that
+    /// would degrade `agent.getSubscriptions` / `describe_subscription`
+    /// output.
     pub(crate) fn find_and_refresh_ungrouped_watch(
         &self,
         workspace_id: &WorkspaceId,
         parent_agent_id: &AgentId,
         child_agent_id: &AgentId,
         one_shot: bool,
-        new_parent_name: String,
+        new_parent_name: Option<String>,
     ) -> Option<String> {
         let mut guard = self
             .agent_subscriptions
@@ -176,8 +184,10 @@ impl Services {
                 && &s.parent_agent_id == parent_agent_id
                 && &s.child_agent_id == child_agent_id
         })?;
-        if watch.parent_agent_name != new_parent_name {
-            watch.parent_agent_name = new_parent_name;
+        if let Some(new_name) = new_parent_name {
+            if watch.parent_agent_name != new_name {
+                watch.parent_agent_name = new_name;
+            }
         }
         Some(watch.id.clone())
     }

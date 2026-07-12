@@ -2259,9 +2259,17 @@ impl Services {
         parent_agent_id: AgentId,
         subscription_id: String,
         after: std::time::Duration,
-    ) {
+    ) -> bool {
+        // Copilot #104 thread PRRT_kwDOS9Wxuc6QKWuM: only arm the cleanup
+        // task when the deadline bump actually landed on a live watch —
+        // otherwise the watch was removed concurrently (e.g. an oneShot
+        // delivery raced this reuse, or a prior cleanup already expired)
+        // and spawning a task that just sleeps and no-ops wastes a
+        // tokio worker slot per repeated wake.
         let deadline = tokio::time::Instant::now() + after;
-        self.bump_watch_cleanup_deadline(&workspace_id, &subscription_id, deadline);
+        if !self.bump_watch_cleanup_deadline(&workspace_id, &subscription_id, deadline) {
+            return false;
+        }
         let services = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(after).await;
@@ -2271,6 +2279,7 @@ impl Services {
                     .await;
             }
         });
+        true
     }
 
     /// `agent.getSubscriptions`: live completion-watch payload for `agent_id`
@@ -2926,21 +2935,29 @@ impl Services {
                 // formats using `watch.parent_agent_name`, so a long-lived
                 // reused watch would otherwise report a stale `agentName` /
                 // `description` from `agent.getSubscriptions`.
+                // Copilot #104 thread PRRT_kwDOS9Wxuc6QKWuU: keep the
+                // resolved name as `Option<String>` so a failed session
+                // lookup does not overwrite an existing watch's stored
+                // `parent_agent_name` with an empty placeholder on the
+                // reuse path. The reuse itself and the paired deadline bump
+                // still proceed; only the fresh-register branch has to
+                // materialize a name, and there `""` matches the pre-fix
+                // behaviour for a brand-new watch.
                 let caller_name = self
                     .store
                     .get_agent_session(&caller)
                     .await
                     .ok()
-                    .map(|s| s.name)
-                    .unwrap_or_default();
+                    .map(|s| s.name);
                 // SUB-2 (Copilot #104 follow-up, thread
                 // PRRT_kwDOS9Wxuc6QKPyt): resolve reuse atomically. If a live
                 // ungrouped watch is found, its `parent_agent_name` is
-                // refreshed under the same lock; otherwise we fall through to
-                // registering a fresh watch. This closes the race where a
-                // concurrent oneShot delivery or expired cleanup task removed
-                // the watch between a prior find and refresh, which would
-                // otherwise leave the caller subscribed to a dead id.
+                // refreshed under the same lock when a fresh name was
+                // resolved; otherwise we fall through to registering a fresh
+                // watch. This closes the race where a concurrent oneShot
+                // delivery or expired cleanup task removed the watch between
+                // a prior find and refresh, which would otherwise leave the
+                // caller subscribed to a dead id.
                 let (subscription_id, reused) = if let Some(existing_id) = self
                     .find_and_refresh_ungrouped_watch(
                         &workspace_id,
@@ -2954,7 +2971,7 @@ impl Services {
                     let new_id = self.register_completion_watch(
                         &workspace_id,
                         caller.clone(),
-                        caller_name,
+                        caller_name.unwrap_or_default(),
                         agent_id.clone(),
                         one_shot,
                         None,
