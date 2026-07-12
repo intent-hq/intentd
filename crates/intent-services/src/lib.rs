@@ -4695,7 +4695,12 @@ impl WorkspaceApi for Services {
             // sessions, drop each session's runtime state, then emit
             // `agent:deleted` per session so subscribers see the tear-down
             // before the terminal `workspace:deleted`.
-            let sessions = store.list_agent_sessions(&id).await.unwrap_or_default();
+            // Fail fast on a transient `list_agent_sessions` error: skipping
+            // the sweep here but still deleting the workspace row leaves ghost
+            // workers, live-turn slots, queued messages, and completion
+            // watches with no owning workspace — a client can retry the
+            // delete, but silent partial success cannot recover.
+            let sessions = store.list_agent_sessions(&id).await?;
             for session in &sessions {
                 if let Some(manager) = manager.as_ref() {
                     // Aborts the worker, drops the handle (kill_child_tree on
@@ -4705,20 +4710,27 @@ impl WorkspaceApi for Services {
                 }
                 // Live-turn slot + pending message queue live in `Services`'
                 // maps (not touched by `manager.stop`); drop them so a
-                // same-slug recreate observes no ghost state.
-                if let Ok(mut slots) = live_turns.lock() {
-                    slots.remove(&session.id);
-                }
-                if let Ok(mut queues) = agent_queues.lock() {
-                    queues.remove(&session.id);
-                }
+                // same-slug recreate observes no ghost state. Recover through
+                // a poisoned lock via `into_inner` — the delete path is the
+                // last chance to unlink this state, so best-effort teardown
+                // outweighs propagating a mutex-poison panic.
+                live_turns
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&session.id);
+                agent_queues
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&session.id);
             }
             // Drop the workspace's completion-watch + delegation-group entry
             // wholesale: every parent/child in the map is workspace-scoped, so
-            // the entry cannot outlive the workspace it keys off.
-            if let Ok(mut subs) = agent_subscriptions.lock() {
-                subs.remove(&id);
-            }
+            // the entry cannot outlive the workspace it keys off. Poison
+            // recovery mirrors the per-session sweep above.
+            agent_subscriptions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
             // Emit `agent:deleted` per swept session before the worktree /
             // store cleanup so subscribers see the terminal event for each
             // agent ahead of `workspace:deleted`. Best-effort: emits when the
