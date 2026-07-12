@@ -5711,3 +5711,93 @@ async fn agent_store_mutations_reject_cross_workspace_writes() {
         .await
         .expect("row still present after cross-ws delete");
 }
+
+/// `workspace.delete` must sweep every live in-memory agent registry keyed
+/// off the workspace BEFORE the store cascade drops the session rows: live-
+/// turn slots, pending message queues, and completion watches (both keys
+/// under the workspace's `WorkspaceWatches` entry). One `agent:deleted` fires
+/// per session ahead of the terminal `workspace:deleted`, so a same-slug
+/// recreate observes zero ghost agents and no residual event traffic.
+#[tokio::test]
+async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    // The delete path walks `workspaces_root` to unlink the daemon-owned
+    // workspace dir; pin a hermetic tempdir so it never falls through to the
+    // real user home. The dir need not exist — `remove_dir_all` swallows
+    // `NotFound`.
+    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let a = create_agent(&svc, &ws, "Alpha").await;
+    let b = create_agent(&svc, &ws, "Beta").await;
+    let c = create_agent(&svc, &ws, "Gamma").await;
+
+    // Seed a completion watch (Alpha → Beta), a live-turn slot for Alpha,
+    // and a queued message for Gamma — the three in-memory registries the
+    // delete path must sweep.
+    svc.register_completion_watch(&ws, a.clone(), "Alpha".into(), b.clone(), true, None);
+    svc.set_live_turn(
+        &a,
+        "msg-live",
+        vec![json!({ "type": "text", "text": "streaming…" })],
+    );
+    svc.enqueue_message(&c, "queued follow-up".to_string(), None, None);
+    assert!(svc.live_turn(&a).is_some(), "live-turn slot seeded");
+    assert!(svc.has_ready_to_send(&c), "queue seeded");
+    assert_eq!(svc.find_watches_for_child(&ws, &b).len(), 1);
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![
+            AGENT_DELETED.to_string(),
+            intent_core::events::WORKSPACE_DELETED.to_string(),
+        ],
+        ..Default::default()
+    });
+
+    <Services as WorkspaceApi>::delete_workspace(&svc, ws.clone())
+        .await
+        .expect("delete workspace");
+
+    // In-memory state is swept: no live-turn slot, no queued messages, no
+    // completion-watch entries left for the workspace.
+    assert!(svc.live_turn(&a).is_none(), "live-turn cleared on delete");
+    assert!(!svc.has_ready_to_send(&c), "queue cleared on delete");
+    assert!(svc.find_watches_for_child(&ws, &b).is_empty());
+    assert!(svc.all_watches(&ws).is_empty());
+
+    // Store rows are gone — the cascade ran after the live-state sweep.
+    for id in [&a, &b, &c] {
+        let err = svc.store().get_agent_session(id).await.expect_err("gone");
+        assert!(matches!(err, Error::NotFound(_)), "{id}: {err:?}");
+    }
+
+    // Collect one full event window (batch may fan out across recvs).
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut deleted_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut saw_workspace_deleted = false;
+    while std::time::Instant::now() < deadline && (deleted_ids.len() < 3 || !saw_workspace_deleted)
+    {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let Ok(Some(batch)) = timeout(remaining, sub.recv()).await else {
+            break;
+        };
+        for ev in batch {
+            assert_eq!(ev.workspace_id, ws);
+            match ev.event_type.as_str() {
+                AGENT_DELETED => {
+                    let id = ev.data["agentId"].as_str().unwrap().to_string();
+                    deleted_ids.insert(id);
+                }
+                t if t == intent_core::events::WORKSPACE_DELETED => {
+                    saw_workspace_deleted = true;
+                    // The workspace event must arrive AFTER the per-agent
+                    // events — subscribers see the tear-down first.
+                    assert_eq!(deleted_ids.len(), 3, "workspace:deleted before all agents");
+                }
+                other => panic!("unexpected event type: {other}"),
+            }
+        }
+    }
+    assert!(saw_workspace_deleted, "workspace:deleted must fire");
+    let expected: std::collections::HashSet<String> =
+        [&a, &b, &c].into_iter().map(|id| id.0.clone()).collect();
+    assert_eq!(deleted_ids, expected, "one agent:deleted per session");
+}

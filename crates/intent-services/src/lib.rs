@@ -4677,7 +4677,81 @@ impl WorkspaceApi for Services {
             .workspaces_root
             .clone()
             .unwrap_or_else(default_workspaces_root);
+        // Live-state teardown handles: cloned so the boxed future owns them
+        // across the store cascade below. `agent_manager()` upgrades the weak
+        // reference; read-only/test wiring with no manager attached simply
+        // skips the runtime stop and still sweeps the in-memory registries.
+        let manager = self.agent_manager();
+        let agent_queues = self.agent_queues.clone();
+        let live_turns = self.live_turns.clone();
+        let agent_subscriptions = self.agent_subscriptions.clone();
         Box::pin(async move {
+            // Terminate live agent sessions BEFORE the store cascade drops
+            // their rows. A same-slug recreate hitting `agent.list` after the
+            // delete would otherwise surface ghost sessions whose workers are
+            // still draining, their live-turn slots + pending message queues
+            // still populated, and their completion watches still firing. The
+            // order mirrors `agent_delete_op`: capture the workspace-scoped
+            // sessions, drop each session's runtime state, then emit
+            // `agent:deleted` per session so subscribers see the tear-down
+            // before the terminal `workspace:deleted`.
+            // Fail fast on a transient `list_agent_sessions` error: skipping
+            // the sweep here but still deleting the workspace row leaves ghost
+            // workers, live-turn slots, queued messages, and completion
+            // watches with no owning workspace — a client can retry the
+            // delete, but silent partial success cannot recover.
+            let sessions = store.list_agent_sessions(&id).await?;
+            for session in &sessions {
+                if let Some(manager) = manager.as_ref() {
+                    // Aborts the worker, drops the handle (kill_child_tree on
+                    // the ACP child), clears busy + agent_ws, and
+                    // deregisters the process — the `agent.stop` semantics.
+                    manager.stop(&session.id).await;
+                }
+                // Live-turn slot + pending message queue live in `Services`'
+                // maps (not touched by `manager.stop`); drop them so a
+                // same-slug recreate observes no ghost state. Recover through
+                // a poisoned lock via `into_inner` — the delete path is the
+                // last chance to unlink this state, so best-effort teardown
+                // outweighs propagating a mutex-poison panic.
+                live_turns
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&session.id);
+                agent_queues
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&session.id);
+            }
+            // Drop the workspace's completion-watch + delegation-group entry
+            // wholesale: every parent/child in the map is workspace-scoped, so
+            // the entry cannot outlive the workspace it keys off. Poison
+            // recovery mirrors the per-session sweep above.
+            agent_subscriptions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+            // Emit `agent:deleted` per swept session before the worktree /
+            // store cleanup so subscribers see the terminal event for each
+            // agent ahead of `workspace:deleted`. Best-effort: emits when the
+            // bus is wired; a `None` bus (read-only wiring) is a quiet no-op.
+            for session in &sessions {
+                publish_event(
+                    &bus,
+                    NewEvent {
+                        workspace_id: id.clone(),
+                        timestamp: now_iso(),
+                        event_type: AGENT_DELETED.to_string(),
+                        actor: system_actor(),
+                        session_id: Some(session.id.0.clone()),
+                        correlation_id: None,
+                        parent_event_id: None,
+                        metadata: None,
+                        data: serde_json::json!({ "agentId": session.id.0 }),
+                    },
+                )
+                .await;
+            }
             // Port the TS `deleteWorkspace` worktree cleanup: under the per-repo
             // worktree lock, remove the linked worktree (+ the now-empty
             // `<root>/<workspaceId>` parent) and delete the workspace branch —

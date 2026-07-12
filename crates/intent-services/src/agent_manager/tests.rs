@@ -1779,6 +1779,148 @@ async fn stop_returns_false_for_unknown_agent() {
     assert!(!mgr.stop(&AgentId::from("missing")).await);
 }
 
+/// Insert an additional session row into an existing workspace (companion to
+/// [`seed_agent`], which also inserts the workspace and so cannot be called
+/// twice with the same `ws`).
+async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
+    let ts = now_iso();
+    let session = AgentSession {
+        id: id.clone(),
+        workspace_id: ws.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Extra".to_string(),
+        name_explicitly_set: false,
+        model: None,
+        provider: None,
+        system_prompt: None,
+        specialist: None,
+        status: AgentStatus::Pending,
+        is_active: true,
+        messages: Vec::new(),
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        is_background: false,
+        metadata: None,
+        created_at: ts.clone(),
+        updated_at: ts,
+    };
+    mgr.services
+        .store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert extra session");
+}
+
+/// `workspace.delete` walks every session in the workspace through
+/// `AgentManager::stop`: the tracked handles, workers, in-flight busy set, and
+/// `agent_ws` map all drain, and the workspace insert itself is idempotent —
+/// a same-slug recreate observes zero pre-existing agents.
+#[tokio::test]
+async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
+    // Build the manager inline so we can pin a hermetic `workspaces_root` on
+    // Services — the delete path walks it to unlink the daemon-owned
+    // workspace dir and must never fall through to the real user home.
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store)
+        .with_event_bus(bus.clone())
+        .with_workspaces_root(tmp.path.with_extension("workspaces"));
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-delete");
+    let live = AgentId::from("a-live");
+    let busy = AgentId::from("a-busy-mid-turn");
+    // Seed the workspace once (`seed_agent` re-inserts it on every call).
+    seed_agent(&mgr, &ws, &live).await;
+    insert_extra_session(&mgr, &ws, &busy).await;
+    track(&mgr, &live);
+    track(&mgr, &busy);
+    // Simulate a mid-turn worker: claim the in-flight slot AND register a
+    // JoinHandle in the workers map (the two pieces of state `stop` clears).
+    assert!(mgr.try_begin(&busy, &ws).await);
+    let worker = tokio::spawn(async {
+        // A never-ending worker; `stop` must abort it.
+        std::future::pending::<()>().await;
+    });
+    mgr.workers.lock().unwrap().insert(busy.clone(), worker);
+    assert!(mgr.is_busy(&busy));
+    assert!(mgr.contains(&live) && mgr.contains(&busy));
+    assert_eq!(mgr.registry().size(), 2);
+
+    <Services as WorkspaceApi>::delete_workspace(&services, ws.clone())
+        .await
+        .expect("delete workspace");
+
+    // Every tracked handle is gone; the process registry is empty; the
+    // busy set + agent_ws map + workers map all drained.
+    assert!(!mgr.contains(&live), "live handle removed");
+    assert!(!mgr.contains(&busy), "busy handle removed");
+    assert_eq!(mgr.registry().size(), 0, "registry emptied");
+    assert!(!mgr.is_busy(&busy), "busy flag cleared");
+    assert!(mgr.workers.lock().unwrap().is_empty(), "worker map cleared");
+    assert!(mgr.agent_ws.lock().unwrap().is_empty(), "agent_ws cleared");
+
+    // A same-slug recreate finds zero pre-existing agents.
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let ts = now_iso();
+    let workspace = Workspace {
+        id: ws.clone(),
+        title: "WS".to_string(),
+        branch: "main".to_string(),
+        base_ref: None,
+        base_commit_sha: None,
+        status: WorkspaceStatus::Active,
+        status_message: None,
+        activity: WorkspaceActivity::Idle,
+        attention: WorkspaceAttention::None,
+        created_at: ts.clone(),
+        updated_at: ts,
+        last_activity: None,
+        tags: vec![],
+        path: None,
+        repository_path: None,
+        repository_owner: None,
+        repository_name: None,
+        worktree_path: None,
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
+        archived: false,
+        archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
+        token_usage: None,
+    };
+    store
+        .insert_workspace(&workspace)
+        .await
+        .expect("re-insert same-slug workspace");
+    let sessions = store
+        .list_agent_sessions(&ws)
+        .await
+        .expect("list on recreated ws");
+    assert!(sessions.is_empty(), "recreated workspace shows no ghosts");
+}
+
 /// `stop` drops any pending `recreated` flag so a stale resend bit cannot
 /// survive a teardown into a future spawn (parity with the `recreated` doc on
 /// `AgentManager`).
