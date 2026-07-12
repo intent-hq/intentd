@@ -4880,6 +4880,7 @@ impl WorkspaceApi for Services {
 
     fn archive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             // Chief cannot be archived: it is a fixed virtual workspace, so
             // return the synthesized shape unchanged rather than mutating the
@@ -4894,12 +4895,21 @@ impl WorkspaceApi for Services {
             ws.archived_at = Some(now.clone());
             ws.updated_at = now;
             store.update_workspace(&ws).await?;
+            // §6.5 has no `workspace:archived`; mirror the reference emitter and
+            // publish `workspace:updated` with the applied `{ archived }` delta
+            // so subscribers flip state without a re-read.
+            publish_event(
+                &bus,
+                workspace_updated_event(&ws.id, serde_json::json!({ "archived": true })),
+            )
+            .await;
             Ok(ws)
         })
     }
 
     fn unarchive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             if id.is_chief() {
                 return Ok(chief_workspace());
@@ -4910,6 +4920,11 @@ impl WorkspaceApi for Services {
             ws.archived_at = None;
             ws.updated_at = now_iso();
             store.update_workspace(&ws).await?;
+            publish_event(
+                &bus,
+                workspace_updated_event(&ws.id, serde_json::json!({ "archived": false })),
+            )
+            .await;
             Ok(ws)
         })
     }
@@ -6633,6 +6648,7 @@ impl WorkspaceApi for Services {
         suggestion_proposed: Option<String>,
     ) -> BoxFuture<'_, Result<CommentRespondResult>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             if thread_id.is_none() && comment_id.is_none() {
                 return Err(Error::Internal(
@@ -6686,7 +6702,7 @@ impl WorkspaceApi for Services {
             let reply = Comment {
                 id: uuid::Uuid::new_v4().to_string(),
                 thread_id: target.clone(),
-                note_id: Some(note_id),
+                note_id: Some(note_id.clone()),
                 kind: kind_parsed,
                 content: comment,
                 author: author.unwrap_or_else(|| "Agent".to_string()),
@@ -6712,6 +6728,14 @@ impl WorkspaceApi for Services {
                 updated_at: now,
             };
             store.insert_comment(&workspace_id, &reply).await?;
+            // Reference `comment.respond` dispatches the same domain event as
+            // `comment.add`; publish `comment:added` so the comment channel
+            // pushes the new reply without a re-read (§6.5).
+            publish_event(
+                &bus,
+                comment_added_event(&workspace_id, &note_id, &reply.id),
+            )
+            .await;
             Ok(CommentRespondResult {
                 success: true,
                 message: "Reply added successfully".to_string(),

@@ -2420,6 +2420,58 @@ mod change_event_parity {
         );
     }
 
+    /// Reference parity: `comment.respond` publishes a single `comment:added`
+    /// event carrying `{ noteId, commentId }` for the reply so subscribers see
+    /// the new thread comment without a re-read (Audit D C2).
+    #[tokio::test]
+    async fn comment_respond_emits_comment_added_once() {
+        let h = harness().await;
+        let tn = note(&h.ws, "n-1", "hello world");
+        h.store.insert_note(&tn).await.expect("insert note");
+        let added = h
+            .services
+            .comment_add(
+                h.ws.clone(),
+                tn.id.clone(),
+                "hello world".to_string(),
+                "hello".to_string(),
+                "root".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("comment");
+        // Subscribe after the add so only the respond event is observed.
+        let mut sub = subscribe(&h);
+        let reply = h
+            .services
+            .comment_respond(
+                h.ws.clone(),
+                tn.id.clone(),
+                None,
+                Some(added.comment_id.clone()),
+                "reply body".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("respond");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "comment:added");
+        assert_eq!(
+            ev["data"],
+            json!({ "noteId": "n-1", "commentId": reply.comment.id })
+        );
+        // Cardinality exactly 1: no additional publishes fire.
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "comment.respond must publish exactly one event, got extra: {quiet:?}"
+        );
+    }
+
     #[tokio::test]
     async fn comment_resolved_payload() {
         let h = harness().await;
@@ -2475,6 +2527,61 @@ mod change_event_parity {
         assert_eq!(
             ev["data"],
             json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+    }
+
+    /// §6.5 has no `workspace:archived`; the reference emitter publishes
+    /// `workspace:updated` with the applied `{ archived }` delta. Verify
+    /// `archive_workspace` fires exactly one such event (Audit D C3).
+    #[tokio::test]
+    async fn archive_workspace_emits_workspace_updated_once() {
+        use intent_core::WorkspaceApi;
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        h.services
+            .archive_workspace(h.ws.clone())
+            .await
+            .expect("archive");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "changes": { "archived": true } })
+        );
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "archive_workspace must publish exactly one event, got extra: {quiet:?}"
+        );
+    }
+
+    /// Symmetric to archive: `unarchive_workspace` emits one `workspace:updated`
+    /// carrying `{ archived: false }` (Audit D C3).
+    #[tokio::test]
+    async fn unarchive_workspace_emits_workspace_updated_once() {
+        use intent_core::{WorkspaceApi, WorkspaceStatus};
+        let h = harness().await;
+        // Seed the row as archived so unarchive has a real state to flip.
+        let mut ws = workspace(&h.ws);
+        ws.status = WorkspaceStatus::Archived;
+        ws.archived = true;
+        ws.archived_at = Some(intent_core::now_iso());
+        h.store.update_workspace(&ws).await.expect("archive row");
+        let mut sub = subscribe(&h);
+        h.services
+            .unarchive_workspace(h.ws.clone())
+            .await
+            .expect("unarchive");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "changes": { "archived": false } })
+        );
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "unarchive_workspace must publish exactly one event, got extra: {quiet:?}"
         );
     }
 
