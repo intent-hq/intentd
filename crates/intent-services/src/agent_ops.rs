@@ -985,7 +985,19 @@ impl Services {
             provider,
             system_prompt: None,
             specialist,
-            status: AgentStatus::Pending,
+            // Reference parity (`agent-factory.ts:435` persists `AgentStatus.Idle`
+            // — the legacy capitalized `"Idle"` variant — on session creation):
+            // a freshly persisted session is `Idle`, not `Pending`. Both values
+            // are recognized as idle by the FE (see `consolidated-backend.service.ts`
+            // where `status === AgentStatus.Idle || status === AgentStatus.RuntimeIdle`
+            // gates the same code paths), so waiting/idle-gating selectors behave
+            // identically to the TS reference. End-of-turn later rewrites the
+            // status to `AgentStatus::RuntimeIdle` (lowercase `"idle"`), which
+            // is the modern wire form. Heal-on-startup is unaffected:
+            // `is_stale_in_flight_status` only matches `Active`/`Processing`/
+            // `Waiting`, so `Idle` (like the former `Pending`) is left untouched
+            // by the sweep at `crates/intent-services/src/lib.rs:653`.
+            status: AgentStatus::Idle,
             is_active: false,
             messages: Vec::new(),
             stats: None,

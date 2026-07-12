@@ -549,12 +549,15 @@ async fn mock_agent_full_turn_over_wss() {
 
 /// Session-status lifecycle persistence (P0 — chat-spinner clear). A normal
 /// `agent.sendMessage` turn must drive the persisted `agent_session.status`
-/// through `pending → active → idle` and emit the matching
+/// through `Idle → active → idle` and emit the matching
 /// `agent:status-changed` self-sufficient events (PROTOCOL §6.5/§6.7), so a
-/// hydrated/reloaded chat reflects the post-turn idle state rather than the
-/// stored `pending` placeholder. Co-emitted with `agent:idle` at turn end.
+/// hydrated/reloaded chat reflects the post-turn idle state. A freshly
+/// created session persists the legacy `AgentStatus::Idle` (wire form
+/// `"Idle"`) for reference parity with `agent-factory.ts:435`; end-of-turn
+/// then rewrites to `AgentStatus::RuntimeIdle` (wire form `"idle"`).
+/// Co-emitted with `agent:idle` at turn end.
 #[tokio::test]
-async fn agent_session_status_persists_pending_active_idle_over_wss() {
+async fn agent_session_status_persists_idle_active_idle_over_wss() {
     let Some(script) = gate("WSS status-lifecycle E2E") else {
         return;
     };
@@ -609,8 +612,11 @@ async fn agent_session_status_persists_pending_active_idle_over_wss() {
         .expect("agent id")
         .to_string();
 
-    // A brand-new agent persists with the default `pending` status; the runtime
-    // must transition it as the turn runs.
+    // A brand-new agent persists as `AgentStatus::Idle` — the legacy
+    // capitalized wire value `"Idle"` — for reference parity with
+    // `agent-factory.ts:435`. The runtime then transitions the session
+    // through `active` and rewrites the terminal state to `RuntimeIdle`
+    // (lowercase `"idle"`) as the turn ends.
     let pre = wss_rpc(
         &mut rpc,
         11,
@@ -619,8 +625,8 @@ async fn agent_session_status_persists_pending_active_idle_over_wss() {
     )
     .await;
     assert_eq!(
-        pre["agent"]["status"], "pending",
-        "fresh agent persisted with status=pending: {pre}"
+        pre["agent"]["status"], "Idle",
+        "fresh agent persisted with status=Idle (legacy capitalized value, reference parity): {pre}"
     );
 
     let sent = wss_rpc(
