@@ -2262,6 +2262,262 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
     );
 }
 
+/// SUB-2 (Copilot #104) end-to-end over WSS: `agent.reportToParent` is
+/// metadata-only — it MUST NOT deliver an immediate parent wake — and the
+/// single parent wake is driven by the child's terminal `agent:idle`,
+/// carrying the persisted `completionReport` via `format_completion_wake`'s
+/// `Report:` branch (which wins over `lastResponseSummary`). Exercised on the
+/// real WSS wire (not just the `intent-services` unit tests) per the repo's
+/// e2e requirement.
+///
+/// A parent's opening turn delegates one child (immediate, ungrouped —
+/// `waitMode: "immediate"`), the child calls `ws.agent.reportToParent` and
+/// then finishes, and the parent's wake turn acknowledges. Asserts:
+/// - the parent transcript carries EXACTLY ONE `[WORKSPACE EVENTS]` wake
+///   message (proving `reportToParent` emitted zero additional wakes);
+/// - that wake carries the `Report: <report>` framing and does NOT fall
+///   through to the `Summary:` branch (report-preferred formatting);
+/// - the wake turn runs on the parent AFTER the child's `agent:idle` — no
+///   parent `agent:stream:*` fires between the child's first stream chunk
+///   and the child's terminal `agent:idle`.
+#[tokio::test]
+async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss() {
+    let Some(script) = gate("WSS reportToParent SUB-2 E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    const CHILD_TAG: &str = "SUB2_WSS_CHILD";
+    const REPORT: &str = "SUB2_WSS_REPORT shipped the thing";
+    const PARENT_GO: &str = "SUB2_WSS_PARENT_GO";
+    // The child reports via the unified `workspace_api` tool + `ws.*` binding
+    // (post-WSAPI-8: discrete `report_to_parent` MCP tool is gone).
+    let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
+    let delegate_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        json!(CHILD_TAG),
+    );
+    // One behavior, prompt-matched rules:
+    // - child (matched on its delegated instructions): reportToParent then finish;
+    // - parent's wake turn (matched on the [WORKSPACE EVENTS] framing): ack;
+    // - parent's opening turn (matched on PARENT_GO): delegate the single child.
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": CHILD_TAG,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": report_js, "summary": "child reportToParent" }
+                },
+                "response": "child finished after reportToParent",
+            },
+            {
+                "ifPromptContains": "[WORKSPACE EVENTS]",
+                "response": "parent acknowledged the wake",
+            },
+            {
+                "ifPromptContains": PARENT_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": delegate_js, "summary": "delegate SUB-2 child" }
+                },
+                "response": "parent delegated one immediate child",
+            },
+        ],
+    })
+    .to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child: child_proc,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE the turn so we miss no events.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let parent = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "SUB2 Parent", "model": "mock:default" }),
+    )
+    .await;
+    let parent_id = parent["agent"]["id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent_id, "content": PARENT_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Track the observable event ordering:
+    // - parent goes idle after the delegating turn;
+    // - child streams (chunk/end) → child agent:idle (report already persisted);
+    // - THEN the parent's wake turn runs (chunk/end) → parent idles again.
+    // If `reportToParent` had emitted an immediate wake, the parent's second
+    // `stream:chunk` would fire BEFORE the child's `agent:idle` here.
+    let mut child_id: Option<String> = None;
+    let mut parent_idle_after_delegate = false;
+    let mut child_first_chunk_seen = false;
+    let mut child_idle = false;
+    let mut parent_wake_chunk_before_child_idle = false;
+    let mut parent_wake_ends = 0u32;
+    let mut parent_idle_after_wake = false;
+    for _ in 0..400 {
+        let frame = wss_event(&mut sub, 60).await;
+        let ev = &frame["params"]["event"];
+        let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+        let ev_type = ev["type"].as_str().unwrap_or_default();
+        // Learn the child id from the first non-parent stream chunk (the
+        // child's own turn keys every stream event by its agent id).
+        if child_id.is_none()
+            && ev_type == "agent:stream:chunk"
+            && !ev_agent.is_empty()
+            && ev_agent != parent_id
+        {
+            child_id = Some(ev_agent.to_string());
+        }
+        if ev_agent == parent_id && ev_type == "agent:idle" && !parent_idle_after_delegate {
+            parent_idle_after_delegate = true;
+            continue;
+        }
+        if let Some(cid) = child_id.as_deref() {
+            if ev_agent == cid && ev_type == "agent:stream:chunk" {
+                child_first_chunk_seen = true;
+            }
+            if ev_agent == cid && ev_type == "agent:idle" {
+                child_idle = true;
+            }
+        }
+        // Between the child's first chunk and the child's idle, the parent
+        // MUST NOT stream a wake turn — that would prove `reportToParent`
+        // delivered an immediate wake.
+        if ev_agent == parent_id
+            && ev_type == "agent:stream:chunk"
+            && child_first_chunk_seen
+            && !child_idle
+        {
+            parent_wake_chunk_before_child_idle = true;
+        }
+        if ev_agent == parent_id && ev_type == "agent:stream:end" && child_idle {
+            parent_wake_ends += 1;
+        }
+        if ev_agent == parent_id && ev_type == "agent:idle" && child_idle {
+            parent_idle_after_wake = true;
+        }
+        if parent_idle_after_wake && parent_wake_ends >= 1 {
+            break;
+        }
+    }
+    assert!(
+        parent_idle_after_delegate,
+        "parent went idle after the delegating turn"
+    );
+    assert!(child_id.is_some(), "child agent id observed on the wire");
+    assert!(child_idle, "child emitted agent:idle after reportToParent");
+    assert!(
+        !parent_wake_chunk_before_child_idle,
+        "reportToParent MUST NOT emit an immediate parent wake — parent streamed before child idled"
+    );
+    assert_eq!(
+        parent_wake_ends, 1,
+        "exactly one wake-turn stream:end on the parent (single wake driven by child idle)"
+    );
+    assert!(
+        parent_idle_after_wake,
+        "parent idled again after the wake turn"
+    );
+
+    // The parent transcript carries EXACTLY ONE `[WORKSPACE EVENTS]` wake
+    // (proof that `reportToParent` didn't emit its own), and that wake
+    // carries the persisted report via `format_completion_wake`'s
+    // `Report:` branch — the `Summary:` fallback MUST NOT appear.
+    let conv = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "agentId": parent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let wake_texts: Vec<String> = messages
+        .iter()
+        .filter_map(|m| {
+            let text = serde_json::to_string(&m["contentBlocks"]).unwrap_or_default();
+            if text.contains("[WORKSPACE EVENTS]") {
+                Some(text)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        wake_texts.len(),
+        1,
+        "exactly one [WORKSPACE EVENTS] wake on the parent: {conv}"
+    );
+    let wake = &wake_texts[0];
+    assert!(
+        wake.contains(&format!("Report: {REPORT}")),
+        "wake carries the persisted report via the Report: branch: {wake}"
+    );
+    assert!(
+        !wake.contains("Summary:"),
+        "wake MUST prefer the persisted report over lastResponseSummary: {wake}"
+    );
+
+    // The child's persisted `metadata.completionReport` is the same text
+    // (the write persisted by `agent.reportToParent`) — the source of truth
+    // that `format_completion_wake` folded into the wake bytes above.
+    let cid = child_id.expect("child id captured");
+    let child_got = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": cid }),
+    )
+    .await;
+    assert_eq!(
+        child_got["agent"]["metadata"]["completionReport"].as_str(),
+        Some(REPORT),
+        "child's persisted completionReport matches: {child_got}"
+    );
+}
+
 /// Pre-seed the daemon's SQLite store with a workspace + target note for the
 /// MCP tool call (the daemon opens the same data dir on launch).
 async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {

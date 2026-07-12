@@ -14,10 +14,9 @@
 use std::sync::Arc;
 
 // Use `tokio::time::Instant` (not `std::time::Instant`) for the cleanup
-// deadline: the timer is driven by `tokio::time::sleep`, which advances
-// under a paused tokio clock (see `tokio::time::pause`) while
-// `std::time::Instant::now()` does not — mixing the two would let a
-// paused-clock test's cleanup task race against a real-time deadline.
+// deadline: Tokio timers/instants follow Tokio's time source while
+// `std::time::Instant` always reads real time; mixing them makes deadline
+// checks incorrect in paused-time tests (see `tokio::time::pause`).
 use tokio::time::Instant;
 
 use intent_core::{now_iso, AgentId, Event, WorkspaceId};
@@ -169,6 +168,35 @@ impl Services {
                     })
                     .cloned()
             })
+    }
+
+    /// SUB-2 (Copilot #104): refresh the stored `parent_agent_name` on a
+    /// reused watch entry so `agent.getSubscriptions` /
+    /// [`describe_subscription`] reflect any rename applied via
+    /// `agent.rename` / `agent.update` since the watch was registered. A
+    /// long-lived reused watch would otherwise render a stale `agentName` /
+    /// `description`. No-op (returns `false`) when the watch is missing;
+    /// silent when the name is already current.
+    pub(crate) fn refresh_watch_parent_name(
+        &self,
+        workspace_id: &WorkspaceId,
+        subscription_id: &str,
+        new_name: String,
+    ) -> bool {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let Some(w) = guard.get_mut(workspace_id) else {
+            return false;
+        };
+        let Some(watch) = w.subscriptions.iter_mut().find(|s| s.id == subscription_id) else {
+            return false;
+        };
+        if watch.parent_agent_name != new_name {
+            watch.parent_agent_name = new_name;
+        }
+        true
     }
 
     /// SUB-2: monotonically bump a watch's cleanup deadline to at least

@@ -2908,18 +2908,31 @@ impl Services {
                 // oneShot. Mismatched modes fall through to a fresh
                 // `register_completion_watch`.
                 let one_shot = !queued;
+                // Resolve the caller's current display name up front so a
+                // fresh watch is registered with it, and a reused watch has
+                // its stored `parent_agent_name` refreshed against the same
+                // source (SUB-2 Copilot #104): agents can rename via
+                // `agent.rename` / `agent.update`, and `describe_subscription`
+                // formats using `watch.parent_agent_name`, so a long-lived
+                // reused watch would otherwise report a stale `agentName` /
+                // `description` from `agent.getSubscriptions`.
+                let caller_name = self
+                    .store
+                    .get_agent_session(&caller)
+                    .await
+                    .ok()
+                    .map(|s| s.name)
+                    .unwrap_or_default();
                 let (subscription_id, reused) = if let Some(existing) =
                     self.find_ungrouped_watch(&workspace_id, &caller, &agent_id, one_shot)
                 {
+                    self.refresh_watch_parent_name(
+                        &workspace_id,
+                        &existing.id,
+                        caller_name.clone(),
+                    );
                     (existing.id, true)
                 } else {
-                    let caller_name = self
-                        .store
-                        .get_agent_session(&caller)
-                        .await
-                        .ok()
-                        .map(|s| s.name)
-                        .unwrap_or_default();
                     let new_id = self.register_completion_watch(
                         &workspace_id,
                         caller.clone(),

@@ -1544,6 +1544,53 @@ async fn wake_or_create_reuses_existing_watch_no_duplicate() {
     assert_eq!(parent_message_count(&svc, &caller).await, baseline + 1);
 }
 
+/// SUB-2 (Copilot #104): reusing an existing ungrouped watch on a repeated
+/// `agent.wakeOrCreate` refreshes the stored `parent_agent_name` so a rename
+/// applied to the caller (via `agent.rename`) between wake calls surfaces
+/// through `agent.getSubscriptions` / `describe_subscription`.
+#[tokio::test]
+async fn wake_or_create_reuse_refreshes_parent_agent_name() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "OldName").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    let note_id = seed_task(&svc, &ws, "SUB-2 rename").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+        .await
+        .expect("assign");
+
+    let input = || AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let r1 = svc
+        .agent_wake_or_create_op(ws.clone(), note_id.clone(), "resume 1".into(), input())
+        .await
+        .expect("wake 1");
+    let sub_id = r1["subscriptionId"].as_str().expect("sub id").to_string();
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].parent_agent_name, "OldName");
+
+    // Rename the caller between wakes (the exact `agent.rename` path a
+    // long-lived coordinator would hit via `agent.rename` / `agent.update`).
+    svc.agent_rename_op(caller.clone(), "NewName".into(), false)
+        .await
+        .expect("rename");
+
+    // Second wake reuses the same watch id AND refreshes the stored name.
+    let r2 = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "resume 2".into(), input())
+        .await
+        .expect("wake 2");
+    assert_eq!(r2["subscriptionId"].as_str(), Some(sub_id.as_str()));
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1, "still no duplicate watches: {watches:?}");
+    assert_eq!(
+        watches[0].parent_agent_name, "NewName",
+        "reused watch reflects the caller rename: {watches:?}"
+    );
+}
+
 /// `agent.delegate` persists the resolved first message as
 /// `metadata.initialMessage` and the child's `metadata.delegationDepth`
 /// (parent depth + 1) so a wake-up can resume (P3-1.2b). Delegated children
