@@ -2905,6 +2905,13 @@ mod change_event_parity {
         assert_envelope(&ev, &h.ws.0, "note:created");
         assert_eq!(ev["data"]["noteId"], "spec");
         assert_eq!(ev["data"]["title"], "Spec");
+
+        // No further events fire — reseed publishes exactly once.
+        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "reseed must publish exactly one event, got extra: {quiet:?}"
+        );
     }
 
     /// A workspace that already has a `spec` note is untouched by `note.list`:

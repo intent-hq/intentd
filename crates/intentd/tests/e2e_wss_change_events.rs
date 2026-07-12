@@ -636,4 +636,34 @@ async fn note_list_reseeds_missing_spec_over_wss() {
     assert_eq!(evt["data"]["noteId"], json!("spec"));
     assert_eq!(evt["data"]["title"], json!("Spec"));
     assert_eq!(evt["data"]["action"], json!("create"));
+
+    // The reseed publishes exactly one `note:created`; drain the socket for a
+    // short window and fail if a second one arrives. Non-matching frames
+    // (heartbeats, other event types) are ignored.
+    let extra = timeout(Duration::from_millis(500), async {
+        loop {
+            match sub.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = match serde_json::from_str(&text) {
+                        Ok(x) => x,
+                        Err(_) => continue,
+                    };
+                    if v["method"] == json!("events.event")
+                        && v["params"]["event"]["type"] == json!("note:created")
+                    {
+                        return Some(v);
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) | Some(Err(_)) | None => continue,
+            }
+        }
+    })
+    .await;
+    assert!(
+        extra.is_err(),
+        "reseed must publish exactly one note:created, got extra: {extra:?}"
+    );
 }
