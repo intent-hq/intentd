@@ -672,3 +672,261 @@ async fn note_list_reseeds_missing_spec_over_wss() {
         "reseed must publish exactly one note:created, got extra: {extra:?}"
     );
 }
+
+/// Drain any additional `events.event` frames matching `event_type` in
+/// `window` ms; return the first extra observed, or `None` if the socket
+/// stayed quiet. Non-matching frames (heartbeats, unrelated event types) are
+/// ignored so the drain is scoped strictly to cardinality of the target
+/// emission.
+async fn drain_extra<S>(
+    ws: &mut WebSocketStream<S>,
+    event_type: &str,
+    window_ms: u64,
+) -> Option<Value>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    timeout(Duration::from_millis(window_ms), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = match serde_json::from_str(&text) {
+                        Ok(x) => x,
+                        Err(_) => continue,
+                    };
+                    if v["method"] == json!("events.event")
+                        && v["params"]["event"]["type"] == json!(event_type)
+                    {
+                        return v;
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
+                None => panic!("subscription socket closed during drain"),
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+/// End-to-end (Audit D C2): `comment.respond` over WSS publishes
+/// `comment:added` with `{ noteId, commentId }` for the reply so a subscribed
+/// client sees the new thread comment without a re-read (PROTOCOL §6.5,
+/// comment channel; reference `comment.respond` dispatches the same domain
+/// event as `comment.add`).
+#[tokio::test]
+async fn comment_respond_emits_comment_added_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    // Bootstrap workspace + note + root comment off UDS so the WSS subscriber
+    // observes only the respond emission.
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "Comments", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Note", "content": "anchor target text" }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+    let add = uds_rpc(
+        &socket,
+        4,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "anchor target text",
+            "commentTarget": "target",
+            "comment": "root"
+        }),
+    )
+    .await;
+    let root_comment_id = add["result"]["commentId"]
+        .as_str()
+        .expect("comment id")
+        .to_string();
+
+    // Subscribe over WSS before the respond, scoped to comment:added.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["comment:added"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Drive comment.respond on a separate WSS RPC connection.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let reply = wss_rpc(
+        &mut rpc,
+        2,
+        "comment.respond",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "commentId": root_comment_id,
+            "comment": "reply body",
+        }),
+    )
+    .await;
+    let reply_id = reply["comment"]["id"]
+        .as_str()
+        .expect("reply id")
+        .to_string();
+    assert_ne!(reply_id, root_comment_id, "reply must have its own id");
+
+    let evt = next_event(&mut sub, &["comment:added"], 10).await;
+    assert_eq!(evt["workspaceId"], ws_id.as_str());
+    assert!(evt["id"].is_string(), "event id: {evt}");
+    assert!(evt["timestamp"].is_string(), "timestamp: {evt}");
+    assert_eq!(
+        evt["actor"],
+        json!({ "type": "system", "id": "system", "name": "System" })
+    );
+    assert_eq!(
+        evt["data"],
+        json!({ "noteId": note_id, "commentId": reply_id })
+    );
+
+    // Cardinality exactly 1: no second comment:added lands.
+    let extra = drain_extra(&mut sub, "comment:added", 500).await;
+    assert!(
+        extra.is_none(),
+        "comment.respond must publish exactly one comment:added, got extra: {extra:?}"
+    );
+}
+
+/// End-to-end (Audit D C3): `workspace.archive` over WSS publishes
+/// `workspace:updated` with `changes: { archived: true }`. §6.5 has no
+/// `workspace:archived` event; the reference emitter dispatches
+/// `workspaceUpdated` with a `changes` delta.
+#[tokio::test]
+async fn archive_workspace_emits_workspace_updated_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "ToArchive", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:updated"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut rpc,
+        2,
+        "workspace.archive",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+
+    let evt = next_event(&mut sub, &["workspace:updated"], 10).await;
+    assert_eq!(evt["workspaceId"], ws_id.as_str());
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": ws_id, "changes": { "archived": true } })
+    );
+
+    let extra = drain_extra(&mut sub, "workspace:updated", 500).await;
+    assert!(
+        extra.is_none(),
+        "workspace.archive must publish exactly one workspace:updated, got extra: {extra:?}"
+    );
+}
+
+/// End-to-end (Audit D C3, symmetric): `workspace.unarchive` over WSS
+/// publishes `workspace:updated` with `changes: { archived: false }`.
+#[tokio::test]
+async fn unarchive_workspace_emits_workspace_updated_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "ToUnarchive", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    // Archive off UDS so the WSS subscriber observes only the unarchive.
+    uds_rpc(
+        &socket,
+        3,
+        "workspace.archive",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:updated"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut rpc,
+        2,
+        "workspace.unarchive",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+
+    let evt = next_event(&mut sub, &["workspace:updated"], 10).await;
+    assert_eq!(evt["workspaceId"], ws_id.as_str());
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": ws_id, "changes": { "archived": false } })
+    );
+
+    let extra = drain_extra(&mut sub, "workspace:updated", 500).await;
+    assert!(
+        extra.is_none(),
+        "workspace.unarchive must publish exactly one workspace:updated, got extra: {extra:?}"
+    );
+}
