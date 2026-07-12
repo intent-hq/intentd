@@ -657,7 +657,12 @@ async fn note_list_reseeds_missing_spec_over_wss() {
                 Some(Ok(Message::Ping(p))) => {
                     let _ = sub.send(Message::Pong(p)).await;
                 }
-                Some(Ok(_)) | Some(Err(_)) | None => continue,
+                Some(Ok(_)) => continue,
+                // Stream close / error during the "should be quiet" window is
+                // not the condition this drain is guarding against; surface
+                // it instead of spinning silently until the timeout.
+                Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
+                None => panic!("subscription socket closed during drain"),
             }
         }
     })
