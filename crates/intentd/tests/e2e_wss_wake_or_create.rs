@@ -494,15 +494,16 @@ async fn wake_or_create_widened_wire_contract_over_wss() {
     assert_eq!(got["agent"]["id"], new_agent_id);
 }
 
-/// TASK-C (Copilot #104): `agent.delegate` with `taskNoteId` prepends the
-/// reference `DelegateTaskTool` "Your Task Note" preamble to the delegated
-/// child's FIRST message, so the child sees the note ID/title and the
-/// single-task scope contract byte-for-byte. Exercised over the real WSS
-/// wire (not just the `intent-services` unit tests) per the repo's e2e
-/// requirement. Hermetic — no ACP provider is spawned; the child's persisted
-/// `metadata.initialMessage` carries the preamble bytes at delegate time.
+/// TASK-C2 (follow-up to #104): `agent.delegate` with `taskNoteId` APPENDS
+/// the reference `DelegateTaskTool` "Your Task Note" preamble after the
+/// delegated child's FIRST message with a `---` separator, so the child sees
+/// the body first followed by the note ID/title and the single-task scope
+/// contract byte-for-byte. Exercised over the real WSS wire (not just the
+/// `intent-services` unit tests) per the repo's e2e requirement. Hermetic —
+/// no ACP provider is spawned; the child's persisted `metadata.initialMessage`
+/// carries the preamble bytes at delegate time.
 #[tokio::test]
-async fn delegate_with_task_note_id_prepends_preamble_over_wss() {
+async fn delegate_with_task_note_id_appends_preamble_over_wss() {
     const TITLE: &str = "TASK-C preamble task";
     let (_daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task(TITLE).await;
     let cfg = client_config(&fp);
@@ -528,8 +529,9 @@ async fn delegate_with_task_note_id_prepends_preamble_over_wss() {
     assert!(!child_id.is_empty(), "non-empty child agentId");
 
     // `agent.get` returns `metadata.initialMessage` — the resolved first
-    // message the child sees. It MUST carry the exact preamble bytes
-    // (title + note id + scope directive) followed by the body.
+    // message the child sees. Byte-exact match against the reference
+    // composition `${msg}\n\n---\n${preamble}${commitInstruction}` from
+    // `agent-interaction-tools.ts`. `skipAutoCommit` unset => empty tail.
     let got = wss_rpc(
         &mut rpc,
         2,
@@ -540,23 +542,73 @@ async fn delegate_with_task_note_id_prepends_preamble_over_wss() {
     let initial = got["agent"]["metadata"]["initialMessage"]
         .as_str()
         .expect("initialMessage string");
-    let expected_title_line = format!("**Your Task Note:** \"{TITLE}\" (ID: {task_note_id})");
-    assert!(
-        initial.starts_with(&expected_title_line),
-        "child first message starts with the exact preamble title line: {initial:?}"
+    let expected = format!(
+        "do the delegated body\n\
+\n\
+---\n\
+**Your Task Note:** \"{TITLE}\" (ID: {task_note_id})\n\
+This note is your workspace for this task. Update it with your progress, findings, and deliverables.\n\
+\n\
+**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks."
     );
-    assert!(
-        initial.contains(
-            "This note is your workspace for this task. Update it with your progress, findings, and deliverables."
-        ),
-        "child first message carries the preamble body line: {initial:?}"
+    assert_eq!(
+        initial, expected,
+        "child first message must be byte-exact: {initial:?}"
     );
-    assert!(
-        initial.contains("**SCOPE: Complete THIS task only.**"),
-        "child first message carries the scope directive: {initial:?}"
+}
+
+/// TASK-C2: `agent.delegate` with `taskNoteId` + `skipAutoCommit=true` appends
+/// the reference `**Auto-commit is OFF.**` instruction after the scope
+/// directive, byte-for-byte, over the real WSS wire.
+#[tokio::test]
+async fn delegate_with_skip_auto_commit_appends_commit_instruction_over_wss() {
+    const TITLE: &str = "TASK-C skipAutoCommit task";
+    let (_daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task(TITLE).await;
+    let cfg = client_config(&fp);
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    let delegated = wss_rpc(
+        &mut rpc,
+        1,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": task_note_id,
+            "agentInstructions": "do the delegated body",
+            "skipAutoCommit": true,
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    assert_eq!(delegated["ok"], true, "delegate ok: {delegated}");
+    let child_id = delegated["agentId"]
+        .as_str()
+        .expect("child agent id")
+        .to_string();
+
+    let got = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": child_id }),
+    )
+    .await;
+    let initial = got["agent"]["metadata"]["initialMessage"]
+        .as_str()
+        .expect("initialMessage string");
+    let expected = format!(
+        "do the delegated body\n\
+\n\
+---\n\
+**Your Task Note:** \"{TITLE}\" (ID: {task_note_id})\n\
+This note is your workspace for this task. Update it with your progress, findings, and deliverables.\n\
+\n\
+**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.\n\
+\n\
+**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `agent_commit_changes` with `userRequested: true`."
     );
-    assert!(
-        initial.contains("do the delegated body"),
-        "the delegated body follows the preamble: {initial:?}"
+    assert_eq!(
+        initial, expected,
+        "child first message must be byte-exact when skipAutoCommit=true: {initial:?}"
     );
 }

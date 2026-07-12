@@ -3528,12 +3528,12 @@ async fn delegate_falls_back_to_task_note_content_for_child_first_message() {
         .contains("note content body"));
 }
 
-/// TASK-C: `agent.delegate` with a linked task note prepends the reference
-/// `DelegateTaskTool` preamble ("Your Task Note" + scope contract) to the
-/// child's first message. The task title and note id appear verbatim so the
-/// child can self-mark the note complete when done.
+/// TASK-C2: `agent.delegate` with a linked task note APPENDS the reference
+/// `DelegateTaskTool` preamble ("Your Task Note" + scope contract) after the
+/// child's first message with a `---` separator. The task title and note id
+/// appear verbatim so the child can self-mark the note complete when done.
 #[tokio::test]
-async fn delegate_prepends_task_note_preamble_to_first_message() {
+async fn delegate_appends_task_note_preamble_to_first_message() {
     let (_t, svc, ws) = setup().await;
     let note = svc
         .create_note(
@@ -3576,22 +3576,23 @@ async fn delegate_prepends_task_note_preamble_to_first_message() {
         body.contains("**SCOPE: Complete THIS task only.**"),
         "scope contract missing: {body}"
     );
-    // The original instructions are preserved below the preamble.
+    // The original instructions are preserved above the preamble.
     assert!(
         body.contains("do the work"),
         "explicit instructions must survive the preamble: {body}"
     );
     // Exact first-message bytes: mirrors the reference `DelegateTaskTool`
-    // preamble (`agent-interaction-tools.ts`) verbatim, with no stray
-    // leading whitespace on the continuation lines, followed by a blank
-    // line and the caller's `agentInstructions`.
+    // composition `${msg}\n\n---\n${preamble}${commitInstruction}` from
+    // `agent-interaction-tools.ts`. With `skipAutoCommit` unset the trailing
+    // commit-instruction slot is empty.
     let expected_first_message = format!(
-        "**Your Task Note:** \"Port frobnicator\" (ID: {note_id})\n\
+        "do the work\n\
+\n\
+---\n\
+**Your Task Note:** \"Port frobnicator\" (ID: {note_id})\n\
 This note is your workspace for this task. Update it with your progress, findings, and deliverables.\n\
 \n\
-**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.\n\
-\n\
-do the work",
+**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.",
         note_id = note.id.as_str(),
     );
     let first_message_text = child_session_first_message_text(&svc, &child).await;
@@ -3601,11 +3602,104 @@ do the work",
     );
 }
 
+/// TASK-C2: when `skipAutoCommit=true` the reference appends the
+/// `**Auto-commit is OFF.**` instruction after the scope directive; assert
+/// the exact bytes.
+#[tokio::test]
+async fn delegate_appends_skip_auto_commit_instruction_when_true() {
+    let (_t, svc, ws) = setup().await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Port frobnicator".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    let input = AgentDelegateInput {
+        task_note_id: Some(note.id.clone()),
+        agent_instructions: Some("do the work".into()),
+        skip_auto_commit: Some(true),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let expected_first_message = format!(
+        "do the work\n\
+\n\
+---\n\
+**Your Task Note:** \"Port frobnicator\" (ID: {note_id})\n\
+This note is your workspace for this task. Update it with your progress, findings, and deliverables.\n\
+\n\
+**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.\n\
+\n\
+**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `agent_commit_changes` with `userRequested: true`.",
+        note_id = note.id.as_str(),
+    );
+    let first_message_text = child_session_first_message_text(&svc, &child).await;
+    assert_eq!(
+        first_message_text, expected_first_message,
+        "first message must be byte-exact when skipAutoCommit=true"
+    );
+}
+
+/// TASK-C2: `skipAutoCommit=false` (explicit) matches the default and omits
+/// the commit-instruction tail — regression guard so future refactors keep
+/// the branch gated correctly.
+#[tokio::test]
+async fn delegate_omits_skip_auto_commit_instruction_when_false() {
+    let (_t, svc, ws) = setup().await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Port frobnicator".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    let input = AgentDelegateInput {
+        task_note_id: Some(note.id.clone()),
+        agent_instructions: Some("do the work".into()),
+        skip_auto_commit: Some(false),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let first_message_text = child_session_first_message_text(&svc, &child).await;
+    assert!(
+        !first_message_text.contains("**Auto-commit is OFF.**"),
+        "commit instruction must be omitted when skipAutoCommit=false: {first_message_text}"
+    );
+    assert!(
+        first_message_text.ends_with(
+            "**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks."
+        ),
+        "message must end with the scope directive when skipAutoCommit=false: {first_message_text}"
+    );
+}
+
 /// TASK-C: delegating with a linked task note but no explicit
 /// `agentInstructions` / `taskText` still injects the preamble (the note's
-/// body/title fallback slots in beneath it).
+/// body/title fallback slots in above it).
 #[tokio::test]
-async fn delegate_task_note_only_injects_preamble_above_note_body() {
+async fn delegate_task_note_only_injects_preamble_below_note_body() {
     let (_t, svc, ws) = setup().await;
     let note = svc
         .create_note(
@@ -3635,12 +3729,12 @@ async fn delegate_task_note_only_injects_preamble_above_note_body() {
     assert!(body.contains("Task title"), "title: {body}");
     assert!(body.contains(note.id.as_str()), "note id: {body}");
     assert!(body.contains("note content body"), "note body: {body}");
-    // Preamble sits ABOVE the note body.
+    // Preamble sits BELOW the note body (reference appends after msg).
     let preamble_idx = body.find("**Your Task Note:**").expect("preamble idx");
     let body_idx = body.find("note content body").expect("body idx");
     assert!(
-        preamble_idx < body_idx,
-        "preamble must precede the note body"
+        body_idx < preamble_idx,
+        "note body must precede the preamble"
     );
 }
 

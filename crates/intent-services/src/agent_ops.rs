@@ -1964,9 +1964,12 @@ impl Services {
         }
         // TASK-C: mirror the reference `DelegateTaskTool` preamble
         // (agent-interaction-tools.ts). When the delegation links a task note,
-        // prepend the standard "Your Task Note" block so the child knows its
-        // note ID/title and the single-task scope contract; without a linked
-        // note the message is delivered verbatim.
+        // APPEND the standard "Your Task Note" block after the user message
+        // with a `---` separator so the child knows its note ID/title and the
+        // single-task scope contract; without a linked note the message is
+        // delivered verbatim. When `skipAutoCommit` is set, a follow-on
+        // commit instruction is concatenated after the scope directive,
+        // byte-for-byte matching the reference.
         if let (Some(note), Some(note_id)) = (task_note.as_ref(), session_task_note_id.as_ref()) {
             let title = first_nonempty(&note.title).unwrap_or_default();
             // Build the preamble from adjacent string literals (via `concat!`)
@@ -1984,9 +1987,16 @@ impl Services {
                 title = title,
                 note_id = note_id,
             );
+            let commit_instruction = if input.skip_auto_commit.unwrap_or(false) {
+                "\n\n**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `agent_commit_changes` with `userRequested: true`."
+            } else {
+                ""
+            };
             message = Some(match message {
-                Some(body) if !body.is_empty() => format!("{preamble}\n\n{body}"),
-                _ => preamble,
+                Some(body) if !body.is_empty() => {
+                    format!("{body}\n\n---\n{preamble}{commit_instruction}")
+                }
+                _ => format!("{preamble}{commit_instruction}"),
             });
         }
         // Resolve the child agent's name to match the reference `DelegateTaskTool`
