@@ -38,6 +38,11 @@ pub struct ProviderConfig {
     pub mcp_config_flag: Option<&'static str>,
     /// Flag for quiet mode (e.g., `--quiet`).
     pub quiet_flag: Option<&'static str>,
+    /// Flag for removing a provider-native tool at spawn time (e.g.
+    /// `--remove-tool`). Repeated once per tool name. `None` when the provider
+    /// exposes no equivalent knob — spawn-time tool restrictions are dropped
+    /// for that provider (MCP-side filtering, §6.8, still applies).
+    pub remove_tool_flag: Option<&'static str>,
     /// Optional provider-specific mode-map overrides (`logical -> provider`).
     pub mode_map: Option<&'static [(&'static str, &'static str)]>,
     /// Optional filter of available models for this provider.
@@ -76,6 +81,7 @@ impl ProviderConfig {
             rules_flag: None,
             mcp_config_flag: None,
             quiet_flag: None,
+            remove_tool_flag: None,
             mode_map: None,
             supported_models: None,
             is_default: false,
@@ -112,6 +118,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         rules_flag: Some("--rules"),
         mcp_config_flag: Some("--mcp-config"),
         quiet_flag: Some("--quiet"),
+        remove_tool_flag: Some("--remove-tool"),
         is_default: true,
         auth_error_patterns: Some(&[
             "authentication required",
