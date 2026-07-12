@@ -986,12 +986,15 @@ impl Services {
             system_prompt: None,
             specialist,
             // Reference parity: `agent-factory.ts:435` persists `AgentStatus.Idle`
-            // — the legacy capitalized `"Idle"` variant — on session creation.
-            // A freshly persisted session must be `Idle`, not `Pending`, so the
-            // FE's idle-gating selectors treat brand-new agents as idle and
-            // match the reference (whereas `Pending` would project as
-            // `"waiting"` per `agent_status_wire` below and drive the UI's
-            // waiting spinner on fresh sessions). Both idle wire values,
+            // — the legacy capitalized `"Idle"` variant — on session creation, so
+            // a freshly persisted session must be `Idle`, not `Pending`. On
+            // `agent.get`/`agent.list` the `AgentLite.status` field is serialized
+            // directly by serde, so `Pending` surfaces on the wire as `"pending"`
+            // (not `"waiting"` — the `"waiting"` string only comes from the
+            // separate `agent_status_wire` normalization used by the diagnostics
+            // / subscription snapshots); the FE's session hydration and idle
+            // selectors treat `"pending"` as a non-idle initial state, whereas
+            // `Idle` correctly hydrates as idle. Both idle wire values,
             // capitalized `"Idle"` (`AgentStatus.Idle`) and lowercase `"idle"`
             // (`AgentStatus.RuntimeIdle`), are accepted equivalently by the FE
             // (see `consolidated-backend.service.ts:1207`
