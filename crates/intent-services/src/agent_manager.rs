@@ -780,6 +780,7 @@ impl AgentManager {
         spawn_opts.quiet = opts.quiet;
         spawn_opts.provider_binary = opts.provider_binary;
         spawn_opts.extra_env = opts.extra_env.clone();
+        spawn_opts.tools_to_remove = opts.tools_to_remove.clone();
         if let Some(ref p) = mcp_config_path {
             spawn_opts.mcp_config_file = Some(p.as_str());
         }
@@ -1920,6 +1921,13 @@ impl AgentManager {
             // frontmatter (SP-B); falls back to the default interactive type so
             // plain agents and specialists without `agentType` are unchanged.
             let agent_type = derive_agent_type(&self.services, &session, workspace.as_ref());
+            // §18.4 CLI-side denylist: strip provider-native tools (e.g.
+            // auggie's built-in `str-replace-editor`, `sub-agent-*`) via
+            // `--remove-tool`. MCP-side filtering (§6.8) already blocks
+            // workspace-MCP tools, but the provider's native tools can only be
+            // stripped through this spawn-time flag.
+            opts.tools_to_remove =
+                intent_acp::get_tools_to_remove(session.specialist.as_deref(), &agent_type);
             self.create_agent(
                 agent_id.clone(),
                 workspace_id.clone(),
