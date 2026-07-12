@@ -13,6 +13,12 @@
 
 use std::sync::Arc;
 
+// Use `tokio::time::Instant` (not `std::time::Instant`) for the cleanup
+// deadline: Tokio timers/instants follow Tokio's time source while
+// `std::time::Instant` always reads real time; mixing them makes deadline
+// checks incorrect in paused-time tests (see `tokio::time::pause`).
+use tokio::time::Instant;
+
 use intent_core::{now_iso, AgentId, Event, WorkspaceId};
 use uuid::Uuid;
 
@@ -32,6 +38,14 @@ pub(crate) struct CompletionWatch {
     pub one_shot: bool,
     pub group_id: Option<String>,
     pub created_at: String,
+    /// SUB-2: monotonic cleanup deadline for the leak-guard timer. Set (and
+    /// bumped) by [`Services::bump_watch_cleanup_deadline`]; a spawned cleanup
+    /// task only removes the watch once this instant is in the past, so an
+    /// earlier-scheduled timer cannot delete a watch whose deadline was
+    /// extended by a later `spawn_watch_cleanup` call. `None` means "no
+    /// timed cleanup is armed" (the default for one-shot watches, which are
+    /// removed on delivery instead).
+    pub cleanup_deadline: Option<Instant>,
 }
 
 /// Fan-in table for `waitMode: "after_all"` delegation groups. All children a
@@ -90,6 +104,7 @@ impl Services {
             one_shot,
             group_id,
             created_at: now_iso(),
+            cleanup_deadline: None,
         };
         self.agent_subscriptions
             .lock()
@@ -121,6 +136,118 @@ impl Services {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKPyt):
+    /// atomically find a live ungrouped (immediate-mode) watch for the given
+    /// caller→target pair whose `one_shot` mode matches `one_shot` and, while
+    /// still holding the registry lock, refresh its stored `parent_agent_name`
+    /// to `new_parent_name`. Returns the live subscription id iff a matching
+    /// watch was found — so a concurrent removal by
+    /// [`Services::deliver_completion_to_watches`] (oneShot cleanup) or by an
+    /// expired [`Services::spawn_watch_cleanup`] task cannot land between the
+    /// find and the refresh and leave `agent.wakeOrCreate` returning a "reused"
+    /// subscription id that no longer exists. Callers must fall through to
+    /// [`Services::register_completion_watch`] when this returns `None`.
+    ///
+    /// Grouped (`after_all`) watches are skipped since they are owned by the
+    /// delegation-group fan-in. The `one_shot` filter ensures a queued wake
+    /// (which needs a non-oneShot watch to survive the current `agent:idle`)
+    /// never reuses a oneShot watch, and vice versa. Refreshing the stored
+    /// name keeps `agent.getSubscriptions` / [`describe_subscription`] in sync
+    /// with any rename applied via `agent.rename` / `agent.update` since the
+    /// watch was registered; a no-op when the name is already current.
+    ///
+    /// `new_parent_name` is `None` when the caller's current display name
+    /// could not be resolved (e.g. `store.get_agent_session` failed under
+    /// contention, Copilot #104 thread PRRT_kwDOS9Wxuc6QKWuU): the reuse and
+    /// the paired deadline bump still proceed, but the existing stored name
+    /// is left intact rather than overwritten with an empty placeholder that
+    /// would degrade `agent.getSubscriptions` / `describe_subscription`
+    /// output.
+    pub(crate) fn find_and_refresh_ungrouped_watch(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+        one_shot: bool,
+        new_parent_name: Option<String>,
+    ) -> Option<String> {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let w = guard.get_mut(workspace_id)?;
+        let watch = w.subscriptions.iter_mut().find(|s| {
+            s.group_id.is_none()
+                && s.one_shot == one_shot
+                && &s.parent_agent_id == parent_agent_id
+                && &s.child_agent_id == child_agent_id
+        })?;
+        if let Some(new_name) = new_parent_name {
+            if watch.parent_agent_name != new_name {
+                watch.parent_agent_name = new_name;
+            }
+        }
+        Some(watch.id.clone())
+    }
+
+    /// SUB-2: monotonically bump a watch's cleanup deadline to at least
+    /// `new_deadline` (never shortens). Returns whether the watch was found.
+    /// Paired with [`Services::remove_watch_if_deadline_passed`] so that a
+    /// stale cleanup task spawned by an earlier call can no-op when a later
+    /// call has extended the deadline past its wake-up time.
+    pub(crate) fn bump_watch_cleanup_deadline(
+        &self,
+        workspace_id: &WorkspaceId,
+        subscription_id: &str,
+        new_deadline: Instant,
+    ) -> bool {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let Some(w) = guard.get_mut(workspace_id) else {
+            return false;
+        };
+        let Some(watch) = w.subscriptions.iter_mut().find(|s| s.id == subscription_id) else {
+            return false;
+        };
+        watch.cleanup_deadline = Some(match watch.cleanup_deadline {
+            Some(existing) => existing.max(new_deadline),
+            None => new_deadline,
+        });
+        true
+    }
+
+    /// SUB-2: atomically remove the watch iff its `cleanup_deadline` is set
+    /// and has already elapsed. Returns whether a removal happened. Called
+    /// by the cleanup task spawned in [`Services::spawn_watch_cleanup`]; a
+    /// task that wakes before the current deadline is a no-op and the later
+    /// task (spawned for the extended deadline) performs the removal.
+    pub(crate) fn remove_watch_if_deadline_passed(
+        &self,
+        workspace_id: &WorkspaceId,
+        subscription_id: &str,
+    ) -> bool {
+        let now = Instant::now();
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let Some(w) = guard.get_mut(workspace_id) else {
+            return false;
+        };
+        let Some(idx) = w.subscriptions.iter().position(|s| s.id == subscription_id) else {
+            return false;
+        };
+        match w.subscriptions[idx].cleanup_deadline {
+            Some(deadline) if deadline <= now => {
+                w.subscriptions.remove(idx);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// All watches registered by `parent_agent_id`.
@@ -266,9 +393,11 @@ impl Services {
     }
 
     /// Whether `child_id` is enrolled in an undelivered `after_all` delegation
-    /// group parented by `parent_id`. Used by `agent.reportToParent` to suppress
-    /// the immediate parent send: a grouped child's report reaches the parent
-    /// only inside the group's single aggregated wake.
+    /// group parented by `parent_id`. Retained for tests and future callers;
+    /// the immediate-mode `reportToParent` suppression has moved to SUB-2
+    /// (the child's `agent:idle` drives the single wake, so grouped children
+    /// no longer need the pre-persist branch this predicate used to gate).
+    #[allow(dead_code)]
     pub(crate) fn child_in_undelivered_group(
         &self,
         workspace_id: &WorkspaceId,

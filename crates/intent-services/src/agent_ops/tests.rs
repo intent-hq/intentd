@@ -1055,6 +1055,683 @@ async fn report_to_parent_persists_completion_report() {
     assert_eq!(v["metadata"]["completionReportTimestamp"], r["savedAt"]);
 }
 
+/// TASK-B: on `agent.reportToParent`, the caller's linked task note
+/// transitions from a non-terminal status (`in_progress`) to
+/// `review_required`, mirroring the reference reportToParent writer.
+#[tokio::test]
+async fn report_to_parent_transitions_linked_task_to_review_required() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Ship feature X".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    svc.mark_as_task(
+        ws.clone(),
+        note.id.clone(),
+        "in_progress".into(),
+        vec![],
+        None,
+    )
+    .await
+    .expect("markAsTask");
+
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            Some(note.id.clone()),
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("done"), Some(child))
+        .await
+        .expect("report");
+
+    let refreshed = svc.store().get_note(&note.id).await.expect("refresh note");
+    assert_eq!(
+        refreshed.task.expect("task metadata").status,
+        intent_core::TaskStatus::ReviewRequired
+    );
+}
+
+/// TASK-B: terminal task statuses (`complete`, `cancelled`) MUST NOT be
+/// overwritten by a late `reportToParent` — the reference writer is a strict
+/// upgrade, never a downgrade of a done/cancelled task.
+#[tokio::test]
+async fn report_to_parent_does_not_overwrite_terminal_task_status() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Already done".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    svc.mark_as_task(ws.clone(), note.id.clone(), "complete".into(), vec![], None)
+        .await
+        .expect("markAsTask");
+
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            Some(note.id.clone()),
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("late"), Some(child))
+        .await
+        .expect("report");
+
+    let refreshed = svc.store().get_note(&note.id).await.expect("refresh note");
+    assert_eq!(
+        refreshed.task.expect("task metadata").status,
+        intent_core::TaskStatus::Complete,
+        "terminal status must not be downgraded to review_required"
+    );
+}
+
+/// TASK-B: repeated `reportToParent` calls for the same delegated child
+/// must not re-persist the linked task note once it has already been
+/// transitioned to `review_required`. `task.updateNoteStatus` always
+/// bumps `updated_at` and `rev` before checking for a status change, so
+/// short-circuiting on the current status is what keeps repeated
+/// child-reports from churning the note (unresolved copilot review
+/// thread PRRT_kwDOS9Wxuc6QIRcj on PR #104).
+#[tokio::test]
+async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Ship feature Y".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    svc.mark_as_task(
+        ws.clone(),
+        note.id.clone(),
+        "in_progress".into(),
+        vec![],
+        None,
+    )
+    .await
+    .expect("markAsTask");
+
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            Some(note.id.clone()),
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let before_rev = svc
+        .store()
+        .get_note(&note.id)
+        .await
+        .expect("initial note")
+        .rev;
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("first"), Some(child.clone()))
+        .await
+        .expect("first report");
+    let after_first = svc
+        .store()
+        .get_note(&note.id)
+        .await
+        .expect("note after first");
+    assert_eq!(
+        after_first.task.as_ref().expect("task").status,
+        intent_core::TaskStatus::ReviewRequired
+    );
+    assert!(
+        after_first.rev > before_rev,
+        "first reportToParent must persist the review_required transition (rev {before_rev} -> {})",
+        after_first.rev
+    );
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("second"), Some(child))
+        .await
+        .expect("second report");
+    let after_second = svc
+        .store()
+        .get_note(&note.id)
+        .await
+        .expect("note after second");
+    assert_eq!(
+        after_second.task.as_ref().expect("task").status,
+        intent_core::TaskStatus::ReviewRequired
+    );
+    assert_eq!(
+        after_second.rev, after_first.rev,
+        "second reportToParent must not re-persist the note (rev must not bump when already \
+         review_required)"
+    );
+    assert_eq!(
+        after_second.updated_at, after_first.updated_at,
+        "second reportToParent must not bump updated_at when already review_required"
+    );
+}
+
+/// TASK-B: an agent without a linked task note reports back without touching
+/// any task metadata — the report is persisted and the call succeeds.
+#[tokio::test]
+async fn report_to_parent_without_linked_task_is_status_noop() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let r = svc
+        .agent_report_to_parent_op(ws.clone(), json!("no task"), Some(child.clone()))
+        .await
+        .expect("report");
+    assert_eq!(r["ok"], json!(true));
+    let session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    assert!(session.task_note_id.is_none());
+    assert_eq!(session.completion_report.as_deref(), Some("no task"));
+}
+
+/// Workspace-scoping (Copilot review PRRT_kwDOS9Wxuc6QIaRJ on PR #104):
+/// `agent.delegate` loads the linked task note via `crate::fetch_note`, which
+/// is workspace-scoped. Passing a `taskNoteId` that belongs to another
+/// workspace must NOT leak the foreign note's title/content into the TASK-C
+/// preamble injected as the child's first message; the preamble is skipped and
+/// the message falls back to the caller-supplied `agentInstructions`.
+#[tokio::test]
+async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("insert ws_b");
+
+    let foreign = svc
+        .create_note(
+            ws_b.clone(),
+            NoteCreate {
+                title: "CROSS-WORKSPACE-SECRET-TITLE".into(),
+                content: Some("CROSS-WORKSPACE-SECRET-BODY".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create foreign note");
+
+    let input = AgentDelegateInput {
+        task_note_id: Some(foreign.id.clone()),
+        agent_instructions: Some("do the work".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws_a.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let body = child_session_messages_json(&svc, &child).await;
+    assert!(
+        body.contains("do the work"),
+        "explicit instructions must still reach the child: {body}"
+    );
+    assert!(
+        !body.contains("CROSS-WORKSPACE-SECRET-TITLE"),
+        "foreign note title must not leak into preamble: {body}"
+    );
+    assert!(
+        !body.contains("CROSS-WORKSPACE-SECRET-BODY"),
+        "foreign note body must not leak into preamble: {body}"
+    );
+    assert!(
+        !body.contains("**Your Task Note:**"),
+        "preamble must be skipped when the linked note is out of workspace: {body}"
+    );
+}
+
+/// Workspace-scoping (Copilot review PRRT_kwDOS9Wxuc6QIaRP on PR #104):
+/// `transition_linked_task_to_review_required` must load the linked task note
+/// via the workspace-scoped `crate::fetch_note` accessor. When a session is
+/// linked to a task note that lives in a different workspace, the fetch
+/// returns `NotFound` and the transition is a silent no-op: the foreign note's
+/// task metadata is left untouched (no cross-workspace read, no cross-workspace
+/// write).
+#[tokio::test]
+async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("insert ws_b");
+
+    let foreign = svc
+        .create_note(
+            ws_b.clone(),
+            NoteCreate {
+                title: "Foreign task".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create foreign note");
+    svc.mark_as_task(
+        ws_b.clone(),
+        foreign.id.clone(),
+        "in_progress".into(),
+        vec![],
+        None,
+    )
+    .await
+    .expect("markAsTask on foreign");
+
+    let before = svc
+        .store()
+        .get_note(&foreign.id)
+        .await
+        .expect("initial foreign note");
+    assert_eq!(
+        before.task.as_ref().expect("task").status,
+        intent_core::TaskStatus::InProgress
+    );
+
+    let parent = create_agent(&svc, &ws_a, "Parent").await;
+    let created = svc
+        .agent_create_op(
+            ws_a.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            Some(foreign.id.clone()),
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    svc.agent_report_to_parent_op(ws_a.clone(), json!("done"), Some(child))
+        .await
+        .expect("report");
+
+    let after = svc
+        .store()
+        .get_note(&foreign.id)
+        .await
+        .expect("refresh foreign note");
+    assert_eq!(
+        after.task.as_ref().expect("task").status,
+        intent_core::TaskStatus::InProgress,
+        "foreign-workspace task status must not be mutated by a cross-workspace reportToParent"
+    );
+    assert_eq!(
+        after.rev, before.rev,
+        "foreign-workspace note rev must not be bumped (no cross-workspace write): {} -> {}",
+        before.rev, after.rev
+    );
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "foreign-workspace note updated_at must not be bumped"
+    );
+}
+
+/// Copilot #104 (thread PRRT_kwDOS9Wxuc6QKTPK): `agent.reportToParent` must
+/// scope-guard the caller-supplied `workspace_id` the same way `agent.get` /
+/// `agent.getConversation` do — a call whose `workspace_id` does not match
+/// the caller session's own workspace is rejected with `NotFound` before any
+/// state changes (completion-report persistence, `review_required`
+/// transition, subscription notification). The child session must remain
+/// untouched (no `completionReport`, no `updated_at` bump).
+#[tokio::test]
+async fn report_to_parent_cross_workspace_rejected_and_has_no_side_effects() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("insert ws_b");
+
+    let parent = create_agent(&svc, &ws_a, "Parent").await;
+    let created = svc
+        .agent_create_op(
+            ws_a.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let before = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("load child before");
+    assert!(before.completion_report.is_none());
+    assert!(before.completion_report_timestamp.is_none());
+
+    // Cross-workspace call: the child lives in ws_a but the caller supplies
+    // ws_b. The scope guard mirrors `agent_get_op` / `agent_get_conversation_op`
+    // and returns `NotFound`.
+    let err = svc
+        .agent_report_to_parent_op(ws_b.clone(), json!("cross-workspace"), Some(child.clone()))
+        .await
+        .expect_err("cross-workspace reportToParent must be rejected");
+    match err {
+        Error::NotFound(msg) => assert!(
+            msg.contains(child.0.as_str()),
+            "NotFound message should reference the child agent id: {msg}"
+        ),
+        other => panic!("expected Error::NotFound, got {other:?}"),
+    }
+
+    // No side effects: the persisted session is byte-identical to `before`.
+    let after = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("load child after");
+    assert!(
+        after.completion_report.is_none(),
+        "completion_report must not be persisted on a rejected cross-workspace call: {:?}",
+        after.completion_report
+    );
+    assert!(
+        after.completion_report_timestamp.is_none(),
+        "completion_report_timestamp must not be set on a rejected cross-workspace call: {:?}",
+        after.completion_report_timestamp
+    );
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "child session updated_at must not be bumped on rejection: {} -> {}",
+        before.updated_at, after.updated_at
+    );
+
+    // Same-workspace call still succeeds (the guard is a scope check, not a
+    // regression to the normal path).
+    let ok = svc
+        .agent_report_to_parent_op(ws_a.clone(), json!("in-workspace"), Some(child.clone()))
+        .await
+        .expect("in-workspace reportToParent must succeed");
+    assert_eq!(ok["ok"], json!(true));
+    assert_eq!(ok["parentAgentId"].as_str(), Some(parent.0.as_str()));
+}
+
+/// SUB-2 end-to-end: `agent.reportToParent` emits zero immediate wakes; the
+/// single parent wake is delivered by the child's terminal `agent:idle` via
+/// the still-armed completion watch, and the wake text carries the persisted
+/// completion report (Report:...).
+#[tokio::test]
+async fn report_to_parent_metadata_only_no_immediate_wake_then_idle_delivers_one() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    // Immediate-mode delegation arms a oneShot completion watch on the child.
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    // The child's delegate-time first message is already in the parent's
+    // transcript queue path via the child (not the parent). Baseline: the
+    // parent has no messages yet.
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    let report = "shipped it";
+    svc.agent_report_to_parent_op(ws.clone(), json!(report), Some(child.clone()))
+        .await
+        .expect("report");
+    // SUB-2: zero immediate wakes.
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline);
+
+    // Drive the child's `agent:idle` (mirrors the turn worker's
+    // stream-complete branch, which enriches the payload with `report` from
+    // the persisted `completionReport`). Exactly one wake fires, carrying
+    // `Report:` text.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "report": report }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains(&format!("Report: {report}")),
+        "wake text must carry the persisted completion report: {text}"
+    );
+    // The oneShot watch is consumed after delivery.
+    assert!(svc.find_watches_for_child(&ws, &child).is_empty());
+}
+
+/// SUB-2: repeated `agent.wakeOrCreate` for the same caller/target reuses the
+/// live ungrouped watch instead of stacking duplicates. A single terminal
+/// `agent:idle` then produces exactly one parent wake.
+#[tokio::test]
+async fn wake_or_create_reuses_existing_watch_no_duplicate() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    let note_id = seed_task(&svc, &ws, "SUB-2 dedupe").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+        .await
+        .expect("assign");
+
+    let input = || AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let r1 = svc
+        .agent_wake_or_create_op(ws.clone(), note_id.clone(), "resume 1".into(), input())
+        .await
+        .expect("wake 1");
+    let r2 = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "resume 2".into(), input())
+        .await
+        .expect("wake 2");
+    // The second wake reuses the first watch's subscription id.
+    assert_eq!(r1["subscriptionId"], r2["subscriptionId"]);
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1, "no duplicate watches: {watches:?}");
+
+    // A single terminal agent:idle produces exactly one parent wake.
+    let baseline = parent_message_count(&svc, &caller).await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &target,
+        json!({ "agentId": target.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &caller).await, baseline + 1);
+}
+
+/// SUB-2 (Copilot #104): reusing an existing ungrouped watch on a repeated
+/// `agent.wakeOrCreate` refreshes the stored `parent_agent_name` so a rename
+/// applied to the caller (via `agent.rename`) between wake calls surfaces
+/// through `agent.getSubscriptions` / `describe_subscription`.
+#[tokio::test]
+async fn wake_or_create_reuse_refreshes_parent_agent_name() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "OldName").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    let note_id = seed_task(&svc, &ws, "SUB-2 rename").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+        .await
+        .expect("assign");
+
+    let input = || AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let r1 = svc
+        .agent_wake_or_create_op(ws.clone(), note_id.clone(), "resume 1".into(), input())
+        .await
+        .expect("wake 1");
+    let sub_id = r1["subscriptionId"].as_str().expect("sub id").to_string();
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].parent_agent_name, "OldName");
+
+    // Rename the caller between wakes (the exact `agent.rename` path a
+    // long-lived coordinator would hit via `agent.rename` / `agent.update`).
+    svc.agent_rename_op(caller.clone(), "NewName".into(), false)
+        .await
+        .expect("rename");
+
+    // Second wake reuses the same watch id AND refreshes the stored name.
+    let r2 = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "resume 2".into(), input())
+        .await
+        .expect("wake 2");
+    assert_eq!(r2["subscriptionId"].as_str(), Some(sub_id.as_str()));
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1, "still no duplicate watches: {watches:?}");
+    assert_eq!(
+        watches[0].parent_agent_name, "NewName",
+        "reused watch reflects the caller rename: {watches:?}"
+    );
+}
+
+/// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKPyt): if a live
+/// ungrouped watch is removed concurrently between find and refresh (by
+/// [`Services::deliver_completion_to_watches`] dropping a oneShot watch, or
+/// by an expired [`Services::spawn_watch_cleanup`] task), the follow-up
+/// `agent.wakeOrCreate` must fall through to CREATING a new live watch —
+/// not return the dead subscription id. Dropping the seeded watch directly
+/// stands in for the concurrent removal that would race the pre-fix
+/// non-atomic find/refresh pair.
+#[tokio::test]
+async fn wake_or_create_reuse_after_removal_registers_fresh_watch() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    let note_id = seed_task(&svc, &ws, "SUB-2 reuse-after-removal").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+        .await
+        .expect("assign");
+
+    let input = || AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+
+    // First wake registers a fresh oneShot watch.
+    let r1 = svc
+        .agent_wake_or_create_op(ws.clone(), note_id.clone(), "resume 1".into(), input())
+        .await
+        .expect("wake 1");
+    let sub1 = r1["subscriptionId"].as_str().expect("sub id").to_string();
+    assert_eq!(svc.list_watches_for_parent(&ws, &caller).len(), 1);
+
+    // Simulate the concurrent removal window (deliver_completion_to_watches
+    // dropping the oneShot watch, or an expired queued-watch cleanup task
+    // removing it) by dropping the seeded watch directly.
+    assert!(
+        svc.remove_watch(&ws, &sub1),
+        "seeded watch must be removed for the race scenario"
+    );
+    assert!(svc.list_watches_for_parent(&ws, &caller).is_empty());
+
+    // Second wake finds no live watch to reuse and MUST create a new one —
+    // the caller must never be handed back the dead subscription id.
+    let r2 = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "resume 2".into(), input())
+        .await
+        .expect("wake 2");
+    let sub2 = r2["subscriptionId"].as_str().expect("sub id").to_string();
+    assert_ne!(sub1, sub2, "must not reuse the dead subscription id");
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1, "one fresh live watch: {watches:?}");
+    assert_eq!(watches[0].id, sub2, "returned id points to the live watch");
+}
+
 /// `agent.delegate` persists the resolved first message as
 /// `metadata.initialMessage` and the child's `metadata.delegationDepth`
 /// (parent depth + 1) so a wake-up can resume (P3-1.2b). Delegated children
@@ -1668,8 +2345,13 @@ async fn subscribe_then_unsubscribe_roundtrips() {
     assert!(matches!(err, Error::Internal(_)));
 }
 
-/// A delegated caller (child whose `parentAgentId` is set) delivers the report
-/// to the parent via the send-message path and returns the TS-shaped result.
+/// SUB-2: a delegated caller's `reportToParent` is now metadata-only — the
+/// report is persisted on the child session (`completion_report`) and the
+/// TS-shaped result is returned, but no immediate parent wake is issued. The
+/// single parent wake is delivered later by the child's terminal
+/// `agent:idle` (via the still-armed completion watch), which is asserted by
+/// the sibling `report_to_parent_metadata_only_no_immediate_wake_then_idle_delivers_one`
+/// test.
 #[tokio::test]
 async fn report_to_parent_delivers_for_delegated_caller() {
     let (_t, svc, ws) = setup().await;
@@ -1692,7 +2374,7 @@ async fn report_to_parent_delivers_for_delegated_caller() {
 
     let report = "done: shipped the thing";
     let result = svc
-        .agent_report_to_parent_op(ws.clone(), json!(report), Some(child))
+        .agent_report_to_parent_op(ws.clone(), json!(report), Some(child.clone()))
         .await
         .expect("report delivered");
     assert_eq!(result["ok"], json!(true));
@@ -1700,13 +2382,20 @@ async fn report_to_parent_delivers_for_delegated_caller() {
     assert_eq!(result["reportLength"], json!(report.chars().count() as i64));
     assert!(result["savedAt"].is_string());
 
-    // The report reached the parent's transcript via agent_send_message_op.
+    // SUB-2: no immediate wake to the parent — reportToParent is
+    // metadata-only. The report is persisted on the child session.
     let parent_session = svc
         .store()
         .get_agent_session(&parent)
         .await
         .expect("parent session");
-    assert_eq!(parent_session.messages.len(), 1);
+    assert_eq!(parent_session.messages.len(), 0);
+    let child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    assert_eq!(child_session.completion_report.as_deref(), Some(report));
 }
 
 /// A non-delegated caller (created directly, no `parentAgentId`) is rejected
@@ -1910,12 +2599,14 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
 /// child (caller set, so the child's `parentAgentId` == parent), then the child
 /// reports back via `report_to_parent` (caller-aware; the registry/dispatch name
 /// is bare — agents still see `report_to_parent_workspace-mcp` because the
-/// provider appends the server suffix) and the
-/// report lands in the parent's transcript. The same report tool through a
-/// caller-less server (the RPC / no-caller path) yields a `-32603` JSON-RPC
-/// error. This is the service-level integration coverage chosen over a
-/// node-gated UDS E2E so the full loop is exercised deterministically without an
-/// external `node` dependency.
+/// provider appends the server suffix). SUB-2: reportToParent is metadata-only
+/// (no immediate parent wake); the report is persisted on the child session
+/// and reaches the parent later through the child's terminal `agent:idle`. The
+/// same report tool through a caller-less server (the RPC / no-caller path)
+/// yields an `isError: true` workspace_api tool result. This is the
+/// service-level integration coverage chosen over a node-gated UDS E2E so the
+/// full loop is exercised deterministically without an external `node`
+/// dependency.
 #[tokio::test]
 async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
     let (_t, svc, ws) = setup().await;
@@ -1986,18 +2677,22 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
         Some(parent.0.as_str())
     );
 
-    // The report reached the parent's transcript via the send-message path.
+    // SUB-2: reportToParent is metadata-only — the parent transcript stays
+    // empty at report-time. The report is persisted on the child session and
+    // reaches the parent later via the child's `agent:idle` (covered by the
+    // sibling `handle_completion_event`-driven tests).
     let parent_session = svc
         .store()
         .get_agent_session(&parent)
         .await
         .expect("parent session");
-    assert_eq!(parent_session.messages.len(), 1);
-    let delivered = serde_json::to_string(&parent_session.messages).expect("serialize messages");
-    assert!(
-        delivered.contains(report),
-        "parent transcript should contain the report text"
-    );
+    assert_eq!(parent_session.messages.len(), 0);
+    let child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    assert_eq!(child_session.completion_report.as_deref(), Some(report));
 
     // RPC / no-caller path: after the WSAPI-8 cutover the report flows
     // through the unified `workspace_api` tool executing
@@ -2419,6 +3114,233 @@ async fn spawn_watch_cleanup_removes_watch_after_timeout() {
     panic!("cleanup did not remove the queued watch");
 }
 
+/// SUB-2 (unresolved copilot review thread PRRT_kwDOS9Wxuc6QIRcq on PR #104):
+/// a queued wake must never reuse a pre-existing oneShot watch for the same
+/// caller/target pair, because a oneShot watch is removed on the first
+/// `agent:idle` — which is precisely the idle that a queued message needs to
+/// survive. The queued path must therefore register a fresh non-oneShot
+/// watch alongside the existing oneShot one. A pre-seeded oneShot watch
+/// (registered via [`Services::register_completion_watch`] to sidestep
+/// runtime turn-starting side effects) drives the queued wake through the
+/// mode-mismatch fall-through in [`Services::agent_wake_or_create_op`].
+#[tokio::test]
+async fn wake_or_create_queued_does_not_reuse_or_receive_oneshot_watch() {
+    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    let note_id = seed_task(&svc, &ws, "SUB-2 mode mismatch").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+        .await
+        .expect("assign");
+
+    // Seed a oneShot watch for this caller/target pair (as an earlier
+    // non-queued wake would have registered).
+    let oneshot_sub_id = svc.register_completion_watch(
+        &ws,
+        caller.clone(),
+        "Coordinator".into(),
+        target.clone(),
+        true,
+        None,
+    );
+
+    // Occupy the assignee's in-flight slot so the wakeOrCreate takes the
+    // queued branch deterministically.
+    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+
+    let queued = svc
+        .agent_wake_or_create_op(
+            ws.clone(),
+            note_id,
+            "follow up".into(),
+            AgentWakeOrCreateInput {
+                caller_agent_id: Some(caller.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("queued wake");
+    assert_eq!(queued["action"], "message_queued_to_active_agent");
+    let queued_sub_id = queued["subscriptionId"]
+        .as_str()
+        .expect("queued subscriptionId")
+        .to_string();
+
+    assert_ne!(
+        oneshot_sub_id, queued_sub_id,
+        "queued wake must not reuse the oneShot subscription id"
+    );
+
+    // Both watches now coexist: the oneShot watch is unchanged and a
+    // fresh non-oneShot watch was registered for the queued delivery.
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(
+        watches.len(),
+        2,
+        "queued must add a distinct watch: {watches:?}"
+    );
+    let oneshot = watches
+        .iter()
+        .find(|w| w.id == oneshot_sub_id)
+        .expect("original oneShot watch still present");
+    assert!(
+        oneshot.one_shot,
+        "existing oneShot watch must remain oneShot"
+    );
+    let queued_watch = watches
+        .iter()
+        .find(|w| w.id == queued_sub_id)
+        .expect("fresh queued watch present");
+    assert!(
+        !queued_watch.one_shot,
+        "queued watch must be non-oneShot so it survives the current agent:idle"
+    );
+
+    manager.release_slot(&target).await;
+}
+
+/// SUB-2 (unresolved copilot review thread PRRT_kwDOS9Wxuc6QIRcq on PR #104):
+/// reusing a queued watch across repeated `wakeOrCreate` calls must not
+/// shorten its effective cleanup deadline. An earlier-spawned cleanup task
+/// wakes first but must no-op because the deadline has been extended by a
+/// later call; the later task then performs the removal at the new deadline.
+#[tokio::test]
+async fn spawn_watch_cleanup_extension_defers_removal_to_the_later_deadline() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let sub_id = svc.register_completion_watch(
+        &ws,
+        caller.clone(),
+        "Coordinator".into(),
+        target.clone(),
+        false,
+        None,
+    );
+    assert_eq!(svc.list_watches_for_parent(&ws, &caller).len(), 1);
+
+    // Arm a short cleanup, then immediately extend it with a much later
+    // deadline before the first timer can fire.
+    svc.spawn_watch_cleanup(
+        ws.clone(),
+        caller.clone(),
+        sub_id.clone(),
+        Duration::from_millis(80),
+    );
+    svc.spawn_watch_cleanup(
+        ws.clone(),
+        caller.clone(),
+        sub_id.clone(),
+        Duration::from_millis(600),
+    );
+
+    // Wait past the original (short) deadline. If the earlier task removed
+    // the watch it would be gone here — that is the bug this test guards
+    // against.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(
+        watches.len(),
+        1,
+        "earlier cleanup task must not shorten an extended deadline (watches now: {watches:?})"
+    );
+
+    // Wait past the extended deadline; the later task must fire and remove.
+    let removal_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < removal_deadline {
+        if svc.list_watches_for_parent(&ws, &caller).is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("later cleanup task did not remove the watch after the extended deadline");
+}
+
+/// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKWuM):
+/// `spawn_watch_cleanup` must not arm a sleeper task when the deadline
+/// bump misses (e.g. the watch was removed concurrently between the reuse
+/// find and the cleanup arm). The bump returns `false`, and no task is
+/// spawned; the return value from `spawn_watch_cleanup` surfaces that.
+#[tokio::test]
+async fn spawn_watch_cleanup_skips_when_deadline_bump_misses() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let sub_id = svc.register_completion_watch(
+        &ws,
+        caller.clone(),
+        "Coordinator".into(),
+        target.clone(),
+        false,
+        None,
+    );
+
+    // Stand in for a concurrent removal: drop the watch before the cleanup
+    // task would be armed.
+    assert!(svc.remove_watch(&ws, &sub_id), "seed removal");
+    assert!(svc.list_watches_for_parent(&ws, &caller).is_empty());
+
+    // The arm must observe the missing watch, skip the tokio::spawn, and
+    // report `false`. Waiting past the requested delay must not resurrect
+    // the empty registry or otherwise mutate state.
+    let armed = svc.spawn_watch_cleanup(
+        ws.clone(),
+        caller.clone(),
+        sub_id,
+        Duration::from_millis(30),
+    );
+    assert!(
+        !armed,
+        "no cleanup task must be spawned when the bump misses"
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        svc.list_watches_for_parent(&ws, &caller).is_empty(),
+        "registry stays empty; the skipped cleanup task cannot side-effect it",
+    );
+}
+
+/// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKWuU):
+/// when the caller's display name cannot be resolved
+/// (`store.get_agent_session` failed), the reuse path must still return
+/// the live subscription id — but must NOT overwrite the watch's stored
+/// `parent_agent_name` with an empty placeholder. Callers pass `None`
+/// through `find_and_refresh_ungrouped_watch` to signal the missing name.
+#[tokio::test]
+async fn find_and_refresh_ungrouped_watch_preserves_name_when_lookup_fails() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    let sub_id = svc.register_completion_watch(
+        &ws,
+        caller.clone(),
+        "Coordinator".into(),
+        target.clone(),
+        true,
+        None,
+    );
+
+    // Reuse with no resolved name: still returns the same subscription id
+    // (reuse proceeds), and the stored `parent_agent_name` is untouched.
+    let reused = svc.find_and_refresh_ungrouped_watch(&ws, &caller, &target, true, None);
+    assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(
+        watches[0].parent_agent_name, "Coordinator",
+        "failed name lookup must NOT overwrite an existing watch's parent_agent_name: {watches:?}"
+    );
+
+    // Sanity: a subsequent reuse with a real name still refreshes as
+    // before, so the `None` short-circuit is scoped to the lookup-failed
+    // case rather than disabling the refresh entirely.
+    let reused =
+        svc.find_and_refresh_ungrouped_watch(&ws, &caller, &target, true, Some("Renamed".into()));
+    assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches[0].parent_agent_name, "Renamed");
+}
+
 /// End-to-end through the MCP front door: delegating with a caller registers
 /// exactly one oneShot watch for the child returned by the tool.
 #[tokio::test]
@@ -2473,6 +3395,26 @@ async fn child_session_messages_json(svc: &Services, child: &AgentId) -> String 
         .await
         .expect("child session");
     serde_json::to_string(&session.messages).expect("serialize child messages")
+}
+
+/// Text of the child's first (delegated) message, joining every text content
+/// block in order. Used for byte-exact assertions on the reference
+/// `DelegateTaskTool` preamble.
+async fn child_session_first_message_text(svc: &Services, child: &AgentId) -> String {
+    let session = svc
+        .store()
+        .get_agent_session(child)
+        .await
+        .expect("child session");
+    let first = session.messages.first().expect("first message");
+    first
+        .content
+        .as_array()
+        .expect("contentBlocks array")
+        .iter()
+        .filter_map(|b| b.get("text").and_then(|t| t.as_str()).map(str::to_owned))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// Explicit `agentInstructions` become the child's first message.
@@ -2584,6 +3526,152 @@ async fn delegate_falls_back_to_task_note_content_for_child_first_message() {
     assert!(child_session_messages_json(&svc, &child)
         .await
         .contains("note content body"));
+}
+
+/// TASK-C: `agent.delegate` with a linked task note prepends the reference
+/// `DelegateTaskTool` preamble ("Your Task Note" + scope contract) to the
+/// child's first message. The task title and note id appear verbatim so the
+/// child can self-mark the note complete when done.
+#[tokio::test]
+async fn delegate_prepends_task_note_preamble_to_first_message() {
+    let (_t, svc, ws) = setup().await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Port frobnicator".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    let input = AgentDelegateInput {
+        task_note_id: Some(note.id.clone()),
+        agent_instructions: Some("do the work".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let body = child_session_messages_json(&svc, &child).await;
+    assert!(
+        body.contains("**Your Task Note:**"),
+        "preamble marker missing: {body}"
+    );
+    assert!(
+        body.contains("Port frobnicator"),
+        "task title missing from preamble: {body}"
+    );
+    assert!(
+        body.contains(note.id.as_str()),
+        "task note id missing from preamble: {body}"
+    );
+    assert!(
+        body.contains("**SCOPE: Complete THIS task only.**"),
+        "scope contract missing: {body}"
+    );
+    // The original instructions are preserved below the preamble.
+    assert!(
+        body.contains("do the work"),
+        "explicit instructions must survive the preamble: {body}"
+    );
+    // Exact first-message bytes: mirrors the reference `DelegateTaskTool`
+    // preamble (`agent-interaction-tools.ts`) verbatim, with no stray
+    // leading whitespace on the continuation lines, followed by a blank
+    // line and the caller's `agentInstructions`.
+    let expected_first_message = format!(
+        "**Your Task Note:** \"Port frobnicator\" (ID: {note_id})\n\
+This note is your workspace for this task. Update it with your progress, findings, and deliverables.\n\
+\n\
+**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.\n\
+\n\
+do the work",
+        note_id = note.id.as_str(),
+    );
+    let first_message_text = child_session_first_message_text(&svc, &child).await;
+    assert_eq!(
+        first_message_text, expected_first_message,
+        "first message must be byte-exact"
+    );
+}
+
+/// TASK-C: delegating with a linked task note but no explicit
+/// `agentInstructions` / `taskText` still injects the preamble (the note's
+/// body/title fallback slots in beneath it).
+#[tokio::test]
+async fn delegate_task_note_only_injects_preamble_above_note_body() {
+    let (_t, svc, ws) = setup().await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Task title".into(),
+                content: Some("note content body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create note");
+    let input = AgentDelegateInput {
+        task_note_id: Some(note.id.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let body = child_session_messages_json(&svc, &child).await;
+    assert!(body.contains("**Your Task Note:**"), "preamble: {body}");
+    assert!(body.contains("Task title"), "title: {body}");
+    assert!(body.contains(note.id.as_str()), "note id: {body}");
+    assert!(body.contains("note content body"), "note body: {body}");
+    // Preamble sits ABOVE the note body.
+    let preamble_idx = body.find("**Your Task Note:**").expect("preamble idx");
+    let body_idx = body.find("note content body").expect("body idx");
+    assert!(
+        preamble_idx < body_idx,
+        "preamble must precede the note body"
+    );
+}
+
+/// TASK-C: delegations without a task note deliver the message verbatim —
+/// no preamble is injected.
+#[tokio::test]
+async fn delegate_without_task_note_omits_preamble() {
+    let (_t, svc, ws) = setup().await;
+    let input = AgentDelegateInput {
+        agent_instructions: Some("just do it".into()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let body = child_session_messages_json(&svc, &child).await;
+    assert!(
+        body.contains("just do it"),
+        "instructions delivered: {body}"
+    );
+    assert!(
+        !body.contains("**Your Task Note:**"),
+        "no preamble without a task note: {body}"
+    );
+    assert!(
+        !body.contains("**SCOPE:"),
+        "no scope contract without a task note: {body}"
+    );
 }
 
 /// A bare delegate (no instructions, no task text, no task note) creates the
@@ -3115,8 +4203,12 @@ async fn report_to_parent_suppressed_for_after_all_group_child() {
     assert!(!text.contains("turn summary"), "wake text: {text}");
 }
 
-/// After the group has fired (delivered + removed), a late `reportToParent`
-/// from a former group child is no longer suppressed and delivers immediately.
+/// SUB-2: `reportToParent` is metadata-only after SUB-2, so a late report
+/// from a former group child (after the group has fired + removed) still
+/// does not push an immediate wake — it just persists the fresh
+/// `completion_report`. The wake belongs to the child's next `agent:idle`;
+/// with the group + watches already gone there is no watch to fire, matching
+/// the reference where `reportToParent` never issues a standalone wake.
 #[tokio::test]
 async fn report_to_parent_immediate_after_group_delivery() {
     let (_t, svc, ws) = setup().await;
@@ -3140,11 +4232,22 @@ async fn report_to_parent_immediate_after_group_delivery() {
     assert_eq!(parent_message_count(&svc, &parent).await, 1);
 
     let r = svc
-        .agent_report_to_parent_op(ws.clone(), json!("late report"), Some(c1))
+        .agent_report_to_parent_op(ws.clone(), json!("late report"), Some(c1.clone()))
         .await
         .expect("late report");
     assert_eq!(r["ok"], json!(true));
-    assert_eq!(parent_message_count(&svc, &parent).await, 2);
+    // SUB-2: metadata-only — no additional immediate parent wake. The report
+    // is persisted on the child session and would ride the next agent:idle.
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    let child_session = svc
+        .store()
+        .get_agent_session(&c1)
+        .await
+        .expect("child session");
+    assert_eq!(
+        child_session.completion_report.as_deref(),
+        Some("late report")
+    );
 }
 
 // ===========================================================================
