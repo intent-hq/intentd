@@ -2859,6 +2859,192 @@ mod change_event_parity {
             .expect("second spec exists");
         assert_eq!(spec_b.workspace_id, second.id);
     }
+
+    /// Reference parity with `notes.service.ts getNotes`: `note.list` for a
+    /// workspace missing its `spec` note reseeds the default spec (empty
+    /// markdown, `Spec` title, `spec` tag, pinned, default, workspace
+    /// visibility), returns it in the response, and emits `note:created`
+    /// exactly once. Heals workspaces that predate the composite-PK spec seed.
+    #[tokio::test]
+    async fn note_list_reseeds_missing_spec_note() {
+        use intent_core::{NoteId, NoteVisibility};
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        // Preconditions: workspace exists (harness inserted the row) but no
+        // spec has been seeded — this mirrors a pre-#110 workspace.
+        assert!(matches!(
+            h.store.get_note(&h.ws, &NoteId::from("spec")).await,
+            Err(intent_core::Error::NotFound(_))
+        ));
+
+        let notes = h.services.list_notes(&h.ws).await.expect("list");
+        assert_eq!(notes.len(), 1);
+        let spec = &notes[0];
+        assert_eq!(spec.id, NoteId::from("spec"));
+        assert_eq!(spec.workspace_id, h.ws);
+        assert_eq!(spec.title, "Spec");
+        assert_eq!(spec.content, "");
+        assert_eq!(spec.tags, vec!["spec".to_string()]);
+        assert!(spec.is_pinned);
+        assert!(spec.is_default);
+        assert!(!spec.is_archived);
+        assert_eq!(spec.visibility, NoteVisibility::Workspace);
+
+        // Reseed captures the initial version snapshot, same as create-time.
+        let versions = h
+            .store
+            .list_note_versions(&h.ws, &NoteId::from("spec"))
+            .await
+            .expect("versions");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].v, 1);
+
+        // Exactly one `note:created` fires for the reseed.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:created");
+        assert_eq!(ev["data"]["noteId"], "spec");
+        assert_eq!(ev["data"]["title"], "Spec");
+
+        // No further events fire — reseed publishes exactly once.
+        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "reseed must publish exactly one event, got extra: {quiet:?}"
+        );
+    }
+
+    /// A workspace that already has a `spec` note is untouched by `note.list`:
+    /// no spurious `note:created`, no extra version snapshot, no rev bump.
+    #[tokio::test]
+    async fn note_list_leaves_existing_spec_untouched() {
+        use intent_core::{NoteId, WorkspaceCreate};
+        let h = harness().await;
+
+        // `create_workspace` seeds the spec; drain both events so the sub is
+        // clean before the list call.
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let created = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Seeded".to_string()),
+                    branch: Some("feat/seeded-list".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        let _ = recv_one(&mut sub).await; // workspace:created
+        let _ = recv_one(&mut sub).await; // note:created (seed)
+
+        let spec_before = h
+            .store
+            .get_note(&created.id, &NoteId::from("spec"))
+            .await
+            .expect("spec exists");
+
+        let notes = h.services.list_notes(&created.id).await.expect("list");
+        let spec_row = notes
+            .iter()
+            .find(|n| n.id == NoteId::from("spec"))
+            .expect("spec listed");
+        // Same rev / updated_at / created_at as before — no write happened.
+        assert_eq!(spec_row.rev, spec_before.rev);
+        assert_eq!(spec_row.updated_at, spec_before.updated_at);
+        assert_eq!(spec_row.created_at, spec_before.created_at);
+
+        // No further events fire for the untouched-spec list call.
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(none.is_err(), "list must not publish for existing spec");
+
+        // Version count unchanged.
+        let versions = h
+            .store
+            .list_note_versions(&created.id, &NoteId::from("spec"))
+            .await
+            .expect("versions");
+        assert_eq!(versions.len(), 1);
+    }
+
+    /// After a client deletes the `spec` note (§5 `note.delete`), the next
+    /// `note.list` reseeds it and emits `note:created`. Regression guard for
+    /// the self-healing behaviour the reference relies on.
+    #[tokio::test]
+    async fn note_list_reseeds_after_spec_deletion() {
+        use intent_core::{NoteId, WorkspaceCreate};
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let created = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Heal".to_string()),
+                    branch: Some("feat/heal-spec".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        let _ = recv_one(&mut sub).await; // workspace:created
+        let _ = recv_one(&mut sub).await; // note:created (initial seed)
+
+        // Drop the spec straight through the store to simulate a corrupt /
+        // manually-cleared workspace.
+        h.store
+            .delete_note(&created.id, &NoteId::from("spec"))
+            .await
+            .expect("delete spec");
+
+        let notes = h.services.list_notes(&created.id).await.expect("list");
+        assert!(notes.iter().any(|n| n.id == NoteId::from("spec")));
+
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &created.id.0, "note:created");
+        assert_eq!(ev["data"]["noteId"], "spec");
+    }
+
+    /// A `note.list` for a workspace id that has no matching workspace row
+    /// must not regress from `Ok([])` to `Err`: the reseed attempt trips the
+    /// `note.workspace_id → workspace.id` FK, but the failure is swallowed
+    /// (best-effort self-heal) and the empty listing is returned unchanged.
+    /// No `note:created` fires.
+    #[tokio::test]
+    async fn note_list_tolerates_reseed_failure_for_unknown_workspace() {
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let unknown = intent_core::WorkspaceId::new();
+
+        let notes = h.services.list_notes(&unknown).await.expect("list");
+        assert!(notes.is_empty());
+
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(
+            none.is_err(),
+            "unknown-workspace list must not publish a reseed event"
+        );
+    }
+
+    /// The Chief virtual workspace has no store row (synthesized via
+    /// `chief_workspace()`), so `note.list` must not attempt to reseed a spec
+    /// against a nonexistent FK target. Reseed is skipped; the list returns
+    /// empty and no `note:created` fires.
+    #[tokio::test]
+    async fn note_list_skips_reseed_for_chief_virtual_workspace() {
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let chief = intent_core::WorkspaceId::chief();
+
+        let notes = h.services.list_notes(&chief).await.expect("list");
+        assert!(notes.is_empty());
+
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(none.is_err(), "chief list must not publish a reseed event");
+    }
 }
 
 /// End-to-end §6.8 "one impl, two front doors": an agent (via the in-process MCP
