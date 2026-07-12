@@ -138,65 +138,48 @@ impl Services {
             .unwrap_or_default()
     }
 
-    /// SUB-2: find a live ungrouped (immediate-mode) watch for the given
-    /// caller→target pair whose `one_shot` mode matches `one_shot`, if one
-    /// exists. Used by `agent.wakeOrCreate` to reuse an existing watch
-    /// instead of stacking duplicates on repeated wake calls; grouped
-    /// (`after_all`) watches are skipped since they are owned by the
+    /// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKPyt):
+    /// atomically find a live ungrouped (immediate-mode) watch for the given
+    /// caller→target pair whose `one_shot` mode matches `one_shot` and, while
+    /// still holding the registry lock, refresh its stored `parent_agent_name`
+    /// to `new_parent_name`. Returns the live subscription id iff a matching
+    /// watch was found — so a concurrent removal by
+    /// [`Services::deliver_completion_to_watches`] (oneShot cleanup) or by an
+    /// expired [`Services::spawn_watch_cleanup`] task cannot land between the
+    /// find and the refresh and leave `agent.wakeOrCreate` returning a "reused"
+    /// subscription id that no longer exists. Callers must fall through to
+    /// [`Services::register_completion_watch`] when this returns `None`.
+    ///
+    /// Grouped (`after_all`) watches are skipped since they are owned by the
     /// delegation-group fan-in. The `one_shot` filter ensures a queued wake
-    /// (which needs a non-oneShot watch to survive the current
-    /// `agent:idle`) never reuses a oneShot watch, and vice versa.
-    pub(crate) fn find_ungrouped_watch(
+    /// (which needs a non-oneShot watch to survive the current `agent:idle`)
+    /// never reuses a oneShot watch, and vice versa. Refreshing the stored
+    /// name keeps `agent.getSubscriptions` / [`describe_subscription`] in sync
+    /// with any rename applied via `agent.rename` / `agent.update` since the
+    /// watch was registered; a no-op when the name is already current.
+    pub(crate) fn find_and_refresh_ungrouped_watch(
         &self,
         workspace_id: &WorkspaceId,
         parent_agent_id: &AgentId,
         child_agent_id: &AgentId,
         one_shot: bool,
-    ) -> Option<CompletionWatch> {
-        self.agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned")
-            .get(workspace_id)
-            .and_then(|w| {
-                w.subscriptions
-                    .iter()
-                    .find(|s| {
-                        s.group_id.is_none()
-                            && s.one_shot == one_shot
-                            && &s.parent_agent_id == parent_agent_id
-                            && &s.child_agent_id == child_agent_id
-                    })
-                    .cloned()
-            })
-    }
-
-    /// SUB-2 (Copilot #104): refresh the stored `parent_agent_name` on a
-    /// reused watch entry so `agent.getSubscriptions` /
-    /// [`describe_subscription`] reflect any rename applied via
-    /// `agent.rename` / `agent.update` since the watch was registered. A
-    /// long-lived reused watch would otherwise render a stale `agentName` /
-    /// `description`. No-op (returns `false`) when the watch is missing;
-    /// silent when the name is already current.
-    pub(crate) fn refresh_watch_parent_name(
-        &self,
-        workspace_id: &WorkspaceId,
-        subscription_id: &str,
-        new_name: String,
-    ) -> bool {
+        new_parent_name: String,
+    ) -> Option<String> {
         let mut guard = self
             .agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned");
-        let Some(w) = guard.get_mut(workspace_id) else {
-            return false;
-        };
-        let Some(watch) = w.subscriptions.iter_mut().find(|s| s.id == subscription_id) else {
-            return false;
-        };
-        if watch.parent_agent_name != new_name {
-            watch.parent_agent_name = new_name;
+        let w = guard.get_mut(workspace_id)?;
+        let watch = w.subscriptions.iter_mut().find(|s| {
+            s.group_id.is_none()
+                && s.one_shot == one_shot
+                && &s.parent_agent_id == parent_agent_id
+                && &s.child_agent_id == child_agent_id
+        })?;
+        if watch.parent_agent_name != new_parent_name {
+            watch.parent_agent_name = new_parent_name;
         }
-        true
+        Some(watch.id.clone())
     }
 
     /// SUB-2: monotonically bump a watch's cleanup deadline to at least

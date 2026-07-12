@@ -2923,15 +2923,23 @@ impl Services {
                     .ok()
                     .map(|s| s.name)
                     .unwrap_or_default();
-                let (subscription_id, reused) = if let Some(existing) =
-                    self.find_ungrouped_watch(&workspace_id, &caller, &agent_id, one_shot)
-                {
-                    self.refresh_watch_parent_name(
+                // SUB-2 (Copilot #104 follow-up, thread
+                // PRRT_kwDOS9Wxuc6QKPyt): resolve reuse atomically. If a live
+                // ungrouped watch is found, its `parent_agent_name` is
+                // refreshed under the same lock; otherwise we fall through to
+                // registering a fresh watch. This closes the race where a
+                // concurrent oneShot delivery or expired cleanup task removed
+                // the watch between a prior find and refresh, which would
+                // otherwise leave the caller subscribed to a dead id.
+                let (subscription_id, reused) = if let Some(existing_id) = self
+                    .find_and_refresh_ungrouped_watch(
                         &workspace_id,
-                        &existing.id,
+                        &caller,
+                        &agent_id,
+                        one_shot,
                         caller_name.clone(),
-                    );
-                    (existing.id, true)
+                    ) {
+                    (existing_id, true)
                 } else {
                     let new_id = self.register_completion_watch(
                         &workspace_id,

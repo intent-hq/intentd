@@ -1591,6 +1591,59 @@ async fn wake_or_create_reuse_refreshes_parent_agent_name() {
     );
 }
 
+/// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKPyt): if a live
+/// ungrouped watch is removed concurrently between find and refresh (by
+/// [`Services::deliver_completion_to_watches`] dropping a oneShot watch, or
+/// by an expired [`Services::spawn_watch_cleanup`] task), the follow-up
+/// `agent.wakeOrCreate` must fall through to CREATING a new live watch —
+/// not return the dead subscription id. Dropping the seeded watch directly
+/// stands in for the concurrent removal that would race the pre-fix
+/// non-atomic find/refresh pair.
+#[tokio::test]
+async fn wake_or_create_reuse_after_removal_registers_fresh_watch() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    let note_id = seed_task(&svc, &ws, "SUB-2 reuse-after-removal").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+        .await
+        .expect("assign");
+
+    let input = || AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+
+    // First wake registers a fresh oneShot watch.
+    let r1 = svc
+        .agent_wake_or_create_op(ws.clone(), note_id.clone(), "resume 1".into(), input())
+        .await
+        .expect("wake 1");
+    let sub1 = r1["subscriptionId"].as_str().expect("sub id").to_string();
+    assert_eq!(svc.list_watches_for_parent(&ws, &caller).len(), 1);
+
+    // Simulate the concurrent removal window (deliver_completion_to_watches
+    // dropping the oneShot watch, or an expired queued-watch cleanup task
+    // removing it) by dropping the seeded watch directly.
+    assert!(
+        svc.remove_watch(&ws, &sub1),
+        "seeded watch must be removed for the race scenario"
+    );
+    assert!(svc.list_watches_for_parent(&ws, &caller).is_empty());
+
+    // Second wake finds no live watch to reuse and MUST create a new one —
+    // the caller must never be handed back the dead subscription id.
+    let r2 = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "resume 2".into(), input())
+        .await
+        .expect("wake 2");
+    let sub2 = r2["subscriptionId"].as_str().expect("sub id").to_string();
+    assert_ne!(sub1, sub2, "must not reuse the dead subscription id");
+    let watches = svc.list_watches_for_parent(&ws, &caller);
+    assert_eq!(watches.len(), 1, "one fresh live watch: {watches:?}");
+    assert_eq!(watches[0].id, sub2, "returned id points to the live watch");
+}
+
 /// `agent.delegate` persists the resolved first message as
 /// `metadata.initialMessage` and the child's `metadata.delegationDepth`
 /// (parent depth + 1) so a wake-up can resume (P3-1.2b). Delegated children
