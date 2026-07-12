@@ -19,9 +19,10 @@ pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_epoch_ms, now_iso, pars
 pub use config::Config;
 pub use error::{Error, Result};
 pub use events::is_known_event_type;
-pub use ids::{AgentId, ClientId, NoteId, WorkspaceId};
+pub use ids::{AgentId, ClientId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
 pub use model::MAX_DELEGATION_DEPTH;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
+pub use model::{chief_workspace, is_chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
 pub use model::{
     ActorType, AgentActivity, AgentCreateExtra, AgentDelegateInput, AgentLite, AgentMessage,
     AgentMetadata, AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,

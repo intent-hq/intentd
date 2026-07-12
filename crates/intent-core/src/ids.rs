@@ -73,6 +73,26 @@ id_newtype!(
     /// Identifier for a workspace.
     WorkspaceId
 );
+
+/// Reserved workspace id for the daemon-known virtual "Chief of Staff"
+/// workspace (TS `CHIEF_WORKSPACE_ID` in `shared/types/branded-ids.ts`). Chief
+/// is not a real workspace on disk: it has no repository/worktree and never
+/// appears in `workspace.list`, but `workspace.get` returns a synthesized
+/// [`crate::model::chief_workspace`] shape and `agent.create` accepts it as
+/// the workspace scope for Chief-of-Staff agents.
+pub const CHIEF_WORKSPACE_ID: &str = "__chief__";
+
+impl WorkspaceId {
+    /// The reserved [`CHIEF_WORKSPACE_ID`] as a strongly-typed id.
+    pub fn chief() -> Self {
+        Self(CHIEF_WORKSPACE_ID.to_string())
+    }
+
+    /// Whether this id is the reserved [`CHIEF_WORKSPACE_ID`].
+    pub fn is_chief(&self) -> bool {
+        self.0 == CHIEF_WORKSPACE_ID
+    }
+}
 id_newtype!(
     /// Identifier for a note.
     NoteId

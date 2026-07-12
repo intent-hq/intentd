@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId};
+use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
 /// Wire values are the PascalCase variant names (`Active`/`Inactive`/`Archived`/
@@ -180,6 +180,62 @@ pub struct Workspace {
     /// Omitted (not `null`) until the first scan writes a snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
+}
+
+/// Fixed timestamp for the synthetic Chief workspace (TS
+/// `CHIEF_WORKSPACE_TIMESTAMP` in `workspace.repository.ts`). Chief is not a
+/// real workspace on disk, so its `createdAt` / `updatedAt` / `lastActivity`
+/// are pinned to a stable epoch rather than the daemon's clock.
+pub const CHIEF_WORKSPACE_TIMESTAMP: &str = "2026-01-01T00:00:00.000Z";
+
+/// Return the synthesized "Chief of Staff" [`Workspace`] (TS
+/// `getChiefWorkspace` in `workspace.repository.ts`). Chief has no
+/// repository, worktree, branch, or card aggregates: it is a daemon-known
+/// virtual scope for Chief-of-Staff agents that never appears in
+/// `workspace.list` and is never persisted, but `workspace.get` returns
+/// this shape and `agent.create` accepts its id as the workspace scope.
+pub fn chief_workspace() -> Workspace {
+    Workspace {
+        id: WorkspaceId::chief(),
+        title: "Chief of Staff".to_string(),
+        branch: String::new(),
+        base_ref: None,
+        base_commit_sha: None,
+        status: WorkspaceStatus::Active,
+        status_message: None,
+        activity: WorkspaceActivity::Idle,
+        attention: WorkspaceAttention::None,
+        created_at: CHIEF_WORKSPACE_TIMESTAMP.to_string(),
+        updated_at: CHIEF_WORKSPACE_TIMESTAMP.to_string(),
+        last_activity: Some(CHIEF_WORKSPACE_TIMESTAMP.to_string()),
+        tags: Vec::new(),
+        path: None,
+        repository_path: None,
+        repository_owner: None,
+        repository_name: None,
+        worktree_path: None,
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
+        archived: false,
+        archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
+        token_usage: None,
+    }
+}
+
+/// Whether the given workspace id is the reserved [`CHIEF_WORKSPACE_ID`].
+#[inline]
+pub fn is_chief_workspace(id: &WorkspaceId) -> bool {
+    id.0 == CHIEF_WORKSPACE_ID
 }
 
 /// The four consumption counters of a token tally (PROTOCOL §5.23 / §19.1).
