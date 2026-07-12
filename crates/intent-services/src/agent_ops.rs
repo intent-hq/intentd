@@ -1854,6 +1854,17 @@ impl Services {
     ) {
         let note = match crate::fetch_note(&self.store, workspace_id, &task_note_id).await {
             Ok(note) => note,
+            // A missing or out-of-workspace linked note is the expected shape
+            // for stale/cross-workspace session metadata — keep it a silent
+            // no-op (debug-level) so normal operation isn't noisy. Real
+            // internal failures still surface as warnings.
+            Err(Error::NotFound(_)) => {
+                tracing::debug!(
+                    note = %task_note_id,
+                    "report_to_parent: linked task note not found in this workspace; skipping status transition"
+                );
+                return;
+            }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
