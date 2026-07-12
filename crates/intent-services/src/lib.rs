@@ -5031,8 +5031,24 @@ impl WorkspaceApi for Services {
             // events, no extra writes. Chief is virtual (no workspace row, no
             // FK target), so skip the reseed; `store.list_notes` returns an
             // empty vec for it naturally.
+            //
+            // The reseed is best-effort so `note.list` never regresses from
+            // Ok(_) to Err on transient conditions the caller cannot act on:
+            // an FK violation for a bare/nonexistent workspace id (previous
+            // behaviour was Ok([])) and the check-then-insert race between
+            // concurrent list callers (whichever loses the insert would trip
+            // the unique constraint). Log-warn and fall through to
+            // `store.list_notes`, which returns the freshly-seeded row when
+            // the winning insert already committed, or the pre-existing
+            // empty/other shape when the reseed genuinely could not run.
             if !id.is_chief() {
-                ensure_spec_note(&store, &bus, &id).await?;
+                if let Err(e) = ensure_spec_note(&store, &bus, &id).await {
+                    tracing::warn!(
+                        workspace_id = %id.0,
+                        error = %e,
+                        "note.list spec reseed failed; continuing with best-effort list"
+                    );
+                }
             }
             store.list_notes(&id).await
         })

@@ -3001,6 +3001,27 @@ mod change_event_parity {
         assert_eq!(ev["data"]["noteId"], "spec");
     }
 
+    /// A `note.list` for a workspace id that has no matching workspace row
+    /// must not regress from `Ok([])` to `Err`: the reseed attempt trips the
+    /// `note.workspace_id → workspace.id` FK, but the failure is swallowed
+    /// (best-effort self-heal) and the empty listing is returned unchanged.
+    /// No `note:created` fires.
+    #[tokio::test]
+    async fn note_list_tolerates_reseed_failure_for_unknown_workspace() {
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let unknown = intent_core::WorkspaceId::new();
+
+        let notes = h.services.list_notes(&unknown).await.expect("list");
+        assert!(notes.is_empty());
+
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(
+            none.is_err(),
+            "unknown-workspace list must not publish a reseed event"
+        );
+    }
+
     /// The Chief virtual workspace has no store row (synthesized via
     /// `chief_workspace()`), so `note.list` must not attempt to reseed a spec
     /// against a nonexistent FK target. Reseed is skipped; the list returns
