@@ -786,6 +786,16 @@ async fn workspace_duplicate_provisions_worktree_over_wss() {
     assert_ne!(dup_id, source_id, "duplicate must mint a fresh id");
     assert_eq!(workspace["title"], json!("Dup Source (Copy)"));
 
+    // `workspace.duplicate` returns a `Workspace` on the wire, so the
+    // backend-authored `lastActivity` (§9.1) must be populated — clients
+    // should never see a missing value on this path (parity with
+    // `workspace.create`).
+    assert!(
+        workspace["lastActivity"].is_string(),
+        "duplicate must return authoritative lastActivity, got: {}",
+        workspace["lastActivity"]
+    );
+
     let wt = workspace["worktreePath"]
         .as_str()
         .expect("worktreePath populated on duplicate");

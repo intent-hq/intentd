@@ -5712,6 +5712,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let worktree_locks = self.worktree_locks.clone();
+        let this = self.clone();
         let workspaces_root = self
             .workspaces_root
             .clone()
@@ -5776,7 +5777,12 @@ impl WorkspaceApi for Services {
                 attention: WorkspaceAttention::None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
-                last_activity: None,
+                // Stamp the wire `lastActivity` at creation time (parity with
+                // `workspace.create`) so the returned `Workspace` is never
+                // missing it; the post-insert `derive_last_activity` below
+                // then folds in any copied notes / activity carried over from
+                // the source workspace.
+                last_activity: Some(now.clone()),
                 tags: source.tags.clone(),
                 path: source.path.clone(),
                 repository_path: source.repository_path.clone(),
@@ -6012,6 +6018,10 @@ impl WorkspaceApi for Services {
                     "workspace.duplicate: failed to list source notes"
                 ),
             }
+            // Fold in copied notes/sessions so the returned `lastActivity`
+            // matches what `workspace.list`/`workspace.get` would compute for
+            // the new row (§9.1, mutation-path parity).
+            this.derive_last_activity(&mut ws).await;
             Ok(ws)
         })
     }
