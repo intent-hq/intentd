@@ -1100,11 +1100,11 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         number(
             "agents.maxConcurrent",
             "Max concurrent agents",
-            "Concurrent agent session cap",
+            "Concurrent agent session cap (0 = auto based on system RAM; changes apply on daemon restart)",
             "agents",
-            Some(1.0),
+            Some(0.0),
             None,
-            8.0,
+            0.0,
         ),
         number(
             "agents.idleReapMinutes",
@@ -1141,6 +1141,20 @@ pub(crate) async fn auto_commit_enabled(store: &Store) -> bool {
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
         _ => true,
+    }
+}
+
+/// Read the effective `agents.maxConcurrent` setting: a positive integer sets an
+/// explicit cap; 0 (the default), negative, unset, or garbled means "auto"
+/// (RAM-based cap via [`intent_services::default_process_cap`]).
+pub async fn max_concurrent_agents(store: &Store) -> Option<usize> {
+    match store.get_setting("agents.maxConcurrent").await {
+        Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|v| v.as_f64())
+            .filter(|&n| n > 0.0)
+            .and_then(|n| usize::try_from(n as i64).ok()),
+        _ => None,
     }
 }
 
@@ -1624,6 +1638,54 @@ mod tests {
             elapsed < cap,
             "settings.update took {elapsed:?}, cap {cap:?}"
         );
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// `max_concurrent_agents` reads `agents.maxConcurrent`: positive value →
+    /// explicit override; 0 / unset / invalid / negative → `None` (fallback to
+    /// `default_process_cap()`). The schema sets default 0, min 0 so "auto" is
+    /// the default and negative values are rejected by validation.
+    #[tokio::test]
+    async fn max_concurrent_agents_resolves_override_or_auto() {
+        let tmp = std::env::temp_dir().join(format!("intent-test-{}", uuid::Uuid::new_v4()));
+        let store = intent_store::Store::open(&tmp).await.unwrap();
+
+        // Unset → None (auto).
+        assert_eq!(max_concurrent_agents(&store).await, None);
+
+        // 0 (the schema default) → None (auto).
+        store
+            .set_setting("agents.maxConcurrent", "0")
+            .await
+            .unwrap();
+        assert_eq!(max_concurrent_agents(&store).await, None);
+
+        // Positive integer → Some(cap).
+        store
+            .set_setting("agents.maxConcurrent", "12")
+            .await
+            .unwrap();
+        assert_eq!(max_concurrent_agents(&store).await, Some(12));
+
+        // Garbled / non-numeric → None (fallback to auto).
+        store
+            .set_setting("agents.maxConcurrent", "\"not-a-number\"")
+            .await
+            .unwrap();
+        assert_eq!(max_concurrent_agents(&store).await, None);
+
+        // Negative (should be rejected by schema, but defensively handle) → None.
+        store
+            .set_setting("agents.maxConcurrent", "-5")
+            .await
+            .unwrap();
+        assert_eq!(max_concurrent_agents(&store).await, None);
 
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
