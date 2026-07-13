@@ -261,8 +261,10 @@ pub fn unstage_hunk(worktree_path: &Path, _file_path: &str, patch: &str) -> Resu
 /// Run `git apply --cached [--reverse]` with `patch` on stdin, retrying with
 /// `--3way` when the strict apply fails. The retry order mirrors the reference
 /// FE (`gitService.stageHunk`/`unstageHunk`) so context-mismatch tolerance is
-/// consistent across ports. Errors surface with the stderr of the final attempt
-/// for diagnostics.
+/// consistent across ports. When both attempts fail, the error surfaces the
+/// stderr from the final (`--3way`) attempt with the direct-apply stderr
+/// appended for context — the 3-way run is the one that decided the patch is
+/// unapplyable, so its diagnostics are what an operator needs to act on.
 fn apply_patch_cached(worktree_path: &Path, patch: &str, reverse: bool) -> Result<()> {
     let base_args: &[&str] = if reverse {
         &["apply", "--cached", "--reverse"]
@@ -275,7 +277,9 @@ fn apply_patch_cached(worktree_path: &Path, patch: &str, reverse: bool) -> Resul
             let three_way: Vec<&str> = base_args.iter().copied().chain(["--3way"]).collect();
             match run_git_apply(worktree_path, &three_way, patch) {
                 Ok(()) => Ok(()),
-                Err(_) => Err(direct_err),
+                Err(three_way_err) => Err(Error::Internal(format!(
+                    "{three_way_err} (direct-apply error: {direct_err})"
+                ))),
             }
         }
     }

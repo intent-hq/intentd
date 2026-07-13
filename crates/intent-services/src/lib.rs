@@ -7720,14 +7720,18 @@ impl WorkspaceApi for Services {
             })?;
             // Resolve the currently-checked-out branch (FE parity — `git push`
             // with no args pushes HEAD's upstream, which for our worktrees is
-            // the current branch on `origin`).
-            let branch = intent_git::status::current_branch_at(&worktree).ok_or_else(|| {
-                Error::Internal(
-                    "Failed to push: no branch checked out (detached HEAD?)".to_string(),
-                )
-            })?;
+            // the current branch on `origin`). Resolve inside the lock so a
+            // concurrent checkout/rename cannot change HEAD between the read
+            // and the push.
             let outcome = locks
                 .with_lock(&worktree, || async {
+                    let branch =
+                        intent_git::status::current_branch_at(&worktree).ok_or_else(|| {
+                            Error::Internal(
+                                "Failed to push: no branch checked out (detached HEAD?)"
+                                    .to_string(),
+                            )
+                        })?;
                     intent_git::push::push(&worktree, "origin", &branch, force)
                 })
                 .await?;
@@ -7759,13 +7763,17 @@ impl WorkspaceApi for Services {
             let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                 Error::Internal("Failed to fetch: workspace has no worktree".to_string())
             })?;
-            let branch = intent_git::status::current_branch_at(&worktree).ok_or_else(|| {
-                Error::Internal(
-                    "Failed to fetch: no branch checked out (detached HEAD?)".to_string(),
-                )
-            })?;
+            // Resolve HEAD's branch inside the lock so a concurrent
+            // checkout/rename cannot change it between the read and the fetch.
             locks
                 .with_lock(&worktree, || async {
+                    let branch =
+                        intent_git::status::current_branch_at(&worktree).ok_or_else(|| {
+                            Error::Internal(
+                                "Failed to fetch: no branch checked out (detached HEAD?)"
+                                    .to_string(),
+                            )
+                        })?;
                     intent_git::fetch::fetch(&worktree, "origin", &branch)
                 })
                 .await?;
@@ -7864,6 +7872,11 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
         Box::pin(async move {
+            if old_branch_name.trim().is_empty() {
+                return Err(Error::InvalidParams(
+                    "oldBranchName cannot be empty".to_string(),
+                ));
+            }
             let trimmed_new = new_branch_name.trim().to_string();
             if trimmed_new.is_empty() {
                 return Err(Error::InvalidParams(
@@ -7897,6 +7910,12 @@ impl WorkspaceApi for Services {
                 git_branch_event(&ws.id, "rename", &trimmed_new, Some(&old_branch_name)),
             )
             .await;
+            // Renaming the currently-checked-out branch changes the
+            // `git.status` `branch` field, so refresh the FE change view.
+            let status = intent_git::status::status(&worktree)
+                .unwrap_or_else(|_| intent_git::status::empty_status());
+            let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+            publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
             Ok(serde_json::json!({
                 "oldBranch": old_branch_name,
                 "newBranch": trimmed_new,

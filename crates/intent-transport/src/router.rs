@@ -1297,10 +1297,13 @@ async fn dispatch(
             let branch_name = require_str_param(params, "branchName")?;
             // Default is `true` (TS parity with `gitService.createBranch`);
             // callers wanting a bare `git branch <name>` pass `checkout:false`.
-            let checkout = params
-                .get("checkout")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
+            // Uses `parse_bool` (rather than `Value::as_bool`) so a string
+            // `"false"` is honoured, matching every other boolean arm.
+            let checkout = if params.contains_key("checkout") {
+                parse_bool(params, "checkout")
+            } else {
+                true
+            };
             let r = api
                 .git_create_branch(ws, branch_name, checkout)
                 .await

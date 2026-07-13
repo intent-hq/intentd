@@ -2115,9 +2115,10 @@ pub trait WorkspaceApi: Send + Sync {
     /// `git.renameBranch`: rename `old_branch_name` → `new_branch_name` in the
     /// workspace's repository (`gitService.renameBranch`). Refuses when the old
     /// branch is missing, the new name already exists, or the new name is
-    /// checked out in another worktree. An empty / same-as-old new name is a
-    /// no-op. Failures surface as `-32603`; validation failures (empty new
-    /// name) as `-32602` (PROTOCOL §5.6).
+    /// checked out in another worktree. A same-as-old new name (after trim) is
+    /// a no-op. Failures surface as `-32603`; validation failures (empty
+    /// `old_branch_name` or empty `new_branch_name`) as `-32602`
+    /// (PROTOCOL §5.6).
     fn git_rename_branch(
         &self,
         workspace_id: WorkspaceId,
