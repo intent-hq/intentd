@@ -1,48 +1,124 @@
 //! Single-branch fetch (`git fetch <remote> <branch>`).
 //!
 //! Ports the `git fetch origin <trunk>` step the accept-changes merge/reset/rebase
-//! handlers run before comparing against trunk. libgit2 performs the fetch with the
-//! shared credential callback ([`crate::auth`]); the explicit refspec updates the
-//! local remote-tracking ref `refs/remotes/<remote>/<branch>` so the downstream
-//! ahead/behind + `isPushed` reads stay consistent. Local/`file://` remotes (the
-//! test path) need no credentials.
+//! handlers run before comparing against trunk, and the fetch step of `pull_branch`.
+//! Shells out to system `git` (not libgit2) so the caller inherits OpenSSH's
+//! `~/.ssh/config` + agent-forwarding + credential-helper resolution — the reference
+//! TS handler ran shell git and never hit the auth-loop that pins libgit2 when
+//! `ssh-agent` has no identities (the runtime-saturation vector behind the FE
+//! `git.pull` and `host.status` timeouts). `GIT_TERMINAL_PROMPT=0` forces fail-fast
+//! instead of a hidden prompt; a wall-clock deadline kills the child via
+//! `Child::kill` if the remote hangs.
 
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-use git2::{FetchOptions, Repository};
 use intent_core::{Error, Result};
 
-use crate::auth::remote_callbacks;
-use crate::map_git_err;
+/// Wall-clock bound for a single `git fetch` shell-out. Chosen below the
+/// service-layer `GIT_PULL_TIMEOUT` (120s) so the fetch child is killed cleanly
+/// by this helper before the outer `spawn_blocking + timeout` wrapper fires and
+/// leaves the process orphaned.
+const SHELL_FETCH_TIMEOUT: Duration = Duration::from_secs(100);
+
+/// Poll interval used while waiting for the fetch child to exit. Small enough
+/// that a completed fetch returns near-instantly, large enough that idle CPU
+/// stays negligible for a long-running remote.
+const SHELL_FETCH_POLL: Duration = Duration::from_millis(50);
 
 /// Fetch a single `branch` from `remote` (typically `origin`), updating the local
 /// remote-tracking ref `refs/remotes/<remote>/<branch>`. Errors when the branch
-/// name is empty or the remote is unreachable.
+/// name is empty, `git` is not on PATH, the remote is unreachable, or the fetch
+/// exceeds [`SHELL_FETCH_TIMEOUT`].
 pub fn fetch(worktree_path: &Path, remote: &str, branch: &str) -> Result<()> {
+    fetch_with_timeout(worktree_path, remote, branch, SHELL_FETCH_TIMEOUT)
+}
+
+/// Timeout-parameterised body of [`fetch`], factored out so tests can drive
+/// the deadline-kill path against a stub git binary without waiting 100s.
+pub(crate) fn fetch_with_timeout(
+    worktree_path: &Path,
+    remote: &str,
+    branch: &str,
+    timeout: Duration,
+) -> Result<()> {
     if branch.is_empty() {
         return Err(Error::Internal(
             "cannot fetch: empty branch name".to_string(),
         ));
     }
-    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
-    let mut remote_handle = repo.find_remote(remote).map_err(map_git_err)?;
-
-    let mut opts = FetchOptions::new();
-    opts.remote_callbacks(remote_callbacks());
 
     // Explicit refspec so the remote-tracking ref is written even when the remote
-    // is not configured with a default fetch refspec.
+    // is not configured with a default fetch refspec (parity with the previous
+    // libgit2 fetch that installed the same refspec).
     let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
-    remote_handle
-        .fetch(&[refspec.as_str()], Some(&mut opts), None)
-        .map_err(map_git_err)?;
-    Ok(())
+
+    // `git -C <path>` so the child cwd is not this crate's cwd (parity with the
+    // reference TS handler); `GIT_TERMINAL_PROMPT=0` turns any credential prompt
+    // into a fast error rather than a hidden hang.
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("fetch")
+        .arg(remote)
+        .arg(&refspec)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::Internal(format!("failed to spawn git: {e}")))?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return Ok(());
+                }
+                let stderr = read_stderr(&mut child);
+                return Err(Error::Internal(format!(
+                    "git fetch failed: {}",
+                    stderr.trim()
+                )));
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Real cancellation: kill the child so no orphaned git process
+                    // survives the wall-clock bound. `wait` reaps the exit status.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Error::Internal(format!(
+                        "git fetch timed out after {}s",
+                        timeout.as_secs()
+                    )));
+                }
+                std::thread::sleep(SHELL_FETCH_POLL);
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Internal(format!("git fetch wait failed: {e}")));
+            }
+        }
+    }
+}
+
+fn read_stderr(child: &mut std::process::Child) -> String {
+    use std::io::Read;
+    let mut buf = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut buf);
+    }
+    buf
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::{commit_file, init_repo};
+    use git2::Repository;
 
     /// Fetch a branch from a local bare remote and confirm the local
     /// remote-tracking ref now points at the remote commit.
@@ -100,5 +176,51 @@ mod tests {
         let dir = init_repo("fetch-empty-branch");
         commit_file(dir.path(), "a.txt", "x\n");
         assert!(fetch(dir.path(), "origin", "").is_err());
+    }
+
+    /// A missing / unreachable remote produces a structured `Err`, not a hang.
+    /// This exercises the fail-fast path enforced by `GIT_TERMINAL_PROMPT=0`.
+    #[test]
+    fn missing_remote_errors_fast() {
+        let dir = init_repo("fetch-no-remote");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let err = fetch(dir.path(), "origin", "main")
+            .expect_err("fetch against a missing remote must error");
+        let msg = match err {
+            Error::Internal(m) => m,
+            other => panic!("expected Internal error, got {other:?}"),
+        };
+        assert!(
+            msg.contains("git fetch failed"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    /// The wall-clock timeout kills the child and returns a structured error
+    /// rather than letting it run indefinitely. Simulated by pointing `git`
+    /// at a bare remote it must reach through a non-routable IP: OpenSSH will
+    /// hang the TCP connect, and the timeout must fire.
+    #[test]
+    fn fetch_timeout_kills_child() {
+        let dir = init_repo("fetch-timeout");
+        commit_file(dir.path(), "a.txt", "x\n");
+        // TEST-NET-1 (RFC 5737) — reserved, non-routable. TCP connect never
+        // completes, so the child hangs until we kill it.
+        let repo = Repository::open(dir.path()).unwrap();
+        repo.remote("origin", "https://192.0.2.1/repo.git").unwrap();
+
+        let start = Instant::now();
+        let err = fetch_with_timeout(dir.path(), "origin", "main", Duration::from_millis(500))
+            .expect_err("fetch must time out against a non-routable remote");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "fetch did not honour the deadline: took {elapsed:?}"
+        );
+        let msg = match err {
+            Error::Internal(m) => m,
+            other => panic!("expected Internal error, got {other:?}"),
+        };
+        assert!(msg.contains("timed out"), "unexpected error message: {msg}");
     }
 }
