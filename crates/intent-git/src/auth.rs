@@ -1,9 +1,9 @@
-//! Shared remote credential resolution for the network git operations.
-//!
-//! Both `push` and `fetch` install the same best-effort credential callback
-//! (ssh-agent → credential helper). Local/`file://` remotes — the test path —
-//! never invoke it. The interactive keychain consent flow the TS service drives
-//! is deferred (see the accept-changes parity notes in `intent-services`).
+//! Shared remote credential resolution for the libgit2-backed network git
+//! operations (currently `push` and `ls_remote_has_branch`; `fetch` shells out
+//! to system `git` and does not go through this callback). Local/`file://`
+//! remotes — the test path — never invoke it. The interactive keychain consent
+//! flow the TS service drives is deferred (see the accept-changes parity
+//! notes in `intent-services`).
 //!
 //! libgit2 re-invokes the credentials callback on every auth failure and keeps
 //! going until the callback returns `Err` (or a working `Cred`). Falling
@@ -14,7 +14,7 @@
 //! "JSON-RPC request timed out: host.status" surface. The bounded closure
 //! installed by [`remote_callbacks`] gives libgit2 a fixed number of attempts
 //! before returning `Err`, mirroring the TS handler's `GIT_TERMINAL_PROMPT=0`
-//! fail-fast semantics for both fetch and push.
+//! fail-fast semantics for the remaining libgit2 network paths.
 
 use git2::{Cred, RemoteCallbacks};
 
@@ -62,7 +62,7 @@ pub(crate) fn resolve_credential(
 
 /// Build a bounded credentials closure suitable for
 /// [`RemoteCallbacks::credentials`]. Each invocation increments a per-callback
-/// counter; once it exceeds `max_attempts` the closure returns `Err` so libgit2
+/// counter; once it reaches `max_attempts` the closure returns `Err` so libgit2
 /// stops re-entering it. Exposed at the module level so unit tests can drive
 /// the counter without a real remote.
 pub(crate) fn make_credentials_callback(
@@ -78,8 +78,10 @@ pub(crate) fn make_credentials_callback(
 }
 
 /// Build [`RemoteCallbacks`] with the bounded credential callback installed.
-/// Applies to fetch and push alike via [`crate::fetch`], [`crate::push`], and
-/// [`crate::remote::ls_remote_has_branch`].
+/// Applies to the libgit2-backed remote operations that still install these
+/// callbacks: [`crate::push`] and [`crate::remote::ls_remote_has_branch`].
+/// (`crate::fetch` shells out to system `git`, so it does not use this
+/// callback — see the module docs.)
 pub(crate) fn remote_callbacks<'cb>() -> RemoteCallbacks<'cb> {
     let mut callbacks = RemoteCallbacks::new();
     callbacks.credentials(make_credentials_callback(MAX_CREDENTIAL_ATTEMPTS));

@@ -65,7 +65,10 @@ pub(crate) fn fetch_with_timeout(
         .arg(&refspec)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        // Discard stdout: git-fetch progress output is only for TTY users, and
+        // an undrained piped stdout would risk pipe backpressure blocking the
+        // child before the deadline fires.
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| Error::Internal(format!("failed to spawn git: {e}")))?;
