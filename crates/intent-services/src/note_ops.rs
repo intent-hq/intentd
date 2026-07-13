@@ -576,6 +576,266 @@ pub fn find_and_anchor_text(
 }
 
 // ---------------------------------------------------------------------------
+// Comment anchor recovery (ported from
+// `src/features/comments/markdown-anchor-recovery.ts`). `comment.add` embeds
+// `<!--anchor:{id}:start-->…<!--anchor:{id}:end-->` markers into the note
+// content; subsequent note edits may destroy one or both markers. Reference
+// semantics: extract the surrounding CONTEXT_LENGTH-char context on add and,
+// on later edits, try to relocate a partial anchor using that context;
+// unresolvable anchors are marked orphaned and their stray markers removed.
+// ---------------------------------------------------------------------------
+
+/// Amount of surrounding text captured on add / used for recovery matching
+/// (reference `CONTEXT_LENGTH = 50` in `markdown-anchor-recovery.ts`).
+pub const ANCHOR_CONTEXT_LEN: usize = 50;
+
+/// Health of a comment's anchor markers in a note's markdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorState {
+    /// Both markers present with a valid range.
+    Healthy,
+    /// Both markers absent — the anchored span was removed entirely.
+    Missing,
+    /// Only the `:start` marker survives.
+    PartialStartOnly,
+    /// Only the `:end` marker survives.
+    PartialEndOnly,
+    /// Both markers present but nothing (or only whitespace) between them.
+    Degenerate,
+}
+
+/// Start/end byte offsets of a comment's `<!--anchor:{id}:…-->` markers, if
+/// found. `start`/`end` point at the first byte of each marker.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AnchorPositions {
+    pub start: Option<usize>,
+    pub end: Option<usize>,
+}
+
+fn start_marker(comment_id: &str) -> String {
+    format!("<!--anchor:{comment_id}:start-->")
+}
+
+fn end_marker(comment_id: &str) -> String {
+    format!("<!--anchor:{comment_id}:end-->")
+}
+
+/// Byte offsets of the `{id}:start` / `{id}:end` markers (reference
+/// `findAnchorsInMarkdown`).
+pub fn find_anchor_positions(markdown: &str, comment_id: &str) -> AnchorPositions {
+    let start_pat = start_marker(comment_id);
+    let end_pat = end_marker(comment_id);
+    AnchorPositions {
+        start: markdown.find(&start_pat),
+        end: markdown.find(&end_pat),
+    }
+}
+
+/// Classify a comment's anchor state in `markdown` (reference
+/// `scanForProblematicAnchors` + healthy/missing cases).
+pub fn classify_anchor_state(markdown: &str, comment_id: &str) -> AnchorState {
+    let start_pat = start_marker(comment_id);
+    let end_pat = end_marker(comment_id);
+    let start = markdown.find(&start_pat);
+    let end = markdown.find(&end_pat);
+    match (start, end) {
+        (None, None) => AnchorState::Missing,
+        (Some(_), None) => AnchorState::PartialStartOnly,
+        (None, Some(_)) => AnchorState::PartialEndOnly,
+        (Some(s), Some(e)) => {
+            let text_start = s + start_pat.len();
+            if text_start > e {
+                // Inverted order — treat as degenerate; both will be scrubbed.
+                return AnchorState::Degenerate;
+            }
+            let between = &markdown[text_start..e];
+            if between.trim().is_empty() {
+                AnchorState::Degenerate
+            } else {
+                AnchorState::Healthy
+            }
+        }
+    }
+}
+
+/// Up to [`ANCHOR_CONTEXT_LEN`] characters (UTF-8-safe) immediately preceding
+/// `pos` in `content`. Reference `extractAnchoredText.contextBefore`.
+pub fn context_before(content: &str, pos: usize) -> String {
+    // Walk backwards up to CONTEXT_LENGTH chars from `pos`.
+    let start = content[..pos]
+        .char_indices()
+        .rev()
+        .take(ANCHOR_CONTEXT_LEN)
+        .last()
+        .map(|(idx, _)| idx)
+        .unwrap_or(pos);
+    content[start..pos].to_string()
+}
+
+/// Up to [`ANCHOR_CONTEXT_LEN`] characters (UTF-8-safe) immediately following
+/// `pos` in `content`. Reference `extractAnchoredText.contextAfter`.
+pub fn context_after(content: &str, pos: usize) -> String {
+    let end = content[pos..]
+        .char_indices()
+        .take(ANCHOR_CONTEXT_LEN)
+        .last()
+        .map(|(idx, ch)| pos + idx + ch.len_utf8())
+        .unwrap_or(pos);
+    content[pos..end].to_string()
+}
+
+/// Remove every `{id}:start` / `{id}:end` marker occurrence from `markdown`
+/// (reference `removeAnchors`; used to scrub broken/degenerate anchors).
+pub fn remove_anchor_markers(markdown: &str, comment_id: &str) -> String {
+    let start_pat = start_marker(comment_id);
+    let end_pat = end_marker(comment_id);
+    markdown.replace(&start_pat, "").replace(&end_pat, "")
+}
+
+/// Outcome of an anchor recovery attempt (reference `RecoveryResult`).
+#[derive(Debug, Clone)]
+pub enum RecoveryOutcome {
+    /// Markers restored — caller should adopt the returned markdown.
+    Recovered(String),
+    /// Recovery failed — caller should scrub any stray markers and mark the
+    /// comment orphaned. The reason mirrors the reference log messages and is
+    /// carried for diagnostics / test assertions.
+    Failed(#[allow(dead_code)] &'static str),
+}
+
+/// Attempt to relocate a partially-anchored comment inside `markdown`, using
+/// the stored surrounding context. Reference `recoverPartialAnchor` collapsed
+/// to a single "anchor-neighbor" pass over the current content — the neighbor
+/// word is derived from the stored `anchor_before` / `anchor_after` context
+/// that `comment.add` captured, so no version history is required. The
+/// original `anchor_text` is not used as an extra constraint here (it can
+/// itself have been partly edited); the surviving marker + neighbor word are
+/// what pin the recovered range, matching the reference behavior.
+pub fn recover_partial_anchor(
+    markdown: &str,
+    comment_id: &str,
+    anchor_before: Option<&str>,
+    anchor_after: Option<&str>,
+) -> RecoveryOutcome {
+    let positions = find_anchor_positions(markdown, comment_id);
+    match (positions.start, positions.end) {
+        (Some(_), Some(_)) => RecoveryOutcome::Failed("both-anchors-present"),
+        (None, None) => RecoveryOutcome::Failed("both-anchors-missing"),
+        (Some(start_pos), None) => recover_missing_end(
+            markdown,
+            comment_id,
+            start_pos,
+            anchor_after.unwrap_or_default(),
+        ),
+        (None, Some(end_pos)) => recover_missing_start(
+            markdown,
+            comment_id,
+            end_pos,
+            anchor_before.unwrap_or_default(),
+        ),
+    }
+}
+
+/// Have `{id}:start`; need to restore `{id}:end` after the original anchored
+/// text. Uses the first "neighbor" word from `context_after` (the word that
+/// followed the end marker at add-time) as a landmark inside `markdown`. On
+/// success the surviving start marker stays put and a fresh end marker is
+/// inserted right before the neighbor, matching reference
+/// `recoverMissingEndAnchor`'s trailing-whitespace walk so the anchored range
+/// does not swallow trailing whitespace.
+fn recover_missing_end(
+    markdown: &str,
+    comment_id: &str,
+    start_pos: usize,
+    context_after: &str,
+) -> RecoveryOutcome {
+    let start_pat = start_marker(comment_id);
+    let end_pat = end_marker(comment_id);
+    let text_start = start_pos + start_pat.len();
+    if text_start > markdown.len() {
+        return RecoveryOutcome::Failed("start-anchor-out-of-range");
+    }
+    let neighbor = leading_word(context_after);
+    if neighbor.is_empty() {
+        return RecoveryOutcome::Failed("neighbor-not-found");
+    }
+    let Some(rel) = markdown[text_start..].find(&neighbor) else {
+        return RecoveryOutcome::Failed("neighbor-not-found");
+    };
+    let mut insertion = text_start + rel;
+    // Walk backwards over whitespace so the freshly-placed end marker sits
+    // immediately after the last non-whitespace char of the anchored text,
+    // exactly like the reference does.
+    while insertion > text_start {
+        let prev = markdown[..insertion].chars().next_back();
+        match prev {
+            Some(c) if c.is_whitespace() => insertion -= c.len_utf8(),
+            _ => break,
+        }
+    }
+    let mut out = String::with_capacity(markdown.len() + end_pat.len());
+    out.push_str(&markdown[..insertion]);
+    out.push_str(&end_pat);
+    out.push_str(&markdown[insertion..]);
+    RecoveryOutcome::Recovered(out)
+}
+
+/// Have `{id}:end`; need to restore `{id}:start` before the original anchored
+/// text. Symmetric counterpart to [`recover_missing_end`]; keeps the surviving
+/// end marker and inserts a fresh start marker right after the trailing word
+/// of `context_before`, walking forward over whitespace so the anchored range
+/// starts at the first non-whitespace char after the neighbor.
+fn recover_missing_start(
+    markdown: &str,
+    comment_id: &str,
+    end_pos: usize,
+    context_before: &str,
+) -> RecoveryOutcome {
+    let start_pat = start_marker(comment_id);
+    let neighbor = trailing_word(context_before);
+    if neighbor.is_empty() {
+        return RecoveryOutcome::Failed("neighbor-not-found");
+    }
+    let Some(idx) = markdown[..end_pos].rfind(&neighbor) else {
+        return RecoveryOutcome::Failed("neighbor-not-found");
+    };
+    let mut insertion = idx + neighbor.len();
+    // Skip forward over whitespace so the fresh start marker sits right
+    // before the first non-whitespace char of the anchored text.
+    while insertion < end_pos {
+        let next = markdown[insertion..].chars().next();
+        match next {
+            Some(c) if c.is_whitespace() => insertion += c.len_utf8(),
+            _ => break,
+        }
+    }
+    let mut out = String::with_capacity(markdown.len() + start_pat.len());
+    out.push_str(&markdown[..insertion]);
+    out.push_str(&start_pat);
+    out.push_str(&markdown[insertion..]);
+    RecoveryOutcome::Recovered(out)
+}
+
+fn leading_word(s: &str) -> String {
+    s.trim_start()
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect()
+}
+
+fn trailing_word(s: &str) -> String {
+    let trimmed = s.trim_end();
+    let start = trimmed
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| !c.is_whitespace())
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(trimmed.len());
+    trimmed[start..].to_string()
+}
+
+// ---------------------------------------------------------------------------
 // @@@task block parsing (ported from notes/utils/task-block-parser.ts).
 // ---------------------------------------------------------------------------
 
@@ -1130,5 +1390,148 @@ mod tests {
         assert_eq!(hash.len(), 8);
         // Round-trips through the read-side mime mapping.
         assert_eq!(mime_from_extension(&id), "image/png");
+    }
+
+    // -----------------------------------------------------------------------
+    // Comment anchor context + recovery.
+    // -----------------------------------------------------------------------
+
+    fn wrap(id: &str, before: &str, anchored: &str, after: &str) -> String {
+        format!("{before}<!--anchor:{id}:start-->{anchored}<!--anchor:{id}:end-->{after}")
+    }
+
+    #[test]
+    fn context_before_after_are_char_bounded() {
+        let content = "hello world foo bar baz";
+        let anchor_start = content.find("foo").unwrap();
+        let anchor_end = anchor_start + "foo".len();
+        assert_eq!(context_before(content, anchor_start), "hello world ");
+        assert_eq!(context_after(content, anchor_end), " bar baz");
+    }
+
+    #[test]
+    fn context_before_after_are_utf8_safe() {
+        // Mix of multi-byte glyphs (é = 2 bytes, 你 = 3 bytes, 😀 = 4 bytes)
+        // exercises the char-boundary logic in context_before / context_after
+        // — a byte-indexed slice here would panic or split a codepoint.
+        let content = "café 你好 😀 target 世界 après 🎉";
+        let anchor_start = content.find("target").unwrap();
+        let anchor_end = anchor_start + "target".len();
+        let before = context_before(content, anchor_start);
+        let after = context_after(content, anchor_end);
+        assert!(
+            content.starts_with(&before),
+            "before must be a suffix-prefix of content"
+        );
+        assert!(
+            content.ends_with(&after),
+            "after must be a prefix-suffix of content"
+        );
+        assert_eq!(before, "café 你好 😀 ");
+        assert_eq!(after, " 世界 après 🎉");
+        // And with a run longer than CONTEXT_LENGTH chars the slice is bounded
+        // by char count (not byte count) and still ends on a char boundary.
+        let long = "🎉".repeat(80) + "X" + &"🎉".repeat(80);
+        let pos = long.find('X').unwrap();
+        let before_long = context_before(&long, pos);
+        let after_long = context_after(&long, pos + 1);
+        assert_eq!(before_long.chars().count(), ANCHOR_CONTEXT_LEN);
+        assert_eq!(after_long.chars().count(), ANCHOR_CONTEXT_LEN);
+    }
+
+    #[test]
+    fn classify_healthy_partial_missing_degenerate() {
+        let healthy = wrap("c1", "pre ", "target", " post");
+        assert_eq!(classify_anchor_state(&healthy, "c1"), AnchorState::Healthy);
+        let missing = "pre target post";
+        assert_eq!(classify_anchor_state(missing, "c1"), AnchorState::Missing);
+        let partial_start = "pre <!--anchor:c1:start-->target post";
+        assert_eq!(
+            classify_anchor_state(partial_start, "c1"),
+            AnchorState::PartialStartOnly
+        );
+        let partial_end = "pre target<!--anchor:c1:end--> post";
+        assert_eq!(
+            classify_anchor_state(partial_end, "c1"),
+            AnchorState::PartialEndOnly
+        );
+        let degenerate = "pre <!--anchor:c1:start--><!--anchor:c1:end--> post";
+        assert_eq!(
+            classify_anchor_state(degenerate, "c1"),
+            AnchorState::Degenerate
+        );
+    }
+
+    #[test]
+    fn recover_missing_end_uses_context_after_neighbor() {
+        // Start marker survives, end marker was deleted; the anchored word
+        // ("target") is still followed by the original neighbor ("post").
+        let markdown = "pre <!--anchor:c1:start-->target post";
+        let out = recover_partial_anchor(markdown, "c1", Some("pre "), Some(" post"));
+        let recovered = match out {
+            RecoveryOutcome::Recovered(m) => m,
+            other => panic!("expected Recovered, got {other:?}"),
+        };
+        assert!(
+            recovered.contains("<!--anchor:c1:start-->target<!--anchor:c1:end--> post"),
+            "unexpected recovery: {recovered}"
+        );
+        assert_eq!(
+            classify_anchor_state(&recovered, "c1"),
+            AnchorState::Healthy
+        );
+    }
+
+    #[test]
+    fn recover_missing_start_uses_context_before_neighbor() {
+        // End marker survives, start marker was deleted; the anchored word
+        // ("target") is still preceded by the original neighbor ("pre").
+        let markdown = "pre target<!--anchor:c1:end--> post";
+        let out = recover_partial_anchor(markdown, "c1", Some("pre "), Some(" post"));
+        let recovered = match out {
+            RecoveryOutcome::Recovered(m) => m,
+            other => panic!("expected Recovered, got {other:?}"),
+        };
+        assert!(
+            recovered.contains("pre <!--anchor:c1:start-->target<!--anchor:c1:end--> post"),
+            "unexpected recovery: {recovered}"
+        );
+        assert_eq!(
+            classify_anchor_state(&recovered, "c1"),
+            AnchorState::Healthy
+        );
+    }
+
+    #[test]
+    fn recover_both_present_or_missing_is_not_attempted() {
+        let both_present = wrap("c1", "pre ", "target", " post");
+        assert!(matches!(
+            recover_partial_anchor(&both_present, "c1", Some("pre "), Some(" post")),
+            RecoveryOutcome::Failed(_)
+        ));
+        let both_missing = "pre target post";
+        assert!(matches!(
+            recover_partial_anchor(both_missing, "c1", Some("pre "), Some(" post")),
+            RecoveryOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn recover_partial_without_neighbor_context_fails() {
+        // Partial anchor but no stored neighbor to search for.
+        let markdown = "pre <!--anchor:c1:start-->target post";
+        assert!(matches!(
+            recover_partial_anchor(markdown, "c1", Some(""), Some("")),
+            RecoveryOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn remove_anchor_markers_strips_both_ends() {
+        let markdown = wrap("c1", "pre ", "target", " post");
+        let stripped = remove_anchor_markers(&markdown, "c1");
+        assert_eq!(stripped, "pre target post");
+        // No-op when nothing to strip.
+        assert_eq!(remove_anchor_markers("plain", "c1"), "plain");
     }
 }

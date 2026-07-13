@@ -1325,6 +1325,115 @@ async fn capture_note_version(store: &Store, note: &Note) -> Result<i64> {
         .await
 }
 
+/// Comment anchor recovery pass, called by every note-content mutation before
+/// the new content is persisted. Reference `NotesService.updateNote` calls
+/// `recoverAllPartialAnchors` on the incoming markdown and marks unrecoverable
+/// comments `isOrphaned: true`; we mirror that here using the anchor context
+/// captured at `comment.add` time (`anchor_before` / `anchor_after`) instead of
+/// version history, since the pass runs before the new version is stored.
+///
+/// Returns a [`ReanchorPlan`]: the possibly-rewritten markdown plus the set
+/// of comments whose `is_orphaned` flag needs to be flipped to `true`.
+/// Already-orphaned comments are left as-is. The plan does **no** store
+/// writes — callers apply the note-content change first via `update_note`
+/// and then call [`ReanchorPlan::apply_orphaned`] so a failed note write
+/// cannot leave comment rows flagged orphaned while the persisted markdown
+/// still contains the original anchors.
+///
+/// The lookup is scoped to `workspace_id` because `note_id` (e.g. the
+/// well-known `spec` id) is not globally unique — see
+/// `comment_repo::list_comments_in_workspace`.
+async fn reanchor_note_comments(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    content: String,
+) -> Result<ReanchorPlan> {
+    // Propagate the list_comments error: a failed lookup must not leave the
+    // note content persisted with broken anchors while the comment row still
+    // claims to be healthy. Callers already treat `reanchor_note_comments` as
+    // fallible and roll back the surrounding mutation.
+    let comments = store
+        .list_comments_in_workspace(workspace_id, note_id)
+        .await?;
+    let mut current = content;
+    let mut orphaned: Vec<Comment> = Vec::new();
+    for comment in comments {
+        // Only root-level anchored comments carry markers; replies inherit the
+        // parent's anchor and never inject their own into the note body.
+        if comment.parent_id.is_some() {
+            continue;
+        }
+        if comment.is_orphaned == Some(true) {
+            continue;
+        }
+        let state = note_ops::classify_anchor_state(&current, &comment.id);
+        match state {
+            note_ops::AnchorState::Healthy => {}
+            note_ops::AnchorState::Missing => {
+                let mut updated = comment.clone();
+                updated.is_orphaned = Some(true);
+                updated.updated_at = now_iso();
+                orphaned.push(updated);
+            }
+            note_ops::AnchorState::Degenerate => {
+                current = note_ops::remove_anchor_markers(&current, &comment.id);
+                let mut updated = comment.clone();
+                updated.is_orphaned = Some(true);
+                updated.updated_at = now_iso();
+                orphaned.push(updated);
+            }
+            note_ops::AnchorState::PartialStartOnly | note_ops::AnchorState::PartialEndOnly => {
+                let outcome = note_ops::recover_partial_anchor(
+                    &current,
+                    &comment.id,
+                    comment.anchor_before.as_deref(),
+                    comment.anchor_after.as_deref(),
+                );
+                match outcome {
+                    note_ops::RecoveryOutcome::Recovered(new_md) => {
+                        current = new_md;
+                    }
+                    note_ops::RecoveryOutcome::Failed(_) => {
+                        current = note_ops::remove_anchor_markers(&current, &comment.id);
+                        let mut updated = comment.clone();
+                        updated.is_orphaned = Some(true);
+                        updated.updated_at = now_iso();
+                        orphaned.push(updated);
+                    }
+                }
+            }
+        }
+    }
+    Ok(ReanchorPlan {
+        content: current,
+        orphaned,
+    })
+}
+
+/// Result of [`reanchor_note_comments`]: the rewritten note markdown and the
+/// set of comment rows whose `is_orphaned` flag needs to flip to `true`.
+struct ReanchorPlan {
+    content: String,
+    orphaned: Vec<Comment>,
+}
+
+impl ReanchorPlan {
+    /// Persist the queued orphan flips. Callers **must** run this only after
+    /// the note-content write has succeeded so a note-write failure cannot
+    /// leave comment rows marked orphaned while the persisted markdown still
+    /// contains the original anchors. If a comment update fails after the
+    /// note has been written the anchors on disk are still a valid pointer
+    /// (either intact or scrubbed) and the next mutation's reanchor pass
+    /// will finish the job.
+    async fn apply_orphaned(self, store: &Store, workspace_id: &WorkspaceId) -> Result<()> {
+        for c in self.orphaned {
+            store.update_comment(workspace_id, &c).await?;
+        }
+        Ok(())
+    }
+}
+
 /// FE `LineAttributionService.DEBOUNCE_MS`. Coalesces bursts of note
 /// mutations into a single recompute + `line-attribution:updated` emit.
 const LINE_ATTRIBUTION_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -5160,6 +5269,7 @@ impl WorkspaceApi for Services {
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             // content present → raw full set; otherwise title/tags metadata.
             let content_changed = input.content.is_some();
+            let mut reanchor_plan: Option<ReanchorPlan> = None;
             if let Some(content) = input.content {
                 // Route the full-content write through the CRDT merge engine
                 // so concurrent writers converge (§5.2 / A5 parity with
@@ -5171,7 +5281,14 @@ impl WorkspaceApi for Services {
                     &old_content,
                     &content,
                 );
-                note.content = merged;
+                // Comment anchor recovery mirrors reference `updateNote`: run
+                // the merged markdown through `recoverAllPartialAnchors` before
+                // persisting so surviving-partial anchors are repaired and
+                // unrecoverable ones are stripped + flipped to orphaned.
+                let mut plan =
+                    reanchor_note_comments(&store, &workspace_id, &note_id, merged).await?;
+                note.content = std::mem::take(&mut plan.content);
+                reanchor_plan = Some(plan);
             } else {
                 if let Some(title) = input.title {
                     note.title = title;
@@ -5182,6 +5299,9 @@ impl WorkspaceApi for Services {
             }
             note.updated_at = now_iso();
             store.update_note_versioned(&note, expected_version).await?;
+            if let Some(plan) = reanchor_plan {
+                plan.apply_orphaned(&store, &workspace_id).await?;
+            }
             if content_changed {
                 capture_note_version(&store, &note).await?;
                 services.schedule_line_attribution_recompute(
@@ -5232,9 +5352,13 @@ impl WorkspaceApi for Services {
                 input.heading.as_deref(),
                 input.position.as_deref(),
             )?;
+            let mut plan =
+                reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
+            let new_content = std::mem::take(&mut plan.content);
             note.content = new_content.clone();
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            plan.apply_orphaned(&store, &workspace_id).await?;
             capture_note_version(&store, &note).await?;
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
@@ -5291,9 +5415,13 @@ impl WorkspaceApi for Services {
             let old_content = note.content.clone();
             let (new_content, match_position, was_empty) =
                 note_ops::apply_edit(&old_content, &input.old, &input.new)?;
+            let mut plan =
+                reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
+            let new_content = std::mem::take(&mut plan.content);
             note.content = new_content.clone();
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            plan.apply_orphaned(&store, &workspace_id).await?;
             capture_note_version(&store, &note).await?;
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
@@ -5349,9 +5477,13 @@ impl WorkspaceApi for Services {
             let new_content =
                 note_ops::apply_edit_lines(&old_content, input.start, input.end, &input.content)?;
             let total_lines_before = old_content.split('\n').count();
+            let mut plan =
+                reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
+            let new_content = std::mem::take(&mut plan.content);
             note.content = new_content.clone();
             note.updated_at = now_iso();
             store.update_note(&note).await?;
+            plan.apply_orphaned(&store, &workspace_id).await?;
             capture_note_version(&store, &note).await?;
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
@@ -5432,10 +5564,13 @@ impl WorkspaceApi for Services {
                 &content,
             );
             let clean = note_ops::clean_set_content(&merged)?;
+            let mut plan = reanchor_note_comments(&store, &workspace_id, &note_id, clean).await?;
+            let clean = std::mem::take(&mut plan.content);
             note.content = clean.clone();
             let now = now_iso();
             note.updated_at = now.clone();
             store.update_note_versioned(&note, expected_version).await?;
+            plan.apply_orphaned(&store, &workspace_id).await?;
             capture_note_version(&store, &note).await?;
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
@@ -6412,6 +6547,14 @@ impl WorkspaceApi for Services {
                         &comment_target,
                     )?;
                     let anchored_text = note.content[from..to].to_string();
+                    // Capture the surrounding context BEFORE inserting the
+                    // anchor markers so the stored context reflects the
+                    // original text (parity with `extractAnchoredText` in
+                    // `markdown-anchor-recovery.ts`). This is Audit D M1: the
+                    // saved context lets a later note edit re-anchor a
+                    // partial-marker survivor without needing note versions.
+                    let ctx_before = note_ops::context_before(&note.content, from);
+                    let ctx_after = note_ops::context_after(&note.content, to);
                     let comment_id = uuid::Uuid::new_v4().to_string();
                     note.content = format!(
                         "{}<!--anchor:{id}:start-->{anchored}<!--anchor:{id}:end-->{}",
@@ -6445,11 +6588,20 @@ impl WorkspaceApi for Services {
                             point_id: None,
                         },
                         anchor_text: Some(anchored_text.clone()),
-                        anchor_before: None,
-                        anchor_after: None,
+                        anchor_before: if ctx_before.is_empty() {
+                            None
+                        } else {
+                            Some(ctx_before)
+                        },
+                        anchor_after: if ctx_after.is_empty() {
+                            None
+                        } else {
+                            Some(ctx_after)
+                        },
                         suggestion_original: None,
                         suggestion_proposed: None,
                         agent_id: None,
+                        is_orphaned: None,
                         created_at: now.clone(),
                         updated_at: now,
                     };
@@ -6745,6 +6897,7 @@ impl WorkspaceApi for Services {
                     None
                 },
                 agent_id: None,
+                is_orphaned: None,
                 created_at: now.clone(),
                 updated_at: now,
             };

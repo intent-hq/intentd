@@ -682,6 +682,15 @@ pub struct Comment {
     pub suggestion_proposed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
+    /// True when a subsequent note edit destroyed the anchor markers and
+    /// recovery from the stored surrounding context (`anchor_before` /
+    /// `anchor_after`) failed (reference
+    /// `commentsRepository.update({ isOrphaned: true })` in
+    /// `notes.service.ts` `applyEditEvent`). Serialized as camelCase
+    /// `isOrphaned`; omitted when `None` (untouched rows). `Some(false)` is
+    /// serialized explicitly so a healed comment can be signalled to clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_orphaned: Option<bool>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1159,6 +1168,8 @@ pub struct CommentWire {
     pub suggestion_diff: Option<SuggestionDiff>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_orphaned: Option<bool>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1195,6 +1206,7 @@ impl CommentWire {
             anchor_context,
             suggestion_diff,
             agent_id: c.agent_id.clone(),
+            is_orphaned: c.is_orphaned,
             created_at: c.created_at.clone(),
             updated_at: c.updated_at.clone(),
         }
@@ -2309,6 +2321,7 @@ mod tests {
             suggestion_original: None,
             suggestion_proposed: None,
             agent_id: None,
+            is_orphaned: None,
             created_at: "t0".to_string(),
             updated_at: "t0".to_string(),
         };
@@ -2354,6 +2367,7 @@ mod tests {
             suggestion_original: Some("Seed".to_string()),
             suggestion_proposed: Some("Sprout".to_string()),
             agent_id: None,
+            is_orphaned: None,
             created_at: "t0".to_string(),
             updated_at: "t0".to_string(),
         };

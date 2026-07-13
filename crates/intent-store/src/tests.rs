@@ -725,6 +725,7 @@ fn sample_comment(note_id: &NoteId, thread_id: &str, id: &str) -> Comment {
         suggestion_original: Some("foo".to_string()),
         suggestion_proposed: Some("baz".to_string()),
         agent_id: Some(AgentId::from("agent-9")),
+        is_orphaned: None,
         created_at: ts.clone(),
         updated_at: ts,
     }
