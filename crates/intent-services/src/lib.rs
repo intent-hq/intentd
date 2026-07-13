@@ -1341,10 +1341,11 @@ async fn reanchor_note_comments(
     note_id: &NoteId,
     content: String,
 ) -> Result<String> {
-    let comments = match store.list_comments(note_id).await {
-        Ok(list) => list,
-        Err(_) => return Ok(content),
-    };
+    // Propagate store errors: a failed lookup or update must not leave the
+    // note content persisted with broken anchors while the comment row still
+    // claims to be healthy. Callers already treat `reanchor_note_comments` as
+    // fallible and roll back the surrounding mutation.
+    let comments = store.list_comments(note_id).await?;
     let mut current = content;
     for comment in comments {
         // Only root-level anchored comments carry markers; replies inherit the
@@ -1362,21 +1363,19 @@ async fn reanchor_note_comments(
                 let mut updated = comment.clone();
                 updated.is_orphaned = Some(true);
                 updated.updated_at = now_iso();
-                let _ = store.update_comment(workspace_id, &updated).await;
+                store.update_comment(workspace_id, &updated).await?;
             }
             note_ops::AnchorState::Degenerate => {
                 current = note_ops::remove_anchor_markers(&current, &comment.id);
                 let mut updated = comment.clone();
                 updated.is_orphaned = Some(true);
                 updated.updated_at = now_iso();
-                let _ = store.update_comment(workspace_id, &updated).await;
+                store.update_comment(workspace_id, &updated).await?;
             }
             note_ops::AnchorState::PartialStartOnly | note_ops::AnchorState::PartialEndOnly => {
-                let anchor_text = comment.anchor_text.clone().unwrap_or_default();
                 let outcome = note_ops::recover_partial_anchor(
                     &current,
                     &comment.id,
-                    &anchor_text,
                     comment.anchor_before.as_deref(),
                     comment.anchor_after.as_deref(),
                 );
@@ -1389,7 +1388,7 @@ async fn reanchor_note_comments(
                         let mut updated = comment.clone();
                         updated.is_orphaned = Some(true);
                         updated.updated_at = now_iso();
-                        let _ = store.update_comment(workspace_id, &updated).await;
+                        store.update_comment(workspace_id, &updated).await?;
                     }
                 }
             }

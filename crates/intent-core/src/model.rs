@@ -686,7 +686,8 @@ pub struct Comment {
     /// recovery from `anchor_text` + `anchor_before`/`anchor_after` failed
     /// (reference `commentsRepository.update({ isOrphaned: true })` in
     /// `notes.service.ts` `applyEditEvent`). Serialized as camelCase
-    /// `isOrphaned`; omitted when absent/false to keep untouched rows narrow.
+    /// `isOrphaned`; omitted when `None` (untouched rows). `Some(false)` is
+    /// serialized explicitly so a healed comment can be signalled to clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_orphaned: Option<bool>,
     pub created_at: String,

@@ -704,15 +704,16 @@ pub enum RecoveryOutcome {
 }
 
 /// Attempt to relocate a partially-anchored comment inside `markdown`, using
-/// the anchor text plus the stored surrounding context. Reference
-/// `recoverPartialAnchor` collapsed to a single "anchor-neighbor" pass over
-/// the current content — the neighbor word is derived from the stored
-/// `anchor_before` / `anchor_after` context that `comment.add` captured, so
-/// no version history is required.
+/// the stored surrounding context. Reference `recoverPartialAnchor` collapsed
+/// to a single "anchor-neighbor" pass over the current content — the neighbor
+/// word is derived from the stored `anchor_before` / `anchor_after` context
+/// that `comment.add` captured, so no version history is required. The
+/// original `anchor_text` is not used as an extra constraint here (it can
+/// itself have been partly edited); the surviving marker + neighbor word are
+/// what pin the recovered range, matching the reference behavior.
 pub fn recover_partial_anchor(
     markdown: &str,
     comment_id: &str,
-    anchor_text: &str,
     anchor_before: Option<&str>,
     anchor_after: Option<&str>,
 ) -> RecoveryOutcome {
@@ -724,14 +725,12 @@ pub fn recover_partial_anchor(
             markdown,
             comment_id,
             start_pos,
-            anchor_text,
             anchor_after.unwrap_or_default(),
         ),
         (None, Some(end_pos)) => recover_missing_start(
             markdown,
             comment_id,
             end_pos,
-            anchor_text,
             anchor_before.unwrap_or_default(),
         ),
     }
@@ -748,7 +747,6 @@ fn recover_missing_end(
     markdown: &str,
     comment_id: &str,
     start_pos: usize,
-    _anchor_text: &str,
     context_after: &str,
 ) -> RecoveryOutcome {
     let start_pat = start_marker(comment_id);
@@ -791,7 +789,6 @@ fn recover_missing_start(
     markdown: &str,
     comment_id: &str,
     end_pos: usize,
-    _anchor_text: &str,
     context_before: &str,
 ) -> RecoveryOutcome {
     let start_pat = start_marker(comment_id);
@@ -1440,7 +1437,7 @@ mod tests {
         // Start marker survives, end marker was deleted; the anchored word
         // ("target") is still followed by the original neighbor ("post").
         let markdown = "pre <!--anchor:c1:start-->target post";
-        let out = recover_partial_anchor(markdown, "c1", "target", Some("pre "), Some(" post"));
+        let out = recover_partial_anchor(markdown, "c1", Some("pre "), Some(" post"));
         let recovered = match out {
             RecoveryOutcome::Recovered(m) => m,
             other => panic!("expected Recovered, got {other:?}"),
@@ -1460,7 +1457,7 @@ mod tests {
         // End marker survives, start marker was deleted; the anchored word
         // ("target") is still preceded by the original neighbor ("pre").
         let markdown = "pre target<!--anchor:c1:end--> post";
-        let out = recover_partial_anchor(markdown, "c1", "target", Some("pre "), Some(" post"));
+        let out = recover_partial_anchor(markdown, "c1", Some("pre "), Some(" post"));
         let recovered = match out {
             RecoveryOutcome::Recovered(m) => m,
             other => panic!("expected Recovered, got {other:?}"),
@@ -1479,12 +1476,12 @@ mod tests {
     fn recover_both_present_or_missing_is_not_attempted() {
         let both_present = wrap("c1", "pre ", "target", " post");
         assert!(matches!(
-            recover_partial_anchor(&both_present, "c1", "target", Some("pre "), Some(" post")),
+            recover_partial_anchor(&both_present, "c1", Some("pre "), Some(" post")),
             RecoveryOutcome::Failed(_)
         ));
         let both_missing = "pre target post";
         assert!(matches!(
-            recover_partial_anchor(both_missing, "c1", "target", Some("pre "), Some(" post")),
+            recover_partial_anchor(both_missing, "c1", Some("pre "), Some(" post")),
             RecoveryOutcome::Failed(_)
         ));
     }
@@ -1494,7 +1491,7 @@ mod tests {
         // Partial anchor but no stored neighbor to search for.
         let markdown = "pre <!--anchor:c1:start-->target post";
         assert!(matches!(
-            recover_partial_anchor(markdown, "c1", "target", Some(""), Some("")),
+            recover_partial_anchor(markdown, "c1", Some(""), Some("")),
             RecoveryOutcome::Failed(_)
         ));
     }
