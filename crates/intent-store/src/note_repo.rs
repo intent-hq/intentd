@@ -264,6 +264,7 @@ impl Store {
         let rows = sqlx::query(
             "SELECT id, title, tags FROM note \
              WHERE workspace_id = ? \
+               AND id != 'spec' \
                AND parent_id IS NULL \
                AND task_json IS NULL \
                AND is_archived = 0 \
@@ -296,9 +297,14 @@ impl Store {
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("defer FKs failed: {e}")))?;
-        sqlx::query(
+        // Belt-and-braces alongside `id != 'spec'` in the SELECT: if another
+        // transaction adopted the same stray between our SELECT and this
+        // UPDATE, the row would already be gone and `rows_affected` would be
+        // 0 — bail out rather than emit spurious delete/create events for a
+        // no-op rewrite.
+        let rewrite = sqlx::query(
             "UPDATE note SET id = 'spec', is_pinned = 1, is_default = 1, tags = ? \
-             WHERE id = ? AND workspace_id = ?",
+             WHERE id = ? AND workspace_id = ? AND id != 'spec'",
         )
         .bind(&tags_json)
         .bind(&old_id)
@@ -306,6 +312,12 @@ impl Store {
         .execute(&mut *tx)
         .await
         .map_err(|e| Error::Internal(format!("rewrite spec note id failed: {e}")))?;
+        if rewrite.rows_affected() != 1 {
+            tx.rollback()
+                .await
+                .map_err(|e| Error::Internal(format!("rollback adopt_spec tx failed: {e}")))?;
+            return Ok(None);
+        }
         sqlx::query("UPDATE note SET parent_id = 'spec' WHERE parent_id = ? AND workspace_id = ?")
             .bind(&old_id)
             .bind(&workspace_id.0)
