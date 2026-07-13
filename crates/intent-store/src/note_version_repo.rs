@@ -25,18 +25,27 @@ impl Store {
         author: &NoteVersionAuthor,
         date: &str,
     ) -> Result<i64> {
-        let mut tx = self
+        // IMMEDIATE mode: acquires write lock upfront, avoiding the
+        // DEFERRED-mode transaction-upgrade race that surfaces SQLITE_BUSY
+        // when concurrent connections hold read locks (STAB-1). The upgrade
+        // path is outside `busy_timeout`'s retry scope; IMMEDIATE acquisition
+        // is retried by the handler.
+        let mut conn = self
             .pool()
-            .begin()
+            .acquire()
             .await
-            .map_err(|e| Error::Internal(format!("begin note_version tx failed: {e}")))?;
+            .map_err(|e| Error::Internal(format!("acquire connection failed: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("begin IMMEDIATE failed: {e}")))?;
         let next_v: i64 = sqlx::query(
             "SELECT COALESCE(MAX(v), 0) + 1 AS v FROM note_version \
              WHERE note_id = ? AND workspace_id = ?",
         )
         .bind(&note.id.0)
         .bind(&note.workspace_id.0)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| Error::Internal(format!("next note_version failed: {e}")))?
         .try_get("v")
@@ -54,17 +63,18 @@ impl Store {
         .bind(&author.author_type)
         .bind(&note.title)
         .bind(&note.content)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await
         .map_err(|e| Error::Internal(format!("insert note_version failed: {e}")))?;
         sqlx::query("DELETE FROM note_version WHERE note_id = ? AND workspace_id = ? AND v <= ?")
             .bind(&note.id.0)
             .bind(&note.workspace_id.0)
             .bind(next_v - MAX_NOTE_VERSIONS)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("prune note_version failed: {e}")))?;
-        tx.commit()
+        sqlx::query("COMMIT")
+            .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("commit note_version tx failed: {e}")))?;
         Ok(next_v)
