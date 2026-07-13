@@ -2733,6 +2733,61 @@ fn token_usage_changed_event(workspace_id: &WorkspaceId, usage: &TokenUsage) -> 
     }
 }
 
+/// Wall-clock bound for a single `git.pull` operation before the daemon
+/// short-circuits with a structured failure. Matches the TS handler's
+/// `timeout: 120_000` on `git pull --rebase` (`git.ipc.ts` PULL_BRANCH), so
+/// FE behaviour on a hung remote is unchanged.
+const GIT_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run a blocking `git.pull`-style closure off the async runtime with an
+/// operation timeout, returning the structured `GitPullResult { ok: false,
+/// error }` shape on timeout so the FE contract (expected pull failures are
+/// never JSON-RPC errors — PROTOCOL §5.6) is preserved.
+///
+/// When the outer timeout fires, `tokio::time::timeout` drops the `JoinHandle`
+/// but the underlying blocking task keeps running on Tokio's blocking pool
+/// until it observes something (network failure, callback `Err`, child exit).
+/// For the normal shell-fetch path this is bounded: `intent_git::fetch::fetch`
+/// enforces its own inner deadline (100s) below [`GIT_PULL_TIMEOUT`] and kills
+/// the git child via `Child::kill`, so the blocking task terminates before the
+/// outer timeout fires in the fetch-hang scenario. The remaining libgit2 code
+/// paths inside `pull_branch` (stash/rebase/pop) are all local disk ops that
+/// complete in milliseconds; the bounded credential callback in
+/// `intent_git::auth` is defence-in-depth for the auth-loop shape.
+async fn git_pull_bounded<F>(
+    op: F,
+    timeout: std::time::Duration,
+) -> Result<intent_core::GitPullResult>
+where
+    F: FnOnce() -> Result<intent_core::GitPullResult> + Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(op);
+    match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(res)) => res,
+        Ok(Err(join_err)) => Err(Error::Internal(format!("git.pull task failed: {join_err}"))),
+        Err(_elapsed) => Ok(intent_core::GitPullResult {
+            ok: false,
+            error: Some(format!("git.pull timed out after {}s", timeout.as_secs())),
+        }),
+    }
+}
+
+/// Run [`intent_git::fetch::fetch`] on the blocking pool so the accept-changes
+/// async flows (`ac_undo_push`, `ac_reset_to_trunk`, `ac_rebase_onto_trunk`,
+/// `ac_merge_to_trunk`) do not pin a Tokio runtime worker for the 100s inner
+/// fetch deadline on a hung remote — the same runtime-saturation vector
+/// [`git_pull_bounded`] closes for `git.pull`. `intent_git::fetch::fetch` owns
+/// its own wall-clock deadline + `Child::kill`, so no outer timeout is needed
+/// here; the wrapper just moves the blocking call off the runtime worker.
+async fn git_fetch_bounded(worktree: &std::path::Path, remote: &str, branch: &str) -> Result<()> {
+    let worktree = worktree.to_path_buf();
+    let remote = remote.to_string();
+    let branch = branch.to_string();
+    tokio::task::spawn_blocking(move || intent_git::fetch::fetch(&worktree, &remote, &branch))
+        .await
+        .map_err(|e| Error::Internal(format!("git.fetch task failed: {e}")))?
+}
+
 /// Build a `git:pull` event for a completed pull inside a workspace worktree
 /// (§6.5). Payload `{ workspaceId, operation: "pull", branch }` mirrors the
 /// reserved `GitOperationEvent` shape in the FE `events/types.ts` so a client
@@ -7379,8 +7434,19 @@ impl WorkspaceApi for Services {
             if branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams("branchName is required".to_string()));
             }
-            let outcome =
-                intent_git::pull::pull_branch(std::path::Path::new(&repo_path), &branch_name)?;
+            // libgit2's pull is blocking and has no cancellation, so drive it
+            // through `spawn_blocking` + a wall-clock timeout to keep a slow /
+            // hung remote from wedging the async runtime (the vector behind the
+            // FE `git.pull` and `host.status` timeouts). On timeout the caller
+            // gets the structured `{ ok: false, error }` failure shape — never
+            // a JSON-RPC error — matching the TS PULL_BRANCH contract.
+            let pull_path = std::path::PathBuf::from(&repo_path);
+            let pull_branch = branch_name.clone();
+            let outcome = git_pull_bounded(
+                move || intent_git::pull::pull_branch(&pull_path, &pull_branch),
+                GIT_PULL_TIMEOUT,
+            )
+            .await?;
             // Best-effort workspace resolution: `git.pull` is path-scoped (the
             // workspace-create auto-pull runs before the workspace row exists),
             // so we look up any workspace pointing at this worktree and skip
@@ -11007,8 +11073,10 @@ impl Services {
             ));
         }
         // `push_refspec` already advances the local tracking ref; the follow-up
-        // fetch (TS parity) is best-effort and never fails the undo.
-        let _ = intent_git::fetch::fetch(worktree, "origin", branch);
+        // fetch (TS parity) is best-effort and never fails the undo. Driven
+        // through `git_fetch_bounded` so a hung remote can't pin a runtime
+        // worker for the shell-fetch inner deadline (100s).
+        let _ = git_fetch_bounded(worktree, "origin", branch).await;
 
         steps.push(accept_changes::step(
             "undo-push",
@@ -11069,7 +11137,7 @@ impl Services {
             .map(|u| u.is_some())
             .unwrap_or(false);
         if has_remote {
-            let _ = intent_git::fetch::fetch(worktree, "origin", trunk);
+            let _ = git_fetch_bounded(worktree, "origin", trunk).await;
         }
         let reset_target = if has_remote {
             format!("origin/{trunk}")
@@ -11150,7 +11218,7 @@ impl Services {
             trunk.to_string()
         };
         if has_remote {
-            let _ = intent_git::fetch::fetch(worktree, "origin", trunk);
+            let _ = git_fetch_bounded(worktree, "origin", trunk).await;
         }
 
         let has_conflicts =
@@ -11297,7 +11365,7 @@ impl Services {
         };
 
         if has_remote_trunk {
-            if let Err(e) = intent_git::fetch::fetch(worktree, "origin", trunk) {
+            if let Err(e) = git_fetch_bounded(worktree, "origin", trunk).await {
                 return Err(ac_step_failure(
                     steps.clone(),
                     "merge",
