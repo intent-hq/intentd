@@ -9668,6 +9668,22 @@ mod initial_agent_orchestration {
             session.initial_message.as_deref(),
             Some("fix the auth flow")
         );
+        // Reference-parity flags stamped on the raw session metadata
+        // (workspace.service.ts:1847/1859 — the FE surface reads these to
+        // classify the workspace's coordinator).
+        let meta = session.metadata.as_ref().and_then(Value::as_object);
+        assert_eq!(
+            meta.and_then(|m| m.get("isInitialAgent")),
+            Some(&Value::Bool(true)),
+            "isInitialAgent stamped: {:?}",
+            session.metadata
+        );
+        assert_eq!(
+            meta.and_then(|m| m.get("isFirstWorkspaceAgent")),
+            Some(&Value::Bool(true)),
+            "isFirstWorkspaceAgent stamped: {:?}",
+            session.metadata
+        );
 
         // Exactly one persisted message: the user prompt.
         let messages = store
@@ -9741,6 +9757,63 @@ mod initial_agent_orchestration {
         assert_eq!(messages.len(), 1, "no second prompt delivery");
     }
 
+    /// No-prompt idempotency replay: the row-creation move stays inside the
+    /// replay guard — a second `workspace.create` with the same key returns
+    /// the stored result, produces no duplicate session row, and never
+    /// persists a message even though the replayed request also carried no
+    /// prompt.
+    #[tokio::test]
+    async fn no_prompt_idempotent_replay_no_duplicate_agent() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let services =
+            Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+        let key = Some("ws-agent-no-prompt-idem-1".to_string());
+
+        let input = || {
+            create_input(Some(WorkspaceCreateInitialAgent {
+                specialist: Some("implementor".to_string()),
+                ..Default::default()
+            }))
+        };
+        let first = services
+            .create_workspace(input(), key.clone())
+            .await
+            .expect("first create");
+        let agent_id = first.initial_agent.as_ref().unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let second = services
+            .create_workspace(input(), key)
+            .await
+            .expect("replay create");
+        assert_eq!(second.workspace.id, first.workspace.id);
+        assert_eq!(
+            second.initial_agent.as_ref().unwrap()["id"]
+                .as_str()
+                .unwrap(),
+            agent_id,
+            "replay returns the original agent"
+        );
+
+        let sessions = store
+            .list_agent_sessions(&first.workspace.id)
+            .await
+            .expect("sessions");
+        assert_eq!(sessions.len(), 1, "no duplicate agent row on replay");
+        let messages = store
+            .get_agent_messages(&AgentId::from(agent_id.as_str()), None)
+            .await
+            .expect("messages");
+        assert!(
+            messages.is_empty(),
+            "no prompt delivered on replay either: {messages:?}"
+        );
+    }
+
     /// No (or blank) prompt → agent row is created without a first turn
     /// (reference parity with `workspace.service.ts`: the session persists
     /// whenever `initialAgent` is present; the FE's first send starts the
@@ -9798,6 +9871,21 @@ mod initial_agent_orchestration {
                 session.initial_message.is_none(),
                 "metadata.initialMessage omitted when no prompt supplied: {:?}",
                 session.initial_message
+            );
+            // Reference-parity flags land even without a prompt (parity
+            // with workspace.service.ts:1847/1859).
+            let meta = session.metadata.as_ref().and_then(Value::as_object);
+            assert_eq!(
+                meta.and_then(|m| m.get("isInitialAgent")),
+                Some(&Value::Bool(true)),
+                "isInitialAgent stamped for no-prompt agent: {:?}",
+                session.metadata
+            );
+            assert_eq!(
+                meta.and_then(|m| m.get("isFirstWorkspaceAgent")),
+                Some(&Value::Bool(true)),
+                "isFirstWorkspaceAgent stamped for no-prompt agent: {:?}",
+                session.metadata
             );
 
             let messages = store

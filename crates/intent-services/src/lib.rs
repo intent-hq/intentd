@@ -1745,6 +1745,13 @@ fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// Whitespace-only strings collapse to `None` (TS truthy-string parity for
+/// caller-supplied identifiers/names in `workspace.create` /
+/// `initialAgent`).
+fn nonempty_owned(s: Option<String>) -> Option<String> {
+    s.filter(|v| !v.trim().is_empty())
+}
+
 /// Shared `primitive.*` glue: append the fenced `ws-block:<block_type>` JSON of
 /// `primitive` to the note, persist it, emit `note:updated`, and return the TS
 /// `appendPrimitiveBlock` response `{ ok, primitiveId, noteId, content }`. A
@@ -4824,9 +4831,6 @@ impl WorkspaceApi for Services {
                     // send starts the turn.
                     let mut initial_agent = None;
                     if let Some(agent) = input.initial_agent {
-                        fn nonempty(s: Option<String>) -> Option<String> {
-                            s.filter(|v| !v.trim().is_empty())
-                        }
                         let prompt = agent
                             .prompt
                             .as_deref()
@@ -4835,15 +4839,29 @@ impl WorkspaceApi for Services {
                             .map(str::to_string);
                         // Persist the prompt (when present) as
                         // `metadata.initialMessage` (delegate parity: a wake-up
-                        // can resume from it). The caller's metadata object is
-                        // forwarded as-is; like agent.create, only the harvested
-                        // gap fields persist today (P2-12a) — `behaviorPrompt`
-                        // has no session column and the behavior derives from
-                        // the persisted `specialist`.
+                        // can resume from it) and stamp the reference-parity
+                        // `isInitialAgent`/`isFirstWorkspaceAgent` flags the
+                        // FE surface (`agent-backend-handler.service.ts`,
+                        // `instruction-service.ts` prompt-cache `':initial'`
+                        // suffix, `agent-persistence.ts`) uses to classify the
+                        // workspace's coordinator. Both flags are persisted on
+                        // the raw `AgentSession.metadata` JSON — the strict
+                        // `AgentLite.metadata` projection does not surface them
+                        // yet (future work if the daemon-only wire path grows
+                        // a consumer). The caller's metadata object is
+                        // forwarded as-is; like agent.create, only the
+                        // harvested gap fields persist today (P2-12a) —
+                        // `behaviorPrompt` has no session column and the
+                        // behavior derives from the persisted `specialist`.
                         let mut metadata = match agent.metadata {
                             Some(serde_json::Value::Object(m)) => m,
                             _ => serde_json::Map::new(),
                         };
+                        metadata.insert("isInitialAgent".to_string(), serde_json::json!(true));
+                        metadata.insert(
+                            "isFirstWorkspaceAgent".to_string(),
+                            serde_json::json!(true),
+                        );
                         if let Some(ref p) = prompt {
                             metadata.insert(
                                 "initialMessage".to_string(),
@@ -4851,8 +4869,8 @@ impl WorkspaceApi for Services {
                             );
                         }
                         let extra = intent_core::AgentCreateExtra {
-                            provider: nonempty(agent.provider),
-                            agent_type: nonempty(agent.agent_type),
+                            provider: nonempty_owned(agent.provider),
+                            agent_type: nonempty_owned(agent.agent_type),
                             metadata: Some(serde_json::Value::Object(metadata)),
                             context_references: agent
                                 .context_references
@@ -4864,14 +4882,14 @@ impl WorkspaceApi for Services {
                             is_background: Some(false),
                             ..Default::default()
                         };
-                        let requested =
-                            nonempty(agent.agent_id).map(|id| AgentId::from(id.as_str()));
+                        let requested = nonempty_owned(agent.agent_id)
+                            .map(|id| AgentId::from(id.as_str()));
                         let created = services
                             .agent_create_op(
                                 ws.id.clone(),
-                                nonempty(agent.name),
-                                nonempty(agent.model),
-                                nonempty(agent.specialist),
+                                nonempty_owned(agent.name),
+                                nonempty_owned(agent.model),
+                                nonempty_owned(agent.specialist),
                                 None,
                                 None,
                                 false,
