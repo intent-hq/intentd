@@ -5736,17 +5736,22 @@ impl WorkspaceApi for Services {
                     // before panicking.
                     let ws_id = ws.id.clone();
                     let cleanup_orphan_branch = |reason: &'static str| {
-                        let cleanup_repo = repo_dir.clone();
+                        // Two owned handles to the same repo path: `lock_key`
+                        // is borrowed by `with_lock`, while `repo_for_delete`
+                        // is moved into the blocking closure. Splitting them
+                        // avoids a borrow/move conflict on a single binding.
+                        let lock_key = repo_dir.clone();
+                        let repo_for_delete = repo_dir.clone();
                         let cleanup_branch = branch.clone();
                         let cleanup_locks = worktree_locks.clone();
                         let cleanup_ws_id = ws_id.clone();
                         let branch_for_log = branch.clone();
                         async move {
                             let cleanup = cleanup_locks
-                                .with_lock(&cleanup_repo.clone(), move || async move {
+                                .with_lock(&lock_key, move || async move {
                                     tokio::task::spawn_blocking(move || {
                                         intent_git::branches::delete_local_branch(
-                                            &cleanup_repo,
+                                            &repo_for_delete,
                                             &cleanup_branch,
                                         )
                                     })
