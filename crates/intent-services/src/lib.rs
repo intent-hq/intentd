@@ -289,9 +289,9 @@ pub struct Services {
     /// Runtime control for the WSS listener + mDNS (server settings apply
     /// hooks, §5.12). When wired, `settings.update` on `server.wsApi.enabled`
     /// / `server.discovery.enabled` starts/stops the listener at runtime.
-    /// `None` when unattached (unit tests, UDS-only wiring) — settings are
-    /// still persisted but the apply action is skipped. Shared across clones.
-    server_control: Option<Arc<dyn intent_core::ServerControl>>,
+    /// Held as `Arc<OnceLock>` so the control can be attached after the `api`
+    /// Arc is built (composition-root wiring, §5.12). Shared across clones.
+    server_control: Arc<OnceLock<Arc<dyn intent_core::ServerControl>>>,
 }
 
 impl Services {
@@ -329,7 +329,7 @@ impl Services {
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
             reverse_dispatch: None,
-            server_control: None,
+            server_control: Arc::new(OnceLock::new()),
         }
     }
 
@@ -796,9 +796,9 @@ impl Services {
     /// Attach the runtime [`ServerControl`] so `settings.update` can start/stop
     /// the WSS listener + mDNS on `server.wsApi.enabled` /
     /// `server.discovery.enabled` changes (server settings apply hooks, §5.12).
-    /// Idempotent: safe to call multiple times with the same or different handles.
-    pub fn attach_server_control(&mut self, control: Arc<dyn intent_core::ServerControl>) {
-        self.server_control = Some(control);
+    /// Idempotent: a second call is a no-op (the `OnceLock` keeps the first).
+    pub fn attach_server_control(&self, control: Arc<dyn intent_core::ServerControl>) {
+        let _ = self.server_control.set(control);
     }
 
     /// Borrow the shared [`McpHub`] (composition root: spawn the health monitor
@@ -3564,7 +3564,7 @@ impl WorkspaceApi for Services {
             if !applied.is_empty() {
                 // Apply server runtime hooks (§5.12): start/stop WSS listener + mDNS
                 // when server.wsApi.enabled / server.discovery.enabled change.
-                if let Some(ref control) = self.server_control {
+                if let Some(control) = self.server_control.get() {
                     self.apply_server_setting_hooks(&applied, control).await;
                 }
                 publish_event(&self.event_bus, settings_changed_event(applied.clone())).await;
