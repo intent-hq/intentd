@@ -5566,6 +5566,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let worktree_locks = self.worktree_locks.clone();
         let workspaces_root = self
             .workspaces_root
             .clone()
@@ -5614,11 +5615,11 @@ impl WorkspaceApi for Services {
                 });
             // Copy the source's configuration verbatim but reset runtime state:
             // fresh id, branch pinned to the new id (TS `duplicateWorkspace`
-            // parity), no worktree/PR/aggregates/token-usage carried over.
-            // Worktree provisioning for the duplicate is deferred to a
-            // follow-up task (the create-time `provision_worktree` machinery
-            // is not repeated here to keep this method minimal).
-            let ws = Workspace {
+            // parity), no PR/aggregates/token-usage carried over. Worktree
+            // provisioning below mirrors `workspace.create` — set on `ws`
+            // *before* the `insert_workspace` call so the row persists with
+            // its `worktreePath`/`baseCommitSha` in one write.
+            let mut ws = Workspace {
                 id: new_id.clone(),
                 title,
                 branch: new_id.0.clone(),
@@ -5653,7 +5654,165 @@ impl WorkspaceApi for Services {
                 diff_summary: None,
                 token_usage: None,
             };
+            // Provision the git worktree for the duplicate (TS
+            // `duplicateWorkspace` parity, mirroring the `workspace.create`
+            // flow): a duplicated local workspace off a local git repo gets a
+            // linked worktree at `<root>/<workspaceId>/<repo-slug>` on a
+            // branch named for its id. Skipped for remote/`skipWorktree`
+            // sources and for non-repo `repositoryPath`s. Failures are logged
+            // and swallowed — the FE reference continues on worktree failure
+            // ("Continue without worktree - user can create it manually").
+            let repo_dir = ws
+                .repository_path
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from);
+            if let Some(repo_dir) = repo_dir {
+                if !ws.is_remote && !ws.skip_worktree && repo_dir.join(".git").exists() {
+                    let repo_name =
+                        known_repo_name(ws.repository_name.as_deref(), &repo_dir.to_string_lossy());
+                    let wt_path = workspaces_root
+                        .join(&ws.id.0)
+                        .join(worktree_folder_slug(&repo_name));
+                    // Uniquify the branch name against the source repo's
+                    // local/remote-tracking branches so a `newId` collision
+                    // with an existing branch (rare, but possible when the
+                    // repo already carries prior workspace branches) does not
+                    // fail the worktree provisioning.
+                    let branch_repo = repo_dir.clone();
+                    let desired = ws.branch.clone();
+                    let branch_result = tokio::task::spawn_blocking(move || {
+                        intent_git::branches::ensure_unique_branch_name(&branch_repo, &desired)
+                    })
+                    .await;
+                    let branch = match branch_result {
+                        Ok(Ok(b)) => b,
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                workspace = %ws.id.as_str(),
+                                error = %e,
+                                "workspace.duplicate: branch uniquification failed; falling back to workspace-id branch name"
+                            );
+                            ws.branch.clone()
+                        }
+                        Err(join_err) => {
+                            tracing::warn!(
+                                workspace = %ws.id.as_str(),
+                                error = %join_err,
+                                "workspace.duplicate: branch uniquification task failed; falling back to workspace-id branch name"
+                            );
+                            ws.branch.clone()
+                        }
+                    };
+                    ws.branch = branch.clone();
+                    let name = ws.id.0.clone();
+                    let base_ref = ws.base_ref.clone();
+                    let repo = repo_dir.clone();
+                    let wt = wt_path.clone();
+                    let provision_branch = branch.clone();
+                    let sha_result = worktree_locks
+                        .with_lock(&repo_dir, move || async move {
+                            tokio::task::spawn_blocking(move || {
+                                intent_git::worktree::provision_worktree(
+                                    &repo,
+                                    &name,
+                                    &wt,
+                                    &provision_branch,
+                                    base_ref.as_deref(),
+                                    "origin",
+                                )
+                            })
+                            .await
+                        })
+                        .await;
+                    // `provision_worktree` creates (or reuses) the branch
+                    // before `git worktree add`; on partial failure the branch
+                    // may exist without a worktree tracking it, and
+                    // `workspace.delete` only cleans the branch when
+                    // `worktree_path` is set. Best-effort delete it here to
+                    // avoid orphaning a `<workspaceId>` branch in the source
+                    // repo. Runs for both the inner-error and JoinError paths
+                    // because the blocking task may have created the branch
+                    // before panicking.
+                    let ws_id = ws.id.clone();
+                    let cleanup_orphan_branch = |reason: &'static str| {
+                        // Two owned handles to the same repo path: `lock_key`
+                        // is borrowed by `with_lock`, while `repo_for_delete`
+                        // is moved into the blocking closure. Splitting them
+                        // avoids a borrow/move conflict on a single binding.
+                        let lock_key = repo_dir.clone();
+                        let repo_for_delete = repo_dir.clone();
+                        let cleanup_branch = branch.clone();
+                        let cleanup_locks = worktree_locks.clone();
+                        let cleanup_ws_id = ws_id.clone();
+                        let branch_for_log = branch.clone();
+                        async move {
+                            let cleanup = cleanup_locks
+                                .with_lock(&lock_key, move || async move {
+                                    tokio::task::spawn_blocking(move || {
+                                        intent_git::branches::delete_local_branch(
+                                            &repo_for_delete,
+                                            &cleanup_branch,
+                                        )
+                                    })
+                                    .await
+                                })
+                                .await;
+                            match cleanup {
+                                Ok(Ok(())) => {}
+                                Ok(Err(cleanup_err)) => tracing::debug!(
+                                    workspace = %cleanup_ws_id.as_str(),
+                                    branch = %branch_for_log,
+                                    reason,
+                                    error = %cleanup_err,
+                                    "workspace.duplicate: best-effort branch cleanup did not delete branch (may not have been created)"
+                                ),
+                                Err(join_err) => tracing::warn!(
+                                    workspace = %cleanup_ws_id.as_str(),
+                                    branch = %branch_for_log,
+                                    reason,
+                                    error = %join_err,
+                                    "workspace.duplicate: best-effort branch cleanup task failed"
+                                ),
+                            }
+                        }
+                    };
+                    match sha_result {
+                        Ok(Ok(sha)) => {
+                            ws.worktree_path = Some(wt_path.to_string_lossy().to_string());
+                            ws.base_commit_sha = Some(sha);
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                workspace = %ws.id.as_str(),
+                                error = %e,
+                                "workspace.duplicate: worktree provisioning failed; continuing without worktree"
+                            );
+                            cleanup_orphan_branch("provision_worktree returned Err").await;
+                        }
+                        Err(join_err) => {
+                            tracing::warn!(
+                                workspace = %ws.id.as_str(),
+                                error = %join_err,
+                                "workspace.duplicate: worktree provisioning task failed"
+                            );
+                            cleanup_orphan_branch("provision_worktree task JoinError").await;
+                        }
+                    }
+                }
+            }
             store.insert_workspace(&ws).await?;
+            // Record branch provenance so `workspace.delete` cleans up the
+            // duplicated branch alongside its worktree (same guard as
+            // `workspace.create`: only auto-generated branches are deleted).
+            if ws.worktree_path.is_some() {
+                if let Err(e) = store
+                    .set_workspace_branch_auto_generated(&ws.id, true)
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to record branch provenance");
+                }
+            }
             if let Err(e) = write_workspace_metadata_file(&workspaces_root, &ws) {
                 tracing::warn!(
                     workspace = %ws.id.as_str(),
