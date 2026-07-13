@@ -7158,8 +7158,11 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Vec<String>>> {
         let store = self.store.clone();
         Box::pin(async move {
-            // Same `.`/`*`/`--all` rejection + CSV/array parse as `git.stage`.
-            let path_list = git_ops::parse_stage_paths(&paths)?;
+            // Discard-specific parser: `.`/`*`/`--all` rejected in BOTH the
+            // top-level string and every array element (closes the array-form
+            // bypass that would otherwise let `["*"]` / `["--all"]` devolve
+            // into a silent no-op). Error messages are discard-oriented.
+            let path_list = git_ops::parse_discard_paths(&paths)?;
             // Mirror `git.stage`: every failure surfaces as `-32603`, so a
             // missing workspace/worktree is `Internal` too.
             let ws = store

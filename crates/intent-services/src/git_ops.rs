@@ -19,6 +19,17 @@ const STAGE_ALL_MSG: &str = "Staging all files is not allowed. Please specify in
 const NO_PATHS_MSG: &str =
     "No file paths provided. Please specify at least one file path to stage.";
 
+/// `git.discard` message when the caller tries to discard everything (parity
+/// with the stage-all guard but discard-oriented). Rejects `.` / `*` /
+/// `--all` in both the CSV-string and array shapes so the array-form
+/// bypass (`["*"]`, `["--all"]`) cannot devolve into a silent no-op.
+const DISCARD_ALL_MSG: &str =
+    "Discarding all files is not allowed. Please specify individual file paths to discard.";
+
+/// `git.discard` message when no usable paths remain after parsing.
+const NO_DISCARD_PATHS_MSG: &str =
+    "No file paths provided. Please specify at least one file path to discard.";
+
 /// TS `assertAgentCommitAllowed` rejection message (auto-commit disabled).
 const AUTO_COMMIT_DISABLED_MSG: &str = "Auto-commit is disabled for this workspace. \
 Use agent_commit_changes with userRequested: true if the user asked you to commit.";
@@ -73,6 +84,50 @@ pub(crate) fn parse_stage_paths(paths: &Value) -> Result<Vec<String>> {
 
     if list.is_empty() {
         return Err(Error::Internal(NO_PATHS_MSG.to_string()));
+    }
+    Ok(list)
+}
+
+/// Parse the `git.discard` `paths` param with discard-oriented error messages
+/// and a discard-all rejection that closes the array-shape bypass. Unlike
+/// [`parse_stage_paths`], the `.` / `*` / `--all` tokens are refused in every
+/// shape — top-level string, CSV entry, or array element — so callers cannot
+/// smuggle a discard-all through `["*"]`, `["--all"]`, or `[".", "a.ts"]`.
+/// Rejections and an empty result surface as [`Error::Internal`] (→ `-32603`).
+pub(crate) fn parse_discard_paths(paths: &Value) -> Result<Vec<String>> {
+    // Top-level string discard-all (parity with `parse_stage_paths`).
+    if let Value::String(s) = paths {
+        if s == "." || s == "*" || s.contains("--all") {
+            return Err(Error::Internal(DISCARD_ALL_MSG.to_string()));
+        }
+    }
+
+    let list: Vec<String> = match paths {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+        Value::String(s) => s
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    // Element-level discard-all: `["*"]`, `["--all"]`, `["."]`, etc. Closes
+    // the array-shape bypass where the shared stage parser only inspected
+    // the top-level string.
+    for p in &list {
+        if p == "." || p == "*" || p.contains("--all") {
+            return Err(Error::Internal(DISCARD_ALL_MSG.to_string()));
+        }
+    }
+
+    if list.is_empty() {
+        return Err(Error::Internal(NO_DISCARD_PATHS_MSG.to_string()));
     }
     Ok(list)
 }
