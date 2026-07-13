@@ -2014,6 +2014,140 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `git.stageHunk`: apply `hunk_patch` (a unified-diff patch for one or
+    /// more hunks) to the index only for `file_path`, mirroring
+    /// `gitService.stageHunk` (`git apply --cached [--3way]`). Failures surface
+    /// as `-32603` (PROTOCOL §5.6).
+    fn git_stage_hunk(
+        &self,
+        workspace_id: WorkspaceId,
+        file_path: String,
+        hunk_patch: String,
+    ) -> BoxFuture<'_, Result<()>> {
+        let _ = (workspace_id, file_path, hunk_patch);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_stage_hunk not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.unstageHunk`: reverse-apply `hunk_patch` to the index only for
+    /// `file_path`, mirroring `gitService.unstageHunk`
+    /// (`git apply --cached --reverse [--3way]`). Failures surface as `-32603`
+    /// (PROTOCOL §5.6).
+    fn git_unstage_hunk(
+        &self,
+        workspace_id: WorkspaceId,
+        file_path: String,
+        hunk_patch: String,
+    ) -> BoxFuture<'_, Result<()>> {
+        let _ = (workspace_id, file_path, hunk_patch);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_unstage_hunk not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.push`: push the workspace's current branch to `origin` (with
+    /// `+refs/heads/<branch>` when `force` is set), mirroring
+    /// `gitService.push`. Returns `{ branch, pushed_sha }`. Failures surface as
+    /// `-32603` (PROTOCOL §5.6).
+    fn git_push(
+        &self,
+        workspace_id: WorkspaceId,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, force);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_push not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.fetch`: fetch the workspace's current branch from `origin`,
+    /// mirroring `gitService.fetch`. Updates the local remote-tracking ref.
+    /// Failures surface as `-32603` (PROTOCOL §5.6).
+    fn git_fetch(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_fetch not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.createBranch`: create `branch_name` from `HEAD` in the workspace's
+    /// worktree and optionally check it out (`gitService.createBranch`).
+    /// Failures surface as `-32603` (PROTOCOL §5.6).
+    fn git_create_branch(
+        &self,
+        workspace_id: WorkspaceId,
+        branch_name: String,
+        checkout: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, branch_name, checkout);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_create_branch not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.checkoutBranch`: check out an existing `branch_name` in the
+    /// workspace's worktree (`gitService.checkoutBranch`). Failures surface as
+    /// `-32603` (PROTOCOL §5.6).
+    fn git_checkout_branch(
+        &self,
+        workspace_id: WorkspaceId,
+        branch_name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, branch_name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_checkout_branch not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.renameBranch`: rename `old_branch_name` → `new_branch_name` in the
+    /// workspace's repository (`gitService.renameBranch`). Refuses when the old
+    /// branch is missing, the new name already exists, or the new name is
+    /// checked out in another worktree. An empty / same-as-old new name is a
+    /// no-op. Failures surface as `-32603`; validation failures (empty new
+    /// name) as `-32602` (PROTOCOL §5.6).
+    fn git_rename_branch(
+        &self,
+        workspace_id: WorkspaceId,
+        old_branch_name: String,
+        new_branch_name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, old_branch_name, new_branch_name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_rename_branch not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.removeLockFile`: delete `index.lock` in the workspace worktree's
+    /// git dir (`gitService.removeLockFile`). Returns `{ removed: bool }`;
+    /// a missing lock file is not an error. Remote workspaces short-circuit
+    /// `{ removed: false }`. Failures surface as `-32603` (PROTOCOL §5.6).
+    fn git_remove_lock_file(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_remove_lock_file not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `git.clone`: streaming clone of `url` into `<parent_dir>/<target_name>`
     /// (or the URL-derived basename when `target_name` is `None`). Returns
     /// `{ requestId, targetPath }` promptly and pushes `git:clone:progress`
