@@ -60,7 +60,7 @@ fn seed_note(ws: &WorkspaceId) -> Note {
     Note {
         id: NoteId::from("note-seed"),
         workspace_id: ws.clone(),
-        title: "Spec".to_string(),
+        title: "Seed Note".to_string(),
         content: "# Seed".to_string(),
         content_type: ContentType::Markdown,
         tags: vec![],
