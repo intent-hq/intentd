@@ -709,22 +709,37 @@ impl WorkspaceApi for FakeApi {
         paths: Value,
     ) -> BoxFuture<'_, Result<Vec<String>>> {
         Box::pin(async move {
+            // Mirrors `parse_discard_paths` in production: reject `.`/`*`/
+            // `--all` in top-level string AND every parsed element (array
+            // items + CSV entries), with a discard-oriented message.
             if let Value::String(s) = &paths {
                 if s == "." || s == "*" || s.contains("--all") {
                     return Err(Error::Internal(
-                        "Staging all files is not allowed.".to_string(),
+                        "Discarding all files is not allowed.".to_string(),
                     ));
                 }
             }
-            let list = match paths {
+            let list: Vec<String> = match paths {
                 Value::Array(items) => items
                     .iter()
                     .filter_map(Value::as_str)
-                    .map(str::to_string)
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
                     .collect(),
-                Value::String(s) => s.split(',').map(|p| p.trim().to_string()).collect(),
+                Value::String(s) => s
+                    .split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect(),
                 _ => vec![],
             };
+            for p in &list {
+                if p == "." || p == "*" || p.contains("--all") {
+                    return Err(Error::Internal(
+                        "Discarding all files is not allowed.".to_string(),
+                    ));
+                }
+            }
             Ok(list)
         })
     }
@@ -2676,6 +2691,28 @@ async fn git_discard_all_is_rejected_with_minus_32603() {
     .await
     .unwrap();
     assert_eq!(err_code(&v), -32603);
+}
+
+#[tokio::test]
+async fn git_discard_all_array_form_is_rejected_with_minus_32603() {
+    // Regression: the array-form discard-all bypass. `["*"]` / `["--all"]`
+    // must be rejected exactly like the top-level string form.
+    for paths in ["[\"*\"]", "[\"--all\"]", "[\".\"]"] {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"git.discard","params":{{"workspaceId":"ws-1","paths":{paths}}}}}"#
+        );
+        let v = call(&frame).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "expected -32603 for paths={paths}");
+        // `Error::Internal` maps to `code=-32603` + generic message with the
+        // detail string carried in `data` (router's `domain_to_rpc`).
+        assert!(
+            v["error"]["data"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Discarding all files is not allowed"),
+            "expected discard-oriented message for paths={paths}: {v}",
+        );
+    }
 }
 
 #[tokio::test]
