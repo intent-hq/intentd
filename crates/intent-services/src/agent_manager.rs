@@ -1715,7 +1715,7 @@ impl AgentManager {
                 self.services.queue_snapshot(&agent_id),
             )
             .await;
-        persist_user(&self, &agent_id, &next.content).await;
+        persist_user(&self, &agent_id, &workspace_id, &next.content).await;
         // Queue-drained turns carry no per-turn prompt hints of their own,
         // but the FE-supplied attachments captured at enqueue time do ride
         // along so the drained turn receives the same image + file blocks.
@@ -2335,7 +2335,7 @@ async fn run_message_worker(
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
-            persist_user(&mgr, &agent_id, &next.content).await;
+            persist_user(&mgr, &agent_id, &workspace_id, &next.content).await;
             content = next.content;
             options = TurnOptions {
                 image_blocks: next_image_blocks,
@@ -2363,7 +2363,7 @@ async fn run_message_worker(
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
-            persist_user(&mgr, &agent_id, &next.content).await;
+            persist_user(&mgr, &agent_id, &workspace_id, &next.content).await;
             content = next.content;
             options = TurnOptions {
                 image_blocks: next_image_blocks,
@@ -2390,15 +2390,34 @@ async fn run_message_worker(
 }
 
 /// Persist a queued user message into the append-only transcript before its turn
-/// (best-effort; a store error is logged and the turn still proceeds).
-async fn persist_user(mgr: &AgentManager, agent_id: &AgentId, content: &str) {
-    if let Err(e) = mgr
+/// and publish the `agent:message` event so chat subscribers and the transcript
+/// reflect the dequeued message (STAB-4 fix). Best-effort; a store or publish error
+/// is logged and the turn still proceeds.
+async fn persist_user(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    content: &str,
+) {
+    match mgr
         .services
         .store
         .append_agent_message(agent_id, "user", &user_text_blocks(content), &now_iso())
         .await
     {
-        tracing::warn!(agent = %agent_id, error = %e, "failed to persist queued user message");
+        Ok(message) => {
+            mgr.services
+                .publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    intent_core::events::AGENT_MESSAGE,
+                    serde_json::json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+                )
+                .await;
+        }
+        Err(e) => {
+            tracing::warn!(agent = %agent_id, error = %e, "failed to persist queued user message");
+        }
     }
 }
 
