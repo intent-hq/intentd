@@ -6372,85 +6372,106 @@ impl WorkspaceApi for Services {
         comment: String,
         kind: Option<String>,
         author: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<CommentAddResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
-            if comment.trim().is_empty() {
-                return Err(Error::Internal(
-                    "Comment text is required and must be non-empty".to_string(),
-                ));
-            }
-            if search_context.trim().is_empty() {
-                return Err(Error::Internal(
-                    "searchContext is required and must be non-empty".to_string(),
-                ));
-            }
-            if comment_target.trim().is_empty() {
-                return Err(Error::Internal(
-                    "commentTarget is required and must be non-empty".to_string(),
-                ));
-            }
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let (from, to, line) =
-                note_ops::find_and_anchor_text(&note.content, &search_context, &comment_target)?;
-            let anchored_text = note.content[from..to].to_string();
-            let comment_id = uuid::Uuid::new_v4().to_string();
-            note.content = format!(
-                "{}<!--anchor:{id}:start-->{anchored}<!--anchor:{id}:end-->{}",
-                &note.content[..from],
-                &note.content[to..],
-                id = comment_id,
-                anchored = anchored_text,
-            );
-            note.updated_at = now_iso();
-            store.update_note(&note).await?;
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
-            services
-                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
-            let now = now_iso();
-            let new_comment = Comment {
-                id: comment_id.clone(),
-                thread_id: comment_id.clone(),
-                note_id: Some(note_id.clone()),
-                kind: parse_comment_type(kind.as_deref()),
-                content: comment,
-                author: author.unwrap_or_else(|| "Agent".to_string()),
-                author_type: AuthorType::Agent,
-                status: CommentStatus::Open,
-                parent_id: None,
-                anchor: CommentAnchor {
-                    kind: CommentAnchorType::Range,
-                    start_id: Some(comment_id.clone()),
-                    end_id: Some(comment_id.clone()),
-                    point_id: None,
+            let ws_scope = workspace_id.0.clone();
+            let op_store = store.clone();
+            // Emission lives inside the idempotency scope so a replayed add
+            // (same idempotencyKey) returns the cached result without a second
+            // `comment:added` (design note TB-0 §5).
+            with_idempotency(
+                &store,
+                &ws_scope,
+                idempotency_key,
+                "comment.add",
+                move || async move {
+                    let store = op_store;
+                    if comment.trim().is_empty() {
+                        return Err(Error::Internal(
+                            "Comment text is required and must be non-empty".to_string(),
+                        ));
+                    }
+                    if search_context.trim().is_empty() {
+                        return Err(Error::Internal(
+                            "searchContext is required and must be non-empty".to_string(),
+                        ));
+                    }
+                    if comment_target.trim().is_empty() {
+                        return Err(Error::Internal(
+                            "commentTarget is required and must be non-empty".to_string(),
+                        ));
+                    }
+                    let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+                    let (from, to, line) = note_ops::find_and_anchor_text(
+                        &note.content,
+                        &search_context,
+                        &comment_target,
+                    )?;
+                    let anchored_text = note.content[from..to].to_string();
+                    let comment_id = uuid::Uuid::new_v4().to_string();
+                    note.content = format!(
+                        "{}<!--anchor:{id}:start-->{anchored}<!--anchor:{id}:end-->{}",
+                        &note.content[..from],
+                        &note.content[to..],
+                        id = comment_id,
+                        anchored = anchored_text,
+                    );
+                    note.updated_at = now_iso();
+                    store.update_note(&note).await?;
+                    services.invalidate_crdt_note(&note.workspace_id, &note.id);
+                    services.schedule_line_attribution_recompute(
+                        note.workspace_id.clone(),
+                        note.id.clone(),
+                    );
+                    let now = now_iso();
+                    let new_comment = Comment {
+                        id: comment_id.clone(),
+                        thread_id: comment_id.clone(),
+                        note_id: Some(note_id.clone()),
+                        kind: parse_comment_type(kind.as_deref()),
+                        content: comment,
+                        author: author.unwrap_or_else(|| "Agent".to_string()),
+                        author_type: AuthorType::Agent,
+                        status: CommentStatus::Open,
+                        parent_id: None,
+                        anchor: CommentAnchor {
+                            kind: CommentAnchorType::Range,
+                            start_id: Some(comment_id.clone()),
+                            end_id: Some(comment_id.clone()),
+                            point_id: None,
+                        },
+                        anchor_text: Some(anchored_text.clone()),
+                        anchor_before: None,
+                        anchor_after: None,
+                        suggestion_original: None,
+                        suggestion_proposed: None,
+                        agent_id: None,
+                        created_at: now.clone(),
+                        updated_at: now,
+                    };
+                    store.insert_comment(&workspace_id, &new_comment).await?;
+                    publish_event(
+                        &bus,
+                        comment_added_event(&workspace_id, &note_id, &comment_id),
+                    )
+                    .await;
+                    Ok(CommentAddResult {
+                        success: true,
+                        message: format!("Comment successfully anchored to \"{anchored_text}\""),
+                        comment_id,
+                        anchored: true,
+                        location: CommentLocation {
+                            line,
+                            anchored_text,
+                        },
+                    })
                 },
-                anchor_text: Some(anchored_text.clone()),
-                anchor_before: None,
-                anchor_after: None,
-                suggestion_original: None,
-                suggestion_proposed: None,
-                agent_id: None,
-                created_at: now.clone(),
-                updated_at: now,
-            };
-            store.insert_comment(&workspace_id, &new_comment).await?;
-            publish_event(
-                &bus,
-                comment_added_event(&workspace_id, &note_id, &comment_id),
             )
-            .await;
-            Ok(CommentAddResult {
-                success: true,
-                message: format!("Comment successfully anchored to \"{anchored_text}\""),
-                comment_id,
-                anchored: true,
-                location: CommentLocation {
-                    line,
-                    anchored_text,
-                },
-            })
+            .await
         })
     }
 

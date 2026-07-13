@@ -817,6 +817,96 @@ async fn comment_respond_emits_comment_added_over_wss() {
     );
 }
 
+/// End-to-end (Audit A F5): `comment.add` over WSS honours
+/// `params.idempotencyKey` — a replay with the same key returns the ORIGINAL
+/// result (same `commentId`) without re-executing, so no duplicate comment is
+/// persisted and no second `comment:added` event is published.
+#[tokio::test]
+async fn comment_add_idempotency_key_dedupes_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    // Bootstrap workspace + note off UDS so the WSS side drives only the adds.
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "Comments", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Note", "content": "anchor target text" }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    // Subscribe over WSS before the adds, scoped to comment:added.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["comment:added"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let params = json!({
+        "workspaceId": ws_id,
+        "noteId": note_id,
+        "searchContext": "anchor target text",
+        "commentTarget": "target",
+        "comment": "root",
+        "idempotencyKey": "wss-comment-idem-1",
+    });
+    let first = wss_rpc(&mut rpc, 2, "comment.add", params.clone()).await;
+    let comment_id = first["commentId"].as_str().expect("comment id").to_string();
+    let evt = next_event(&mut sub, &["comment:added"], 10).await;
+    assert_eq!(
+        evt["data"],
+        json!({ "noteId": note_id, "commentId": comment_id })
+    );
+
+    // Replay with the same idempotencyKey: the stored result comes back (same
+    // commentId), nothing re-executes.
+    let second = wss_rpc(&mut rpc, 3, "comment.add", params).await;
+    assert_eq!(
+        second["commentId"].as_str(),
+        Some(comment_id.as_str()),
+        "replay must return the original commentId: {second}"
+    );
+
+    // Exactly one comment persisted, exactly one comment:added published.
+    let list = uds_rpc(
+        &socket,
+        4,
+        "comment.list",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "includeComments": true }),
+    )
+    .await;
+    assert_eq!(
+        list["result"]["totalThreads"],
+        json!(1),
+        "replay must not duplicate the comment: {list}"
+    );
+    let extra = drain_extra(&mut sub, "comment:added", 500).await;
+    assert!(
+        extra.is_none(),
+        "idempotent replay must not publish a second comment:added, got extra: {extra:?}"
+    );
+}
+
 /// End-to-end (Audit D C3): `workspace.archive` over WSS publishes
 /// `workspace:updated` with `changes: { archived: true }`. §6.5 has no
 /// `workspace:archived` event; the reference emitter dispatches

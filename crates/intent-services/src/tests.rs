@@ -1479,6 +1479,7 @@ async fn comment_add_unique_match_anchors_and_persists() {
             "nice".into(),
             None,
             None,
+            None,
         )
         .await
         .expect("comment.add");
@@ -1512,6 +1513,7 @@ async fn comment_add_ambiguous_context_errors() {
             "c".into(),
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1530,6 +1532,7 @@ async fn comment_respond_suggestion_nests_diff_and_threads() {
             "alpha unique-target omega".into(),
             "unique-target".into(),
             "root".into(),
+            None,
             None,
             None,
         )
@@ -1599,6 +1602,7 @@ async fn comment_resolve_thread_marks_and_reopens() {
             "alpha resolve-target omega".into(),
             "resolve-target".into(),
             "root".into(),
+            None,
             None,
             None,
         )
@@ -1704,6 +1708,7 @@ async fn comment_ops_reject_cross_workspace_bare_id_writes() {
             "this is a test sentence".into(),
             "test".into(),
             "nice".into(),
+            None,
             None,
             None,
         )
@@ -2541,6 +2546,7 @@ mod change_event_parity {
                 "nice".to_string(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("comment");
@@ -2550,6 +2556,62 @@ mod change_event_parity {
             ev["data"],
             json!({ "noteId": "n-1", "commentId": added.comment_id })
         );
+    }
+
+    /// Idempotency replay (Audit A F5, design note TB-0 §5.3): a second
+    /// `comment.add` with the same `(workspaceId, idempotencyKey)` returns the
+    /// ORIGINAL result without re-executing — no duplicate comment row, no
+    /// second anchor in the note, and no second `comment:added` event.
+    #[tokio::test]
+    async fn idempotent_comment_add_replay_returns_original_no_reexec() {
+        let h = harness().await;
+        let tn = note(&h.ws, "n-1", "hello world");
+        h.store.insert_note(&tn).await.expect("insert note");
+        let mut sub = subscribe(&h);
+        let key = Some("comment-idem-1".to_string());
+        let first = h
+            .services
+            .comment_add(
+                h.ws.clone(),
+                tn.id.clone(),
+                "hello world".to_string(),
+                "hello".to_string(),
+                "nice".to_string(),
+                None,
+                None,
+                key.clone(),
+            )
+            .await
+            .expect("first add");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "comment:added");
+
+        // Replay with the same key returns the original comment id and does
+        // not insert a second comment.
+        let second = h
+            .services
+            .comment_add(
+                h.ws.clone(),
+                tn.id.clone(),
+                "hello world".to_string(),
+                "hello".to_string(),
+                "nice".to_string(),
+                None,
+                None,
+                key,
+            )
+            .await
+            .expect("replay add");
+        assert_eq!(
+            second.comment_id, first.comment_id,
+            "replay returns the original comment"
+        );
+        let comments = h.store.list_comments(&tn.id).await.expect("list comments");
+        assert_eq!(comments.len(), 1, "replay must not duplicate the comment");
+
+        // No second event is published (the replay short-circuits before mutate).
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(none.is_err(), "replay must not publish a second event");
     }
 
     /// Reference parity: `comment.respond` publishes a single `comment:added`
@@ -2568,6 +2630,7 @@ mod change_event_parity {
                 "hello world".to_string(),
                 "hello".to_string(),
                 "root".to_string(),
+                None,
                 None,
                 None,
             )
@@ -2617,6 +2680,7 @@ mod change_event_parity {
                 "hello world".to_string(),
                 "hello".to_string(),
                 "nice".to_string(),
+                None,
                 None,
                 None,
             )
@@ -9416,6 +9480,7 @@ mod line_attribution_hooks {
             "this is a test sentence".into(),
             "test".into(),
             "nice".into(),
+            None,
             None,
             None,
         )
