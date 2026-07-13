@@ -737,6 +737,7 @@ async fn delete_note_cascades_comments_and_unlinks_children() {
         suggestion_original: None,
         suggestion_proposed: None,
         agent_id: None,
+        is_orphaned: None,
         created_at: now.clone(),
         updated_at: now.clone(),
     };
@@ -1502,6 +1503,183 @@ async fn comment_add_unique_match_anchors_and_persists() {
 }
 
 #[tokio::test]
+async fn comment_add_persists_anchor_context() {
+    // M1: `comment.add` must persist `anchor_before` / `anchor_after` (the
+    // ~50 chars of surrounding text) so a later note edit can relocate a
+    // partial anchor without needing version history.
+    let (_tmp, svc, ws, id) = setup("Hello world, this is a test sentence.").await;
+    let r = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "this is a test sentence".into(),
+            "test".into(),
+            "nice".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("comment.add");
+    let list = svc
+        .comment_list(ws, id, None, None, None, true)
+        .await
+        .expect("list");
+    let comment = list.threads[0].comments.as_ref().unwrap()[0].clone();
+    assert_eq!(comment.id, r.comment_id);
+    let ctx = comment.anchor_context.expect("anchor_context persisted");
+    assert!(
+        ctx.before.ends_with("this is a "),
+        "unexpected before: {:?}",
+        ctx.before
+    );
+    assert!(
+        ctx.after.starts_with(" sentence"),
+        "unexpected after: {:?}",
+        ctx.after
+    );
+}
+
+/// Fetch a single comment for a note by id from the service layer, matching
+/// how the wire client sees it (including `is_orphaned`).
+async fn fetch_comment_by_id(
+    svc: &Services,
+    ws: &WorkspaceId,
+    note_id: &NoteId,
+    comment_id: &str,
+) -> intent_core::CommentWire {
+    let list = svc
+        .comment_list(ws.clone(), note_id.clone(), None, None, None, true)
+        .await
+        .expect("list");
+    list.threads
+        .into_iter()
+        .flat_map(|t| t.comments.unwrap_or_default())
+        .find(|c| c.id == comment_id)
+        .expect("comment present")
+}
+
+#[tokio::test]
+async fn edit_above_anchor_preserves_healthy_state() {
+    // H1: an edit that touches text BEFORE the anchored range must leave both
+    // markers intact and must not orphan the comment.
+    let (_tmp, svc, ws, id) = setup("prefix line\ntarget word here\nsuffix line").await;
+    let added = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "target word here".into(),
+            "target word".into(),
+            "c".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("add");
+    // Rewrite the line above the anchored text.
+    svc.edit_note(
+        ws.clone(),
+        id.clone(),
+        NoteEditInput {
+            old: "prefix line".into(),
+            new: "PREFIX LINE".into(),
+        },
+    )
+    .await
+    .expect("edit");
+    let note = svc.get_note(ws.clone(), id.clone()).await.unwrap();
+    let cid = &added.comment_id;
+    assert!(note.content.contains(&format!(
+        "<!--anchor:{cid}:start-->target word<!--anchor:{cid}:end-->"
+    )));
+    let comment = fetch_comment_by_id(&svc, &ws, &id, cid).await;
+    assert_ne!(comment.is_orphaned, Some(true));
+}
+
+#[tokio::test]
+async fn edit_that_destroys_start_marker_recovers_via_context() {
+    // H1: an edit that clobbers just the start marker (but leaves the
+    // anchored text + neighbor intact) must be re-anchored using the
+    // `anchor_before` context stored at add time.
+    let (_tmp, svc, ws, id) = setup("prefix target here suffix").await;
+    let added = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "prefix target here suffix".into(),
+            "target".into(),
+            "c".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("add");
+    let cid = &added.comment_id;
+    // Nuke the start marker via edit_note. The anchored text ("target") and
+    // its `contextBefore` neighbor ("prefix") remain.
+    let before = svc.get_note(ws.clone(), id.clone()).await.unwrap();
+    let start_pat = format!("<!--anchor:{cid}:start-->");
+    assert!(before.content.contains(&start_pat));
+    svc.edit_note(
+        ws.clone(),
+        id.clone(),
+        NoteEditInput {
+            old: start_pat.clone(),
+            new: String::new(),
+        },
+    )
+    .await
+    .expect("edit");
+    let note = svc.get_note(ws.clone(), id.clone()).await.unwrap();
+    assert!(
+        note.content.contains(&format!("<!--anchor:{cid}:start-->")),
+        "start marker not restored: {}",
+        note.content
+    );
+    assert!(note.content.contains(&format!("<!--anchor:{cid}:end-->")));
+    let comment = fetch_comment_by_id(&svc, &ws, &id, cid).await;
+    assert_ne!(comment.is_orphaned, Some(true));
+}
+
+#[tokio::test]
+async fn edit_that_destroys_both_markers_marks_orphaned() {
+    // H1: an edit that wipes both anchor markers cannot be recovered — the
+    // comment must be flipped to `is_orphaned = true` per reference
+    // `updateNote` (failed recoveries).
+    let (_tmp, svc, ws, id) = setup("prefix target here suffix").await;
+    let added = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "prefix target here suffix".into(),
+            "target".into(),
+            "c".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("add");
+    let cid = added.comment_id.clone();
+    // Full-content replace that omits both anchor markers.
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        "completely different content without markers".into(),
+        true,
+        None,
+    )
+    .await
+    .expect("set_note_content");
+    let note = svc.get_note(ws.clone(), id.clone()).await.unwrap();
+    assert!(!note.content.contains(&format!("<!--anchor:{cid}:")));
+    let comment = fetch_comment_by_id(&svc, &ws, &id, &cid).await;
+    assert_eq!(comment.is_orphaned, Some(true));
+}
+
+#[tokio::test]
 async fn comment_add_ambiguous_context_errors() {
     let (_tmp, svc, ws, id) = setup("repeat repeat").await;
     let err = svc
@@ -1831,6 +2009,7 @@ async fn comment_respond_rejects_cross_workspace_comment_id_probe() {
         suggestion_original: None,
         suggestion_proposed: None,
         agent_id: None,
+        is_orphaned: None,
         created_at: now.clone(),
         updated_at: now,
     };
