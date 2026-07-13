@@ -2287,11 +2287,14 @@ fn worktree_folder_slug(repo_name: &str) -> String {
 }
 
 /// Recursively scan `dir` for git repositories (a directory that contains a
-/// `.git` child). Ports the FE `workspace.repository.scanDirectory` semantics:
-/// depth capped at 3, hidden entries skipped, git roots emitted without
-/// descending further, and I/O errors on individual entries are silently
-/// swallowed. Absolute paths are pushed into `out` as UTF-8 strings; entries
-/// whose paths cannot be represented as UTF-8 are skipped.
+/// `.git` child — either a `.git/` directory *or* a `.git` file whose first
+/// non-empty line starts with `gitdir:`, matching the worktree pointer form
+/// that `host_ops::has_git_marker` already recognizes). Ports the FE
+/// `workspace.repository.scanDirectory` semantics: depth capped at 3, hidden
+/// entries skipped, git roots emitted without descending further, and I/O
+/// errors on individual entries are silently swallowed. Absolute paths are
+/// pushed into `out` as UTF-8 strings; entries whose paths cannot be
+/// represented as UTF-8 are skipped.
 fn scan_for_repositories(dir: &Path, depth: usize, out: &mut Vec<String>) {
     if depth > 3 {
         return;
@@ -2301,9 +2304,18 @@ fn scan_for_repositories(dir: &Path, depth: usize, out: &mut Vec<String>) {
         Err(_) => return,
     };
     let entries: Vec<_> = entries.flatten().collect();
-    let is_git_repo = entries
-        .iter()
-        .any(|e| e.file_name() == *".git" && e.file_type().map(|t| t.is_dir()).unwrap_or(false));
+    let is_git_repo = entries.iter().any(|e| {
+        if e.file_name() != *".git" {
+            return false;
+        }
+        match e.file_type() {
+            Ok(t) if t.is_dir() => true,
+            Ok(t) if t.is_file() => std::fs::read_to_string(e.path())
+                .map(|s| s.trim_start().starts_with("gitdir:"))
+                .unwrap_or(false),
+            _ => false,
+        }
+    });
     if is_git_repo {
         if let Some(s) = dir.to_str() {
             out.push(s.to_string());
