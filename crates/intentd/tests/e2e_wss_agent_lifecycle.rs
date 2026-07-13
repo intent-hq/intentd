@@ -275,13 +275,20 @@ where
 
 /// Variant of `wss_event` that returns `None` on timeout instead of panicking,
 /// for tests that assert an event stream stayed silent (e.g. no-prompt initial
-/// agent must not emit any `agent:stream:*` frame).
+/// agent must not emit any `agent:stream:*` frame). Uses a single deadline so
+/// periodic non-`events.event` frames (heartbeat `Ping`, unrelated pushes) do
+/// not reset the wait window and hide silence-violations.
 async fn wss_event_opt<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Option<Value>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     loop {
-        let next = match timeout(Duration::from_secs(secs), ws.next()).await {
+        let remaining = match deadline.checked_duration_since(tokio::time::Instant::now()) {
+            Some(d) if !d.is_zero() => d,
+            _ => return None,
+        };
+        let next = match timeout(remaining, ws.next()).await {
             Ok(next) => next,
             Err(_) => return None,
         };
