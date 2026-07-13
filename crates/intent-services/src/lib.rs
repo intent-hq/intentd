@@ -5315,10 +5315,22 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let this = self.clone();
-        // Snapshot the caller-supplied delta before it is consumed by the
-        // apply loop; the `workspace:updated` event carries `changes` as the
-        // applied delta (reference-parity FE emitter, §6.5).
-        let changes = serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
+        // Normalise write-time-canonicalised fields on the delta snapshot so
+        // `workspace:updated { changes }` (§6.5) matches the returned/persisted
+        // `Workspace` byte-for-byte: raw `baseRef: "origin/main"` collapses to
+        // canonical `"main"`, and whitespace-only `statusMessage` folds to
+        // `null` (the effective clear). Subscribers can then mirror the delta
+        // without a follow-up read.
+        let mut normalised = update.clone();
+        if let Some(raw) = normalised.base_ref.as_deref() {
+            normalised.base_ref = Some(canonicalise_base_ref(raw));
+        }
+        if let Some(raw) = normalised.status_message.as_deref() {
+            if raw.trim().is_empty() {
+                normalised.status_message = None;
+            }
+        }
+        let changes = serde_json::to_value(&normalised).unwrap_or(serde_json::Value::Null);
         Box::pin(async move {
             let mut ws = if id.is_chief() {
                 chief_workspace()

@@ -3127,6 +3127,42 @@ mod change_event_parity {
         );
     }
 
+    /// `update_workspace` normalises the delta snapshot published as
+    /// `workspace:updated { changes }` (§6.5) so subscribers see the same
+    /// values the returned/persisted `Workspace` carries: a raw
+    /// `baseRef: "origin/main"` collapses to canonical `"main"` in both, and
+    /// a whitespace-only `statusMessage` folds to `null` (the effective
+    /// clear). Prevents state divergence without a follow-up read.
+    #[tokio::test]
+    async fn update_workspace_event_delta_matches_persisted_normalisation() {
+        use intent_core::{WorkspaceApi, WorkspaceUpdate};
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let ws = h
+            .services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    base_ref: Some("origin/main".to_string()),
+                    status_message: Some("   \t ".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update");
+        // Persisted / returned workspace carries the canonical values.
+        assert_eq!(ws.base_ref.as_deref(), Some("main"));
+        assert!(ws.status_message.is_none());
+
+        // The emitted `changes` mirrors those canonical values (raw
+        // `origin/main` and whitespace-only `statusMessage` would surface as
+        // state divergence for subscribers).
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(ev["data"]["changes"]["baseRef"], json!("main"));
+        assert!(ev["data"]["changes"].get("statusMessage").is_none());
+    }
+
     /// Derived `activity` flips `Idle → AgentRunning → Idle` across in-flight
     /// session begin/end, reflected by `get_workspace`, and emits
     /// `workspace:activity-changed` ONLY on the zero/non-zero edges (§9.9/§10.1).
