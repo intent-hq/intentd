@@ -740,6 +740,14 @@ impl WorkspaceApi for FakeApi {
                     ));
                 }
             }
+            // Parity with production: an empty parsed list (e.g. `[]`,
+            // `[null]`, `" , "`) is `-32603`, not a silent `ok: true`.
+            if list.is_empty() {
+                return Err(Error::Internal(
+                    "No file paths provided. Please specify at least one file path to discard."
+                        .to_string(),
+                ));
+            }
             Ok(list)
         })
     }
@@ -2711,6 +2719,26 @@ async fn git_discard_all_array_form_is_rejected_with_minus_32603() {
                 .unwrap_or("")
                 .contains("Discarding all files is not allowed"),
             "expected discard-oriented message for paths={paths}: {v}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn git_discard_empty_parsed_list_is_minus_32603() {
+    // Regression: an empty parsed list (`[]`, `[null]`, `" , "`) must be
+    // `-32603` with the no-paths message, not a silent `ok: true`.
+    for paths in ["[]", "[null]", "\" , \""] {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"git.discard","params":{{"workspaceId":"ws-1","paths":{paths}}}}}"#
+        );
+        let v = call(&frame).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "expected -32603 for paths={paths}");
+        assert!(
+            v["error"]["data"]
+                .as_str()
+                .unwrap_or("")
+                .contains("No file paths provided"),
+            "expected no-paths message for paths={paths}: {v}",
         );
     }
 }

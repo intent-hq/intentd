@@ -7163,8 +7163,12 @@ impl WorkspaceApi for Services {
             // bypass that would otherwise let `["*"]` / `["--all"]` devolve
             // into a silent no-op). Error messages are discard-oriented.
             let path_list = git_ops::parse_discard_paths(&paths)?;
-            // Mirror `git.stage`: every failure surfaces as `-32603`, so a
-            // missing workspace/worktree is `Internal` too.
+            // Workspace / worktree resolution mirrors `git.stage`: a missing
+            // workspace or unset worktree is `Internal` (→ `-32603`). The
+            // subsequent `intent_git::stage::discard` call may still return
+            // `Error::InvalidParams` (→ `-32602`) for unsafe pathspecs
+            // (e.g. `..` traversal, absolute paths outside the worktree) —
+            // those propagate unchanged.
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
