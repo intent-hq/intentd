@@ -5725,6 +5725,53 @@ impl WorkspaceApi for Services {
                             .await
                         })
                         .await;
+                    // `provision_worktree` creates (or reuses) the branch
+                    // before `git worktree add`; on partial failure the branch
+                    // may exist without a worktree tracking it, and
+                    // `workspace.delete` only cleans the branch when
+                    // `worktree_path` is set. Best-effort delete it here to
+                    // avoid orphaning a `<workspaceId>` branch in the source
+                    // repo. Runs for both the inner-error and JoinError paths
+                    // because the blocking task may have created the branch
+                    // before panicking.
+                    let ws_id = ws.id.clone();
+                    let cleanup_orphan_branch = |reason: &'static str| {
+                        let cleanup_repo = repo_dir.clone();
+                        let cleanup_branch = branch.clone();
+                        let cleanup_locks = worktree_locks.clone();
+                        let cleanup_ws_id = ws_id.clone();
+                        let branch_for_log = branch.clone();
+                        async move {
+                            let cleanup = cleanup_locks
+                                .with_lock(&cleanup_repo.clone(), move || async move {
+                                    tokio::task::spawn_blocking(move || {
+                                        intent_git::branches::delete_local_branch(
+                                            &cleanup_repo,
+                                            &cleanup_branch,
+                                        )
+                                    })
+                                    .await
+                                })
+                                .await;
+                            match cleanup {
+                                Ok(Ok(())) => {}
+                                Ok(Err(cleanup_err)) => tracing::debug!(
+                                    workspace = %cleanup_ws_id.as_str(),
+                                    branch = %branch_for_log,
+                                    reason,
+                                    error = %cleanup_err,
+                                    "workspace.duplicate: best-effort branch cleanup did not delete branch (may not have been created)"
+                                ),
+                                Err(join_err) => tracing::warn!(
+                                    workspace = %cleanup_ws_id.as_str(),
+                                    branch = %branch_for_log,
+                                    reason,
+                                    error = %join_err,
+                                    "workspace.duplicate: best-effort branch cleanup task failed"
+                                ),
+                            }
+                        }
+                    };
                     match sha_result {
                         Ok(Ok(sha)) => {
                             ws.worktree_path = Some(wt_path.to_string_lossy().to_string());
@@ -5736,40 +5783,16 @@ impl WorkspaceApi for Services {
                                 error = %e,
                                 "workspace.duplicate: worktree provisioning failed; continuing without worktree"
                             );
-                            // `provision_worktree` creates (or reuses) the
-                            // branch before `git worktree add`; on partial
-                            // failure the branch may exist without a worktree
-                            // tracking it. `workspace.delete` only cleans the
-                            // branch when `worktree_path` is set, so best-effort
-                            // delete it here to avoid orphaning a
-                            // `<workspaceId>` branch in the source repo.
-                            let cleanup_repo = repo_dir.clone();
-                            let cleanup_branch = branch.clone();
-                            let cleanup = worktree_locks
-                                .with_lock(&repo_dir, move || async move {
-                                    tokio::task::spawn_blocking(move || {
-                                        intent_git::branches::delete_local_branch(
-                                            &cleanup_repo,
-                                            &cleanup_branch,
-                                        )
-                                    })
-                                    .await
-                                })
-                                .await;
-                            if let Ok(Err(cleanup_err)) = cleanup {
-                                tracing::debug!(
-                                    workspace = %ws.id.as_str(),
-                                    branch = %branch,
-                                    error = %cleanup_err,
-                                    "workspace.duplicate: best-effort branch cleanup after failed provisioning did not delete branch (may not have been created)"
-                                );
-                            }
+                            cleanup_orphan_branch("provision_worktree returned Err").await;
                         }
-                        Err(join_err) => tracing::warn!(
-                            workspace = %ws.id.as_str(),
-                            error = %join_err,
-                            "workspace.duplicate: worktree provisioning task failed"
-                        ),
+                        Err(join_err) => {
+                            tracing::warn!(
+                                workspace = %ws.id.as_str(),
+                                error = %join_err,
+                                "workspace.duplicate: worktree provisioning task failed"
+                            );
+                            cleanup_orphan_branch("provision_worktree task JoinError").await;
+                        }
                     }
                 }
             }

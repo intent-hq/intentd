@@ -209,8 +209,10 @@ pub trait WorkspaceApi: Send + Sync {
     /// Duplicate a workspace (PROTOCOL §5.1): clone the persisted metadata into
     /// a freshly minted id, seed the well-known `spec` note, and copy over any
     /// non-`spec` notes from the source. Runtime-only fields (`activity`, card
-    /// aggregates, timeline, changesets) are not carried over; the new workspace
-    /// starts on a fresh branch pinned to its id. When the source carries a
+    /// aggregates, timeline, changesets) are not carried over; the new
+    /// workspace starts on a fresh branch derived from its id (uniquified with
+    /// a `-N` suffix against the source repo's local/remote-tracking refs on
+    /// collision, same as `workspace.create`). When the source carries a
     /// local `repositoryPath` and is not `skipWorktree`/`isRemote`, the daemon
     /// provisions a linked worktree at `<root>/<newId>/<repo-slug>` on that
     /// branch (mirroring the `workspace.create` flow); provisioning failures
