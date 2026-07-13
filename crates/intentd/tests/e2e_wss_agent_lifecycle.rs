@@ -3614,7 +3614,7 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
 
-    // Send first message — agent will be busy for 500ms.
+    // Send first message — agent will be busy for 2000ms (firstTurnDelayMs).
     let send1 = wss_rpc(
         &mut rpc,
         11,
@@ -3649,8 +3649,10 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
         let evt = &frame["params"]["event"];
         match evt["type"].as_str() {
             Some("agent:queue:updated") => {
-                // After the first turn completes, the queue drains
-                if stream_end_count >= 1 {
+                // After the first turn completes, the queue drains to empty
+                if stream_end_count >= 1
+                    && evt["data"]["queue"].as_array().map(|q| q.is_empty()).unwrap_or(false)
+                {
                     saw_queue_drain = true;
                 }
             }
