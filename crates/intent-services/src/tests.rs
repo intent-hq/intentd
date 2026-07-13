@@ -5263,13 +5263,13 @@ mod pr {
 
     #[tokio::test]
     async fn refresh_all_discovers_unlinked_workspaces() {
-        // STAB-3 regression test: `refresh_all_linked_prs()` (the background 60s
-        // loop) should discover and link PRs for unlinked workspaces, not just
+        // STAB-3 regression test: `refresh_all_workspace_prs()` (the background
+        // 60s loop) should discover and link PRs for unlinked workspaces, not just
         // refresh already-linked ones. Without the fix, the background loop
         // skipped workspaces with `pr_number.is_none()`, so discovery was
         // on-demand only. This test asserts that an unlinked workspace on branch X
         // with an open PR whose head ref is X gets linked when
-        // `refresh_all_linked_prs()` runs (simulating the background loop).
+        // `refresh_all_workspace_prs()` runs (simulating the background loop).
         let forge = StubForge {
             discover: true,
             ..Default::default()
@@ -5281,7 +5281,7 @@ mod pr {
         assert_eq!(before.pr_number, None);
 
         // Run the same sweep the background loop runs.
-        svc.refresh_all_linked_prs().await;
+        svc.refresh_all_workspace_prs().await;
 
         // After the sweep the workspace is linked to PR #42.
         let after = svc.store().get_workspace(&ws_id).await.unwrap();
