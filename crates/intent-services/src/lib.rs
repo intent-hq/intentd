@@ -5317,17 +5317,18 @@ impl WorkspaceApi for Services {
         let this = self.clone();
         // Normalise write-time-canonicalised fields on the delta snapshot so
         // `workspace:updated { changes }` (§6.5) matches the returned/persisted
-        // `Workspace` byte-for-byte: raw `baseRef: "origin/main"` collapses to
-        // canonical `"main"`, and whitespace-only `statusMessage` folds to
-        // `null` (the effective clear). Subscribers can then mirror the delta
-        // without a follow-up read.
+        // `Workspace`: raw `baseRef: "origin/main"` collapses to canonical
+        // `"main"`, and whitespace-only `statusMessage` folds to `""` (the
+        // clear-signal wire value, preserved through `skip_serializing_if` so
+        // subscribers can distinguish "clear" from "no change"). Lets
+        // subscribers mirror the delta without a follow-up read.
         let mut normalised = update.clone();
         if let Some(raw) = normalised.base_ref.as_deref() {
             normalised.base_ref = Some(canonicalise_base_ref(raw));
         }
         if let Some(raw) = normalised.status_message.as_deref() {
             if raw.trim().is_empty() {
-                normalised.status_message = None;
+                normalised.status_message = Some(String::new());
             }
         }
         let changes = serde_json::to_value(&normalised).unwrap_or(serde_json::Value::Null);
