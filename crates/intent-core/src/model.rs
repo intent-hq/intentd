@@ -683,8 +683,9 @@ pub struct Comment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
     /// True when a subsequent note edit destroyed the anchor markers and
-    /// recovery from `anchor_text` + `anchor_before`/`anchor_after` failed
-    /// (reference `commentsRepository.update({ isOrphaned: true })` in
+    /// recovery from the stored surrounding context (`anchor_before` /
+    /// `anchor_after`) failed (reference
+    /// `commentsRepository.update({ isOrphaned: true })` in
     /// `notes.service.ts` `applyEditEvent`). Serialized as camelCase
     /// `isOrphaned`; omitted when `None` (untouched rows). `Some(false)` is
     /// serialized explicitly so a healed comment can be signalled to clients.
