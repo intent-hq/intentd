@@ -258,6 +258,24 @@ impl Store {
             .begin()
             .await
             .map_err(|e| Error::Internal(format!("begin adopt_spec tx failed: {e}")))?;
+        // Re-check the "no `id='spec'`" precondition *inside* the tx: the
+        // caller's `fetch_note(spec)` runs on a fresh connection before we
+        // begin, so a racing `workspace.create` or a sibling `note.list`
+        // may have committed a real spec in the gap. Bailing here lets that
+        // caller list the freshly-created spec on its next round-trip
+        // rather than surfacing a UNIQUE PK conflict from the UPDATE.
+        let existing_spec: Option<String> =
+            sqlx::query_scalar("SELECT id FROM note WHERE workspace_id = ? AND id = 'spec'")
+                .bind(&workspace_id.0)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("recheck spec precondition failed: {e}")))?;
+        if existing_spec.is_some() {
+            tx.rollback()
+                .await
+                .map_err(|e| Error::Internal(format!("rollback adopt_spec tx failed: {e}")))?;
+            return Ok(None);
+        }
         // Scan for candidates inside the tx so the caller's "no `id='spec'`"
         // precondition still holds at commit. `LIMIT 2` is enough to
         // distinguish "exactly one" from "≥2".
