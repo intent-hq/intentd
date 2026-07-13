@@ -239,9 +239,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// cache directory and, when a local worktree exists, run `git gc` on it.
     /// Cache reclamation runs the recursive-delete under the daemon-owned
     /// `<workspaces_root>/<id>/cache/` path (never a caller-supplied path);
-    /// `git gc` failures are logged and swallowed (the workspace stays healthy).
-    /// `NotFound` if the workspace is absent; other errors from the cache
-    /// removal propagate.
+    /// both cache-removal and `git gc` failures are logged and swallowed so
+    /// the workspace stays healthy. `NotFound` if the workspace is absent;
+    /// otherwise this RPC always resolves `Ok(())`.
     fn cleanup_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
         let _ = id;
         Box::pin(async {

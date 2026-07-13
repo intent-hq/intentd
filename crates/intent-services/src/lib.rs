@@ -5509,13 +5509,23 @@ impl WorkspaceApi for Services {
             // Fresh id: reuse the random adjective-animal slug generator and
             // uniquify against live rows, tombstones, and stray directories.
             // Retries stay bounded so a wildly saturated slug space fails fast
-            // rather than looping forever.
+            // rather than looping forever; if the budget is exhausted without
+            // finding an available slug we surface `Internal` rather than
+            // silently returning a colliding id.
             let mut new_id = WorkspaceId::from(intent_core::slug::generate_workspace_slug());
+            let mut found = false;
             for _ in 0..32 {
                 if workspace_id_available(&store, &workspaces_root, &new_id).await {
+                    found = true;
                     break;
                 }
                 new_id = WorkspaceId::from(intent_core::slug::generate_workspace_slug());
+            }
+            if !found {
+                return Err(Error::Internal(
+                    "workspace.duplicate: exhausted slug retries without finding an available id"
+                        .to_string(),
+                ));
             }
             let now = now_iso();
             let title = new_title
@@ -5724,8 +5734,11 @@ impl WorkspaceApi for Services {
             // Pass 1: drop every workspace whose stored status is `Deleted`.
             // `list_workspaces(true)` includes archived rows; we filter by
             // status manually so the pass is independent of the `archived`
-            // flag semantics.
-            let all = store.list_workspaces(true).await.unwrap_or_default();
+            // flag semantics. If the store call fails we must propagate:
+            // treating an empty list as ground truth would make pass 2 sweep
+            // every non-dot/non-`clones` directory under `workspaces_root` as
+            // an orphan, which is a data-loss hazard.
+            let all = store.list_workspaces(true).await?;
             let mut live_ids: HashSet<String> = HashSet::new();
             for ws in &all {
                 if ws.status == WorkspaceStatus::Deleted {
@@ -5824,7 +5837,24 @@ impl WorkspaceApi for Services {
 
     fn find_repositories(&self, directory: String) -> BoxFuture<'_, Result<Vec<String>>> {
         Box::pin(async move {
-            let root = PathBuf::from(&directory);
+            let requested = PathBuf::from(&directory);
+            // Normalize a relative `directory` to an absolute base against the
+            // daemon's cwd before scanning so the response matches the
+            // protocol contract (absolute paths). `canonicalize` is preferred
+            // because it resolves symlinks and `..`, but fall back to a plain
+            // `cwd.join(requested)` when the path does not exist yet so the
+            // scan can still surface an empty result rather than an error.
+            let root = if requested.is_absolute() {
+                requested
+            } else {
+                match std::fs::canonicalize(&requested) {
+                    Ok(p) => p,
+                    Err(_) => match std::env::current_dir() {
+                        Ok(cwd) => cwd.join(&requested),
+                        Err(_) => requested,
+                    },
+                }
+            };
             let scan = tokio::task::spawn_blocking(move || {
                 let mut out = Vec::new();
                 scan_for_repositories(&root, 0, &mut out);
