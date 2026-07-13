@@ -72,9 +72,16 @@ pub fn unstage(worktree_path: &Path, paths: &[String]) -> Result<()> {
 /// from disk (files unlinked, directories removed recursively). Idempotent on
 /// clean files: a checkout against an unchanged path is a no-op, and a missing
 /// untracked path (already deleted) is ignored (`ENOENT` race). Staged changes
-/// are untouched — this discards only the unstaged worktree delta, matching the
-/// reference. Individual failures are best-effort (logged in the reference,
-/// swallowed here) so the batch does not abort on one bad path.
+/// are untouched — this discards only the unstaged worktree delta, matching
+/// the reference. A pathspec naming a directory whose contents are tracked is
+/// treated as tracked and routed through `checkout_index` (reference parity —
+/// libgit2's exact-file index probe would otherwise miss it and `remove_dir_all`
+/// would wipe tracked content). Untracked deletion is refused (surfaced as
+/// `-32602 InvalidParams`) for any path that escapes the worktree (absolute
+/// paths outside `workdir`, `..` traversal, or the empty / `.` root). A
+/// non-ENOENT filesystem error on untracked deletion is best-effort (silently
+/// swallowed, matching the reference's per-file warn-and-continue behavior);
+/// tracked-batch checkout failures propagate as `Error::Git`.
 pub fn discard(worktree_path: &Path, paths: &[String]) -> Result<()> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let workdir = repo
@@ -85,12 +92,33 @@ pub fn discard(worktree_path: &Path, paths: &[String]) -> Result<()> {
 
     // Partition into tracked vs untracked, mirroring the reference's
     // `git ls-files --error-unmatch <path>` probe: a path is tracked iff it
-    // has a stage-0 entry in the current index.
+    // has a stage-0 entry in the current index. Directories that *contain*
+    // tracked files (index entries under a `<rel>/` prefix) are also treated
+    // as tracked so `remove_dir_all` never wipes tracked content — the
+    // reference guards this with `git ls-files --error-unmatch` on the
+    // literal path but never issues `rm -rf` on a directory.
+    // Validate + classify. `normalize_rel` returns a repo-relative path when
+    // the input is inside the worktree; anything else (absolute path outside,
+    // `.` / empty root, `..` traversal) is refused up-front as -32602 so
+    // libgit2's index probe never sees a path it would panic on and
+    // `remove_dir_all` can never target the worktree root or outside.
     let mut tracked: Vec<String> = Vec::new();
     let mut untracked: Vec<String> = Vec::new();
     for raw in paths {
         let rel = normalize_rel(&workdir, raw);
-        if index.get_path(Path::new(&rel), 0).is_some() {
+        if !is_safe_rel(&workdir, &rel) {
+            return Err(Error::InvalidParams(format!(
+                "Path escapes the worktree: {rel}"
+            )));
+        }
+        if index.get_path(Path::new(&rel), 0).is_some() || index_has_dir_prefix(&index, &rel) {
+            // Exact-file index entry OR a directory pathspec naming a tracked
+            // subtree — go through `checkout_index`, matching the reference
+            // where `git ls-files --error-unmatch <dir>` succeeds recursively
+            // and the path is then checked out as a directory pathspec. This
+            // is what prevents `remove_dir_all` from wiping tracked content
+            // reachable via a directory pathspec (libgit2's exact-file index
+            // probe would otherwise miss it).
             tracked.push(rel);
         } else {
             untracked.push(rel);
@@ -128,6 +156,57 @@ pub fn discard(worktree_path: &Path, paths: &[String]) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// True when `rel` is a non-empty, non-`.` relative path whose lexical
+/// resolution against `workdir` stays strictly under `workdir`. Used by
+/// `discard` to reject absolute paths outside the repo, `..` traversal, and
+/// the worktree-root pathspec before touching either the index or the
+/// filesystem.
+fn is_safe_rel(workdir: &Path, rel: &str) -> bool {
+    if rel.is_empty() || rel == "." {
+        return false;
+    }
+    let candidate = Path::new(rel);
+    if candidate.is_absolute() {
+        return false;
+    }
+    let full = workdir.join(candidate);
+    let normalized = lexical_normalize(&full);
+    normalized.starts_with(workdir) && normalized != workdir
+}
+
+/// Returns true when the index contains any entry under the `<rel>/`
+/// directory prefix — i.e. the pathspec names a tracked subtree, even
+/// though the directory itself is not a stage-0 index entry.
+fn index_has_dir_prefix(index: &git2::Index, rel: &str) -> bool {
+    if rel.is_empty() {
+        return false;
+    }
+    let mut prefix = rel.trim_end_matches('/').to_string();
+    prefix.push('/');
+    index
+        .iter()
+        .any(|entry| String::from_utf8_lossy(&entry.path).starts_with(&prefix))
+}
+
+/// Purely lexical path normalization: resolves `.` / `..` components against
+/// `path` without touching the filesystem (unlike `canonicalize`, which
+/// requires the path to exist and follows symlinks). Used by `discard` to
+/// verify an untracked deletion target stays inside the worktree even when
+/// the path is missing (idempotent-ENOENT branch).
+fn lexical_normalize(path: &Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Normalize a path to be relative to the worktree, mirroring the TS
@@ -281,5 +360,70 @@ mod tests {
         let dir = init_repo("discard-missing");
         commit_file(dir.path(), "seed.txt", "seed\n");
         discard(dir.path(), &["nope.txt".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn discard_directory_of_tracked_files_restores_from_index() {
+        // A pathspec naming a directory whose contents are tracked in the
+        // index must go through `checkout_index` (not `rm -rf`). Reference
+        // parity: `ls-files --error-unmatch <dir>` succeeds recursively, so
+        // the FE reaches the `git checkout -- <dir>` branch and dirty files
+        // under it are restored. libgit2's index probe is exact-file, so we
+        // extend the tracked classification with a directory-prefix check.
+        let dir = init_repo("discard-tracked-dir");
+        commit_file(dir.path(), "src/a.txt", "a\n");
+        commit_file(dir.path(), "src/b.txt", "b\n");
+        // Dirty the tracked files under the directory.
+        write_file(dir.path(), "src/a.txt", "dirty a\n");
+        write_file(dir.path(), "src/b.txt", "dirty b\n");
+        discard(dir.path(), &["src".to_string()]).unwrap();
+        // Restored to the index (HEAD) content, not deleted.
+        assert!(dir.path().join("src/a.txt").exists());
+        assert!(dir.path().join("src/b.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/a.txt")).unwrap(),
+            "a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/b.txt")).unwrap(),
+            "b\n"
+        );
+    }
+
+    #[test]
+    fn discard_refuses_traversal_outside_worktree() {
+        // A relative pathspec containing `..` that resolves outside the
+        // worktree must be refused rather than deleted.
+        let dir = init_repo("discard-traversal");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        // `../evil.txt` is untracked (no index entry, no prefix match),
+        // resolves to a sibling of the worktree — must fail.
+        let err = discard(dir.path(), &["../evil.txt".to_string()]).unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    #[test]
+    fn discard_refuses_absolute_path_outside_worktree() {
+        // An absolute path outside the worktree survives `normalize_rel`
+        // unchanged (its `strip_prefix` fails) and must be refused rather
+        // than deleted.
+        let dir = init_repo("discard-abs");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        let err = discard(dir.path(), &["/tmp/nope-outside-worktree".to_string()]).unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    #[test]
+    fn discard_refuses_dot_and_empty() {
+        // Router-level validation already rejects `.` / `*` / `--all`; this
+        // is a defense-in-depth guard against a caller sneaking `.` in via
+        // the array shape and having the deletion loop target the whole
+        // worktree via `remove_dir_all`.
+        let dir = init_repo("discard-dot");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        let err = discard(dir.path(), &[".".to_string()]).unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+        let err = discard(dir.path(), &["".to_string()]).unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
     }
 }
