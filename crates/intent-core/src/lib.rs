@@ -46,8 +46,8 @@ pub use model::{
     TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, TokenUsageTotals, TopChangedFile,
     Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiffSummary,
-    WorkspaceDiffSummaryFile, WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask,
-    WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceDiffSummaryFile, WorkspaceEventSummary, WorkspacePurgeResult, WorkspaceStatus,
+    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use traits::{

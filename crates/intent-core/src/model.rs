@@ -161,6 +161,11 @@ pub struct Workspace {
     /// Persisted snapshot of the linked PR (§7.6); refreshed in the background.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_pull_request: Option<PullRequestInfo>,
+    /// Persisted list of PR snapshots discovered for the workspace's baseRef
+    /// (§7.6). Distinct from `activePullRequest` (the currently-linked PR); the
+    /// FE reconciles stale PR links against this collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_requests: Option<Vec<PullRequestInfo>>,
     pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<String>,
@@ -223,6 +228,7 @@ pub fn chief_workspace() -> Workspace {
         pr_url: None,
         pr_status: None,
         active_pull_request: None,
+        pull_requests: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -461,6 +467,13 @@ pub struct WorkspaceCreateResult {
 /// Serializes with `skip_serializing_if = "Option::is_none"` so the
 /// `workspace:updated` change event only carries the fields the caller
 /// actually asked to mutate.
+///
+/// Clearable optional fields (`pr_url`, `pr_number`, `pr_status`,
+/// `active_pull_request`, `pull_requests`) use `Option<Option<T>>` so a wire
+/// `null` deserializes to `Some(None)` (explicit clear) and can be distinguished
+/// from a missing field (`None`, no change). Callers pass `null` to drop the
+/// stored value; the response `Workspace` still omits cleared optionals (§9.1
+/// `skip_serializing_if`) rather than echoing `null`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspaceUpdate {
@@ -498,16 +511,67 @@ pub struct WorkspaceUpdate {
     pub is_remote: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pr_number: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pr_url: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_field"
+    )]
+    pub pr_number: Option<Option<u64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_field"
+    )]
+    pub pr_url: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_field"
+    )]
+    pub pr_status: Option<Option<PullRequestStatus>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_field"
+    )]
+    pub active_pull_request: Option<Option<PullRequestInfo>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_field"
+    )]
+    pub pull_requests: Option<Option<Vec<PullRequestInfo>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attention: Option<WorkspaceAttention>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
+}
+
+/// Deserialize a JSON `null` as `Some(None)` (explicit clear) and a missing
+/// field as `None` (no change), so `Option<Option<T>>` on [`WorkspaceUpdate`]
+/// can distinguish the two. A present non-null value maps to `Some(Some(v))`.
+fn deserialize_optional_field<'de, T, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
+}
+
+/// Wire result for `workspace.purge` (PROTOCOL §5.1). Counters returned by a
+/// best-effort sweep of the daemon-owned workspaces root: `removed` is the
+/// number of workspace rows whose status was `Deleted` and whose on-disk
+/// directory was reclaimed; `orphans` is the number of stray `<root>/<id>/`
+/// directories reclaimed because no matching row exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePurgeResult {
+    pub removed: u32,
+    pub orphans: u32,
 }
 
 /// Additional per-note metadata that ships nested under `metadata` on the wire
@@ -2507,6 +2571,7 @@ mod tests {
             pr_url: None,
             pr_status: None,
             active_pull_request: None,
+            pull_requests: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -2523,6 +2588,7 @@ mod tests {
             "prNumber",
             "prStatus",
             "activePullRequest",
+            "pullRequests",
             "repositoryOwner",
             "lastActivity",
             "archivedAt",
@@ -2592,6 +2658,86 @@ mod tests {
         assert_eq!(v["totalAdditions"], 10);
         assert_eq!(v["totalDeletions"], 4);
         assert!(v["files"].is_array());
+    }
+
+    /// `WorkspaceUpdate` distinguishes an explicit wire `null` on the
+    /// clearable PR fields from a missing field: `null` → `Some(None)`
+    /// (clear the stored value), missing → `None` (no change), value →
+    /// `Some(Some(v))` (set the stored value). Mirrors PROTOCOL §5.1.
+    #[test]
+    fn workspace_update_pr_fields_null_clear_semantics() {
+        // Missing fields → outer `None` (no change).
+        let empty: WorkspaceUpdate = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(empty.pr_url.is_none(), "missing prUrl → None (no change)");
+        assert!(empty.pr_number.is_none());
+        assert!(empty.pr_status.is_none());
+        assert!(empty.active_pull_request.is_none());
+        assert!(empty.pull_requests.is_none());
+
+        // Explicit wire `null` → `Some(None)` (explicit clear).
+        let cleared: WorkspaceUpdate = serde_json::from_value(serde_json::json!({
+            "prUrl": null,
+            "prNumber": null,
+            "prStatus": null,
+            "activePullRequest": null,
+            "pullRequests": null,
+        }))
+        .unwrap();
+        assert_eq!(cleared.pr_url, Some(None));
+        assert_eq!(cleared.pr_number, Some(None));
+        assert_eq!(cleared.pr_status, Some(None));
+        assert_eq!(cleared.active_pull_request, Some(None));
+        assert_eq!(cleared.pull_requests, Some(None));
+
+        // Present value → `Some(Some(v))`.
+        let set: WorkspaceUpdate = serde_json::from_value(serde_json::json!({
+            "prUrl": "https://example.com/pr/1",
+            "prNumber": 42,
+            "prStatus": "Open",
+            "pullRequests": [],
+        }))
+        .unwrap();
+        assert_eq!(
+            set.pr_url,
+            Some(Some("https://example.com/pr/1".to_string()))
+        );
+        assert_eq!(set.pr_number, Some(Some(42)));
+        assert_eq!(set.pr_status, Some(Some(PullRequestStatus::Open)));
+        assert_eq!(set.pull_requests, Some(Some(vec![])));
+    }
+
+    /// The `workspace:updated` event carries the applied `WorkspaceUpdate`
+    /// delta as `changes` (§6.5). Missing fields are omitted from the wire
+    /// (`skip_serializing_if = "Option::is_none"`); an explicit `Some(None)`
+    /// clear serializes as JSON `null`, distinguishable from omission.
+    #[test]
+    fn workspace_update_serializes_omits_missing_and_emits_null_for_clear() {
+        let empty = WorkspaceUpdate::default();
+        let v = serde_json::to_value(&empty).unwrap();
+        for key in [
+            "prUrl",
+            "prNumber",
+            "prStatus",
+            "activePullRequest",
+            "pullRequests",
+        ] {
+            assert!(v.get(key).is_none(), "expected `{key}` to be omitted");
+        }
+
+        let clear = WorkspaceUpdate {
+            pr_url: Some(None),
+            pr_number: Some(None),
+            pr_status: Some(None),
+            active_pull_request: Some(None),
+            pull_requests: Some(None),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&clear).unwrap();
+        assert_eq!(v["prUrl"], serde_json::Value::Null);
+        assert_eq!(v["prNumber"], serde_json::Value::Null);
+        assert_eq!(v["prStatus"], serde_json::Value::Null);
+        assert_eq!(v["activePullRequest"], serde_json::Value::Null);
+        assert_eq!(v["pullRequests"], serde_json::Value::Null);
     }
 
     /// `WorkspaceDiffSummaryFile` matches the TS per-file wire shape.

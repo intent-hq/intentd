@@ -12,15 +12,15 @@ use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, Store};
 const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, status, \
     status_message, attention, path, repository_path, repository_owner, repository_name, \
     worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, pr_status, \
-    active_pull_request, archived, archived_at, tags, created_at, updated_at, last_activity, \
-    token_usage, setup_script";
+    active_pull_request, pull_requests, archived, archived_at, tags, created_at, updated_at, \
+    last_activity, token_usage, setup_script";
 
 impl Store {
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
     pub async fn insert_workspace(&self, ws: &Workspace) -> Result<()> {
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -44,6 +44,7 @@ impl Store {
             .bind(&ws.pr_url)
             .bind(pr_status_to_db(ws)?)
             .bind(active_pr_to_db(ws)?)
+            .bind(pull_requests_to_db(ws)?)
             .bind(ws.archived as i64)
             .bind(&ws.archived_at)
             .bind(tags_to_db(&ws.tags)?)
@@ -80,8 +81,8 @@ impl Store {
              status_message=?, attention=?, path=?, repository_path=?, repository_owner=?, \
              repository_name=?, worktree_path=?, scope=?, skip_worktree=?, is_remote=?, \
              default_model=?, pr_number=?, pr_url=?, pr_status=?, active_pull_request=?, \
-             archived=?, archived_at=?, tags=?, created_at=?, updated_at=?, last_activity=?, \
-             token_usage=?, setup_script=? \
+             pull_requests=?, archived=?, archived_at=?, tags=?, created_at=?, updated_at=?, \
+             last_activity=?, token_usage=?, setup_script=? \
              WHERE id=?",
         )
         .bind(&ws.title)
@@ -104,6 +105,7 @@ impl Store {
         .bind(&ws.pr_url)
         .bind(pr_status_to_db(ws)?)
         .bind(active_pr_to_db(ws)?)
+        .bind(pull_requests_to_db(ws)?)
         .bind(ws.archived as i64)
         .bind(&ws.archived_at)
         .bind(tags_to_db(&ws.tags)?)
@@ -258,6 +260,26 @@ fn active_pr_from_db(s: Option<String>) -> Result<Option<PullRequestInfo>> {
     .transpose()
 }
 
+/// Encode the optional `pull_requests` snapshot list to a JSON TEXT column.
+fn pull_requests_to_db(ws: &Workspace) -> Result<Option<String>> {
+    ws.pull_requests
+        .as_ref()
+        .map(|prs| {
+            serde_json::to_string(prs)
+                .map_err(|e| Error::Internal(format!("encode pull_requests failed: {e}")))
+        })
+        .transpose()
+}
+
+/// Decode the optional `pull_requests` JSON TEXT column.
+fn pull_requests_from_db(s: Option<String>) -> Result<Option<Vec<PullRequestInfo>>> {
+    s.map(|json| {
+        serde_json::from_str::<Vec<PullRequestInfo>>(&json)
+            .map_err(|e| Error::Internal(format!("decode pull_requests failed: {e}")))
+    })
+    .transpose()
+}
+
 /// Encode the optional `token_usage` snapshot to a JSON TEXT column (§5.23).
 fn token_usage_to_db(ws: &Workspace) -> Result<Option<String>> {
     ws.token_usage
@@ -305,6 +327,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         .transpose()?;
     let active_pull_request =
         active_pr_from_db(col::<Option<String>>(row, "active_pull_request")?)?;
+    let pull_requests = pull_requests_from_db(col::<Option<String>>(row, "pull_requests")?)?;
     let token_usage = token_usage_from_db(col::<Option<String>>(row, "token_usage")?)?;
     let setup_script = setup_script_from_db(col::<Option<String>>(row, "setup_script")?)?;
     Ok(Workspace {
@@ -336,6 +359,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         pr_url: col(row, "pr_url")?,
         pr_status,
         active_pull_request,
+        pull_requests,
         archived: col::<i64>(row, "archived")? != 0,
         archived_at: col(row, "archived_at")?,
         // Card aggregates are computed on the workspace.list/get emit path

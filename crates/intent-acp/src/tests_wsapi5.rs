@@ -91,6 +91,7 @@ fn make_workspace(id: &str, variant: WorkspaceVariant) -> Workspace {
         pr_url: None,
         pr_status: None,
         active_pull_request: None,
+        pull_requests: None,
         archived: false,
         archived_at: None,
         task_stats: None,

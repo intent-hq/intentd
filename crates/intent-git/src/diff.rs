@@ -136,6 +136,126 @@ pub fn diff_range(repo_path: &Path, base_ref: &str) -> Result<Vec<FileDiff>> {
     diff_to_file_summaries(&diff)
 }
 
+/// Per-file summaries for `HEAD` → workdir over **tracked** paths only
+/// (staged + unstaged tracked changes; untracked files are **excluded**),
+/// mirroring `git diff HEAD --numstat`. Returns an empty vec when `HEAD` is
+/// unborn (nothing to diff against).
+pub fn diff_head_to_workdir_tracked(repo_path: &Path) -> Result<Vec<FileDiff>> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let Some(head_tree) = repo
+        .head()
+        .ok()
+        .and_then(|h| h.target())
+        .and_then(|oid| repo.find_commit(oid).ok())
+        .and_then(|c| c.tree().ok())
+    else {
+        return Ok(Vec::new());
+    };
+    let diff = repo
+        .diff_tree_to_workdir_with_index(Some(&head_tree), None)
+        .map_err(map_git_err)?;
+    diff_to_file_summaries(&diff)
+}
+
+/// Per-file summaries for the index → workdir diff over **tracked** paths only
+/// (unstaged tracked changes; untracked files are **excluded**), mirroring
+/// `git diff --numstat`. Unlike [`diff_index_to_workdir`], this omits untracked
+/// entries to match the CLI numstat's tracked-only surface.
+pub fn diff_index_to_workdir_tracked(repo_path: &Path) -> Result<Vec<FileDiff>> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let diff = repo
+        .diff_index_to_workdir(None, None)
+        .map_err(map_git_err)?;
+    diff_to_file_summaries(&diff)
+}
+
+/// Per-file summaries for the committed two-dot range `<from_sha>..<to_ref>`
+/// (base tree → target tree), mirroring `git diff --numstat <from>..<to>`.
+/// `from_sha` is any revparse-able revision (typically a merge-base SHA
+/// resolved by the caller); `to_ref` is likewise revparse-able (typically
+/// `HEAD` or a branch name). Returns an empty vec when either side cannot
+/// be resolved.
+pub fn diff_two_dot(repo_path: &Path, from_sha: &str, to_ref: &str) -> Result<Vec<FileDiff>> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let Ok(from_obj) = repo.revparse_single(from_sha) else {
+        return Ok(Vec::new());
+    };
+    let Ok(to_obj) = repo.revparse_single(to_ref) else {
+        return Ok(Vec::new());
+    };
+    let Ok(from_tree) = from_obj.peel_to_tree() else {
+        return Ok(Vec::new());
+    };
+    let Ok(to_tree) = to_obj.peel_to_tree() else {
+        return Ok(Vec::new());
+    };
+    let diff = repo
+        .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)
+        .map_err(map_git_err)?;
+    diff_to_file_summaries(&diff)
+}
+
+/// Resolve the branch boundary the FE branch-base diff/numstat callers use:
+/// prefer the merge-base of `target_ref` and `base_ref` (trying `origin/<base>`
+/// before the bare ref name when `base_ref` has no `/`), else fall back to
+/// `base_sha` when it is an ancestor of `target_ref`. Returns `None` when no
+/// boundary can be resolved (the FE folds that to an empty result).
+///
+/// Ports `resolveBranchBoundary` in `git.service.ts` / the FE bridge seeder.
+pub fn resolve_branch_boundary(
+    repo_path: &Path,
+    base_ref: Option<&str>,
+    base_sha: Option<&str>,
+    target_ref: &str,
+) -> Result<Option<String>> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let target_oid = match repo
+        .revparse_single(target_ref)
+        .ok()
+        .and_then(|o| o.peel_to_commit().ok())
+    {
+        Some(c) => c.id(),
+        None => return Ok(None),
+    };
+
+    if let Some(base) = base_ref.filter(|s| !s.is_empty()) {
+        let candidates: Vec<String> = if base.contains('/') {
+            vec![base.to_string()]
+        } else {
+            vec![format!("origin/{base}"), base.to_string()]
+        };
+        for cand in candidates {
+            let Ok(obj) = repo.revparse_single(&cand) else {
+                continue;
+            };
+            let Ok(commit) = obj.peel_to_commit() else {
+                continue;
+            };
+            if let Ok(mb) = repo.merge_base(target_oid, commit.id()) {
+                return Ok(Some(mb.to_string()));
+            }
+        }
+    }
+
+    if let Some(sha) = base_sha.filter(|s| !s.is_empty()) {
+        let Ok(obj) = repo.revparse_single(sha) else {
+            return Ok(None);
+        };
+        let Ok(commit) = obj.peel_to_commit() else {
+            return Ok(None);
+        };
+        if repo
+            .graph_descendant_of(target_oid, commit.id())
+            .unwrap_or(false)
+            || target_oid == commit.id()
+        {
+            return Ok(Some(commit.id().to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
 /// Per-file summaries for the commit `<commit_hash>^..<commit_hash>` (the
 /// commit's own changes against its first parent). A root commit (no parent)
 /// diffs against the empty tree, so every file appears as additions. An
@@ -489,5 +609,124 @@ mod tests {
             .lines
             .iter()
             .all(|l| l.kind == DiffLineKind::Addition));
+    }
+
+    #[test]
+    fn head_to_workdir_tracked_excludes_untracked_files() {
+        // Tracked modification is counted; the untracked file is not.
+        let dir = init_repo("numstat-head-wd");
+        commit_file(dir.path(), "a.txt", "one\ntwo\nthree\n");
+        write_file(dir.path(), "a.txt", "one\nCHANGED\nthree\nfour\n");
+        write_file(dir.path(), "untracked.txt", "hello\n");
+        let files = diff_head_to_workdir_tracked(dir.path()).unwrap();
+        assert_eq!(files.len(), 1);
+        let f = &files[0];
+        assert_eq!(f.path, "a.txt");
+        assert_eq!(f.additions, 2);
+        assert_eq!(f.deletions, 1);
+    }
+
+    #[test]
+    fn index_to_workdir_tracked_excludes_untracked_files() {
+        // Only the unstaged tracked change appears; the untracked file is
+        // excluded (mirrors `git diff --numstat`, unlike the untracked-
+        // including `diff_index_to_workdir`).
+        let dir = init_repo("numstat-ix-wd");
+        commit_file(dir.path(), "a.txt", "one\ntwo\n");
+        write_file(dir.path(), "a.txt", "one\nTWO\n");
+        write_file(dir.path(), "untracked.txt", "hello\n");
+        let files = diff_index_to_workdir_tracked(dir.path()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "a.txt");
+    }
+
+    #[test]
+    fn two_dot_range_diffs_base_to_target() {
+        // A boundary commit and two follow-up commits: the two-dot range
+        // from the boundary to `HEAD` should show both follow-up changes.
+        let dir = init_repo("numstat-2dot");
+        commit_file(dir.path(), "a.txt", "one\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let boundary = repo.head().unwrap().target().unwrap().to_string();
+        commit_file(dir.path(), "a.txt", "one\ntwo\n");
+        commit_file(dir.path(), "b.txt", "b\n");
+        let files = diff_two_dot(dir.path(), &boundary, "HEAD").unwrap();
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"a.txt"));
+        assert!(paths.contains(&"b.txt"));
+    }
+
+    #[test]
+    fn two_dot_range_unknown_from_is_empty() {
+        let dir = init_repo("numstat-2dot-bad-from");
+        commit_file(dir.path(), "a.txt", "one\n");
+        assert!(diff_two_dot(dir.path(), "no-such-ref", "HEAD")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn resolve_branch_boundary_uses_merge_base_when_base_ref_resolves() {
+        // Boundary is the first commit shared between `main` and the feature
+        // branch, so the merge-base of feature vs main is the seed commit.
+        let dir = init_repo("boundary-merge-base");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let base_head = repo.head().unwrap().target().unwrap().to_string();
+        let main_branch = crate::status::current_branch(&repo);
+        // Branch off, add a commit on the feature branch.
+        {
+            let commit = repo
+                .find_commit(repo.head().unwrap().target().unwrap())
+                .unwrap();
+            repo.branch("feature", &commit, false).unwrap();
+            repo.set_head("refs/heads/feature").unwrap();
+            repo.checkout_head(None).unwrap();
+        }
+        commit_file(dir.path(), "feat.txt", "feat\n");
+        // Add a commit on `main` too, so it moves past the boundary.
+        {
+            let mut branch = repo
+                .find_branch(&main_branch, git2::BranchType::Local)
+                .unwrap();
+            let name = format!("refs/heads/{main_branch}");
+            repo.set_head(&name).unwrap();
+            repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+                .unwrap();
+            // Drop the &mut borrow before mutating repo.
+            let _ = branch.get_mut();
+        }
+        commit_file(dir.path(), "main.txt", "main\n");
+        // Boundary vs feature target should be the seed commit (merge-base),
+        // not the tip of `main` and not the tip of `feature`.
+        let boundary = resolve_branch_boundary(dir.path(), Some(&main_branch), None, "feature")
+            .unwrap()
+            .expect("boundary resolves");
+        assert_eq!(boundary, base_head);
+    }
+
+    #[test]
+    fn resolve_branch_boundary_falls_back_to_ancestor_base_sha() {
+        // `base_ref` does not resolve; `base_sha` is an ancestor of target →
+        // use it directly.
+        let dir = init_repo("boundary-fallback-sha");
+        commit_file(dir.path(), "a.txt", "one\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let seed = repo.head().unwrap().target().unwrap().to_string();
+        commit_file(dir.path(), "b.txt", "two\n");
+        let boundary =
+            resolve_branch_boundary(dir.path(), Some("no-such-ref"), Some(&seed), "HEAD")
+                .unwrap()
+                .expect("boundary resolves via base_sha");
+        assert_eq!(boundary, seed);
+    }
+
+    #[test]
+    fn resolve_branch_boundary_none_when_nothing_resolves() {
+        let dir = init_repo("boundary-none");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        let boundary =
+            resolve_branch_boundary(dir.path(), Some("no-such-ref"), None, "HEAD").unwrap();
+        assert!(boundary.is_none());
     }
 }

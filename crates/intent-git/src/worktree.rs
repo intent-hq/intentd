@@ -186,6 +186,27 @@ pub fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Best-effort delete of the `index.lock` file for the worktree at
+/// `worktree_path` (`gitService.removeLockFile`). Resolves the actual git dir
+/// via libgit2 so linked worktrees (where `<worktree>/.git` is a pointer file)
+/// are handled the same as main repositories. Returns whether a lock file was
+/// removed. A missing lock file is `Ok(false)`; other filesystem errors surface
+/// as [`Error::Internal`].
+pub fn remove_index_lock(worktree_path: &Path) -> Result<bool> {
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    // `Repository::path()` returns the worktree-specific git dir (e.g.
+    // `<main>/.git/worktrees/<name>/`) — that's where `index.lock` lives.
+    let lock = repo.path().join("index.lock");
+    match std::fs::remove_file(&lock) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(Error::Internal(format!(
+            "failed to remove {}: {e}",
+            lock.display()
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,5 +386,24 @@ mod tests {
             .with_lock(&a, || async { locks.with_lock(&b, || async { 42 }).await })
             .await;
         assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn remove_index_lock_removes_present_lock_file() {
+        let dir = init_repo("lock-remove");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let lock = repo.path().join("index.lock");
+        std::fs::write(&lock, b"pid").unwrap();
+        assert!(lock.exists());
+        assert!(remove_index_lock(dir.path()).unwrap());
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn remove_index_lock_is_ok_when_missing() {
+        let dir = init_repo("lock-missing");
+        commit_file(dir.path(), "a.txt", "x\n");
+        assert!(!remove_index_lock(dir.path()).unwrap());
     }
 }

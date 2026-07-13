@@ -21,7 +21,8 @@ use crate::model::{
     TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
     TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
-    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspacePurgeResult,
+    WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -201,6 +202,98 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::generate_setup_script not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Duplicate a workspace (PROTOCOL §5.1): clone the persisted metadata into
+    /// a freshly minted id, seed the well-known `spec` note, and copy over any
+    /// non-`spec` notes from the source. Runtime-only fields (`activity`, card
+    /// aggregates, timeline, changesets) are not carried over; the new
+    /// workspace starts on a fresh branch derived from its id (uniquified with
+    /// a `-N` suffix against the source repo's local/remote-tracking refs on
+    /// collision, same as `workspace.create`). When the source carries a
+    /// local `repositoryPath` and is not `skipWorktree`/`isRemote`, the daemon
+    /// provisions a linked worktree at `<root>/<newId>/<repo-slug>` on that
+    /// branch (mirroring the `workspace.create` flow); provisioning failures
+    /// are logged and the duplicate still returns without a `worktreePath`
+    /// (FE parity: "user can create it manually"). `newTitle` overrides the
+    /// auto-suffixed `"<source> (Copy)"` title. `NotFound` if the source
+    /// workspace is absent.
+    fn duplicate_workspace(
+        &self,
+        id: WorkspaceId,
+        new_title: Option<String>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        let _ = (id, new_title);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::duplicate_workspace not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Restore an archived workspace to `active` (PROTOCOL §5.1). Alias of
+    /// [`Self::unarchive_workspace`] with the same event emission; provided so
+    /// clients can express intent (archive → restore) rather than the raw state
+    /// transition. `NotFound` if the workspace is absent.
+    fn restore_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+        self.unarchive_workspace(id)
+    }
+
+    /// Best-effort per-workspace cleanup (PROTOCOL §5.1): reclaim the workspace
+    /// cache directory and, when a local worktree exists, run `git gc` on it.
+    /// Cache reclamation runs the recursive-delete under the daemon-owned
+    /// `<workspaces_root>/<id>/cache/` path (never a caller-supplied path);
+    /// both cache-removal and `git gc` failures are logged and swallowed so
+    /// the workspace stays healthy. `NotFound` if the workspace is absent;
+    /// otherwise this RPC always resolves `Ok(())`.
+    fn cleanup_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::cleanup_workspace not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Purge deleted workspaces and orphan on-disk directories (PROTOCOL §5.1).
+    /// Sweeps `<workspaces_root>/`: rows whose stored status is `Deleted` are
+    /// dropped alongside their directory (`removed`), and directories with no
+    /// matching row are removed too (`orphans`). Best-effort; individual
+    /// per-workspace failures are logged and skipped rather than aborting the
+    /// sweep.
+    fn purge_workspaces(&self) -> BoxFuture<'_, Result<WorkspacePurgeResult>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::purge_workspaces not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Scan a directory for git repositories (PROTOCOL §5.1). Returns absolute
+    /// paths (as strings) of every directory that contains a `.git` folder,
+    /// walking a bounded depth to keep the scan cheap. Non-repo directories are
+    /// recursed into; a git repo is emitted and its subtree is skipped.
+    fn find_repositories(&self, directory: String) -> BoxFuture<'_, Result<Vec<String>>> {
+        let _ = directory;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::find_repositories not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Initialize a new git repository at `path` (PROTOCOL §5.1): create the
+    /// directory when missing, `git init -b main`, seed a `.gitignore` and
+    /// `README.md`, and land an initial commit. When the target is already a
+    /// git repository with at least one commit the call is a quiet no-op.
+    /// Failures propagate as `Internal` errors.
+    fn initialize_repository(&self, path: String) -> BoxFuture<'_, Result<()>> {
+        let _ = path;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::initialize_repository not implemented".to_string(),
             ))
         })
     }
@@ -2010,6 +2103,212 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_show_file not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.numstat`: per-file additions/deletions for a workspace's tracked
+    /// changes (mirrors `git diff --numstat`). When `base_ref`/`base_sha` are
+    /// set, resolves the branch boundary (merge-base of `target_ref` and
+    /// `base_ref`, else `base_sha` when it is an ancestor of `target_ref`) and
+    /// returns `<boundary>..<target_ref>`; else `staged=true` selects HEAD→index
+    /// (`--cached`), `staged=false` selects index→workdir tracked-only, and the
+    /// unset/`None` default is HEAD→workdir tracked-only. `target_ref` defaults
+    /// to `HEAD`. `paths` filters to the given repo-relative paths. Result is
+    /// `[{ filePath, additions, deletions }]`; remote/non-repo workspaces and
+    /// an unresolved boundary return an empty array (wire §7.7).
+    fn git_numstat(
+        &self,
+        workspace_id: WorkspaceId,
+        staged: Option<bool>,
+        base_ref: Option<String>,
+        base_sha: Option<String>,
+        target_ref: Option<String>,
+        paths: Option<Vec<String>>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, staged, base_ref, base_sha, target_ref, paths);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_numstat not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.branchDiff`: committed diff of `target_ref` vs the branch boundary
+    /// (merge-base of `target_ref` and `base_ref`, else `base_sha` when it is
+    /// an ancestor of `target_ref`). Returns
+    /// `[{ file, chunks: [], oldContent, newContent }]` — each entry carries the
+    /// full file contents at the boundary and target so the FE branch-base
+    /// viewer can render the diff without a follow-up read. `target_ref`
+    /// defaults to `HEAD`. `paths` narrows the result. Remote/non-repo
+    /// workspaces and an unresolved boundary return an empty array (wire §7.7);
+    /// omitting both `base_ref` and `base_sha` is `-32602`.
+    fn git_branch_diff(
+        &self,
+        workspace_id: WorkspaceId,
+        base_ref: Option<String>,
+        base_sha: Option<String>,
+        target_ref: Option<String>,
+        paths: Option<Vec<String>>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, base_ref, base_sha, target_ref, paths);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_branch_diff not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.getRemoteUrl`: the configured URL of the named remote for the git
+    /// repository at `repo_path` (default `remote_name` = `"origin"`). Result
+    /// is `{ url: string | null }` — a missing remote folds to `null` rather
+    /// than an error (FE `git-tracking:get-remote-url` parity). Path-based
+    /// like the branch reads (§5.6): a nonexistent or non-git `repo_path` is
+    /// `-32602`.
+    fn git_get_remote_url(
+        &self,
+        repo_path: String,
+        remote_name: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (repo_path, remote_name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_get_remote_url not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.stageHunk`: apply `hunk_patch` (a unified-diff patch for one or
+    /// more hunks) to the index only for `file_path`, mirroring
+    /// `gitService.stageHunk` (`git apply --cached [--3way]`). Failures surface
+    /// as `-32603` (PROTOCOL §5.6).
+    fn git_stage_hunk(
+        &self,
+        workspace_id: WorkspaceId,
+        file_path: String,
+        hunk_patch: String,
+    ) -> BoxFuture<'_, Result<()>> {
+        let _ = (workspace_id, file_path, hunk_patch);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_stage_hunk not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.unstageHunk`: reverse-apply `hunk_patch` to the index only for
+    /// `file_path`, mirroring `gitService.unstageHunk`
+    /// (`git apply --cached --reverse [--3way]`). Failures surface as `-32603`
+    /// (PROTOCOL §5.6).
+    fn git_unstage_hunk(
+        &self,
+        workspace_id: WorkspaceId,
+        file_path: String,
+        hunk_patch: String,
+    ) -> BoxFuture<'_, Result<()>> {
+        let _ = (workspace_id, file_path, hunk_patch);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_unstage_hunk not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.push`: push the workspace's current branch to `origin` (with
+    /// `+refs/heads/<branch>` when `force` is set), mirroring
+    /// `gitService.push`. Returns `{ branch, pushedSha }` (camelCase on the
+    /// wire — see PROTOCOL §5.6). Failures surface as `-32603`.
+    fn git_push(
+        &self,
+        workspace_id: WorkspaceId,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, force);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_push not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.fetch`: fetch the workspace's current branch from `origin`,
+    /// mirroring `gitService.fetch`. Updates the local remote-tracking ref.
+    /// Failures surface as `-32603` (PROTOCOL §5.6).
+    fn git_fetch(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_fetch not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.createBranch`: create `branch_name` from `HEAD` in the workspace's
+    /// worktree and optionally check it out (`gitService.createBranch`).
+    /// Failures surface as `-32603` (PROTOCOL §5.6).
+    fn git_create_branch(
+        &self,
+        workspace_id: WorkspaceId,
+        branch_name: String,
+        checkout: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, branch_name, checkout);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_create_branch not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.checkoutBranch`: check out an existing `branch_name` in the
+    /// workspace's worktree (`gitService.checkoutBranch`). Failures surface as
+    /// `-32603` (PROTOCOL §5.6).
+    fn git_checkout_branch(
+        &self,
+        workspace_id: WorkspaceId,
+        branch_name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, branch_name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_checkout_branch not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.renameBranch`: rename `old_branch_name` → `new_branch_name` in the
+    /// workspace's repository (`gitService.renameBranch`). Refuses when the old
+    /// branch is missing, the new name already exists, or the new name is
+    /// checked out in another worktree. A same-as-old new name (after trim) is
+    /// a no-op. Failures surface as `-32603`; validation failures (empty
+    /// `old_branch_name` or empty `new_branch_name`) as `-32602`
+    /// (PROTOCOL §5.6).
+    fn git_rename_branch(
+        &self,
+        workspace_id: WorkspaceId,
+        old_branch_name: String,
+        new_branch_name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, old_branch_name, new_branch_name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_rename_branch not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.removeLockFile`: delete `index.lock` in the workspace worktree's
+    /// git dir (`gitService.removeLockFile`). Returns `{ removed: bool }`;
+    /// a missing lock file is not an error. Remote workspaces short-circuit
+    /// `{ removed: false }`. Failures surface as `-32603` (PROTOCOL §5.6).
+    fn git_remove_lock_file(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_remove_lock_file not implemented".to_string(),
             ))
         })
     }

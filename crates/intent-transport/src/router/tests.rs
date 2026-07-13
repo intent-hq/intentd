@@ -47,6 +47,7 @@ fn sample_ws() -> Workspace {
         pr_url: None,
         pr_status: None,
         active_pull_request: None,
+        pull_requests: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -152,6 +153,55 @@ impl WorkspaceApi for FakeApi {
                 return Err(Error::NotFound("workspace".to_string()));
             }
             Ok(ws_with(&id))
+        })
+    }
+    fn duplicate_workspace(
+        &self,
+        id: WorkspaceId,
+        new_title: Option<String>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            let mut ws = ws_with(&WorkspaceId::from(format!("{}-copy", id.as_str())));
+            ws.title = new_title.unwrap_or_else(|| format!("{} (Copy)", ws.title));
+            Ok(ws)
+        })
+    }
+    fn cleanup_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            Ok(())
+        })
+    }
+    fn purge_workspaces(&self) -> BoxFuture<'_, Result<intent_core::WorkspacePurgeResult>> {
+        Box::pin(async move {
+            Ok(intent_core::WorkspacePurgeResult {
+                removed: 3,
+                orphans: 1,
+            })
+        })
+    }
+    fn find_repositories(&self, directory: String) -> BoxFuture<'_, Result<Vec<String>>> {
+        Box::pin(async move {
+            if directory == "fail" {
+                return Err(Error::Internal("scan failed".to_string()));
+            }
+            Ok(vec![
+                format!("{directory}/repo-a"),
+                format!("{directory}/repo-b"),
+            ])
+        })
+    }
+    fn initialize_repository(&self, path: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            if path == "fail" {
+                return Err(Error::Internal("init failed".to_string()));
+            }
+            Ok(())
         })
     }
     fn dismiss_attention(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
@@ -1895,18 +1945,57 @@ async fn workspace_update_returns_workspace_object() {
 }
 
 #[tokio::test]
-async fn workspace_lifecycle_methods_return_success_true() {
-    for method in [
-        "workspace.delete",
-        "workspace.archive",
-        "workspace.unarchive",
-    ] {
-        let msg = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"workspaceId":"ws-1"}}}}"#
-        );
-        let v = call(&msg).await.unwrap();
-        assert_eq!(v["result"]["success"], serde_json::json!(true), "{method}");
-    }
+async fn workspace_delete_returns_success_true() {
+    let msg =
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.delete","params":{"workspaceId":"ws-1"}}"#;
+    let v = call(msg).await.unwrap();
+    assert_eq!(v["result"]["success"], serde_json::json!(true));
+}
+
+/// `workspace.archive` and `workspace.unarchive` return the updated
+/// `workspace` record (§5.1) — a `{success:true}` shape would force a
+/// follow-up `workspace.get` on the FE. The `archived` flag flips through
+/// the wire result on each call.
+#[tokio::test]
+async fn workspace_archive_and_unarchive_return_workspace() {
+    let archived = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.archive","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        archived["result"]["workspace"]["id"],
+        serde_json::json!("ws-1")
+    );
+    assert_eq!(
+        archived["result"]["workspace"]["archived"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        archived["result"]["workspace"]["status"],
+        serde_json::json!("Archived")
+    );
+    // The `success` shape must not leak.
+    assert!(archived["result"].get("success").is_none());
+
+    let unarchived = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace.unarchive","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        unarchived["result"]["workspace"]["id"],
+        serde_json::json!("ws-1")
+    );
+    assert_eq!(
+        unarchived["result"]["workspace"]["archived"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        unarchived["result"]["workspace"]["status"],
+        serde_json::json!("Active")
+    );
+    assert!(unarchived["result"].get("success").is_none());
 }
 
 #[tokio::test]
@@ -1933,11 +2022,127 @@ async fn workspace_mutations_missing_id_is_minus_32602() {
         "workspace.unarchive",
         "workspace.dismissAttention",
         "workspace.markSeen",
+        "workspace.duplicate",
+        "workspace.restore",
+        "workspace.cleanup",
     ] {
         let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{}}}}"#);
         let v = call(&msg).await.unwrap();
         assert_eq!(err_code(&v), -32602, "{method}");
     }
+}
+
+#[tokio::test]
+async fn workspace_duplicate_returns_workspace_with_new_title() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.duplicate","params":{"workspaceId":"ws-1","newTitle":"My Copy"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"]["workspace"]["title"],
+        serde_json::json!("My Copy")
+    );
+    assert_eq!(
+        v["result"]["workspace"]["id"],
+        serde_json::json!("ws-1-copy")
+    );
+}
+
+#[tokio::test]
+async fn workspace_duplicate_defaults_to_copy_suffix() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.duplicate","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"]["workspace"]["title"],
+        serde_json::json!("WS One (Copy)")
+    );
+}
+
+#[tokio::test]
+async fn workspace_duplicate_not_found_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.duplicate","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Workspace not found")
+    );
+}
+
+#[tokio::test]
+async fn workspace_restore_returns_workspace() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.restore","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["workspace"]["id"], serde_json::json!("ws-1"));
+}
+
+#[tokio::test]
+async fn workspace_cleanup_returns_success_true() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.cleanup","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["success"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn workspace_purge_returns_removed_and_orphans() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.purge","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(v["result"]["removed"], serde_json::json!(3));
+    assert_eq!(v["result"]["orphans"], serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn workspace_find_repositories_returns_repositories_array() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.findRepositories","params":{"directory":"/tmp/scan"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"]["repositories"],
+        serde_json::json!(["/tmp/scan/repo-a", "/tmp/scan/repo-b"])
+    );
+}
+
+#[tokio::test]
+async fn workspace_find_repositories_missing_directory_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.findRepositories","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn workspace_initialize_repository_returns_success_true() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.initializeRepository","params":{"path":"/tmp/new-repo"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["success"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn workspace_initialize_repository_missing_path_is_minus_32602() {
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.initializeRepository","params":{}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32602);
 }
 
 #[tokio::test]
