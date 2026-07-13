@@ -2911,9 +2911,10 @@ fn opt_nonempty_str(params: &Map<String, Value>, name: &str) -> Option<String> {
 /// `Vec<ContextItem>`. The daemon treats each item as an opaque JSON blob
 /// authored by the FE (`ContextItem` union in
 /// `packages/cloudlands-fe/src/features/context/types.ts`); the only
-/// required field is a non-empty string `id`. `items` itself must be an
-/// array — absent, non-array, or per-item shape errors surface as
-/// `-32602 Invalid params`.
+/// required field is a non-empty string `id`, and ids must be unique inside
+/// a single request (the store keys rows by `(workspaceId, id)`). `items`
+/// itself must be an array — absent, non-array, per-item shape errors, and
+/// duplicate ids surface as `-32602 Invalid params`.
 fn require_context_items(params: &Map<String, Value>) -> Result<Vec<ContextItem>, RpcErr> {
     let raw = params
         .get("items")
@@ -2922,6 +2923,8 @@ fn require_context_items(params: &Map<String, Value>) -> Result<Vec<ContextItem>
         .as_array()
         .ok_or_else(|| rpc(INVALID_PARAMS, "items must be an array"))?;
     let mut out = Vec::with_capacity(arr.len());
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(arr.len());
     for (idx, entry) in arr.iter().enumerate() {
         let item: ContextItem = serde_json::from_value(entry.clone()).map_err(|e| {
             rpc(
@@ -2935,6 +2938,12 @@ fn require_context_items(params: &Map<String, Value>) -> Result<Vec<ContextItem>
                 format!("items[{idx}].id must be a non-empty string"),
             ));
         }
+        if !seen.insert(item.id.clone()) {
+            return Err(rpc(
+                INVALID_PARAMS,
+                format!("items[{idx}].id is a duplicate: {:?}", item.id),
+            ));
+        }
         out.push(item);
     }
     Ok(out)
@@ -2944,7 +2953,11 @@ fn require_context_items(params: &Map<String, Value>) -> Result<Vec<ContextItem>
 /// `byNoteId → byTaskKey → TaskAgentLink` map (matches
 /// `TaskAgentAssociationsState.byNoteId[noteId][taskKey]` so the FE
 /// hydration is a mechanical cut-over from
-/// `localStorage["task-agent-associations:{wsId}"]`).
+/// `localStorage["task-agent-associations:{wsId}"]`). `TaskAgentLink`'s
+/// fields (strings + `i64`) are all trivially serializable — a
+/// `serde_json::to_value` failure here would indicate a corrupted process,
+/// so an `expect` is preferable to silently emitting a malformed
+/// `linksByNoteId` shape.
 fn links_by_note_id(links: &[TaskAgentLink]) -> Value {
     let mut by_note: Map<String, Value> = Map::new();
     for link in links {
@@ -2953,10 +2966,9 @@ fn links_by_note_id(links: &[TaskAgentLink]) -> Value {
             .entry(note_id)
             .or_insert_with(|| Value::Object(Map::new()));
         if let Value::Object(inner) = entry {
-            inner.insert(
-                link.task_key.clone(),
-                serde_json::to_value(link).unwrap_or(Value::Null),
-            );
+            let value =
+                serde_json::to_value(link).expect("TaskAgentLink is always serializable to JSON");
+            inner.insert(link.task_key.clone(), value);
         }
     }
     Value::Object(by_note)

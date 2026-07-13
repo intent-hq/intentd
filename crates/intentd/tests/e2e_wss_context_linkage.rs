@@ -4,10 +4,15 @@
 //! `workspace:context-changed` / `task:agent-linked` /
 //! `task:agent-unlinked`). Drives a real [`WsApiServer`] over plain `ws://`
 //! (insecure dev mode, same pattern as `e2e_wss_sticky_reverse.rs`) so the
-//! HTTPS-upgrade → JSON-RPC → router → services → store round-trip is
+//! WebSocket-upgrade → JSON-RPC → router → services → store round-trip is
 //! exercised end-to-end, matching the FE call sites in
 //! `packages/cloudlands-fe/src/store/renderer/slices/context/` and
-//! `.../task-agent-associations/`.
+//! `.../task-agent-associations/`. TLS pinning, bearer auth, origin
+//! allow-list and heartbeat are already covered end-to-end by the
+//! spawned-daemon suites (see `e2e_wss_workspace_worktree.rs` /
+//! `e2e_wss_agent_rehydration.rs`); the router path exercised here reuses
+//! that shared WSS listener, so per-method suites do not re-verify the
+//! TLS/auth handshake.
 
 #![cfg(unix)]
 
@@ -85,6 +90,14 @@ async fn connect(port: u16) -> PlainWs {
 }
 
 async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
+    let v = wss_rpc_raw(ws, id, method, params).await;
+    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
+    v["result"].clone()
+}
+
+/// Like [`wss_rpc`] but returns the full envelope so callers can assert on
+/// `error.code` for negative-path tests (invalid params, etc.).
+async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string()))
         .await
@@ -101,8 +114,7 @@ async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Valu
             Ok(Some(Ok(Message::Text(text)))) => {
                 let v: Value = serde_json::from_str(&text).expect("json");
                 if v.get("id") == Some(&json!(id)) {
-                    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
-                    return v["result"].clone();
+                    return v;
                 }
             }
             Ok(Some(Ok(Message::Ping(p)))) => {
@@ -408,4 +420,36 @@ async fn task_agent_link_lifecycle_and_events() {
     .await;
     assert_eq!(final_list["links"].as_array().unwrap().len(), 2);
     assert!(final_list["linksByNoteId"]["spec"].get("Ship it").is_none());
+}
+
+/// Negative path: `workspace.updateContext` rejects duplicate item ids with
+/// `-32602 Invalid params` (the store rows are keyed by
+/// `(workspace_id, id)`, so the router validates up front to keep the error
+/// contract clean instead of surfacing a store constraint violation).
+#[tokio::test]
+async fn workspace_update_context_rejects_duplicate_ids() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port).await;
+
+    let ws = wss_rpc(&mut rpc, 1, "workspace.create", json!({ "title": "Dup" })).await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+
+    let dup = json!([
+        { "id": "dup", "type": "note", "provider": "internal" },
+        { "id": "dup", "type": "note", "provider": "internal" },
+    ]);
+    let resp = wss_rpc_raw(
+        &mut rpc,
+        2,
+        "workspace.updateContext",
+        json!({ "workspaceId": ws_id, "items": dup }),
+    )
+    .await;
+    let err = resp.get("error").expect("duplicate-id must error");
+    assert_eq!(err["code"], -32602, "invalid params: {resp}");
+    let msg = err["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("duplicate") && msg.contains("dup"),
+        "duplicate-id message: {msg}"
+    );
 }
