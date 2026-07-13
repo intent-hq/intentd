@@ -2733,6 +2733,41 @@ fn token_usage_changed_event(workspace_id: &WorkspaceId, usage: &TokenUsage) -> 
     }
 }
 
+/// Wall-clock bound for a single `git.pull` operation before the daemon
+/// short-circuits with a structured failure. Matches the TS handler's
+/// `timeout: 120_000` on `git pull --rebase` (`git.ipc.ts` PULL_BRANCH), so
+/// FE behaviour on a hung remote is unchanged.
+const GIT_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run a blocking `git.pull`-style closure off the async runtime with an
+/// operation timeout, returning the structured `GitPullResult { ok: false,
+/// error }` shape on timeout so the FE contract (expected pull failures are
+/// never JSON-RPC errors — PROTOCOL §5.6) is preserved.
+///
+/// libgit2 has no in-flight cancellation, so on timeout the spawned blocking
+/// task keeps running detached until it observes a network/auth failure. This
+/// matches the reference handler's process-kill semantics closely enough:
+/// the bounded credential callback in `intent_git::auth` guarantees any
+/// auth-shaped hang terminates instead of spinning a runtime worker forever
+/// (the runtime-saturation vector behind the FE `host.status` timeout).
+async fn git_pull_bounded<F>(
+    op: F,
+    timeout: std::time::Duration,
+) -> Result<intent_core::GitPullResult>
+where
+    F: FnOnce() -> Result<intent_core::GitPullResult> + Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(op);
+    match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(res)) => res,
+        Ok(Err(join_err)) => Err(Error::Internal(format!("git.pull task failed: {join_err}"))),
+        Err(_elapsed) => Ok(intent_core::GitPullResult {
+            ok: false,
+            error: Some(format!("git.pull timed out after {}s", timeout.as_secs())),
+        }),
+    }
+}
+
 /// Build a `git:pull` event for a completed pull inside a workspace worktree
 /// (§6.5). Payload `{ workspaceId, operation: "pull", branch }` mirrors the
 /// reserved `GitOperationEvent` shape in the FE `events/types.ts` so a client
@@ -7379,8 +7414,19 @@ impl WorkspaceApi for Services {
             if branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams("branchName is required".to_string()));
             }
-            let outcome =
-                intent_git::pull::pull_branch(std::path::Path::new(&repo_path), &branch_name)?;
+            // libgit2's pull is blocking and has no cancellation, so drive it
+            // through `spawn_blocking` + a wall-clock timeout to keep a slow /
+            // hung remote from wedging the async runtime (the vector behind the
+            // FE `git.pull` and `host.status` timeouts). On timeout the caller
+            // gets the structured `{ ok: false, error }` failure shape — never
+            // a JSON-RPC error — matching the TS PULL_BRANCH contract.
+            let pull_path = std::path::PathBuf::from(&repo_path);
+            let pull_branch = branch_name.clone();
+            let outcome = git_pull_bounded(
+                move || intent_git::pull::pull_branch(&pull_path, &pull_branch),
+                GIT_PULL_TIMEOUT,
+            )
+            .await?;
             // Best-effort workspace resolution: `git.pull` is path-scoped (the
             // workspace-create auto-pull runs before the workspace row exists),
             // so we look up any workspace pointing at this worktree and skip
