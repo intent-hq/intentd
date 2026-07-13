@@ -9898,6 +9898,58 @@ mod initial_agent_orchestration {
             );
         }
     }
+
+    /// No-prompt path must not persist a caller-supplied
+    /// `metadata.initialMessage`: the daemon owns the `initialMessage`
+    /// invariant end-to-end, so a workspace created without a prompt has an
+    /// empty transcript even if the caller stuffed a stray prompt into the
+    /// initial-agent metadata. Otherwise `agent_create_op`'s metadata
+    /// harvest would silently promote the caller value into
+    /// `AgentSession.initial_message`.
+    #[tokio::test]
+    async fn no_prompt_drops_caller_supplied_initial_message_in_metadata() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let services =
+            Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+
+        let requested = format!("agent-{}", uuid::Uuid::new_v4());
+        let res = services
+            .create_workspace(
+                create_input(Some(WorkspaceCreateInitialAgent {
+                    agent_id: Some(requested.clone()),
+                    prompt: None,
+                    name: Some("Coordinator".to_string()),
+                    model: Some("opus".to_string()),
+                    specialist: Some("implementor".to_string()),
+                    metadata: Some(json!({ "initialMessage": "stale prompt from caller" })),
+                    ..Default::default()
+                })),
+                None,
+            )
+            .await
+            .expect("create");
+
+        assert!(res.initial_agent.is_some(), "initial agent row persisted");
+        let session = store
+            .get_agent_session(&AgentId::from(requested.as_str()))
+            .await
+            .expect("session");
+        assert!(
+            session.initial_message.is_none(),
+            "caller-supplied metadata.initialMessage dropped on no-prompt create: {:?}",
+            session.initial_message
+        );
+        let messages = store
+            .get_agent_messages(&AgentId::from(requested.as_str()), None)
+            .await
+            .expect("messages");
+        assert!(
+            messages.is_empty(),
+            "no messages persisted on no-prompt create: {messages:?}"
+        );
+    }
 }
 
 /// Daemon-owned clone orchestration inside `workspace.create` (PROTOCOL §5.1):

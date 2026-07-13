@@ -4862,11 +4862,19 @@ impl WorkspaceApi for Services {
                             "isFirstWorkspaceAgent".to_string(),
                             serde_json::json!(true),
                         );
+                        // Own the `metadata.initialMessage` invariant: when
+                        // the daemon has a non-empty prompt, stamp it (delegate
+                        // parity — a wake-up can resume from it); otherwise
+                        // drop any caller-supplied `initialMessage` so
+                        // `agent_create_op`'s metadata harvest cannot persist
+                        // a stale prompt for a no-prompt workspace.
                         if let Some(ref p) = prompt {
                             metadata.insert(
                                 "initialMessage".to_string(),
                                 serde_json::json!(p.clone()),
                             );
+                        } else {
+                            metadata.remove("initialMessage");
                         }
                         let extra = intent_core::AgentCreateExtra {
                             provider: nonempty_owned(agent.provider),
