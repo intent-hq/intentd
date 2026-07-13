@@ -356,6 +356,191 @@ async fn uds_git_write_ops_round_trip() {
     std::fs::remove_dir_all(&base).ok();
 }
 
+/// Over-the-wire coverage for the write methods added alongside the
+/// Wave B remediation: hunk stage/unstage, branch create/checkout/rename,
+/// and the index.lock removal helper. `git.push`/`git.fetch` are covered by
+/// their own crate-level tests (they need a bare-remote fixture).
+#[tokio::test]
+async fn uds_git_write_ops_wave_b_round_trip() {
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let base = Path::new("/tmp").join(format!("intentd-gitwb-{}", &short[..8]));
+    let data_dir = base.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let repo = base.join("repo");
+    seed_repo(&repo);
+
+    let config = {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTENTD_DATA_DIR", &data_dir);
+        Config::resolve().expect("resolve config")
+    };
+
+    let ws_id = WorkspaceId::from("ws-gitwb");
+    {
+        let store = Store::open(&config.db_path).await.expect("open store");
+        store
+            .insert_workspace(&seed_workspace(&ws_id, repo.to_str().unwrap()))
+            .await
+            .expect("seed ws");
+    }
+
+    let store = Store::open(&config.db_path).await.expect("reopen store");
+    let bus = EventBus::new(store.clone());
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store).with_workspaces_root(
+        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+    ));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let socket = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_uds(services, bus, &socket, None, async move {
+            let _ = rx.await;
+        })
+        .await
+        .expect("serve");
+    });
+    for _ in 0..50 {
+        if config.socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // (a) createBranch without checkout leaves HEAD alone.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.createBranch","params":{"workspaceId":"ws-gitwb","branchName":"feature","checkout":false}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["branch"], json!("feature"));
+
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":2,"method":"git.status","params":{"workspaceId":"ws-gitwb"}}"#,
+    )
+    .await;
+    let branch_before = resp["result"]["branch"].as_str().unwrap().to_string();
+    assert_ne!(branch_before, "feature");
+
+    // (b) checkoutBranch switches HEAD.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":3,"method":"git.checkoutBranch","params":{"workspaceId":"ws-gitwb","branchName":"feature"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["branch"], json!("feature"));
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":4,"method":"git.status","params":{"workspaceId":"ws-gitwb"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["branch"], json!("feature"));
+
+    // (c) renameBranch swaps the current branch's name.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":5,"method":"git.renameBranch","params":{"workspaceId":"ws-gitwb","oldBranchName":"feature","newBranchName":"feature-2"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["oldBranch"], json!("feature"));
+    assert_eq!(resp["result"]["newBranch"], json!("feature-2"));
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":6,"method":"git.status","params":{"workspaceId":"ws-gitwb"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["branch"], json!("feature-2"));
+
+    // (d) renameBranch with an empty name → -32602.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":7,"method":"git.renameBranch","params":{"workspaceId":"ws-gitwb","oldBranchName":"feature-2","newBranchName":""}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+
+    // (e) stageHunk on a working-tree modification stages just the hunk.
+    std::fs::write(repo.join("seed.txt"), "seed\nnew line\n").unwrap();
+    let patch = "diff --git a/seed.txt b/seed.txt\n--- a/seed.txt\n+++ b/seed.txt\n@@ -1 +1,2 @@\n seed\n+new line\n";
+    let params = json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "git.stageHunk",
+        "params": {
+            "workspaceId": "ws-gitwb",
+            "filePath": "seed.txt",
+            "hunkPatch": patch,
+        },
+    });
+    let resp = send(&config.socket_path, &params.to_string()).await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":9,"method":"git.status","params":{"workspaceId":"ws-gitwb"}}"#,
+    )
+    .await;
+    let staged = resp["result"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == json!("seed.txt"))
+        .expect("seed.txt in status");
+    assert_eq!(staged["staged"], json!(true));
+
+    // (f) unstageHunk reverses the previously-staged hunk.
+    let params = json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "git.unstageHunk",
+        "params": {
+            "workspaceId": "ws-gitwb",
+            "filePath": "seed.txt",
+            "hunkPatch": patch,
+        },
+    });
+    let resp = send(&config.socket_path, &params.to_string()).await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":11,"method":"git.status","params":{"workspaceId":"ws-gitwb"}}"#,
+    )
+    .await;
+    let unstaged = resp["result"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == json!("seed.txt"))
+        .expect("seed.txt in status");
+    assert_eq!(unstaged["staged"], json!(false));
+
+    // (g) removeLockFile is `removed=false` when no lock file is present.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":12,"method":"git.removeLockFile","params":{"workspaceId":"ws-gitwb"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["removed"], json!(false));
+
+    // (h) removeLockFile deletes a present index.lock.
+    let lock = repo.join(".git").join("index.lock");
+    std::fs::write(&lock, b"pid").unwrap();
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":13,"method":"git.removeLockFile","params":{"workspaceId":"ws-gitwb"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["removed"], json!(true));
+    assert!(!lock.exists());
+
+    let _ = tx.send(());
+    let _ = server.await;
+    std::fs::remove_dir_all(&base).ok();
+}
+
 /// Over-the-wire git read slice: `git.changes`, `git.diffs` (+ `git.diff`
 /// alias), and `git.commits` (+ `git.log` alias) populate the FE panels.
 #[tokio::test]

@@ -6,7 +6,9 @@
 //! `git add`. The CSV/array parse and the `.`/`*`/`--all` rejection are wire
 //! policy and live in `intent-services` (the TS `ws.git.stage` builder).
 
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use git2::{ObjectType, Repository};
 use intent_core::{Error, Result};
@@ -236,6 +238,136 @@ fn normalize_rel(workdir: &Path, raw: &str) -> String {
     }
 }
 
+/// Apply a unified-diff `patch` to the index only (`git apply --cached`),
+/// staging one or more hunks without staging the rest of `file_path`. Mirrors
+/// `gitService.stageHunk`: a direct apply is attempted first, then a `--3way`
+/// retry to tolerate small context mismatches. Shells out to `git` because
+/// libgit2's `apply` API does not implement the three-way fallback. `file_path`
+/// is validated against every `diff --git a/… b/…` header in `patch` so a
+/// client cannot slip a multi-file or path-mismatched patch through the
+/// single-file wire contract (`-32602` on mismatch). The patch is streamed on
+/// stdin so no temp file is written.
+pub fn stage_hunk(worktree_path: &Path, file_path: &str, patch: &str) -> Result<()> {
+    validate_single_file_patch(file_path, patch)?;
+    apply_patch_cached(worktree_path, patch, false)
+}
+
+/// Reverse-apply a unified-diff `patch` to the index only
+/// (`git apply --cached --reverse`), unstaging one or more hunks without
+/// unstaging the rest of `file_path`. Mirrors `gitService.unstageHunk`; the
+/// direct-then-`--3way` fallback and the single-file header check match
+/// [`stage_hunk`].
+pub fn unstage_hunk(worktree_path: &Path, file_path: &str, patch: &str) -> Result<()> {
+    validate_single_file_patch(file_path, patch)?;
+    apply_patch_cached(worktree_path, patch, true)
+}
+
+/// Reject patches that either target more than one file or reference a path
+/// other than `file_path`. Enforces the single-file contract advertised by
+/// `git.stageHunk`/`git.unstageHunk` — otherwise a client could pass an
+/// arbitrary multi-file patch through `hunkPatch` and have the daemon apply
+/// it, hiding the real touch set behind the `filePath` parameter. Returns
+/// [`Error::InvalidParams`] so the router surfaces `-32602`.
+fn validate_single_file_patch(file_path: &str, patch: &str) -> Result<()> {
+    let expected = file_path.trim();
+    if expected.is_empty() {
+        return Err(Error::InvalidParams("filePath is required".to_string()));
+    }
+    let mut header_count = 0usize;
+    for raw in patch.lines() {
+        let Some(rest) = raw.strip_prefix("diff --git ") else {
+            continue;
+        };
+        header_count += 1;
+        // `diff --git a/PATH b/PATH` — split on the last ` b/` so quoted
+        // paths with spaces still parse. Both sides must match `file_path`.
+        let (a_side, b_side) = rest.split_once(" b/").ok_or_else(|| {
+            Error::InvalidParams(format!(
+                "hunkPatch header is not a valid `diff --git a/… b/…` line: {raw}"
+            ))
+        })?;
+        let a_path = a_side.strip_prefix("a/").ok_or_else(|| {
+            Error::InvalidParams(format!(
+                "hunkPatch header is not a valid `diff --git a/… b/…` line: {raw}"
+            ))
+        })?;
+        if a_path != expected || b_side != expected {
+            return Err(Error::InvalidParams(format!(
+                "hunkPatch targets `{a_path}` (b: `{b_side}`), expected `{expected}`"
+            )));
+        }
+    }
+    if header_count == 0 {
+        return Err(Error::InvalidParams(
+            "hunkPatch is missing a `diff --git a/… b/…` header".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Run `git apply --cached [--reverse]` with `patch` on stdin, retrying with
+/// `--3way` when the strict apply fails. The retry order mirrors the reference
+/// FE (`gitService.stageHunk`/`unstageHunk`) so context-mismatch tolerance is
+/// consistent across ports. When both attempts fail, the error surfaces the
+/// stderr from the final (`--3way`) attempt with the direct-apply stderr
+/// appended for context — the 3-way run is the one that decided the patch is
+/// unapplyable, so its diagnostics are what an operator needs to act on.
+fn apply_patch_cached(worktree_path: &Path, patch: &str, reverse: bool) -> Result<()> {
+    let base_args: &[&str] = if reverse {
+        &["apply", "--cached", "--reverse"]
+    } else {
+        &["apply", "--cached"]
+    };
+    match run_git_apply(worktree_path, base_args, patch) {
+        Ok(()) => Ok(()),
+        Err(direct_err) => {
+            let three_way: Vec<&str> = base_args.iter().copied().chain(["--3way"]).collect();
+            match run_git_apply(worktree_path, &three_way, patch) {
+                Ok(()) => Ok(()),
+                Err(three_way_err) => Err(Error::Internal(format!(
+                    "{three_way_err} (direct-apply error: {direct_err})"
+                ))),
+            }
+        }
+    }
+}
+
+/// Spawn `git <args>` in `worktree_path` and pipe `patch` on stdin. Non-zero
+/// exit surfaces as [`Error::Internal`] with the stderr the git binary produced.
+fn run_git_apply(worktree_path: &Path, args: &[&str], patch: &str) -> Result<()> {
+    let mut child = Command::new("git")
+        .current_dir(worktree_path)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::Internal(format!("failed to spawn git: {e}")))?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| Error::Internal("git stdin unavailable".to_string()))?;
+        stdin
+            .write_all(patch.as_bytes())
+            .map_err(|e| Error::Internal(format!("failed to write patch: {e}")))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| Error::Internal(format!("failed to wait for git: {e}")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(Error::Internal(if stderr.is_empty() {
+            format!("git {} failed", args.join(" "))
+        } else {
+            stderr
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,6 +588,85 @@ mod tests {
         let err = discard(dir.path(), &[".".to_string()]).unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
         let err = discard(dir.path(), &["".to_string()]).unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    /// A single-line unified-diff patch that turns the seed file's content
+    /// from `"seed\n"` into `"seed\nnew line\n"`, safe to `git apply --cached`.
+    fn append_line_patch(rel: &str) -> String {
+        format!(
+            "diff --git a/{rel} b/{rel}\n--- a/{rel}\n+++ b/{rel}\n@@ -1 +1,2 @@\n seed\n+new line\n"
+        )
+    }
+
+    #[test]
+    fn stage_hunk_stages_only_the_hunk() {
+        let dir = init_repo("stage-hunk");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        // Working tree has the addition; the patch we apply matches it.
+        write_file(dir.path(), "seed.txt", "seed\nnew line\n");
+        let patch = append_line_patch("seed.txt");
+        stage_hunk(dir.path(), "seed.txt", &patch).unwrap();
+        let st = status(dir.path()).unwrap();
+        let f = st.files.iter().find(|f| f.path == "seed.txt").unwrap();
+        assert!(f.staged);
+        assert_eq!(f.status, GitFileStatus::Modified);
+    }
+
+    #[test]
+    fn unstage_hunk_reverses_a_staged_hunk() {
+        let dir = init_repo("unstage-hunk");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        write_file(dir.path(), "seed.txt", "seed\nnew line\n");
+        stage(dir.path(), &["seed.txt".to_string()]).unwrap();
+        // Reverse the same hunk out of the index.
+        let patch = append_line_patch("seed.txt");
+        unstage_hunk(dir.path(), "seed.txt", &patch).unwrap();
+        let st = status(dir.path()).unwrap();
+        let f = st.files.iter().find(|f| f.path == "seed.txt").unwrap();
+        assert!(!f.staged);
+    }
+
+    #[test]
+    fn stage_hunk_invalid_patch_errors() {
+        let dir = init_repo("stage-hunk-bad");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        // A patch that is well-formed at the header level but does not apply
+        // (nothing to match) still surfaces as `Internal` (`-32603`) from
+        // `git apply`.
+        let unappliable = format!(
+            "{}--- a/seed.txt\n+++ b/seed.txt\n@@ -1 +1 @@\n-nope\n+other\n",
+            "diff --git a/seed.txt b/seed.txt\n"
+        );
+        let err = stage_hunk(dir.path(), "seed.txt", &unappliable).unwrap_err();
+        assert!(matches!(err, Error::Internal(_)));
+    }
+
+    #[test]
+    fn stage_hunk_rejects_missing_header() {
+        let dir = init_repo("stage-hunk-noheader");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        let err = stage_hunk(dir.path(), "seed.txt", "not a patch\n").unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    #[test]
+    fn stage_hunk_rejects_mismatched_path() {
+        let dir = init_repo("stage-hunk-mismatch");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        // Header targets `other.txt` but caller claims `seed.txt`.
+        let patch = append_line_patch("other.txt");
+        let err = stage_hunk(dir.path(), "seed.txt", &patch).unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    #[test]
+    fn stage_hunk_rejects_multi_file_patch() {
+        let dir = init_repo("stage-hunk-multi");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        let mut patch = append_line_patch("seed.txt");
+        patch.push_str(&append_line_patch("other.txt"));
+        let err = stage_hunk(dir.path(), "seed.txt", &patch).unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
     }
 }

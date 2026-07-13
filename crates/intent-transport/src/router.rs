@@ -1297,6 +1297,94 @@ async fn dispatch(
             let discarded = api.git_discard(ws, paths).await.map_err(domain_to_rpc)?;
             Ok(json!({ "ok": true, "paths": discarded }))
         }
+        "git.stageHunk" => {
+            let ws = require_ws_note(params)?;
+            let file_path = require_str_param(params, "filePath")?;
+            let hunk_patch = require_str_param(params, "hunkPatch")?;
+            api.git_stage_hunk(ws, file_path, hunk_patch)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({ "ok": true }))
+        }
+        "git.unstageHunk" => {
+            let ws = require_ws_note(params)?;
+            let file_path = require_str_param(params, "filePath")?;
+            let hunk_patch = require_str_param(params, "hunkPatch")?;
+            api.git_unstage_hunk(ws, file_path, hunk_patch)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({ "ok": true }))
+        }
+        "git.push" => {
+            let ws = require_ws_note(params)?;
+            let force = parse_bool(params, "force");
+            let r = api.git_push(ws, force).await.map_err(domain_to_rpc)?;
+            Ok(json!({
+                "ok": true,
+                "branch": r.get("branch").cloned().unwrap_or(Value::Null),
+                "pushedSha": r.get("pushedSha").cloned().unwrap_or(Value::Null),
+            }))
+        }
+        "git.fetch" => {
+            let ws = require_ws_note(params)?;
+            api.git_fetch(ws).await.map_err(domain_to_rpc)?;
+            Ok(json!({ "ok": true }))
+        }
+        "git.createBranch" => {
+            let ws = require_ws_note(params)?;
+            let branch_name = require_str_param(params, "branchName")?;
+            // Default is `true` (TS parity with `gitService.createBranch`);
+            // callers wanting a bare `git branch <name>` pass `checkout:false`.
+            // Uses `parse_bool` (rather than `Value::as_bool`) so a string
+            // `"false"` is honoured, matching every other boolean arm.
+            let checkout = if params.contains_key("checkout") {
+                parse_bool(params, "checkout")
+            } else {
+                true
+            };
+            let r = api
+                .git_create_branch(ws, branch_name, checkout)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({
+                "ok": true,
+                "branch": r.get("branch").cloned().unwrap_or(Value::Null),
+            }))
+        }
+        "git.checkoutBranch" => {
+            let ws = require_ws_note(params)?;
+            let branch_name = require_str_param(params, "branchName")?;
+            let r = api
+                .git_checkout_branch(ws, branch_name)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({
+                "ok": true,
+                "branch": r.get("branch").cloned().unwrap_or(Value::Null),
+            }))
+        }
+        "git.renameBranch" => {
+            let ws = require_ws_note(params)?;
+            let old_branch_name = require_str_param(params, "oldBranchName")?;
+            let new_branch_name = require_str_param(params, "newBranchName")?;
+            let r = api
+                .git_rename_branch(ws, old_branch_name, new_branch_name)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({
+                "ok": true,
+                "oldBranch": r.get("oldBranch").cloned().unwrap_or(Value::Null),
+                "newBranch": r.get("newBranch").cloned().unwrap_or(Value::Null),
+            }))
+        }
+        "git.removeLockFile" => {
+            let ws = require_ws_note(params)?;
+            let r = api.git_remove_lock_file(ws).await.map_err(domain_to_rpc)?;
+            Ok(json!({
+                "ok": true,
+                "removed": r.get("removed").cloned().unwrap_or(Value::Bool(false)),
+            }))
+        }
         "git.getBranches" => {
             let repo_path = require_str_param(params, "repoPath")?;
             let include_remote = parse_bool(params, "includeRemote");
