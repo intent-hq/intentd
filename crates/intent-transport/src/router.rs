@@ -1538,6 +1538,58 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "git.numstat" => {
+            // §5.6 extension: per-file additions/deletions for a workspace's
+            // tracked changes (or a branch-base two-dot range when `baseRef`
+            // / `baseCommitSha` is set). `staged` is honoured only when no
+            // base is supplied; `targetRef` defaults to `HEAD`.
+            let ws = require_ws_note(params)?;
+            let staged = opt_bool(params, "staged");
+            let base_ref = opt_nonempty_str(params, "baseRef");
+            let base_sha = opt_nonempty_str(params, "baseCommitSha");
+            let target_ref = opt_nonempty_str(params, "targetRef");
+            let paths = opt_str_array(params, "paths");
+            let r = api
+                .git_numstat(ws, staged, base_ref, base_sha, target_ref, paths)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "git.branchDiff" => {
+            // §5.6 extension: committed diff of `targetRef` vs the branch
+            // boundary (merge-base of `targetRef` and `baseRef`, else
+            // `baseCommitSha` when it is an ancestor of `targetRef`). At
+            // least one of `baseRef` / `baseCommitSha` is required (-32602);
+            // `targetRef` defaults to `HEAD`.
+            let ws = require_ws_note(params)?;
+            let base_ref = opt_nonempty_str(params, "baseRef");
+            let base_sha = opt_nonempty_str(params, "baseCommitSha");
+            if base_ref.is_none() && base_sha.is_none() {
+                return Err(rpc(
+                    INVALID_PARAMS,
+                    "git.branchDiff requires baseRef or baseCommitSha".to_string(),
+                ));
+            }
+            let target_ref = opt_nonempty_str(params, "targetRef");
+            let paths = opt_str_array(params, "paths");
+            let r = api
+                .git_branch_diff(ws, base_ref, base_sha, target_ref, paths)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "git.getRemoteUrl" => {
+            // §5.6 extension: path-based read like `git.getBranches` — a
+            // nonexistent / non-git repo path surfaces verbatim as -32602
+            // without the `invalid params:` prefix `domain_to_rpc` would add.
+            let repo_path = require_str_param(params, "repoPath")?;
+            let remote_name = opt_nonempty_str(params, "remoteName");
+            match api.git_get_remote_url(repo_path, remote_name).await {
+                Ok(r) => Ok(r),
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "pr.status" => {
             let ws = require_ws_note(params)?;
             let r = api.pr_status(ws).await.map_err(domain_to_rpc)?;

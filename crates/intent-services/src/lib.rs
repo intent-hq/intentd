@@ -8597,8 +8597,12 @@ impl WorkspaceApi for Services {
             // with no args pushes HEAD's upstream, which for our worktrees is
             // the current branch on `origin`). Resolve inside the lock so a
             // concurrent checkout/rename cannot change HEAD between the read
-            // and the push.
-            let outcome = locks
+            // and the push. The status snapshot for the follow-up
+            // `changes:git-status` event is taken inside the lock too, so a
+            // concurrent write cannot slip a different state into the event
+            // this call is supposed to describe (same pattern as
+            // `git_stage_hunk`/`git_unstage_hunk`).
+            let (outcome, status_json) = locks
                 .with_lock(&worktree, || async {
                     let branch =
                         intent_git::status::current_branch_at(&worktree).ok_or_else(|| {
@@ -8607,7 +8611,12 @@ impl WorkspaceApi for Services {
                                     .to_string(),
                             )
                         })?;
-                    intent_git::push::push(&worktree, "origin", &branch, force)
+                    let outcome = intent_git::push::push(&worktree, "origin", &branch, force)?;
+                    let status = intent_git::status::status(&worktree)
+                        .unwrap_or_else(|_| intent_git::status::empty_status());
+                    let status_json =
+                        serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+                    Ok::<_, Error>((outcome, status_json))
                 })
                 .await?;
             publish_event(
@@ -8615,9 +8624,6 @@ impl WorkspaceApi for Services {
                 git_push_event(&ws.id, &outcome.branch, &outcome.pushed_sha, force),
             )
             .await;
-            let status = intent_git::status::status(&worktree)
-                .unwrap_or_else(|_| intent_git::status::empty_status());
-            let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
             publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
             Ok(serde_json::json!({
                 "branch": outcome.branch,
@@ -8640,7 +8646,12 @@ impl WorkspaceApi for Services {
             })?;
             // Resolve HEAD's branch inside the lock so a concurrent
             // checkout/rename cannot change it between the read and the fetch.
-            locks
+            // The status snapshot is taken inside the lock too, so the
+            // follow-up `changes:git-status` event reflects the tree state
+            // this fetch produced rather than a state a concurrent writer
+            // slipped in between the unlock and the read (same pattern as
+            // `git_stage_hunk`/`git_unstage_hunk`).
+            let status_json = locks
                 .with_lock(&worktree, || async {
                     let branch =
                         intent_git::status::current_branch_at(&worktree).ok_or_else(|| {
@@ -8649,14 +8660,13 @@ impl WorkspaceApi for Services {
                                     .to_string(),
                             )
                         })?;
-                    intent_git::fetch::fetch(&worktree, "origin", &branch)
+                    intent_git::fetch::fetch(&worktree, "origin", &branch)?;
+                    let status = intent_git::status::status(&worktree)
+                        .unwrap_or_else(|_| intent_git::status::empty_status());
+                    Ok::<_, Error>(serde_json::to_value(&status).unwrap_or(serde_json::Value::Null))
                 })
                 .await?;
-            // A successful fetch may have changed the diverged state; refresh
-            // the FE change view without a follow-up `git.status` read.
-            let status = intent_git::status::status(&worktree)
-                .unwrap_or_else(|_| intent_git::status::empty_status());
-            let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+            // Refresh the FE change view without a follow-up `git.status` read.
             publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
             Ok(())
         })
@@ -9329,6 +9339,114 @@ impl WorkspaceApi for Services {
             }
             let content = intent_git::show::show_file(&worktree, &git_ref, &file_path)?;
             Ok(serde_json::json!({ "content": content }))
+        })
+    }
+
+    fn git_numstat(
+        &self,
+        workspace_id: WorkspaceId,
+        staged: Option<bool>,
+        base_ref: Option<String>,
+        base_sha: Option<String>,
+        target_ref: Option<String>,
+        paths: Option<Vec<String>>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let empty = serde_json::json!([]);
+            let ws = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(Error::NotFound(_)) => return Ok(empty),
+                Err(e) => return Err(e),
+            };
+            if ws.is_remote {
+                return Ok(empty);
+            }
+            let Some(worktree) = git_ops::worktree_path(&ws) else {
+                return Ok(empty);
+            };
+            if !worktree.join(".git").exists() {
+                return Ok(empty);
+            }
+            let target = target_ref
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("HEAD");
+            git_ops::build_numstat(
+                &worktree,
+                staged,
+                base_ref.as_deref(),
+                base_sha.as_deref(),
+                target,
+                paths.as_deref(),
+            )
+        })
+    }
+
+    fn git_branch_diff(
+        &self,
+        workspace_id: WorkspaceId,
+        base_ref: Option<String>,
+        base_sha: Option<String>,
+        target_ref: Option<String>,
+        paths: Option<Vec<String>>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Router already rejects the missing-both-bases case as -32602
+            // (see the `git.branchDiff` arm); this is a defense-in-depth
+            // check for direct trait callers.
+            if base_ref.as_deref().unwrap_or("").is_empty()
+                && base_sha.as_deref().unwrap_or("").is_empty()
+            {
+                return Err(Error::InvalidParams(
+                    "git.branchDiff requires baseRef or baseCommitSha".to_string(),
+                ));
+            }
+            let empty = serde_json::json!([]);
+            let ws = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(Error::NotFound(_)) => return Ok(empty),
+                Err(e) => return Err(e),
+            };
+            if ws.is_remote {
+                return Ok(empty);
+            }
+            let Some(worktree) = git_ops::worktree_path(&ws) else {
+                return Ok(empty);
+            };
+            if !worktree.join(".git").exists() {
+                return Ok(empty);
+            }
+            let target = target_ref
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("HEAD");
+            git_ops::build_branch_diff(
+                &worktree,
+                base_ref.as_deref(),
+                base_sha.as_deref(),
+                target,
+                paths.as_deref(),
+            )
+        })
+    }
+
+    fn git_get_remote_url(
+        &self,
+        repo_path: String,
+        remote_name: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            // Path-based validation like `git_get_branches`/`git_branch_status`:
+            // nonexistent / non-git repo path → -32602 (PROTOCOL §5.6).
+            git_ops::validate_repo_path(&repo_path)?;
+            let name = remote_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("origin");
+            let url = intent_git::remote::remote_url(std::path::Path::new(&repo_path), name)?;
+            Ok(serde_json::json!({ "url": url }))
         })
     }
 

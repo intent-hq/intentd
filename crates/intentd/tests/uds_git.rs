@@ -1261,3 +1261,126 @@ async fn uds_git_pull_round_trip() {
     let _ = server.await;
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// Over-the-wire coverage for the read-side git extensions added alongside
+/// the deferred `#126` cleanup: `git.numstat`, `git.branchDiff`, and
+/// `git.getRemoteUrl`. Uses a small on-disk repo (no bare-remote fixture,
+/// so `origin` is a configured URL only, not a reachable remote).
+#[tokio::test]
+async fn uds_git_read_ops_extensions_round_trip() {
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let base = Path::new("/tmp").join(format!("intentd-gitreads-{}", &short[..8]));
+    let data_dir = base.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let repo = base.join("repo");
+    seed_repo(&repo);
+    // Configure an origin URL so `git.getRemoteUrl` has something to return.
+    git(
+        &repo,
+        &["remote", "add", "origin", "https://example.invalid/o/r.git"],
+    );
+
+    let config = {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTENTD_DATA_DIR", &data_dir);
+        Config::resolve().expect("resolve config")
+    };
+
+    let ws_id = WorkspaceId::from("ws-gitreads");
+    {
+        let store = Store::open(&config.db_path).await.expect("open store");
+        store
+            .insert_workspace(&seed_workspace(&ws_id, repo.to_str().unwrap()))
+            .await
+            .expect("seed ws");
+    }
+
+    let store = Store::open(&config.db_path).await.expect("reopen store");
+    let bus = EventBus::new(store.clone());
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store).with_workspaces_root(
+        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+    ));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let socket = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_uds(services, bus, &socket, None, async move {
+            let _ = rx.await;
+        })
+        .await
+        .expect("serve");
+    });
+    for _ in 0..50 {
+        if config.socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // (a) numstat — default (HEAD→workdir tracked) picks up the tracked
+    // modification but not the untracked file.
+    std::fs::write(repo.join("seed.txt"), "seed\nnew line\n").unwrap();
+    std::fs::write(repo.join("untracked.txt"), "hello\n").unwrap();
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.numstat","params":{"workspaceId":"ws-gitreads"}}"#,
+    )
+    .await;
+    let items = resp["result"].as_array().expect("numstat items");
+    assert_eq!(items.len(), 1, "only tracked change: {resp}");
+    assert_eq!(items[0]["filePath"], json!("seed.txt"));
+    assert_eq!(items[0]["additions"], json!(1));
+    assert_eq!(items[0]["deletions"], json!(0));
+
+    // (b) numstat — staged=true with nothing staged → empty array.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":2,"method":"git.numstat","params":{"workspaceId":"ws-gitreads","staged":true}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"], json!([]));
+
+    // (c) branchDiff — missing both bases → -32602.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":3,"method":"git.branchDiff","params":{"workspaceId":"ws-gitreads"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+
+    // (d) getRemoteUrl — configured origin URL.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"git.getRemoteUrl","params":{{"repoPath":"{}"}}}}"#,
+            repo.display(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["url"],
+        json!("https://example.invalid/o/r.git")
+    );
+
+    // (e) getRemoteUrl — missing remote → { url: null }.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"git.getRemoteUrl","params":{{"repoPath":"{}","remoteName":"no-such-remote"}}}}"#,
+            repo.display(),
+        ),
+    )
+    .await;
+    assert!(resp["result"]["url"].is_null(), "{resp}");
+
+    // (f) getRemoteUrl — nonexistent path → -32602.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":6,"method":"git.getRemoteUrl","params":{"repoPath":"/no/such/repo"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+
+    let _ = tx.send(());
+    let _ = server.await;
+    std::fs::remove_dir_all(&base).ok();
+}
