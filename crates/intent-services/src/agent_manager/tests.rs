@@ -69,6 +69,17 @@ fn compute_process_cap_matches_ts_thresholds() {
     assert_eq!(compute_process_cap(128 * super::GB), 100);
 }
 
+#[test]
+#[cfg(target_os = "macos")]
+fn total_memory_bytes_macos_returns_physical_ram() {
+    let mem = super::total_memory_bytes();
+    assert!(mem.is_some(), "macOS should detect physical RAM");
+    let bytes = mem.unwrap();
+    assert!(bytes > 0, "detected RAM should be > 0");
+    // Sanity check: physical RAM on modern machines is at least 1 GB.
+    assert!(bytes >= super::GB, "detected RAM should be >= 1 GB");
+}
+
 #[tokio::test]
 async fn tracks_concurrent_processes_and_deregisters() {
     let reg = ProcessRegistry::new(8);

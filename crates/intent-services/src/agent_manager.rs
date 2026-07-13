@@ -141,7 +141,33 @@ fn total_memory_bytes() -> Option<u64> {
     None
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn total_memory_bytes() -> Option<u64> {
+    use std::mem;
+    use std::ptr;
+
+    let mut size: u64 = 0;
+    let mut len = mem::size_of::<u64>();
+    let name = b"hw.memsize\0";
+
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr() as *const libc::c_char,
+            &mut size as *mut u64 as *mut libc::c_void,
+            &mut len,
+            ptr::null_mut(),
+            0,
+        )
+    };
+
+    if result == 0 {
+        Some(size)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn total_memory_bytes() -> Option<u64> {
     None
 }
