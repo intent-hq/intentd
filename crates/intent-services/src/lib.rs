@@ -2927,17 +2927,21 @@ fn git_push_event(
 }
 
 /// Build a `git:branch` event for a completed branch operation inside a
-/// workspace worktree (§6.5). Payload `{ workspaceId, operation, branch,
-/// oldBranch? }` — `operation` is one of `"create"`, `"checkout"`, `"rename"`.
+/// workspace worktree (§6.5). Payload `{ workspaceId, operation: "branch",
+/// branchOp, branch, oldBranch? }` — `operation` mirrors the reserved
+/// `GitOperationEvent.data.operation` union (`commit|push|pull|branch|merge`),
+/// while `branchOp` disambiguates between `"create"`, `"checkout"`, and
+/// `"rename"` for clients that render per-sub-op markers.
 fn git_branch_event(
     workspace_id: &WorkspaceId,
-    operation: &str,
+    branch_op: &str,
     branch: &str,
     old_branch: Option<&str>,
 ) -> NewEvent {
     let mut data = serde_json::json!({
         "workspaceId": workspace_id.as_str(),
-        "operation": operation,
+        "operation": "branch",
+        "branchOp": branch_op,
         "branch": branch,
     });
     if let Some(old) = old_branch {
@@ -7905,6 +7909,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
+        let locks = self.worktree_locks.clone();
         Box::pin(async move {
             // Unknown workspace → surface as `-32603`; a bare `NotFound` here
             // would be misleading given the FE's `Result` shape.
@@ -7920,7 +7925,13 @@ impl WorkspaceApi for Services {
             let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                 Error::Internal("Failed to remove lock file: workspace has no worktree".to_string())
             })?;
-            let removed = intent_git::worktree::remove_index_lock(&worktree)?;
+            // Hold the per-worktree lock so a stale-lock cleanup cannot race
+            // with a healthy in-flight write and delete its live `index.lock`.
+            let removed = locks
+                .with_lock(&worktree, || async {
+                    intent_git::worktree::remove_index_lock(&worktree)
+                })
+                .await?;
             Ok(serde_json::json!({ "removed": removed }))
         })
     }
