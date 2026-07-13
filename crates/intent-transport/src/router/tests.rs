@@ -812,7 +812,7 @@ impl WorkspaceApi for FakeApi {
                     {
                         "path": "/src/intent",
                         "name": "intent",
-                        "owner": "cloudlands-ai",
+                        "owner": "intent-hq",
                         "addedAt": "t0",
                         "lastUsedAt": "t1"
                     }
@@ -2875,7 +2875,7 @@ async fn repo_list_returns_repos_with_camelcase_keys() {
     let repo = &v["result"]["repos"][0];
     assert_eq!(repo["path"], serde_json::json!("/src/intent"));
     assert_eq!(repo["name"], serde_json::json!("intent"));
-    assert_eq!(repo["owner"], serde_json::json!("cloudlands-ai"));
+    assert_eq!(repo["owner"], serde_json::json!("intent-hq"));
     assert_eq!(repo["addedAt"], serde_json::json!("t0"));
     assert_eq!(repo["lastUsedAt"], serde_json::json!("t1"));
 }

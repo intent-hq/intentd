@@ -2258,7 +2258,7 @@ mod tests {
         let with_owner = KnownRepo {
             path: "/Users/me/src/intent".to_string(),
             name: "intent".to_string(),
-            owner: Some("cloudlands-ai".to_string()),
+            owner: Some("intent-hq".to_string()),
             added_at: "2026-01-01T00:00:00Z".to_string(),
             last_used_at: "2026-01-02T00:00:00Z".to_string(),
         };
@@ -2267,7 +2267,7 @@ mod tests {
             json!({
                 "path": "/Users/me/src/intent",
                 "name": "intent",
-                "owner": "cloudlands-ai",
+                "owner": "intent-hq",
                 "addedAt": "2026-01-01T00:00:00Z",
                 "lastUsedAt": "2026-01-02T00:00:00Z"
             })

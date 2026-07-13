@@ -56,7 +56,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         tags: vec!["alpha".to_string(), "beta".to_string()],
         path: Some("/tmp/ws-meta".to_string()),
         repository_path: Some("/tmp/repo".to_string()),
-        repository_owner: Some("cloudlands-ai".to_string()),
+        repository_owner: Some("intent-hq".to_string()),
         repository_name: Some("intentd".to_string()),
         worktree_path: None,
         scope: None,

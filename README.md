@@ -6,7 +6,7 @@ and events — and exposes it over a **JSON-RPC 2.0** API. Clients (a desktop UI
 agent acting as an MCP client) are thin: all business logic lives in the daemon.
 
 > ⚠️ Private Repository — This repo is internal to the Cloudlands engineering team. It is
-> consumed as a git submodule by [cloudlands-ai/monorepo](https://github.com/cloudlands-ai/monorepo).
+> consumed as a git submodule by [intent-hq/monorepo](https://github.com/intent-hq/monorepo).
 
 ## What it is
 
@@ -160,5 +160,5 @@ The design lives in the monorepo under `docs/00_initial_porting/`:
 
 ## Related Repositories
 
-- [cloudlands-ai/monorepo](https://github.com/cloudlands-ai/monorepo) — engineering monorepo
+- [intent-hq/monorepo](https://github.com/intent-hq/monorepo) — engineering monorepo
   that mounts this repo at `packages/intentd` and holds the cross-cutting docs and tooling.

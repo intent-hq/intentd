@@ -2676,7 +2676,7 @@ mod _dead_workspace_metadata_tool_tests {
                 path: None,
                 repository_path: None,
                 repository_owner: None,
-                repository_name: Some("cloudlands-ai/intentd".to_string()),
+                repository_name: Some("intent-hq/intentd".to_string()),
                 worktree_path: None,
                 scope: None,
                 skip_worktree: false,
@@ -2758,7 +2758,7 @@ mod _dead_workspace_metadata_tool_tests {
         assert_eq!(body["status"], json!("Active"));
         assert_eq!(body["statusMessage"], Value::Null);
         assert_eq!(body["branch"], json!("amber-forest"));
-        assert_eq!(body["repositoryName"], json!("cloudlands-ai/intentd"));
+        assert_eq!(body["repositoryName"], json!("intent-hq/intentd"));
         assert_eq!(body["tags"], json!(["demo"]));
     }
 
