@@ -1410,6 +1410,36 @@ mod tests {
     }
 
     #[test]
+    fn context_before_after_are_utf8_safe() {
+        // Mix of multi-byte glyphs (é = 2 bytes, 你 = 3 bytes, 😀 = 4 bytes)
+        // exercises the char-boundary logic in context_before / context_after
+        // — a byte-indexed slice here would panic or split a codepoint.
+        let content = "café 你好 😀 target 世界 après 🎉";
+        let anchor_start = content.find("target").unwrap();
+        let anchor_end = anchor_start + "target".len();
+        let before = context_before(content, anchor_start);
+        let after = context_after(content, anchor_end);
+        assert!(
+            content.starts_with(&before),
+            "before must be a suffix-prefix of content"
+        );
+        assert!(
+            content.ends_with(&after),
+            "after must be a prefix-suffix of content"
+        );
+        assert_eq!(before, "café 你好 😀 ");
+        assert_eq!(after, " 世界 après 🎉");
+        // And with a run longer than CONTEXT_LENGTH chars the slice is bounded
+        // by char count (not byte count) and still ends on a char boundary.
+        let long = "🎉".repeat(80) + "X" + &"🎉".repeat(80);
+        let pos = long.find('X').unwrap();
+        let before_long = context_before(&long, pos);
+        let after_long = context_after(&long, pos + 1);
+        assert_eq!(before_long.chars().count(), ANCHOR_CONTEXT_LEN);
+        assert_eq!(after_long.chars().count(), ANCHOR_CONTEXT_LEN);
+    }
+
+    #[test]
     fn classify_healthy_partial_missing_degenerate() {
         let healthy = wrap("c1", "pre ", "target", " post");
         assert_eq!(classify_anchor_state(&healthy, "c1"), AnchorState::Healthy);

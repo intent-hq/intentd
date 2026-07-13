@@ -5352,8 +5352,9 @@ impl WorkspaceApi for Services {
                 input.heading.as_deref(),
                 input.position.as_deref(),
             )?;
-            let plan = reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
-            let new_content = plan.content.clone();
+            let mut plan =
+                reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
+            let new_content = std::mem::take(&mut plan.content);
             note.content = new_content.clone();
             note.updated_at = now_iso();
             store.update_note(&note).await?;
@@ -5414,8 +5415,9 @@ impl WorkspaceApi for Services {
             let old_content = note.content.clone();
             let (new_content, match_position, was_empty) =
                 note_ops::apply_edit(&old_content, &input.old, &input.new)?;
-            let plan = reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
-            let new_content = plan.content.clone();
+            let mut plan =
+                reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
+            let new_content = std::mem::take(&mut plan.content);
             note.content = new_content.clone();
             note.updated_at = now_iso();
             store.update_note(&note).await?;
@@ -5475,8 +5477,9 @@ impl WorkspaceApi for Services {
             let new_content =
                 note_ops::apply_edit_lines(&old_content, input.start, input.end, &input.content)?;
             let total_lines_before = old_content.split('\n').count();
-            let plan = reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
-            let new_content = plan.content.clone();
+            let mut plan =
+                reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
+            let new_content = std::mem::take(&mut plan.content);
             note.content = new_content.clone();
             note.updated_at = now_iso();
             store.update_note(&note).await?;
@@ -5561,8 +5564,8 @@ impl WorkspaceApi for Services {
                 &content,
             );
             let clean = note_ops::clean_set_content(&merged)?;
-            let plan = reanchor_note_comments(&store, &workspace_id, &note_id, clean).await?;
-            let clean = plan.content.clone();
+            let mut plan = reanchor_note_comments(&store, &workspace_id, &note_id, clean).await?;
+            let clean = std::mem::take(&mut plan.content);
             note.content = clean.clone();
             let now = now_iso();
             note.updated_at = now.clone();
