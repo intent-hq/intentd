@@ -307,6 +307,42 @@ pub struct SetupScript {
     pub generated_by: Option<SetupScriptGeneratedBy>,
 }
 
+/// One chat-context attachment for a workspace (PROTOCOL §5.1 —
+/// `workspace.getContext` / `updateContext`). The daemon treats the item as an
+/// opaque JSON blob authored by the FE (`ContextItem` union in
+/// `packages/cloudlands-fe/src/features/context/types.ts` — notes, linear /
+/// github / sentry issues, browser URLs) and only pulls `id` out for keying
+/// and ordering. All other fields round-trip verbatim via
+/// `#[serde(flatten)]`, so provider-specific extras (`identifier`, `number`,
+/// `favicon`, …) reach the FE without the daemon needing a matching Rust
+/// union.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextItem {
+    pub id: String,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Persisted task↔agent linkage (PROTOCOL §5.4 — `task.linkAgent` /
+/// `unlinkAgent` / `listAgentLinks`, §6.5 `task:agent-linked` /
+/// `task:agent-unlinked`). Migrates the renderer-only
+/// `localStorage["task-agent-associations:{workspaceId}"]` store into
+/// daemon-owned rows. `taskKey` is the FE's association key
+/// (`association.taskKey ?? association.taskText`); `taskText` records the
+/// human-readable checkbox text at link time; `createdAt` is epoch-ms (FE
+/// parity with `TaskAgentAssociation.createdAt: number`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAgentLink {
+    pub workspace_id: WorkspaceId,
+    pub note_id: NoteId,
+    pub task_key: String,
+    pub task_text: String,
+    pub agent_id: String,
+    pub created_at: i64,
+}
+
 /// `Workspace.taskStats` card aggregate (§9.1; TS `WorkspaceTaskStats`). Ports
 /// the canonical `computeTaskStats` (`task-stats.ts`): `total` excludes
 /// `cancelled`, `completed` counts `complete`, and `inProgress` counts

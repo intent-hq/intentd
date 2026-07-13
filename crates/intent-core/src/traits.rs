@@ -11,18 +11,18 @@ use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId};
 use crate::model::{
     AgentDelegateInput, AgentLite, AgentSession, CommentAddResult, CommentDeleteResult,
     CommentGetThreadResult, CommentListResult, CommentResolveThreadResult, CommentRespondResult,
-    Draft, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity,
-    GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts,
-    GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData, Note,
-    NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
-    NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult, NoteSetContentResult,
-    NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary,
-    ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams, SetupScript,
-    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
-    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspacePurgeResult,
-    WorkspaceTask, WorkspaceUpdate,
+    ContextItem, Draft, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
+    FileActivity, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
+    GitMergeConflicts, GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData,
+    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
+    NoteVersionSummary, ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
+    SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
+    TaskRemoveAgentFromAllTasksResult, TaskUpdateNoteStatusResult, TaskUpdateResult,
+    TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult,
+    WorkspaceEventSummary, WorkspacePurgeResult, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -202,6 +202,89 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::generate_setup_script not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Read the workspace's chat-context attachment list (PROTOCOL §5.1). Returns
+    /// an empty vec when nothing has been stored yet; `NotFound` if the workspace
+    /// itself is absent (router maps to `-32602`).
+    fn get_workspace_context(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Vec<ContextItem>>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::get_workspace_context not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Replace the workspace's chat-context attachment list atomically
+    /// (PROTOCOL §5.1). Item order is preserved. Emits
+    /// `workspace:context-changed` with the persisted list. `NotFound` if
+    /// the workspace is absent.
+    fn update_workspace_context(
+        &self,
+        id: WorkspaceId,
+        items: Vec<ContextItem>,
+    ) -> BoxFuture<'_, Result<Vec<ContextItem>>> {
+        let _ = (id, items);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::update_workspace_context not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Upsert a task↔agent link (PROTOCOL §5.4). The caller-supplied
+    /// `taskKey` mirrors the FE derivation (`association.taskKey ??
+    /// association.taskText`); `createdAt` is set to the current epoch-ms.
+    /// Existing rows at the same key are overwritten (FE parity with
+    /// `addTaskAgentAssociation`). Emits `task:agent-linked` with the
+    /// persisted row.
+    fn link_task_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        task_key: String,
+        task_text: String,
+        agent_id: String,
+    ) -> BoxFuture<'_, Result<TaskAgentLink>> {
+        let _ = (workspace_id, note_id, task_key, task_text, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::link_task_agent not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Remove a task↔agent link (PROTOCOL §5.4). Returns whether the row
+    /// was actually removed; deleting an unknown key is not an error.
+    /// Emits `task:agent-unlinked` only when a row was actually removed.
+    fn unlink_task_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        task_key: String,
+    ) -> BoxFuture<'_, Result<bool>> {
+        let _ = (workspace_id, note_id, task_key);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::unlink_task_agent not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// List every task↔agent link for a workspace, oldest first (PROTOCOL
+    /// §5.4). Hydration read for `task.listAgentLinks`; the router groups
+    /// the flat vec into the FE-parity `byNoteId → byTaskKey` shape.
+    fn list_task_agent_links(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<TaskAgentLink>>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::list_task_agent_links not implemented".to_string(),
             ))
         })
     }

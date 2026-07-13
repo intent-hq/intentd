@@ -15,31 +15,33 @@ use intent_core::events::{
     AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED,
     COMMENT_ADDED, COMMENT_RESOLVED, GIT_BRANCH, GIT_COMMIT, GIT_PULL, GIT_PUSH,
     LINE_ATTRIBUTION_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED,
-    PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, TASK_READY_TASKS_CHANGED,
-    TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
-    WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
+    PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, TASK_AGENT_LINKED,
+    TASK_AGENT_UNLINKED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
+    WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::AgentReverseDispatch;
 use intent_core::{
-    chief_workspace, iso_minutes_ago, now_iso, parse_iso, ActorType, AgentDelegateInput, AgentId,
-    AgentLite, AgentSession, AuthorType, BoxFuture, ClientId, Comment, CommentAddResult,
-    CommentAnchor, CommentAnchorType, CommentDeleteResult, CommentGetThreadResult,
-    CommentListResult, CommentLocation, CommentResolveThreadResult, CommentRespondResult,
-    CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType, CommentWire,
-    ContentType, Draft, Event, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
-    FileActivity, LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData,
-    LineAttributionInfo, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
-    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
-    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
-    ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams, SessionStats, SetupScript,
-    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
-    TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult,
-    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceActivity,
-    WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
-    WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceEventSummary, WorkspaceId,
-    WorkspacePurgeResult, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    chief_workspace, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso, ActorType,
+    AgentDelegateInput, AgentId, AgentLite, AgentSession, AuthorType, BoxFuture, ClientId, Comment,
+    CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
+    CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
+    CommentRespondResult, CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType,
+    CommentWire, ContentType, ContextItem, Draft, Event, EventQueryParams, EventSubscribeResult,
+    EventUnsubscribeResult, FileActivity, LineAttributionAuthor, LineAttributionComputeResult,
+    LineAttributionData, LineAttributionInfo, Note, NoteAddInput, NoteAddResult, NoteCreate,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    NoteId, NoteMetadata, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow,
+    NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary,
+    NoteVisibility, ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
+    SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
+    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
+    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    WorkspaceCreate, WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceEventSummary,
+    WorkspaceId, WorkspacePurgeResult, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
+    WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -3008,6 +3010,76 @@ fn workspace_deleted_event(workspace_id: &WorkspaceId) -> NewEvent {
         metadata: None,
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
+        }),
+    }
+}
+
+/// Build a `workspace:context-changed` event carrying the new authoritative
+/// context-item list (PROTOCOL §5.1 / §6.5). Self-sufficient payload
+/// `{ workspaceId, items }` (§6.7) so subscribers refresh without a
+/// follow-up `workspace.getContext`.
+fn workspace_context_changed_event(workspace_id: &WorkspaceId, items: &[ContextItem]) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_CONTEXT_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "items": items,
+        }),
+    }
+}
+
+/// Build a `task:agent-linked` event for a freshly-persisted task↔agent
+/// row (PROTOCOL §5.4 / §6.5). Self-sufficient payload
+/// `{ workspaceId, noteId, taskKey, link }` (§6.7) so subscribers rebuild
+/// the `byNoteId → byTaskKey` map without a follow-up read.
+fn task_agent_linked_event(link: &TaskAgentLink) -> NewEvent {
+    NewEvent {
+        workspace_id: link.workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: TASK_AGENT_LINKED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": link.workspace_id.as_str(),
+            "noteId": link.note_id.as_str(),
+            "taskKey": link.task_key,
+            "link": link,
+        }),
+    }
+}
+
+/// Build a `task:agent-unlinked` event for a task↔agent row that was
+/// removed (PROTOCOL §5.4 / §6.5). Payload `{ workspaceId, noteId,
+/// taskKey }` — enough for subscribers to drop the entry from the
+/// `byNoteId → byTaskKey` map.
+fn task_agent_unlinked_event(
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    task_key: &str,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: TASK_AGENT_UNLINKED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "noteId": note_id.as_str(),
+            "taskKey": task_key,
         }),
     }
 }
@@ -6406,6 +6478,92 @@ impl WorkspaceApi for Services {
             let ws = store.get_workspace(&id).await?;
             let project_type = git_ops::worktree_path(&ws).and_then(|p| setup_scripts::detect(&p));
             Ok(setup_scripts::generate(project_type))
+        })
+    }
+
+    fn get_workspace_context(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Vec<ContextItem>>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // `NotFound` on missing workspace propagates so the router maps to
+            // `-32602`; an empty list is the pre-first-save default (§5.1).
+            store.get_workspace(&id).await?;
+            store.list_workspace_context_items(&id).await
+        })
+    }
+
+    fn update_workspace_context(
+        &self,
+        id: WorkspaceId,
+        items: Vec<ContextItem>,
+    ) -> BoxFuture<'_, Result<Vec<ContextItem>>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            store.get_workspace(&id).await?;
+            let persisted = store.replace_workspace_context_items(&id, &items).await?;
+            publish_event(&bus, workspace_context_changed_event(&id, &persisted)).await;
+            Ok(persisted)
+        })
+    }
+
+    fn link_task_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        task_key: String,
+        task_text: String,
+        agent_id: String,
+    ) -> BoxFuture<'_, Result<TaskAgentLink>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            store.get_workspace(&workspace_id).await?;
+            let link = TaskAgentLink {
+                workspace_id: workspace_id.clone(),
+                note_id: note_id.clone(),
+                task_key: task_key.clone(),
+                task_text,
+                agent_id,
+                created_at: now_epoch_ms() as i64,
+            };
+            let stored = store.upsert_task_agent_link(&link).await?;
+            publish_event(&bus, task_agent_linked_event(&stored)).await;
+            Ok(stored)
+        })
+    }
+
+    fn unlink_task_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        task_key: String,
+    ) -> BoxFuture<'_, Result<bool>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            store.get_workspace(&workspace_id).await?;
+            let removed = store
+                .delete_task_agent_link(&workspace_id, &note_id, &task_key)
+                .await?;
+            if removed {
+                publish_event(
+                    &bus,
+                    task_agent_unlinked_event(&workspace_id, &note_id, &task_key),
+                )
+                .await;
+            }
+            Ok(removed)
+        })
+    }
+
+    fn list_task_agent_links(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<TaskAgentLink>>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            store.get_workspace(&workspace_id).await?;
+            store.list_task_agent_links(&workspace_id).await
         })
     }
 

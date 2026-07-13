@@ -28,7 +28,9 @@ mod note_repo;
 mod note_version_repo;
 mod script_repo;
 mod settings_repo;
+mod task_agent_link_repo;
 mod tracked_changes_repo;
+mod workspace_context_repo;
 mod workspace_repo;
 
 pub use agent_repo::ReplaceMessage;

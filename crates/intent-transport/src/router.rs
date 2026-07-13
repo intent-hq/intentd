@@ -8,9 +8,9 @@
 
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    Error, EventQueryParams, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId,
-    NoteUpdateInput, ScriptCreateParams, ScriptMode, WorkspaceApi, WorkspaceCreate, WorkspaceId,
-    WorkspaceUpdate,
+    ContextItem, Error, EventQueryParams, NoteAddInput, NoteCreate, NoteEditInput,
+    NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode, TaskAgentLink,
+    WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
 };
 use serde_json::{json, Map, Value};
 
@@ -242,6 +242,20 @@ async fn dispatch(
             let id = require_workspace_id(params)?;
             let setup_script = api.generate_setup_script(id).await.map_err(workspace_err)?;
             Ok(json!({ "setupScript": setup_script }))
+        }
+        "workspace.getContext" => {
+            let id = require_workspace_id(params)?;
+            let items = api.get_workspace_context(id).await.map_err(workspace_err)?;
+            Ok(json!({ "items": items }))
+        }
+        "workspace.updateContext" => {
+            let id = require_workspace_id(params)?;
+            let items = require_context_items(params)?;
+            let items = api
+                .update_workspace_context(id, items)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "items": items }))
         }
         "workspace.duplicate" => {
             let id = require_workspace_id(params)?;
@@ -607,6 +621,39 @@ async fn dispatch(
                 Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Task not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
+        }
+        "task.linkAgent" => {
+            let workspace_id = require_workspace_id(params)?;
+            let note_id = require_note_id(params)?;
+            let task_text = require_str_param(params, "taskText")?;
+            let agent_id = require_str_param(params, "agentId")?;
+            let task_key = opt_nonempty_str(params, "taskKey").unwrap_or_else(|| task_text.clone());
+            let link = api
+                .link_task_agent(workspace_id, note_id, task_key, task_text, agent_id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "link": link }))
+        }
+        "task.unlinkAgent" => {
+            let workspace_id = require_workspace_id(params)?;
+            let note_id = require_note_id(params)?;
+            let task_key = require_str_param(params, "taskKey")?;
+            let removed = api
+                .unlink_task_agent(workspace_id, note_id, task_key)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "removed": removed }))
+        }
+        "task.listAgentLinks" => {
+            let workspace_id = require_workspace_id(params)?;
+            let links = api
+                .list_task_agent_links(workspace_id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({
+                "links": links,
+                "linksByNoteId": links_by_note_id(&links),
+            }))
         }
         "comment.add" => {
             let ws = require_ws_note(params)?;
@@ -2858,6 +2905,61 @@ fn opt_str(params: &Map<String, Value>, name: &str) -> Option<String> {
 /// widened `provider`/`agentType`/`workspacePath` fields).
 fn opt_nonempty_str(params: &Map<String, Value>, name: &str) -> Option<String> {
     opt_str(params, name).filter(|s| !s.trim().is_empty())
+}
+
+/// Parse the `items` array from `workspace.updateContext` into a
+/// `Vec<ContextItem>`. The daemon treats each item as an opaque JSON blob
+/// authored by the FE (`ContextItem` union in
+/// `packages/cloudlands-fe/src/features/context/types.ts`); the only
+/// required field is a non-empty string `id`. `items` itself must be an
+/// array — absent, non-array, or per-item shape errors surface as
+/// `-32602 Invalid params`.
+fn require_context_items(params: &Map<String, Value>) -> Result<Vec<ContextItem>, RpcErr> {
+    let raw = params
+        .get("items")
+        .ok_or_else(|| rpc(INVALID_PARAMS, "items is required"))?;
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| rpc(INVALID_PARAMS, "items must be an array"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, entry) in arr.iter().enumerate() {
+        let item: ContextItem = serde_json::from_value(entry.clone()).map_err(|e| {
+            rpc(
+                INVALID_PARAMS,
+                format!("items[{idx}] is not a valid ContextItem: {e}"),
+            )
+        })?;
+        if item.id.trim().is_empty() {
+            return Err(rpc(
+                INVALID_PARAMS,
+                format!("items[{idx}].id must be a non-empty string"),
+            ));
+        }
+        out.push(item);
+    }
+    Ok(out)
+}
+
+/// Group a flat list of task↔agent links into the FE-parity
+/// `byNoteId → byTaskKey → TaskAgentLink` map (matches
+/// `TaskAgentAssociationsState.byNoteId[noteId][taskKey]` so the FE
+/// hydration is a mechanical cut-over from
+/// `localStorage["task-agent-associations:{wsId}"]`).
+fn links_by_note_id(links: &[TaskAgentLink]) -> Value {
+    let mut by_note: Map<String, Value> = Map::new();
+    for link in links {
+        let note_id = link.note_id.as_str().to_string();
+        let entry = by_note
+            .entry(note_id)
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Value::Object(inner) = entry {
+            inner.insert(
+                link.task_key.clone(),
+                serde_json::to_value(link).unwrap_or(Value::Null),
+            );
+        }
+    }
+    Value::Object(by_note)
 }
 
 /// Optional string-array param (absent/null/non-array → `None`); non-string
