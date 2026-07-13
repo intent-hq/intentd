@@ -51,7 +51,7 @@ pub fn status(worktree_path: &Path) -> Result<GitStatus> {
 
 /// Mirror `git branch --show-current`: the branch shorthand, empty on a detached
 /// HEAD, and the unborn branch name when there is no commit yet.
-pub(crate) fn current_branch(repo: &Repository) -> String {
+pub fn current_branch(repo: &Repository) -> String {
     match repo.head() {
         Ok(head) if head.is_branch() => head.shorthand().unwrap_or("").to_string(),
         Ok(_) => String::new(),
@@ -61,6 +61,19 @@ pub(crate) fn current_branch(repo: &Repository) -> String {
             .and_then(|r| r.symbolic_target().ok().flatten().map(str::to_string))
             .and_then(|t| t.strip_prefix("refs/heads/").map(str::to_string))
             .unwrap_or_default(),
+    }
+}
+
+/// Path-based convenience over [`current_branch`]: open the repository at
+/// `worktree_path` and return its checked-out branch. `None` when the repo
+/// cannot be opened or `HEAD` is not a branch (detached / unborn).
+pub fn current_branch_at(worktree_path: &Path) -> Option<String> {
+    let repo = Repository::open(worktree_path).ok()?;
+    let name = current_branch(&repo);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
     }
 }
 
