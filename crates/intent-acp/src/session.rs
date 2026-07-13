@@ -184,7 +184,7 @@ fn map_content(block: &ContentBlock) -> (Value, Option<String>) {
 /// Map a fresh `tool_call` (status defaults to "started").
 fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
     let title = tool_call.title.clone();
-    let tool_name = derive_tool_name(&title);
+    let tool_name = derive_tool_name(&title, tool_call.raw_input.as_ref());
     MappedToolCall {
         tool_call_id: tool_call.tool_call_id.0.to_string(),
         tool_kind: tool_kind_word(tool_call.kind, &tool_name),
@@ -200,7 +200,7 @@ fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
 fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
     let fields = &update.fields;
     let title = fields.title.clone().unwrap_or_default();
-    let tool_name = derive_tool_name(&title);
+    let tool_name = derive_tool_name(&title, fields.raw_input.as_ref());
     MappedToolCall {
         tool_kind: tool_kind_word(fields.kind.unwrap_or_default(), &tool_name),
         // A bare progress update (no status) is still mid-flight → "started".
@@ -213,11 +213,12 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
     }
 }
 
-/// Derive the "real" tool name from a human-readable ACP `title` (§6.6).
+/// Derive the "real" tool name from a human-readable ACP `title` and, when the
+/// title carries no identifier, the shape of the `raw_input` parameters (§6.6).
 ///
 /// ACP providers (auggie, codex, …) deliver a prose `title` (e.g.
 /// `"sub-agent-explore: Explore the AI agent system…"`) rather than the raw
-/// tool name the model invoked. Rules:
+/// tool name the model invoked. Rules, in order:
 ///  - A title of the form `<name>: <description>` (`<name>` a bare identifier
 ///    of `[A-Za-z0-9_-]+`, followed by `": "` or `":\t"`) is split; the prefix
 ///    becomes the name.
@@ -225,10 +226,73 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///    auggie names an MCP tool `<tool>_<server>`, so our registry tool
 ///    `add_to_note` surfaces as `add_to_note_workspace-mcp`; stripping
 ///    recovers the registry name (§18.4).
+///  - When neither of the above yielded an identifier (the title is prose like
+///    `"Read"` or `"Edit foo.rs"`), inspect `raw_input` for unambiguous shapes:
+///    `information_request` → `codebase-retrieval` (or `conversation-retrieval`
+///    when the title mentions `conversation`); `command ∈ {str_replace, insert,
+///    create}` → `str-replace-editor`; `file_content + path +
+///    instructions_reminder` → `save-file`; `path + view_range` → `view`;
+///    `file_paths` array → `remove-files`; `input` containing `*** Begin Patch`
+///    → `apply_patch`.
 ///  - Otherwise the title passes through as-is.
-pub fn derive_tool_name(title: &str) -> String {
-    let base = split_name_prefix(title).unwrap_or(title);
-    strip_workspace_mcp_suffix(base)
+pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
+    if let Some(name) = split_name_prefix(title) {
+        return strip_workspace_mcp_suffix(name);
+    }
+    let stripped = strip_workspace_mcp_suffix(title);
+    if stripped != title {
+        return stripped;
+    }
+    if let Some(input) = raw_input {
+        if let Some(from_input) = derive_tool_name_from_input(title, input) {
+            return from_input;
+        }
+    }
+    stripped
+}
+
+/// Inspect an ACP `raw_input` object for shapes that unambiguously identify a
+/// well-known tool. Mirrors the reference in
+/// `acp-provider-streaming.ts` ~L1630. Returns `None` when no pattern matches;
+/// the caller falls back to the title.
+fn derive_tool_name_from_input(title: &str, input: &Value) -> Option<String> {
+    let obj = input.as_object()?;
+    // command ∈ {str_replace, insert, create} → str-replace-editor
+    if let Some(cmd) = obj.get("command").and_then(Value::as_str) {
+        if matches!(cmd, "str_replace" | "insert" | "create") {
+            return Some("str-replace-editor".to_string());
+        }
+    }
+    // file_content + path + instructions_reminder → save-file
+    if obj.contains_key("file_content")
+        && obj.get("path").is_some()
+        && obj.contains_key("instructions_reminder")
+    {
+        return Some("save-file".to_string());
+    }
+    // path + view_range → view (must precede the retrieval check; view_range is
+    // unambiguous even when the title looks like prose)
+    if obj.get("path").is_some() && obj.contains_key("view_range") {
+        return Some("view".to_string());
+    }
+    // information_request → codebase-retrieval / conversation-retrieval
+    if obj.contains_key("information_request") {
+        if title.to_lowercase().contains("conversation") {
+            return Some("conversation-retrieval".to_string());
+        }
+        return Some("codebase-retrieval".to_string());
+    }
+    // file_paths array → remove-files
+    if obj.get("file_paths").and_then(Value::as_array).is_some() {
+        return Some("remove-files".to_string());
+    }
+    // input: string containing "*** Begin Patch" → apply_patch
+    if let Some(s) = obj.get("input").and_then(Value::as_str) {
+        if s.contains("*** Begin Patch") {
+            return Some("apply_patch".to_string());
+        }
+    }
+    None
 }
 
 fn split_name_prefix(title: &str) -> Option<&str> {
@@ -263,8 +327,9 @@ fn strip_workspace_mcp_suffix(name: &str) -> String {
 }
 
 /// Map ACP's `ToolKind` (+ tool name) to the intentd taxonomy
-/// (file|terminal|search|note|git|other). `note`/`git` are not expressible via
-/// `ToolKind` alone, so they are inferred from the tool name (§6.6).
+/// (file|terminal|search|note|git|other). `note`/`git` and the context-engine
+/// retrievals are not expressible via `ToolKind` alone, so they are inferred
+/// from the tool name (§6.6).
 fn tool_kind_word(kind: ToolKind, name: &str) -> &'static str {
     let lower = name.to_lowercase();
     if lower.starts_with("git") || lower.contains(" git ") {
@@ -272,6 +337,9 @@ fn tool_kind_word(kind: ToolKind, name: &str) -> &'static str {
     }
     if lower.contains("note") {
         return "note";
+    }
+    if lower == "codebase-retrieval" || lower == "conversation-retrieval" {
+        return "search";
     }
     match kind {
         ToolKind::Read | ToolKind::Edit | ToolKind::Delete | ToolKind::Move => "file",
