@@ -7657,16 +7657,20 @@ impl WorkspaceApi for Services {
             let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                 Error::Internal("Failed to stage hunk: workspace has no worktree".to_string())
             })?;
-            locks
+            // Read the post-mutation status snapshot INSIDE the lock so a
+            // concurrent write can't slip a different state into the event
+            // that this call is supposed to describe. The event itself is
+            // published outside the lock (payload is already a Value).
+            let status_json = locks
                 .with_lock(&worktree, || async {
-                    intent_git::stage::stage_hunk(&worktree, &file_path, &hunk_patch)
+                    intent_git::stage::stage_hunk(&worktree, &file_path, &hunk_patch)?;
+                    let status = intent_git::status::status(&worktree)
+                        .unwrap_or_else(|_| intent_git::status::empty_status());
+                    Ok::<_, Error>(serde_json::to_value(&status).unwrap_or(serde_json::Value::Null))
                 })
                 .await?;
             // Notify the FE bridge so the changes view refreshes without a
             // follow-up `git.status` read (parity with `git.stage`).
-            let status = intent_git::status::status(&worktree)
-                .unwrap_or_else(|_| intent_git::status::empty_status());
-            let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
             publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
             Ok(())
         })
@@ -7689,14 +7693,16 @@ impl WorkspaceApi for Services {
             let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                 Error::Internal("Failed to unstage hunk: workspace has no worktree".to_string())
             })?;
-            locks
+            // Status snapshot inside the lock — see the matching note on
+            // `git_stage_hunk` above.
+            let status_json = locks
                 .with_lock(&worktree, || async {
-                    intent_git::stage::unstage_hunk(&worktree, &file_path, &hunk_patch)
+                    intent_git::stage::unstage_hunk(&worktree, &file_path, &hunk_patch)?;
+                    let status = intent_git::status::status(&worktree)
+                        .unwrap_or_else(|_| intent_git::status::empty_status());
+                    Ok::<_, Error>(serde_json::to_value(&status).unwrap_or(serde_json::Value::Null))
                 })
                 .await?;
-            let status = intent_git::status::status(&worktree)
-                .unwrap_or_else(|_| intent_git::status::empty_status());
-            let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
             publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
             Ok(())
         })

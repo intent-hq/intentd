@@ -2052,8 +2052,8 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `git.push`: push the workspace's current branch to `origin` (with
     /// `+refs/heads/<branch>` when `force` is set), mirroring
-    /// `gitService.push`. Returns `{ branch, pushed_sha }`. Failures surface as
-    /// `-32603` (PROTOCOL §5.6).
+    /// `gitService.push`. Returns `{ branch, pushedSha }` (camelCase on the
+    /// wire — see PROTOCOL §5.6). Failures surface as `-32603`.
     fn git_push(
         &self,
         workspace_id: WorkspaceId,

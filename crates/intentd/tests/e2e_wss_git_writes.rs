@@ -1,15 +1,14 @@
 //! WSS end-to-end for the write-side `git.*` methods added in
 //! PROTOCOL.md §5.6: `git.createBranch`, `git.checkoutBranch`,
-//! `git.renameBranch`, `git.stageHunk`, `git.unstageHunk`, and
-//! `git.removeLockFile`. Drives a real pinned-TLS WebSocket against a live
-//! `intentd serve --listen both` and asserts the response envelope shape
-//! from PROTOCOL.md §5 (`{ ok, ... }`) plus the `-32602` error envelope
-//! from §9 for the empty-name validation path.
+//! `git.renameBranch`, `git.stageHunk`, `git.unstageHunk`,
+//! `git.removeLockFile`, `git.push`, and `git.fetch`. Drives a real
+//! pinned-TLS WebSocket against a live `intentd serve --listen both` and
+//! asserts the response envelope shape from PROTOCOL.md §5 (`{ ok, ... }`)
+//! plus the `-32602` error envelope from §9 for the validation paths.
 //!
-//! `git.push`/`git.fetch` are covered by their own crate-level tests in
-//! `intent-git` (they need a bare-remote fixture); this file focuses on
-//! the router → services → intent-git wire path that the FE bridge
-//! actually calls.
+//! `git.push`/`git.fetch` add a local bare-remote fixture wired up as
+//! `origin` on the source repo (linked worktrees share the object store
+//! and refs, so the workspace's worktree inherits the remote).
 //!
 //! Uses a tiny local repository as the workspace source so the test never
 //! touches the network. Gated on `git` being on PATH; skips cleanly
@@ -457,6 +456,97 @@ async fn git_branch_ops_round_trip_over_wss() {
     )
     .await;
     assert_eq!(resp["error"]["code"], json!(-32602));
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// Exercises `git.push` and `git.fetch` over WSS against a local bare-remote
+/// fixture. Response envelopes are checked against PROTOCOL.md §5.6 and the
+/// bare-remote / local tracking ref advance is asserted after each call.
+#[tokio::test]
+async fn git_push_and_fetch_round_trip_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("root-remote");
+    let (daemon, port, cfg) = boot(&root).await;
+    let repo = make_source_repo(&daemon.scratch);
+
+    // Bare remote wired to the source repo as `origin`. Linked worktrees
+    // share the object store and refs, so the workspace's worktree inherits
+    // the remote without any extra config.
+    let bare = daemon.scratch.join("bare-remote.git");
+    run_git(
+        &["init", "--bare", "-q", bare.to_str().unwrap()],
+        &daemon.scratch,
+    );
+    run_git(&["remote", "add", "origin", bare.to_str().unwrap()], &repo);
+
+    let mut ws = connect_ws(port, cfg).await;
+    let (ws_id, wt) = create_workspace(&mut ws, &repo, "Git Write E2E — push/fetch").await;
+
+    // Seed a commit on the workspace's worktree so there is something to push.
+    std::fs::write(wt.join("tracked.txt"), "seed\nnew line\n").unwrap();
+    run_git(&["add", "tracked.txt"], &wt);
+    run_git(&["commit", "-q", "-m", "wt-change"], &wt);
+    let local_sha = run_git(&["rev-parse", "HEAD"], &wt);
+    let wt_branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], &wt);
+
+    // git.push — response carries `{ ok, branch, pushedSha }` per §5.6.
+    let resp = wss_rpc(
+        &mut ws,
+        3,
+        "git.push",
+        json!({ "workspaceId": ws_id, "force": false }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "push: {resp}");
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["branch"].as_str(), Some(wt_branch.as_str()));
+    assert_eq!(
+        resp["result"]["pushedSha"].as_str(),
+        Some(local_sha.as_str())
+    );
+
+    // Bare remote now carries the branch at the pushed sha.
+    let remote_sha = run_git(&["rev-parse", &format!("refs/heads/{wt_branch}")], &bare);
+    assert_eq!(remote_sha, local_sha);
+
+    // Advance the bare remote out-of-band so a subsequent git.fetch has
+    // something to pull down into the worktree's tracking ref.
+    let clone_dir = daemon.scratch.join("bare-clone");
+    run_git(
+        &[
+            "clone",
+            "-q",
+            bare.to_str().unwrap(),
+            clone_dir.to_str().unwrap(),
+        ],
+        &daemon.scratch,
+    );
+    run_git(&["checkout", "-q", &wt_branch], &clone_dir);
+    std::fs::write(
+        clone_dir.join("tracked.txt"),
+        "seed\nnew line\nremote-only\n",
+    )
+    .unwrap();
+    run_git(&["add", "tracked.txt"], &clone_dir);
+    run_git(&["commit", "-q", "-m", "remote-advance"], &clone_dir);
+    run_git(&["push", "-q", "origin", &wt_branch], &clone_dir);
+    let advanced_sha = run_git(&["rev-parse", "HEAD"], &clone_dir);
+
+    // git.fetch — response carries `{ ok: true }` per §5.6.
+    let resp = wss_rpc(&mut ws, 4, "git.fetch", json!({ "workspaceId": ws_id })).await;
+    assert!(resp.get("error").is_none(), "fetch: {resp}");
+    assert_eq!(resp["result"]["ok"], json!(true));
+
+    // Local tracking ref for `origin/<branch>` now points at the advanced sha.
+    let tracked = run_git(
+        &["rev-parse", &format!("refs/remotes/origin/{wt_branch}")],
+        &wt,
+    );
+    assert_eq!(tracked, advanced_sha);
 
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
