@@ -1020,3 +1020,122 @@ async fn unarchive_workspace_emits_workspace_updated_over_wss() {
         "workspace.unarchive must publish exactly one workspace:updated, got extra: {extra:?}"
     );
 }
+
+/// End-to-end (Audit D H1+M1): `comment.add` over WSS persists the
+/// surrounding `anchorContext` and a subsequent `note.setContent` that wipes
+/// the anchor markers must flip the comment to `isOrphaned: true` (reference
+/// `updateNote` failed-recovery path).
+#[tokio::test]
+async fn note_edit_marks_destroyed_anchor_orphaned_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "AnchorResilience", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Note", "content": "prefix target suffix" }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    // comment.add over WSS — the response nests `anchorContext` per PROTOCOL
+    // §5 comment shape, sourced from the anchor_before / anchor_after fields
+    // persisted by M1.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let add = wss_rpc(
+        &mut rpc,
+        1,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "prefix target suffix",
+            "commentTarget": "target",
+            "comment": "root",
+        }),
+    )
+    .await;
+    let comment_id = add["commentId"].as_str().expect("comment id").to_string();
+
+    // Read the comment back and assert `anchorContext` was persisted (M1).
+    let list = wss_rpc(
+        &mut rpc,
+        2,
+        "comment.list",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "includeComments": true,
+        }),
+    )
+    .await;
+    let comment = list["threads"][0]["comments"][0].clone();
+    assert_eq!(comment["id"], comment_id.as_str());
+    let ctx = &comment["anchorContext"];
+    assert!(ctx.is_object(), "anchorContext missing: {comment}");
+    assert!(
+        ctx["before"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("prefix "),
+        "unexpected before: {ctx}"
+    );
+    assert!(
+        ctx["after"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with(" suffix"),
+        "unexpected after: {ctx}"
+    );
+    assert!(
+        !comment["isOrphaned"].as_bool().unwrap_or(false),
+        "comment should not be orphaned yet: {comment}"
+    );
+
+    // Wipe both anchor markers via note.setContent → H1 orphan path.
+    wss_rpc(
+        &mut rpc,
+        3,
+        "note.setContent",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "content": "totally different content with no markers",
+            "confirmReplacement": true,
+        }),
+    )
+    .await;
+
+    let after = wss_rpc(
+        &mut rpc,
+        4,
+        "comment.list",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "includeComments": true,
+        }),
+    )
+    .await;
+    let comment_after = after["threads"][0]["comments"][0].clone();
+    assert_eq!(comment_after["id"], comment_id.as_str());
+    assert_eq!(
+        comment_after["isOrphaned"],
+        json!(true),
+        "expected orphaned after anchor destruction: {comment_after}"
+    );
+}
