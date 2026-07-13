@@ -1752,6 +1752,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `git.discard`: discard working-tree changes to `paths` (CSV string or
+    /// array), mirroring `gitService.discardChanges`: tracked paths are
+    /// restored from the index (`git checkout -- <paths>`); untracked paths
+    /// are deleted from disk. Staged changes are untouched. `.`/`*`/`--all`
+    /// are rejected (`-32603`); idempotent on already-clean paths. Returns the
+    /// validated path list (PROTOCOL §5.6).
+    fn git_discard(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: serde_json::Value,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        let _ = (workspace_id, paths);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_discard not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `git.getBranches`: branches for a known `repo_path`; an unknown repo path
     /// is `-32602` (PROTOCOL §5.6).
     fn git_get_branches(

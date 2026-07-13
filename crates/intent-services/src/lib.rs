@@ -7151,6 +7151,31 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn git_discard(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: serde_json::Value,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Same `.`/`*`/`--all` rejection + CSV/array parse as `git.stage`.
+            let path_list = git_ops::parse_stage_paths(&paths)?;
+            // Mirror `git.stage`: every failure surfaces as `-32603`, so a
+            // missing workspace/worktree is `Internal` too.
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to discard changes: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to discard changes: workspace has no worktree".to_string())
+            })?;
+            // Tracked paths → checkout from index; untracked → delete from
+            // disk. Idempotent on clean/missing paths (matches reference).
+            intent_git::stage::discard(&worktree, &path_list)?;
+            Ok(path_list)
+        })
+    }
+
     fn git_get_branches(
         &self,
         repo_path: String,

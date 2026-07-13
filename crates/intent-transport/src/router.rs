@@ -1249,6 +1249,13 @@ async fn dispatch(
             let unstaged = api.git_unstage(ws, paths).await.map_err(domain_to_rpc)?;
             Ok(json!({ "ok": true, "paths": unstaged }))
         }
+        "git.discard" => {
+            let ws = require_ws_note(params)?;
+            require_present(params, "paths")?;
+            let paths = params.get("paths").cloned().unwrap_or(Value::Null);
+            let discarded = api.git_discard(ws, paths).await.map_err(domain_to_rpc)?;
+            Ok(json!({ "ok": true, "paths": discarded }))
+        }
         "git.getBranches" => {
             let repo_path = require_str_param(params, "repoPath")?;
             let include_remote = parse_bool(params, "includeRemote");

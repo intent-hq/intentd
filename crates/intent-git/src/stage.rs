@@ -66,6 +66,70 @@ pub fn unstage(worktree_path: &Path, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Discard working-tree changes to `paths` (already split and validated),
+/// mirroring `gitService.discardChanges`: tracked paths are restored from the
+/// index (equivalent to `git checkout -- <paths>`), untracked paths are deleted
+/// from disk (files unlinked, directories removed recursively). Idempotent on
+/// clean files: a checkout against an unchanged path is a no-op, and a missing
+/// untracked path (already deleted) is ignored (`ENOENT` race). Staged changes
+/// are untouched — this discards only the unstaged worktree delta, matching the
+/// reference. Individual failures are best-effort (logged in the reference,
+/// swallowed here) so the batch does not abort on one bad path.
+pub fn discard(worktree_path: &Path, paths: &[String]) -> Result<()> {
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| Error::Internal("Repository has no working directory".to_string()))?
+        .to_path_buf();
+    let index = repo.index().map_err(map_git_err)?;
+
+    // Partition into tracked vs untracked, mirroring the reference's
+    // `git ls-files --error-unmatch <path>` probe: a path is tracked iff it
+    // has a stage-0 entry in the current index.
+    let mut tracked: Vec<String> = Vec::new();
+    let mut untracked: Vec<String> = Vec::new();
+    for raw in paths {
+        let rel = normalize_rel(&workdir, raw);
+        if index.get_path(Path::new(&rel), 0).is_some() {
+            tracked.push(rel);
+        } else {
+            untracked.push(rel);
+        }
+    }
+
+    // Tracked: restore worktree from index (`git checkout -- <paths>`).
+    if !tracked.is_empty() {
+        let mut opts = git2::build::CheckoutBuilder::new();
+        // Overwrite modified working-tree files, do not touch the index.
+        opts.force().update_index(false).remove_untracked(false);
+        for rel in &tracked {
+            opts.path(rel);
+        }
+        // `checkout_index` with `None` uses the repository's current index.
+        repo.checkout_index(None, Some(&mut opts))
+            .map_err(map_git_err)?;
+    }
+
+    // Untracked: delete from disk (files unlinked, directories recursively
+    // removed). `ENOENT` is ignored — matches the reference's race-tolerant
+    // deletion.
+    for rel in &untracked {
+        let full = workdir.join(rel);
+        let meta = match std::fs::symlink_metadata(&full) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_dir() {
+            let _ = std::fs::remove_dir_all(&full);
+        } else {
+            let _ = std::fs::remove_file(&full);
+        }
+    }
+
+    Ok(())
+}
+
 /// Normalize a path to be relative to the worktree, mirroring the TS
 /// `path.isAbsolute(p) ? path.relative(worktree, p) : p`.
 fn normalize_rel(workdir: &Path, raw: &str) -> String {
@@ -142,5 +206,80 @@ mod tests {
         commit_file(dir.path(), "seed.txt", "seed\n");
         let err = stage(dir.path(), &["nope.txt".to_string()]).unwrap_err();
         assert!(format!("{err}").contains("did not match any files"));
+    }
+
+    #[test]
+    fn discard_reverts_an_unstaged_modification() {
+        let dir = init_repo("discard-mod");
+        commit_file(dir.path(), "a.txt", "one\n");
+        write_file(dir.path(), "a.txt", "two\n");
+        discard(dir.path(), &["a.txt".to_string()]).unwrap();
+        let on_disk = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
+        assert_eq!(on_disk, "one\n");
+        let st = status(dir.path()).unwrap();
+        assert!(st.files.iter().all(|f| f.path != "a.txt"));
+    }
+
+    #[test]
+    fn discard_deletes_untracked_files() {
+        let dir = init_repo("discard-untracked");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        write_file(dir.path(), "new.txt", "hi\n");
+        assert!(dir.path().join("new.txt").exists());
+        discard(dir.path(), &["new.txt".to_string()]).unwrap();
+        assert!(!dir.path().join("new.txt").exists());
+        let st = status(dir.path()).unwrap();
+        assert!(st.files.iter().all(|f| f.path != "new.txt"));
+    }
+
+    #[test]
+    fn discard_deletes_untracked_directory_recursively() {
+        let dir = init_repo("discard-untracked-dir");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        let sub = dir.path().join("newdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.txt"), "a\n").unwrap();
+        std::fs::write(sub.join("b.txt"), "b\n").unwrap();
+        discard(dir.path(), &["newdir".to_string()]).unwrap();
+        assert!(!sub.exists());
+    }
+
+    #[test]
+    fn discard_preserves_staged_changes() {
+        let dir = init_repo("discard-staged");
+        commit_file(dir.path(), "a.txt", "one\n");
+        // Stage a modification, then dirty the worktree further.
+        write_file(dir.path(), "a.txt", "two\n");
+        stage(dir.path(), &["a.txt".to_string()]).unwrap();
+        write_file(dir.path(), "a.txt", "three\n");
+        // Discard drops the unstaged "three" back to the staged "two"; the
+        // staged entry itself is preserved (matches `git checkout -- a.txt`).
+        discard(dir.path(), &["a.txt".to_string()]).unwrap();
+        let on_disk = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
+        assert_eq!(on_disk, "two\n");
+        let st = status(dir.path()).unwrap();
+        let f = st.files.iter().find(|f| f.path == "a.txt").unwrap();
+        assert!(f.staged);
+        assert_eq!(f.status, GitFileStatus::Modified);
+    }
+
+    #[test]
+    fn discard_is_idempotent_on_clean_files() {
+        let dir = init_repo("discard-clean");
+        commit_file(dir.path(), "a.txt", "one\n");
+        discard(dir.path(), &["a.txt".to_string()]).unwrap();
+        // A second call on the same clean path is still ok.
+        discard(dir.path(), &["a.txt".to_string()]).unwrap();
+        let on_disk = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
+        assert_eq!(on_disk, "one\n");
+    }
+
+    #[test]
+    fn discard_missing_untracked_path_is_ignored() {
+        // ENOENT parity with the reference's race-tolerant unlink: an untracked
+        // path that no longer exists on disk does not error.
+        let dir = init_repo("discard-missing");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        discard(dir.path(), &["nope.txt".to_string()]).unwrap();
     }
 }
