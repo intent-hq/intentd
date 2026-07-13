@@ -2065,6 +2065,16 @@ async fn comment_add_forwards_idempotency_key() {
     .await
     .unwrap();
     assert_eq!(v["result"]["commentId"], serde_json::json!("idem-42"));
+
+    // Present-but-empty (or whitespace-only) keys are treated as absent at the
+    // router boundary, so distinct empty-key calls can never dedupe onto the
+    // first cached result. The fake falls back to "c1" when the key is None.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"comment.add","params":{"workspaceId":"ws-1","noteId":"n1","searchContext":"a test sentence","commentTarget":"test","comment":"nice","idempotencyKey":"  "}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["commentId"], serde_json::json!("c1"));
 }
 
 #[tokio::test]

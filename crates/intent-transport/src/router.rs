@@ -575,7 +575,7 @@ async fn dispatch(
             let comment = require_str_param(params, "comment")?;
             let kind = opt_str(params, "type");
             let author = opt_str(params, "author");
-            let idempotency_key = opt_str(params, "idempotencyKey");
+            let idempotency_key = opt_nonempty_str(params, "idempotencyKey");
             let result = api
                 .comment_add(
                     ws,
