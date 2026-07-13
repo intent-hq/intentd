@@ -210,10 +210,14 @@ pub trait WorkspaceApi: Send + Sync {
     /// a freshly minted id, seed the well-known `spec` note, and copy over any
     /// non-`spec` notes from the source. Runtime-only fields (`activity`, card
     /// aggregates, timeline, changesets) are not carried over; the new workspace
-    /// starts on a fresh branch and no worktree — worktree provisioning for a
-    /// duplicated workspace is deferred to a follow-up task (git-worktree
-    /// machinery). `newTitle` overrides the auto-suffixed `"<source> (Copy)"`
-    /// title. `NotFound` if the source workspace is absent.
+    /// starts on a fresh branch pinned to its id. When the source carries a
+    /// local `repositoryPath` and is not `skipWorktree`/`isRemote`, the daemon
+    /// provisions a linked worktree at `<root>/<newId>/<repo-slug>` on that
+    /// branch (mirroring the `workspace.create` flow); provisioning failures
+    /// are logged and the duplicate still returns without a `worktreePath`
+    /// (FE parity: "user can create it manually"). `newTitle` overrides the
+    /// auto-suffixed `"<source> (Copy)"` title. `NotFound` if the source
+    /// workspace is absent.
     fn duplicate_workspace(
         &self,
         id: WorkspaceId,
