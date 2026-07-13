@@ -71,7 +71,9 @@ async fn add(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, args: &Value) -> Res
             comment,
             kind,
             author,
-            Some(uuid::Uuid::new_v4().to_string()),
+            opt_str(args, "idempotencyKey")
+                .filter(|k| !k.trim().is_empty())
+                .or_else(|| Some(uuid::Uuid::new_v4().to_string())),
         )
         .await
         .map_err(map_err)?;
