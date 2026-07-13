@@ -340,13 +340,13 @@ pub(crate) fn build_branch_diff(
                 continue;
             }
         }
-        // `show_file` folds a missing path at the ref to "", which matches the
-        // FE handler's per-side `showFileAt` and gives us empty pre-images
-        // for added files and empty post-images for deletions.
-        let old_content =
-            intent_git::show::show_file(worktree, &boundary, &fd.path).unwrap_or_default();
-        let new_content =
-            intent_git::show::show_file(worktree, target_ref, &fd.path).unwrap_or_default();
+        // `show_file` folds a missing path at the ref to `Ok("")`, which
+        // matches the FE handler's per-side `showFileAt` and gives us empty
+        // pre-images for added files and empty post-images for deletions.
+        // Any other error (revparse failure, repository IO) is a real problem
+        // — surface it instead of silently returning empty content.
+        let old_content = intent_git::show::show_file(worktree, &boundary, &fd.path)?;
+        let new_content = intent_git::show::show_file(worktree, target_ref, &fd.path)?;
         out.push(json!({
             "file": fd.path,
             "chunks": Vec::<Value>::new(),

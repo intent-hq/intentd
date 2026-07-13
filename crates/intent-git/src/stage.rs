@@ -667,10 +667,13 @@ mod tests {
     }
 
     /// Regression: a path whose own name contains ` b/` (a directory literally
-    /// named `dir b`) must still be accepted. `rsplit_once(" b/")` picks the
-    /// final occurrence so the `a/` and `b/` sides both parse as the full path;
-    /// the pre-fix `split_once(" b/")` grabbed the first occurrence and rejected
-    /// the header with a mismatched-path error.
+    /// named `dir b`) must still be accepted. Any `split_once(" b/")` /
+    /// `rsplit_once(" b/")` header parser is ambiguous here — the header
+    /// `a/dir b/file.txt b/dir b/file.txt` has three ` b/` occurrences and no
+    /// single split (first, last, or middle) picks the right one. The current
+    /// validator sidesteps the parse entirely by comparing the header against
+    /// the synthesized `a/{path} b/{path}` string, so this path must round-trip
+    /// cleanly.
     #[test]
     fn stage_hunk_accepts_path_containing_b_slash() {
         let dir = init_repo("stage-hunk-b-slash");
