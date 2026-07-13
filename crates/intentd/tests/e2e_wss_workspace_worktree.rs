@@ -687,9 +687,11 @@ async fn workspace_create_stores_empty_title_when_title_empty_over_wss() {
 }
 
 /// `workspace.create` over WSS with the `title` field entirely omitted from
-/// `params` also persists `""` — the reference contract collapses missing
-/// and blank titles to the same Untitled shape. Guards the JSON-RPC
-/// `params:{}` request path onboarding uses today.
+/// the `params` object (other fields still present) persists `""` — the
+/// reference contract collapses missing and blank titles to the same
+/// Untitled shape. Guards the JSON-RPC request path where callers send a
+/// `params` object without a `title` key, matching what onboarding sends
+/// today.
 #[tokio::test]
 async fn workspace_create_stores_empty_title_when_title_omitted_over_wss() {
     if !gate() {
