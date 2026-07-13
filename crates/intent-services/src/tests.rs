@@ -8695,15 +8695,14 @@ mod worktree_provisioning {
     }
 
     /// When the caller passes an empty (or missing) title, `workspace.create`
-    /// seeds the workspace title with the derived id (slug) so the FE header
-    /// shows a readable name (e.g. `auth-fix`) immediately instead of
-    /// "Untitled". The FE recognizes this shape via `isWorkspaceSlug()` and
-    /// still prompts the initial agent to rename via `workspace.setTitle`.
+    /// stores `""` — reference parity with `workspace.service`
+    /// (`title: request.title || ''`) so the FE renders "Untitled" until the
+    /// initial agent's first-turn naming instruction calls `workspace.setTitle`.
     #[tokio::test]
-    async fn create_seeds_title_from_slug_when_title_omitted() {
+    async fn create_stores_empty_title_when_title_omitted() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let root = unique_dir("intentd-titleslug-root");
+        let root = unique_dir("intentd-titleempty-root");
         let svc = Services::new(store).with_workspaces_root(root.0.clone());
 
         let ws = svc
@@ -8725,9 +8724,12 @@ mod worktree_provisioning {
             .workspace;
 
         assert_eq!(ws.id.0, "auth-fix");
-        assert_eq!(ws.title, "auth-fix", "title falls back to the derived slug");
+        assert_eq!(
+            ws.title, "",
+            "missing title stored as empty for Untitled parity"
+        );
 
-        // The metadata file mirrors the seeded title so FE reads see it too.
+        // The metadata file mirrors the stored empty title so FE reads see it too.
         let metadata_path = root
             .0
             .join(&ws.id.0)
@@ -8735,7 +8737,35 @@ mod worktree_provisioning {
             .join("workspace.json");
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
-        assert_eq!(value["title"], "auth-fix");
+        assert_eq!(value["title"], "");
+    }
+
+    /// A whitespace-only title is normalized to `""` (same Untitled shape).
+    #[tokio::test]
+    async fn create_stores_empty_title_when_title_is_whitespace() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-titlewsp-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("   \t  ".to_string()),
+                    skip_worktree: Some(true),
+                    initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                        prompt: Some("fix the auth flow".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.title, "");
     }
 
     /// An explicit non-empty title from the caller wins over the slug

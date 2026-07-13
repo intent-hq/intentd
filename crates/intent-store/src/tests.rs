@@ -87,14 +87,14 @@ async fn migration_status_reports_current_after_open() {
         status.expected,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34
         ]
     );
     assert_eq!(
         status.applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34
         ]
     );
 }
@@ -159,6 +159,74 @@ async fn backfill_repository_name_from_path_basename() {
         "Windows-style `\\` separators backfill to the basename too"
     );
 }
+
+/// Migration 0034 heals legacy rows where `intent-services::create_workspace`
+/// seeded `title = id` (slug-shaped placeholder from before the Untitled-parity
+/// fix): it clears those to `""` so the FE renders "Untitled". Rows with an
+/// explicit user title, and the Chief-of-Staff row, are never touched.
+#[tokio::test]
+async fn heal_slug_seeded_titles_clears_only_matching_rows() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    // Legacy slug-seeded row: `title == id` — should be cleared.
+    let slug_id = WorkspaceId::from("amber-fox");
+    let mut slug = sample_workspace(&slug_id, "amber-fox", false);
+    slug.repository_name = Some("intentd".to_string());
+    // Row with a real user title — must be preserved verbatim.
+    let user_id = WorkspaceId::new();
+    let user = sample_workspace(&user_id, "Add dark mode support", false);
+    // Row with a title that already equals `""` — must stay `""`.
+    let empty_id = WorkspaceId::new();
+    let empty = sample_workspace(&empty_id, "", false);
+    // Coincidental collision: user-typed title happens to match the id shape.
+    // The heal cannot distinguish this from a slug seed, and the task note is
+    // explicit that clearing it is the accepted trade-off (slug-seeded rows
+    // are the reference case). Documented here so the assertion is intentional.
+    let collision_id = WorkspaceId::from("blue-heron");
+    let collision = sample_workspace(&collision_id, "blue-heron", false);
+
+    for ws in [&slug, &user, &empty, &collision] {
+        store.insert_workspace(ws).await.expect("insert");
+    }
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/0034_workspace_title_untitled_heal.sql"
+    ))
+    .execute(store.pool())
+    .await
+    .expect("re-run heal");
+
+    assert_eq!(
+        store.get_workspace(&slug_id).await.unwrap().title,
+        "",
+        "slug-seeded title cleared"
+    );
+    assert_eq!(
+        store.get_workspace(&user_id).await.unwrap().title,
+        "Add dark mode support",
+        "user-set title preserved"
+    );
+    assert_eq!(
+        store.get_workspace(&empty_id).await.unwrap().title,
+        "",
+        "already-empty title stays empty"
+    );
+    assert_eq!(
+        store.get_workspace(&collision_id).await.unwrap().title,
+        "",
+        "collision case documented: title=id rows are cleared"
+    );
+
+    // Chief-of-Staff (seeded by migration 0033) keeps its canonical title,
+    // guaranteed by the `id != '__chief__'` clause in the heal SQL.
+    let chief = store
+        .get_workspace(&WorkspaceId::from("__chief__"))
+        .await
+        .expect("chief row present");
+    assert_eq!(chief.title, "Chief of Staff");
+}
+
 #[tokio::test]
 async fn workspace_round_trip_and_archive_filter() {
     let tmp = TempDb::new();
