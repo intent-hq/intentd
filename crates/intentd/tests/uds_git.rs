@@ -290,6 +290,67 @@ async fn uds_git_write_ops_round_trip() {
     .await;
     assert_eq!(resp["error"]["code"], json!(-32603));
 
+    // (j) git.discard restores an unstaged tracked modification from the
+    // index. After step (h) HEAD/index have seed.txt = "seed changed again\n"
+    // (the userRequested checkpoint), so discard must restore to that content
+    // — matching `git checkout -- seed.txt` semantics.
+    std::fs::write(repo.join("seed.txt"), "seed dirty\n").unwrap();
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":15,"method":"git.discard","params":{"workspaceId":"ws-git","paths":["seed.txt"]}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["paths"], json!(["seed.txt"]));
+    let on_disk = std::fs::read_to_string(repo.join("seed.txt")).unwrap();
+    assert_eq!(on_disk, "seed changed again\n");
+
+    // (k) git.discard on an untracked path deletes it from disk. other.txt
+    // was left untracked by step (h) with contents "unstaged\n".
+    assert!(repo.join("other.txt").exists());
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":16,"method":"git.discard","params":{"workspaceId":"ws-git","paths":["other.txt"]}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["paths"], json!(["other.txt"]));
+    assert!(!repo.join("other.txt").exists());
+
+    // (l) idempotent on a now-clean tracked path.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":17,"method":"git.discard","params":{"workspaceId":"ws-git","paths":["seed.txt"]}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["paths"], json!(["seed.txt"]));
+
+    // (m) missing untracked path is ignored (ENOENT parity).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":18,"method":"git.discard","params":{"workspaceId":"ws-git","paths":["nope.txt"]}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(resp["result"]["paths"], json!(["nope.txt"]));
+
+    // (n) `.`/`*`/`--all` is rejected with -32603 (matches git.stage).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":19,"method":"git.discard","params":{"workspaceId":"ws-git","paths":"."}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32603));
+
+    // (o) missing `paths` param → -32602.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":20,"method":"git.discard","params":{"workspaceId":"ws-git"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+
     let _ = tx.send(());
     let _ = server.await;
     std::fs::remove_dir_all(&base).ok();

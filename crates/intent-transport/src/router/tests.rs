@@ -703,6 +703,55 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn git_discard(
+        &self,
+        _workspace_id: WorkspaceId,
+        paths: Value,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        Box::pin(async move {
+            // Mirrors `parse_discard_paths` in production: reject `.`/`*`/
+            // `--all` in top-level string AND every parsed element (array
+            // items + CSV entries), with a discard-oriented message.
+            if let Value::String(s) = &paths {
+                if s == "." || s == "*" || s.contains("--all") {
+                    return Err(Error::Internal(
+                        "Discarding all files is not allowed.".to_string(),
+                    ));
+                }
+            }
+            let list: Vec<String> = match paths {
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect(),
+                Value::String(s) => s
+                    .split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect(),
+                _ => vec![],
+            };
+            for p in &list {
+                if p == "." || p == "*" || p.contains("--all") {
+                    return Err(Error::Internal(
+                        "Discarding all files is not allowed.".to_string(),
+                    ));
+                }
+            }
+            // Parity with production: an empty parsed list (e.g. `[]`,
+            // `[null]`, `" , "`) is `-32603`, not a silent `ok: true`.
+            if list.is_empty() {
+                return Err(Error::Internal(
+                    "No file paths provided. Please specify at least one file path to discard."
+                        .to_string(),
+                ));
+            }
+            Ok(list)
+        })
+    }
+
     fn git_get_branches(
         &self,
         repo_path: String,
@@ -2613,6 +2662,85 @@ async fn git_unstage_missing_paths_is_minus_32602() {
         v["error"]["message"],
         serde_json::json!("Missing required parameter: paths")
     );
+}
+
+#[tokio::test]
+async fn git_discard_returns_ok_and_paths() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.discard","params":{"workspaceId":"ws-1","paths":["src/a.ts","src/b.ts"]}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(
+        v["result"]["paths"],
+        serde_json::json!(["src/a.ts", "src/b.ts"])
+    );
+}
+
+#[tokio::test]
+async fn git_discard_missing_paths_is_minus_32602() {
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"git.discard","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: paths")
+    );
+}
+
+#[tokio::test]
+async fn git_discard_all_is_rejected_with_minus_32603() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.discard","params":{"workspaceId":"ws-1","paths":"."}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+}
+
+#[tokio::test]
+async fn git_discard_all_array_form_is_rejected_with_minus_32603() {
+    // Regression: the array-form discard-all bypass. `["*"]` / `["--all"]`
+    // must be rejected exactly like the top-level string form.
+    for paths in ["[\"*\"]", "[\"--all\"]", "[\".\"]"] {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"git.discard","params":{{"workspaceId":"ws-1","paths":{paths}}}}}"#
+        );
+        let v = call(&frame).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "expected -32603 for paths={paths}");
+        // `Error::Internal` maps to `code=-32603` + generic message with the
+        // detail string carried in `data` (router's `domain_to_rpc`).
+        assert!(
+            v["error"]["data"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Discarding all files is not allowed"),
+            "expected discard-oriented message for paths={paths}: {v}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn git_discard_empty_parsed_list_is_minus_32603() {
+    // Regression: an empty parsed list (`[]`, `[null]`, `" , "`) must be
+    // `-32603` with the no-paths message, not a silent `ok: true`.
+    for paths in ["[]", "[null]", "\" , \""] {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"git.discard","params":{{"workspaceId":"ws-1","paths":{paths}}}}}"#
+        );
+        let v = call(&frame).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "expected -32603 for paths={paths}");
+        assert!(
+            v["error"]["data"]
+                .as_str()
+                .unwrap_or("")
+                .contains("No file paths provided"),
+            "expected no-paths message for paths={paths}: {v}",
+        );
+    }
 }
 
 #[tokio::test]

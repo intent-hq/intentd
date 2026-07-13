@@ -7151,6 +7151,38 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn git_discard(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: serde_json::Value,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Discard-specific parser: `.`/`*`/`--all` rejected in BOTH the
+            // top-level string and every array element (closes the array-form
+            // bypass that would otherwise let `["*"]` / `["--all"]` devolve
+            // into a silent no-op). Error messages are discard-oriented.
+            let path_list = git_ops::parse_discard_paths(&paths)?;
+            // Workspace / worktree resolution mirrors `git.stage`: a missing
+            // workspace or unset worktree is `Internal` (→ `-32603`). The
+            // subsequent `intent_git::stage::discard` call may still return
+            // `Error::InvalidParams` (→ `-32602`) for unsafe pathspecs
+            // (e.g. `..` traversal, absolute paths outside the worktree) —
+            // those propagate unchanged.
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to discard changes: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to discard changes: workspace has no worktree".to_string())
+            })?;
+            // Tracked paths → checkout from index; untracked → delete from
+            // disk. Idempotent on clean/missing paths (matches reference).
+            intent_git::stage::discard(&worktree, &path_list)?;
+            Ok(path_list)
+        })
+    }
+
     fn git_get_branches(
         &self,
         repo_path: String,

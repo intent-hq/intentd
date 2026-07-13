@@ -5194,6 +5194,129 @@ mod file_tracking {
         assert!(st.files.iter().any(|f| f.path == "seed.txt" && !f.staged));
     }
 
+    /// `git.discard` over the git.* RPC surface: an unstaged worktree change
+    /// is restored from the index, echoing the validated path list.
+    #[tokio::test]
+    async fn git_discard_reverts_an_unstaged_modification() {
+        let repo = init_git_repo();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store);
+
+        std::fs::write(repo.dir.join("seed.txt"), "seed changed\n").unwrap();
+
+        let discarded = svc
+            .git_discard(ws_id.clone(), serde_json::json!(["seed.txt"]))
+            .await
+            .unwrap();
+        assert_eq!(discarded, vec!["seed.txt".to_string()]);
+        let on_disk = std::fs::read_to_string(repo.dir.join("seed.txt")).unwrap();
+        assert_eq!(on_disk, "seed\n");
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        assert!(st.files.iter().all(|f| f.path != "seed.txt"));
+    }
+
+    /// `git.discard` on an untracked file deletes it from disk (mirrors the
+    /// reference's `fs.unlink` after `git ls-files --error-unmatch` fails).
+    #[tokio::test]
+    async fn git_discard_deletes_an_untracked_file() {
+        let repo = init_git_repo();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store);
+
+        std::fs::write(repo.dir.join("new.txt"), "hi\n").unwrap();
+        assert!(repo.dir.join("new.txt").exists());
+
+        let discarded = svc
+            .git_discard(ws_id.clone(), serde_json::json!(["new.txt"]))
+            .await
+            .unwrap();
+        assert_eq!(discarded, vec!["new.txt".to_string()]);
+        assert!(!repo.dir.join("new.txt").exists());
+    }
+
+    /// `git.discard` is idempotent: discarding a clean tracked path or a
+    /// missing untracked path returns the list rather than erroring.
+    #[tokio::test]
+    async fn git_discard_is_idempotent() {
+        let repo = init_git_repo();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store);
+
+        // Clean tracked path (seed.txt is committed, unchanged) + missing
+        // untracked path (nope.txt was never created).
+        let first = svc
+            .git_discard(ws_id.clone(), serde_json::json!(["seed.txt", "nope.txt"]))
+            .await
+            .unwrap();
+        assert_eq!(first, vec!["seed.txt".to_string(), "nope.txt".to_string()]);
+        let second = svc
+            .git_discard(ws_id.clone(), serde_json::json!(["seed.txt", "nope.txt"]))
+            .await
+            .unwrap();
+        assert_eq!(second, vec!["seed.txt".to_string(), "nope.txt".to_string()]);
+    }
+
+    /// `git.discard` refuses the discard-all tokens (`.` / `*` / `--all`) in
+    /// EVERY input shape: top-level string, CSV entry, and array element.
+    /// Regression for the array-form bypass where the shared stage parser
+    /// only inspected the top-level string, letting `["*"]` / `["--all"]`
+    /// fall through to a silent no-op and `["."]` to the worktree-escape
+    /// guard's `-32602`.
+    #[tokio::test]
+    async fn git_discard_refuses_discard_all_in_every_shape() {
+        let repo = init_git_repo();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store);
+
+        let expect_discard_all = |v: serde_json::Value| {
+            let svc = &svc;
+            let ws_id = ws_id.clone();
+            async move {
+                let err = svc.git_discard(ws_id, v).await.unwrap_err();
+                let msg = format!("{err}");
+                assert!(
+                    matches!(err, intent_core::Error::Internal(_)),
+                    "expected -32603 Internal, got: {msg}"
+                );
+                assert!(
+                    msg.contains("Discarding all files is not allowed"),
+                    "expected discard-all message, got: {msg}"
+                );
+            }
+        };
+
+        // Top-level string forms.
+        expect_discard_all(serde_json::json!(".")).await;
+        expect_discard_all(serde_json::json!("*")).await;
+        expect_discard_all(serde_json::json!("--all")).await;
+        // Array element forms (the bypass this test covers).
+        expect_discard_all(serde_json::json!(["."])).await;
+        expect_discard_all(serde_json::json!(["*"])).await;
+        expect_discard_all(serde_json::json!(["--all"])).await;
+        // Mixed array — a single tainted element still trips the guard.
+        expect_discard_all(serde_json::json!(["seed.txt", "*"])).await;
+    }
+
     /// Build a workspace whose worktree points at `repo`, returning the service.
     async fn svc_with_repo(repo: &GitRepo) -> (TempDb, Services, WorkspaceId) {
         let tmp = TempDb::new();
