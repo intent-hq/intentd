@@ -12,6 +12,7 @@ pub mod events;
 pub mod ids;
 pub mod model;
 pub mod secrets;
+pub mod server_control;
 pub mod slug;
 pub mod traits;
 
@@ -50,6 +51,7 @@ pub use model::{
     WorkspaceTaskStats, WorkspaceUpdate,
 };
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
+pub use server_control::ServerControl;
 pub use traits::{
     AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability,
     RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError, WorkspaceApi,

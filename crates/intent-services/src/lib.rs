@@ -286,6 +286,12 @@ pub struct Services {
     /// client-triggered `browser.exec` path already produces. Shared across
     /// clones so every service handle sees the same live-client set.
     reverse_dispatch: Option<Arc<dyn AgentReverseDispatch>>,
+    /// Runtime control for the WSS listener + mDNS (server settings apply
+    /// hooks, §5.12). When wired, `settings.update` on `server.wsApi.enabled`
+    /// / `server.discovery.enabled` starts/stops the listener at runtime.
+    /// `None` when unattached (unit tests, UDS-only wiring) — settings are
+    /// still persisted but the apply action is skipped. Shared across clones.
+    server_control: Option<Arc<dyn intent_core::ServerControl>>,
 }
 
 impl Services {
@@ -323,6 +329,7 @@ impl Services {
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
             reverse_dispatch: None,
+            server_control: None,
         }
     }
 
@@ -784,6 +791,14 @@ impl Services {
     pub fn with_reverse_dispatch(mut self, dispatch: Arc<dyn AgentReverseDispatch>) -> Self {
         self.reverse_dispatch = Some(dispatch);
         self
+    }
+
+    /// Attach the runtime [`ServerControl`] so `settings.update` can start/stop
+    /// the WSS listener + mDNS on `server.wsApi.enabled` /
+    /// `server.discovery.enabled` changes (server settings apply hooks, §5.12).
+    /// Idempotent: safe to call multiple times with the same or different handles.
+    pub fn attach_server_control(&mut self, control: Arc<dyn intent_core::ServerControl>) {
+        self.server_control = Some(control);
     }
 
     /// Borrow the shared [`McpHub`] (composition root: spawn the health monitor
@@ -3481,6 +3496,52 @@ impl Services {
         });
         serde_json::json!({ "requestId": request_id, "matches": [] })
     }
+
+    /// Apply server runtime control hooks after `settings.update` persists
+    /// `server.wsApi.enabled` / `server.discovery.enabled` changes (§5.12).
+    async fn apply_server_setting_hooks(
+        &self,
+        applied: &[serde_json::Value],
+        control: &Arc<dyn intent_core::ServerControl>,
+    ) {
+        for change in applied {
+            if let Some(key) = change.get("key").and_then(|v| v.as_str()) {
+                match key {
+                    "server.wsApi.enabled" => {
+                        if let Some(enabled) = change.get("value").and_then(|v| v.as_bool()) {
+                            if enabled {
+                                match control.start_ws_listener().await {
+                                    Ok(port) => {
+                                        tracing::info!(
+                                            port,
+                                            "server.wsApi.enabled → true: started WSS listener"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = ?e,
+                                            "server.wsApi.enabled → true: failed to start WSS listener"
+                                        );
+                                    }
+                                }
+                            } else {
+                                control.stop_ws_listener().await;
+                                tracing::info!("server.wsApi.enabled → false: stopped WSS listener");
+                            }
+                        }
+                    }
+                    "server.discovery.enabled" => {
+                        // mDNS control will be implemented later when Discovery is wired
+                        tracing::debug!(
+                            key,
+                            "server.discovery.enabled changed (mDNS control not yet wired)"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 impl WorkspaceApi for Services {
@@ -3499,6 +3560,11 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let applied = self.settings_service().update(&changes).await?;
             if !applied.is_empty() {
+                // Apply server runtime hooks (§5.12): start/stop WSS listener + mDNS
+                // when server.wsApi.enabled / server.discovery.enabled change.
+                if let Some(ref control) = self.server_control {
+                    self.apply_server_setting_hooks(&applied, control).await;
+                }
                 publish_event(&self.event_bus, settings_changed_event(applied.clone())).await;
             }
             Ok(serde_json::json!({ "applied": applied }))
