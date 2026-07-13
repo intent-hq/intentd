@@ -625,8 +625,8 @@ async fn dispatch(
         "task.linkAgent" => {
             let workspace_id = require_workspace_id(params)?;
             let note_id = require_note_id(params)?;
-            let task_text = require_str_param(params, "taskText")?;
-            let agent_id = require_str_param(params, "agentId")?;
+            let task_text = require_non_empty_str(params, "taskText")?;
+            let agent_id = require_non_empty_str(params, "agentId")?;
             let task_key = opt_nonempty_str(params, "taskKey").unwrap_or_else(|| task_text.clone());
             let link = api
                 .link_task_agent(workspace_id, note_id, task_key, task_text, agent_id)
@@ -637,7 +637,7 @@ async fn dispatch(
         "task.unlinkAgent" => {
             let workspace_id = require_workspace_id(params)?;
             let note_id = require_note_id(params)?;
-            let task_key = require_str_param(params, "taskKey")?;
+            let task_key = require_non_empty_str(params, "taskKey")?;
             let removed = api
                 .unlink_task_agent(workspace_id, note_id, task_key)
                 .await
