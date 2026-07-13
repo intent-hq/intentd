@@ -162,8 +162,12 @@ async fn backfill_repository_name_from_path_basename() {
 
 /// Migration 0034 heals legacy rows where `intent-services::create_workspace`
 /// seeded `title = id` (slug-shaped placeholder from before the Untitled-parity
-/// fix): it clears those to `""` so the FE renders "Untitled". Rows with an
-/// explicit user title, and the Chief-of-Staff row, are never touched.
+/// fix): it clears those to `""` so the FE renders "Untitled". User-typed
+/// titles that differ from the id are preserved verbatim, and the
+/// Chief-of-Staff row (`id = '__chief__'`) is exempted. The rare collision
+/// case — a user title that happens to equal the workspace id — is
+/// indistinguishable from a slug seed at rest and is also cleared; this is an
+/// accepted trade-off documented on the collision row below.
 #[tokio::test]
 async fn heal_slug_seeded_titles_clears_only_matching_rows() {
     let tmp = TempDb::new();
