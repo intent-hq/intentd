@@ -12,10 +12,13 @@ pub use intent_core::{
     GitMergeConflicts, GitPullResult, GitStatus, Result,
 };
 
+pub use cow::{cow_clone, cow_probe, CowSupport};
+
 pub mod auth;
 pub mod branches;
 pub mod commit;
 pub mod conflicts;
+pub mod cow;
 pub mod diff;
 pub mod fetch;
 pub mod history;

@@ -1842,6 +1842,7 @@ version = "0.1.0"
 dependencies = [
  "git2",
  "intent-core",
+ "libc",
  "serde",
  "tokio",
 ]
