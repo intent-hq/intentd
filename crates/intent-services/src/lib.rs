@@ -490,9 +490,13 @@ impl Services {
     /// Derive `lastActivity` as the max of the persisted value, `updatedAt`,
     /// `createdAt`, every workspace note's `updated_at`, and every agent
     /// session's `updated_at` (FE `deriveWorkspaceLastActivity` parity, §9.1).
-    /// Called on every path that returns a `Workspace` on the wire so clients
-    /// never have to recompute it. Store failures fall back to the workspace's
-    /// own timestamps rather than failing the caller.
+    /// Called on `workspace.*` mutation paths (update/archive/unarchive) that
+    /// return a `Workspace` on the wire so clients never have to recompute it;
+    /// the `workspace.list`/`workspace.get` read paths derive the same value
+    /// inline as part of [`Services::enrich_workspace_aggregates`] to keep the
+    /// aggregate scan single-pass. Keep the two in sync when the derivation
+    /// rules change. Store failures fall back to the workspace's own
+    /// timestamps rather than failing the caller.
     pub(crate) async fn derive_last_activity(&self, ws: &mut Workspace) {
         let mut activity_max = latest_activity_candidate(&[
             ws.last_activity.as_deref(),
@@ -522,9 +526,11 @@ impl Services {
     /// `diffSummary`) for the `workspace.list` / `workspace.get` emit path (§9.1).
     /// Each is computed from live state (notes / agents / git worktree) and
     /// omitted when not computable; a read failure degrades to an absent
-    /// aggregate rather than failing the whole call. Also derives
-    /// `lastActivity` (see [`Services::derive_last_activity`]) as part of the
-    /// same pass so list/get callers get both in one round-trip.
+    /// aggregate rather than failing the whole call. `lastActivity` is derived
+    /// inline from the same notes/sessions scan (mirrors
+    /// [`Services::derive_last_activity`] so list/get callers get both in one
+    /// round-trip); keep the two derivations in lock-step when the rules or
+    /// underlying store queries change.
     pub(crate) async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
         let mut activity_max = latest_activity_candidate(&[
             ws.last_activity.as_deref(),
@@ -1543,9 +1549,11 @@ fn iso_to_epoch_ms(iso: &str) -> i64 {
 }
 
 /// Return the latest RFC-3339 timestamp among the supplied candidates, ignoring
-/// unparsable or absent entries. Powers the `lastActivity` derivation on the
-/// `workspace.list`/`workspace.get` emit path (§9.1) — FE
-/// `getLatestActivityCandidate` parity.
+/// unparsable or absent entries. Powers the `lastActivity` derivation on every
+/// `workspace.*` path that returns a `Workspace` on the wire (§9.1) — the
+/// list/get read path via [`Services::enrich_workspace_aggregates`] and the
+/// update/archive/unarchive mutation paths via [`Services::derive_last_activity`].
+/// FE `getLatestActivityCandidate` parity.
 fn latest_activity_candidate(candidates: &[Option<&str>]) -> Option<String> {
     let mut best: Option<(i64, String)> = None;
     for c in candidates.iter().copied().flatten() {
