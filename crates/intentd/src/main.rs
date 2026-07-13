@@ -263,6 +263,11 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     let locality_override = parse_locality_mode(mode)?;
     let config = resolve_config()?;
     std::fs::create_dir_all(&config.data_dir)?;
+    // CoW isolation startup probe: probe the workspaces root once at daemon startup
+    // so the result is cached for future cow_probe calls. This runs before the
+    // store/services are initialized so the cache is ready when sandbox provisioning
+    // needs it. The probe result is also reported by `intentd doctor`.
+    probe_cow_at_startup(&config);
     // OS-level single-instance backstop (§5.6): hold an exclusive advisory lock
     // on `data_dir/intentd.lock` for the whole process. Acquired before the
     // socket/pidfile guard so the strongest, configuration-independent guard
@@ -1374,8 +1379,20 @@ fn report_host_capabilities() {
     );
 }
 
+/// Probe CoW support for the workspaces root at daemon startup. This populates
+/// the cache so later cow_probe calls for the same volume pair are instant. Best-effort;
+/// failures are silent (the probe will be retried on demand if needed).
+fn probe_cow_at_startup(config: &Config) {
+    let workspaces_root = config.data_dir.join("workspaces");
+    if std::fs::create_dir_all(&workspaces_root).is_ok() {
+        // Probe and cache; ignore errors (doctor will report them if persistent)
+        let _ = intent_git::cow_probe(&workspaces_root, &workspaces_root);
+    }
+}
+
 /// CoW isolation support: probe the workspaces root for copy-on-write capability.
 /// Non-fatal — CoW isolation degrades gracefully when unsupported (shared mode).
+/// Uses the cached result if available (populated by probe_cow_at_startup).
 fn report_cow_support(config: &Config) {
     let workspaces_root = config.data_dir.join("workspaces");
     // Create workspaces dir if it doesn't exist (probe needs it)

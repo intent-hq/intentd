@@ -150,6 +150,24 @@ fn same_volume(src: &Path, dst: &Path) -> bool {
     src_stat.f_fsid == dst_stat.f_fsid
 }
 
+/// Get volume IDs (f_fsid) for both paths as a cache key.
+pub(super) fn get_volume_id_pair(src: &Path, dst: &Path) -> Option<(u64, u64)> {
+    let src_id = get_volume_id(src)?;
+    let dst_id = get_volume_id(dst)?;
+    Some((src_id, dst_id))
+}
+
+fn get_volume_id(path: &Path) -> Option<u64> {
+    let path_cstr = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: StatFs = unsafe { std::mem::zeroed() };
+    let ret = unsafe { statfs(path_cstr.as_ptr(), &mut stat) };
+    if ret != 0 {
+        return None;
+    }
+    // Combine the two i32 fsid values into a u64
+    Some(((stat.f_fsid[0] as u64) << 32) | (stat.f_fsid[1] as u64))
+}
+
 pub fn probe(src_dir: &Path, dst_dir: &Path) -> Result<CowSupport> {
     // Try fast path first
     if let Some(result) = check_volume_caps(src_dir, dst_dir) {
