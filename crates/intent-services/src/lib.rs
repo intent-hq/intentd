@@ -13,11 +13,11 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use base64::Engine as _;
 use intent_core::events::{
     AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED,
-    COMMENT_ADDED, COMMENT_RESOLVED, GIT_COMMIT, GIT_PULL, LINE_ATTRIBUTION_UPDATED, NOTE_CREATED,
-    NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT,
-    SETTINGS_CHANGED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
-    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
-    WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
+    COMMENT_ADDED, COMMENT_RESOLVED, GIT_BRANCH, GIT_COMMIT, GIT_PULL, GIT_PUSH,
+    LINE_ATTRIBUTION_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED,
+    PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, TASK_READY_TASKS_CHANGED,
+    TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
+    WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::AgentReverseDispatch;
 use intent_core::{
@@ -2895,6 +2895,64 @@ fn git_pull_event(workspace_id: &WorkspaceId, branch: &str) -> NewEvent {
             "operation": "pull",
             "branch": branch,
         }),
+    }
+}
+
+/// Build a `git:push` event for a completed push inside a workspace worktree
+/// (§6.5). Payload `{ workspaceId, operation: "push", branch, commit, force }`
+/// mirrors the reserved `GitOperationEvent` shape. Only emitted on success.
+fn git_push_event(
+    workspace_id: &WorkspaceId,
+    branch: &str,
+    pushed_sha: &str,
+    force: bool,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: GIT_PUSH.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "operation": "push",
+            "branch": branch,
+            "commit": pushed_sha,
+            "force": force,
+        }),
+    }
+}
+
+/// Build a `git:branch` event for a completed branch operation inside a
+/// workspace worktree (§6.5). Payload `{ workspaceId, operation, branch,
+/// oldBranch? }` — `operation` is one of `"create"`, `"checkout"`, `"rename"`.
+fn git_branch_event(
+    workspace_id: &WorkspaceId,
+    operation: &str,
+    branch: &str,
+    old_branch: Option<&str>,
+) -> NewEvent {
+    let mut data = serde_json::json!({
+        "workspaceId": workspace_id.as_str(),
+        "operation": operation,
+        "branch": branch,
+    });
+    if let Some(old) = old_branch {
+        data["oldBranch"] = serde_json::json!(old);
+    }
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: GIT_BRANCH.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
     }
 }
 
@@ -7573,6 +7631,297 @@ impl WorkspaceApi for Services {
             // disk. Idempotent on clean/missing paths (matches reference).
             intent_git::stage::discard(&worktree, &path_list)?;
             Ok(path_list)
+        })
+    }
+
+    fn git_stage_hunk(
+        &self,
+        workspace_id: WorkspaceId,
+        file_path: String,
+        hunk_patch: String,
+    ) -> BoxFuture<'_, Result<()>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        let locks = self.worktree_locks.clone();
+        Box::pin(async move {
+            // Wire policy mirrors `git.stage`: every failure surfaces as
+            // `-32603`. A missing workspace/worktree stays `Internal`.
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to stage hunk: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to stage hunk: workspace has no worktree".to_string())
+            })?;
+            locks
+                .with_lock(&worktree, || async {
+                    intent_git::stage::stage_hunk(&worktree, &file_path, &hunk_patch)
+                })
+                .await?;
+            // Notify the FE bridge so the changes view refreshes without a
+            // follow-up `git.status` read (parity with `git.stage`).
+            let status = intent_git::status::status(&worktree)
+                .unwrap_or_else(|_| intent_git::status::empty_status());
+            let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+            publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
+            Ok(())
+        })
+    }
+
+    fn git_unstage_hunk(
+        &self,
+        workspace_id: WorkspaceId,
+        file_path: String,
+        hunk_patch: String,
+    ) -> BoxFuture<'_, Result<()>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        let locks = self.worktree_locks.clone();
+        Box::pin(async move {
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to unstage hunk: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to unstage hunk: workspace has no worktree".to_string())
+            })?;
+            locks
+                .with_lock(&worktree, || async {
+                    intent_git::stage::unstage_hunk(&worktree, &file_path, &hunk_patch)
+                })
+                .await?;
+            let status = intent_git::status::status(&worktree)
+                .unwrap_or_else(|_| intent_git::status::empty_status());
+            let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+            publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
+            Ok(())
+        })
+    }
+
+    fn git_push(
+        &self,
+        workspace_id: WorkspaceId,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        let locks = self.worktree_locks.clone();
+        Box::pin(async move {
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to push: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to push: workspace has no worktree".to_string())
+            })?;
+            // Resolve the currently-checked-out branch (FE parity — `git push`
+            // with no args pushes HEAD's upstream, which for our worktrees is
+            // the current branch on `origin`).
+            let branch = intent_git::status::current_branch_at(&worktree).ok_or_else(|| {
+                Error::Internal(
+                    "Failed to push: no branch checked out (detached HEAD?)".to_string(),
+                )
+            })?;
+            let outcome = locks
+                .with_lock(&worktree, || async {
+                    intent_git::push::push(&worktree, "origin", &branch, force)
+                })
+                .await?;
+            publish_event(
+                &bus,
+                git_push_event(&ws.id, &outcome.branch, &outcome.pushed_sha, force),
+            )
+            .await;
+            let status = intent_git::status::status(&worktree)
+                .unwrap_or_else(|_| intent_git::status::empty_status());
+            let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+            publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
+            Ok(serde_json::json!({
+                "branch": outcome.branch,
+                "pushedSha": outcome.pushed_sha,
+            }))
+        })
+    }
+
+    fn git_fetch(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        let locks = self.worktree_locks.clone();
+        Box::pin(async move {
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to fetch: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to fetch: workspace has no worktree".to_string())
+            })?;
+            let branch = intent_git::status::current_branch_at(&worktree).ok_or_else(|| {
+                Error::Internal(
+                    "Failed to fetch: no branch checked out (detached HEAD?)".to_string(),
+                )
+            })?;
+            locks
+                .with_lock(&worktree, || async {
+                    intent_git::fetch::fetch(&worktree, "origin", &branch)
+                })
+                .await?;
+            // A successful fetch may have changed the diverged state; refresh
+            // the FE change view without a follow-up `git.status` read.
+            let status = intent_git::status::status(&worktree)
+                .unwrap_or_else(|_| intent_git::status::empty_status());
+            let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+            publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
+            Ok(())
+        })
+    }
+
+    fn git_create_branch(
+        &self,
+        workspace_id: WorkspaceId,
+        branch_name: String,
+        checkout: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        let locks = self.worktree_locks.clone();
+        Box::pin(async move {
+            if branch_name.trim().is_empty() {
+                return Err(Error::InvalidParams("branchName is required".to_string()));
+            }
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to create branch: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to create branch: workspace has no worktree".to_string())
+            })?;
+            let name = branch_name.clone();
+            locks
+                .with_lock(&worktree, || async {
+                    intent_git::branches::create_branch(&worktree, &name, checkout)
+                })
+                .await?;
+            publish_event(&bus, git_branch_event(&ws.id, "create", &branch_name, None)).await;
+            if checkout {
+                let status = intent_git::status::status(&worktree)
+                    .unwrap_or_else(|_| intent_git::status::empty_status());
+                let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+                publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
+            }
+            Ok(serde_json::json!({ "branch": branch_name }))
+        })
+    }
+
+    fn git_checkout_branch(
+        &self,
+        workspace_id: WorkspaceId,
+        branch_name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        let locks = self.worktree_locks.clone();
+        Box::pin(async move {
+            if branch_name.trim().is_empty() {
+                return Err(Error::InvalidParams("branchName is required".to_string()));
+            }
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to checkout branch: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to checkout branch: workspace has no worktree".to_string())
+            })?;
+            let name = branch_name.clone();
+            locks
+                .with_lock(&worktree, || async {
+                    intent_git::branches::checkout_branch(&worktree, &name)
+                })
+                .await?;
+            publish_event(
+                &bus,
+                git_branch_event(&ws.id, "checkout", &branch_name, None),
+            )
+            .await;
+            let status = intent_git::status::status(&worktree)
+                .unwrap_or_else(|_| intent_git::status::empty_status());
+            let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+            publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
+            Ok(serde_json::json!({ "branch": branch_name }))
+        })
+    }
+
+    fn git_rename_branch(
+        &self,
+        workspace_id: WorkspaceId,
+        old_branch_name: String,
+        new_branch_name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        let locks = self.worktree_locks.clone();
+        Box::pin(async move {
+            let trimmed_new = new_branch_name.trim().to_string();
+            if trimmed_new.is_empty() {
+                return Err(Error::InvalidParams(
+                    "newBranchName cannot be empty".to_string(),
+                ));
+            }
+            // Same-name rename is a no-op (TS parity — reference returns `ok`
+            // without touching git).
+            if old_branch_name == trimmed_new {
+                return Ok(serde_json::json!({
+                    "oldBranch": old_branch_name,
+                    "newBranch": trimmed_new,
+                }));
+            }
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to rename branch: {e}")))?;
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to rename branch: workspace has no worktree".to_string())
+            })?;
+            let old = old_branch_name.clone();
+            let new = trimmed_new.clone();
+            locks
+                .with_lock(&worktree, || async {
+                    intent_git::branches::rename_branch(&worktree, &old, &new)
+                })
+                .await?;
+            publish_event(
+                &bus,
+                git_branch_event(&ws.id, "rename", &trimmed_new, Some(&old_branch_name)),
+            )
+            .await;
+            Ok(serde_json::json!({
+                "oldBranch": old_branch_name,
+                "newBranch": trimmed_new,
+            }))
+        })
+    }
+
+    fn git_remove_lock_file(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Unknown workspace → surface as `-32603`; a bare `NotFound` here
+            // would be misleading given the FE's `Result` shape.
+            let ws = store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to remove lock file: {e}")))?;
+            // Remote workspaces skip the local fs operation (TS parity — the
+            // reference short-circuits `{ removed: false }` here too).
+            if ws.is_remote {
+                return Ok(serde_json::json!({ "removed": false }));
+            }
+            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::Internal("Failed to remove lock file: workspace has no worktree".to_string())
+            })?;
+            let removed = intent_git::worktree::remove_index_lock(&worktree)?;
+            Ok(serde_json::json!({ "removed": removed }))
         })
     }
 
