@@ -3651,7 +3651,10 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
             Some("agent:queue:updated") => {
                 // After the first turn completes, the queue drains to empty
                 if stream_end_count >= 1
-                    && evt["data"]["queue"].as_array().map(|q| q.is_empty()).unwrap_or(false)
+                    && evt["data"]["queue"]
+                        .as_array()
+                        .map(|q| q.is_empty())
+                        .unwrap_or(false)
                 {
                     saw_queue_drain = true;
                 }
