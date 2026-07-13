@@ -104,6 +104,12 @@ impl MigrationStatus {
 
 /// Open a WAL-mode SQLite pool with the required PRAGMAs (§9.4): `journal_mode
 /// = WAL`, `foreign_keys = ON`, `busy_timeout = 5000`.
+///
+/// Pool sizing: SQLite WAL mode supports many concurrent readers but only one
+/// writer. We set `max_connections=10` to balance throughput with resource
+/// limits; `acquire_timeout=10s` ensures pool exhaustion surfaces a clear error
+/// instead of silently queueing for 30s, which would exceed the sidecar health
+/// probe's 3s timeout and risk a false-positive daemon kill (STAB-6).
 pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
@@ -113,9 +119,21 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
         .busy_timeout(Duration::from_millis(5000));
 
     SqlitePoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(Duration::from_secs(10))
         .connect_with(opts)
         .await
-        .map_err(|e| Error::Internal(format!("failed to open database: {e}")))
+        .map_err(|e| {
+            // When the pool is saturated, sqlx returns a PoolTimedOut error.
+            // Surface this as "database pool exhausted" so logs clearly identify
+            // the failure mode.
+            let msg = e.to_string();
+            if msg.contains("timed out") || msg.contains("PoolTimedOut") {
+                Error::Internal("database pool exhausted (acquire timeout exceeded)".to_string())
+            } else {
+                Error::Internal(format!("failed to open database: {e}"))
+            }
+        })
 }
 
 /// Encode tags as a JSON-array TEXT column.

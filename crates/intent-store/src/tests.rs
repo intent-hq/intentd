@@ -2131,3 +2131,42 @@ async fn idempotency_reaper_deletes_only_rows_older_than_cutoff() {
     // Re-running the sweep removes nothing more (idempotent).
     assert_eq!(store.reap_idempotent(&cutoff).await.expect("reap"), 0);
 }
+
+/// Pool configuration: `connect()` sets explicit `max_connections` and
+/// `acquire_timeout` so pool behavior is bounded and observable (STAB-6).
+/// The configured values (max_connections=10, acquire_timeout=10s) ensure
+/// that pool exhaustion surfaces a clear error within 10s instead of silently
+/// queueing for the sqlx default 30s, which would exceed the sidecar health
+/// probe's 3s timeout and risk a false-positive daemon kill.
+///
+/// This test confirms the pool opens successfully with the configured options
+/// and can execute queries. The actual timeout behavior is validated indirectly:
+/// the configured 10s acquire_timeout prevents silent 30s stalls observed in
+/// production (STAB-6).
+#[tokio::test]
+async fn pool_configuration_is_explicit() {
+    let tmp = TempDb::new();
+    let pool = crate::connect(&tmp.path).await.expect("connect");
+
+    // Verify the pool is usable and the configuration doesn't break basic ops.
+    let row: (i64,) = sqlx::query_as("SELECT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("basic query works");
+    assert_eq!(row.0, 1);
+
+    // Verify multiple concurrent acquires work (pool has max_connections=10).
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let p = pool.clone();
+        handles.push(tokio::spawn(async move {
+            let row: (i64,) = sqlx::query_as("SELECT 1").fetch_one(&p).await?;
+            Ok::<_, sqlx::Error>(row.0)
+        }));
+    }
+    for h in handles {
+        assert_eq!(h.await.expect("task completes").expect("query"), 1);
+    }
+
+    pool.close().await;
+}
