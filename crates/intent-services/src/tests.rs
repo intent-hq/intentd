@@ -8694,12 +8694,13 @@ mod worktree_provisioning {
         assert_eq!(value["changesets"].as_array().unwrap().len(), 0);
     }
 
-    /// When the caller passes an empty (or missing) title, `workspace.create`
-    /// stores `""` — reference parity with `workspace.service`
-    /// (`title: request.title || ''`) so the FE renders "Untitled" until the
-    /// initial agent's first-turn naming instruction calls `workspace.setTitle`.
+    /// When the caller passes `title: ""` (the JSON-RPC shape onboarding
+    /// sends today), `workspace.create` stores `""` — reference parity with
+    /// `workspace.service` (`title: request.title || ''`) so the FE renders
+    /// "Untitled" until the initial agent's first-turn naming instruction
+    /// calls `workspace.setTitle`.
     #[tokio::test]
-    async fn create_stores_empty_title_when_title_omitted() {
+    async fn create_stores_empty_title_when_title_is_empty_string() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-titleempty-root");
@@ -8726,7 +8727,7 @@ mod worktree_provisioning {
         assert_eq!(ws.id.0, "auth-fix");
         assert_eq!(
             ws.title, "",
-            "missing title stored as empty for Untitled parity"
+            "empty-string title stored as empty for Untitled parity"
         );
 
         // The metadata file mirrors the stored empty title so FE reads see it too.
@@ -8738,6 +8739,38 @@ mod worktree_provisioning {
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
         assert_eq!(value["title"], "");
+    }
+
+    /// When the caller omits the `title` field entirely (JSON-RPC `null` /
+    /// absent), `workspace.create` stores `""` (matching the empty-string
+    /// case): the reference contract collapses missing and blank titles to
+    /// the same Untitled shape.
+    #[tokio::test]
+    async fn create_stores_empty_title_when_title_is_none() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-titlenone-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    // `title` field absent from the wire payload.
+                    title: None,
+                    skip_worktree: Some(true),
+                    initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                        prompt: Some("fix the auth flow".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.title, "");
     }
 
     /// A whitespace-only title is normalized to `""` (same Untitled shape).

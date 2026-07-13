@@ -4640,10 +4640,13 @@ impl WorkspaceApi for Services {
                             }
                         }
                     };
-                    // Store the caller-supplied title verbatim (trimmed to
-                    // ignore whitespace-only titles) or `""` when it is
-                    // missing/blank, matching the reference `workspace.service`
-                    // shape (`title: request.title || ''`). The FE renders
+                    // Normalise the caller-supplied title: trim surrounding
+                    // whitespace so whitespace-only titles collapse to `""`,
+                    // and default to `""` when the caller omits the field
+                    // entirely. Matches the reference `workspace.service`
+                    // shape (`title: request.title || ''`), with the added
+                    // trim to keep persistence consistent with the rest of
+                    // the daemon's title-emptiness guards. The FE renders
                     // `""` as "Untitled" until the initial agent's first-turn
                     // naming instruction calls `workspace.setTitle`. The
                     // `hasTitle` binding keeps its `title != id` guard as
