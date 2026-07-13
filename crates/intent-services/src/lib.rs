@@ -830,6 +830,18 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<pr_ops::PrRefreshOutcome> {
+        // Check eligibility before resolving provider (PRRT_kwDOS9Wxuc6QZ0zr):
+        // avoids errors/warnings for remote/archived/ineligible workspaces when
+        // source control is unconfigured.
+        use pr_ops::PrRefreshOutcome;
+        let ws = self.store.get_workspace(workspace_id).await?;
+        if ws.is_remote || ws.archived {
+            return Ok(PrRefreshOutcome::Skipped);
+        }
+        if pr_ops::repo_of(&ws).is_err() {
+            return Ok(PrRefreshOutcome::Skipped);
+        }
+
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
         self.refresh_workspace_pr_with_sc(workspace_id, &sc).await
     }
