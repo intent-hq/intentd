@@ -441,9 +441,11 @@ pub struct WorkspaceCreateInitialAgent {
 }
 
 /// Result of `workspace.create` (PROTOCOL §5.1): the created workspace plus,
-/// when the request carried an `initialAgent` with a prompt, the created
-/// agent's `AgentLite` wire projection (the same shape as the `agent.create`
-/// result's `agent`). Serialized verbatim as the RPC result object.
+/// when the request carried an `initialAgent`, the created agent's `AgentLite`
+/// wire projection (the same shape as the `agent.create` result's `agent`).
+/// The agent row is persisted whenever `initialAgent` is present; the first
+/// turn only starts when a non-empty prompt was supplied. Serialized verbatim
+/// as the RPC result object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceCreateResult {

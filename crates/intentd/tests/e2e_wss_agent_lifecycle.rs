@@ -273,6 +273,41 @@ where
     }
 }
 
+/// Variant of `wss_event` that returns `None` on timeout instead of panicking,
+/// for tests that assert an event stream stayed silent (e.g. no-prompt initial
+/// agent must not emit any `agent:stream:*` frame). Uses a single deadline so
+/// periodic non-`events.event` frames (heartbeat `Ping`, unrelated pushes) do
+/// not reset the wait window and hide silence-violations.
+async fn wss_event_opt<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Option<Value>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let remaining = match deadline.checked_duration_since(tokio::time::Instant::now()) {
+            Some(d) if !d.is_zero() => d,
+            _ => return None,
+        };
+        let next = match timeout(remaining, ws.next()).await {
+            Ok(next) => next,
+            Err(_) => return None,
+        };
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "events.event" {
+                    return Some(v);
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
 /// Read one `subscription.push` notification from a connection (bounded). Used
 /// to read a channel's seq-0 snapshot after `chat.subscribe`.
 async fn wss_push<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
@@ -4721,4 +4756,121 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
 
     // Clean teardown so `AgentHandle::drop` reaps the child + temp file.
     let _ = wss_rpc(&mut rpc, 13, "agent.stop", json!({ "agentId": agent_id })).await;
+}
+
+/// No-prompt initial-agent parity over WSS (PROTOCOL §5.1): `workspace.create`
+/// with an `initialAgent` but no prompt persists the agent row and returns the
+/// `AgentLite` — the subscriber sees `workspace:created` → `agent:created`,
+/// but never a `stream:*` frame because no first turn was started. The
+/// transcript stays empty until the FE sends its first message.
+#[tokio::test]
+async fn workspace_create_no_prompt_creates_agent_over_wss() {
+    let Some(script) = gate("WSS workspace.create no-prompt initial-agent E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:*", "agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let agent_id = format!("agent-{}", Uuid::new_v4());
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "No-prompt WS",
+            "branch": "feat/initial-agent-no-prompt-e2e",
+            "initialAgent": {
+                "agentId": agent_id,
+                "name": "Coordinator",
+                "model": "mock:default",
+                "specialist": "implementor",
+            },
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"].as_str().expect("workspace id");
+    assert_eq!(
+        created["initialAgent"]["id"], agent_id,
+        "no-prompt create still returns the agent: {created}"
+    );
+    assert_eq!(created["initialAgent"]["name"], "Coordinator");
+
+    // Event flow: workspace:created → agent:created, NO stream frames.
+    let mut saw_ws_created = false;
+    let mut saw_agent_created = false;
+    let mut saw_stream = false;
+    for _ in 0..40 {
+        let Some(frame) = wss_event_opt(&mut sub, 2).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        match ev["type"].as_str() {
+            Some("workspace:created") => {
+                assert_eq!(ev["data"]["workspaceId"], ws_id);
+                saw_ws_created = true;
+            }
+            Some("agent:created") => {
+                assert!(saw_ws_created, "workspace:created precedes agent:created");
+                assert_eq!(ev["data"]["agentId"], agent_id.as_str());
+                saw_agent_created = true;
+            }
+            Some(t)
+                if t.starts_with("agent:stream:") && ev["data"]["agentId"] == agent_id.as_str() =>
+            {
+                saw_stream = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_ws_created, "workspace:created observed");
+    assert!(saw_agent_created, "agent:created observed");
+    assert!(!saw_stream, "no first turn started without a prompt");
+
+    // Transcript is empty — the FE's first send will start the turn.
+    let conv = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    assert!(
+        messages.is_empty(),
+        "no messages persisted without a prompt: {conv}"
+    );
 }
