@@ -23,7 +23,8 @@ use crate::WorkspaceMcpServer;
 struct FakeApi {
     git_status_calls: Mutex<u32>,
     stage_calls: Mutex<Vec<Value>>,
-    commit_calls: Mutex<Vec<String>>,
+    /// Recorded `git_commit` calls: (message, idempotency_key).
+    commit_calls: Mutex<Vec<(String, Option<String>)>>,
     agent_commit_calls: Mutex<Vec<(String, Option<String>, bool)>>,
     merge_calls: Mutex<Vec<Option<String>>>,
     script_list_calls: Mutex<u32>,
@@ -201,9 +202,12 @@ impl WorkspaceApi for FakeApi {
         &self,
         _id: WorkspaceId,
         message: String,
-        _idempotency_key: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<GitCommitResult>> {
-        self.commit_calls.lock().unwrap().push(message);
+        self.commit_calls
+            .lock()
+            .unwrap()
+            .push((message, idempotency_key));
         Box::pin(async {
             Ok(GitCommitResult {
                 hash: "abc123".to_string(),
@@ -733,7 +737,66 @@ async fn git_commit_appends_agent_id_when_caller_present() {
     let v = body(&resp);
     assert_eq!(v["hash"], json!("abc123"));
     let msgs = api.commit_calls.lock().unwrap();
-    assert!(msgs[0].contains("Agent-Id: agent-9"));
+    assert!(msgs[0].0.contains("Agent-Id: agent-9"));
+}
+
+#[tokio::test]
+async fn git_commit_mints_idempotency_key_when_absent() {
+    // Agents call `ws.git.commit(msg)` without an idempotencyKey; the binding
+    // must mint one so the services `with_idempotency` wrapper sees a key and
+    // the soft-launch warn never fires.
+    let (srv, api) = server_with_caller("agent-9");
+    let resp = call(&srv, "return await ws.git.commit('feat: x');").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let calls = api.commit_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let key = calls[0]
+        .1
+        .as_deref()
+        .expect("git.commit must mint an idempotencyKey");
+    assert!(
+        uuid::Uuid::parse_str(key).is_ok(),
+        "minted key {key:?} is not a UUID"
+    );
+}
+
+#[tokio::test]
+async fn git_commit_passes_caller_idempotency_key_through() {
+    // A caller-supplied key is adopted verbatim so retries of the same tool
+    // call dedupe against the idempotency store.
+    let (srv, api) = server_with_caller("agent-9");
+    let resp = call(
+        &srv,
+        "return await host({ method: 'git.commit', args: { message: 'feat: x', idempotencyKey: 'key-from-caller' } });",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let calls = api.commit_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1.as_deref(), Some("key-from-caller"));
+}
+
+#[tokio::test]
+async fn git_commit_treats_blank_idempotency_key_as_absent() {
+    // A whitespace-only key must be treated as absent (parity with
+    // `comment.add`) so it cannot collapse dedupe across unrelated requests.
+    let (srv, api) = server_with_caller("agent-9");
+    let resp = call(
+        &srv,
+        "return await host({ method: 'git.commit', args: { message: 'feat: x', idempotencyKey: '   ' } });",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let calls = api.commit_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let key = calls[0]
+        .1
+        .as_deref()
+        .expect("git.commit must mint an idempotencyKey");
+    assert!(
+        uuid::Uuid::parse_str(key).is_ok(),
+        "minted key {key:?} is not a UUID (got blank passthrough)"
+    );
 }
 
 #[tokio::test]
