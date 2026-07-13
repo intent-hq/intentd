@@ -124,14 +124,16 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
         .connect_with(opts)
         .await
         .map_err(|e| {
-            // When the pool is saturated, sqlx returns a PoolTimedOut error.
-            // Surface this as "database pool exhausted" so logs clearly identify
-            // the failure mode.
-            let msg = e.to_string();
-            if msg.contains("timed out") || msg.contains("PoolTimedOut") {
-                Error::Internal("database pool exhausted (acquire timeout exceeded)".to_string())
-            } else {
-                Error::Internal(format!("failed to open database: {e}"))
+            // Match on the structured error variant for precision.
+            // NOTE: This mapping applies only to initial pool creation. Runtime pool
+            // exhaustion (pool.begin()/queries) will surface as the default sqlx error
+            // message unless mapped at the point of acquisition. Consider adding a
+            // shared error-mapping helper if runtime exhaustion diagnostics are needed.
+            match e {
+                sqlx::Error::PoolTimedOut => Error::Internal(
+                    "database pool exhausted (acquire timeout exceeded)".to_string(),
+                ),
+                _ => Error::Internal(format!("failed to open database: {e}")),
             }
         })
 }

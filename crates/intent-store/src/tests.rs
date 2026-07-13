@@ -2132,19 +2132,18 @@ async fn idempotency_reaper_deletes_only_rows_older_than_cutoff() {
     assert_eq!(store.reap_idempotent(&cutoff).await.expect("reap"), 0);
 }
 
-/// Pool configuration: `connect()` sets explicit `max_connections` and
-/// `acquire_timeout` so pool behavior is bounded and observable (STAB-6).
-/// The configured values (max_connections=10, acquire_timeout=10s) ensure
-/// that pool exhaustion surfaces a clear error within 10s instead of silently
-/// queueing for the sqlx default 30s, which would exceed the sidecar health
-/// probe's 3s timeout and risk a false-positive daemon kill.
+/// Smoke test: verify the pool opens successfully with explicit configuration
+/// (max_connections=10, acquire_timeout=10s per STAB-6) and supports basic
+/// queries and concurrent access.
 ///
-/// This test confirms the pool opens successfully with the configured options
-/// and can execute queries. The actual timeout behavior is validated indirectly:
-/// the configured 10s acquire_timeout prevents silent 30s stalls observed in
-/// production (STAB-6).
+/// This does NOT directly assert acquire timeout behavior (saturating the pool
+/// and confirming PoolTimedOut). That would require holding 10+ connections
+/// and timing a failure, which risks test flakiness. The configuration itself
+/// (lib.rs:122-123) ensures pool exhaustion fails within 10s instead of silently
+/// queueing for the sqlx default 30s, which would exceed the sidecar health
+/// probe's 3s timeout and risk a false-positive daemon kill (STAB-6).
 #[tokio::test]
-async fn pool_configuration_is_explicit() {
+async fn pool_smoke_test_with_explicit_config() {
     let tmp = TempDb::new();
     let pool = crate::connect(&tmp.path).await.expect("connect");
 
