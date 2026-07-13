@@ -630,3 +630,111 @@ async fn workspace_delete_cleans_orphan_directory_over_wss() {
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
+
+/// `workspace.create` over the real WSS transport with an explicit empty
+/// `title` persists `""` (reference parity with `workspace.service`
+/// `title: request.title || ''`) rather than seeding the slug id. A
+/// follow-up `workspace.list` round-trips that empty title so FE reads see
+/// the same shape (rendered as "Untitled"). Regression for the slug-seeded
+/// title that broke Untitled parity on the wire.
+#[tokio::test]
+async fn workspace_create_stores_empty_title_when_title_empty_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("titleempty");
+    let (daemon, port, cfg) = boot(&root).await;
+    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+
+    let mut ws = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "initialAgent": { "prompt": "fix the auth flow" },
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let id = created["workspace"]["id"].as_str().expect("id").to_string();
+    assert_eq!(id, "auth-fix", "workspace id is the prompt-derived slug");
+    assert_eq!(
+        created["workspace"]["title"],
+        json!(""),
+        "empty title stored verbatim on the wire (Untitled parity)"
+    );
+
+    let listed = wss_rpc(&mut ws, 3, "workspace.list", json!({})).await;
+    let row = listed["workspaces"]
+        .as_array()
+        .expect("workspaces array")
+        .iter()
+        .find(|w| w["id"] == json!(id))
+        .expect("created workspace listed");
+    assert_eq!(
+        row["title"],
+        json!(""),
+        "workspace.list round-trips the empty title"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// `workspace.create` over WSS with the `title` field entirely omitted from
+/// the `params` object (other fields still present) persists `""` — the
+/// reference contract collapses missing and blank titles to the same
+/// Untitled shape. Guards the JSON-RPC request path where callers send a
+/// `params` object without a `title` key, matching what onboarding sends
+/// today.
+#[tokio::test]
+async fn workspace_create_stores_empty_title_when_title_omitted_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("titleomit");
+    let (daemon, port, cfg) = boot(&root).await;
+    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+
+    let mut ws = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "initialAgent": { "prompt": "fix the auth flow" },
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let id = created["workspace"]["id"].as_str().expect("id").to_string();
+    assert_eq!(
+        created["workspace"]["title"],
+        json!(""),
+        "omitted title persists as empty on the wire"
+    );
+
+    let listed = wss_rpc(&mut ws, 3, "workspace.list", json!({})).await;
+    let row = listed["workspaces"]
+        .as_array()
+        .expect("workspaces array")
+        .iter()
+        .find(|w| w["id"] == json!(id))
+        .expect("created workspace listed");
+    assert_eq!(
+        row["title"],
+        json!(""),
+        "workspace.list round-trips the omitted-title empty shape"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}

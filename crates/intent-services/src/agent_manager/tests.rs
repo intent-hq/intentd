@@ -1151,6 +1151,40 @@ async fn build_turn_prompt_injects_naming_instruction_for_slug_title() {
     assert!(text.trim_end().ends_with("hello"));
 }
 
+/// Empty workspace title on an agent's first turn → the naming instruction
+/// still fires (Untitled parity: `create_workspace` now stores `""` when the
+/// caller omits a title, and `needsWorkspaceRename` treats empty/whitespace
+/// titles as "needs rename").
+#[tokio::test]
+async fn build_turn_prompt_injects_naming_instruction_for_empty_title() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-empty"), AgentId::from("a-empty"));
+    seed_agent_with_title(&mgr, &ws, &id, "").await;
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "hello" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        text.starts_with("<system>"),
+        "empty title still triggers the naming instruction: {text:?}"
+    );
+    assert!(text.contains("`set_workspace_title_workspace-mcp`"));
+}
+
 /// Custom workspace title on an agent's first turn → no naming instruction is
 /// injected (the reference `needsWorkspaceRename` guard skips already-titled
 /// workspaces).

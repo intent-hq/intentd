@@ -4680,16 +4680,22 @@ impl WorkspaceApi for Services {
                             }
                         }
                     };
-                    // Seed the title with the derived id (slug) when the caller
-                    // omits one, so the FE header shows a readable name (e.g.
-                    // 'auth-fix') immediately instead of 'Untitled'. The FE's
-                    // isWorkspaceSlug() still treats it as a placeholder, so
-                    // the initial agent's workspace.setTitle flow renames it
-                    // to a human title on the first turn (TS parity).
+                    // Normalise the caller-supplied title: trim surrounding
+                    // whitespace so whitespace-only titles collapse to `""`,
+                    // and default to `""` when the caller omits the field
+                    // entirely. Matches the reference `workspace.service`
+                    // shape (`title: request.title || ''`), with the added
+                    // trim to keep persistence consistent with the rest of
+                    // the daemon's title-emptiness guards. The FE renders
+                    // `""` as "Untitled" until the initial agent's first-turn
+                    // naming instruction calls `workspace.setTitle`. The
+                    // `hasTitle` binding keeps its `title != id` guard as
+                    // belt-and-braces for legacy rows the data heal has not
+                    // yet touched.
                     let title = input
                         .title
-                        .filter(|t| !t.trim().is_empty())
-                        .unwrap_or_else(|| id.0.clone());
+                        .map(|t| t.trim().to_string())
+                        .unwrap_or_default();
                     let mut ws = Workspace {
                         id,
                         title,
