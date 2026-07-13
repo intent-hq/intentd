@@ -5301,6 +5301,43 @@ mod pr {
         assert!(evs.is_empty());
     }
 
+    #[tokio::test]
+    async fn refresh_all_discovers_unlinked_workspaces() {
+        // STAB-3 regression test: `refresh_all_workspace_prs()` (the background
+        // 60s loop) should discover and link PRs for unlinked workspaces, not just
+        // refresh already-linked ones. Without the fix, the background loop
+        // skipped workspaces with `pr_number.is_none()`, so discovery was
+        // on-demand only. This test asserts that an unlinked workspace on branch X
+        // with an open PR whose head ref is X gets linked when
+        // `refresh_all_workspace_prs()` runs (simulating the background loop).
+        let forge = StubForge {
+            discover: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) = refresh_setup(forge, "feature", None, false).await;
+
+        // Before the sweep the workspace is unlinked (no pr_number).
+        let before = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(before.pr_number, None);
+
+        // Run the same sweep the background loop runs.
+        svc.refresh_all_workspace_prs().await;
+
+        // After the sweep the workspace is linked to PR #42.
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+
+        // A `pr:linked` event was emitted.
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:linked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data["prNumber"], 42);
+    }
+
     // ------------------------------------------------------------------------
     // accept-changes.* orchestration (§5.18): the commit→push→create-PR
     // pipeline against a real worktree + local bare remote, then mergePR via the

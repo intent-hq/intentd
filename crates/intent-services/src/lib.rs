@@ -887,6 +887,32 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<pr_ops::PrRefreshOutcome> {
+        // Check eligibility before resolving provider (PRRT_kwDOS9Wxuc6QZ0zr):
+        // avoids errors/warnings for remote/archived/ineligible workspaces when
+        // source control is unconfigured.
+        use pr_ops::PrRefreshOutcome;
+        let ws = self.store.get_workspace(workspace_id).await?;
+        if ws.is_remote || ws.archived {
+            return Ok(PrRefreshOutcome::Skipped);
+        }
+        if pr_ops::repo_of(&ws).is_err() {
+            return Ok(PrRefreshOutcome::Skipped);
+        }
+
+        let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
+        self.refresh_workspace_pr_with_sc(workspace_id, &sc).await
+    }
+
+    /// Refresh one workspace's PR linkage with a pre-resolved [`SourceControl`]
+    /// provider (§7.6). Same semantics as [`refresh_workspace_pr`], but avoids
+    /// re-resolving the provider on every call — used by the background sweep to
+    /// resolve once per cycle and reuse across all workspaces, avoiding spamming
+    /// warnings when unconfigured.
+    async fn refresh_workspace_pr_with_sc(
+        &self,
+        workspace_id: &WorkspaceId,
+        sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
+    ) -> Result<pr_ops::PrRefreshOutcome> {
         use pr_ops::PrRefreshOutcome;
 
         let mut ws = self.store.get_workspace(workspace_id).await?;
@@ -897,7 +923,6 @@ impl Services {
             Ok(pair) => pair,
             Err(_) => return Ok(PrRefreshOutcome::Skipped),
         };
-        let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
         let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
 
         match ws.pr_number {
@@ -968,9 +993,24 @@ impl Services {
         }
     }
 
-    /// Refresh every workspace that already has a linked PR (discovery stays
-    /// on-demand). Errors are logged per workspace and never abort the sweep.
-    async fn refresh_all_linked_prs(&self) {
+    /// Refresh every active workspace's PR linkage: existing links are
+    /// re-fetched (persisting deltas + emitting `pr:updated`/`pr:unlinked`), and
+    /// unlinked workspaces discover a matching open PR by head ref (branch-only
+    /// matching per §7.6 — `pr.head.ref == workspace.branch`), persisting the
+    /// link + emitting `pr:linked` on first match. Remote/archived workspaces and
+    /// those lacking repo/branch info are skipped. Errors are logged per
+    /// workspace and never abort the sweep.
+    async fn refresh_all_workspace_prs(&self) {
+        // Resolve the SourceControl provider once per sweep to avoid spamming
+        // warnings when unconfigured and hitting keychain/gh on the blocking pool
+        // once per workspace (Copilot review comment on PR #131).
+        let sc = match pr_ops::resolve_source_control(self.source_control.clone()).await {
+            Ok(sc) => sc,
+            Err(e) => {
+                tracing::warn!(error = %e, "pr refresh: source control unavailable, skipping sweep");
+                return;
+            }
+        };
         let workspaces = match self.store.list_workspaces(false).await {
             Ok(list) => list,
             Err(e) => {
@@ -979,10 +1019,10 @@ impl Services {
             }
         };
         for ws in workspaces {
-            if ws.pr_number.is_none() {
-                continue;
-            }
-            if let Err(e) = self.refresh_workspace_pr(&ws.id).await {
+            // STAB-3 fix: refresh all workspaces (discovery + update), not just
+            // those already linked. `refresh_workspace_pr_with_sc` skips
+            // ineligible workspaces internally.
+            if let Err(e) = self.refresh_workspace_pr_with_sc(&ws.id, &sc).await {
                 tracing::warn!(
                     workspace = %ws.id.as_str(),
                     error = %e,
@@ -993,11 +1033,12 @@ impl Services {
     }
 
     /// Spawn the background PR refresh loop (§7.6): every `interval` it refreshes
-    /// all linked PRs, persisting deltas and emitting `pr:*` events. The first
-    /// sweep runs after one `interval`. Missed ticks are skipped (no pile-up).
-    /// No-op-safe when source control is unconfigured (each refresh surfaces the
-    /// missing-provider error, which is logged and swallowed). Returns the task
-    /// handle so the composition root can hold/abort it.
+    /// all active workspaces — discovering open PRs by head-ref match for
+    /// unlinked workspaces (emitting `pr:linked`) and updating linked PRs
+    /// (emitting `pr:updated`/`pr:unlinked`). The first sweep runs after one
+    /// `interval`. Missed ticks are skipped (no pile-up). No-op-safe when source
+    /// control is unconfigured (the sweep logs a single warning and returns).
+    /// Returns the task handle so the composition root can hold/abort it.
     pub fn spawn_pr_refresh_loop(
         &self,
         interval: std::time::Duration,
@@ -1010,7 +1051,7 @@ impl Services {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                services.refresh_all_linked_prs().await;
+                services.refresh_all_workspace_prs().await;
             }
         })
     }
