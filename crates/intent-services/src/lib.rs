@@ -1305,9 +1305,9 @@ async fn fetch_note(store: &Store, workspace_id: &WorkspaceId, note_id: &NoteId)
     store.get_note(workspace_id, note_id).await
 }
 
-/// Author stamp for daemon-captured note versions. `note.*` writes carry no
-/// author context yet, so every version is attributed to the system author
-/// (documented in PROTOCOL §5.2 version-history extensions).
+/// Author stamp for daemon-internal note-version writes (the workspace-seed
+/// spec note snapshot). All user- and agent-originated writes resolve the
+/// author from the caller instead (see [`resolve_note_version_author`]).
 fn system_version_author() -> NoteVersionAuthor {
     NoteVersionAuthor {
         id: "system".to_string(),
@@ -1316,12 +1316,54 @@ fn system_version_author() -> NoteVersionAuthor {
     }
 }
 
+/// FE/user-originated note-version author. Reference parity with
+/// `notes.service.ts` (`{ id: 'user', name: 'User', type: 'user' }`) — used
+/// when a note write carries no agent caller.
+fn user_version_author() -> NoteVersionAuthor {
+    NoteVersionAuthor {
+        id: "user".to_string(),
+        name: "User".to_string(),
+        author_type: "user".to_string(),
+    }
+}
+
+/// Resolve the version author for a note write. `Some(agent_id)` → an
+/// agent-typed author with the caller's session `name` (best-effort; falls
+/// back to the id when the session lookup fails). `None` → the user author.
+/// Mirrors `notes.service.ts` provenance (`currentActor?.type === 'agent'`
+/// path) so `note.listVersions`/`note.getVersion` carry the acting agent.
+async fn resolve_note_version_author(
+    store: &Store,
+    caller_agent_id: Option<&AgentId>,
+) -> NoteVersionAuthor {
+    match caller_agent_id {
+        Some(agent_id) => {
+            let name = store
+                .get_agent_session(agent_id)
+                .await
+                .ok()
+                .map(|s| s.name)
+                .unwrap_or_else(|| agent_id.0.clone());
+            NoteVersionAuthor {
+                id: agent_id.0.clone(),
+                name,
+                author_type: "agent".to_string(),
+            }
+        }
+        None => user_version_author(),
+    }
+}
+
 /// Append a full-snapshot version of `note`'s *current* (post-mutation) state,
-/// stamped with the note's `updated_at` (PROTOCOL §5.2 version-history
-/// extensions). The store prunes to the newest 50 on append.
-async fn capture_note_version(store: &Store, note: &Note) -> Result<i64> {
+/// stamped with `author` and the note's `updated_at` (PROTOCOL §5.2
+/// version-history extensions). The store prunes to the newest 50 on append.
+async fn capture_note_version(
+    store: &Store,
+    note: &Note,
+    author: &NoteVersionAuthor,
+) -> Result<i64> {
     store
-        .append_note_version(note, &system_version_author(), &note.updated_at)
+        .append_note_version(note, author, &note.updated_at)
         .await
 }
 
@@ -1613,7 +1655,8 @@ async fn ensure_spec_note(
         updated_at: now,
     };
     store.insert_note(&note).await?;
-    capture_note_version(store, &note).await?;
+    // Workspace-seed spec is daemon-internal; no caller agent applies.
+    capture_note_version(store, &note, &system_version_author()).await?;
     publish_event(
         bus,
         note_change_event(
@@ -3078,17 +3121,21 @@ impl Services {
     /// fence, invoke `convert_task_blocks` and refetch the stored note so
     /// callers can return it in place of their in-flight (now stale) copy.
     /// Never fails the write — errors are logged and treated as no-op.
+    ///
+    /// `caller_agent_id` is threaded through so the conversion's version
+    /// snapshot inherits the outer write's author (reference parity).
     async fn auto_convert_task_blocks_after_write(
         &self,
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
         content_after_write: &str,
+        caller_agent_id: Option<&AgentId>,
     ) -> AutoConvertOutcome {
         if !note_ops::has_task_blocks(content_after_write) {
             return AutoConvertOutcome::default();
         }
         match self
-            .convert_task_blocks(workspace_id.clone(), note_id.clone())
+            .convert_task_blocks_op(workspace_id.clone(), note_id.clone(), caller_agent_id)
             .await
         {
             Ok(r) => {
@@ -3109,6 +3156,123 @@ impl Services {
                 AutoConvertOutcome::default()
             }
         }
+    }
+
+    /// Shared body for the `task.convertBlocks` trait method and the
+    /// `auto_convert_task_blocks_after_write` post-write hook. Threading
+    /// `caller_agent_id` here lets both the explicit RPC call (currently
+    /// `None`) and the note-write auto-conversion (which forwards the outer
+    /// mutation's caller) attribute the resulting "Converted task blocks"
+    /// version snapshot to the acting agent when applicable.
+    async fn convert_task_blocks_op(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        caller_agent_id: Option<&AgentId>,
+    ) -> Result<TaskConvertBlocksResult> {
+        let store = &self.store;
+        let mut note = fetch_note_peer(store, &workspace_id, &note_id).await?;
+        if note.content.is_empty() {
+            return Ok(TaskConvertBlocksResult {
+                ok: true,
+                converted_count: 0,
+                created_note_ids: Vec::new(),
+            });
+        }
+        // Mirror the TS guard: only parse when a `@@@task` fence exists.
+        let parsed = if note_ops::has_task_blocks(&note.content) {
+            note_ops::extract_task_blocks(&note.content)
+        } else {
+            note_ops::TaskBlocksResult {
+                tasks: Vec::new(),
+                content_without_blocks: note.content.clone(),
+            }
+        };
+        // Idempotency: map existing child note titles (normalized) → id.
+        let all = store.list_notes(&workspace_id).await?;
+        let mut existing_by_title: std::collections::HashMap<String, NoteId> = all
+            .iter()
+            .filter(|n| n.parent_id.as_ref() == Some(&note.id))
+            .map(|n| (n.title.trim().to_lowercase(), n.id.clone()))
+            .collect();
+
+        // Start from the placeholder-substituted content; each valid block
+        // is `<!-- task-block-placeholder-{i} -->` to be replaced below.
+        let mut working = parsed.content_without_blocks.clone();
+        let mut created_note_ids: Vec<String> = Vec::new();
+        let mut peer_order = 100i64;
+        for (i, task) in parsed.tasks.iter().enumerate() {
+            let body = if task.content.is_empty() {
+                format!("# {}\n\nCreated as a prerequisite task.", task.title)
+            } else {
+                format!("# {}\n\n{}", task.title, task.content)
+            };
+            let normalized = task.title.trim().to_lowercase();
+            let task_note_id = match existing_by_title.get(&normalized) {
+                Some(existing_id) => existing_id.clone(),
+                None => {
+                    let child = self
+                        .create_child_task_note(
+                            &workspace_id,
+                            &note.id,
+                            &task.title,
+                            body,
+                            TaskStatus::NotStarted,
+                            Some(peer_order),
+                        )
+                        .await?;
+                    existing_by_title.insert(normalized, child.id.clone());
+                    created_note_ids.push(child.id.0.clone());
+                    child.id
+                }
+            };
+            let placeholder = format!("<!-- task-block-placeholder-{i} -->");
+            let linked = format!(
+                "- [ ] [{}](intent://local/task/{})",
+                task.title, task_note_id.0
+            );
+            working = working.replace(&placeholder, &linked);
+            peer_order += 100;
+        }
+
+        let content_changed = working != note.content;
+        if !content_changed && created_note_ids.is_empty() {
+            return Ok(TaskConvertBlocksResult {
+                ok: true,
+                converted_count: 0,
+                created_note_ids: Vec::new(),
+            });
+        }
+        note.content = working;
+        note.updated_at = now_iso();
+        store.update_note(&note).await?;
+        // TS parity: the reference pushes a version snapshot ("Converted
+        // task blocks to linked Task Notes") as part of the conversion
+        // save, so the newest stored version matches the fence-free
+        // content that line-attribution/history consumers diff against.
+        let author = resolve_note_version_author(store, caller_agent_id).await;
+        capture_note_version(store, &note, &author).await?;
+        self.invalidate_crdt_note(&note.workspace_id, &note.id);
+        self.schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
+        // Emit `note:updated` for the rewritten parent so subscribers
+        // refresh the fence-free content live (TS parity: the reference
+        // emits `note:updated` after saving the converted note).
+        publish_event(
+            &self.event_bus,
+            note_change_event(
+                &note.workspace_id,
+                &note.id,
+                &note.title,
+                NOTE_UPDATED,
+                "update",
+            ),
+        )
+        .await;
+        Ok(TaskConvertBlocksResult {
+            ok: true,
+            converted_count: created_note_ids.len() as i64,
+            created_note_ids,
+        })
     }
 
     /// Create a child task note nested under `parent_id`, marking it a task with
@@ -5188,6 +5352,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         input: NoteCreate,
         idempotency_key: Option<String>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<Note>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -5221,7 +5386,9 @@ impl WorkspaceApi for Services {
                         updated_at: now,
                     };
                     store.insert_note(&note).await?;
-                    capture_note_version(&store, &note).await?;
+                    let author =
+                        resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+                    capture_note_version(&store, &note, &author).await?;
                     services.schedule_line_attribution_recompute(
                         note.workspace_id.clone(),
                         note.id.clone(),
@@ -5232,6 +5399,7 @@ impl WorkspaceApi for Services {
                             &note.workspace_id,
                             &note.id,
                             &note.content,
+                            caller_agent_id.as_ref(),
                         )
                         .await;
                     if let Some(refetched) = outcome.refetched_note {
@@ -5303,7 +5471,9 @@ impl WorkspaceApi for Services {
                 plan.apply_orphaned(&store, &workspace_id).await?;
             }
             if content_changed {
-                capture_note_version(&store, &note).await?;
+                // FE-only `note.update`: no caller-agent context on this arm
+                // (transport router path), so the version author is the user.
+                capture_note_version(&store, &note, &user_version_author()).await?;
                 services.schedule_line_attribution_recompute(
                     note.workspace_id.clone(),
                     note.id.clone(),
@@ -5313,6 +5483,7 @@ impl WorkspaceApi for Services {
                         &note.workspace_id,
                         &note.id,
                         &note.content,
+                        None,
                     )
                     .await;
                 if let Some(refetched) = outcome.refetched_note {
@@ -5339,6 +5510,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         note_id: NoteId,
         input: NoteAddInput,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteAddResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -5359,12 +5531,18 @@ impl WorkspaceApi for Services {
             note.updated_at = now_iso();
             store.update_note(&note).await?;
             plan.apply_orphaned(&store, &workspace_id).await?;
-            capture_note_version(&store, &note).await?;
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            capture_note_version(&store, &note, &author).await?;
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let outcome = services
-                .auto_convert_task_blocks_after_write(&note.workspace_id, &note.id, &new_content)
+                .auto_convert_task_blocks_after_write(
+                    &note.workspace_id,
+                    &note.id,
+                    &new_content,
+                    caller_agent_id.as_ref(),
+                )
                 .await;
             let final_content = outcome
                 .refetched_note
@@ -5401,6 +5579,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         note_id: NoteId,
         input: NoteEditInput,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteEditResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -5422,12 +5601,18 @@ impl WorkspaceApi for Services {
             note.updated_at = now_iso();
             store.update_note(&note).await?;
             plan.apply_orphaned(&store, &workspace_id).await?;
-            capture_note_version(&store, &note).await?;
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            capture_note_version(&store, &note, &author).await?;
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let outcome = services
-                .auto_convert_task_blocks_after_write(&note.workspace_id, &note.id, &new_content)
+                .auto_convert_task_blocks_after_write(
+                    &note.workspace_id,
+                    &note.id,
+                    &new_content,
+                    caller_agent_id.as_ref(),
+                )
                 .await;
             let final_content = outcome
                 .refetched_note
@@ -5467,6 +5652,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         note_id: NoteId,
         input: NoteEditLinesInput,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteEditLinesResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -5484,12 +5670,18 @@ impl WorkspaceApi for Services {
             note.updated_at = now_iso();
             store.update_note(&note).await?;
             plan.apply_orphaned(&store, &workspace_id).await?;
-            capture_note_version(&store, &note).await?;
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            capture_note_version(&store, &note, &author).await?;
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let outcome = services
-                .auto_convert_task_blocks_after_write(&note.workspace_id, &note.id, &new_content)
+                .auto_convert_task_blocks_after_write(
+                    &note.workspace_id,
+                    &note.id,
+                    &new_content,
+                    caller_agent_id.as_ref(),
+                )
                 .await;
             let final_content = outcome
                 .refetched_note
@@ -5529,6 +5721,7 @@ impl WorkspaceApi for Services {
         content: String,
         confirm_replacement: bool,
         expected_version: Option<i64>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -5571,11 +5764,17 @@ impl WorkspaceApi for Services {
             note.updated_at = now.clone();
             store.update_note_versioned(&note, expected_version).await?;
             plan.apply_orphaned(&store, &workspace_id).await?;
-            capture_note_version(&store, &note).await?;
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            capture_note_version(&store, &note, &author).await?;
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             let outcome = services
-                .auto_convert_task_blocks_after_write(&note.workspace_id, &note.id, &clean)
+                .auto_convert_task_blocks_after_write(
+                    &note.workspace_id,
+                    &note.id,
+                    &clean,
+                    caller_agent_id.as_ref(),
+                )
                 .await;
             let (final_content, final_updated_at) = match outcome.refetched_note {
                 Some(n) => (n.content, n.updated_at),
@@ -5613,6 +5812,10 @@ impl WorkspaceApi for Services {
         title: Option<String>,
         tags: Option<Vec<String>>,
         expected_version: Option<i64>,
+        // Metadata-only writes do not push a note-version snapshot (parity
+        // with `notes.service.ts`), so the caller-agent hint is unused here.
+        // Accepted for trait uniformity and future-proofing.
+        _caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteUpdateMetadataResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -5817,6 +6020,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         note_id: NoteId,
         v: i64,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteRestoreVersionResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -5828,7 +6032,8 @@ impl WorkspaceApi for Services {
             note.content = version.content;
             note.updated_at = now_iso();
             store.update_note(&note).await?;
-            let new_v = capture_note_version(&store, &note).await?;
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            let new_v = capture_note_version(&store, &note, &author).await?;
             services
                 .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
@@ -6217,112 +6422,16 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskConvertBlocksResult>> {
+        // Thin trait wrapper; `convert_task_blocks_op` owns the logic so the
+        // auto-convert hook after every mutation can reuse it while carrying
+        // the outer write's caller-agent context.
         let services = self.clone();
         Box::pin(async move {
-            let store = &services.store;
-            let mut note = fetch_note_peer(store, &workspace_id, &note_id).await?;
-            if note.content.is_empty() {
-                return Ok(TaskConvertBlocksResult {
-                    ok: true,
-                    converted_count: 0,
-                    created_note_ids: Vec::new(),
-                });
-            }
-            // Mirror the TS guard: only parse when a `@@@task` fence exists.
-            let parsed = if note_ops::has_task_blocks(&note.content) {
-                note_ops::extract_task_blocks(&note.content)
-            } else {
-                note_ops::TaskBlocksResult {
-                    tasks: Vec::new(),
-                    content_without_blocks: note.content.clone(),
-                }
-            };
-            // Idempotency: map existing child note titles (normalized) → id.
-            let all = store.list_notes(&workspace_id).await?;
-            let mut existing_by_title: std::collections::HashMap<String, NoteId> = all
-                .iter()
-                .filter(|n| n.parent_id.as_ref() == Some(&note.id))
-                .map(|n| (n.title.trim().to_lowercase(), n.id.clone()))
-                .collect();
-
-            // Start from the placeholder-substituted content; each valid block
-            // is `<!-- task-block-placeholder-{i} -->` to be replaced below.
-            let mut working = parsed.content_without_blocks.clone();
-            let mut created_note_ids: Vec<String> = Vec::new();
-            let mut peer_order = 100i64;
-            for (i, task) in parsed.tasks.iter().enumerate() {
-                let body = if task.content.is_empty() {
-                    format!("# {}\n\nCreated as a prerequisite task.", task.title)
-                } else {
-                    format!("# {}\n\n{}", task.title, task.content)
-                };
-                let normalized = task.title.trim().to_lowercase();
-                let task_note_id = match existing_by_title.get(&normalized) {
-                    Some(existing_id) => existing_id.clone(),
-                    None => {
-                        let child = services
-                            .create_child_task_note(
-                                &workspace_id,
-                                &note.id,
-                                &task.title,
-                                body,
-                                TaskStatus::NotStarted,
-                                Some(peer_order),
-                            )
-                            .await?;
-                        existing_by_title.insert(normalized, child.id.clone());
-                        created_note_ids.push(child.id.0.clone());
-                        child.id
-                    }
-                };
-                let placeholder = format!("<!-- task-block-placeholder-{i} -->");
-                let linked = format!(
-                    "- [ ] [{}](intent://local/task/{})",
-                    task.title, task_note_id.0
-                );
-                working = working.replace(&placeholder, &linked);
-                peer_order += 100;
-            }
-
-            let content_changed = working != note.content;
-            if !content_changed && created_note_ids.is_empty() {
-                return Ok(TaskConvertBlocksResult {
-                    ok: true,
-                    converted_count: 0,
-                    created_note_ids: Vec::new(),
-                });
-            }
-            note.content = working;
-            note.updated_at = now_iso();
-            store.update_note(&note).await?;
-            // TS parity: the reference pushes a version snapshot ("Converted
-            // task blocks to linked Task Notes") as part of the conversion
-            // save, so the newest stored version matches the fence-free
-            // content that line-attribution/history consumers diff against.
-            capture_note_version(store, &note).await?;
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             services
-                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
-            // Emit `note:updated` for the rewritten parent so subscribers
-            // refresh the fence-free content live (TS parity: the reference
-            // emits `note:updated` after saving the converted note).
-            publish_event(
-                &services.event_bus,
-                note_change_event(
-                    &note.workspace_id,
-                    &note.id,
-                    &note.title,
-                    NOTE_UPDATED,
-                    "update",
-                ),
-            )
-            .await;
-            Ok(TaskConvertBlocksResult {
-                ok: true,
-                converted_count: created_note_ids.len() as i64,
-                created_note_ids,
-            })
+                .convert_task_blocks_op(workspace_id, note_id, caller_agent_id.as_ref())
+                .await
         })
     }
 

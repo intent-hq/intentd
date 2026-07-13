@@ -106,6 +106,7 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
                 parent_id: None,
             },
             None,
+            None,
         )
         .await
         .expect("create note");

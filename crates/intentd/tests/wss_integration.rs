@@ -2050,7 +2050,11 @@ async fn wss_note_version_history_round_trip() {
     for (i, entry) in versions.iter().enumerate() {
         assert_eq!(entry["v"].as_i64(), Some(i as i64 + 1));
         assert_eq!(entry["type"], "snapshot");
-        assert_eq!(entry["author"]["type"], "system");
+        // JSON-RPC (FE) note mutations resolve the version author to `user`
+        // (reference parity with `notes.service.ts`); the `system` author is
+        // reserved for daemon-internal writes such as the workspace-seed
+        // spec-note snapshot.
+        assert_eq!(entry["author"]["type"], "user");
         assert!(entry["date"].is_string());
         assert!(entry["contentLength"].is_i64());
         assert!(entry.get("content").is_none(), "summaries carry no content");

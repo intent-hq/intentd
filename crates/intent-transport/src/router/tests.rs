@@ -200,6 +200,7 @@ impl WorkspaceApi for FakeApi {
         workspace_id: WorkspaceId,
         input: NoteCreate,
         _idempotency_key: Option<String>,
+        _caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<Note>> {
         Box::pin(async move {
             let mut note = sample_note(&workspace_id);
@@ -243,6 +244,7 @@ impl WorkspaceApi for FakeApi {
         _workspace_id: WorkspaceId,
         note_id: NoteId,
         input: NoteAddInput,
+        _caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteAddResult>> {
         Box::pin(async move {
             Ok(NoteAddResult {
@@ -264,6 +266,7 @@ impl WorkspaceApi for FakeApi {
         _workspace_id: WorkspaceId,
         note_id: NoteId,
         input: NoteEditInput,
+        _caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteEditResult>> {
         Box::pin(async move {
             Ok(NoteEditResult {
@@ -285,6 +288,7 @@ impl WorkspaceApi for FakeApi {
         _workspace_id: WorkspaceId,
         note_id: NoteId,
         input: NoteEditLinesInput,
+        _caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteEditLinesResult>> {
         Box::pin(async move {
             Ok(NoteEditLinesResult {
@@ -309,6 +313,7 @@ impl WorkspaceApi for FakeApi {
         content: String,
         _confirm_replacement: bool,
         _expected_version: Option<i64>,
+        _caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
         Box::pin(async move {
             Ok(NoteSetContentResult {
@@ -332,6 +337,7 @@ impl WorkspaceApi for FakeApi {
         title: Option<String>,
         tags: Option<Vec<String>>,
         _expected_version: Option<i64>,
+        _caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteUpdateMetadataResult>> {
         Box::pin(async move {
             // Sentinel: a stale `expectedVersion` on this id surfaces the

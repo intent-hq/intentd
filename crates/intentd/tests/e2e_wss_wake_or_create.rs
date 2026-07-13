@@ -320,6 +320,7 @@ async fn seed_workspace_and_task(data_dir: &Path, title: &str) -> (String, Strin
                 parent_id: None,
             },
             None,
+            None,
         )
         .await
         .expect("create note");

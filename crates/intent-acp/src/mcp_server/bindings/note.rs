@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use intent_core::{
-    NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, WorkspaceApi, WorkspaceId,
+    AgentId, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, WorkspaceApi,
+    WorkspaceId,
 };
 use serde_json::{json, Value};
 
@@ -39,20 +40,21 @@ pub(crate) const PRELUDE: &str = r#"
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
     match method {
         "read" => read(api, ws, args).await,
-        "create" => create(api, ws, args).await,
+        "create" => create(api, ws, caller_agent_id, args).await,
         "list" => list(api, ws, args).await,
         "listTasks" => list_tasks(api, ws, args).await,
         "readAsset" => read_asset(api, ws, args).await,
-        "setContent" => set_content(api, ws, args).await,
-        "add" => add(api, ws, args).await,
-        "edit" => edit(api, ws, args).await,
-        "editLines" => edit_lines(api, ws, args).await,
-        "updateMetadata" => update_metadata(api, ws, args).await,
+        "setContent" => set_content(api, ws, caller_agent_id, args).await,
+        "add" => add(api, ws, caller_agent_id, args).await,
+        "edit" => edit(api, ws, caller_agent_id, args).await,
+        "editLines" => edit_lines(api, ws, caller_agent_id, args).await,
+        "updateMetadata" => update_metadata(api, ws, caller_agent_id, args).await,
         "delete" => delete(api, ws, args).await,
         other => Err(format!("host: unknown method `note.{other}`")),
     }
@@ -140,6 +142,7 @@ async fn read(
 async fn create(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let title = req_str(args, "title").map_err(|_| "Title and content are required".to_string())?;
@@ -156,6 +159,7 @@ async fn create(
                 parent_id: None,
             },
             Some(uuid::Uuid::new_v4().to_string()),
+            caller_agent_id.cloned(),
         )
         .await
         .map_err(map_err)?;
@@ -222,6 +226,7 @@ async fn read_asset(
 async fn set_content(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let id = req_str(args, "id").map_err(|_| "Note ID is required".to_string())?;
@@ -238,13 +243,25 @@ async fn set_content(
         _ => false,
     };
     let r = api
-        .set_note_content(ws.clone(), NoteId::from_string(&id), content, confirm, None)
+        .set_note_content(
+            ws.clone(),
+            NoteId::from_string(&id),
+            content,
+            confirm,
+            None,
+            caller_agent_id.cloned(),
+        )
         .await
         .map_err(map_err)?;
     serde_json::to_value(r).map_err(|e| e.to_string())
 }
 
-async fn add(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, args: &Value) -> Result<Value, String> {
+async fn add(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
+    args: &Value,
+) -> Result<Value, String> {
     let id = req_str(args, "id").map_err(|_| "Note ID is required".to_string())?;
     let content = req_str(args, "content").map_err(|_| "Content is required".to_string())?;
     let heading = opt_str(args, "heading");
@@ -258,6 +275,7 @@ async fn add(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, args: &Value) -> Res
                 heading,
                 position,
             },
+            caller_agent_id.cloned(),
         )
         .await
         .map_err(map_err)?;
@@ -267,6 +285,7 @@ async fn add(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, args: &Value) -> Res
 async fn edit(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let id = req_str(args, "id").map_err(|_| "Note ID is required".to_string())?;
@@ -286,6 +305,7 @@ async fn edit(
             ws.clone(),
             NoteId::from_string(&id),
             NoteEditInput { old, new: new_text },
+            caller_agent_id.cloned(),
         )
         .await
         .map_err(map_err)?;
@@ -295,6 +315,7 @@ async fn edit(
 async fn edit_lines(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let id = req_str(args, "id").map_err(|_| "Note ID is required".to_string())?;
@@ -324,6 +345,7 @@ async fn edit_lines(
                 end,
                 content,
             },
+            caller_agent_id.cloned(),
         )
         .await
         .map_err(map_err)?;
@@ -333,6 +355,7 @@ async fn edit_lines(
 async fn update_metadata(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let id = req_str(args, "id").map_err(|_| "Note ID is required".to_string())?;
@@ -342,7 +365,14 @@ async fn update_metadata(
         return Err("At least one of title or tags must be provided".to_string());
     }
     let r = api
-        .update_note_metadata(ws.clone(), NoteId::from_string(&id), title, tags, None)
+        .update_note_metadata(
+            ws.clone(),
+            NoteId::from_string(&id),
+            title,
+            tags,
+            None,
+            caller_agent_id.cloned(),
+        )
         .await
         .map_err(map_err)?;
     serde_json::to_value(r).map_err(|e| e.to_string())

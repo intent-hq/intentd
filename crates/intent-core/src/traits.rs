@@ -230,13 +230,18 @@ pub trait WorkspaceApi: Send + Sync {
     /// `idempotency_key` is the optional `params.idempotencyKey` (design note TB-0
     /// §5): when present and previously recorded, the original result is returned
     /// without re-executing; soft-launch when absent (warn + execute).
+    ///
+    /// `caller_agent_id` attributes the captured note version to the invoking
+    /// agent (the MCP front door passes it); `None` → user-authored (FE/RPC
+    /// path). Mirrors the LC-1 `task.updateNoteStatus` provenance threading.
     fn create_note(
         &self,
         workspace_id: WorkspaceId,
         input: NoteCreate,
         idempotency_key: Option<String>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<Note>> {
-        let _ = (workspace_id, input, idempotency_key);
+        let _ = (workspace_id, input, idempotency_key, caller_agent_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::create_note not implemented".to_string(),
@@ -260,13 +265,17 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `note.add`: append/prepend/insert content (PROTOCOL §5.2).
+    ///
+    /// `caller_agent_id` attributes the captured note version to the invoking
+    /// agent (the MCP front door passes it); `None` → user-authored.
     fn add_to_note(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         input: NoteAddInput,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteAddResult>> {
-        let _ = (workspace_id, note_id, input);
+        let _ = (workspace_id, note_id, input, caller_agent_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::add_to_note not implemented".to_string(),
@@ -275,13 +284,17 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `note.edit`: first exact-match replacement (PROTOCOL §5.2).
+    ///
+    /// `caller_agent_id` attributes the captured note version to the invoking
+    /// agent (the MCP front door passes it); `None` → user-authored.
     fn edit_note(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         input: NoteEditInput,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteEditResult>> {
-        let _ = (workspace_id, note_id, input);
+        let _ = (workspace_id, note_id, input, caller_agent_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::edit_note not implemented".to_string(),
@@ -290,13 +303,17 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `note.editLines`: 1-based inclusive line replace/delete/insert (PROTOCOL §5.2).
+    ///
+    /// `caller_agent_id` attributes the captured note version to the invoking
+    /// agent (the MCP front door passes it); `None` → user-authored.
     fn edit_note_lines(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         input: NoteEditLinesInput,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteEditLinesResult>> {
-        let _ = (workspace_id, note_id, input);
+        let _ = (workspace_id, note_id, input, caller_agent_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::edit_note_lines not implemented".to_string(),
@@ -306,6 +323,9 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `note.setContent`: full replace with the reduction guard (PROTOCOL §5.2).
     /// `expected_version` gates the write on the current `rev` when `Some` (§5.6).
+    ///
+    /// `caller_agent_id` attributes the captured note version to the invoking
+    /// agent (the MCP front door passes it); `None` → user-authored.
     fn set_note_content(
         &self,
         workspace_id: WorkspaceId,
@@ -313,6 +333,7 @@ pub trait WorkspaceApi: Send + Sync {
         content: String,
         confirm_replacement: bool,
         expected_version: Option<i64>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
         let _ = (
             workspace_id,
@@ -320,6 +341,7 @@ pub trait WorkspaceApi: Send + Sync {
             content,
             confirm_replacement,
             expected_version,
+            caller_agent_id,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -330,6 +352,10 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `note.updateMetadata`: title/tags (spec title is skipped) (PROTOCOL §5.2).
     /// `expected_version` gates the write on the current `rev` when `Some` (§5.6).
+    ///
+    /// `caller_agent_id` is accepted for uniformity with the other note-mutation
+    /// methods; metadata-only writes do not push a version snapshot, so the
+    /// hint is currently unused (parity with `notes.service.ts`).
     fn update_note_metadata(
         &self,
         workspace_id: WorkspaceId,
@@ -337,8 +363,16 @@ pub trait WorkspaceApi: Send + Sync {
         title: Option<String>,
         tags: Option<Vec<String>>,
         expected_version: Option<i64>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteUpdateMetadataResult>> {
-        let _ = (workspace_id, note_id, title, tags, expected_version);
+        let _ = (
+            workspace_id,
+            note_id,
+            title,
+            tags,
+            expected_version,
+            caller_agent_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::update_note_metadata not implemented".to_string(),
@@ -444,13 +478,17 @@ pub trait WorkspaceApi: Send + Sync {
     /// `note.restoreVersion`: reset content to version `v` and append a new
     /// version capturing the restored state (PROTOCOL §5.2 version-history
     /// extensions).
+    ///
+    /// `caller_agent_id` attributes the captured note version to the invoking
+    /// agent (the MCP front door passes it); `None` → user-authored.
     fn restore_note_version(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         v: i64,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteRestoreVersionResult>> {
-        let _ = (workspace_id, note_id, v);
+        let _ = (workspace_id, note_id, v, caller_agent_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::restore_note_version not implemented".to_string(),
@@ -620,12 +658,17 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.convertBlocks`: `@@@task` blocks → linked child task notes (§5.4).
+    ///
+    /// `caller_agent_id` attributes the resulting "Converted task blocks"
+    /// version snapshot to the invoking agent (the MCP front door passes it);
+    /// `None` → user-authored.
     fn convert_task_blocks(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskConvertBlocksResult>> {
-        let _ = (workspace_id, note_id);
+        let _ = (workspace_id, note_id, caller_agent_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::convert_task_blocks not implemented".to_string(),
