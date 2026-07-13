@@ -1139,3 +1139,115 @@ async fn note_edit_marks_destroyed_anchor_orphaned_over_wss() {
         "expected orphaned after anchor destruction: {comment_after}"
     );
 }
+
+/// End-to-end self-heal for the pre-#110 global-note-identity bug over WSS:
+/// a workspace whose spec content lives on a UUID note titled "Spec"
+/// (because the buggy agent path called `note.create` for the spec) is
+/// adopted onto the reserved `id='spec'` on the next `note.list`. The
+/// adoption emits an ordered pair — `note:deleted` for the stray UUID then
+/// `note:created` for `spec` — with the adopted title on both, and the
+/// WSS `note.list` response carries the adopted content on `id='spec'` so
+/// live FE clients replace the stale tree entry without an extra read.
+#[tokio::test]
+async fn note_list_adopts_stray_spec_note_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "AdoptHeal", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Reproduce the pre-#110 damaged shape: create a top-level, non-task
+    // note titled "Spec" with real content on a random UUID id, then delete
+    // the seeded `id='spec'` so `ensure_spec_note` sees exactly one
+    // adoption candidate on the next `note.list`.
+    let stray = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({
+            "workspaceId": ws_id,
+            "title": "Spec",
+            "content": "# Real spec content\n\nkeep me",
+        }),
+    )
+    .await;
+    let stray_id = stray["result"]["note"]["id"]
+        .as_str()
+        .expect("stray id")
+        .to_string();
+    assert_ne!(stray_id, "spec", "sanity: stray must have a UUID id");
+    let del = uds_rpc(
+        &socket,
+        4,
+        "note.delete",
+        json!({ "workspaceId": ws_id, "noteId": "spec" }),
+    )
+    .await;
+    assert_eq!(del["result"]["ok"], json!(true), "delete seed: {del}");
+
+    // Subscribe over WSS *after* setup so the adoption pair is the only
+    // note:*/note:deleted traffic we see on this socket.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["note:created", "note:deleted"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Drive `note.list` over a separate WSS RPC connection; the response
+    // must carry the adopted content on `id='spec'` and no longer list the
+    // stray UUID.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let list = wss_rpc(&mut rpc, 2, "note.list", json!({ "workspaceId": ws_id })).await;
+    let notes = list["notes"].as_array().expect("notes array");
+    assert!(
+        !notes.iter().any(|n| n["id"] == json!(stray_id)),
+        "stray UUID note must be replaced: {list}"
+    );
+    let spec = notes
+        .iter()
+        .find(|n| n["id"] == json!("spec"))
+        .expect("spec present in response");
+    assert_eq!(spec["workspaceId"], json!(ws_id));
+    assert_eq!(spec["title"], json!("Spec"));
+    assert_eq!(spec["content"], json!("# Real spec content\n\nkeep me"));
+    assert_eq!(spec["isPinned"], json!(true));
+    assert_eq!(spec["isDefault"], json!(true));
+
+    // Event ordering: `note:deleted` for the stray, then `note:created` for
+    // spec. Both carry the adopted title so a subscribed FE tree replaces
+    // the stale node in one pass.
+    let deleted = next_event(&mut sub, &["note:deleted"], 10).await;
+    assert_eq!(deleted["workspaceId"], ws_id.as_str());
+    assert_eq!(deleted["data"]["noteId"], json!(stray_id));
+    assert_eq!(deleted["data"]["title"], json!("Spec"));
+    assert_eq!(deleted["data"]["action"], json!("delete"));
+    let created = next_event(&mut sub, &["note:created"], 10).await;
+    assert_eq!(created["workspaceId"], ws_id.as_str());
+    assert_eq!(created["data"]["noteId"], json!("spec"));
+    assert_eq!(created["data"]["title"], json!("Spec"));
+    assert_eq!(created["data"]["action"], json!("create"));
+
+    // Adoption is one-shot: no additional note:deleted / note:created on a
+    // second `note.list`.
+    let _ = wss_rpc(&mut rpc, 3, "note.list", json!({ "workspaceId": ws_id })).await;
+    assert!(
+        drain_extra(&mut sub, "note:deleted", 400).await.is_none(),
+        "adoption must not republish note:deleted on re-list"
+    );
+    assert!(
+        drain_extra(&mut sub, "note:created", 400).await.is_none(),
+        "adoption must not republish note:created on re-list"
+    );
+}

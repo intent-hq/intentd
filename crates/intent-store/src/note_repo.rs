@@ -233,6 +233,143 @@ impl Store {
             .map_err(|e| Error::Internal(format!("list tasks failed: {e}")))?;
         rows.iter().map(map_note_row).collect()
     }
+
+    /// Self-heal for workspaces damaged by the pre-#110 global-note-identity
+    /// bug: if the workspace has no `id='spec'` note but *exactly one*
+    /// top-level (`parent_id IS NULL`), non-task (`task_json IS NULL`),
+    /// non-archived note titled "Spec" (trim + case-insensitive), adopt it as
+    /// the reserved spec in a single transaction — rewrite `note.id` to
+    /// `'spec'`, re-parent children, move `note_version`,
+    /// `note_line_attribution`, and `comment` rows to the new id, set
+    /// `is_pinned=1, is_default=1`, and ensure the `spec` tag is present.
+    /// Foreign keys are deferred to commit so the referenced key can be
+    /// rewritten alongside its dependents (§9.4 keeps `foreign_keys = ON`
+    /// outside this window). Returns `Some((old_id, title))` on adoption, or
+    /// `None` when zero or ≥2 candidates match — both fall through to the
+    /// caller's empty-seed path. The caller (`ensure_spec_note`) has already
+    /// confirmed no `id='spec'` note exists; a concurrent adoption race is
+    /// resolved by the composite PK on `(id, workspace_id)`.
+    pub async fn adopt_stray_spec_note(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<(NoteId, String)>> {
+        let mut tx = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(format!("begin adopt_spec tx failed: {e}")))?;
+        // Re-check the "no `id='spec'`" precondition *inside* the tx: the
+        // caller's `fetch_note(spec)` runs on a fresh connection before we
+        // begin, so a racing `workspace.create` or a sibling `note.list`
+        // may have committed a real spec in the gap. Bailing here lets that
+        // caller list the freshly-created spec on its next round-trip
+        // rather than surfacing a UNIQUE PK conflict from the UPDATE.
+        let existing_spec: Option<String> =
+            sqlx::query_scalar("SELECT id FROM note WHERE workspace_id = ? AND id = 'spec'")
+                .bind(&workspace_id.0)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("recheck spec precondition failed: {e}")))?;
+        if existing_spec.is_some() {
+            tx.rollback()
+                .await
+                .map_err(|e| Error::Internal(format!("rollback adopt_spec tx failed: {e}")))?;
+            return Ok(None);
+        }
+        // Scan for candidates inside the tx so the caller's "no `id='spec'`"
+        // precondition still holds at commit. `LIMIT 2` is enough to
+        // distinguish "exactly one" from "≥2".
+        let rows = sqlx::query(
+            "SELECT id, title, tags FROM note \
+             WHERE workspace_id = ? \
+               AND id != 'spec' \
+               AND parent_id IS NULL \
+               AND task_json IS NULL \
+               AND is_archived = 0 \
+               AND LOWER(TRIM(title)) = 'spec' \
+             LIMIT 2",
+        )
+        .bind(&workspace_id.0)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("scan stray spec candidates failed: {e}")))?;
+        if rows.len() != 1 {
+            tx.rollback()
+                .await
+                .map_err(|e| Error::Internal(format!("rollback adopt_spec tx failed: {e}")))?;
+            return Ok(None);
+        }
+        let row = &rows[0];
+        let old_id: String = col(row, "id")?;
+        let title: String = col(row, "title")?;
+        let existing_tags: Vec<String> = tags_from_db(&col::<String>(row, "tags")?)?;
+        let mut new_tags = existing_tags;
+        if !new_tags.iter().any(|t| t == "spec") {
+            new_tags.push("spec".to_string());
+        }
+        let tags_json = tags_to_db(&new_tags)?;
+        // Defer FK enforcement to commit so the composite `(note_id,
+        // workspace_id)` FKs on note_version / note_line_attribution /
+        // comment stay consistent while we rewrite the referenced key.
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("defer FKs failed: {e}")))?;
+        // Belt-and-braces alongside `id != 'spec'` in the SELECT: if another
+        // transaction adopted the same stray between our SELECT and this
+        // UPDATE, the row would already be gone and `rows_affected` would be
+        // 0 — bail out rather than emit spurious delete/create events for a
+        // no-op rewrite.
+        let rewrite = sqlx::query(
+            "UPDATE note SET id = 'spec', is_pinned = 1, is_default = 1, tags = ? \
+             WHERE id = ? AND workspace_id = ? AND id != 'spec'",
+        )
+        .bind(&tags_json)
+        .bind(&old_id)
+        .bind(&workspace_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("rewrite spec note id failed: {e}")))?;
+        if rewrite.rows_affected() != 1 {
+            tx.rollback()
+                .await
+                .map_err(|e| Error::Internal(format!("rollback adopt_spec tx failed: {e}")))?;
+            return Ok(None);
+        }
+        sqlx::query("UPDATE note SET parent_id = 'spec' WHERE parent_id = ? AND workspace_id = ?")
+            .bind(&old_id)
+            .bind(&workspace_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("reparent spec children failed: {e}")))?;
+        sqlx::query(
+            "UPDATE note_version SET note_id = 'spec' WHERE note_id = ? AND workspace_id = ?",
+        )
+        .bind(&old_id)
+        .bind(&workspace_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("move spec versions failed: {e}")))?;
+        sqlx::query(
+            "UPDATE note_line_attribution SET note_id = 'spec' \
+             WHERE note_id = ? AND workspace_id = ?",
+        )
+        .bind(&old_id)
+        .bind(&workspace_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("move spec line attribution failed: {e}")))?;
+        sqlx::query("UPDATE comment SET note_id = 'spec' WHERE note_id = ? AND workspace_id = ?")
+            .bind(&old_id)
+            .bind(&workspace_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("move spec comments failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("commit adopt_spec tx failed: {e}")))?;
+        Ok(Some((NoteId(old_id), title)))
+    }
 }
 
 fn col<'r, T>(row: &'r SqliteRow, name: &str) -> Result<T>

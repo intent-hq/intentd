@@ -3693,6 +3693,408 @@ mod change_event_parity {
         let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(none.is_err(), "chief list must not publish a reseed event");
     }
+
+    /// Self-heal for workspaces damaged by the pre-#110 global-note-identity
+    /// bug: on `note.list` with no `id='spec'` note but exactly one top-level,
+    /// non-task note titled "Spec", the stray is *adopted* — its `note.id` is
+    /// rewritten to `'spec'`, children are re-parented, version history / line
+    /// attribution / comments follow, `is_pinned` / `is_default` / the `spec`
+    /// tag are set, and delete+create events fire so live FE clients converge.
+    #[tokio::test]
+    async fn note_list_adopts_stray_spec_note() {
+        use intent_core::{
+            now_iso, AuthorType, Comment, CommentAnchor, CommentAnchorType, CommentStatus,
+            CommentType, ContentType, LineAttributionData, Note, NoteId, NoteMetadata,
+            NoteVersionAuthor, NoteVisibility, TaskMetadata, TaskStatus,
+        };
+        use std::collections::BTreeMap;
+
+        let h = harness().await;
+
+        // Seed a stray "Spec" note (random UUID id, pre-#110 shape): top-level,
+        // non-task, existing tag list to verify merge preserves callers' tags.
+        let stray_id = NoteId::new();
+        let stray_ts = now_iso();
+        let stray = Note {
+            id: stray_id.clone(),
+            workspace_id: h.ws.clone(),
+            title: "Spec".to_string(),
+            content: "# Real spec content\n\nkeep me".to_string(),
+            content_type: ContentType::Markdown,
+            tags: vec!["custom".to_string()],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: None,
+            visibility: NoteVisibility::Workspace,
+            metadata: NoteMetadata::default(),
+            created_at: stray_ts.clone(),
+            rev: 0,
+            updated_at: stray_ts.clone(),
+        };
+        h.store.insert_note(&stray).await.expect("insert stray");
+
+        // Two task-note children whose parent is the stray UUID id — after
+        // adoption they must point at `spec` instead.
+        let mk_child = |id: &str| Note {
+            id: NoteId::from(id),
+            workspace_id: h.ws.clone(),
+            title: id.to_string(),
+            content: String::new(),
+            content_type: ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: Some(stray_id.clone()),
+            visibility: NoteVisibility::Workspace,
+            metadata: NoteMetadata {
+                task: Some(TaskMetadata {
+                    status: TaskStatus::NotStarted,
+                    ..Default::default()
+                }),
+            },
+            created_at: stray_ts.clone(),
+            rev: 0,
+            updated_at: stray_ts.clone(),
+        };
+        let child_a = mk_child("task-a");
+        let child_b = mk_child("task-b");
+        h.store.insert_note(&child_a).await.expect("insert child a");
+        h.store.insert_note(&child_b).await.expect("insert child b");
+
+        // Version history + line attribution + a comment, all keyed to the
+        // stray id and expected to follow into `spec`.
+        let author = NoteVersionAuthor {
+            id: "user".to_string(),
+            name: "User".to_string(),
+            author_type: "user".to_string(),
+        };
+        h.store
+            .append_note_version(&stray, &author, &stray_ts)
+            .await
+            .expect("v1");
+
+        let mut attributions = BTreeMap::new();
+        attributions.insert(
+            "1".to_string(),
+            intent_core::LineAttributionInfo {
+                timestamp: 0,
+                author: Some(intent_core::LineAttributionAuthor {
+                    id: "user".to_string(),
+                    name: "User".to_string(),
+                    author_type: "user".to_string(),
+                    turn_number: None,
+                }),
+            },
+        );
+        h.store
+            .upsert_note_line_attribution(&LineAttributionData {
+                note_id: stray_id.clone(),
+                workspace_id: h.ws.clone(),
+                computed_at: stray_ts.clone(),
+                attributions,
+            })
+            .await
+            .expect("upsert attribution");
+
+        let comment = Comment {
+            id: "c1".to_string(),
+            thread_id: "t1".to_string(),
+            note_id: Some(stray_id.clone()),
+            kind: CommentType::Comment,
+            content: "hi".to_string(),
+            author: "user".to_string(),
+            author_type: AuthorType::User,
+            status: CommentStatus::Open,
+            parent_id: None,
+            anchor: CommentAnchor {
+                kind: CommentAnchorType::Range,
+                ..Default::default()
+            },
+            anchor_text: None,
+            anchor_before: None,
+            anchor_after: None,
+            suggestion_original: None,
+            suggestion_proposed: None,
+            agent_id: None,
+            is_orphaned: None,
+            created_at: stray_ts.clone(),
+            updated_at: stray_ts,
+        };
+        h.store
+            .insert_comment(&h.ws, &comment)
+            .await
+            .expect("insert comment");
+
+        let mut sub = subscribe(&h);
+
+        // Trigger the self-heal via `note.list` — the public path §5 clients
+        // use to converge a damaged workspace.
+        let notes = h.services.list_notes(&h.ws).await.expect("list");
+
+        // The stray UUID is gone; `spec` carries the adopted content, tags
+        // merge (`spec` added, `custom` preserved), and the pinned/default
+        // flags are on.
+        assert!(
+            !notes.iter().any(|n| n.id == stray_id),
+            "old UUID note must be replaced"
+        );
+        let spec = notes
+            .iter()
+            .find(|n| n.id == NoteId::from("spec"))
+            .expect("spec listed");
+        assert_eq!(spec.title, "Spec");
+        assert_eq!(spec.content, "# Real spec content\n\nkeep me");
+        assert!(spec.tags.iter().any(|t| t == "spec"));
+        assert!(spec.tags.iter().any(|t| t == "custom"));
+        assert!(spec.is_pinned);
+        assert!(spec.is_default);
+
+        // Children re-parented to `spec`.
+        let child_a_now = h
+            .store
+            .get_note(&h.ws, &NoteId::from("task-a"))
+            .await
+            .expect("child a");
+        let child_b_now = h
+            .store
+            .get_note(&h.ws, &NoteId::from("task-b"))
+            .await
+            .expect("child b");
+        assert_eq!(child_a_now.parent_id, Some(NoteId::from("spec")));
+        assert_eq!(child_b_now.parent_id, Some(NoteId::from("spec")));
+
+        // Version history moved.
+        let versions_old = h
+            .store
+            .list_note_versions(&h.ws, &stray_id)
+            .await
+            .expect("versions old");
+        assert!(versions_old.is_empty());
+        let versions_new = h
+            .store
+            .list_note_versions(&h.ws, &NoteId::from("spec"))
+            .await
+            .expect("versions new");
+        assert_eq!(versions_new.len(), 1);
+
+        // Line attribution moved.
+        let attr_old = h
+            .store
+            .get_note_line_attribution(&h.ws, &stray_id)
+            .await
+            .expect("attr old");
+        assert!(attr_old.is_none());
+        let attr_new = h
+            .store
+            .get_note_line_attribution(&h.ws, &NoteId::from("spec"))
+            .await
+            .expect("attr new");
+        assert!(attr_new.is_some());
+
+        // Comments moved.
+        let comments_old = h
+            .store
+            .list_comments_in_workspace(&h.ws, &stray_id)
+            .await
+            .expect("comments old");
+        assert!(comments_old.is_empty());
+        let comments_new = h
+            .store
+            .list_comments_in_workspace(&h.ws, &NoteId::from("spec"))
+            .await
+            .expect("comments new");
+        assert_eq!(comments_new.len(), 1);
+        assert_eq!(comments_new[0].id, "c1");
+
+        // Events: `note:deleted` for the old id, then `note:created` for
+        // `spec` — both carry the adopted title so FE tree entries reconcile.
+        let del = recv_one(&mut sub).await;
+        assert_envelope(&del, &h.ws.0, "note:deleted");
+        assert_eq!(del["data"]["noteId"], stray_id.0);
+        assert_eq!(del["data"]["title"], "Spec");
+        assert_eq!(del["data"]["action"], "delete");
+        let created = recv_one(&mut sub).await;
+        assert_envelope(&created, &h.ws.0, "note:created");
+        assert_eq!(created["data"]["noteId"], "spec");
+        assert_eq!(created["data"]["title"], "Spec");
+        assert_eq!(created["data"]["action"], "create");
+
+        // Idempotency: a second `note.list` is a no-op — no further events,
+        // no additional version snapshots.
+        let _ = h.services.list_notes(&h.ws).await.expect("list again");
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "second list must not republish after adoption"
+        );
+        let versions_after = h
+            .store
+            .list_note_versions(&h.ws, &NoteId::from("spec"))
+            .await
+            .expect("versions after");
+        assert_eq!(versions_after.len(), 1);
+    }
+
+    /// Ambiguity (≥2 top-level "Spec" notes): the adoption bails out and
+    /// falls through to the existing empty-seed path. Both strays stay put;
+    /// the new `spec` is a fresh empty row.
+    #[tokio::test]
+    async fn note_list_falls_back_to_empty_seed_when_multiple_spec_candidates() {
+        use intent_core::{now_iso, ContentType, Note, NoteId, NoteMetadata, NoteVisibility};
+        let h = harness().await;
+        let mk = |id: &str, title: &str, body: &str| Note {
+            id: NoteId::from(id),
+            workspace_id: h.ws.clone(),
+            title: title.to_string(),
+            content: body.to_string(),
+            content_type: ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: None,
+            visibility: NoteVisibility::Workspace,
+            metadata: NoteMetadata::default(),
+            created_at: now_iso(),
+            rev: 0,
+            updated_at: now_iso(),
+        };
+        // Two top-level candidates — case/whitespace variations still count.
+        let s1 = mk("stray-1", "Spec", "one");
+        let s2 = mk("stray-2", "  spec  ", "two");
+        h.store.insert_note(&s1).await.expect("insert s1");
+        h.store.insert_note(&s2).await.expect("insert s2");
+
+        let mut sub = subscribe(&h);
+        let notes = h.services.list_notes(&h.ws).await.expect("list");
+
+        // Fresh empty seed, both strays untouched.
+        let spec = notes
+            .iter()
+            .find(|n| n.id == NoteId::from("spec"))
+            .expect("spec seeded");
+        assert_eq!(spec.content, "");
+        assert!(notes.iter().any(|n| n.id == NoteId::from("stray-1")));
+        assert!(notes.iter().any(|n| n.id == NoteId::from("stray-2")));
+
+        // Exactly one `note:created` (the empty seed) — no `note:deleted`.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:created");
+        assert_eq!(ev["data"]["noteId"], "spec");
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(quiet.is_err(), "no adoption events on ambiguous fallback");
+    }
+
+    /// Candidates must be top-level and non-task: a task-note titled "Spec"
+    /// or a child note titled "Spec" is *not* adopted. With no other stray
+    /// present the caller falls through to the empty-seed path.
+    #[tokio::test]
+    async fn note_list_ignores_task_or_child_spec_candidates() {
+        use intent_core::{
+            now_iso, ContentType, Note, NoteId, NoteMetadata, NoteVisibility, TaskMetadata,
+            TaskStatus,
+        };
+        let h = harness().await;
+        let base = |id: &str, title: &str| Note {
+            id: NoteId::from(id),
+            workspace_id: h.ws.clone(),
+            title: title.to_string(),
+            content: String::new(),
+            content_type: ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: None,
+            visibility: NoteVisibility::Workspace,
+            metadata: NoteMetadata::default(),
+            created_at: now_iso(),
+            rev: 0,
+            updated_at: now_iso(),
+        };
+        let parent = base("parent", "Parent");
+        h.store.insert_note(&parent).await.expect("insert parent");
+        let mut child = base("child-spec", "Spec");
+        child.parent_id = Some(NoteId::from("parent"));
+        h.store.insert_note(&child).await.expect("insert child");
+        let mut task = base("task-spec", "Spec");
+        task.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::NotStarted,
+            ..Default::default()
+        });
+        h.store.insert_note(&task).await.expect("insert task");
+
+        let notes = h.services.list_notes(&h.ws).await.expect("list");
+        let spec = notes
+            .iter()
+            .find(|n| n.id == NoteId::from("spec"))
+            .expect("spec seeded");
+        assert_eq!(spec.content, "", "task/child matches must not be adopted");
+        assert!(notes.iter().any(|n| n.id == NoteId::from("child-spec")));
+        assert!(notes.iter().any(|n| n.id == NoteId::from("task-spec")));
+    }
+
+    /// A workspace that already has `id='spec'` is untouched even if a stray
+    /// "Spec" UUID note sits beside it: `ensure_spec_note` returns early on
+    /// the healthy path, no adoption runs, no adoption events fire.
+    #[tokio::test]
+    async fn note_list_does_not_adopt_when_spec_already_exists() {
+        use intent_core::{
+            now_iso, ContentType, Note, NoteId, NoteMetadata, NoteVisibility, WorkspaceCreate,
+        };
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let created = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Healthy".to_string()),
+                    branch: Some("feat/adopt-noop".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        let _ = recv_one(&mut sub).await; // workspace:created
+        let _ = recv_one(&mut sub).await; // note:created (seed)
+
+        let stray_id = NoteId::new();
+        let stray = Note {
+            id: stray_id.clone(),
+            workspace_id: created.id.clone(),
+            title: "Spec".to_string(),
+            content: "stray body".to_string(),
+            content_type: ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: None,
+            visibility: NoteVisibility::Workspace,
+            metadata: NoteMetadata::default(),
+            created_at: now_iso(),
+            rev: 0,
+            updated_at: now_iso(),
+        };
+        h.store.insert_note(&stray).await.expect("insert stray");
+
+        let notes = h.services.list_notes(&created.id).await.expect("list");
+        // Both notes present, stray untouched.
+        assert!(notes.iter().any(|n| n.id == NoteId::from("spec")));
+        let stray_now = h
+            .store
+            .get_note(&created.id, &stray_id)
+            .await
+            .expect("stray present");
+        assert_eq!(stray_now.content, "stray body");
+
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(quiet.is_err(), "healthy workspace must not fire adoption");
+    }
 }
 
 /// End-to-end §6.8 "one impl, two front doors": an agent (via the in-process MCP

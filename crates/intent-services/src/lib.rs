@@ -1639,6 +1639,39 @@ async fn ensure_spec_note(
         Err(Error::NotFound(_)) => {}
         Err(e) => return Err(e),
     }
+    // Self-heal for workspaces damaged by the pre-#110 global-note-identity
+    // bug: agents that hit "no `spec` yet" fell back to `note.create` and
+    // captured a random UUID id, leaving `isSpecNote()` (id-based) blind to
+    // real spec content. Rather than seed an empty spec beside the stray,
+    // rewrite the stray to the reserved id (children, versions, attribution,
+    // and comments follow in the same tx) and emit delete+create events so
+    // live FE clients reconcile. Nothing to adopt (zero or ≥2 candidates)
+    // falls through to the empty seed below.
+    if let Some((old_id, adopted_title)) = store.adopt_stray_spec_note(workspace_id).await? {
+        publish_event(
+            bus,
+            note_change_event(
+                workspace_id,
+                &old_id,
+                &adopted_title,
+                NOTE_DELETED,
+                "delete",
+            ),
+        )
+        .await;
+        publish_event(
+            bus,
+            note_change_event(
+                workspace_id,
+                &spec_id,
+                &adopted_title,
+                NOTE_CREATED,
+                "create",
+            ),
+        )
+        .await;
+        return Ok(());
+    }
     let now = now_iso();
     let note = Note {
         id: spec_id,
