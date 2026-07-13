@@ -149,6 +149,11 @@ async fn create(
     let content =
         req_str(args, "content").map_err(|_| "Title and content are required".to_string())?;
     let tags = opt_vec_str(args, "tags");
+    // Idempotency-wrapped in `intent-services`: honor a caller-supplied
+    // `idempotencyKey` when present so retries of the same tool call dedupe,
+    // otherwise mint a fresh UUID.
+    let idempotency_key =
+        opt_str(args, "idempotencyKey").or_else(|| Some(uuid::Uuid::new_v4().to_string()));
     let note = api
         .create_note(
             ws.clone(),
@@ -158,7 +163,7 @@ async fn create(
                 tags,
                 parent_id: None,
             },
-            Some(uuid::Uuid::new_v4().to_string()),
+            idempotency_key,
             caller_agent_id.cloned(),
         )
         .await

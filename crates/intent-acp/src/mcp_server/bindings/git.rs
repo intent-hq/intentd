@@ -139,8 +139,13 @@ async fn commit(
     } else {
         message
     };
+    // Idempotency-wrapped in `intent-services`: pass the caller-supplied key
+    // through when present, otherwise mint a UUID so agent-initiated retries
+    // dedupe and the `with_idempotency` soft-launch warn never fires.
+    let idempotency_key =
+        opt_str(args, "idempotencyKey").or_else(|| Some(uuid::Uuid::new_v4().to_string()));
     let r = api
-        .git_commit(ws.clone(), full_message, None)
+        .git_commit(ws.clone(), full_message, idempotency_key)
         .await
         .map_err(map_err)?;
     Ok(json!({ "ok": true, "hash": r.hash, "files": r.files }))

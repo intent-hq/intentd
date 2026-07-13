@@ -4410,7 +4410,13 @@ mod wsapi6_bindings_tests {
 
     use crate::WorkspaceMcpServer;
 
-    type PrMergeCall = (Option<String>, Option<String>, Option<String>);
+    /// `(mergeMethod, commitTitle, commitMessage, idempotencyKey)`.
+    type PrMergeCall = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
     type PrReviewCommentsCall = (Option<String>, Option<String>);
     type PrWaitCall = (Option<i64>, Option<i64>, Option<String>);
     type PrResolveThreadCall = (String, Option<String>);
@@ -4472,12 +4478,13 @@ mod wsapi6_bindings_tests {
             merge_method: Option<String>,
             commit_title: Option<String>,
             commit_message: Option<String>,
-            _idempotency_key: Option<String>,
+            idempotency_key: Option<String>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.pr_merge_calls.lock().unwrap().push((
                 merge_method.clone(),
                 commit_title,
                 commit_message,
+                idempotency_key,
             ));
             Box::pin(async move {
                 Ok(json!({
@@ -4818,10 +4825,33 @@ mod wsapi6_bindings_tests {
         assert_eq!(v["mergeMethod"], json!("merge"));
         let calls = api.pr_merge_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(
-            calls[0],
-            (None, Some("ct".to_string()), Some("cm".to_string()),)
+        assert_eq!(calls[0].0, None);
+        assert_eq!(calls[0].1.as_deref(), Some("ct"));
+        assert_eq!(calls[0].2.as_deref(), Some("cm"));
+        let key = calls[0]
+            .3
+            .as_deref()
+            .expect("pr.merge must mint an idempotencyKey");
+        assert!(
+            uuid::Uuid::parse_str(key).is_ok(),
+            "minted key {key:?} is not a UUID"
         );
+    }
+
+    #[tokio::test]
+    async fn pr_merge_passes_caller_idempotency_key_through() {
+        // A caller-supplied idempotencyKey is adopted verbatim so retries of
+        // the same tool call dedupe against the idempotency store; the
+        // services soft-launch warn must never fire for MCP tool calls.
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.pr.merge({ idempotencyKey: 'key-from-caller' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.pr_merge_calls.lock().unwrap();
+        assert_eq!(calls[0].3.as_deref(), Some("key-from-caller"));
     }
 
     #[tokio::test]
