@@ -57,9 +57,17 @@ pub fn ls_remote_has_branch(
 
 /// The `origin` remote URL, or `None` when the workspace has no `origin`.
 pub fn origin_url(worktree_path: &Path) -> Result<Option<String>> {
+    remote_url(worktree_path, "origin")
+}
+
+/// The URL of the named `remote`, or `None` when the repository has no such
+/// remote (or the remote's URL is not valid UTF-8). Ports the FE
+/// `git-tracking:get-remote-url` handler / `getRemoteUrl` helper (which shells
+/// `git -C <path> config --get remote.<name>.url` and folds missing to null).
+pub fn remote_url(worktree_path: &Path, remote: &str) -> Result<Option<String>> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
-    let url = match repo.find_remote("origin") {
-        Ok(remote) => remote.url().ok().map(str::to_string),
+    let url = match repo.find_remote(remote) {
+        Ok(handle) => handle.url().ok().map(str::to_string),
         Err(_) => None,
     };
     Ok(url)
@@ -166,6 +174,21 @@ mod tests {
         let dir = test_init_repo("remote-none");
         commit_file(dir.path(), "a.txt", "x\n");
         assert!(origin_url(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn remote_url_reads_named_remote_and_none_for_missing() {
+        let dir = test_init_repo("remote-url-named");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        repo.remote("upstream", "https://github.com/o/upstream.git")
+            .unwrap();
+        assert_eq!(
+            remote_url(dir.path(), "upstream").unwrap().as_deref(),
+            Some("https://github.com/o/upstream.git")
+        );
+        // Missing remote is null, not an error (FE `getRemoteUrl` parity).
+        assert!(remote_url(dir.path(), "no-such-remote").unwrap().is_none());
     }
 
     #[test]

@@ -2107,6 +2107,77 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `git.numstat`: per-file additions/deletions for a workspace's tracked
+    /// changes (mirrors `git diff --numstat`). When `base_ref`/`base_sha` are
+    /// set, resolves the branch boundary (merge-base of `target_ref` and
+    /// `base_ref`, else `base_sha` when it is an ancestor of `target_ref`) and
+    /// returns `<boundary>..<target_ref>`; else `staged=true` selects HEAD→index
+    /// (`--cached`), `staged=false` selects index→workdir tracked-only, and the
+    /// unset/`None` default is HEAD→workdir tracked-only. `target_ref` defaults
+    /// to `HEAD`. `paths` filters to the given repo-relative paths. Result is
+    /// `[{ filePath, additions, deletions }]`; remote/non-repo workspaces and
+    /// an unresolved boundary return an empty array (wire §7.7).
+    fn git_numstat(
+        &self,
+        workspace_id: WorkspaceId,
+        staged: Option<bool>,
+        base_ref: Option<String>,
+        base_sha: Option<String>,
+        target_ref: Option<String>,
+        paths: Option<Vec<String>>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, staged, base_ref, base_sha, target_ref, paths);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_numstat not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.branchDiff`: committed diff of `target_ref` vs the branch boundary
+    /// (merge-base of `target_ref` and `base_ref`, else `base_sha` when it is
+    /// an ancestor of `target_ref`). Returns
+    /// `[{ file, chunks: [], oldContent, newContent }]` — each entry carries the
+    /// full file contents at the boundary and target so the FE branch-base
+    /// viewer can render the diff without a follow-up read. `target_ref`
+    /// defaults to `HEAD`. `paths` narrows the result. Remote/non-repo
+    /// workspaces and an unresolved boundary return an empty array (wire §7.7);
+    /// omitting both `base_ref` and `base_sha` is `-32602`.
+    fn git_branch_diff(
+        &self,
+        workspace_id: WorkspaceId,
+        base_ref: Option<String>,
+        base_sha: Option<String>,
+        target_ref: Option<String>,
+        paths: Option<Vec<String>>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, base_ref, base_sha, target_ref, paths);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_branch_diff not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.getRemoteUrl`: the configured URL of the named remote for the git
+    /// repository at `repo_path` (default `remote_name` = `"origin"`). Result
+    /// is `{ url: string | null }` — a missing remote folds to `null` rather
+    /// than an error (FE `git-tracking:get-remote-url` parity). Path-based
+    /// like the branch reads (§5.6): a nonexistent or non-git `repo_path` is
+    /// `-32602`.
+    fn git_get_remote_url(
+        &self,
+        repo_path: String,
+        remote_name: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (repo_path, remote_name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_get_remote_url not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `git.stageHunk`: apply `hunk_patch` (a unified-diff patch for one or
     /// more hunks) to the index only for `file_path`, mirroring
     /// `gitService.stageHunk` (`git apply --cached [--3way]`). Failures surface
