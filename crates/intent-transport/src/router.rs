@@ -196,13 +196,13 @@ async fn dispatch(
         }
         "workspace.archive" => {
             let id = require_workspace_id(params)?;
-            api.archive_workspace(id).await.map_err(workspace_err)?;
-            Ok(json!({ "success": true }))
+            let ws = api.archive_workspace(id).await.map_err(workspace_err)?;
+            Ok(json!({ "workspace": ws }))
         }
         "workspace.unarchive" => {
             let id = require_workspace_id(params)?;
-            api.unarchive_workspace(id).await.map_err(workspace_err)?;
-            Ok(json!({ "success": true }))
+            let ws = api.unarchive_workspace(id).await.map_err(workspace_err)?;
+            Ok(json!({ "workspace": ws }))
         }
         "workspace.dismissAttention" => {
             let id = require_workspace_id(params)?;

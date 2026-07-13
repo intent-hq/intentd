@@ -46,6 +46,7 @@ fn seed_workspace(id: &WorkspaceId) -> Workspace {
         pr_url: None,
         pr_status: None,
         active_pull_request: None,
+        pull_requests: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -229,7 +230,11 @@ async fn uds_slice_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(resp["result"]["success"], json!(true));
+    // §5.1: archive/unarchive return the updated `workspace` record (no
+    // `{success:true}`) so callers do not need a follow-up `workspace.get`.
+    assert_eq!(resp["result"]["workspace"]["id"], json!(new_id.as_str()));
+    assert_eq!(resp["result"]["workspace"]["archived"], json!(true));
+    assert_eq!(resp["result"]["workspace"]["status"], json!("Archived"));
 
     let resp = send(
         &config.socket_path,
@@ -238,7 +243,9 @@ async fn uds_slice_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(resp["result"]["success"], json!(true));
+    assert_eq!(resp["result"]["workspace"]["id"], json!(new_id.as_str()));
+    assert_eq!(resp["result"]["workspace"]["archived"], json!(false));
+    assert_eq!(resp["result"]["workspace"]["status"], json!("Active"));
 
     let resp = send(
         &config.socket_path,

@@ -47,6 +47,7 @@ fn sample_ws() -> Workspace {
         pr_url: None,
         pr_status: None,
         active_pull_request: None,
+        pull_requests: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -1944,18 +1945,57 @@ async fn workspace_update_returns_workspace_object() {
 }
 
 #[tokio::test]
-async fn workspace_lifecycle_methods_return_success_true() {
-    for method in [
-        "workspace.delete",
-        "workspace.archive",
-        "workspace.unarchive",
-    ] {
-        let msg = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"workspaceId":"ws-1"}}}}"#
-        );
-        let v = call(&msg).await.unwrap();
-        assert_eq!(v["result"]["success"], serde_json::json!(true), "{method}");
-    }
+async fn workspace_delete_returns_success_true() {
+    let msg =
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.delete","params":{"workspaceId":"ws-1"}}"#;
+    let v = call(msg).await.unwrap();
+    assert_eq!(v["result"]["success"], serde_json::json!(true));
+}
+
+/// `workspace.archive` and `workspace.unarchive` return the updated
+/// `workspace` record (§5.1) — a `{success:true}` shape would force a
+/// follow-up `workspace.get` on the FE. The `archived` flag flips through
+/// the wire result on each call.
+#[tokio::test]
+async fn workspace_archive_and_unarchive_return_workspace() {
+    let archived = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.archive","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        archived["result"]["workspace"]["id"],
+        serde_json::json!("ws-1")
+    );
+    assert_eq!(
+        archived["result"]["workspace"]["archived"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        archived["result"]["workspace"]["status"],
+        serde_json::json!("Archived")
+    );
+    // The `success` shape must not leak.
+    assert!(archived["result"].get("success").is_none());
+
+    let unarchived = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace.unarchive","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        unarchived["result"]["workspace"]["id"],
+        serde_json::json!("ws-1")
+    );
+    assert_eq!(
+        unarchived["result"]["workspace"]["archived"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        unarchived["result"]["workspace"]["status"],
+        serde_json::json!("Active")
+    );
+    assert!(unarchived["result"].get("success").is_none());
 }
 
 #[tokio::test]
