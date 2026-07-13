@@ -3526,7 +3526,9 @@ impl Services {
                                 }
                             } else {
                                 control.stop_ws_listener().await;
-                                tracing::info!("server.wsApi.enabled → false: stopped WSS listener");
+                                tracing::info!(
+                                    "server.wsApi.enabled → false: stopped WSS listener"
+                                );
                             }
                         }
                     }
