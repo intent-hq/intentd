@@ -1,0 +1,23 @@
+fixup(git): close discard traversal bypass + add WSS e2e
+
+Addresses two remaining Copilot review threads on PR #115:
+
+1. `is_safe_rel` traversal bypass: a pathspec like `a/../tracked.txt`
+   passed the lexical containment check (because the target resolves to
+   a path inside the worktree), but the classification step matches the
+   index against the un-normalized string — so it missed the exact-file
+   probe, fell through to the untracked-deletion branch, and the OS
+   resolved `..` at unlink time and would have removed the tracked file.
+   Refuse ANY `..` component up-front (component-scan on the input) so
+   the bypass cannot reach classification. New unit test
+   `discard_refuses_traversal_bypass_into_worktree` seeds `tracked.txt`,
+   attempts `discard(["a/../tracked.txt"])`, and asserts the request is
+   refused as `-32602` AND the tracked file is still intact.
+
+2. WSS end-to-end coverage: per `packages/intentd/AGENTS.md`, every new
+   `git.*` router method needs a WSS e2e driving the real `/ws`
+   transport. Add `crates/intentd/tests/e2e_wss_git_discard.rs` with two
+   scenarios — happy path (restore-tracked + delete-untracked in one
+   call, asserting the `{ ok, paths }` envelope shape from PROTOCOL.md
+   §5) and refusal path (`a/../tracked.txt` ⇒ `-32602` envelope shape
+   from §9, tracked file untouched).

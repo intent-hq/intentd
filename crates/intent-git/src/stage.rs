@@ -158,10 +158,13 @@ pub fn discard(worktree_path: &Path, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// True when `rel` is a non-empty, non-`.` relative path whose lexical
-/// resolution against `workdir` stays strictly under `workdir`. Used by
-/// `discard` to reject absolute paths outside the repo, `..` traversal, and
-/// the worktree-root pathspec before touching either the index or the
+/// True when `rel` is a non-empty, non-`.` relative path with no `..`
+/// components whose lexical resolution against `workdir` stays strictly
+/// under `workdir`. Used by `discard` to reject absolute paths outside the
+/// repo, any `..` traversal (including bypasses like `a/../tracked.txt`
+/// whose lexical target is inside the worktree but which the OS would
+/// resolve at deletion time to unlink a tracked file), and the
+/// worktree-root pathspec before touching either the index or the
 /// filesystem.
 fn is_safe_rel(workdir: &Path, rel: &str) -> bool {
     if rel.is_empty() || rel == "." {
@@ -170,6 +173,17 @@ fn is_safe_rel(workdir: &Path, rel: &str) -> bool {
     let candidate = Path::new(rel);
     if candidate.is_absolute() {
         return false;
+    }
+    // Reject ANY `..` component outright — even if it lexically normalizes
+    // to a path inside `workdir`, the classification step matches the index
+    // against the un-normalized string (so `a/../tracked.txt` misses the
+    // exact-file probe and falls through to untracked deletion, where the
+    // OS resolves `..` and unlinks the tracked file). Refusing `..` up-front
+    // closes that bypass.
+    for comp in candidate.components() {
+        if matches!(comp, std::path::Component::ParentDir) {
+            return false;
+        }
     }
     let full = workdir.join(candidate);
     let normalized = lexical_normalize(&full);
@@ -411,6 +425,24 @@ mod tests {
         commit_file(dir.path(), "seed.txt", "seed\n");
         let err = discard(dir.path(), &["/tmp/nope-outside-worktree".to_string()]).unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    #[test]
+    fn discard_refuses_traversal_bypass_into_worktree() {
+        // Regression: a relative pathspec like `a/../tracked.txt` lexically
+        // normalizes to a target inside the worktree, so a naive containment
+        // check would let it through — but the untracked-branch deletion
+        // uses `workdir.join(rel)` which the OS resolves at unlink time and
+        // would unlink the tracked file. Refuse any `..` component up-front.
+        let dir = init_repo("discard-traversal-bypass");
+        commit_file(dir.path(), "tracked.txt", "tracked\n");
+        let err = discard(dir.path(), &["a/../tracked.txt".to_string()]).unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+        // The tracked file must still be intact.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+            "tracked\n"
+        );
     }
 
     #[test]
