@@ -642,8 +642,14 @@ impl intent_core::ServerControl for DaemonControl {
             // Build a fresh WsApiServer and start it
             let server = if let Some(ref tls) = runtime.tls_cert {
                 // Secure mode
-                let token_store = runtime.token_store.as_ref()
-                    .ok_or_else(|| intent_core::Error::Internal("token_store missing in secure mode".to_string()))?
+                let token_store = runtime
+                    .token_store
+                    .as_ref()
+                    .ok_or_else(|| {
+                        intent_core::Error::Internal(
+                            "token_store missing in secure mode".to_string(),
+                        )
+                    })?
                     .clone();
                 WsApiServer::new_with_reverse(
                     runtime.api.clone(),
