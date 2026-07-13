@@ -575,6 +575,7 @@ async fn dispatch(
             let comment = require_str_param(params, "comment")?;
             let kind = opt_str(params, "type");
             let author = opt_str(params, "author");
+            let idempotency_key = opt_str(params, "idempotencyKey");
             let result = api
                 .comment_add(
                     ws,
@@ -584,6 +585,7 @@ async fn dispatch(
                     comment,
                     kind,
                     author,
+                    idempotency_key,
                 )
                 .await
                 .map_err(domain_to_rpc)?;
@@ -709,34 +711,6 @@ async fn dispatch(
                 page_token: opt_str(params, "nextToken"),
             };
             api.event_query(ws, query).await.map_err(domain_to_rpc)
-        }
-        "event.subscribe" => {
-            let ws = require_ws_note(params)?;
-            require_present(params, "eventTypes")?;
-            let event_types = match params.get("eventTypes") {
-                Some(Value::Array(items)) => items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>(),
-                _ => return Err(rpc(INVALID_PARAMS, "eventTypes must be an array")),
-            };
-            let exclude_self = params.get("excludeSelf").and_then(Value::as_bool);
-            let batch_window = opt_int(params, "batchWindow");
-            let result = api
-                .event_subscribe(ws, event_types, exclude_self, batch_window)
-                .await
-                .map_err(domain_to_rpc)?;
-            to_result_value(&result)
-        }
-        "event.unsubscribe" => {
-            let ws = require_ws_note(params)?;
-            let subscription_id = require_str_param(params, "subscriptionId")?;
-            let result = api
-                .event_unsubscribe(ws, subscription_id)
-                .await
-                .map_err(domain_to_rpc)?;
-            to_result_value(&result)
         }
         "agent.list" => {
             let ws = require_ws_note(params)?;

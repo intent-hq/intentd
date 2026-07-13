@@ -1462,6 +1462,10 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `comment.add`: text-anchored comment via searchContext + commentTarget (§5.3).
+    ///
+    /// `idempotency_key` is the optional `params.idempotencyKey` (design note TB-0
+    /// §5): when present and previously recorded, the original result is returned
+    /// without re-executing; soft-launch when absent (warn + execute).
     #[allow(clippy::too_many_arguments)]
     fn comment_add(
         &self,
@@ -1472,6 +1476,7 @@ pub trait WorkspaceApi: Send + Sync {
         comment: String,
         kind: Option<String>,
         author: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<CommentAddResult>> {
         let _ = (
             workspace_id,
@@ -1481,6 +1486,7 @@ pub trait WorkspaceApi: Send + Sync {
             comment,
             kind,
             author,
+            idempotency_key,
         );
         Box::pin(async {
             Err(Error::Internal(

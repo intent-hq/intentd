@@ -4,14 +4,13 @@ use intent_core::{
     AgentId, AuthorType, BoxFuture, Comment, CommentAddResult, CommentAnchor, CommentAnchorType,
     CommentLocation, CommentResolveThreadResult, CommentRespondResult, CommentRespondThread,
     CommentStatus, CommentType, CommentWire, ContentType, Error, Event, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
-    GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitStatus,
-    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility,
-    ReadAssetResult, Result, ScriptCreateParams, ScriptMode, TaskUpdateResult, Workspace,
-    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary,
-    WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    FileActivity, FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
+    GitFileStatus, GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    NoteId, NoteMetadata, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, Result, ScriptCreateParams,
+    ScriptMode, TaskUpdateResult, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
+    WorkspaceCreate, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use serde_json::Value;
 
@@ -444,12 +443,15 @@ impl WorkspaceApi for FakeApi {
         _comment: String,
         _kind: Option<String>,
         _author: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<CommentAddResult>> {
         Box::pin(async move {
             Ok(CommentAddResult {
                 success: true,
                 message: format!("Comment successfully anchored to \"{comment_target}\""),
-                comment_id: "c1".to_string(),
+                // Echo the key so router tests can pin that the arm forwards
+                // `params.idempotencyKey` instead of silently dropping it.
+                comment_id: idempotency_key.unwrap_or_else(|| "c1".to_string()),
                 anchored: true,
                 location: CommentLocation {
                     line: 1,
@@ -617,34 +619,6 @@ impl WorkspaceApi for FakeApi {
                 data: serde_json::json!({}),
             };
             Ok(serde_json::to_value(vec![event]).unwrap())
-        })
-    }
-
-    fn event_subscribe(
-        &self,
-        _workspace_id: WorkspaceId,
-        event_types: Vec<String>,
-        _exclude_self: Option<bool>,
-        _batch_window: Option<i64>,
-    ) -> BoxFuture<'_, Result<EventSubscribeResult>> {
-        Box::pin(async move {
-            Ok(EventSubscribeResult {
-                subscription_id: "sub-fake".to_string(),
-                event_types,
-            })
-        })
-    }
-
-    fn event_unsubscribe(
-        &self,
-        _workspace_id: WorkspaceId,
-        subscription_id: String,
-    ) -> BoxFuture<'_, Result<EventUnsubscribeResult>> {
-        Box::pin(async move {
-            Ok(EventUnsubscribeResult {
-                ok: true,
-                subscription_id,
-            })
         })
     }
 
@@ -2080,6 +2054,19 @@ async fn comment_add_returns_location_shape() {
     );
 }
 
+/// Audit A F5: the `comment.add` arm forwards `params.idempotencyKey` to the
+/// service (the fake echoes it back as the comment id) instead of silently
+/// dropping it like it used to.
+#[tokio::test]
+async fn comment_add_forwards_idempotency_key() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"comment.add","params":{"workspaceId":"ws-1","noteId":"n1","searchContext":"a test sentence","commentTarget":"test","comment":"nice","idempotencyKey":"idem-42"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["commentId"], serde_json::json!("idem-42"));
+}
+
 #[tokio::test]
 async fn comment_add_missing_target_is_minus_32602() {
     let v = call(
@@ -2266,62 +2253,20 @@ async fn event_directory_changes_requires_dir() {
     );
 }
 
+/// Audit A F3: the singular `event.subscribe` / `event.unsubscribe` router
+/// arms are gone — the only subscription surface is the connection-level
+/// `events.subscribe` / `events.unsubscribe` fast-path (PROTOCOL §6), so the
+/// dispatcher answers `-32601` for the singular spellings.
 #[tokio::test]
-async fn event_subscribe_validates_event_types() {
-    // Missing eventTypes → -32602.
-    let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"event.subscribe","params":{"workspaceId":"ws-1"}}"#,
-    )
-    .await
-    .unwrap();
-    assert_eq!(err_code(&v), -32602);
-    assert_eq!(
-        v["error"]["message"],
-        serde_json::json!("Missing required parameter: eventTypes")
-    );
-
-    // Present but not an array → -32602 with the array message.
-    let v = call(
-        r#"{"jsonrpc":"2.0","id":2,"method":"event.subscribe","params":{"workspaceId":"ws-1","eventTypes":"agent:*"}}"#,
-    )
-    .await
-    .unwrap();
-    assert_eq!(err_code(&v), -32602);
-    assert_eq!(
-        v["error"]["message"],
-        serde_json::json!("eventTypes must be an array")
-    );
-
-    // A valid array routes through and echoes the resolved types.
-    let v = call(
-        r#"{"jsonrpc":"2.0","id":3,"method":"event.subscribe","params":{"workspaceId":"ws-1","eventTypes":["agent:*"]}}"#,
-    )
-    .await
-    .unwrap();
-    assert_eq!(v["result"]["subscriptionId"], serde_json::json!("sub-fake"));
-    assert_eq!(v["result"]["eventTypes"], serde_json::json!(["agent:*"]));
-}
-
-#[tokio::test]
-async fn event_unsubscribe_requires_subscription_id() {
-    let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"event.unsubscribe","params":{"workspaceId":"ws-1"}}"#,
-    )
-    .await
-    .unwrap();
-    assert_eq!(err_code(&v), -32602);
-    assert_eq!(
-        v["error"]["message"],
-        serde_json::json!("Missing required parameter: subscriptionId")
-    );
-
-    let v = call(
+async fn singular_event_subscribe_aliases_are_not_routable() {
+    for frame in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"event.subscribe","params":{"workspaceId":"ws-1","eventTypes":["agent:*"]}}"#,
         r#"{"jsonrpc":"2.0","id":2,"method":"event.unsubscribe","params":{"workspaceId":"ws-1","subscriptionId":"s1"}}"#,
-    )
-    .await
-    .unwrap();
-    assert_eq!(v["result"]["ok"], serde_json::json!(true));
-    assert_eq!(v["result"]["subscriptionId"], serde_json::json!("s1"));
+    ] {
+        let v = call(frame).await.unwrap();
+        assert_eq!(err_code(&v), -32601);
+        assert_eq!(v["error"]["message"], serde_json::json!("Method not found"));
+    }
 }
 
 #[tokio::test]
