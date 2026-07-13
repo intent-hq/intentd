@@ -1268,6 +1268,7 @@ async fn cmd_doctor() -> ExitCode {
     report_github_token();
     report_context_engine().await;
     report_host_capabilities();
+    report_cow_support(&config);
 
     if ok {
         ExitCode::SUCCESS
@@ -1371,6 +1372,47 @@ fn report_host_capabilities() {
         std::env::consts::ARCH,
         detect_has_display(),
     );
+}
+
+/// CoW isolation support: probe the workspaces root for copy-on-write capability.
+/// Non-fatal — CoW isolation degrades gracefully when unsupported (shared mode).
+fn report_cow_support(config: &Config) {
+    let workspaces_root = config.data_dir.join("workspaces");
+    // Create workspaces dir if it doesn't exist (probe needs it)
+    if !workspaces_root.exists() {
+        if let Err(e) = std::fs::create_dir_all(&workspaces_root) {
+            println!("[--] CoW isolation: probe failed (cannot create workspaces dir: {e})");
+            return;
+        }
+    }
+
+    match intent_git::cow_probe(&workspaces_root, &workspaces_root) {
+        Ok(intent_git::CowSupport::Supported) => {
+            #[cfg(target_os = "macos")]
+            println!("[ok] CoW isolation: supported (apfs)");
+            #[cfg(target_os = "linux")]
+            println!("[ok] CoW isolation: supported (btrfs/xfs/bcachefs/zfs)");
+            #[cfg(target_os = "windows")]
+            println!("[ok] CoW isolation: supported (refs)");
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            println!("[ok] CoW isolation: supported");
+        }
+        Ok(intent_git::CowSupport::Unsupported) => {
+            #[cfg(target_os = "macos")]
+            println!("[--] CoW isolation: unsupported (not apfs or different volumes)");
+            #[cfg(target_os = "linux")]
+            println!(
+                "[--] CoW isolation: unsupported (not btrfs/xfs/bcachefs/zfs or different volumes)"
+            );
+            #[cfg(target_os = "windows")]
+            println!("[--] CoW isolation: unsupported (not ReFS or different volumes)");
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            println!("[--] CoW isolation: unsupported (platform not supported)");
+        }
+        Err(e) => {
+            println!("[--] CoW isolation: probe failed ({e})");
+        }
+    }
 }
 
 /// Doctor provider-discovery section (§6.9): print which configured ACP
