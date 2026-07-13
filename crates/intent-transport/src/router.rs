@@ -270,8 +270,11 @@ async fn dispatch(
                 tags: opt_tags(params, "tags"),
                 parent_id: opt_str(params, "parentId"),
             };
+            // Transport (UDS + WSS) is the user-originated JSON-RPC path; no
+            // caller-agent context is threaded here, so note-version author
+            // resolves to the user. Agent writes come through MCP bindings.
             let note = api
-                .create_note(ws, input, idempotency_key)
+                .create_note(ws, input, idempotency_key, None)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(json!({ "note": note }))
@@ -301,7 +304,7 @@ async fn dispatch(
                 position: opt_str(params, "position"),
             };
             let result = api
-                .add_to_note(ws, note_id, input)
+                .add_to_note(ws, note_id, input, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -313,7 +316,7 @@ async fn dispatch(
             let new = require_str_param(params, "new")?;
             let input = NoteEditInput { old, new };
             let result = api
-                .edit_note(ws, note_id, input)
+                .edit_note(ws, note_id, input, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -334,7 +337,7 @@ async fn dispatch(
                 content,
             };
             let result = api
-                .edit_note_lines(ws, note_id, input)
+                .edit_note_lines(ws, note_id, input, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -346,7 +349,7 @@ async fn dispatch(
             let confirm = parse_confirm(params);
             let expected_version = opt_int(params, "expectedVersion");
             let result = api
-                .set_note_content(ws, note_id, content, confirm, expected_version)
+                .set_note_content(ws, note_id, content, confirm, expected_version, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -358,7 +361,7 @@ async fn dispatch(
             let tags = opt_tags(params, "tags");
             let expected_version = opt_int(params, "expectedVersion");
             let result = api
-                .update_note_metadata(ws, note_id, title, tags, expected_version)
+                .update_note_metadata(ws, note_id, title, tags, expected_version, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -425,7 +428,7 @@ async fn dispatch(
             let note_id = require_note_id(params)?;
             let v = require_int_param(params, "v")?;
             let result = api
-                .restore_note_version(ws, note_id, v)
+                .restore_note_version(ws, note_id, v, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -515,7 +518,7 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
             let result = api
-                .convert_task_blocks(ws, note_id)
+                .convert_task_blocks(ws, note_id, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)

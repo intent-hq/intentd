@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use intent_core::{NoteId, WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, NoteId, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
 use super::{map_err, opt_str, opt_vec_str, req_i64, req_str};
@@ -54,6 +54,7 @@ pub(crate) const PRELUDE: &str = r#"
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
@@ -63,7 +64,7 @@ pub(crate) async fn dispatch(
         "update" => update(api, ws, args).await,
         "getMyTask" => get_my_task(api, ws, args).await,
         "markAsTask" => mark_as_task(api, ws, args).await,
-        "convertBlocks" => convert_blocks(api, ws, args).await,
+        "convertBlocks" => convert_blocks(api, ws, caller_agent_id, args).await,
         "createPrerequisite" => create_prerequisite(api, ws, args).await,
         "assignAgent" => assign_agent(api, ws, args).await,
         other => Err(format!("host: unknown method `task.{other}`")),
@@ -198,11 +199,16 @@ async fn mark_as_task(
 async fn convert_blocks(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let note_id = req_str(args, "noteId")?;
     let r = api
-        .convert_task_blocks(ws.clone(), NoteId::from_string(&note_id))
+        .convert_task_blocks(
+            ws.clone(),
+            NoteId::from_string(&note_id),
+            caller_agent_id.cloned(),
+        )
         .await
         .map_err(map_err)?;
     serde_json::to_value(r).map_err(|e| e.to_string())

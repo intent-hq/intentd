@@ -100,6 +100,18 @@ impl Store {
         }
     }
 
+    /// Lightweight name-only lookup used by hot paths that just need the
+    /// session's display name (e.g. note-version author stamping). Skips the
+    /// full message-log fetch that `get_agent_session` performs.
+    pub async fn get_agent_session_name(&self, id: &AgentId) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT name FROM agent_session WHERE id = ?")
+            .bind(&id.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent session name failed: {e}")))?;
+        Ok(row.map(|r| r.get::<String, _>("name")))
+    }
+
     /// List a workspace's sessions (each with its message log), oldest first.
     pub async fn list_agent_sessions(
         &self,

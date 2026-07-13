@@ -527,6 +527,7 @@ mod mcp_tests {
             workspace_id: WorkspaceId,
             input: NoteCreate,
             idempotency_key: Option<String>,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<Note>> {
             self.created
                 .lock()
@@ -588,6 +589,7 @@ mod mcp_tests {
             _workspace_id: WorkspaceId,
             note_id: NoteId,
             input: NoteAddInput,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<NoteAddResult>> {
             self.added
                 .lock()
@@ -3210,6 +3212,7 @@ mod wsapi3_bindings_tests {
             workspace_id: WorkspaceId,
             input: NoteCreate,
             _idempotency_key: Option<String>,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<Note>> {
             self.create_note_calls.lock().unwrap().push((
                 input.title.clone(),
@@ -3280,6 +3283,7 @@ mod wsapi3_bindings_tests {
             content: String,
             confirm_replacement: bool,
             _expected_version: Option<i64>,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
             self.set_content_calls.lock().unwrap().push((
                 note_id.as_str().to_string(),
@@ -3306,6 +3310,7 @@ mod wsapi3_bindings_tests {
             _ws: WorkspaceId,
             note_id: NoteId,
             input: NoteAddInput,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<NoteAddResult>> {
             self.add_calls.lock().unwrap().push((
                 note_id.as_str().to_string(),
@@ -3334,6 +3339,7 @@ mod wsapi3_bindings_tests {
             _ws: WorkspaceId,
             note_id: NoteId,
             input: NoteEditInput,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<NoteEditResult>> {
             self.edit_calls.lock().unwrap().push((
                 note_id.as_str().to_string(),
@@ -3360,6 +3366,7 @@ mod wsapi3_bindings_tests {
             _ws: WorkspaceId,
             note_id: NoteId,
             input: NoteEditLinesInput,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<NoteEditLinesResult>> {
             self.edit_lines_calls.lock().unwrap().push((
                 note_id.as_str().to_string(),
@@ -3390,6 +3397,7 @@ mod wsapi3_bindings_tests {
             title: Option<String>,
             tags: Option<Vec<String>>,
             _expected_version: Option<i64>,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<NoteUpdateMetadataResult>> {
             self.update_metadata_calls.lock().unwrap().push((
                 note_id.as_str().to_string(),
@@ -3560,6 +3568,7 @@ mod wsapi3_bindings_tests {
             &self,
             _ws: WorkspaceId,
             note_id: NoteId,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<TaskConvertBlocksResult>> {
             self.convert_blocks_calls
                 .lock()

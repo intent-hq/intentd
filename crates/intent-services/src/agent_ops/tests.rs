@@ -1072,6 +1072,7 @@ async fn report_to_parent_transitions_linked_task_to_review_required() {
                 parent_id: None,
             },
             None,
+            None,
         )
         .await
         .expect("create note");
@@ -1133,6 +1134,7 @@ async fn report_to_parent_does_not_overwrite_terminal_task_status() {
                 parent_id: None,
             },
             None,
+            None,
         )
         .await
         .expect("create note");
@@ -1192,6 +1194,7 @@ async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
                 tags: None,
                 parent_id: None,
             },
+            None,
             None,
         )
         .await
@@ -1331,6 +1334,7 @@ async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
                 parent_id: None,
             },
             None,
+            None,
         )
         .await
         .expect("create foreign note");
@@ -1390,6 +1394,7 @@ async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
                 tags: None,
                 parent_id: None,
             },
+            None,
             None,
         )
         .await
@@ -3513,6 +3518,7 @@ async fn delegate_falls_back_to_task_note_content_for_child_first_message() {
                 parent_id: None,
             },
             None,
+            None,
         )
         .await
         .expect("create note");
@@ -3552,6 +3558,7 @@ async fn delegate_appends_task_note_preamble_to_first_message() {
                 tags: None,
                 parent_id: None,
             },
+            None,
             None,
         )
         .await
@@ -3626,6 +3633,7 @@ async fn delegate_appends_skip_auto_commit_instruction_when_true() {
                 parent_id: None,
             },
             None,
+            None,
         )
         .await
         .expect("create note");
@@ -3676,6 +3684,7 @@ async fn delegate_omits_skip_auto_commit_instruction_when_false() {
                 parent_id: None,
             },
             None,
+            None,
         )
         .await
         .expect("create note");
@@ -3718,6 +3727,7 @@ async fn delegate_task_note_only_injects_preamble_below_note_body() {
                 tags: None,
                 parent_id: None,
             },
+            None,
             None,
         )
         .await
@@ -3813,6 +3823,7 @@ async fn delegate_names_child_from_task_note_title() {
                 parent_id: None,
             },
             None,
+            None,
         )
         .await
         .expect("create note");
@@ -3849,6 +3860,7 @@ async fn delegate_names_child_from_task_text() {
                 tags: None,
                 parent_id: None,
             },
+            None,
             None,
         )
         .await
@@ -5044,6 +5056,7 @@ async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
                 tags: None,
                 parent_id: None,
             },
+            None,
             None,
         )
         .await

@@ -213,7 +213,9 @@ async fn line_attribution_compute_now_persists_and_emits_event() {
         let entry = attributions.get(key).expect("line entry");
         assert!(entry["timestamp"].is_number(), "line {key}: {entry}");
         let author = &entry["author"];
-        assert_eq!(author["type"], "system");
+        // `note.create` over the JSON-RPC (FE) path resolves to the `user`
+        // author (reference parity with `notes.service.ts`).
+        assert_eq!(author["type"], "user");
         assert!(author["id"].is_string());
     }
 

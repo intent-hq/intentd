@@ -219,6 +219,7 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
                     parent_id: None,
                 },
                 None,
+                None,
             )
             .await
             .expect("create note");

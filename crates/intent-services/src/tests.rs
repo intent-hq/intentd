@@ -407,6 +407,7 @@ async fn add_persists_and_reports_position() {
                 heading: None,
                 position: Some("end".into()),
             },
+            None,
         )
         .await
         .expect("add");
@@ -427,6 +428,7 @@ async fn edit_no_match_maps_to_internal() {
                 old: "zzz".into(),
                 new: "x".into(),
             },
+            None,
         )
         .await
         .unwrap_err();
@@ -445,6 +447,7 @@ async fn edit_lines_deletes_range() {
                 end: 2,
                 content: String::new(),
             },
+            None,
         )
         .await
         .expect("editLines");
@@ -456,11 +459,11 @@ async fn edit_lines_deletes_range() {
 async fn set_content_reduction_guard_requires_confirmation() {
     let (_tmp, svc, ws, id) = setup("0123456789ABCDEFGHIJ").await;
     let denied = svc
-        .set_note_content(ws.clone(), id.clone(), "x".into(), false, None)
+        .set_note_content(ws.clone(), id.clone(), "x".into(), false, None, None)
         .await;
     assert!(matches!(denied, Err(Error::Internal(_))));
     let ok = svc
-        .set_note_content(ws, id, "x".into(), true, None)
+        .set_note_content(ws, id, "x".into(), true, None, None)
         .await
         .expect("confirmed");
     assert_eq!(ok.new_content, "x");
@@ -478,7 +481,14 @@ async fn set_content_merges_concurrent_writes() {
 
     // Author A appends a line at the end.
     let a = svc
-        .set_note_content(ws.clone(), id.clone(), "BODY\nA-line".into(), true, None)
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "BODY\nA-line".into(),
+            true,
+            None,
+            None,
+        )
         .await
         .expect("A write");
     assert_eq!(a.new_content, "BODY\nA-line");
@@ -491,6 +501,7 @@ async fn set_content_merges_concurrent_writes() {
             id.clone(),
             "B-line\nBODY\nA-line".into(),
             true,
+            None,
             None,
         )
         .await
@@ -506,6 +517,7 @@ async fn set_content_merges_concurrent_writes() {
             old: "A-line".into(),
             new: "A-line (edited)".into(),
         },
+        None,
     )
     .await
     .expect("edit");
@@ -515,6 +527,7 @@ async fn set_content_merges_concurrent_writes() {
             id,
             "B-line\nBODY\nA-line (edited)\nC-line".into(),
             true,
+            None,
             None,
         )
         .await
@@ -617,7 +630,14 @@ async fn update_metadata_skips_spec_title_but_applies_tags() {
 
     // Title-only on spec → skipped, title unchanged.
     let skipped = svc
-        .update_note_metadata(ws.clone(), spec.clone(), Some("New".into()), None, None)
+        .update_note_metadata(
+            ws.clone(),
+            spec.clone(),
+            Some("New".into()),
+            None,
+            None,
+            None,
+        )
         .await
         .expect("meta");
     assert_eq!(skipped.skipped, Some(true));
@@ -633,6 +653,7 @@ async fn update_metadata_skips_spec_title_but_applies_tags() {
             spec.clone(),
             Some("New".into()),
             Some(vec!["a".into()]),
+            None,
             None,
         )
         .await
@@ -815,6 +836,7 @@ async fn update_metadata_expected_version_gate_hit_and_miss() {
             Some("Renamed".into()),
             None,
             Some(0),
+            None,
         )
         .await
         .expect("expectedVersion hit writes");
@@ -823,7 +845,14 @@ async fn update_metadata_expected_version_gate_hit_and_miss() {
     // MISS: a stale expectedVersion (0) now conflicts, carrying the current
     // entity (rev 1, title "Renamed") and leaving the note unchanged.
     let miss = svc
-        .update_note_metadata(ws.clone(), id.clone(), Some("Nope".into()), None, Some(0))
+        .update_note_metadata(
+            ws.clone(),
+            id.clone(),
+            Some("Nope".into()),
+            None,
+            Some(0),
+            None,
+        )
         .await;
     match miss {
         Err(Error::Conflict { current }) => {
@@ -1225,7 +1254,7 @@ async fn convert_blocks_creates_children_idempotently() {
     let content = "intro\n@@@task\n# Build API\nBuild the thing.\n@@@\ntail";
     let (_tmp, svc, ws, id) = setup(content).await;
     let r = svc
-        .convert_task_blocks(ws.clone(), id.clone())
+        .convert_task_blocks(ws.clone(), id.clone(), None)
         .await
         .expect("convertBlocks");
     assert_eq!(r.converted_count, 1);
@@ -1254,7 +1283,7 @@ async fn convert_blocks_creates_children_idempotently() {
 
     // Re-running is idempotent: the existing child is reused, none created.
     let r2 = svc
-        .convert_task_blocks(ws.clone(), id.clone())
+        .convert_task_blocks(ws.clone(), id.clone(), None)
         .await
         .expect("convertBlocks2");
     assert_eq!(r2.converted_count, 0);
@@ -1267,6 +1296,131 @@ async fn convert_blocks_creates_children_idempotently() {
         .await
         .expect("versions");
     assert_eq!(versions.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Version-author attribution: `capture_note_version` stamps a `NoteVersionAuthor`
+// resolved from the caller. Reference parity with `notes.service.ts` L518-555:
+// `Some(agent_id)` → `{id, name: session.name, type: "agent"}` (name falls
+// back to the id string when the session lookup fails); `None` → the FE user
+// author `{id: "user", name: "User", type: "user"}`. Only genuinely internal
+// daemon writes (workspace-seed spec snapshot) keep the `system`/"intentd"
+// stamp.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn note_add_stamps_user_author_when_caller_is_none() {
+    let (_tmp, svc, ws, id) = setup("body").await;
+    svc.add_to_note(
+        ws.clone(),
+        id.clone(),
+        NoteAddInput {
+            content: "more".into(),
+            heading: None,
+            position: None,
+        },
+        None,
+    )
+    .await
+    .expect("add");
+    let versions = svc
+        .store
+        .list_note_versions(&ws, &id)
+        .await
+        .expect("versions");
+    let last = versions.last().expect("at least one version");
+    assert_eq!(last.author.id, "user");
+    assert_eq!(last.author.name, "User");
+    assert_eq!(last.author.author_type, "user");
+}
+
+#[tokio::test]
+async fn note_add_stamps_agent_author_with_session_name() {
+    use intent_core::{AgentId, AgentSession, AgentStatus};
+    let (_tmp, svc, ws, id) = setup("body").await;
+    let agent_id = AgentId::from("agent-writer");
+    let session = AgentSession {
+        id: agent_id.clone(),
+        workspace_id: ws.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Writer".to_string(),
+        name_explicitly_set: true,
+        model: None,
+        provider: None,
+        system_prompt: None,
+        specialist: None,
+        status: AgentStatus::Active,
+        is_active: true,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        is_background: false,
+        metadata: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    svc.store
+        .insert_agent_session(&session)
+        .await
+        .expect("session");
+    svc.add_to_note(
+        ws.clone(),
+        id.clone(),
+        NoteAddInput {
+            content: "more".into(),
+            heading: None,
+            position: None,
+        },
+        Some(agent_id.clone()),
+    )
+    .await
+    .expect("add");
+    let versions = svc
+        .store
+        .list_note_versions(&ws, &id)
+        .await
+        .expect("versions");
+    let last = versions.last().expect("at least one version");
+    assert_eq!(last.author.id, "agent-writer");
+    assert_eq!(last.author.name, "Writer");
+    assert_eq!(last.author.author_type, "agent");
+}
+
+#[tokio::test]
+async fn note_add_falls_back_to_agent_id_when_session_missing() {
+    use intent_core::AgentId;
+    let (_tmp, svc, ws, id) = setup("body").await;
+    let agent_id = AgentId::from("agent-ghost");
+    svc.add_to_note(
+        ws.clone(),
+        id.clone(),
+        NoteAddInput {
+            content: "more".into(),
+            heading: None,
+            position: None,
+        },
+        Some(agent_id.clone()),
+    )
+    .await
+    .expect("add");
+    let versions = svc
+        .store
+        .list_note_versions(&ws, &id)
+        .await
+        .expect("versions");
+    let last = versions.last().expect("at least one version");
+    assert_eq!(last.author.id, "agent-ghost");
+    assert_eq!(last.author.name, "agent-ghost");
+    assert_eq!(last.author.author_type, "agent");
 }
 
 // ---------------------------------------------------------------------------
@@ -1297,6 +1451,7 @@ async fn create_note_with_task_block_auto_converts() {
                 tags: None,
                 parent_id: None,
             },
+            None,
             None,
         )
         .await
@@ -1354,6 +1509,7 @@ async fn add_to_note_task_block_auto_converts() {
                 heading: None,
                 position: Some("end".into()),
             },
+            None,
         )
         .await
         .expect("add");
@@ -1378,6 +1534,7 @@ async fn edit_note_replacing_text_with_task_block_auto_converts() {
                 old: "PLACEHOLDER".into(),
                 new: "\n@@@task\n# From Edit\nbody\n@@@\n".into(),
             },
+            None,
         )
         .await
         .expect("edit");
@@ -1403,6 +1560,7 @@ async fn edit_note_lines_inserting_task_block_auto_converts() {
                 end: 2,
                 content: "@@@task\n# From EditLines\nbody\n@@@".into(),
             },
+            None,
         )
         .await
         .expect("editLines");
@@ -1428,6 +1586,7 @@ async fn set_note_content_with_task_block_auto_converts() {
             id.clone(),
             "intro\n@@@task\n# From SetContent\nbody\n@@@\ntail".into(),
             true,
+            None,
             None,
         )
         .await
@@ -1457,6 +1616,7 @@ async fn write_without_task_block_reports_zero_conversions() {
                 heading: None,
                 position: Some("end".into()),
             },
+            None,
         )
         .await
         .expect("add");
@@ -1585,6 +1745,7 @@ async fn edit_above_anchor_preserves_healthy_state() {
             old: "prefix line".into(),
             new: "PREFIX LINE".into(),
         },
+        None,
     )
     .await
     .expect("edit");
@@ -1629,6 +1790,7 @@ async fn edit_that_destroys_start_marker_recovers_via_context() {
             old: start_pat.clone(),
             new: String::new(),
         },
+        None,
     )
     .await
     .expect("edit");
@@ -1669,6 +1831,7 @@ async fn edit_that_destroys_both_markers_marks_orphaned() {
         id.clone(),
         "completely different content without markers".into(),
         true,
+        None,
         None,
     )
     .await
@@ -2475,6 +2638,7 @@ mod change_event_parity {
                     parent_id: None,
                 },
                 None,
+                None,
             )
             .await
             .expect("create");
@@ -2505,6 +2669,7 @@ mod change_event_parity {
                     parent_id: None,
                 },
                 key.clone(),
+                None,
             )
             .await
             .expect("first create");
@@ -2524,6 +2689,7 @@ mod change_event_parity {
                     parent_id: None,
                 },
                 key,
+                None,
             )
             .await
             .expect("replay create");
@@ -2547,12 +2713,12 @@ mod change_event_parity {
         };
         let a = h
             .services
-            .create_note(h.ws.clone(), mk(), None)
+            .create_note(h.ws.clone(), mk(), None, None)
             .await
             .expect("first create");
         let b = h
             .services
-            .create_note(h.ws.clone(), mk(), None)
+            .create_note(h.ws.clone(), mk(), None, None)
             .await
             .expect("second create");
         assert_ne!(
@@ -3596,6 +3762,85 @@ mod mcp_callback {
             .expect("event delivered")
             .expect("subscription open");
         assert!(batch.iter().any(|e| e.event_type == NOTE_UPDATED));
+    }
+
+    /// The MCP front door threads its bound `caller_agent_id` down into
+    /// `WorkspaceApi::add_to_note`, so the version snapshot appended by the
+    /// mutation carries the acting agent's session name (reference parity with
+    /// `notes.service.ts` L518-555 — `currentActor?.type === 'agent'` branch).
+    #[tokio::test]
+    async fn agent_note_add_through_mcp_stamps_agent_version_author() {
+        use intent_core::{now_iso, AgentId, AgentSession, AgentStatus};
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let note_id = NoteId::from("n1");
+        store
+            .insert_note(&note(&ws, "n1", "# A\nbody"))
+            .await
+            .expect("note");
+        let agent_id = AgentId::from_string("agent-mcp-writer");
+        let session = AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "McpWriter".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_agent_session(&session).await.expect("session");
+
+        let services = Services::new(store.clone());
+        let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+        let server = WorkspaceMcpServer::new(api.clone(), ws.clone())
+            .with_caller_agent_id(Some(agent_id.clone()));
+
+        let resp = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "workspace_api",
+                    "arguments": {
+                        "code": "return await ws.note.add('n1', { content: 'more' });",
+                        "summary": "agent note.add via MCP"
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call returns a response");
+        assert_eq!(resp["result"]["isError"], json!(false));
+
+        let versions = store
+            .list_note_versions(&ws, &note_id)
+            .await
+            .expect("versions");
+        let last = versions.last().expect("version appended");
+        assert_eq!(last.author.id, "agent-mcp-writer");
+        assert_eq!(last.author.name, "McpWriter");
+        assert_eq!(last.author.author_type, "agent");
     }
 }
 
@@ -9767,7 +10012,7 @@ mod line_attribution_hooks {
     async fn convert_task_blocks_schedules_recompute() {
         let content = "intro\n@@@task\n# Build API\nBuild the thing.\n@@@\ntail";
         let (_tmp, svc, ws, id) = setup(content).await;
-        svc.convert_task_blocks(ws.clone(), id.clone())
+        svc.convert_task_blocks(ws.clone(), id.clone(), None)
             .await
             .expect("convertBlocks");
         assert_debouncer_scheduled(&svc, &ws, &id);
