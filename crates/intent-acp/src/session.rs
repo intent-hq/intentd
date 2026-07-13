@@ -219,22 +219,33 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 /// ACP providers (auggie, codex, …) deliver a prose `title` (e.g.
 /// `"sub-agent-explore: Explore the AI agent system…"`) rather than the raw
 /// tool name the model invoked. Rules, in order:
-///  - A title of the form `<name>: <description>` (`<name>` a bare identifier
-///    of `[A-Za-z0-9_-]+`, followed by `": "` or `":\t"`) is split; the prefix
-///    becomes the name.
-///  - Trailing `_workspace-mcp` server suffixes (one or more) are stripped —
-///    auggie names an MCP tool `<tool>_<server>`, so our registry tool
-///    `add_to_note` surfaces as `add_to_note_workspace-mcp`; stripping
-///    recovers the registry name (§18.4).
-///  - When neither of the above yielded an identifier (the title is prose like
-///    `"Read"` or `"Edit foo.rs"`), inspect `raw_input` for unambiguous shapes:
-///    `information_request` → `codebase-retrieval` (or `conversation-retrieval`
-///    when the title mentions `conversation`); `command ∈ {str_replace, insert,
-///    create}` → `str-replace-editor`; `file_content + path +
-///    instructions_reminder` → `save-file`; `path + view_range` → `view`;
-///    `file_paths` array → `remove-files`; `input` containing `*** Begin Patch`
-///    → `apply_patch`.
-///  - Otherwise the title passes through as-is.
+///  1. A title of the form `<name>: <description>` (`<name>` a bare identifier
+///     of `[A-Za-z0-9_-]+`, followed by `": "` or `":\t"`) is split; the prefix
+///     becomes the name.
+///  2. Trailing `_workspace-mcp` server suffixes (one or more) are stripped —
+///     auggie names an MCP tool `<tool>_<server>`, so our registry tool
+///     `add_to_note` surfaces as `add_to_note_workspace-mcp`; stripping
+///     recovers the registry name (§18.4).
+///  3. When neither of the above yielded an identifier (the title is prose
+///     like `"Read"` or `"Edit foo.rs"`), inspect `raw_input` for unambiguous
+///     shapes. Evaluated in the same order as the reference
+///     (`acp-provider-streaming.ts` ~L1635–1666), first match wins:
+///       - `command ∈ {str_replace, insert, create}` → `str-replace-editor`
+///       - `file_content` + `path` + `instructions_reminder` → `save-file`
+///       - `path` + `view_range` → `view`
+///       - `information_request` → `codebase-retrieval`
+///         (or `conversation-retrieval` when the title mentions `conversation`)
+///       - `file_paths` array → `remove-files`
+///       - `input` string containing `*** Begin Patch` → `apply_patch`
+///  4. Otherwise the title passes through as-is.
+///
+/// The `conversation`-vs-`codebase` split keys off the passed-in ACP `title`.
+/// The reference keys off its local `toolName` variable, which may have been
+/// reassigned by an upstream codex-input unwrap (reference ~L1580–1606); for
+/// every path we reach today (title is prose, no prefix, no `_workspace-mcp`
+/// suffix), the two are equivalent. If a future codex-style path rewrite
+/// mutates the tool name before this call, feed the rewritten string into
+/// `title` to keep parity.
 pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
     if let Some(name) = split_name_prefix(title) {
         return strip_workspace_mcp_suffix(name);
@@ -253,8 +264,9 @@ pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
 
 /// Inspect an ACP `raw_input` object for shapes that unambiguously identify a
 /// well-known tool. Mirrors the reference in
-/// `acp-provider-streaming.ts` ~L1630. Returns `None` when no pattern matches;
-/// the caller falls back to the title.
+/// `acp-provider-streaming.ts` ~L1635–1666. Returns `None` when no pattern
+/// matches; the caller falls back to the title. Order matches the reference —
+/// first match wins.
 fn derive_tool_name_from_input(title: &str, input: &Value) -> Option<String> {
     let obj = input.as_object()?;
     // command ∈ {str_replace, insert, create} → str-replace-editor
@@ -263,16 +275,17 @@ fn derive_tool_name_from_input(title: &str, input: &Value) -> Option<String> {
             return Some("str-replace-editor".to_string());
         }
     }
-    // file_content + path + instructions_reminder → save-file
+    // file_content + path + instructions_reminder → save-file. The reference
+    // uses JS truthy on `path` (rejects null / empty); we match by requiring
+    // a non-empty string, so `{ path: null }` falls through as it does in JS.
     if obj.contains_key("file_content")
-        && obj.get("path").is_some()
+        && is_non_empty_string(obj.get("path"))
         && obj.contains_key("instructions_reminder")
     {
         return Some("save-file".to_string());
     }
-    // path + view_range → view (must precede the retrieval check; view_range is
-    // unambiguous even when the title looks like prose)
-    if obj.get("path").is_some() && obj.contains_key("view_range") {
+    // path + view_range → view. Same JS-truthy semantics on `path` as above.
+    if is_non_empty_string(obj.get("path")) && obj.contains_key("view_range") {
         return Some("view".to_string());
     }
     // information_request → codebase-retrieval / conversation-retrieval
@@ -293,6 +306,13 @@ fn derive_tool_name_from_input(title: &str, input: &Value) -> Option<String> {
         }
     }
     None
+}
+
+/// JS-truthy on a `path`-style field: present, a string, and non-empty.
+/// Rejects `null`, `""`, missing keys, and non-string types so
+/// `{ path: null, view_range: [] }` does not misclassify as `view`.
+fn is_non_empty_string(v: Option<&Value>) -> bool {
+    v.and_then(Value::as_str).is_some_and(|s| !s.is_empty())
 }
 
 fn split_name_prefix(title: &str) -> Option<&str> {

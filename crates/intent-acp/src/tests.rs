@@ -526,6 +526,90 @@ mod session_tests {
             session::derive_tool_name("Do something", Some(&json!("hello"))),
             "Do something"
         );
+        // Empty raw_input object → title passes through verbatim.
+        assert_eq!(
+            session::derive_tool_name("Edit src/lib.rs", Some(&json!({}))),
+            "Edit src/lib.rs"
+        );
+        // Path is present-but-null (or empty) → does not misclassify as
+        // `view` / `save-file`; JS-truthy semantics reject null/"".
+        assert_eq!(
+            session::derive_tool_name(
+                "Read",
+                Some(&json!({ "path": null, "view_range": [1, 10] })),
+            ),
+            "Read"
+        );
+        assert_eq!(
+            session::derive_tool_name(
+                "Create",
+                Some(&json!({
+                    "file_content": "x",
+                    "path": "",
+                    "instructions_reminder": "…",
+                })),
+            ),
+            "Create"
+        );
+    }
+
+    #[test]
+    fn derive_tool_name_input_derivation_order_matches_reference() {
+        // First matching pattern wins, in the reference's order
+        // (acp-provider-streaming.ts ~L1635–1666):
+        // command → save-file → view → retrieval → remove-files → apply_patch.
+        //
+        // `command=str_replace` + `information_request` + `view_range`:
+        // command wins.
+        assert_eq!(
+            session::derive_tool_name(
+                "Do stuff",
+                Some(&json!({
+                    "command": "str_replace",
+                    "path": "a.rs",
+                    "information_request": "…",
+                    "view_range": [1, 10],
+                })),
+            ),
+            "str-replace-editor"
+        );
+        // `path` + `view_range` + `information_request`: view wins over
+        // retrieval (view is checked first).
+        assert_eq!(
+            session::derive_tool_name(
+                "Do stuff",
+                Some(&json!({
+                    "path": "a.rs",
+                    "view_range": [1, 10],
+                    "information_request": "…",
+                })),
+            ),
+            "view"
+        );
+        // `information_request` + `file_paths`: retrieval wins over
+        // remove-files (retrieval is checked first).
+        assert_eq!(
+            session::derive_tool_name(
+                "Do stuff",
+                Some(&json!({
+                    "information_request": "…",
+                    "file_paths": ["a.rs"],
+                })),
+            ),
+            "codebase-retrieval"
+        );
+        // `file_paths` + `input: "*** Begin Patch"`: remove-files wins
+        // over apply_patch (file_paths is checked first).
+        assert_eq!(
+            session::derive_tool_name(
+                "Do stuff",
+                Some(&json!({
+                    "file_paths": ["a.rs"],
+                    "input": "*** Begin Patch\n*** End Patch",
+                })),
+            ),
+            "remove-files"
+        );
     }
 
     #[test]
