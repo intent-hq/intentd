@@ -5681,20 +5681,25 @@ impl WorkspaceApi for Services {
                     // fail the worktree provisioning.
                     let branch_repo = repo_dir.clone();
                     let desired = ws.branch.clone();
-                    let branch = tokio::task::spawn_blocking(move || {
+                    let branch_result = tokio::task::spawn_blocking(move || {
                         intent_git::branches::ensure_unique_branch_name(&branch_repo, &desired)
                     })
-                    .await
-                    .map_err(|e| {
-                        Error::Internal(format!("branch uniquification task failed: {e}"))
-                    })?;
-                    let branch = match branch {
-                        Ok(b) => b,
-                        Err(e) => {
+                    .await;
+                    let branch = match branch_result {
+                        Ok(Ok(b)) => b,
+                        Ok(Err(e)) => {
                             tracing::warn!(
                                 workspace = %ws.id.as_str(),
                                 error = %e,
-                                "workspace.duplicate: branch uniquification failed; skipping worktree"
+                                "workspace.duplicate: branch uniquification failed; falling back to workspace-id branch name"
+                            );
+                            ws.branch.clone()
+                        }
+                        Err(join_err) => {
+                            tracing::warn!(
+                                workspace = %ws.id.as_str(),
+                                error = %join_err,
+                                "workspace.duplicate: branch uniquification task failed; falling back to workspace-id branch name"
                             );
                             ws.branch.clone()
                         }
@@ -5704,6 +5709,7 @@ impl WorkspaceApi for Services {
                     let base_ref = ws.base_ref.clone();
                     let repo = repo_dir.clone();
                     let wt = wt_path.clone();
+                    let provision_branch = branch.clone();
                     let sha_result = worktree_locks
                         .with_lock(&repo_dir, move || async move {
                             tokio::task::spawn_blocking(move || {
@@ -5711,7 +5717,7 @@ impl WorkspaceApi for Services {
                                     &repo,
                                     &name,
                                     &wt,
-                                    &branch,
+                                    &provision_branch,
                                     base_ref.as_deref(),
                                     "origin",
                                 )
@@ -5724,11 +5730,41 @@ impl WorkspaceApi for Services {
                             ws.worktree_path = Some(wt_path.to_string_lossy().to_string());
                             ws.base_commit_sha = Some(sha);
                         }
-                        Ok(Err(e)) => tracing::warn!(
-                            workspace = %ws.id.as_str(),
-                            error = %e,
-                            "workspace.duplicate: worktree provisioning failed; continuing without worktree"
-                        ),
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                workspace = %ws.id.as_str(),
+                                error = %e,
+                                "workspace.duplicate: worktree provisioning failed; continuing without worktree"
+                            );
+                            // `provision_worktree` creates (or reuses) the
+                            // branch before `git worktree add`; on partial
+                            // failure the branch may exist without a worktree
+                            // tracking it. `workspace.delete` only cleans the
+                            // branch when `worktree_path` is set, so best-effort
+                            // delete it here to avoid orphaning a
+                            // `<workspaceId>` branch in the source repo.
+                            let cleanup_repo = repo_dir.clone();
+                            let cleanup_branch = branch.clone();
+                            let cleanup = worktree_locks
+                                .with_lock(&repo_dir, move || async move {
+                                    tokio::task::spawn_blocking(move || {
+                                        intent_git::branches::delete_local_branch(
+                                            &cleanup_repo,
+                                            &cleanup_branch,
+                                        )
+                                    })
+                                    .await
+                                })
+                                .await;
+                            if let Ok(Err(cleanup_err)) = cleanup {
+                                tracing::debug!(
+                                    workspace = %ws.id.as_str(),
+                                    branch = %branch,
+                                    error = %cleanup_err,
+                                    "workspace.duplicate: best-effort branch cleanup after failed provisioning did not delete branch (may not have been created)"
+                                );
+                            }
+                        }
                         Err(join_err) => tracing::warn!(
                             workspace = %ws.id.as_str(),
                             error = %join_err,
