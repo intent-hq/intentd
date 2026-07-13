@@ -1338,11 +1338,14 @@ async fn resolve_note_version_author(
 ) -> NoteVersionAuthor {
     match caller_agent_id {
         Some(agent_id) => {
+            // Name-only lookup avoids pulling the full message log on every
+            // version stamp; the id string is used as the display fallback
+            // when the session row is missing.
             let name = store
-                .get_agent_session(agent_id)
+                .get_agent_session_name(agent_id)
                 .await
                 .ok()
-                .map(|s| s.name)
+                .flatten()
                 .unwrap_or_else(|| agent_id.0.clone());
             NoteVersionAuthor {
                 id: agent_id.0.clone(),
