@@ -749,6 +749,7 @@ async fn git_commit_mints_idempotency_key_when_absent() {
     let resp = call(&srv, "return await ws.git.commit('feat: x');").await;
     assert_eq!(resp["result"]["isError"], json!(false));
     let calls = api.commit_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
     let key = calls[0]
         .1
         .as_deref()
@@ -771,7 +772,31 @@ async fn git_commit_passes_caller_idempotency_key_through() {
     .await;
     assert_eq!(resp["result"]["isError"], json!(false));
     let calls = api.commit_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].1.as_deref(), Some("key-from-caller"));
+}
+
+#[tokio::test]
+async fn git_commit_treats_blank_idempotency_key_as_absent() {
+    // A whitespace-only key must be treated as absent (parity with
+    // `comment.add`) so it cannot collapse dedupe across unrelated requests.
+    let (srv, api) = server_with_caller("agent-9");
+    let resp = call(
+        &srv,
+        "return await host({ method: 'git.commit', args: { message: 'feat: x', idempotencyKey: '   ' } });",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let calls = api.commit_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let key = calls[0]
+        .1
+        .as_deref()
+        .expect("git.commit must mint an idempotencyKey");
+    assert!(
+        uuid::Uuid::parse_str(key).is_ok(),
+        "minted key {key:?} is not a UUID (got blank passthrough)"
+    );
 }
 
 #[tokio::test]

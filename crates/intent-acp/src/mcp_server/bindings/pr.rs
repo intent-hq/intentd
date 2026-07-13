@@ -73,9 +73,13 @@ async fn merge(
     let commit_message = opt_str(args, "commitMessage");
     // Idempotency-wrapped in `intent-services`: pass the caller-supplied key
     // through when present, otherwise mint a UUID so agent-initiated retries
-    // dedupe and the `with_idempotency` soft-launch warn never fires.
-    let idempotency_key =
-        opt_str(args, "idempotencyKey").or_else(|| Some(uuid::Uuid::new_v4().to_string()));
+    // dedupe and the `with_idempotency` soft-launch warn never fires. Blank /
+    // whitespace-only keys are treated as absent (parity with `comment.add`)
+    // so an accidental empty string cannot collapse dedupe across unrelated
+    // requests.
+    let idempotency_key = opt_str(args, "idempotencyKey")
+        .filter(|k| !k.trim().is_empty())
+        .or_else(|| Some(uuid::Uuid::new_v4().to_string()));
     api.pr_merge(
         ws.clone(),
         merge_method,
