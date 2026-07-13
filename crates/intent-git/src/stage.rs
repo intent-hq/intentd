@@ -273,27 +273,23 @@ fn validate_single_file_patch(file_path: &str, patch: &str) -> Result<()> {
     if expected.is_empty() {
         return Err(Error::InvalidParams("filePath is required".to_string()));
     }
+    // git emits `diff --git a/PATH b/PATH` without quoting for paths that
+    // contain spaces (only non-ASCII / control chars trigger c-style quoting
+    // by default), so a path whose own name contains ` b/` (e.g.
+    // `dir b/file.txt`) makes the header ambiguous to split on ` b/` — the
+    // first, last, or any middle occurrence could be the a/b separator. The
+    // header shape is fully determined by `expected`, so compare against the
+    // exact synthesized header instead of trying to split.
+    let expected_header = format!("a/{expected} b/{expected}");
     let mut header_count = 0usize;
     for raw in patch.lines() {
         let Some(rest) = raw.strip_prefix("diff --git ") else {
             continue;
         };
         header_count += 1;
-        // `diff --git a/PATH b/PATH` — split on the last ` b/` so quoted
-        // paths with spaces still parse. Both sides must match `file_path`.
-        let (a_side, b_side) = rest.split_once(" b/").ok_or_else(|| {
-            Error::InvalidParams(format!(
-                "hunkPatch header is not a valid `diff --git a/… b/…` line: {raw}"
-            ))
-        })?;
-        let a_path = a_side.strip_prefix("a/").ok_or_else(|| {
-            Error::InvalidParams(format!(
-                "hunkPatch header is not a valid `diff --git a/… b/…` line: {raw}"
-            ))
-        })?;
-        if a_path != expected || b_side != expected {
+        if rest != expected_header {
             return Err(Error::InvalidParams(format!(
-                "hunkPatch targets `{a_path}` (b: `{b_side}`), expected `{expected}`"
+                "hunkPatch targets `{rest}`, expected `{expected_header}`"
             )));
         }
     }
@@ -668,5 +664,24 @@ mod tests {
         patch.push_str(&append_line_patch("other.txt"));
         let err = stage_hunk(dir.path(), "seed.txt", &patch).unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    /// Regression: a path whose own name contains ` b/` (a directory literally
+    /// named `dir b`) must still be accepted. `rsplit_once(" b/")` picks the
+    /// final occurrence so the `a/` and `b/` sides both parse as the full path;
+    /// the pre-fix `split_once(" b/")` grabbed the first occurrence and rejected
+    /// the header with a mismatched-path error.
+    #[test]
+    fn stage_hunk_accepts_path_containing_b_slash() {
+        let dir = init_repo("stage-hunk-b-slash");
+        let rel = "dir b/file.txt";
+        commit_file(dir.path(), rel, "seed\n");
+        write_file(dir.path(), rel, "seed\nnew line\n");
+        let patch = append_line_patch(rel);
+        stage_hunk(dir.path(), rel, &patch).unwrap();
+        let st = status(dir.path()).unwrap();
+        let f = st.files.iter().find(|f| f.path == rel).unwrap();
+        assert!(f.staged);
+        assert_eq!(f.status, GitFileStatus::Modified);
     }
 }

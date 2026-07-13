@@ -259,6 +259,104 @@ pub(crate) fn build_commit_details(worktree: &Path, commit_hash: &str) -> Result
     }))
 }
 
+/// Build the `git.numstat` wire result for a worktree. Selection rules match
+/// the FE `git:numstat` handler: when `base_ref` or `base_sha` is set, the
+/// branch boundary (merge-base of `target_ref` and `base_ref`, else `base_sha`
+/// when it is an ancestor of `target_ref`) drives a two-dot `<boundary>..
+/// <target>` diff; else `staged=Some(true)` → HEAD→index, `staged=Some(false)`
+/// → index→workdir tracked, `staged=None` → HEAD→workdir tracked. `paths`
+/// filters to the given repo-relative paths. An unresolved boundary yields
+/// an empty array. Result shape: `[{ filePath, additions, deletions }]`.
+pub(crate) fn build_numstat(
+    worktree: &Path,
+    staged: Option<bool>,
+    base_ref: Option<&str>,
+    base_sha: Option<&str>,
+    target_ref: &str,
+    paths: Option<&[String]>,
+) -> Result<Value> {
+    let has_base =
+        base_ref.is_some_and(|s| !s.is_empty()) || base_sha.is_some_and(|s| !s.is_empty());
+    let files = if has_base {
+        let Some(boundary) =
+            intent_git::diff::resolve_branch_boundary(worktree, base_ref, base_sha, target_ref)?
+        else {
+            return Ok(Value::Array(Vec::new()));
+        };
+        intent_git::diff::diff_two_dot(worktree, &boundary, target_ref)?
+    } else {
+        match staged {
+            Some(true) => intent_git::diff::diff_head_to_index(worktree)?,
+            Some(false) => intent_git::diff::diff_index_to_workdir_tracked(worktree)?,
+            None => intent_git::diff::diff_head_to_workdir_tracked(worktree)?,
+        }
+    };
+    let filter: Option<std::collections::HashSet<&str>> =
+        paths.map(|p| p.iter().map(String::as_str).collect());
+    let items: Vec<Value> = files
+        .into_iter()
+        .filter(|fd| match &filter {
+            Some(set) => set.contains(fd.path.as_str()),
+            None => true,
+        })
+        .map(|fd| {
+            json!({
+                "filePath": fd.path,
+                "additions": fd.additions,
+                "deletions": fd.deletions,
+            })
+        })
+        .collect();
+    Ok(Value::Array(items))
+}
+
+/// Build the `git.branchDiff` wire result: one entry per changed file in the
+/// two-dot `<boundary>..<target_ref>` range, carrying the full file contents
+/// at the boundary and the target so the FE branch-base viewer can render the
+/// diff from `oldContent`/`newContent` alone (parity with
+/// `batchedGitBranchBaseDiff` / TrackedChangeDiffViewer). `chunks` is always
+/// an empty array — the FE consumer ignores it for the branch-base shape.
+/// Boundary resolution matches [`build_numstat`]; an unresolved boundary
+/// yields an empty array.
+pub(crate) fn build_branch_diff(
+    worktree: &Path,
+    base_ref: Option<&str>,
+    base_sha: Option<&str>,
+    target_ref: &str,
+    paths: Option<&[String]>,
+) -> Result<Value> {
+    let Some(boundary) =
+        intent_git::diff::resolve_branch_boundary(worktree, base_ref, base_sha, target_ref)?
+    else {
+        return Ok(Value::Array(Vec::new()));
+    };
+    let files = intent_git::diff::diff_two_dot(worktree, &boundary, target_ref)?;
+    let filter: Option<std::collections::HashSet<&str>> =
+        paths.map(|p| p.iter().map(String::as_str).collect());
+    let mut out = Vec::new();
+    for fd in files {
+        if let Some(set) = &filter {
+            if !set.contains(fd.path.as_str()) {
+                continue;
+            }
+        }
+        // `show_file` folds a missing path at the ref to "", which matches the
+        // FE handler's per-side `showFileAt` and gives us empty pre-images
+        // for added files and empty post-images for deletions.
+        let old_content =
+            intent_git::show::show_file(worktree, &boundary, &fd.path).unwrap_or_default();
+        let new_content =
+            intent_git::show::show_file(worktree, target_ref, &fd.path).unwrap_or_default();
+        out.push(json!({
+            "file": fd.path,
+            "chunks": Vec::<Value>::new(),
+            "oldContent": old_content,
+            "newContent": new_content,
+        }));
+    }
+    Ok(Value::Array(out))
+}
+
 /// Empty `git.commitDetails` envelope returned for non-repo / remote / unknown
 /// workspaces and for an unresolvable `commit_hash`. Mirrors the graceful-empty
 /// pattern used by `git_diffs`/`git_commits`.
