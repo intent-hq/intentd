@@ -498,6 +498,7 @@ impl WorkspaceApi for FakeApi {
                 suggestion_original,
                 suggestion_proposed,
                 agent_id: None,
+                is_orphaned: None,
                 created_at: now.clone(),
                 updated_at: now,
             };

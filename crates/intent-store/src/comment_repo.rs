@@ -33,6 +33,8 @@ struct ExtraFields {
     suggestion_proposed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    is_orphaned: Option<bool>,
 }
 
 impl ExtraFields {
@@ -42,6 +44,7 @@ impl ExtraFields {
             && self.suggestion_original.is_none()
             && self.suggestion_proposed.is_none()
             && self.agent_id.is_none()
+            && self.is_orphaned.is_none()
     }
 }
 
@@ -59,6 +62,7 @@ impl Store {
             suggestion_original: c.suggestion_original.clone(),
             suggestion_proposed: c.suggestion_proposed.clone(),
             agent_id: c.agent_id.clone(),
+            is_orphaned: c.is_orphaned,
         };
         let extra_json = if extra.is_empty() {
             None
@@ -121,6 +125,7 @@ impl Store {
             suggestion_original: c.suggestion_original.clone(),
             suggestion_proposed: c.suggestion_proposed.clone(),
             agent_id: c.agent_id.clone(),
+            is_orphaned: c.is_orphaned,
         };
         let extra_json = if extra.is_empty() {
             None
@@ -294,6 +299,7 @@ fn map_comment_row(row: &SqliteRow) -> Result<Comment> {
         suggestion_original: extra.suggestion_original,
         suggestion_proposed: extra.suggestion_proposed,
         agent_id: extra.agent_id,
+        is_orphaned: extra.is_orphaned,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
     })
