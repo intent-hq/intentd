@@ -911,8 +911,13 @@ impl Services {
         }
     }
 
-    /// Refresh every workspace that already has a linked PR (discovery stays
-    /// on-demand). Errors are logged per workspace and never abort the sweep.
+    /// Refresh every active workspace's PR linkage: existing links are
+    /// re-fetched (persisting deltas + emitting `pr:updated`/`pr:unlinked`), and
+    /// unlinked workspaces discover a matching open PR by head ref (branch-only
+    /// matching per §7.6 — `pr.head.ref == workspace.branch`), persisting the
+    /// link + emitting `pr:linked` on first match. Remote/archived workspaces and
+    /// those lacking repo/branch info are skipped. Errors are logged per
+    /// workspace and never abort the sweep.
     async fn refresh_all_linked_prs(&self) {
         let workspaces = match self.store.list_workspaces(false).await {
             Ok(list) => list,
@@ -922,9 +927,9 @@ impl Services {
             }
         };
         for ws in workspaces {
-            if ws.pr_number.is_none() {
-                continue;
-            }
+            // STAB-3 fix: refresh all workspaces (discovery + update), not just
+            // those already linked. `refresh_workspace_pr` skips ineligible
+            // workspaces internally.
             if let Err(e) = self.refresh_workspace_pr(&ws.id).await {
                 tracing::warn!(
                     workspace = %ws.id.as_str(),
@@ -936,11 +941,13 @@ impl Services {
     }
 
     /// Spawn the background PR refresh loop (§7.6): every `interval` it refreshes
-    /// all linked PRs, persisting deltas and emitting `pr:*` events. The first
-    /// sweep runs after one `interval`. Missed ticks are skipped (no pile-up).
-    /// No-op-safe when source control is unconfigured (each refresh surfaces the
-    /// missing-provider error, which is logged and swallowed). Returns the task
-    /// handle so the composition root can hold/abort it.
+    /// all active workspaces — discovering open PRs by head-ref match for
+    /// unlinked workspaces (emitting `pr:linked`) and updating linked PRs
+    /// (emitting `pr:updated`/`pr:unlinked`). The first sweep runs after one
+    /// `interval`. Missed ticks are skipped (no pile-up). No-op-safe when source
+    /// control is unconfigured (each refresh surfaces the missing-provider error,
+    /// which is logged and swallowed). Returns the task handle so the composition
+    /// root can hold/abort it.
     pub fn spawn_pr_refresh_loop(
         &self,
         interval: std::time::Duration,
