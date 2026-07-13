@@ -9741,34 +9741,73 @@ mod initial_agent_orchestration {
         assert_eq!(messages.len(), 1, "no second prompt delivery");
     }
 
-    /// No (or blank) prompt → no agent: the result has no `initialAgent` and
-    /// no session row is created.
+    /// No (or blank) prompt → agent row is created without a first turn
+    /// (reference parity with `workspace.service.ts`: the session persists
+    /// whenever `initialAgent` is present; the FE's first send starts the
+    /// turn). The result carries the `AgentLite`, the row is non-background
+    /// with the requested specialist/model, `metadata.initialMessage` is
+    /// absent, and no messages are persisted.
     #[tokio::test]
-    async fn no_prompt_no_agent() {
-        let tmp = TempDb::new();
-        let store = Store::open(&tmp.path).await.expect("open store");
-        let ws_root = WorkspacesRoot::new();
-        let services =
-            Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
-
+    async fn no_prompt_creates_agent_row_without_message() {
         for prompt in [None, Some("   ".to_string())] {
+            let tmp = TempDb::new();
+            let store = Store::open(&tmp.path).await.expect("open store");
+            let ws_root = WorkspacesRoot::new();
+            let services =
+                Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+
+            let requested = format!("agent-{}", uuid::Uuid::new_v4());
             let res = services
                 .create_workspace(
                     create_input(Some(WorkspaceCreateInitialAgent {
+                        agent_id: Some(requested.clone()),
                         prompt,
-                        name: Some("Never created".to_string()),
+                        name: Some("Coordinator".to_string()),
+                        model: Some("opus".to_string()),
+                        specialist: Some("implementor".to_string()),
                         ..Default::default()
                     })),
                     None,
                 )
                 .await
                 .expect("create");
-            assert!(res.initial_agent.is_none(), "no agent in result");
+
+            let agent = res
+                .initial_agent
+                .as_ref()
+                .expect("initialAgent in result even without a prompt");
+            assert_eq!(agent["id"], Value::from(requested.as_str()));
+            assert_eq!(agent["name"], "Coordinator");
+
             let sessions = store
                 .list_agent_sessions(&res.workspace.id)
                 .await
                 .expect("sessions");
-            assert!(sessions.is_empty(), "no session row created");
+            assert_eq!(sessions.len(), 1, "one session row created");
+
+            let session = store
+                .get_agent_session(&AgentId::from(requested.as_str()))
+                .await
+                .expect("session");
+            assert_eq!(session.workspace_id, res.workspace.id);
+            assert!(session.parent_agent_id.is_none());
+            assert!(!session.is_background);
+            assert_eq!(session.specialist.as_deref(), Some("implementor"));
+            assert_eq!(session.model.as_deref(), Some("opus"));
+            assert!(
+                session.initial_message.is_none(),
+                "metadata.initialMessage omitted when no prompt supplied: {:?}",
+                session.initial_message
+            );
+
+            let messages = store
+                .get_agent_messages(&AgentId::from(requested.as_str()), None)
+                .await
+                .expect("messages");
+            assert!(
+                messages.is_empty(),
+                "no messages persisted without a prompt: {messages:?}"
+            );
         }
     }
 }
