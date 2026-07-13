@@ -243,6 +243,44 @@ async fn dispatch(
             let setup_script = api.generate_setup_script(id).await.map_err(workspace_err)?;
             Ok(json!({ "setupScript": setup_script }))
         }
+        "workspace.duplicate" => {
+            let id = require_workspace_id(params)?;
+            let new_title = opt_str(params, "newTitle");
+            let ws = api
+                .duplicate_workspace(id, new_title)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "workspace": ws }))
+        }
+        "workspace.restore" => {
+            let id = require_workspace_id(params)?;
+            let ws = api.restore_workspace(id).await.map_err(workspace_err)?;
+            Ok(json!({ "workspace": ws }))
+        }
+        "workspace.cleanup" => {
+            let id = require_workspace_id(params)?;
+            api.cleanup_workspace(id).await.map_err(workspace_err)?;
+            Ok(json!({ "success": true }))
+        }
+        "workspace.purge" => {
+            let result = api.purge_workspaces().await.map_err(domain_to_rpc)?;
+            Ok(json!({ "removed": result.removed, "orphans": result.orphans }))
+        }
+        "workspace.findRepositories" => {
+            let directory = require_str_param(params, "directory")?;
+            let repositories = api
+                .find_repositories(directory)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({ "repositories": repositories }))
+        }
+        "workspace.initializeRepository" => {
+            let path = require_str_param(params, "path")?;
+            api.initialize_repository(path)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({ "success": true }))
+        }
         "note.list" => {
             let ws_id = match params.get("workspaceId").and_then(Value::as_str) {
                 Some(s) if !s.is_empty() => WorkspaceId::from(s),

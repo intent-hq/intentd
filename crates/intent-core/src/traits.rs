@@ -21,7 +21,8 @@ use crate::model::{
     TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
     TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
-    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspacePurgeResult,
+    WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -201,6 +202,92 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::generate_setup_script not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Duplicate a workspace (PROTOCOL §5.1): clone the persisted metadata into
+    /// a freshly minted id, seed the well-known `spec` note, and copy over any
+    /// non-`spec` notes from the source. Runtime-only fields (`activity`, card
+    /// aggregates, timeline, changesets) are not carried over; the new workspace
+    /// starts on a fresh branch and no worktree — worktree provisioning for a
+    /// duplicated workspace is deferred to a follow-up task (git-worktree
+    /// machinery). `newTitle` overrides the auto-suffixed `"<source> (Copy)"`
+    /// title. `NotFound` if the source workspace is absent.
+    fn duplicate_workspace(
+        &self,
+        id: WorkspaceId,
+        new_title: Option<String>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        let _ = (id, new_title);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::duplicate_workspace not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Restore an archived workspace to `active` (PROTOCOL §5.1). Alias of
+    /// [`Self::unarchive_workspace`] with the same event emission; provided so
+    /// clients can express intent (archive → restore) rather than the raw state
+    /// transition. `NotFound` if the workspace is absent.
+    fn restore_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+        self.unarchive_workspace(id)
+    }
+
+    /// Best-effort per-workspace cleanup (PROTOCOL §5.1): reclaim the workspace
+    /// cache directory and, when a local worktree exists, run `git gc` on it.
+    /// Cache reclamation runs the recursive-delete under the daemon-owned
+    /// `<workspaces_root>/<id>/cache/` path (never a caller-supplied path);
+    /// both cache-removal and `git gc` failures are logged and swallowed so
+    /// the workspace stays healthy. `NotFound` if the workspace is absent;
+    /// otherwise this RPC always resolves `Ok(())`.
+    fn cleanup_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::cleanup_workspace not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Purge deleted workspaces and orphan on-disk directories (PROTOCOL §5.1).
+    /// Sweeps `<workspaces_root>/`: rows whose stored status is `Deleted` are
+    /// dropped alongside their directory (`removed`), and directories with no
+    /// matching row are removed too (`orphans`). Best-effort; individual
+    /// per-workspace failures are logged and skipped rather than aborting the
+    /// sweep.
+    fn purge_workspaces(&self) -> BoxFuture<'_, Result<WorkspacePurgeResult>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::purge_workspaces not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Scan a directory for git repositories (PROTOCOL §5.1). Returns absolute
+    /// paths (as strings) of every directory that contains a `.git` folder,
+    /// walking a bounded depth to keep the scan cheap. Non-repo directories are
+    /// recursed into; a git repo is emitted and its subtree is skipped.
+    fn find_repositories(&self, directory: String) -> BoxFuture<'_, Result<Vec<String>>> {
+        let _ = directory;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::find_repositories not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Initialize a new git repository at `path` (PROTOCOL §5.1): create the
+    /// directory when missing, `git init -b main`, seed a `.gitignore` and
+    /// `README.md`, and land an initial commit. When the target is already a
+    /// git repository with at least one commit the call is a quiet no-op.
+    /// Failures propagate as `Internal` errors.
+    fn initialize_repository(&self, path: String) -> BoxFuture<'_, Result<()>> {
+        let _ = path;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::initialize_repository not implemented".to_string(),
             ))
         })
     }

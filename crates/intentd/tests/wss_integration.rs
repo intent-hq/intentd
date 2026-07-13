@@ -2353,3 +2353,189 @@ async fn wss_repo_remove_round_trip() {
 
     srv.ws.stop().await;
 }
+
+/// End-to-end WSS coverage for the workspace lifecycle helpers added by the
+/// thin-FE remediation (PROTOCOL.md §5.1): `workspace.duplicate`,
+/// `workspace.restore`, `workspace.cleanup`, `workspace.purge`,
+/// `workspace.findRepositories`, and `workspace.initializeRepository`. Every
+/// method is driven over the real pinned-TLS WebSocket transport and its
+/// response envelope is asserted against the documented shape.
+#[tokio::test]
+async fn wss_workspace_lifecycle_helpers_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed a workspace to duplicate/restore/clean up.
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Source WS"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+
+    // workspace.duplicate returns { workspace }, defaulting the title to the
+    // "<source> (Copy)" convention.
+    let dup = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.duplicate","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert!(dup["result"]["workspace"].is_object(), "workspace object");
+    assert_eq!(dup["result"]["workspace"]["title"], "Source WS (Copy)");
+    let dup_id = dup["result"]["workspace"]["id"]
+        .as_str()
+        .expect("dup id")
+        .to_string();
+    assert_ne!(dup_id, ws_id, "duplicate must mint a fresh id");
+
+    // Explicit newTitle overrides the auto-suffix.
+    let dup2 = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.duplicate","params":{{"workspaceId":"{ws_id}","newTitle":"Custom Copy"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(dup2["result"]["workspace"]["title"], "Custom Copy");
+
+    // workspace.restore alias of unarchive: archive first, then restore.
+    let _ = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"workspace.archive","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let restored = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"workspace.restore","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(restored["result"]["workspace"]["id"], ws_id);
+    assert_eq!(restored["result"]["workspace"]["archived"], false);
+
+    // workspace.cleanup returns { success: true } on an existing workspace.
+    let cleanup = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"workspace.cleanup","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(cleanup["result"], serde_json::json!({ "success": true }));
+
+    // workspace.cleanup on a missing workspace → -32602 "Workspace not found".
+    let cleanup_missing = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":7,"method":"workspace.cleanup","params":{"workspaceId":"ghost"}}"#,
+    )
+    .await;
+    assert_eq!(cleanup_missing["error"]["code"], -32602);
+    assert_eq!(cleanup_missing["error"]["message"], "Workspace not found");
+
+    // workspace.purge returns { removed, orphans } counters even when nothing
+    // is deleted; both counters are numbers.
+    let purge = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":8,"method":"workspace.purge","params":{}}"#,
+    )
+    .await;
+    assert!(
+        purge["result"]["removed"].is_number(),
+        "removed is a number"
+    );
+    assert!(
+        purge["result"]["orphans"].is_number(),
+        "orphans is a number"
+    );
+
+    // workspace.findRepositories returns { repositories: string[] }. Seed a
+    // scratch dir with a fake `.git` folder so the scan produces a match.
+    let scratch =
+        std::env::temp_dir().join(format!("itd-find-repos-{}", uuid::Uuid::new_v4().simple()));
+    let repo_a = scratch.join("repo-a");
+    std::fs::create_dir_all(repo_a.join(".git")).expect("mkdir repo-a/.git");
+    std::fs::create_dir_all(scratch.join("plain")).expect("mkdir plain");
+    let find = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"workspace.findRepositories","params":{{"directory":"{}"}}}}"#,
+            scratch.display()
+        ),
+    )
+    .await;
+    let repos = find["result"]["repositories"]
+        .as_array()
+        .expect("repositories array");
+    assert!(
+        repos
+            .iter()
+            .any(|r| r.as_str() == Some(repo_a.to_str().unwrap())),
+        "repo-a must be in {repos:?}"
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    // workspace.findRepositories without `directory` → -32602.
+    let find_missing = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":10,"method":"workspace.findRepositories","params":{}}"#,
+    )
+    .await;
+    assert_eq!(find_missing["error"]["code"], -32602);
+
+    // workspace.initializeRepository returns { success: true }. Point it at a
+    // fresh scratch dir and assert `.git` shows up. Gated on `git` being on
+    // PATH; skip the assertion cleanly when it's absent.
+    if std::process::Command::new("git")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        let init_path =
+            std::env::temp_dir().join(format!("itd-init-{}", uuid::Uuid::new_v4().simple()));
+        let init = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":11,"method":"workspace.initializeRepository","params":{{"path":"{}"}}}}"#,
+                init_path.display()
+            ),
+        )
+        .await;
+        assert_eq!(init["result"], serde_json::json!({ "success": true }));
+        assert!(init_path.join(".git").exists(), ".git directory seeded");
+        assert!(init_path.join("README.md").exists(), "README seeded");
+        assert!(init_path.join(".gitignore").exists(), ".gitignore seeded");
+        let _ = std::fs::remove_dir_all(&init_path);
+    }
+
+    // workspace.initializeRepository without `path` → -32602.
+    let init_missing = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":12,"method":"workspace.initializeRepository","params":{}}"#,
+    )
+    .await;
+    assert_eq!(init_missing["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+}
