@@ -85,12 +85,12 @@ it has a WSS e2e.
 New tests should reuse the harness already in `crates/intentd/tests/`:
 
 - **WSS agent-lifecycle e2e** — landed in commit
-  [`500b33c`](https://github.com/cloudlands-ai/intentd/commit/500b33c) (`test(intentd): WSS
+  [`500b33c`](https://github.com/intent-hq/intentd/commit/500b33c) (`test(intentd): WSS
   e2e agent lifecycle over websocket (mock ACP provider)`). Drives the full agent
   lifecycle over a real WSS connection using the mock ACP provider. See
   `crates/intentd/tests/e2e_wss_agent_lifecycle.rs`.
 - **WSS coverage sweep** — landed in commit
-  [`887bbad`](https://github.com/cloudlands-ai/intentd/commit/887bbad) (`test(intentd):
+  [`887bbad`](https://github.com/intent-hq/intentd/commit/887bbad) (`test(intentd):
   WSS coverage sweep — router read/lifecycle arms, mid-stream disconnect, subscription
   filters, upgrade head guard`). Covers router read/lifecycle arms, mid-stream disconnect,
   subscription filters, and the upgrade head guard. See

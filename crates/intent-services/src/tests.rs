@@ -7920,7 +7920,7 @@ mod known_repo {
                 &WorkspaceId::new(),
                 Some("/src/intent"),
                 Some("intent"),
-                Some("cloudlands-ai"),
+                Some("intent-hq"),
             ))
             .await
             .expect("ws1");
@@ -7947,10 +7947,7 @@ mod known_repo {
         let by_path: std::collections::HashMap<_, _> =
             repos.iter().map(|r| (r.path.as_str(), r)).collect();
         assert_eq!(by_path["/src/intent"].name, "intent");
-        assert_eq!(
-            by_path["/src/intent"].owner.as_deref(),
-            Some("cloudlands-ai")
-        );
+        assert_eq!(by_path["/src/intent"].owner.as_deref(), Some("intent-hq"));
         assert_eq!(by_path["/home/me/other-repo"].name, "other-repo");
         assert_eq!(by_path["/home/me/other-repo"].owner, None);
 
@@ -7970,7 +7967,7 @@ mod known_repo {
             WorkspaceCreate {
                 repository_path: Some("/src/intent".to_string()),
                 repository_name: Some("intent".to_string()),
-                repository_owner: Some("cloudlands-ai".to_string()),
+                repository_owner: Some("intent-hq".to_string()),
                 ..Default::default()
             },
             None,
@@ -7983,7 +7980,7 @@ mod known_repo {
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0]["path"], "/src/intent");
         assert_eq!(repos[0]["name"], "intent");
-        assert_eq!(repos[0]["owner"], "cloudlands-ai");
+        assert_eq!(repos[0]["owner"], "intent-hq");
         assert!(repos[0]["addedAt"].is_string());
         assert!(repos[0]["lastUsedAt"].is_string());
     }
