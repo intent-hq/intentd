@@ -398,31 +398,236 @@ mod session_tests {
         // names are bare and the ACP provider (auggie) appends `_workspace-mcp`
         // on its side, so any number of trailing server suffixes is stripped.
         assert_eq!(
-            session::derive_tool_name("add_to_note_workspace-mcp: Append content"),
+            session::derive_tool_name("add_to_note_workspace-mcp: Append content", None),
             "add_to_note"
         );
         assert_eq!(
-            session::derive_tool_name("add_to_note_workspace-mcp_workspace-mcp: x"),
+            session::derive_tool_name("add_to_note_workspace-mcp_workspace-mcp: x", None),
             "add_to_note"
         );
         assert_eq!(
-            session::derive_tool_name("add_to_note_workspace-mcp"),
+            session::derive_tool_name("add_to_note_workspace-mcp", None),
             "add_to_note"
         );
         assert_eq!(
-            session::derive_tool_name("sub-agent-explore: Explore the AI agent system"),
+            session::derive_tool_name("sub-agent-explore: Explore the AI agent system", None),
             "sub-agent-explore"
         );
         // Titles without the `<name>: ` prefix shape pass through unchanged.
         assert_eq!(
-            session::derive_tool_name("Edit src/lib.rs"),
+            session::derive_tool_name("Edit src/lib.rs", None),
             "Edit src/lib.rs"
         );
         assert_eq!(
-            session::derive_tool_name("https://example.com/x"),
+            session::derive_tool_name("https://example.com/x", None),
             "https://example.com/x"
         );
-        assert_eq!(session::derive_tool_name("10:15 sync"), "10:15 sync");
+        assert_eq!(session::derive_tool_name("10:15 sync", None), "10:15 sync");
+    }
+
+    #[test]
+    fn derive_tool_name_uses_raw_input_when_title_is_prose() {
+        // information_request → codebase-retrieval; "conversation" in the
+        // title routes to conversation-retrieval instead.
+        assert_eq!(
+            session::derive_tool_name(
+                "Search codebase",
+                Some(&json!({ "information_request": "where is auth?" })),
+            ),
+            "codebase-retrieval"
+        );
+        assert_eq!(
+            session::derive_tool_name(
+                "Search Conversation history",
+                Some(&json!({ "information_request": "when did we discuss auth?" })),
+            ),
+            "conversation-retrieval"
+        );
+        // command ∈ {str_replace, insert, create} → str-replace-editor.
+        for cmd in ["str_replace", "insert", "create"] {
+            assert_eq!(
+                session::derive_tool_name(
+                    "Edit file",
+                    Some(&json!({ "command": cmd, "path": "a.rs" })),
+                ),
+                "str-replace-editor",
+                "command={cmd}"
+            );
+        }
+        // file_content + path + instructions_reminder → save-file.
+        assert_eq!(
+            session::derive_tool_name(
+                "Create",
+                Some(&json!({
+                    "file_content": "hi",
+                    "path": "a.rs",
+                    "instructions_reminder": "…",
+                })),
+            ),
+            "save-file"
+        );
+        // path + view_range → view.
+        assert_eq!(
+            session::derive_tool_name(
+                "Read",
+                Some(&json!({ "path": "a.rs", "view_range": [1, 10] })),
+            ),
+            "view"
+        );
+        // file_paths array → remove-files.
+        assert_eq!(
+            session::derive_tool_name("Delete", Some(&json!({ "file_paths": ["a.rs", "b.rs"] })),),
+            "remove-files"
+        );
+        // input string containing "*** Begin Patch" → apply_patch.
+        assert_eq!(
+            session::derive_tool_name(
+                "Apply patch",
+                Some(&json!({ "input": "*** Begin Patch\n*** End Patch" })),
+            ),
+            "apply_patch"
+        );
+    }
+
+    #[test]
+    fn derive_tool_name_title_prefix_wins_over_input_derivation() {
+        // Even when raw_input matches an input-derivation shape, an
+        // unambiguous `<name>: <desc>` title prefix takes precedence — the
+        // ACP provider (or MCP registry name) is authoritative for the tool
+        // identity when it is explicit.
+        assert_eq!(
+            session::derive_tool_name(
+                "read_note_workspace-mcp: Read the spec",
+                Some(&json!({ "information_request": "spec contents" })),
+            ),
+            "read_note"
+        );
+        // Same for the `_workspace-mcp` suffix without a `<name>: ` prefix:
+        // the suffix-strip already identified this as an MCP tool.
+        assert_eq!(
+            session::derive_tool_name(
+                "read_note_workspace-mcp",
+                Some(&json!({ "information_request": "spec" })),
+            ),
+            "read_note"
+        );
+    }
+
+    #[test]
+    fn derive_tool_name_falls_back_when_input_has_no_match() {
+        // Prose title + raw_input that doesn't match any pattern → title
+        // passes through verbatim.
+        assert_eq!(
+            session::derive_tool_name("Edit src/lib.rs", Some(&json!({ "path": "src/lib.rs" })),),
+            "Edit src/lib.rs"
+        );
+        // Non-object raw_input (e.g. bare string) is ignored.
+        assert_eq!(
+            session::derive_tool_name("Do something", Some(&json!("hello"))),
+            "Do something"
+        );
+        // Empty raw_input object → title passes through verbatim.
+        assert_eq!(
+            session::derive_tool_name("Edit src/lib.rs", Some(&json!({}))),
+            "Edit src/lib.rs"
+        );
+        // Path is present-but-null (or empty) → does not misclassify as
+        // `view` / `save-file`; JS-truthy semantics reject null/"".
+        assert_eq!(
+            session::derive_tool_name(
+                "Read",
+                Some(&json!({ "path": null, "view_range": [1, 10] })),
+            ),
+            "Read"
+        );
+        assert_eq!(
+            session::derive_tool_name(
+                "Create",
+                Some(&json!({
+                    "file_content": "x",
+                    "path": "",
+                    "instructions_reminder": "…",
+                })),
+            ),
+            "Create"
+        );
+    }
+
+    #[test]
+    fn derive_tool_name_input_derivation_order_matches_reference() {
+        // First matching pattern wins, in the reference's order
+        // (acp-provider-streaming.ts ~L1635–1666):
+        // command → save-file → view → retrieval → remove-files → apply_patch.
+        //
+        // `command=str_replace` + `information_request` + `view_range`:
+        // command wins.
+        assert_eq!(
+            session::derive_tool_name(
+                "Do stuff",
+                Some(&json!({
+                    "command": "str_replace",
+                    "path": "a.rs",
+                    "information_request": "…",
+                    "view_range": [1, 10],
+                })),
+            ),
+            "str-replace-editor"
+        );
+        // `path` + `view_range` + `information_request`: view wins over
+        // retrieval (view is checked first).
+        assert_eq!(
+            session::derive_tool_name(
+                "Do stuff",
+                Some(&json!({
+                    "path": "a.rs",
+                    "view_range": [1, 10],
+                    "information_request": "…",
+                })),
+            ),
+            "view"
+        );
+        // `information_request` + `file_paths`: retrieval wins over
+        // remove-files (retrieval is checked first).
+        assert_eq!(
+            session::derive_tool_name(
+                "Do stuff",
+                Some(&json!({
+                    "information_request": "…",
+                    "file_paths": ["a.rs"],
+                })),
+            ),
+            "codebase-retrieval"
+        );
+        // `file_paths` + `input: "*** Begin Patch"`: remove-files wins
+        // over apply_patch (file_paths is checked first).
+        assert_eq!(
+            session::derive_tool_name(
+                "Do stuff",
+                Some(&json!({
+                    "file_paths": ["a.rs"],
+                    "input": "*** Begin Patch\n*** End Patch",
+                })),
+            ),
+            "remove-files"
+        );
+    }
+
+    #[test]
+    fn input_derived_retrieval_names_classify_as_search() {
+        // A prose title + information_request must yield tool_name
+        // "codebase-retrieval" AND tool_kind "search" so the FE renders the
+        // context-engine card even when the ACP provider set ToolKind::Other.
+        let call = ToolCall::new("t1", "Search codebase")
+            .kind(ToolKind::Other)
+            .raw_input(json!({ "information_request": "where is auth?" }));
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCall(call)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.tool_name, "codebase-retrieval");
+        assert_eq!(tc.title, "Search codebase");
+        assert_eq!(tc.tool_kind, "search");
     }
 
     #[test]
