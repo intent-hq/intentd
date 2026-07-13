@@ -39,7 +39,7 @@ use intent_core::{
     TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceActivity,
     WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
     WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceEventSummary, WorkspaceId,
-    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspacePurgeResult, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -2284,6 +2284,158 @@ fn worktree_folder_slug(repo_name: &str) -> String {
     } else {
         slug.to_string()
     }
+}
+
+/// Recursively scan `dir` for git repositories (a directory that contains a
+/// `.git` child). Ports the FE `workspace.repository.scanDirectory` semantics:
+/// depth capped at 3, hidden entries skipped, git roots emitted without
+/// descending further, and I/O errors on individual entries are silently
+/// swallowed. Absolute paths are pushed into `out` as UTF-8 strings; entries
+/// whose paths cannot be represented as UTF-8 are skipped.
+fn scan_for_repositories(dir: &Path, depth: usize, out: &mut Vec<String>) {
+    if depth > 3 {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let entries: Vec<_> = entries.flatten().collect();
+    let is_git_repo = entries
+        .iter()
+        .any(|e| e.file_name() == *".git" && e.file_type().map(|t| t.is_dir()).unwrap_or(false));
+    if is_git_repo {
+        if let Some(s) = dir.to_str() {
+            out.push(s.to_string());
+        }
+        return;
+    }
+    for entry in entries {
+        let ft = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        if name_str.starts_with('.') {
+            continue;
+        }
+        scan_for_repositories(&dir.join(name_str), depth + 1, out);
+    }
+}
+
+/// Blocking body for `WorkspaceApi::initialize_repository`. Mirrors the FE
+/// `initializeNewRepository` reference: `mkdir -p`, quiet no-op when the
+/// target already carries a git repo with at least one commit, otherwise
+/// `git init -b main`, seed `.gitignore` + `README.md`, and land an initial
+/// commit. Git user identity falls back to `Intent <intent@local>` when no
+/// global identity is configured. Every failure surfaces as
+/// [`Error::Internal`].
+fn initialize_repository_blocking(repo_path: &Path) -> Result<()> {
+    use std::process::Command;
+    std::fs::create_dir_all(repo_path).map_err(|e| {
+        Error::Internal(format!(
+            "workspace.initializeRepository: mkdir {} failed: {e}",
+            repo_path.display()
+        ))
+    })?;
+    let git_dir = repo_path.join(".git");
+    if git_dir.exists() {
+        let head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_path)
+            .output();
+        if let Ok(out) = head {
+            if out.status.success() && !out.stdout.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+    let run = |args: &[&str]| -> Result<()> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(repo_path)
+            .output()
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "workspace.initializeRepository: git {} failed to spawn: {e}",
+                    args.join(" ")
+                ))
+            })?;
+        if !out.status.success() {
+            return Err(Error::Internal(format!(
+                "workspace.initializeRepository: git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(())
+    };
+    run(&["init", "-b", "main"])?;
+    let read_global = |key: &str| -> Option<String> {
+        let out = Command::new("git")
+            .args(["config", "--global", key])
+            .current_dir(repo_path)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let value = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    };
+    let user_name = read_global("user.name").unwrap_or_else(|| "Intent".to_string());
+    let user_email = read_global("user.email").unwrap_or_else(|| "intent@local".to_string());
+    run(&["config", "user.name", &user_name])?;
+    run(&["config", "user.email", &user_email])?;
+    let gitignore = "# Dependencies\nnode_modules/\n.pnpm-store/\n\n# Build outputs\ndist/\nbuild/\nout/\n\n# IDE\n.idea/\n.vscode/\n*.swp\n*.swo\n\n# OS\n.DS_Store\nThumbs.db\n\n# Environment\n.env\n.env.local\n.env.*.local\n\n# Logs\n*.log\nnpm-debug.log*\n";
+    std::fs::write(repo_path.join(".gitignore"), gitignore).map_err(|e| {
+        Error::Internal(format!(
+            "workspace.initializeRepository: write .gitignore failed: {e}"
+        ))
+    })?;
+    let repo_name = repo_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
+    let readme = format!("# {repo_name}\n\nA new project created with Intent by Augment.\n");
+    std::fs::write(repo_path.join("README.md"), readme).map_err(|e| {
+        Error::Internal(format!(
+            "workspace.initializeRepository: write README.md failed: {e}"
+        ))
+    })?;
+    run(&["add", "."])?;
+    // Initial commit tolerates "nothing to commit" (reruns after a manual
+    // seed), matching the FE reference. Every other non-zero exit propagates.
+    let commit = Command::new("git")
+        .args(["commit", "-m", "Initial commit"])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| {
+            Error::Internal(format!(
+                "workspace.initializeRepository: git commit failed to spawn: {e}"
+            ))
+        })?;
+    if !commit.status.success() {
+        let out = String::from_utf8_lossy(&commit.stdout);
+        if !out.contains("nothing to commit") {
+            return Err(Error::Internal(format!(
+                "workspace.initializeRepository: git commit failed: {}",
+                String::from_utf8_lossy(&commit.stderr).trim()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Blocking `workspace.delete` cleanup (ports the TS `removeGitWorktree`
@@ -5330,6 +5482,366 @@ impl WorkspaceApi for Services {
             )
             .await;
             Ok(ws)
+        })
+    }
+
+    fn duplicate_workspace(
+        &self,
+        id: WorkspaceId,
+        new_title: Option<String>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        let workspaces_root = self
+            .workspaces_root
+            .clone()
+            .unwrap_or_else(default_workspaces_root);
+        Box::pin(async move {
+            // Chief is virtual and never carries user content; duplication is
+            // not meaningful (TS parity: coverflow never exposes a duplicate
+            // affordance on the seeded row).
+            if id.is_chief() {
+                return Err(Error::InvalidParams(
+                    "cannot duplicate chief workspace".to_string(),
+                ));
+            }
+            let source = store.get_workspace(&id).await?;
+            // Fresh id: reuse the random adjective-animal slug generator and
+            // uniquify against live rows, tombstones, and stray directories.
+            // Retries stay bounded so a wildly saturated slug space fails fast
+            // rather than looping forever.
+            let mut new_id = WorkspaceId::from(intent_core::slug::generate_workspace_slug());
+            for _ in 0..32 {
+                if workspace_id_available(&store, &workspaces_root, &new_id).await {
+                    break;
+                }
+                new_id = WorkspaceId::from(intent_core::slug::generate_workspace_slug());
+            }
+            let now = now_iso();
+            let title = new_title
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| {
+                    if source.title.trim().is_empty() {
+                        "Untitled (Copy)".to_string()
+                    } else {
+                        format!("{} (Copy)", source.title)
+                    }
+                });
+            // Copy the source's configuration verbatim but reset runtime state:
+            // fresh id, branch pinned to the new id (TS `duplicateWorkspace`
+            // parity), no worktree/PR/aggregates/token-usage carried over.
+            // Worktree provisioning for the duplicate is deferred to a
+            // follow-up task (the create-time `provision_worktree` machinery
+            // is not repeated here to keep this method minimal).
+            let ws = Workspace {
+                id: new_id.clone(),
+                title,
+                branch: new_id.0.clone(),
+                base_ref: source.base_ref.clone(),
+                base_commit_sha: None,
+                status: WorkspaceStatus::Active,
+                status_message: None,
+                activity: WorkspaceActivity::Idle,
+                attention: WorkspaceAttention::None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_activity: None,
+                tags: source.tags.clone(),
+                path: source.path.clone(),
+                repository_path: source.repository_path.clone(),
+                repository_owner: source.repository_owner.clone(),
+                repository_name: source.repository_name.clone(),
+                worktree_path: None,
+                scope: source.scope.clone(),
+                skip_worktree: source.skip_worktree,
+                setup_script: source.setup_script.clone(),
+                is_remote: source.is_remote,
+                default_model: source.default_model.clone(),
+                pr_number: None,
+                pr_url: None,
+                pr_status: None,
+                active_pull_request: None,
+                archived: false,
+                archived_at: None,
+                task_stats: None,
+                agent_summary: None,
+                diff_summary: None,
+                token_usage: None,
+            };
+            store.insert_workspace(&ws).await?;
+            if let Err(e) = write_workspace_metadata_file(&workspaces_root, &ws) {
+                tracing::warn!(
+                    workspace = %ws.id.as_str(),
+                    error = %e,
+                    "workspace.duplicate: failed to write .workspace/workspace.json"
+                );
+            }
+            publish_event(&bus, workspace_created_event(&ws)).await;
+            // Seed the default spec note for the new workspace (mirrors the
+            // `workspace.create` flow so `note.list` returns the well-known
+            // `spec` id immediately).
+            ensure_spec_note(&store, &bus, &ws.id).await?;
+            // Copy over every non-`spec` note from the source with a freshly
+            // minted id; per-note failures are logged and skipped so a single
+            // bad row does not abort the duplication.
+            match store.list_notes(&id).await {
+                Ok(source_notes) => {
+                    for src in source_notes {
+                        if src.id.as_str() == "spec" {
+                            continue;
+                        }
+                        let clone = Note {
+                            id: NoteId::new(),
+                            workspace_id: ws.id.clone(),
+                            title: src.title,
+                            content: src.content,
+                            content_type: src.content_type,
+                            tags: src.tags,
+                            is_pinned: src.is_pinned,
+                            is_archived: src.is_archived,
+                            is_default: false,
+                            parent_id: None,
+                            visibility: src.visibility,
+                            metadata: NoteMetadata::default(),
+                            created_at: now.clone(),
+                            rev: 0,
+                            updated_at: now.clone(),
+                        };
+                        if let Err(e) = store.insert_note(&clone).await {
+                            tracing::warn!(
+                                workspace = %ws.id.as_str(),
+                                error = %e,
+                                "workspace.duplicate: failed to copy note"
+                            );
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    workspace = %id.as_str(),
+                    error = %e,
+                    "workspace.duplicate: failed to list source notes"
+                ),
+            }
+            Ok(ws)
+        })
+    }
+
+    fn cleanup_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
+        let store = self.store.clone();
+        let workspaces_root = self
+            .workspaces_root
+            .clone()
+            .unwrap_or_else(default_workspaces_root);
+        Box::pin(async move {
+            // Chief is virtual: no on-disk cache and no worktree — TS parity's
+            // `isVirtualWorkspace` guard.
+            if id.is_chief() {
+                return Ok(());
+            }
+            // Confirm the row exists before touching disk so a bogus id
+            // surfaces a `NotFound` at the trait layer instead of silently
+            // sweeping a random directory.
+            let ws = store.get_workspace(&id).await?;
+            // Best-effort recursive delete of the daemon-owned cache directory
+            // (`<workspaces_root>/<id>/cache`). Missing / non-existent is a
+            // success; other errors are logged and swallowed.
+            let cache_dir = workspaces_root.join(id.as_str()).join("cache");
+            let cache_task =
+                tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&cache_dir) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e),
+                })
+                .await;
+            match cache_task {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    workspace = %id.as_str(),
+                    error = %e,
+                    "workspace.cleanup: failed to remove cache directory"
+                ),
+                Err(join_err) => tracing::warn!(
+                    workspace = %id.as_str(),
+                    error = %join_err,
+                    "workspace.cleanup: cache cleanup task failed"
+                ),
+            }
+            // Run `git gc` against the worktree when there is one — reclaims
+            // loose objects and packs (TS `cleanupWorkspace` parity).
+            // Failures do not fail the RPC.
+            if let Some(wt) = ws
+                .worktree_path
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+            {
+                if wt.exists() {
+                    let gc = tokio::task::spawn_blocking(move || {
+                        std::process::Command::new("git")
+                            .arg("gc")
+                            .arg("--auto")
+                            .current_dir(&wt)
+                            .output()
+                    })
+                    .await;
+                    match gc {
+                        Ok(Ok(out)) if !out.status.success() => {
+                            tracing::warn!(
+                                workspace = %id.as_str(),
+                                stderr = %String::from_utf8_lossy(&out.stderr),
+                                "workspace.cleanup: git gc reported non-zero exit"
+                            );
+                        }
+                        Ok(Err(e)) => tracing::warn!(
+                            workspace = %id.as_str(),
+                            error = %e,
+                            "workspace.cleanup: git gc failed"
+                        ),
+                        Err(join_err) => tracing::warn!(
+                            workspace = %id.as_str(),
+                            error = %join_err,
+                            "workspace.cleanup: git gc task failed"
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn purge_workspaces(&self) -> BoxFuture<'_, Result<WorkspacePurgeResult>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        let workspaces_root = self
+            .workspaces_root
+            .clone()
+            .unwrap_or_else(default_workspaces_root);
+        Box::pin(async move {
+            let mut removed: u32 = 0;
+            let mut orphans: u32 = 0;
+            // Pass 1: drop every workspace whose stored status is `Deleted`.
+            // `list_workspaces(true)` includes archived rows; we filter by
+            // status manually so the pass is independent of the `archived`
+            // flag semantics.
+            let all = store.list_workspaces(true).await.unwrap_or_default();
+            let mut live_ids: HashSet<String> = HashSet::new();
+            for ws in &all {
+                if ws.status == WorkspaceStatus::Deleted {
+                    let dir = workspaces_root.join(ws.id.as_str());
+                    let cleanup =
+                        tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&dir) {
+                            Ok(()) => Ok(()),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                            Err(e) => Err(e),
+                        })
+                        .await;
+                    if let Ok(Err(e)) = cleanup {
+                        tracing::warn!(
+                            workspace = %ws.id.as_str(),
+                            error = %e,
+                            "workspace.purge: failed to remove deleted workspace directory"
+                        );
+                    }
+                    match store.delete_workspace(&ws.id).await {
+                        Ok(()) => {
+                            removed = removed.saturating_add(1);
+                            publish_event(&bus, workspace_deleted_event(&ws.id)).await;
+                        }
+                        Err(Error::NotFound(_)) => {}
+                        Err(e) => tracing::warn!(
+                            workspace = %ws.id.as_str(),
+                            error = %e,
+                            "workspace.purge: failed to delete row for deleted workspace"
+                        ),
+                    }
+                } else {
+                    live_ids.insert(ws.id.0.clone());
+                }
+            }
+            // Pass 2: sweep `<workspaces_root>/` for `<id>/` directories that
+            // no longer have a matching live row. Best-effort; anything we
+            // cannot read is logged and skipped.
+            let root_for_scan = workspaces_root.clone();
+            let scan = tokio::task::spawn_blocking(move || -> Vec<PathBuf> {
+                let mut orphan_paths = Vec::new();
+                let read = match std::fs::read_dir(&root_for_scan) {
+                    Ok(r) => r,
+                    Err(_) => return orphan_paths,
+                };
+                for entry in read.flatten() {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        // Skip reserved siblings inside the root (`clones/`,
+                        // any dotdir the daemon writes) and every live id.
+                        if name.starts_with('.') || name == "clones" {
+                            continue;
+                        }
+                        orphan_paths.push(path);
+                    }
+                }
+                orphan_paths
+            })
+            .await
+            .unwrap_or_default();
+            for path in scan {
+                let name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                if live_ids.contains(&name) {
+                    continue;
+                }
+                let target = path.clone();
+                let removed_ok =
+                    tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&target) {
+                        Ok(()) => Ok(()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(e) => Err(e),
+                    })
+                    .await;
+                match removed_ok {
+                    Ok(Ok(())) => orphans = orphans.saturating_add(1),
+                    Ok(Err(e)) => tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "workspace.purge: failed to remove orphan directory"
+                    ),
+                    Err(join_err) => tracing::warn!(
+                        path = %path.display(),
+                        error = %join_err,
+                        "workspace.purge: orphan cleanup task failed"
+                    ),
+                }
+            }
+            Ok(WorkspacePurgeResult { removed, orphans })
+        })
+    }
+
+    fn find_repositories(&self, directory: String) -> BoxFuture<'_, Result<Vec<String>>> {
+        Box::pin(async move {
+            let root = PathBuf::from(&directory);
+            let scan = tokio::task::spawn_blocking(move || {
+                let mut out = Vec::new();
+                scan_for_repositories(&root, 0, &mut out);
+                out
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("find_repositories task failed: {e}")))?;
+            Ok(scan)
+        })
+    }
+
+    fn initialize_repository(&self, path: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let repo_path = PathBuf::from(&path);
+            tokio::task::spawn_blocking(move || initialize_repository_blocking(&repo_path))
+                .await
+                .map_err(|e| Error::Internal(format!("initialize_repository task failed: {e}")))?
         })
     }
 
