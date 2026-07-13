@@ -487,19 +487,70 @@ impl Services {
         }
     }
 
+    /// Derive `lastActivity` as the max of the persisted value, `updatedAt`,
+    /// `createdAt`, every workspace note's `updated_at`, and every agent
+    /// session's `updated_at` (FE `deriveWorkspaceLastActivity` parity, §9.1).
+    /// Called on every path that returns a `Workspace` on the wire so clients
+    /// never have to recompute it. Store failures fall back to the workspace's
+    /// own timestamps rather than failing the caller.
+    pub(crate) async fn derive_last_activity(&self, ws: &mut Workspace) {
+        let mut activity_max = latest_activity_candidate(&[
+            ws.last_activity.as_deref(),
+            Some(ws.updated_at.as_str()),
+            Some(ws.created_at.as_str()),
+        ]);
+        if let Ok(notes) = self.store.list_notes(&ws.id).await {
+            for note in &notes {
+                activity_max =
+                    latest_activity_candidate(&[activity_max.as_deref(), Some(&note.updated_at)]);
+            }
+        }
+        if let Ok(sessions) = self.store.list_agent_sessions(&ws.id).await {
+            for session in &sessions {
+                activity_max = latest_activity_candidate(&[
+                    activity_max.as_deref(),
+                    Some(&session.updated_at),
+                ]);
+            }
+        }
+        if activity_max.is_some() {
+            ws.last_activity = activity_max;
+        }
+    }
+
     /// Populate a workspace's card aggregates (`taskStats`/`agentSummary`/
     /// `diffSummary`) for the `workspace.list` / `workspace.get` emit path (§9.1).
     /// Each is computed from live state (notes / agents / git worktree) and
     /// omitted when not computable; a read failure degrades to an absent
-    /// aggregate rather than failing the whole call.
+    /// aggregate rather than failing the whole call. Also derives
+    /// `lastActivity` (see [`Services::derive_last_activity`]) as part of the
+    /// same pass so list/get callers get both in one round-trip.
     pub(crate) async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
+        let mut activity_max = latest_activity_candidate(&[
+            ws.last_activity.as_deref(),
+            Some(ws.updated_at.as_str()),
+            Some(ws.created_at.as_str()),
+        ]);
         if let Ok(notes) = self.store.list_notes(&ws.id).await {
+            for note in &notes {
+                activity_max =
+                    latest_activity_candidate(&[activity_max.as_deref(), Some(&note.updated_at)]);
+            }
             ws.task_stats = Some(compute_task_stats(&notes));
         }
         if let Ok(sessions) = self.store.list_agent_sessions(&ws.id).await {
+            for session in &sessions {
+                activity_max = latest_activity_candidate(&[
+                    activity_max.as_deref(),
+                    Some(&session.updated_at),
+                ]);
+            }
             ws.agent_summary = Some(build_agent_summary(&sessions));
         }
         ws.diff_summary = compute_diff_summary(ws);
+        if activity_max.is_some() {
+            ws.last_activity = activity_max;
+        }
     }
 
     /// Record an agent session entering flight for `workspace_id`. On the
@@ -1489,6 +1540,45 @@ fn iso_to_epoch_ms(iso: &str) -> i64 {
     parse_iso(iso)
         .and_then(|dt| i64::try_from(dt.unix_timestamp_nanos() / 1_000_000).ok())
         .unwrap_or(0)
+}
+
+/// Return the latest RFC-3339 timestamp among the supplied candidates, ignoring
+/// unparsable or absent entries. Powers the `lastActivity` derivation on the
+/// `workspace.list`/`workspace.get` emit path (§9.1) — FE
+/// `getLatestActivityCandidate` parity.
+fn latest_activity_candidate(candidates: &[Option<&str>]) -> Option<String> {
+    let mut best: Option<(i64, String)> = None;
+    for c in candidates.iter().copied().flatten() {
+        let ms =
+            parse_iso(c).and_then(|dt| i64::try_from(dt.unix_timestamp_nanos() / 1_000_000).ok());
+        if let Some(ms) = ms {
+            if best.as_ref().map(|(b, _)| ms > *b).unwrap_or(true) {
+                best = Some((ms, c.to_string()));
+            }
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+/// Conservative allowlist of remote names whose first path segment may be
+/// stripped when canonicalising a workspace `baseRef` on write. Mirrors the
+/// FE `baseref-matching.ts` allowlist so a persisted `baseRef` compares raw-
+/// equal to a PR `sourceBranch` (§7.6). Slashed local branches like
+/// `feature/foo` are never stripped.
+const CANONICAL_BASE_REF_REMOTES: &[&str] = &["origin/", "upstream/", "fork/"];
+
+/// Strip a known remote prefix (`origin/`, `upstream/`, `fork/`) from a raw
+/// `baseRef` string, returning the canonical plain branch name. Values without
+/// a known prefix, and empty stripped remainders, are returned unchanged.
+fn canonicalise_base_ref(raw: &str) -> String {
+    for prefix in CANONICAL_BASE_REF_REMOTES {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            if !rest.is_empty() {
+                return rest.to_string();
+            }
+        }
+    }
+    raw.to_string()
 }
 
 /// Build a `line-attribution:updated` change event with the FE-parity payload
@@ -4926,7 +5016,11 @@ impl WorkspaceApi for Services {
                         id,
                         title,
                         branch,
-                        base_ref: input.base_ref,
+                        // Canonicalise the wire `baseRef` on write so the
+                        // persisted value is the plain branch name — a PR's
+                        // `sourceBranch` (never remote-qualified) compares
+                        // raw-equal without FE-side stripping (§7.6).
+                        base_ref: input.base_ref.map(|r| canonicalise_base_ref(&r)),
                         base_commit_sha: input.base_commit_sha,
                         status: WorkspaceStatus::Active,
                         status_message: input.status_message,
@@ -4934,8 +5028,11 @@ impl WorkspaceApi for Services {
                         activity: WorkspaceActivity::Idle,
                         attention: WorkspaceAttention::None,
                         created_at: now.clone(),
-                        updated_at: now,
-                        last_activity: None,
+                        updated_at: now.clone(),
+                        // Stamp `lastActivity` at create so it is always
+                        // populated — the emit path (§9.1) still enriches
+                        // with the max of notes / agents / updatedAt.
+                        last_activity: Some(now),
                         tags: input.tags.unwrap_or_default(),
                         path: input.path,
                         repository_path: input.repository_path,
@@ -4951,6 +5048,7 @@ impl WorkspaceApi for Services {
                         pr_url: None,
                         pr_status: None,
                         active_pull_request: None,
+                        pull_requests: None,
                         archived: false,
                         archived_at: None,
                         // Card aggregates are computed on the list/get emit path only.
@@ -5216,6 +5314,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let this = self.clone();
         // Snapshot the caller-supplied delta before it is consumed by the
         // apply loop; the `workspace:updated` event carries `changes` as the
         // applied delta (reference-parity FE emitter, §6.5).
@@ -5240,7 +5339,9 @@ impl WorkspaceApi for Services {
                 ws.branch = v;
             }
             if let Some(v) = update.base_ref {
-                ws.base_ref = Some(v);
+                // Canonicalise the wire `baseRef` on write so the persisted
+                // value stays the plain branch name (§7.6, matches create).
+                ws.base_ref = Some(canonicalise_base_ref(&v));
             }
             if let Some(v) = update.base_commit_sha {
                 ws.base_commit_sha = Some(v);
@@ -5281,11 +5382,23 @@ impl WorkspaceApi for Services {
             if let Some(v) = update.default_model {
                 ws.default_model = Some(v);
             }
+            // Clearable PR fields (§5.1): `Some(None)` deserialized from a
+            // wire `null` clears the stored value; `Some(Some(v))` sets it;
+            // bare `None` leaves it untouched (missing on the wire).
             if let Some(v) = update.pr_number {
-                ws.pr_number = Some(v);
+                ws.pr_number = v;
             }
             if let Some(v) = update.pr_url {
-                ws.pr_url = Some(v);
+                ws.pr_url = v;
+            }
+            if let Some(v) = update.pr_status {
+                ws.pr_status = v;
+            }
+            if let Some(v) = update.active_pull_request {
+                ws.active_pull_request = v;
+            }
+            if let Some(v) = update.pull_requests {
+                ws.pull_requests = v;
             }
             if let Some(v) = update.last_activity {
                 ws.last_activity = Some(v);
@@ -5314,6 +5427,11 @@ impl WorkspaceApi for Services {
                 ws.last_activity = pinned.last_activity;
             } else {
                 store.update_workspace(&ws).await?;
+                // Derive `lastActivity` (§9.1) on the returned record so
+                // `workspace.update` callers get the authoritative wire shape
+                // without a follow-up `workspace.get`. Chief is skipped: its
+                // timestamps are pinned above.
+                this.derive_last_activity(&mut ws).await;
             }
             // Self-sufficient `workspace:updated` payload (§6.5) so every
             // client mirrors the delta without a follow-up read.
@@ -5511,6 +5629,7 @@ impl WorkspaceApi for Services {
     fn archive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let this = self.clone();
         Box::pin(async move {
             // Chief cannot be archived: it is a fixed virtual workspace, so
             // return the synthesized shape unchanged rather than mutating the
@@ -5525,6 +5644,9 @@ impl WorkspaceApi for Services {
             ws.archived_at = Some(now.clone());
             ws.updated_at = now;
             store.update_workspace(&ws).await?;
+            // Derive `lastActivity` (§9.1) so archive callers get the
+            // authoritative wire shape without a follow-up `workspace.get`.
+            this.derive_last_activity(&mut ws).await;
             // §6.5 has no `workspace:archived`; mirror the reference emitter and
             // publish `workspace:updated` with the applied `{ archived }` delta
             // so subscribers flip state without a re-read.
@@ -5540,6 +5662,7 @@ impl WorkspaceApi for Services {
     fn unarchive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let this = self.clone();
         Box::pin(async move {
             if id.is_chief() {
                 return Ok(chief_workspace());
@@ -5550,6 +5673,7 @@ impl WorkspaceApi for Services {
             ws.archived_at = None;
             ws.updated_at = now_iso();
             store.update_workspace(&ws).await?;
+            this.derive_last_activity(&mut ws).await;
             publish_event(
                 &bus,
                 workspace_updated_event(&ws.id, serde_json::json!({ "archived": false })),
@@ -5647,6 +5771,7 @@ impl WorkspaceApi for Services {
                 pr_url: None,
                 pr_status: None,
                 active_pull_request: None,
+                pull_requests: None,
                 archived: false,
                 archived_at: None,
                 task_stats: None,
