@@ -1103,7 +1103,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Concurrent agent session cap (0 = auto based on system RAM; changes apply on daemon restart)",
             "agents",
             Some(0.0),
-            None,
+            Some(200.0), // Upper bound to prevent resource exhaustion
             0.0,
         ),
         number(
@@ -1151,9 +1151,9 @@ pub async fn max_concurrent_agents(store: &Store) -> Option<usize> {
     match store.get_setting("agents.maxConcurrent").await {
         Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
             .ok()
-            .and_then(|v| v.as_f64())
-            .filter(|&n| n > 0.0 && n.fract() == 0.0) // reject non-integer values
-            .and_then(|n| usize::try_from(n as i64).ok()),
+            .and_then(|v| v.as_u64()) // parse as u64 directly to avoid float saturation
+            .filter(|&n| n > 0 && n <= 200) // reject 0, negative, and unreasonably large values
+            .and_then(|n| usize::try_from(n).ok()),
         _ => None,
     }
 }
