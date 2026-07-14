@@ -12,6 +12,7 @@
 
 use intent_core::events::AGENT_IDLE;
 use intent_core::{AgentId, AgentSession, Error, Event, NoteId, WorkspaceApi};
+use intent_git::commit::CLEAN_TREE_ERROR;
 
 use crate::events::SubscriptionFilter;
 use crate::Services;
@@ -26,10 +27,6 @@ const AUTO_COMMIT_DISABLED_MARK: &str = "Auto-commit is disabled";
 /// `git_agent_commit` empty-worktree result (§5.6 parity) treated as a silent
 /// skip — there is simply nothing to attribute to the idle agent.
 const NO_CHANGES_MARK: &str = "No uncommitted changes found";
-/// Clean-tree rejection from `intent_git::commit` when the staged tree
-/// matches the parent commit exactly (also a benign skip). Must stay in
-/// sync with the error text in `intent_git::commit::commit`.
-const CLEAN_TREE_MARK: &str = "nothing to commit, working tree clean";
 
 /// Whether the `agent:idle` `finishReason` is a normal turn-end we should
 /// auto-commit on. Anything outside this allowlist (or missing) is treated as
@@ -155,7 +152,7 @@ impl Services {
             Err(Error::Internal(msg))
                 if msg.contains(AUTO_COMMIT_DISABLED_MARK)
                     || msg.contains(NO_CHANGES_MARK)
-                    || msg.contains(CLEAN_TREE_MARK) =>
+                    || msg.contains(CLEAN_TREE_ERROR) =>
             {
                 tracing::debug!(
                     agent = %agent_id.0,
