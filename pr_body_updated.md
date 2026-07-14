@@ -11,10 +11,11 @@ Implements three observability features to make the next unexplained daemon deat
 ### File Logging
 - Uses tracing-appender::rolling with **daily rotation** (time-based, not size-based)
 - Logs to INTENTD_DATA_DIR/intentd.log
-- Keeps ~5 files (max_log_files setting)
+- Keeps 5 most recent files (hardcoded `max_log_files(5)`)
 - INFO default, RUST_LOG override respected
 - Dual output: stderr (interactive) + file (diagnostics)
 - Degrades gracefully: if file appender fails, continues with stderr-only logging
+- WorkerGuard stored in static to keep background writer thread alive for process lifetime
 
 ### Panic Hook
 - Installed via std::panic::set_hook

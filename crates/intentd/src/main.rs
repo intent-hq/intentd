@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -27,6 +27,10 @@ mod client;
 mod import;
 mod service;
 use client::rpc_call;
+
+/// Global guard for the file log writer thread. Must be kept alive for the
+/// process lifetime to ensure file logging continues working.
+static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
 /// intentd — local-first JSON-RPC daemon for the Intent domain model.
 #[derive(Debug, Parser)]
@@ -285,10 +289,14 @@ fn init_tracing() {
         .with(stderr_layer);
 
     if let Some(appender) = file_appender {
-        let (non_blocking, _guard) = tracing_appender::non_blocking(appender);
+        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
         let file_layer = fmt::layer().with_writer(non_blocking).with_ansi(false);
         match subscriber.with(file_layer).try_init() {
-            Ok(_) => {}
+            Ok(_) => {
+                // Store the guard in a static to keep it alive for the process lifetime.
+                // Dropping it would stop the background file writer thread.
+                let _ = LOG_GUARD.set(guard);
+            }
             Err(e) => eprintln!(
                 "WARN: failed to initialize tracing (already initialized?): {}",
                 e
