@@ -1944,7 +1944,9 @@ impl AgentManager {
         self.kill_child_only(&agent_id).await;
 
         // Start the drain loop to redrive the requeued message
-        self.clone().try_drain_queue(agent_id, workspace_id.clone()).await;
+        self.clone()
+            .try_drain_queue(agent_id, workspace_id.clone())
+            .await;
 
         Ok(json!({ "ok": true }))
     }
