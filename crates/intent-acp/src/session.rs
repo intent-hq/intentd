@@ -33,7 +33,15 @@ pub use agent_client_protocol::schema::{
 
 /// Timeout for session setup requests (`session/new`, `session/load`). Generous
 /// relative to `initialize` because the agent may connect MCP servers here.
-const SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Overridable via `INTENTD_SESSION_SETUP_TIMEOUT_MS` (primarily for tests/CI).
+fn session_setup_timeout() -> Duration {
+    if let Ok(val) = std::env::var("INTENTD_SESSION_SETUP_TIMEOUT_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return Duration::from_millis(ms);
+        }
+    }
+    Duration::from_secs(60)
+}
 /// Timeout for a full prompt turn. A turn can run for minutes, so this is large;
 /// real cancellation flows through `session/cancel`, not the timeout.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -49,7 +57,7 @@ pub async fn new_session(
     let request = NewSessionRequest::new(cwd).mcp_servers(mcp_servers);
     let params = serde_json::to_value(&request)?;
     let result = conn
-        .request_timeout("session/new", params, SESSION_SETUP_TIMEOUT)
+        .request_timeout("session/new", params, session_setup_timeout())
         .await?;
     serde_json::from_value(result)
         .map_err(|e| AcpError::Protocol(format!("invalid session/new response: {e}")))
@@ -67,7 +75,7 @@ pub async fn load_session(
     let request = LoadSessionRequest::new(SessionId::new(session_id), cwd).mcp_servers(mcp_servers);
     let params = serde_json::to_value(&request)?;
     let result = conn
-        .request_timeout("session/load", params, SESSION_SETUP_TIMEOUT)
+        .request_timeout("session/load", params, session_setup_timeout())
         .await?;
     serde_json::from_value(result)
         .map_err(|e| AcpError::Protocol(format!("invalid session/load response: {e}")))

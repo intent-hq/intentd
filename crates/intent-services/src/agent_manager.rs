@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::agent_ops::new_message_id;
-
+use crate::agent_session::agent_actor;
 use crate::events::EventBus;
 use crate::Services;
 
@@ -1536,6 +1536,20 @@ impl AgentManager {
         claimed
     }
 
+    /// Release the in-flight slot without persisting agent status (used when
+    /// terminal spawn failure already persisted Error status and we only need
+    /// to release busy/agent_ws so a future message can restart the worker).
+    async fn release_in_flight_slot(&self, agent_id: &AgentId) {
+        let was_busy = self.busy.lock().unwrap().remove(agent_id);
+        if !was_busy {
+            return;
+        }
+        let workspace_id = self.agent_ws.lock().unwrap().remove(agent_id);
+        if let Some(workspace_id) = workspace_id {
+            self.services.agent_activity_end(&workspace_id).await;
+        }
+    }
+
     /// Release the in-flight slot, recomputing the owning workspace's derived
     /// `WorkspaceActivity` (§9.9) and emitting `workspace:activity-changed` on
     /// the `AgentRunning → Idle` edge. Also persists the `agent_session.status`
@@ -1872,6 +1886,71 @@ impl AgentManager {
         self.try_begin(agent_id, workspace_id).await
     }
 
+    /// Retry a failed agent spawn (`agent.retry` RPC path). Only valid when
+    /// the agent status is `error`; returns `{ ok: false }` otherwise. Clears
+    /// the error status back to pending, tears down any stale child, and
+    /// attempts to redrive the front-of-queue message (requeued at exhaustion)
+    /// plus any subsequent messages. Reuses the spawn-retry/backoff machinery,
+    /// so a retry that fails again lands back in the `error` state with events.
+    pub async fn agent_retry(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        _workspace_id: WorkspaceId,
+    ) -> Result<Value> {
+        // Fetch current session status
+        let session = self.services.store.get_agent_session(&agent_id).await?;
+
+        // Only allow retry when the session status is `error`
+        if session.status != AgentStatus::Error {
+            return Ok(json!({ "ok": false }));
+        }
+
+        // Use the session's persisted workspace_id for safety (cross-workspace guard)
+        let workspace_id = &session.workspace_id;
+
+        // Clear the error status back to pending
+        let ts = now_iso();
+        self.services
+            .store
+            .set_agent_session_status(workspace_id, &agent_id, AgentStatus::Pending, false, &ts)
+            .await?;
+
+        // Emit agent:status-changed
+        let event = NewEvent {
+            workspace_id: workspace_id.clone(),
+            timestamp: ts,
+            event_type: AGENT_STATUS_CHANGED.to_string(),
+            actor: agent_actor(&agent_id),
+            session_id: Some(agent_id.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({
+                "agentId": agent_id.0,
+                "status": "pending",
+                "isActive": false,
+            }),
+        };
+        crate::publish_event(&self.services.event_bus, event).await;
+
+        // Abort any in-flight worker task and release the in-flight slot
+        if let Some(worker) = self.workers.lock().unwrap().remove(&agent_id) {
+            worker.abort();
+        }
+        self.release_in_flight_slot(&agent_id).await;
+
+        // Tear down any stale child handle (use kill_child_only to avoid
+        // overwriting the status we just set to Pending)
+        self.kill_child_only(&agent_id).await;
+
+        // Start the drain loop to redrive the requeued message
+        self.clone()
+            .try_drain_queue(agent_id, workspace_id.clone())
+            .await;
+
+        Ok(json!({ "ok": true }))
+    }
+
     /// Spawn the background turn worker after the caller has already claimed
     /// the in-flight slot via [`AgentManager::try_begin_turn`] AND persisted
     /// the user-message row. The worker path does NOT re-persist the initial
@@ -1965,6 +2044,19 @@ impl AgentManager {
         self.registry
             .evict_idle_older_than(ttl, move |id| !busy.lock().unwrap().contains(id))
             .await
+    }
+
+    /// Tear down only the agent's child process + handle, without touching the
+    /// worker or busy flag. Safe to call from within the worker itself (e.g.,
+    /// retry loop). Use `stop()` for full teardown from external callers.
+    async fn kill_child_only(&self, agent_id: &AgentId) {
+        let handle = self.handles.lock().unwrap().remove(agent_id);
+        if let Some(mut handle) = handle {
+            if let Some(child) = handle._child.take() {
+                kill_child_tree(child).await;
+            }
+        }
+        self.registry.deregister(agent_id);
     }
 
     /// Build the kill callback for `agent_id`: removing the handle signals the
@@ -2308,7 +2400,7 @@ async fn run_message_worker(
     // agent with the same ACP content blocks as if it had run inline.
     let mut options = initial_options;
     'outer: loop {
-        match mgr.ensure_started(&agent_id, &workspace_id).await {
+        match retry_spawn(&mgr, &agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
                 let prompt = mgr
                     .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
@@ -2321,7 +2413,21 @@ async fn run_message_worker(
                 }
             }
             Err(e) => {
-                tracing::warn!(agent = %agent_id, error = %e, "agent spawn failed");
+                tracing::warn!(agent = %agent_id, error = %e, "agent spawn failed after all retries");
+                handle_terminal_spawn_failure(
+                    &mgr,
+                    &agent_id,
+                    &workspace_id,
+                    &content,
+                    &options,
+                    &e,
+                )
+                .await;
+                // Release the in-flight slot without overwriting the Error status
+                // that handle_terminal_spawn_failure just persisted. This allows
+                // a future message (or agent.retry) to restart the worker.
+                mgr.release_in_flight_slot(&agent_id).await;
+                break 'outer;
             }
         }
         // Drain the next queued message while still holding the in-flight slot.
@@ -2430,6 +2536,232 @@ async fn persist_user(
             tracing::warn!(agent = %agent_id, error = %e, "failed to persist queued user message");
         }
     }
+}
+
+/// Max number of spawn attempts (includes the initial attempt).
+const MAX_SPAWN_ATTEMPTS: u32 = 3;
+/// Default backoff delays between retry attempts (in milliseconds).
+const DEFAULT_RETRY_BACKOFF_MS: &[u64] = &[2000, 5000];
+
+/// Get retry backoff delays, overridable via INTENTD_SPAWN_RETRY_BACKOFF_MS
+/// (comma-separated milliseconds, e.g. "100,200"). Primarily for tests/CI.
+fn retry_backoff_ms() -> Vec<u64> {
+    if let Ok(val) = std::env::var("INTENTD_SPAWN_RETRY_BACKOFF_MS") {
+        let mut delays = Vec::new();
+        for part in val.split(',') {
+            if let Ok(ms) = part.trim().parse::<u64>() {
+                delays.push(ms);
+            } else {
+                // Invalid format, fall back to default
+                return DEFAULT_RETRY_BACKOFF_MS.to_vec();
+            }
+        }
+        if !delays.is_empty() {
+            return delays;
+        }
+    }
+    DEFAULT_RETRY_BACKOFF_MS.to_vec()
+}
+
+/// Classify whether an error from `ensure_started` is retryable. Retryable
+/// errors include session/new or session/load timeouts and handshake failures
+/// (e.g., "agent stdout closed" when the child dies immediately). Non-retryable
+/// errors include InvalidParams, NotFound, Conflict, provider resolution
+/// failures, mock provider missing env, and unknown Internal errors (fail-fast
+/// by default to avoid retry loops on non-transient errors).
+fn is_retryable_spawn_error(err: &Error) -> bool {
+    // Non-retryable: InvalidParams, NotFound, Conflict are client/state issues,
+    // not transient spawn failures that benefit from retry.
+    match err {
+        Error::InvalidParams(_) | Error::NotFound(_) | Error::Conflict { .. } => {
+            return false;
+        }
+        _ => {}
+    }
+
+    let msg = err.to_string();
+    // Retryable: session setup timeout, handshake failures, transport errors
+    if msg.contains("session/new failed")
+        || msg.contains("session/load failed")
+        || msg.contains("handshake failed")
+        || msg.contains("agent stdout closed")
+        || msg.contains("timed out")
+    {
+        return true;
+    }
+    // Non-retryable: provider resolution failures (missing env, etc.)
+    if msg.contains("provider") && msg.contains("missing") {
+        return false;
+    }
+    // Default to non-retryable for unexpected Internal errors (conservative:
+    // only retry explicitly-known transient failures to avoid masking bugs).
+    false
+}
+
+/// Retry `ensure_started` up to `MAX_SPAWN_ATTEMPTS` times with exponential
+/// backoff. On each retry (after the first failure), tear down the failed
+/// child, publish an `agent:stream:status` retry hint, and spawn a fresh
+/// process. Returns the `acpSessionId` on success, or the final error after
+/// exhausting all attempts.
+async fn retry_spawn(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+) -> Result<String> {
+    let mut last_error: Option<Error> = None;
+
+    for attempt in 1..=MAX_SPAWN_ATTEMPTS {
+        match mgr.ensure_started(agent_id, workspace_id).await {
+            Ok(session_id) => return Ok(session_id),
+            Err(e) => {
+                let retryable = is_retryable_spawn_error(&e);
+                let error_msg = e.to_string();
+                tracing::warn!(
+                    agent = %agent_id,
+                    attempt = attempt,
+                    max = MAX_SPAWN_ATTEMPTS,
+                    retryable = retryable,
+                    error = %e,
+                    "agent spawn attempt failed"
+                );
+
+                last_error = Some(e);
+
+                // If non-retryable or last attempt, fail immediately
+                if !retryable || attempt == MAX_SPAWN_ATTEMPTS {
+                    break;
+                }
+
+                // Tear down the failed child so the next attempt spawns fresh
+                // (narrower than full stop() — only kills child/handle, no worker/busy-flag touch)
+                mgr.kill_child_only(agent_id).await;
+
+                // Publish retry status hint with the actual failure kind
+                let retry_num = attempt;
+                let failure_kind = if error_msg.contains("timed out") {
+                    "timed out"
+                } else if error_msg.contains("agent stdout closed") {
+                    "stdout closed"
+                } else {
+                    "failed"
+                };
+                let message = format!(
+                    "Agent spawn {} — retrying (attempt {}/{})…",
+                    failure_kind,
+                    retry_num + 1,
+                    MAX_SPAWN_ATTEMPTS
+                );
+                mgr.services
+                    .publish_status_event(
+                        workspace_id,
+                        agent_id,
+                        "spawn-retry",
+                        &message,
+                        "warning",
+                    )
+                    .await;
+
+                // Backoff before retry
+                let backoff = retry_backoff_ms();
+                if let Some(&delay_ms) = backoff.get((attempt - 1) as usize) {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| Error::Internal("spawn retry loop exhausted without error".to_string())))
+}
+
+/// Handle terminal spawn failure after all retries are exhausted. Publishes
+/// terminal `agent:failed` and `agent:stream:end` events, persists the agent
+/// status as `Error`, requeues the failed message to the front of the queue,
+/// and stops draining further messages.
+async fn handle_terminal_spawn_failure(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    content: &str,
+    options: &TurnOptions,
+    error: &Error,
+) {
+    use intent_core::events::{AGENT_FAILED, AGENT_STATUS_CHANGED, AGENT_STREAM_END};
+    use serde_json::json;
+
+    // Build error message. We do NOT include recent stderr in the agent:failed
+    // event to avoid leaking secrets (API keys, tokens, file paths) to subscribed
+    // clients. Stderr is available server-side in logs for debugging.
+    let error_msg = error.to_string();
+
+    // Publish terminal agent:failed event
+    mgr.services
+        .publish_agent_event(
+            workspace_id,
+            agent_id,
+            AGENT_FAILED,
+            json!({ "agentId": agent_id.0, "error": error_msg }),
+        )
+        .await;
+
+    // Publish terminal agent:stream:end event
+    mgr.services
+        .publish_agent_event(
+            workspace_id,
+            agent_id,
+            AGENT_STREAM_END,
+            json!({ "agentId": agent_id.0 }),
+        )
+        .await;
+
+    // Persist agent status as Error and emit agent:status-changed
+    let ts = now_iso();
+    if let Err(e) = mgr
+        .services
+        .store
+        .set_agent_session_status(workspace_id, agent_id, AgentStatus::Error, false, &ts)
+        .await
+    {
+        tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status");
+    } else {
+        // Emit agent:status-changed
+        let event = NewEvent {
+            workspace_id: workspace_id.clone(),
+            timestamp: ts,
+            event_type: AGENT_STATUS_CHANGED.to_string(),
+            actor: agent_actor(agent_id),
+            session_id: Some(agent_id.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({
+                "agentId": agent_id.0,
+                "status": "error",
+                "isActive": false,
+            }),
+        };
+        crate::publish_event(&mgr.services.event_bus, event).await;
+    }
+
+    // Requeue the failed message to the front of the queue
+    let queued = crate::agent_ops::QueuedMessage {
+        id: new_message_id(),
+        content: content.to_string(),
+        image_blocks: options.image_blocks.clone(),
+        file_blocks: options.file_blocks.clone(),
+        queued_at: now_iso(),
+        editing: false,
+    };
+    mgr.services.requeue_front(agent_id, queued);
+
+    // Publish queue updated so FE reflects the requeued message
+    mgr.services
+        .publish_queue_updated_for(
+            agent_id,
+            workspace_id,
+            mgr.services.queue_snapshot(agent_id),
+        )
+        .await;
 }
 
 #[cfg(test)]
@@ -2745,5 +3077,241 @@ mod role_reminder_tests {
             .agent_specialist_injection(&agent_id, None)
             .await
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    //! Unit tests for spawn retry logic (classify retryable errors, tear down
+    //! failed child between attempts, emit terminal failure events).
+
+    use super::*;
+
+    #[test]
+    fn session_new_timeout_is_retryable() {
+        let err =
+            Error::Internal("session/new failed: request `session/new` timed out".to_string());
+        assert!(is_retryable_spawn_error(&err));
+    }
+
+    #[test]
+    fn session_load_timeout_is_retryable() {
+        let err = Error::Internal("session/load failed: timed out after 60s".to_string());
+        assert!(is_retryable_spawn_error(&err));
+    }
+
+    #[test]
+    fn handshake_agent_stdout_closed_is_retryable() {
+        let err =
+            Error::Internal("handshake failed: JSON-RPC error 0: agent stdout closed".to_string());
+        assert!(is_retryable_spawn_error(&err));
+    }
+
+    #[test]
+    fn not_found_is_not_retryable() {
+        let err = Error::NotFound("agent session not found".to_string());
+        assert!(!is_retryable_spawn_error(&err));
+    }
+
+    #[test]
+    fn provider_missing_is_not_retryable() {
+        let err =
+            Error::Internal("provider auggie missing required env ANTHROPIC_API_KEY".to_string());
+        assert!(!is_retryable_spawn_error(&err));
+    }
+
+    #[test]
+    fn generic_internal_error_is_not_retryable() {
+        // Default changed to non-retryable for unknown Internal errors to avoid
+        // masking bugs — only explicitly-known transient failures are retried.
+        let err = Error::Internal("transport error: connection reset".to_string());
+        assert!(!is_retryable_spawn_error(&err));
+    }
+
+    #[test]
+    fn invalid_params_is_not_retryable() {
+        let err = Error::InvalidParams("missing required parameter".to_string());
+        assert!(!is_retryable_spawn_error(&err));
+    }
+
+    #[test]
+    fn conflict_is_not_retryable() {
+        let err = Error::Conflict {
+            current: serde_json::json!({"rev": 2}),
+        };
+        assert!(!is_retryable_spawn_error(&err));
+    }
+}
+
+#[cfg(test)]
+mod agent_retry_tests {
+    //! Unit tests for agent.retry RPC (retry a failed agent spawn).
+
+    use super::*;
+    use crate::events::EventBus;
+    use crate::BusEventSink;
+    use intent_core::{
+        AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
+        WorkspaceStatus,
+    };
+    use intent_store::Store;
+    use std::sync::Arc;
+
+    fn workspace(id: &WorkspaceId) -> Workspace {
+        let ts = now_iso();
+        Workspace {
+            id: id.clone(),
+            title: "Test WS".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            pull_requests: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            archived: false,
+            archived_at: None,
+            active_pull_request: None,
+            pr_number: None,
+            pr_status: None,
+            pr_url: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            task_stats: None,
+        }
+    }
+
+    fn session(agent_id: &AgentId, ws: &WorkspaceId, status: AgentStatus) -> AgentSession {
+        let ts = now_iso();
+        AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: Some("session-1".to_string()),
+            name: "Agent".to_string(),
+            name_explicitly_set: false,
+            model: Some("model-1".to_string()),
+            provider: Some("provider-1".to_string()),
+            system_prompt: None,
+            specialist: None,
+            status,
+            is_active: false,
+            messages: Vec::new(),
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    }
+
+    async fn manager_with_session(
+        agent_id: &AgentId,
+        ws: &WorkspaceId,
+        status: AgentStatus,
+    ) -> Arc<AgentManager> {
+        let path = std::env::temp_dir().join(format!("intentd-retry-{}.db", uuid::Uuid::new_v4()));
+        let db = Store::open(&path).await.expect("temp store");
+        db.insert_workspace(&workspace(ws))
+            .await
+            .expect("insert workspace");
+        db.insert_agent_session(&session(agent_id, ws, status))
+            .await
+            .expect("insert session");
+        let bus = EventBus::new(db.clone());
+        let services = Services::new(db).with_event_bus(bus.clone());
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+        Arc::new(AgentManager::new(services, sink, 8))
+    }
+
+    #[tokio::test]
+    async fn retry_from_error_status_returns_ok_true() {
+        let agent_id = AgentId::from("agent-1");
+        let ws = WorkspaceId::from("ws-1");
+        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+
+        let result = mgr
+            .agent_retry(agent_id.clone(), ws.clone())
+            .await
+            .expect("retry");
+        assert_eq!(result["ok"], true);
+
+        // Status should be cleared to Pending
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .expect("session");
+        assert_eq!(session.status, AgentStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn retry_from_pending_status_returns_ok_false() {
+        let agent_id = AgentId::from("agent-2");
+        let ws = WorkspaceId::from("ws-2");
+        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Pending).await;
+
+        let result = mgr
+            .agent_retry(agent_id.clone(), ws.clone())
+            .await
+            .expect("retry");
+        assert_eq!(result["ok"], false);
+
+        // Status should remain Pending
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .expect("session");
+        assert_eq!(session.status, AgentStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn retry_from_active_status_returns_ok_false() {
+        let agent_id = AgentId::from("agent-3");
+        let ws = WorkspaceId::from("ws-3");
+        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Active).await;
+
+        let result = mgr
+            .agent_retry(agent_id.clone(), ws.clone())
+            .await
+            .expect("retry");
+        assert_eq!(result["ok"], false);
+
+        // Status should remain Active
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .expect("session");
+        assert_eq!(session.status, AgentStatus::Active);
     }
 }

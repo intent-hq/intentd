@@ -1334,6 +1334,26 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.retry`: redrive a failed agent spawn — only valid when the agent
+    /// status is `error`; returns `{ ok: false }` otherwise. Clears the error
+    /// status back to pending, tears down any stale child, and attempts to
+    /// redrive the front-of-queue message (requeued at exhaustion) plus any
+    /// subsequent messages. Reuses the spawn-retry/backoff machinery, so a
+    /// retry that fails again lands back in the `error` state with events
+    /// (new in intentd — not part of the ported 104).
+    fn agent_retry(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_retry not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.setModel`: change an agent's model (PROTOCOL §5.5).
     fn agent_set_model(
         &self,
