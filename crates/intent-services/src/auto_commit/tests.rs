@@ -94,6 +94,7 @@ fn workspace_with_repo(id: &WorkspaceId, repo: &GitRepo) -> Workspace {
         pr_url: None,
         pr_status: None,
         active_pull_request: None,
+        pull_requests: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -161,6 +162,9 @@ fn session(
         metadata: None,
         created_at: ts.clone(),
         updated_at: ts,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
     }
 }
 

@@ -87,6 +87,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         pr_url: None,
         pr_status: None,
         active_pull_request: None,
+        pull_requests: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -207,6 +208,9 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         metadata: None,
         created_at: now_iso(),
         updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
     };
     store
         .insert_agent_session(&mk_agent("agent-1", "Builder", Some("implementor")))
@@ -1367,6 +1371,9 @@ async fn note_add_stamps_agent_author_with_session_name() {
         metadata: None,
         created_at: now_iso(),
         updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
     };
     svc.store
         .insert_agent_session(&session)
@@ -2798,6 +2805,9 @@ mod change_event_parity {
             metadata: None,
             created_at: now_iso(),
             updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         };
         h.store
             .insert_agent_session(&session)
@@ -3124,6 +3134,45 @@ mod change_event_parity {
             quiet.is_err(),
             "unarchive_workspace must publish exactly one event, got extra: {quiet:?}"
         );
+    }
+
+    /// `update_workspace` normalises the delta snapshot published as
+    /// `workspace:updated { changes }` (§6.5) so subscribers can mirror the
+    /// applied delta without a follow-up read: a raw `baseRef: "origin/main"`
+    /// collapses to canonical `"main"`, and a whitespace-only `statusMessage`
+    /// folds to the empty-string clear signal (preserving the "clear" vs
+    /// "no change" distinction, which a `None` snapshot would erase via
+    /// `skip_serializing_if`).
+    #[tokio::test]
+    async fn update_workspace_event_delta_matches_persisted_normalisation() {
+        use intent_core::{WorkspaceApi, WorkspaceUpdate};
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let ws = h
+            .services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    base_ref: Some("origin/main".to_string()),
+                    status_message: Some("   \t ".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update");
+        // Persisted / returned workspace carries the canonical values.
+        assert_eq!(ws.base_ref.as_deref(), Some("main"));
+        assert!(ws.status_message.is_none());
+
+        // The emitted `changes` mirrors those canonical values (raw
+        // `origin/main` and whitespace-only `statusMessage` would surface as
+        // state divergence for subscribers). `statusMessage: ""` is the
+        // explicit clear wire value; omitting it would collapse to
+        // "no change" via `skip_serializing_if`.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(ev["data"]["changes"]["baseRef"], json!("main"));
+        assert_eq!(ev["data"]["changes"]["statusMessage"], json!(""));
     }
 
     /// Derived `activity` flips `Idle → AgentRunning → Idle` across in-flight
@@ -4212,6 +4261,9 @@ mod mcp_callback {
             metadata: None,
             created_at: now_iso(),
             updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         };
         store.insert_agent_session(&session).await.expect("session");
 
@@ -5259,6 +5311,43 @@ mod pr {
         assert_eq!(outcome, crate::PrRefreshOutcome::Skipped);
         let evs = svc.store().events_by_workspace(&ws_id, 10).await.unwrap();
         assert!(evs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_all_discovers_unlinked_workspaces() {
+        // STAB-3 regression test: `refresh_all_workspace_prs()` (the background
+        // 60s loop) should discover and link PRs for unlinked workspaces, not just
+        // refresh already-linked ones. Without the fix, the background loop
+        // skipped workspaces with `pr_number.is_none()`, so discovery was
+        // on-demand only. This test asserts that an unlinked workspace on branch X
+        // with an open PR whose head ref is X gets linked when
+        // `refresh_all_workspace_prs()` runs (simulating the background loop).
+        let forge = StubForge {
+            discover: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) = refresh_setup(forge, "feature", None, false).await;
+
+        // Before the sweep the workspace is unlinked (no pr_number).
+        let before = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(before.pr_number, None);
+
+        // Run the same sweep the background loop runs.
+        svc.refresh_all_workspace_prs().await;
+
+        // After the sweep the workspace is linked to PR #42.
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+
+        // A `pr:linked` event was emitted.
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:linked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data["prNumber"], 42);
     }
 
     // ------------------------------------------------------------------------
@@ -6720,6 +6809,9 @@ mod search_adapters {
             metadata: None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         };
         store.insert_agent_session(&session).await.expect("session");
         for (role, content) in messages {
@@ -9251,7 +9343,12 @@ mod file_ops_service {
         let svc = Services::new(store);
 
         let written = svc
-            .file_write(ws.clone(), "notes/x.txt".to_string(), "hi".to_string())
+            .file_write(
+                ws.clone(),
+                "notes/x.txt".to_string(),
+                "hi".to_string(),
+                None,
+            )
             .await
             .expect("write");
         assert_eq!(
@@ -9260,13 +9357,13 @@ mod file_ops_service {
         );
 
         let read = svc
-            .file_read(ws.clone(), "notes/x.txt".to_string())
+            .file_read(ws.clone(), "notes/x.txt".to_string(), None)
             .await
             .expect("read");
         assert_eq!(read, serde_json::Value::String("hi".to_string()));
 
         let listed = svc
-            .file_list(ws.clone(), "notes".to_string())
+            .file_list(ws.clone(), "notes".to_string(), None)
             .await
             .expect("list");
         assert_eq!(
@@ -9274,10 +9371,257 @@ mod file_ops_service {
             serde_json::json!([{ "name": "x.txt", "type": "file" }])
         );
 
-        let denied = svc.file_read(ws.clone(), "../escape".to_string()).await;
+        let denied = svc
+            .file_read(ws.clone(), "../escape".to_string(), None)
+            .await;
         assert!(matches!(denied, Err(Error::Internal(_))));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Containment integration test: delegate an agent with isolation=cow, perform a
+    /// file write through the agent-scoped ops path (caller_agent_id → resolve_root),
+    /// and assert the write landed in the sandbox and the user's directory is untouched.
+    #[tokio::test]
+    async fn file_write_via_sandboxed_agent_is_contained() {
+        use crate::sandbox_ops::{provision_sandbox, ProvisionConfig};
+        use intent_core::{AgentId, AgentSession, AgentStatus};
+        use intent_git::{cow_probe, CowSupport};
+        use std::fs;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+
+        // Set up test directories under target/ (same volume)
+        let workspace_root = std::env::current_dir()
+            .unwrap()
+            .ancestors()
+            .nth(2) // packages/intentd
+            .unwrap()
+            .to_path_buf();
+        let test_root = workspace_root
+            .join("target")
+            .join(format!("test-containment-{}", uuid::Uuid::new_v4()));
+        let user_dir = test_root.join("user-workspace");
+        let workspaces_root = test_root.join("workspaces");
+
+        // Initialize a git repo in the user directory
+        fs::create_dir_all(&user_dir).unwrap();
+        let repo = git2::Repository::init(&user_dir).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
+            .unwrap();
+
+        // Early probe check - skip test if CoW not available
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&user_dir, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!(
+                "SKIP test (CoW not supported): {:?} → {:?}",
+                user_dir, workspaces_root
+            );
+            let _ = fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        // Create workspace pointing at user directory
+        let mut ws = workspace(&ws_id);
+        ws.repository_path = Some(user_dir.to_string_lossy().to_string());
+        ws.skip_worktree = true; // direct mode
+        store.insert_workspace(&ws).await.expect("insert ws");
+
+        // Create agent
+        let agent_id = AgentId::new();
+        let agent = AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws_id.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Sandboxed Agent".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        };
+        store
+            .insert_agent_session(&agent)
+            .await
+            .expect("insert agent");
+
+        // Create Services before provisioning so it has access to the store
+        let svc = Services::new(store.clone());
+
+        // Provision sandbox
+        let config = ProvisionConfig { workspaces_root };
+        let outcome = provision_sandbox(&store, &ws_id, &agent_id, &config)
+            .await
+            .expect("provision");
+        let crate::sandbox_ops::ProvisionOutcome::Supported {
+            path: sandbox_path, ..
+        } = outcome
+        else {
+            panic!("Expected Supported after probe confirmed CoW available");
+        };
+
+        // Update agent session with sandbox path (simulates delegate flow)
+        let mut updated_agent = store.get_agent_session(&agent_id).await.unwrap();
+        updated_agent.sandbox_path = Some(sandbox_path.to_string_lossy().to_string());
+        updated_agent.updated_at = now_iso();
+        store
+            .update_agent_session(&ws_id, &updated_agent)
+            .await
+            .unwrap();
+
+        // Write a file via the sandboxed agent (caller_agent_id triggers resolve_root to use sandbox_path)
+        let written = svc
+            .file_write(
+                ws_id.clone(),
+                "contained.txt".to_string(),
+                "sandboxed write".to_string(),
+                Some(agent_id.clone()),
+            )
+            .await
+            .expect("write via sandbox agent");
+
+        assert_eq!(
+            written,
+            serde_json::json!({ "ok": true, "path": "contained.txt", "size": 15 })
+        );
+
+        // Assert the write landed in the sandbox
+        let sandbox_file = sandbox_path.join("contained.txt");
+        assert!(
+            sandbox_file.exists(),
+            "Write must land in sandbox: {:?}",
+            sandbox_file
+        );
+        let sandbox_content = fs::read_to_string(&sandbox_file).unwrap();
+        assert_eq!(sandbox_content, "sandboxed write");
+
+        // Assert the user's directory is completely untouched
+        let user_file = user_dir.join("contained.txt");
+        assert!(
+            !user_file.exists(),
+            "User directory must remain untouched: {:?}",
+            user_file
+        );
+
+        // Clean up
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    /// Wire-contract test: agent.delegate returns effectiveIsolation field when
+    /// isolation is requested, reporting "cow" on successful provisioning or "direct"
+    /// on unsupported fallback.
+    #[tokio::test]
+    async fn delegate_returns_effective_isolation_in_result() {
+        use intent_core::AgentDelegateInput;
+        use intent_git::{cow_probe, CowSupport};
+        use std::fs;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+
+        // Set up test directories under target/ (same volume for CoW support)
+        let workspace_root = std::env::current_dir()
+            .unwrap()
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .to_path_buf();
+        let test_root = workspace_root
+            .join("target")
+            .join(format!("test-delegate-iso-{}", uuid::Uuid::new_v4()));
+        let user_dir = test_root.join("user-workspace");
+        let workspaces_root = test_root.join("workspaces");
+
+        // Initialize a git repo
+        fs::create_dir_all(&user_dir).unwrap();
+        let repo = git2::Repository::init(&user_dir).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
+            .unwrap();
+
+        // Create workspace
+        let mut ws = workspace(&ws_id);
+        ws.repository_path = Some(user_dir.to_string_lossy().to_string());
+        ws.skip_worktree = true;
+        store.insert_workspace(&ws).await.expect("insert ws");
+
+        // Probe CoW support to determine expected outcome
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&user_dir, &workspaces_root).unwrap();
+        let expected_isolation = match probe {
+            CowSupport::Supported => "cow",
+            CowSupport::Unsupported => "direct",
+        };
+
+        // Create services with workspaces_root configured
+        let mut svc = Services::new(store.clone());
+        svc.workspaces_root = Some(workspaces_root);
+
+        // Delegate with isolation=cow
+        let delegate_input = AgentDelegateInput {
+            task_text: Some("test task".to_string()),
+            agent_instructions: Some("test instructions".to_string()),
+            isolation: Some("cow".to_string()),
+            ..Default::default()
+        };
+        let result = svc
+            .agent_delegate_op(ws_id.clone(), delegate_input, None)
+            .await
+            .expect("delegate");
+
+        // Assert effectiveIsolation field is present and correct
+        let effective_iso = result
+            .get("effectiveIsolation")
+            .expect("effectiveIsolation field must be present when isolation is requested");
+        assert_eq!(
+            effective_iso.as_str().unwrap(),
+            expected_isolation,
+            "effectiveIsolation must report actual provisioning outcome"
+        );
+
+        // Also verify agentId and name are present (baseline delegate result shape)
+        assert!(result.get("ok").unwrap().as_bool().unwrap());
+        assert!(result.get("agentId").is_some());
+        assert!(result.get("name").is_some());
+
+        // Clean up
+        let _ = fs::remove_dir_all(&test_root);
     }
 }
 
@@ -9945,6 +10289,9 @@ mod heal_stale_agent_sessions {
             metadata: None,
             created_at: ts.clone(),
             updated_at: ts,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         }
     }
 

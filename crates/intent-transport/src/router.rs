@@ -8,9 +8,9 @@
 
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    Error, EventQueryParams, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId,
-    NoteUpdateInput, ScriptCreateParams, ScriptMode, WorkspaceApi, WorkspaceCreate, WorkspaceId,
-    WorkspaceUpdate,
+    ContextItem, Error, EventQueryParams, NoteAddInput, NoteCreate, NoteEditInput,
+    NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode, TaskAgentLink,
+    WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
 };
 use serde_json::{json, Map, Value};
 
@@ -196,13 +196,13 @@ async fn dispatch(
         }
         "workspace.archive" => {
             let id = require_workspace_id(params)?;
-            api.archive_workspace(id).await.map_err(workspace_err)?;
-            Ok(json!({ "success": true }))
+            let ws = api.archive_workspace(id).await.map_err(workspace_err)?;
+            Ok(json!({ "workspace": ws }))
         }
         "workspace.unarchive" => {
             let id = require_workspace_id(params)?;
-            api.unarchive_workspace(id).await.map_err(workspace_err)?;
-            Ok(json!({ "success": true }))
+            let ws = api.unarchive_workspace(id).await.map_err(workspace_err)?;
+            Ok(json!({ "workspace": ws }))
         }
         "workspace.dismissAttention" => {
             let id = require_workspace_id(params)?;
@@ -242,6 +242,58 @@ async fn dispatch(
             let id = require_workspace_id(params)?;
             let setup_script = api.generate_setup_script(id).await.map_err(workspace_err)?;
             Ok(json!({ "setupScript": setup_script }))
+        }
+        "workspace.getContext" => {
+            let id = require_workspace_id(params)?;
+            let items = api.get_workspace_context(id).await.map_err(workspace_err)?;
+            Ok(json!({ "items": items }))
+        }
+        "workspace.updateContext" => {
+            let id = require_workspace_id(params)?;
+            let items = require_context_items(params)?;
+            let items = api
+                .update_workspace_context(id, items)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "items": items }))
+        }
+        "workspace.duplicate" => {
+            let id = require_workspace_id(params)?;
+            let new_title = opt_str(params, "newTitle");
+            let ws = api
+                .duplicate_workspace(id, new_title)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "workspace": ws }))
+        }
+        "workspace.restore" => {
+            let id = require_workspace_id(params)?;
+            let ws = api.restore_workspace(id).await.map_err(workspace_err)?;
+            Ok(json!({ "workspace": ws }))
+        }
+        "workspace.cleanup" => {
+            let id = require_workspace_id(params)?;
+            api.cleanup_workspace(id).await.map_err(workspace_err)?;
+            Ok(json!({ "success": true }))
+        }
+        "workspace.purge" => {
+            let result = api.purge_workspaces().await.map_err(domain_to_rpc)?;
+            Ok(json!({ "removed": result.removed, "orphans": result.orphans }))
+        }
+        "workspace.findRepositories" => {
+            let directory = require_str_param(params, "directory")?;
+            let repositories = api
+                .find_repositories(directory)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({ "repositories": repositories }))
+        }
+        "workspace.initializeRepository" => {
+            let path = require_str_param(params, "path")?;
+            api.initialize_repository(path)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({ "success": true }))
         }
         "note.list" => {
             let ws_id = match params.get("workspaceId").and_then(Value::as_str) {
@@ -569,6 +621,39 @@ async fn dispatch(
                 Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Task not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
+        }
+        "task.linkAgent" => {
+            let workspace_id = require_workspace_id(params)?;
+            let note_id = require_note_id(params)?;
+            let task_text = require_non_empty_str(params, "taskText")?;
+            let agent_id = require_non_empty_str(params, "agentId")?;
+            let task_key = opt_nonempty_str(params, "taskKey").unwrap_or_else(|| task_text.clone());
+            let link = api
+                .link_task_agent(workspace_id, note_id, task_key, task_text, agent_id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "link": link }))
+        }
+        "task.unlinkAgent" => {
+            let workspace_id = require_workspace_id(params)?;
+            let note_id = require_note_id(params)?;
+            let task_key = require_non_empty_str(params, "taskKey")?;
+            let removed = api
+                .unlink_task_agent(workspace_id, note_id, task_key)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "removed": removed }))
+        }
+        "task.listAgentLinks" => {
+            let workspace_id = require_workspace_id(params)?;
+            let links = api
+                .list_task_agent_links(workspace_id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({
+                "links": links,
+                "linksByNoteId": links_by_note_id(&links),
+            }))
         }
         "comment.add" => {
             let ws = require_ws_note(params)?;
@@ -1122,6 +1207,12 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.retry" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = require_ws_note(params)?;
+            let result = api.agent_retry(ws, agent_id).await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.wakeOrCreate" => {
             let ws = require_ws_note(params)?;
             let task_note_id = require_str_param(params, "taskNoteId").map(NoteId::from)?;
@@ -1233,6 +1324,24 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "sandbox.merge" => {
+            let ws = require_ws_note(params)?;
+            let sandbox_id = require_agent_id(params)?;
+            let result = api
+                .sandbox_merge(ws, sandbox_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "sandbox.discard" => {
+            let ws = require_ws_note(params)?;
+            let sandbox_id = require_agent_id(params)?;
+            let result = api
+                .sandbox_discard(ws, sandbox_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "git.status" => {
             let ws = require_ws_note(params)?;
             let status = api.git_status(ws).await.map_err(domain_to_rpc)?;
@@ -1258,6 +1367,94 @@ async fn dispatch(
             let paths = params.get("paths").cloned().unwrap_or(Value::Null);
             let discarded = api.git_discard(ws, paths).await.map_err(domain_to_rpc)?;
             Ok(json!({ "ok": true, "paths": discarded }))
+        }
+        "git.stageHunk" => {
+            let ws = require_ws_note(params)?;
+            let file_path = require_str_param(params, "filePath")?;
+            let hunk_patch = require_str_param(params, "hunkPatch")?;
+            api.git_stage_hunk(ws, file_path, hunk_patch)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({ "ok": true }))
+        }
+        "git.unstageHunk" => {
+            let ws = require_ws_note(params)?;
+            let file_path = require_str_param(params, "filePath")?;
+            let hunk_patch = require_str_param(params, "hunkPatch")?;
+            api.git_unstage_hunk(ws, file_path, hunk_patch)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({ "ok": true }))
+        }
+        "git.push" => {
+            let ws = require_ws_note(params)?;
+            let force = parse_bool(params, "force");
+            let r = api.git_push(ws, force).await.map_err(domain_to_rpc)?;
+            Ok(json!({
+                "ok": true,
+                "branch": r.get("branch").cloned().unwrap_or(Value::Null),
+                "pushedSha": r.get("pushedSha").cloned().unwrap_or(Value::Null),
+            }))
+        }
+        "git.fetch" => {
+            let ws = require_ws_note(params)?;
+            api.git_fetch(ws).await.map_err(domain_to_rpc)?;
+            Ok(json!({ "ok": true }))
+        }
+        "git.createBranch" => {
+            let ws = require_ws_note(params)?;
+            let branch_name = require_str_param(params, "branchName")?;
+            // Default is `true` (TS parity with `gitService.createBranch`);
+            // callers wanting a bare `git branch <name>` pass `checkout:false`.
+            // Uses `parse_bool` (rather than `Value::as_bool`) so a string
+            // `"false"` is honoured, matching every other boolean arm.
+            let checkout = if params.contains_key("checkout") {
+                parse_bool(params, "checkout")
+            } else {
+                true
+            };
+            let r = api
+                .git_create_branch(ws, branch_name, checkout)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({
+                "ok": true,
+                "branch": r.get("branch").cloned().unwrap_or(Value::Null),
+            }))
+        }
+        "git.checkoutBranch" => {
+            let ws = require_ws_note(params)?;
+            let branch_name = require_str_param(params, "branchName")?;
+            let r = api
+                .git_checkout_branch(ws, branch_name)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({
+                "ok": true,
+                "branch": r.get("branch").cloned().unwrap_or(Value::Null),
+            }))
+        }
+        "git.renameBranch" => {
+            let ws = require_ws_note(params)?;
+            let old_branch_name = require_str_param(params, "oldBranchName")?;
+            let new_branch_name = require_str_param(params, "newBranchName")?;
+            let r = api
+                .git_rename_branch(ws, old_branch_name, new_branch_name)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({
+                "ok": true,
+                "oldBranch": r.get("oldBranch").cloned().unwrap_or(Value::Null),
+                "newBranch": r.get("newBranch").cloned().unwrap_or(Value::Null),
+            }))
+        }
+        "git.removeLockFile" => {
+            let ws = require_ws_note(params)?;
+            let r = api.git_remove_lock_file(ws).await.map_err(domain_to_rpc)?;
+            Ok(json!({
+                "ok": true,
+                "removed": r.get("removed").cloned().unwrap_or(Value::Bool(false)),
+            }))
         }
         "git.getBranches" => {
             let repo_path = require_str_param(params, "repoPath")?;
@@ -1411,6 +1608,58 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
+        }
+        "git.numstat" => {
+            // §5.6 extension: per-file additions/deletions for a workspace's
+            // tracked changes (or a branch-base two-dot range when `baseRef`
+            // / `baseCommitSha` is set). `staged` is honoured only when no
+            // base is supplied; `targetRef` defaults to `HEAD`.
+            let ws = require_ws_note(params)?;
+            let staged = opt_bool(params, "staged");
+            let base_ref = opt_nonempty_str(params, "baseRef");
+            let base_sha = opt_nonempty_str(params, "baseCommitSha");
+            let target_ref = opt_nonempty_str(params, "targetRef");
+            let paths = opt_str_array(params, "paths");
+            let r = api
+                .git_numstat(ws, staged, base_ref, base_sha, target_ref, paths)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "git.branchDiff" => {
+            // §5.6 extension: committed diff of `targetRef` vs the branch
+            // boundary (merge-base of `targetRef` and `baseRef`, else
+            // `baseCommitSha` when it is an ancestor of `targetRef`). At
+            // least one of `baseRef` / `baseCommitSha` is required (-32602);
+            // `targetRef` defaults to `HEAD`.
+            let ws = require_ws_note(params)?;
+            let base_ref = opt_nonempty_str(params, "baseRef");
+            let base_sha = opt_nonempty_str(params, "baseCommitSha");
+            if base_ref.is_none() && base_sha.is_none() {
+                return Err(rpc(
+                    INVALID_PARAMS,
+                    "git.branchDiff requires baseRef or baseCommitSha".to_string(),
+                ));
+            }
+            let target_ref = opt_nonempty_str(params, "targetRef");
+            let paths = opt_str_array(params, "paths");
+            let r = api
+                .git_branch_diff(ws, base_ref, base_sha, target_ref, paths)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "git.getRemoteUrl" => {
+            // §5.6 extension: path-based read like `git.getBranches` — a
+            // nonexistent / non-git repo path surfaces verbatim as -32602
+            // without the `invalid params:` prefix `domain_to_rpc` would add.
+            let repo_path = require_str_param(params, "repoPath")?;
+            let remote_name = opt_nonempty_str(params, "remoteName");
+            match api.git_get_remote_url(repo_path, remote_name).await {
+                Ok(r) => Ok(r),
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
         }
         "pr.status" => {
             let ws = require_ws_note(params)?;
@@ -2214,13 +2463,13 @@ async fn dispatch(
         "file.read" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
-            api.file_read(ws, path).await.map_err(domain_to_rpc)
+            api.file_read(ws, path, None).await.map_err(domain_to_rpc)
         }
         "file.write" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
             let content = require_str_param(params, "content")?;
-            api.file_write(ws, path, content)
+            api.file_write(ws, path, content, None)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -2228,7 +2477,7 @@ async fn dispatch(
             // `path` is optional, defaulting to "." (TS builder default).
             let ws = require_ws_note(params)?;
             let path = opt_str(params, "path").unwrap_or_else(|| ".".to_string());
-            api.file_list(ws, path).await.map_err(domain_to_rpc)
+            api.file_list(ws, path, None).await.map_err(domain_to_rpc)
         }
         "file.tree" => {
             // `path` is optional, defaulting to the workspace root ("."). The FE
@@ -2240,18 +2489,18 @@ async fn dispatch(
         "file.delete" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
-            api.file_delete(ws, path).await.map_err(domain_to_rpc)
+            api.file_delete(ws, path, None).await.map_err(domain_to_rpc)
         }
         "file.mkdir" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
-            api.file_mkdir(ws, path).await.map_err(domain_to_rpc)
+            api.file_mkdir(ws, path, None).await.map_err(domain_to_rpc)
         }
         "file.rename" => {
             let ws = require_ws_note(params)?;
             let old_path = require_str_param(params, "oldPath")?;
             let new_path = require_str_param(params, "newPath")?;
-            api.file_rename(ws, old_path, new_path)
+            api.file_rename(ws, old_path, new_path, None)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -2680,6 +2929,73 @@ fn opt_str(params: &Map<String, Value>, name: &str) -> Option<String> {
 /// widened `provider`/`agentType`/`workspacePath` fields).
 fn opt_nonempty_str(params: &Map<String, Value>, name: &str) -> Option<String> {
     opt_str(params, name).filter(|s| !s.trim().is_empty())
+}
+
+/// Parse the `items` array from `workspace.updateContext` into a
+/// `Vec<ContextItem>`. The daemon treats each item as an opaque JSON blob
+/// authored by the FE (`ContextItem` union in
+/// `packages/cloudlands-fe/src/features/context/types.ts`); the only
+/// required field is a non-empty string `id`, and ids must be unique inside
+/// a single request (the store keys rows by `(workspaceId, id)`). `items`
+/// itself must be an array — absent, non-array, per-item shape errors, and
+/// duplicate ids surface as `-32602 Invalid params`.
+fn require_context_items(params: &Map<String, Value>) -> Result<Vec<ContextItem>, RpcErr> {
+    let raw = params
+        .get("items")
+        .ok_or_else(|| rpc(INVALID_PARAMS, "items is required"))?;
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| rpc(INVALID_PARAMS, "items must be an array"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(arr.len());
+    for (idx, entry) in arr.iter().enumerate() {
+        let item: ContextItem = serde_json::from_value(entry.clone()).map_err(|e| {
+            rpc(
+                INVALID_PARAMS,
+                format!("items[{idx}] is not a valid ContextItem: {e}"),
+            )
+        })?;
+        if item.id.trim().is_empty() {
+            return Err(rpc(
+                INVALID_PARAMS,
+                format!("items[{idx}].id must be a non-empty string"),
+            ));
+        }
+        if !seen.insert(item.id.clone()) {
+            return Err(rpc(
+                INVALID_PARAMS,
+                format!("items[{idx}].id is a duplicate: {:?}", item.id),
+            ));
+        }
+        out.push(item);
+    }
+    Ok(out)
+}
+
+/// Group a flat list of task↔agent links into the FE-parity
+/// `byNoteId → byTaskKey → TaskAgentLink` map (matches
+/// `TaskAgentAssociationsState.byNoteId[noteId][taskKey]` so the FE
+/// hydration is a mechanical cut-over from
+/// `localStorage["task-agent-associations:{wsId}"]`). `TaskAgentLink`'s
+/// fields (strings + `i64`) are all trivially serializable — a
+/// `serde_json::to_value` failure here would indicate a corrupted process,
+/// so an `expect` is preferable to silently emitting a malformed
+/// `linksByNoteId` shape.
+fn links_by_note_id(links: &[TaskAgentLink]) -> Value {
+    let mut by_note: Map<String, Value> = Map::new();
+    for link in links {
+        let note_id = link.note_id.as_str().to_string();
+        let entry = by_note
+            .entry(note_id)
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Value::Object(inner) = entry {
+            let value =
+                serde_json::to_value(link).expect("TaskAgentLink is always serializable to JSON");
+            inner.insert(link.task_key.clone(), value);
+        }
+    }
+    Value::Object(by_note)
 }
 
 /// Optional string-array param (absent/null/non-array → `None`); non-string

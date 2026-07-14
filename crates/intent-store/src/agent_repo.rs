@@ -20,7 +20,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, \
     parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, \
     completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
-    is_background, metadata";
+    is_background, metadata, sandbox_id, sandbox_path, sandbox_branch";
 
 /// Encode an optional JSON payload column (`context_references` /
 /// `image_blocks`) as its TEXT form, `None` staying NULL.
@@ -48,7 +48,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&s.id.0)
@@ -76,6 +76,9 @@ impl Store {
             .bind(json_col_to_db(&s.image_blocks)?)
             .bind(s.is_background as i64)
             .bind(encode_metadata(s.metadata.as_ref())?)
+            .bind(&s.sandbox_id)
+            .bind(&s.sandbox_path)
+            .bind(&s.sandbox_branch)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
@@ -177,7 +180,8 @@ impl Store {
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, is_background=?, \
-             metadata=? WHERE id=? AND workspace_id=?",
+             metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=? \
+             WHERE id=? AND workspace_id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.acp_session_id)
@@ -201,6 +205,9 @@ impl Store {
         .bind(json_col_to_db(&s.image_blocks)?)
         .bind(s.is_background as i64)
         .bind(encode_metadata(s.metadata.as_ref())?)
+        .bind(&s.sandbox_id)
+        .bind(&s.sandbox_path)
+        .bind(&s.sandbox_branch)
         .bind(&s.id.0)
         .bind(&workspace_id.0)
         .execute(self.pool())
@@ -246,6 +253,51 @@ impl Store {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
         Ok(())
+    }
+
+    /// Refresh `updated_at` to the current timestamp whenever a message is
+    /// appended to an agent session (STAB-19 fix). The FE agent-card timestamp
+    /// is derived from `agent_session.updated_at`, so bumping it on every message
+    /// (both user and agent messages, including the dequeued-message path) ensures
+    /// the UI reflects real activity, not just status transitions. Scoped to
+    /// `workspace_id` (defense-in-depth guard — matches the pattern of
+    /// `set_agent_session_status` and `update_agent_session`). `NotFound` if
+    /// the session is absent or the workspace does not match.
+    pub async fn refresh_agent_session_timestamp(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        updated_at: &str,
+    ) -> Result<()> {
+        let rows =
+            sqlx::query("UPDATE agent_session SET updated_at=? WHERE id=? AND workspace_id=?")
+                .bind(updated_at)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .execute(self.pool())
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("refresh agent session timestamp failed: {e}"))
+                })?
+                .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(())
+    }
+
+    /// Reset all `is_active=1` rows to `is_active=0` unconditionally (Wave B
+    /// post-restart recovery). ACP sessions are process-local and cannot survive
+    /// a daemon restart, so any `is_active=1` flag after boot is stale. Called
+    /// early in startup (before listeners) to ensure no races with live turn
+    /// spawns. Returns the count of rows reset.
+    pub async fn reset_all_active_flags(&self) -> Result<usize> {
+        let rows = sqlx::query("UPDATE agent_session SET is_active=0 WHERE is_active=1")
+            .execute(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("reset active flags failed: {e}")))?
+            .rows_affected();
+        Ok(rows as usize)
     }
 
     /// Set `acp_session_id` write-once (the provider `session:created` path).
@@ -398,6 +450,9 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         metadata,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
+        sandbox_id: col(row, "sandbox_id")?,
+        sandbox_path: col(row, "sandbox_path")?,
+        sandbox_branch: col(row, "sandbox_branch")?,
     })
 }
 
@@ -451,6 +506,26 @@ impl Store {
     /// `messageId` at turn start so streaming block ids `{messageId}:{index}`
     /// match the persisted blocks — CS-0 D1), allocating the next monotonic
     /// `seq` and returning the persisted [`AgentMessage`].
+    ///
+    /// ## Transaction boundary
+    ///
+    /// This operation executes TWO separate queries (SELECT next seq, INSERT
+    /// message) without an explicit transaction wrapper. Each query runs in
+    /// SQLite's autocommit mode as its own implicit transaction. The schema
+    /// enforces `UNIQUE(agent_id, seq)`, so concurrent appends racing on the
+    /// SELECT phase will cause one INSERT to fail with a constraint violation.
+    ///
+    /// **Crash safety**: Because `seq` is computed as `COALESCE(MAX(seq), -1) + 1`
+    /// rather than a persisted counter, a crash between SELECT and INSERT does
+    /// NOT create a durable gap — the next caller recomputes seq from the same
+    /// MAX. Only the INSERT commits data, so once INSERT completes the message
+    /// row is durable. No committed message can be lost. Assistant-message append
+    /// (the streaming path) is additionally protected by the AgentManager's
+    /// per-agent single-flight slot, serializing turns for one agent and
+    /// eliminating the seq-race window on that hot path. User-message appends
+    /// (sendMessage, forceMessage, wake delivery) can still race if fired
+    /// concurrently for one agent, but the UNIQUE constraint will reject
+    /// duplicates rather than silently corrupting the seq order.
     pub async fn append_agent_message_with_id(
         &self,
         agent_id: &AgentId,

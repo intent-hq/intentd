@@ -68,6 +68,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         pr_url: None,
         pr_status: None,
         active_pull_request: None,
+        pull_requests: None,
         archived,
         archived_at: if archived { Some(now_iso()) } else { None },
         task_stats: None,
@@ -87,14 +88,14 @@ async fn migration_status_reports_current_after_open() {
         status.expected,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40
         ]
     );
     assert_eq!(
         status.applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40
         ]
     );
 }
@@ -325,6 +326,47 @@ async fn workspace_get_update_delete() {
         store.delete_workspace(&id).await,
         Err(intent_core::Error::NotFound(_))
     ));
+}
+
+/// `pull_requests` (the persisted `Vec<PullRequestInfo>` alongside the
+/// `active_pull_request` scalar) round-trips through insert → get → update →
+/// get, including a clear back to `None` (§7.6). Migration 0035 adds the
+/// column; the store maps it as a JSON TEXT payload.
+#[tokio::test]
+async fn workspace_pull_requests_round_trip_and_clear() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::new();
+    let mut ws = sample_workspace(&id, "PR list", false);
+    let pr = intent_core::PullRequestInfo {
+        id: "pr-1".to_string(),
+        number: 7,
+        url: "https://example.com/pr/7".to_string(),
+        title: "Add feature".to_string(),
+        status: intent_core::PullRequestStatus::Open,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        base_ref: Some("main".to_string()),
+        head_ref: Some("feature/foo".to_string()),
+        head_sha: None,
+        author: None,
+        mergeable: None,
+        mergeable_state: None,
+        is_draft: None,
+    };
+    ws.pull_requests = Some(vec![pr.clone()]);
+    store.insert_workspace(&ws).await.expect("insert");
+
+    let got = store.get_workspace(&id).await.expect("get");
+    assert_eq!(got.pull_requests.as_deref(), Some(&[pr][..]));
+
+    // Clear via update: `pull_requests = None` drops the column.
+    let mut cleared = got.clone();
+    cleared.pull_requests = None;
+    store.update_workspace(&cleared).await.expect("update");
+    let reread = store.get_workspace(&id).await.expect("re-get");
+    assert!(reread.pull_requests.is_none());
 }
 
 /// `delete_workspace` records a tombstone so `workspace_id_ever_used` keeps
@@ -1293,6 +1335,9 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         metadata: None,
         created_at: ts.clone(),
         updated_at: ts,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
     }
 }
 #[tokio::test]
@@ -2130,4 +2175,95 @@ async fn idempotency_reaper_deletes_only_rows_older_than_cutoff() {
 
     // Re-running the sweep removes nothing more (idempotent).
     assert_eq!(store.reap_idempotent(&cutoff).await.expect("reap"), 0);
+}
+
+/// Smoke test: verify the pool opens successfully with explicit configuration
+/// (max_connections=10, acquire_timeout=10s per STAB-6) and supports basic
+/// queries and concurrent access.
+///
+/// This does NOT directly assert acquire timeout behavior (saturating the pool
+/// and confirming PoolTimedOut). That would require holding 10+ connections
+/// and timing a failure, which risks test flakiness. The configuration itself
+/// (lib.rs:122-123) ensures pool exhaustion fails within 10s instead of silently
+/// queueing for the sqlx default 30s, which would exceed the sidecar health
+/// probe's 3s timeout and risk a false-positive daemon kill (STAB-6).
+#[tokio::test]
+async fn pool_smoke_test_with_explicit_config() {
+    let tmp = TempDb::new();
+    let pool = crate::connect(&tmp.path).await.expect("connect");
+
+    // Verify the pool is usable and the configuration doesn't break basic ops.
+    let row: (i64,) = sqlx::query_as("SELECT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("basic query works");
+    assert_eq!(row.0, 1);
+
+    // Verify multiple concurrent acquires work (pool has max_connections=10).
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let p = pool.clone();
+        handles.push(tokio::spawn(async move {
+            let row: (i64,) = sqlx::query_as("SELECT 1").fetch_one(&p).await?;
+            Ok::<_, sqlx::Error>(row.0)
+        }));
+    }
+    for h in handles {
+        assert_eq!(h.await.expect("task completes").expect("query"), 1);
+    }
+
+    pool.close().await;
+}
+
+/// Regression test for STAB-19: appending a message to an agent session
+/// must refresh `agent_session.updated_at` so the FE agent-card timestamp
+/// reflects real activity, not just status transitions.
+#[tokio::test]
+async fn agent_message_append_refreshes_updated_at() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let agent_id = AgentId::from("agent-bbbbbbbb-1111-2222-3333-444444444444");
+    let mut session = sample_agent_session(&agent_id, &ws);
+    session.updated_at = "2026-01-01T00:00:00Z".to_string();
+    store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert session");
+
+    // Baseline: the session was inserted with updated_at = "2026-01-01T00:00:00Z".
+    let before = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(before.updated_at, "2026-01-01T00:00:00Z");
+
+    // Append a message with a later timestamp.
+    let later = "2026-01-01T01:00:00Z";
+    store
+        .append_agent_message(
+            &agent_id,
+            "user",
+            &json!([{ "type": "text", "text": "test message" }]),
+            later,
+        )
+        .await
+        .expect("append message");
+
+    // STAB-19 fix: refresh_agent_session_timestamp is called by the services
+    // layer after append_agent_message. Simulate that here.
+    store
+        .refresh_agent_session_timestamp(&ws, &agent_id, later)
+        .await
+        .expect("refresh timestamp");
+
+    // The session's updated_at should now reflect the message timestamp.
+    let after = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(
+        after.updated_at, later,
+        "updated_at must advance when a message is appended"
+    );
+    assert_eq!(after.messages.len(), 1, "message log should have 1 entry");
 }

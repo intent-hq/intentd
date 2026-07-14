@@ -26,15 +26,24 @@ pub enum Error {
     /// as `-32005` with `error.data.current`).
     #[error("conflict: version mismatch")]
     Conflict { current: serde_json::Value },
+
+    /// A requested operation is not supported on this platform or configuration.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+
+    /// Invalid input provided to an operation (e.g., file already exists, path doesn't exist).
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 impl Error {
     /// JSON-RPC 2.0 numeric error code for this error (PROTOCOL §9).
     pub fn code(&self) -> i32 {
         match self {
-            Error::InvalidParams(_) | Error::NotFound(_) => -32602,
+            Error::InvalidParams(_) | Error::NotFound(_) | Error::InvalidInput(_) => -32602,
             Error::Internal(_) => -32603,
             Error::Conflict { .. } => -32005,
+            Error::Unsupported(_) => -32603, // Map to internal error for now
         }
     }
 }

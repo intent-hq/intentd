@@ -34,7 +34,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role};
 use tokio_tungstenite::WebSocketStream;
 
-use crate::auth::{extract_token, is_allowed_origin, validate_token, AsyncTokenStore, TokenStore};
+use crate::auth::{extract_token, is_allowed_origin, validate_token, AsyncTokenStore};
 use crate::conn::{self, ConnSubs, OUTBOUND_CAPACITY};
 use crate::forward::ForwardRegistry;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
@@ -135,6 +135,9 @@ pub(crate) struct WsInner {
     /// reverse RPCs still surface `NoClient` when the composition root did not
     /// share a registry across listeners).
     pub reverse_registry: Arc<PrimaryReverseRegistry>,
+    /// Server pairing info provider for `server.pairingInfo` / `server.rotateToken`
+    /// fast-path (§5.2). `None` means the methods are unavailable on this listener.
+    pub server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -152,7 +155,7 @@ impl WsApiServer {
         api: Arc<dyn WorkspaceApi>,
         bus: EventBus,
         tls: &TlsCertificate,
-        token_store: Arc<dyn TokenStore>,
+        token_store: Arc<AsyncTokenStore>,
         options: WsOptions,
     ) -> Result<Self> {
         let acceptor = build_acceptor(tls)?;
@@ -160,7 +163,7 @@ impl WsApiServer {
             api,
             bus,
             acceptor: Some(acceptor),
-            token_store: Some(AsyncTokenStore::new(token_store)),
+            token_store: Some((*token_store).clone()),
             enabled: options.enabled,
             auth_enabled: options.auth_enabled,
             discovery_enabled: options.discovery_enabled,
@@ -177,6 +180,7 @@ impl WsApiServer {
             external_stop_generation: AtomicU64::new(0),
             state: tokio::sync::Mutex::new(StartState::default()),
             reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
+            server_pairing_info: None,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -208,6 +212,7 @@ impl WsApiServer {
             external_stop_generation: AtomicU64::new(0),
             state: tokio::sync::Mutex::new(StartState::default()),
             reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
+            server_pairing_info: None,
         };
         Self {
             inner: Arc::new(inner),
@@ -223,7 +228,7 @@ impl WsApiServer {
         api: Arc<dyn WorkspaceApi>,
         bus: EventBus,
         tls: &TlsCertificate,
-        token_store: Arc<dyn TokenStore>,
+        token_store: Arc<AsyncTokenStore>,
         options: WsOptions,
         reverse_registry: Arc<PrimaryReverseRegistry>,
     ) -> Result<Self> {
@@ -255,6 +260,17 @@ impl WsApiServer {
         let inner = Arc::get_mut(&mut server.inner)
             .expect("WsApiServer inner not yet shared before install_registry");
         inner.reverse_registry = reverse_registry;
+    }
+
+    /// Install server pairing info provider on the inner state. Uses the same
+    /// `Arc::get_mut` pattern as `install_registry`. Called from composition root.
+    pub fn install_pairing_info(
+        &mut self,
+        server_pairing_info: Arc<dyn crate::server::ServerPairingInfo>,
+    ) {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("WsApiServer inner not yet shared before install_pairing_info");
+        inner.server_pairing_info = Some(server_pairing_info);
     }
 
     /// Start the listener, returning the bound port (single-flight).
@@ -292,6 +308,25 @@ impl WsApiServer {
     /// real TLS posture rather than a phantom fingerprint.
     pub fn is_insecure(&self) -> bool {
         self.inner.acceptor.is_none()
+    }
+
+    /// Start mDNS discovery advertisement if not already running and the listener
+    /// is started. Idempotent: if discovery is already active, does nothing.
+    /// Returns `Ok(())` on success or if already running; `Err` if the listener
+    /// is not started or if there is no fingerprint (insecure mode).
+    pub async fn start_discovery(&self) -> Result<()> {
+        self.inner.start_discovery().await
+    }
+
+    /// Stop mDNS discovery advertisement if currently running. Idempotent: if
+    /// discovery is not active, does nothing.
+    pub async fn stop_discovery(&self) {
+        self.inner.stop_discovery().await
+    }
+
+    /// Whether mDNS discovery is currently active.
+    pub async fn is_discovery_active(&self) -> bool {
+        self.inner.is_discovery_active().await
     }
 }
 
@@ -520,7 +555,12 @@ impl WsInner {
                         // surface (those are served over the local UDS); pass `None`.
                         // `host.status` IS answered here, with the resolved WSS
                         // locality (remote unless overridden, §5.14).
-                        if !conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, None, &mut client_id, self.locality_is_local).await {
+                        // Wrap in connection context (is_tcp=true for WSS) so server.*
+                        // RPCs gate on real origin, not the locality flag (§5.2).
+                        let frame_ok = crate::context::with_connection_context(true, async {
+                            conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, None, self.server_pairing_info.as_ref(), &mut client_id, self.locality_is_local).await
+                        }).await;
+                        if !frame_ok {
                             break;
                         }
                     }

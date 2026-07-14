@@ -9,6 +9,20 @@
 //! without a canonical `WorkspaceEvent` in `events/types.ts`
 //! (plan/mode/thought/commands/usage/…) map to `None`: emitting invented event
 //! strings would break wire parity with the live iOS client.
+//!
+//! ## Session lifetime semantics
+//!
+//! ACP session ids are **process-local** — they exist only for the lifetime of
+//! the provider child process. When the daemon restarts (or the provider crashes),
+//! stored session ids become stale. For providers that do not persist session state
+//! across restarts, post-restart `session/load` will fail (typically `-32602`
+//! invalid params) because the provider has no record of the stale id. This is a
+//! limitation of process-local session state in such providers, not a bug. The
+//! daemon implements a recreate+resend fallback (see `AgentManager::start_session`):
+//! when `session/load` fails (or the agent lacks `loadSession` capability), the
+//! daemon creates a fresh session via `session/new` (CAS-replacing the stale id)
+//! and prepends the prior conversation history as `<supervisor>` XML on the next
+//! prompt turn so the fresh session has context.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -33,7 +47,15 @@ pub use agent_client_protocol::schema::{
 
 /// Timeout for session setup requests (`session/new`, `session/load`). Generous
 /// relative to `initialize` because the agent may connect MCP servers here.
-const SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Overridable via `INTENTD_SESSION_SETUP_TIMEOUT_MS` (primarily for tests/CI).
+fn session_setup_timeout() -> Duration {
+    if let Ok(val) = std::env::var("INTENTD_SESSION_SETUP_TIMEOUT_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return Duration::from_millis(ms);
+        }
+    }
+    Duration::from_secs(60)
+}
 /// Timeout for a full prompt turn. A turn can run for minutes, so this is large;
 /// real cancellation flows through `session/cancel`, not the timeout.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -49,7 +71,7 @@ pub async fn new_session(
     let request = NewSessionRequest::new(cwd).mcp_servers(mcp_servers);
     let params = serde_json::to_value(&request)?;
     let result = conn
-        .request_timeout("session/new", params, SESSION_SETUP_TIMEOUT)
+        .request_timeout("session/new", params, session_setup_timeout())
         .await?;
     serde_json::from_value(result)
         .map_err(|e| AcpError::Protocol(format!("invalid session/new response: {e}")))
@@ -67,7 +89,7 @@ pub async fn load_session(
     let request = LoadSessionRequest::new(SessionId::new(session_id), cwd).mcp_servers(mcp_servers);
     let params = serde_json::to_value(&request)?;
     let result = conn
-        .request_timeout("session/load", params, SESSION_SETUP_TIMEOUT)
+        .request_timeout("session/load", params, session_setup_timeout())
         .await?;
     serde_json::from_value(result)
         .map_err(|e| AcpError::Protocol(format!("invalid session/load response: {e}")))

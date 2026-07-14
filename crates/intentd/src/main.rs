@@ -5,11 +5,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use intent_core::{Config, WorkspaceApi};
+use intent_core::{Config, ServerControl, WorkspaceApi};
 use intent_services::{
     default_process_cap, max_concurrent_agents, AgentManager, BusEventSink, EventBus, FileWatcher,
     PermissionPolicy, Services,
@@ -21,11 +21,16 @@ use intent_transport::{
     SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
+use sqlx::Row;
 
 mod client;
 mod import;
 mod service;
 use client::rpc_call;
+
+/// Global guard for the file log writer thread. Must be kept alive for the
+/// process lifetime to ensure file logging continues working.
+static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
 /// intentd — local-first JSON-RPC daemon for the Intent domain model.
 #[derive(Debug, Parser)]
@@ -130,6 +135,7 @@ enum ServiceAction {
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
+    install_panic_hook();
     match Cli::parse().command {
         Command::Serve {
             listen,
@@ -234,12 +240,119 @@ fn to_exit(result: anyhow::Result<()>) -> ExitCode {
 }
 
 fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+    // Resolve the log file path: INTENTD_DATA_DIR/intentd.log
+    let log_dir = match std::env::var_os("INTENTD_DATA_DIR") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            if let Some(proj) = directories::ProjectDirs::from("", "", "intentd") {
+                proj.data_dir().to_path_buf()
+            } else {
+                // Fallback to current directory if platform dirs unavailable
+                std::path::PathBuf::from(".")
+            }
+        }
+    };
+
+    // Create the data directory if it doesn't exist
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("WARN: failed to create log directory {:?}: {}", log_dir, e);
+    }
+
+    // Set up file appender with rotation: keep ~5 files, rotate daily
+    // Note: tracing-appender's max_log_files works with time-based rotation
+    // (DAILY/HOURLY/etc), not size-based rotation. We use daily rotation
+    // to prevent unbounded growth on long-running daemons.
+    let file_appender = match tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .max_log_files(5)
+        .filename_prefix("intentd")
+        .filename_suffix("log")
+        .build(log_dir)
+    {
+        Ok(appender) => Some(appender),
+        Err(e) => {
+            eprintln!(
+                "WARN: failed to create log file appender: {}, continuing with stderr-only logging",
+                e
+            );
+            None
+        }
+    };
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
+
+    // Set up dual output: stderr (for interactive use) and optionally file (for diagnostics)
+    let stderr_layer = fmt::layer().with_writer(std::io::stderr);
+
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr_layer);
+
+    if let Some(appender) = file_appender {
+        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+        let file_layer = fmt::layer().with_writer(non_blocking).with_ansi(false);
+        match subscriber.with(file_layer).try_init() {
+            Ok(_) => {
+                // Store the guard in a static to keep it alive for the process lifetime.
+                // Dropping it would stop the background file writer thread.
+                let _ = LOG_GUARD.set(guard);
+            }
+            Err(e) => eprintln!(
+                "WARN: failed to initialize tracing (already initialized?): {}",
+                e
+            ),
+        }
+    } else {
+        match subscriber.try_init() {
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "WARN: failed to initialize tracing (already initialized?): {}",
+                e
+            ),
+        }
+    }
+}
+
+/// Install a panic hook that logs the panic message and backtrace to the
+/// tracing log. This ensures panic details are written to the rotating log
+/// file (INTENTD_DATA_DIR/intentd.log) for post-mortem diagnosis of unexpected
+/// daemon deaths. Chains the default panic hook to preserve standard Rust
+/// panic formatting (thread name, etc.). The process will panic/unwind/abort
+/// according to Rust's standard behavior after both hooks run.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+
+        let location = panic_info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+
+        let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+
+        tracing::error!(
+            location = %location,
+            message = %message,
+            backtrace = %backtrace,
+            "PANIC: daemon panicked"
+        );
+
+        // Also write to stderr so it's visible in immediate context
+        eprintln!("PANIC at {}: {}", location, message);
+        eprintln!("Backtrace:\n{}", backtrace);
+
+        // Chain the default hook to preserve standard Rust panic formatting
+        default_hook(panic_info);
+    }));
 }
 
 fn resolve_config() -> anyhow::Result<Config> {
@@ -263,6 +376,11 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     let locality_override = parse_locality_mode(mode)?;
     let config = resolve_config()?;
     std::fs::create_dir_all(&config.data_dir)?;
+    // CoW isolation startup probe: probe the workspaces root once at daemon startup
+    // so the result is cached for future cow_probe calls. This runs before the
+    // store/services are initialized so the cache is ready when sandbox provisioning
+    // needs it. The probe result is also reported by `intentd doctor`.
+    probe_cow_at_startup(&config);
     // OS-level single-instance backstop (§5.6): hold an exclusive advisory lock
     // on `data_dir/intentd.lock` for the whole process. Acquired before the
     // socket/pidfile guard so the strongest, configuration-independent guard
@@ -336,6 +454,15 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
         process_cap = manager.registry().cap(),
         "agent manager ready"
     );
+    // Wave B: unconditionally reset all is_active=1 rows (ACP sessions cannot
+    // survive a daemon restart — they are process-local). Any is_active=1 flag
+    // after boot is stale. This runs BEFORE heal_stale_agent_sessions so the
+    // stale-status heal sees is_active=0 rows across the board.
+    match services.store().reset_all_active_flags().await {
+        Ok(0) => {}
+        Ok(reset) => tracing::warn!(reset, "reset stale is_active=1 flags on startup"),
+        Err(e) => tracing::warn!(error = %e, "is_active reset failed"),
+    }
     // Heal stale in-flight conversations from any prior crash BEFORE the chat
     // subscription path can observe them (iter#1c). Sessions left in an
     // active status (`Active`/`Processing`/`Waiting`) without a live worker
@@ -398,78 +525,144 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     services.start_enabled_mcp_servers().await;
     let mcp_hub = services.mcp_hub();
     let mcp_monitor = mcp_hub.spawn_health_monitor();
-    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+
+    // Build api Arc early so it can be cloned for runtime control (§5.12).
+    // ServerControl is attached after DaemonControl is built via the OnceLock seam.
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
     // Start a filesystem watcher per active workspace with a resolvable on-disk
     // path; each publishes debounced `file:changed` events to the shared bus.
     // The handles are held for the lifetime of `serve` and torn down on return.
     let _watchers = start_workspace_watchers(&bus, api.as_ref()).await;
 
-    // Start the HTTPS+WSS listener when requested. TLS and bearer auth are
-    // auto-on for TCP (§5.2/§5.3): the self-signed cert (M5.1) is reused across
-    // restarts and the persisted token (M5.2) gates upgrades. In insecure dev
-    // mode the listener serves plain `ws://` on the same port with no TLS and
-    // no bearer-token enforcement; certificate provisioning is skipped. Any
-    // bind failure propagates and aborts the whole serve process (no port
-    // walking, all listen modes — the UDS listener dies with it).
-    let (ws_server, ws_port) = if serve_tcp_enabled {
+    // Prepare runtime control for the HTTPS+WSS listener (§5.12). When TCP is
+    // enabled (--listen tcp/both), build the construction args so settings can
+    // toggle the listener on/off. The CLI --listen flag + env (INTENTD_TCP_PORT,
+    // INTENTD_DISCOVERY, --insecure) override persisted settings, logged when they
+    // win. TLS and bearer auth are auto-on for TCP (§5.2/§5.3) unless --insecure.
+    let (_ws_server, _ws_port, ws_runtime) = if serve_tcp_enabled {
         let mut ws_options = ws_options_from_env();
         ws_options.locality_override = locality_override;
-        let server = if insecure {
+
+        let (tls_cert, token_store) = if insecure {
             tracing::warn!(
                 "intentd INSECURE dev mode: TLS disabled, bearer-token auth disabled, plain ws:// on {}:{} — do NOT use outside local dev",
                 ws_options.bind_address,
                 ws_options.base_port
             );
-            WsApiServer::new_insecure_with_reverse(
-                api.clone(),
-                bus.clone(),
-                ws_options,
-                reverse_registry.clone(),
-            )
+            (None, None)
         } else {
             let tls = ensure_tls_certificate(&config.data_dir)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            let token_store = resolve_token_store();
-            get_or_create_token(&AsyncTokenStore::new(token_store.clone()))
+            let async_token_store = Arc::new(AsyncTokenStore::new(resolve_token_store()));
+            get_or_create_token(&async_token_store)
                 .await
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            (Some(tls), Some(async_token_store))
+        };
+
+        // Build runtime control struct
+        let runtime = Arc::new(WsRuntimeControl {
+            api: api.clone(),
+            bus: bus.clone(),
+            tls_cert: tls_cert.clone(),
+            token_store: token_store.clone(),
+            ws_options: ws_options.clone(),
+            reverse_registry: reverse_registry.clone(),
+            data_dir: config.data_dir.clone(),
+            state: tokio::sync::Mutex::new(WsRuntimeState {
+                ws_server: None,
+                port: None,
+            }),
+        });
+
+        // Start the listener immediately (CLI --listen wins over settings)
+        let mut server = if insecure {
+            WsApiServer::new_insecure_with_reverse(
+                api.clone(),
+                bus.clone(),
+                ws_options.clone(),
+                reverse_registry.clone(),
+            )
+        } else {
             WsApiServer::new_with_reverse(
                 api.clone(),
                 bus.clone(),
-                &tls,
-                token_store,
-                ws_options,
+                tls_cert.as_ref().unwrap(),
+                token_store.clone().unwrap(),
+                ws_options.clone(),
                 reverse_registry.clone(),
             )
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
         };
+
+        // Install pairing info provider on the server (§5.2) if in secure mode
+        if !insecure {
+            let pairing_provider = Arc::new(DaemonPairingInfo {
+                data_dir: config.data_dir.clone(),
+                token_store: token_store.clone().unwrap(),
+                ws_runtime: Some(runtime.clone()),
+            });
+            server.install_pairing_info(pairing_provider);
+        }
+
         let port = server.start().await?;
         match server.fingerprint() {
             Some(fp) => tracing::info!(port, fingerprint = %fp, "intentd WSS listening"),
             None => tracing::info!(port, "intentd WS listening (insecure, no TLS)"),
         }
-        (Some(server), Some(port))
+
+        // mDNS discovery is now managed internally by WsApiServer.start() based on
+        // ws_options.discovery_enabled. No manual Discovery::start needed here.
+
+        // Store the server in runtime state (discovery is managed by WsApiServer)
+        {
+            let mut state = runtime.state.lock().await;
+            state.ws_server = Some(server.clone());
+            state.port = Some(port);
+        }
+
+        (Some(server), Some(port), Some(runtime))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
-    // System control surface (§5.7): exposes `system.status` / `system.shutdown`
-    // to local UDS clients (`intentd status` / `intentd stop`). The `Notify`
-    // lets the `system.shutdown` RPC trigger the same graceful teardown as an OS
-    // signal, so `stop` can ask politely before escalating to SIGTERM/SIGKILL.
+    // System control surface (§5.7 + §5.12): exposes `system.status` /
+    // `system.shutdown` to local UDS clients plus runtime WSS listener control.
+    // The `Notify` lets the `system.shutdown` RPC trigger the same graceful
+    // teardown as an OS signal, so `stop` can ask politely before escalating.
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-    let control: Arc<dyn SystemControl> = Arc::new(DaemonControl {
+    let control = Arc::new(DaemonControl {
         listen_mode: listen.to_string(),
         uds: serve_uds_enabled,
         tcp: serve_tcp_enabled,
-        port: ws_port,
-        fingerprint: ws_server
-            .as_ref()
-            .and_then(|s| s.fingerprint().map(str::to_string)),
-        ws_server: ws_server.clone(),
         manager: manager.clone(),
         shutdown: shutdown_notify.clone(),
+        ws_runtime: ws_runtime.clone(),
     });
+
+    // Wire ServerControl to Services for settings-driven runtime control (§5.12).
+    // The control is attached after the api Arc is built via the `OnceLock` seam.
+    let server_control: Arc<dyn intent_core::ServerControl> = control.clone();
+    services.attach_server_control(server_control);
+
+    // Build pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
+    // Only built when there's a token store (secure mode); `None` in insecure mode.
+    // Available to UDS clients even when TCP is disabled (they can still call the RPCs).
+    let pairing_info: Option<Arc<dyn intent_transport::ServerPairingInfo>> = if insecure {
+        None
+    } else {
+        // Share the same AsyncTokenStore instance as the WSS listener (if enabled)
+        // so rotations propagate to the live auth layer.
+        let token_store = match ws_runtime.as_ref() {
+            Some(rt) => rt.token_store.clone().expect("secure mode token_store"),
+            None => Arc::new(AsyncTokenStore::new(resolve_token_store())),
+        };
+        Some(Arc::new(DaemonPairingInfo {
+            data_dir: config.data_dir.clone(),
+            token_store,
+            ws_runtime: ws_runtime.clone(),
+        }))
+    };
 
     let shutdown = {
         let notify = shutdown_notify.clone();
@@ -483,11 +676,13 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
 
     if serve_uds_enabled {
         tracing::info!(socket = %config.socket_path.display(), "starting intentd");
+        let system_control: Arc<dyn SystemControl> = control.clone();
         serve_uds_with_reverse(
             api,
             bus,
             &config.socket_path,
-            Some(control),
+            Some(system_control),
+            pairing_info,
             reverse_registry.clone(),
             shutdown,
         )
@@ -502,10 +697,9 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     // Clean shutdown: stop the WSS listener (graceful close + port release),
     // stop the PR refresh loop, then kill every spawned agent child and clear
     // the registry (§6.8 teardown). Idle reaping during the run is the M5
-    // `reap_idle` hook.
-    if let Some(server) = ws_server {
-        server.stop().await;
-    }
+    // `reap_idle` hook. Stop via ServerControl so we stop the runtime listener
+    // (ws_runtime.state.ws_server), not the stale boot-time ws_server variable.
+    control.stop_ws_listener().await;
     pr_refresh.abort();
     token_usage_scan.abort();
     completion_delivery.abort();
@@ -527,33 +721,113 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
 }
 
 /// Live daemon control surface backing `system.status` / `system.shutdown`
-/// (§5.7). Built post-bind so the resolved WSS `port`/`fingerprint` are real
-/// (not guessed); `client_count`/agent count are read live on each status call.
+/// (§5.7) plus runtime WSS listener control (§5.12). Built post-bind so the
+/// resolved WSS `port`/`fingerprint` are real (not guessed); `client_count`/agent
+/// count are read live on each status call. The runtime fields (`ws_server`,
+/// `discovery`, `ws_runtime`) allow settings-driven start/stop without daemon restart.
 struct DaemonControl {
     listen_mode: String,
     uds: bool,
     tcp: bool,
-    port: Option<u16>,
-    fingerprint: Option<String>,
-    ws_server: Option<WsApiServer>,
     manager: Arc<AgentManager>,
     shutdown: Arc<tokio::sync::Notify>,
+    /// Runtime state for settings-driven listener control (§5.12). Holds the
+    /// WsApiServer construction args so `start_ws_listener` can build a fresh
+    /// server when toggled on. `None` when the daemon was started with --listen uds
+    /// (no TCP listener capability at all).
+    ws_runtime: Option<Arc<WsRuntimeControl>>,
+}
+
+/// Runtime control for the WSS listener + mDNS, shared between DaemonControl and
+/// the lifecycle hooks (§5.12). Holds WsApiServer construction args plus mutable
+/// state guarded by a Mutex so settings.update can start/stop the listener.
+struct WsRuntimeControl {
+    api: Arc<dyn WorkspaceApi>,
+    bus: EventBus,
+    tls_cert: Option<intent_transport::TlsCertificate>,
+    token_store: Option<Arc<AsyncTokenStore>>,
+    ws_options: WsOptions,
+    reverse_registry: Arc<PrimaryReverseRegistry>,
+    /// Data directory for building pairing info provider (§5.2) in start_ws_listener.
+    data_dir: PathBuf,
+    /// Mutable runtime state: the live WsApiServer (when started) plus mDNS.
+    state: tokio::sync::Mutex<WsRuntimeState>,
+}
+
+struct WsRuntimeState {
+    ws_server: Option<WsApiServer>,
+    /// Cached port for sync system.status access
+    port: Option<u16>,
+}
+
+/// Pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
+/// Implemented by the daemon composition root and wired to UDS and WSS listeners.
+struct DaemonPairingInfo {
+    data_dir: PathBuf,
+    token_store: Arc<AsyncTokenStore>,
+    /// Runtime control reference to read the current bound port. `None` when the
+    /// daemon was started with --listen uds (no TCP listener capability).
+    ws_runtime: Option<Arc<WsRuntimeControl>>,
+}
+
+impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
+    fn pairing_snapshot(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = intent_transport::PairingSnapshot> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let port = if let Some(ref runtime) = self.ws_runtime {
+                let state = runtime.state.lock().await;
+                state.port
+            } else {
+                None
+            };
+            intent_transport::PairingSnapshot { port }
+        })
+    }
+
+    fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
+    fn token_store(&self) -> &AsyncTokenStore {
+        &self.token_store
+    }
 }
 
 impl SystemControl for DaemonControl {
     fn status(&self) -> SystemStatus {
+        // Read live port/fingerprint/client count from runtime state (§5.12 fix).
+        // Use try_lock to avoid blocking; if locked, report as unavailable.
+        let (port, fingerprint, clients) = if let Some(ref runtime) = self.ws_runtime {
+            if let Ok(state) = runtime.state.try_lock() {
+                let port = state.port;
+                let fingerprint = state
+                    .ws_server
+                    .as_ref()
+                    .and_then(|s| s.fingerprint().map(str::to_string));
+                let clients = state
+                    .ws_server
+                    .as_ref()
+                    .map(|s| s.client_count())
+                    .unwrap_or(0);
+                (port, fingerprint, clients)
+            } else {
+                (None, None, 0)
+            }
+        } else {
+            (None, None, 0)
+        };
+
         SystemStatus {
             listen_mode: self.listen_mode.clone(),
             uds: self.uds,
             tcp: self.tcp,
-            port: self.port,
-            clients: self
-                .ws_server
-                .as_ref()
-                .map(|s| s.client_count())
-                .unwrap_or(0),
+            port,
+            clients,
             agents: self.manager.registry().size(),
-            fingerprint: self.fingerprint.clone(),
+            fingerprint,
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             has_display: detect_has_display(),
@@ -564,6 +838,203 @@ impl SystemControl for DaemonControl {
         // `notify_one` stores a permit if the serve loop is not yet awaiting, so
         // the shutdown is never lost to a race with a freshly-arrived RPC.
         self.shutdown.notify_one();
+    }
+}
+
+impl intent_core::ServerControl for DaemonControl {
+    fn start_ws_listener(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<u16>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let runtime = self.ws_runtime.as_ref().ok_or_else(|| {
+                intent_core::Error::Internal(
+                    "WSS listener not available (daemon started with --listen uds)".to_string(),
+                )
+            })?;
+
+            // Check if already running (don't hold lock across await)
+            let existing_server = {
+                let state = runtime.state.lock().await;
+                state.ws_server.clone()
+            };
+
+            // If already started, return the current port (idempotent)
+            if let Some(ref server) = existing_server {
+                if let Some(port) = server.bound_port().await {
+                    return Ok(port);
+                }
+            }
+
+            // Build a fresh WsApiServer and start it
+            let mut server = if let Some(ref tls) = runtime.tls_cert {
+                // Secure mode
+                let token_store = runtime
+                    .token_store
+                    .as_ref()
+                    .ok_or_else(|| {
+                        intent_core::Error::Internal(
+                            "token_store missing in secure mode".to_string(),
+                        )
+                    })?
+                    .clone();
+                WsApiServer::new_with_reverse(
+                    runtime.api.clone(),
+                    runtime.bus.clone(),
+                    tls,
+                    token_store.clone(),
+                    runtime.ws_options.clone(),
+                    runtime.reverse_registry.clone(),
+                )
+                .map_err(|e| intent_core::Error::Internal(e.to_string()))?
+            } else {
+                // Insecure mode
+                WsApiServer::new_insecure_with_reverse(
+                    runtime.api.clone(),
+                    runtime.bus.clone(),
+                    runtime.ws_options.clone(),
+                    runtime.reverse_registry.clone(),
+                )
+            };
+
+            // Install pairing info provider (§5.2) on runtime-started servers
+            if runtime.token_store.is_some() {
+                let pairing_provider = Arc::new(DaemonPairingInfo {
+                    data_dir: runtime.data_dir.clone(),
+                    token_store: runtime.token_store.clone().unwrap(),
+                    ws_runtime: Some(self.ws_runtime.clone().unwrap()),
+                })
+                    as Arc<dyn intent_transport::ServerPairingInfo>;
+                server.install_pairing_info(pairing_provider);
+            }
+
+            let port = server.start().await.map_err(|e| {
+                intent_core::Error::Internal(format!("failed to start WSS listener: {}", e))
+            })?;
+
+            // mDNS discovery is now managed internally by WsApiServer.start() based on
+            // ws_options.discovery_enabled. No manual Discovery::start needed here.
+
+            // Store server + port (acquire lock only after all awaits done)
+            {
+                let mut state = runtime.state.lock().await;
+                state.ws_server = Some(server);
+                state.port = Some(port);
+            }
+
+            Ok(port)
+        })
+    }
+
+    fn stop_ws_listener(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if let Some(runtime) = &self.ws_runtime {
+                // Extract server without holding lock across await
+                let server = {
+                    let mut state = runtime.state.lock().await;
+                    state.port = None;
+                    state.ws_server.take()
+                };
+
+                // Stop the WS server (async, handles mDNS internally)
+                if let Some(s) = server {
+                    s.stop().await;
+                }
+            }
+        })
+    }
+
+    fn ws_listener_port(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u16>> + Send + '_>> {
+        Box::pin(async move {
+            if let Some(runtime) = &self.ws_runtime {
+                // Extract server without holding lock across await
+                let server = {
+                    let state = runtime.state.lock().await;
+                    state.ws_server.clone()
+                };
+                if let Some(ref s) = server {
+                    s.bound_port().await
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    fn is_tcp_connection(&self) -> bool {
+        // Read from task-local connection context set by the transport layer.
+        // Returns true for TCP (WSS) connections, false for UDS or when called
+        // outside a request context.
+        intent_transport::is_tcp_connection()
+    }
+
+    fn start_discovery(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<()>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let runtime = self.ws_runtime.as_ref().ok_or_else(|| {
+                intent_core::Error::Internal(
+                    "WSS listener not available (daemon started with --listen uds)".to_string(),
+                )
+            })?;
+
+            // Get the server without holding lock across await
+            let server = {
+                let state = runtime.state.lock().await;
+                state.ws_server.clone()
+            };
+
+            let server = server.ok_or_else(|| {
+                intent_core::Error::Internal("WSS listener not started".to_string())
+            })?;
+
+            server.start_discovery().await
+        })
+    }
+
+    fn stop_discovery(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if let Some(runtime) = &self.ws_runtime {
+                let server = {
+                    let state = runtime.state.lock().await;
+                    state.ws_server.clone()
+                };
+
+                if let Some(s) = server {
+                    s.stop_discovery().await;
+                }
+            }
+        })
+    }
+
+    fn is_discovery_active(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async move {
+            if let Some(runtime) = &self.ws_runtime {
+                let server = {
+                    let state = runtime.state.lock().await;
+                    state.ws_server.clone()
+                };
+
+                if let Some(s) = server {
+                    s.is_discovery_active().await
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        })
     }
 }
 
@@ -1254,6 +1725,9 @@ async fn cmd_doctor() -> ExitCode {
                     println!("[FAIL] migration status: {e}");
                 }
             }
+
+            // DB health checks (STAB-15 observability)
+            report_db_health(&store).await;
         }
         Err(e) => {
             ok = false;
@@ -1275,6 +1749,7 @@ async fn cmd_doctor() -> ExitCode {
     report_github_token();
     report_context_engine().await;
     report_host_capabilities();
+    report_cow_support(&config);
 
     if ok {
         ExitCode::SUCCESS
@@ -1380,6 +1855,59 @@ fn report_host_capabilities() {
     );
 }
 
+/// Probe CoW support for the workspaces root at daemon startup. This populates
+/// the cache so later cow_probe calls for the same volume pair are instant. Best-effort;
+/// failures are silent (the probe will be retried on demand if needed).
+fn probe_cow_at_startup(config: &Config) {
+    let workspaces_root = config.data_dir.join("workspaces");
+    if std::fs::create_dir_all(&workspaces_root).is_ok() {
+        // Probe and cache; ignore errors (doctor will report them if persistent)
+        let _ = intent_git::cow_probe(&workspaces_root, &workspaces_root);
+    }
+}
+
+/// CoW isolation support: probe the workspaces root for copy-on-write capability.
+/// Non-fatal — CoW isolation degrades gracefully when unsupported (shared mode).
+/// Uses the cached result if available (populated by probe_cow_at_startup).
+fn report_cow_support(config: &Config) {
+    let workspaces_root = config.data_dir.join("workspaces");
+    // Create workspaces dir if it doesn't exist (probe needs it)
+    if !workspaces_root.exists() {
+        if let Err(e) = std::fs::create_dir_all(&workspaces_root) {
+            println!("[--] CoW isolation: probe failed (cannot create workspaces dir: {e})");
+            return;
+        }
+    }
+
+    match intent_git::cow_probe(&workspaces_root, &workspaces_root) {
+        Ok(intent_git::CowSupport::Supported) => {
+            #[cfg(target_os = "macos")]
+            println!("[ok] CoW isolation: supported (apfs)");
+            #[cfg(target_os = "linux")]
+            println!("[ok] CoW isolation: supported (btrfs/xfs/bcachefs/zfs)");
+            #[cfg(target_os = "windows")]
+            println!("[ok] CoW isolation: supported (refs)");
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            println!("[ok] CoW isolation: supported");
+        }
+        Ok(intent_git::CowSupport::Unsupported) => {
+            #[cfg(target_os = "macos")]
+            println!("[--] CoW isolation: unsupported (not apfs or different volumes)");
+            #[cfg(target_os = "linux")]
+            println!(
+                "[--] CoW isolation: unsupported (not btrfs/xfs/bcachefs/zfs or different volumes)"
+            );
+            #[cfg(target_os = "windows")]
+            println!("[--] CoW isolation: unsupported (not ReFS or different volumes)");
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            println!("[--] CoW isolation: unsupported (platform not supported)");
+        }
+        Err(e) => {
+            println!("[--] CoW isolation: probe failed ({e})");
+        }
+    }
+}
+
 /// Doctor provider-discovery section (§6.9): print which configured ACP
 /// providers are installed (resolvable on `PATH`) and, best-effort, which are
 /// authenticated. Provider availability never fails `doctor` — a host with no
@@ -1435,6 +1963,91 @@ fn check_data_dir_writable(config: &Config) -> anyhow::Result<()> {
     std::fs::write(&probe, b"ok")?;
     std::fs::remove_file(&probe)?;
     Ok(())
+}
+
+/// Report database health metrics for diagnostics (STAB-15 observability).
+/// Runs PRAGMA integrity_check, PRAGMA wal_checkpoint(PASSIVE), and reports
+/// connection pool stats. Never fails the doctor check — all checks are
+/// informational.
+async fn report_db_health(store: &Store) {
+    println!("database health:");
+
+    // PRAGMA integrity_check: verify DB structural integrity
+    // Can return multiple rows if issues are found; treat anything other
+    // than a single "ok" row as a warning.
+    match sqlx::query("PRAGMA integrity_check")
+        .fetch_all(store.pool())
+        .await
+    {
+        Ok(rows) => {
+            if rows.len() == 1 {
+                match rows[0].try_get::<String, _>(0) {
+                    Ok(result) if result == "ok" => println!("  [ok] integrity_check: ok"),
+                    Ok(result) => println!("  [WARN] integrity_check: {}", result),
+                    Err(e) => println!("  [WARN] integrity_check: failed to decode result: {}", e),
+                }
+            } else {
+                println!("  [WARN] integrity_check: {} issues found", rows.len());
+                for row in rows {
+                    match row.try_get::<String, _>(0) {
+                        Ok(result) => println!("    - {}", result),
+                        Err(e) => println!("    - [decode error: {}]", e),
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            println!("  [WARN] integrity_check failed: {}", e);
+        }
+    }
+
+    // PRAGMA wal_checkpoint(PASSIVE): report checkpoint stats
+    // Returns (busy, log, checkpointed) — number of frames in WAL and how many
+    // were checkpointed. PASSIVE mode does not block writers. busy > 0 means the
+    // checkpoint couldn't complete.
+    match sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+        .fetch_one(store.pool())
+        .await
+    {
+        Ok(row) => {
+            let busy = row.try_get::<i64, _>(0);
+            let log = row.try_get::<i64, _>(1);
+            let checkpointed = row.try_get::<i64, _>(2);
+
+            match (busy, log, checkpointed) {
+                (Ok(busy), Ok(log), Ok(checkpointed)) => {
+                    if busy != 0 {
+                        println!(
+                            "  [WARN] wal_checkpoint(PASSIVE): busy={}, log={} frames, checkpointed={} frames (checkpoint incomplete)",
+                            busy, log, checkpointed
+                        );
+                    } else if checkpointed < log {
+                        println!(
+                            "  [WARN] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames (partial checkpoint)",
+                            log, checkpointed
+                        );
+                    } else {
+                        println!(
+                            "  [ok] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames",
+                            log, checkpointed
+                        );
+                    }
+                }
+                _ => {
+                    println!("  [WARN] wal_checkpoint(PASSIVE): failed to decode PRAGMA result");
+                }
+            }
+        }
+        Err(e) => {
+            println!("  [WARN] wal_checkpoint failed: {}", e);
+        }
+    }
+
+    // Connection pool stats: report size and idle connections
+    let pool = store.pool();
+    let size = pool.size();
+    let idle = pool.num_idle();
+    println!("  [ok] pool: size={}, idle={}", size, idle);
 }
 
 #[cfg(unix)]

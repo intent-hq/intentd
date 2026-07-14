@@ -112,6 +112,7 @@ pub(crate) async fn process_frame(
     forwards: &mut ForwardRegistry,
     reverse: &ReverseChannel,
     control: Option<&Arc<dyn SystemControl>>,
+    server_pairing_info: Option<&Arc<dyn crate::server::ServerPairingInfo>>,
     client_id: &mut Option<ClientId>,
     is_local: bool,
 ) -> bool {
@@ -130,6 +131,17 @@ pub(crate) async fn process_frame(
                 };
             }
         }
+        if let Some(server_info) = server_pairing_info {
+            if let Some(req) = crate::server::classify(&value) {
+                // server.* RPCs are local-only; gate on real connection origin (UDS vs TCP)
+                // not the locality flag. Task-local context set by transport (§5.2).
+                let is_local = !crate::context::is_tcp_connection();
+                return match crate::server::handle(req, server_info, is_local).await {
+                    Some(frame) => out_tx.send(frame).await.is_ok(),
+                    None => true,
+                };
+            }
+        }
         if let Some(req) = host::classify(&value) {
             // Slow path: spawn so `host.exec` and friends can't block the read
             // loop (UDS HOL fix). `openInEditor` in particular awaits an
@@ -141,12 +153,16 @@ pub(crate) async fn process_frame(
             let bus = bus.clone();
             let out = out_tx.clone();
             let reverse = reverse.clone();
+            let is_tcp = crate::context::is_tcp_connection();
             tokio::spawn(async move {
-                if let Some(frame) =
-                    host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse).await
-                {
-                    let _ = out.send(frame).await;
-                }
+                crate::context::with_connection_context(is_tcp, async {
+                    if let Some(frame) =
+                        host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse).await
+                    {
+                        let _ = out.send(frame).await;
+                    }
+                })
+                .await
             });
             return true;
         }
@@ -157,10 +173,14 @@ pub(crate) async fn process_frame(
             // the reverse timeout.
             let out = out_tx.clone();
             let reverse = reverse.clone();
+            let is_tcp = crate::context::is_tcp_connection();
             tokio::spawn(async move {
-                if let Some(frame) = browser::handle(req, &reverse).await {
-                    let _ = out.send(frame).await;
-                }
+                crate::context::with_connection_context(is_tcp, async {
+                    if let Some(frame) = browser::handle(req, &reverse).await {
+                        let _ = out.send(frame).await;
+                    }
+                })
+                .await
             });
             return true;
         }
@@ -191,13 +211,19 @@ pub(crate) async fn process_frame(
     }
     // Slow path: the ported-methods dispatcher can touch any service, so spawn
     // it too. Owns the raw frame so the read loop can advance to the next line.
+    // Thread connection context (UDS vs TCP) through so ServerControl can guard
+    // self-terminating stop calls.
     let api = api.clone();
     let out_tx = out_tx.clone();
     let raw = raw.to_string();
+    let is_tcp = !is_local;
     tokio::spawn(async move {
-        if let Some(response) = handle_message(api.as_ref(), &raw).await {
-            let _ = out_tx.send(response).await;
-        }
+        crate::context::with_connection_context(is_tcp, async {
+            if let Some(response) = handle_message(api.as_ref(), &raw).await {
+                let _ = out_tx.send(response).await;
+            }
+        })
+        .await
     });
     true
 }

@@ -738,3 +738,167 @@ async fn workspace_create_stores_empty_title_when_title_omitted_over_wss() {
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
+
+/// `workspace.duplicate` off a workspace backed by a local git repository
+/// provisions a fresh linked worktree for the duplicate (TS
+/// `duplicateWorkspace` parity, mirroring the `workspace.create` flow): the
+/// returned `worktreePath` lives at `<root>/<newId>/<repo-slug>`, is a real
+/// checkout on the duplicate's branch at the source `baseRef` tip, and
+/// `baseCommitSha` records that SHA. Regression for the deferred item from PR
+/// #127 (`workspace.duplicate` persisted a row without a checkout).
+#[tokio::test]
+async fn workspace_duplicate_provisions_worktree_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("dupwt");
+    let (daemon, port, cfg) = boot(&root).await;
+    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // Seed a source workspace with a real worktree so `workspace.duplicate`
+    // has repository metadata to clone into the new row.
+    let created = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "Dup Source",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "initialAgent": { "prompt": "fix the auth flow" },
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let source_id = created["workspace"]["id"].as_str().expect("id").to_string();
+
+    let dup = wss_rpc(
+        &mut ws,
+        3,
+        "workspace.duplicate",
+        json!({ "workspaceId": source_id }),
+    )
+    .await;
+    let workspace = &dup["workspace"];
+    let dup_id = workspace["id"].as_str().expect("dup id");
+    assert_ne!(dup_id, source_id, "duplicate must mint a fresh id");
+    assert_eq!(workspace["title"], json!("Dup Source (Copy)"));
+
+    // `workspace.duplicate` returns a `Workspace` on the wire, so the
+    // backend-authored `lastActivity` (§9.1) must be populated — clients
+    // should never see a missing value on this path (parity with
+    // `workspace.create`).
+    assert!(
+        workspace["lastActivity"].is_string(),
+        "duplicate must return authoritative lastActivity, got: {}",
+        workspace["lastActivity"]
+    );
+
+    let wt = workspace["worktreePath"]
+        .as_str()
+        .expect("worktreePath populated on duplicate");
+    assert_eq!(
+        wt,
+        root.join(dup_id)
+            .join("source-repo")
+            .to_string_lossy()
+            .as_ref(),
+        "duplicate worktree lives at <root>/<newId>/<repo-slug>"
+    );
+    assert_eq!(
+        workspace["baseCommitSha"],
+        json!(head_sha),
+        "duplicate baseCommitSha records the source baseRef tip"
+    );
+
+    // The duplicate's worktree is a real checkout on its branch at the base
+    // tip. The branch may have gained a `-N` suffix if the raw id collided
+    // with a pre-existing branch in the source repo; the check-out branch is
+    // whatever the workspace row reports.
+    let branch = workspace["branch"]
+        .as_str()
+        .expect("duplicate branch")
+        .to_string();
+    let wt_path = PathBuf::from(wt);
+    assert!(
+        wt_path.join("README.md").exists(),
+        "duplicate checkout populated"
+    );
+    assert_eq!(
+        run_git(&["rev-parse", "--is-inside-work-tree"], &wt_path),
+        "true"
+    );
+    assert_eq!(
+        run_git(&["rev-parse", "--abbrev-ref", "HEAD"], &wt_path),
+        branch
+    );
+    assert_eq!(run_git(&["rev-parse", "HEAD"], &wt_path), head_sha);
+
+    // Cleaning up the duplicate must sweep its worktree registration so the
+    // source repo stays healthy for subsequent tests.
+    let _ = wss_rpc(
+        &mut ws,
+        4,
+        "workspace.delete",
+        json!({ "workspaceId": dup_id }),
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// `workspace.duplicate` off a workspace with `skipWorktree: true` does NOT
+/// provision a worktree for the duplicate — the source configuration flows
+/// through verbatim, so a metadata-only source stays metadata-only. Guards the
+/// skip-arm on the duplicate's provisioning gate.
+#[tokio::test]
+async fn workspace_duplicate_skips_worktree_when_source_skips() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("dupskip");
+    let (daemon, port, cfg) = boot(&root).await;
+    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+    let mut ws = connect_ws(port, cfg).await;
+
+    let created = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "Skip Source",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "skipWorktree": true,
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert!(
+        created["workspace"]["worktreePath"].is_null(),
+        "source with skipWorktree has no worktree"
+    );
+    let source_id = created["workspace"]["id"].as_str().expect("id").to_string();
+
+    let dup = wss_rpc(
+        &mut ws,
+        3,
+        "workspace.duplicate",
+        json!({ "workspaceId": source_id }),
+    )
+    .await;
+    assert!(
+        dup["workspace"]["worktreePath"].is_null(),
+        "duplicate inherits skipWorktree and stays worktree-less"
+    );
+    assert!(
+        dup["workspace"]["baseCommitSha"].is_null(),
+        "no baseCommitSha when no worktree is provisioned"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}

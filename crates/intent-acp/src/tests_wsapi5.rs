@@ -91,6 +91,7 @@ fn make_workspace(id: &str, variant: WorkspaceVariant) -> Workspace {
         pr_url: None,
         pr_status: None,
         active_pull_request: None,
+        pull_requests: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -333,7 +334,12 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async { Ok(json!("terminal output")) })
     }
 
-    fn file_read(&self, _id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+    fn file_read(
+        &self,
+        _id: WorkspaceId,
+        path: String,
+        _caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Value>> {
         self.file_read_calls.lock().unwrap().push(path.clone());
         Box::pin(async move {
             if path == "outside/../oob" {
@@ -350,6 +356,7 @@ impl WorkspaceApi for FakeApi {
         _id: WorkspaceId,
         path: String,
         content: String,
+        _caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<Value>> {
         self.file_write_calls
             .lock()
@@ -358,17 +365,32 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async move { Ok(json!({ "ok": true, "path": path, "size": content.len() })) })
     }
 
-    fn file_list(&self, _id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+    fn file_list(
+        &self,
+        _id: WorkspaceId,
+        path: String,
+        _caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Value>> {
         self.file_list_calls.lock().unwrap().push(path);
         Box::pin(async { Ok(json!([{ "name": "a.txt", "type": "file" }])) })
     }
 
-    fn file_delete(&self, _id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+    fn file_delete(
+        &self,
+        _id: WorkspaceId,
+        path: String,
+        _caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Value>> {
         self.file_delete_calls.lock().unwrap().push(path.clone());
         Box::pin(async move { Ok(json!({ "ok": true, "path": path, "deleted": true })) })
     }
 
-    fn file_mkdir(&self, _id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+    fn file_mkdir(
+        &self,
+        _id: WorkspaceId,
+        path: String,
+        _caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Value>> {
         self.file_mkdir_calls.lock().unwrap().push(path.clone());
         Box::pin(async move { Ok(json!({ "ok": true, "path": path, "created": true })) })
     }
@@ -378,6 +400,7 @@ impl WorkspaceApi for FakeApi {
         _id: WorkspaceId,
         old_path: String,
         new_path: String,
+        _caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<Value>> {
         self.file_rename_calls
             .lock()

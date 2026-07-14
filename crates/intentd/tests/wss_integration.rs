@@ -20,7 +20,9 @@ use intent_core::{
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
-use intent_transport::{ensure_tls_certificate, serve_uds, TokenStore, WsApiServer, WsOptions};
+use intent_transport::{
+    ensure_tls_certificate, serve_uds, AsyncTokenStore, TokenStore, WsApiServer, WsOptions,
+};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
@@ -186,8 +188,9 @@ async fn start(opts: WsOptions) -> Server {
 async fn start_with_auggie(mut opts: WsOptions, auggie_bin: Option<std::path::PathBuf>) -> Server {
     let (api, bus, store, dir) = make_services(auggie_bin).await;
     let tls = ensure_tls_certificate(&dir).expect("cert");
-    let token_store = Arc::new(MemTokenStore::default());
-    token_store.store_token(TOKEN).unwrap();
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     if opts.base_port == WsOptions::default().base_port {
         opts.base_port = free_port();
     }
@@ -609,9 +612,17 @@ async fn wss_agent_session_shape_rpcs_round_trip() {
             format!(
                 r#"{{"jsonrpc":"2.0","id":13,"method":"agent.update","params":{{"agentId":"{agent_id}","changes":{{"nope":"x"}}}}}}"#
             ),
+            // STAB-19: getSession before append to capture baseline updated_at.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":13.5,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
+            ),
             // agent.appendMessage — append one user message.
             format!(
                 r#"{{"jsonrpc":"2.0","id":14,"method":"agent.appendMessage","params":{{"agentId":"{agent_id}","role":"user","contentBlocks":[{{"type":"text","text":"wake"}}]}}}}"#
+            ),
+            // STAB-19: getSession after append to verify updated_at advanced.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":14.5,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
             ),
             // agent.replaceMessages — atomic swap → seq 0/1.
             format!(
@@ -668,13 +679,29 @@ async fn wss_agent_session_shape_rpcs_round_trip() {
         sess[3]
     );
 
+    // STAB-19: capture updated_at before append.
+    let before_updated_at = sess[4]["result"]["session"]["updatedAt"]
+        .as_str()
+        .expect("updated_at before append");
+
     // appendMessage persists one row.
-    assert_eq!(sess[4]["result"]["success"], Value::Bool(true));
-    assert_eq!(sess[4]["result"]["message"]["role"].as_str(), Some("user"));
+    assert_eq!(sess[5]["result"]["success"], Value::Bool(true));
+    assert_eq!(sess[5]["result"]["message"]["role"].as_str(), Some("user"));
+
+    // STAB-19: updated_at must advance after append (STAB-19 regression).
+    let after_updated_at = sess[6]["result"]["session"]["updatedAt"]
+        .as_str()
+        .expect("updated_at after append");
+    assert!(
+        after_updated_at > before_updated_at,
+        "agent_session.updated_at must advance when a message is appended (STAB-19): before={}, after={}",
+        before_updated_at,
+        after_updated_at
+    );
 
     // replaceMessages atomically swaps under fresh seq.
-    assert_eq!(sess[5]["result"]["success"], Value::Bool(true));
-    let swapped = sess[5]["result"]["messages"]
+    assert_eq!(sess[7]["result"]["success"], Value::Bool(true));
+    let swapped = sess[7]["result"]["messages"]
         .as_array()
         .expect("messages array");
     assert_eq!(swapped.len(), 2);
@@ -683,13 +710,13 @@ async fn wss_agent_session_shape_rpcs_round_trip() {
 
     // Unknown-agent lookups surface as -32602 "Agent not found".
     assert_eq!(
-        sess[6]["error"]["code"].as_i64(),
+        sess[8]["error"]["code"].as_i64(),
         Some(-32602),
         "unknown agent must be -32602: {}",
-        sess[6]
+        sess[8]
     );
     assert_eq!(
-        sess[6]["error"]["message"].as_str(),
+        sess[8]["error"]["message"].as_str(),
         Some("Agent not found")
     );
 
@@ -1134,8 +1161,9 @@ async fn bind_fails_fast_on_occupied_port() {
     let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, base)).unwrap();
     let (api, bus, _store, dir) = make_services(None).await;
     let tls = ensure_tls_certificate(&dir).expect("cert");
-    let token_store = Arc::new(MemTokenStore::default());
-    token_store.store_token(TOKEN).unwrap();
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     let mut opts = WsOptions {
         base_port: base,
         ..WsOptions::default()
@@ -1278,6 +1306,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         pr_url: None,
         pr_status: None,
         active_pull_request: None,
+        pull_requests: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -2350,6 +2379,192 @@ async fn wss_repo_remove_round_trip() {
     .await;
     assert_eq!(resp["error"]["code"], -32602);
     assert_eq!(resp["error"]["message"], "Missing required parameter: path");
+
+    srv.ws.stop().await;
+}
+
+/// End-to-end WSS coverage for the workspace lifecycle helpers added by the
+/// thin-FE remediation (PROTOCOL.md §5.1): `workspace.duplicate`,
+/// `workspace.restore`, `workspace.cleanup`, `workspace.purge`,
+/// `workspace.findRepositories`, and `workspace.initializeRepository`. Every
+/// method is driven over the real pinned-TLS WebSocket transport and its
+/// response envelope is asserted against the documented shape.
+#[tokio::test]
+async fn wss_workspace_lifecycle_helpers_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed a workspace to duplicate/restore/clean up.
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Source WS"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+
+    // workspace.duplicate returns { workspace }, defaulting the title to the
+    // "<source> (Copy)" convention.
+    let dup = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.duplicate","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert!(dup["result"]["workspace"].is_object(), "workspace object");
+    assert_eq!(dup["result"]["workspace"]["title"], "Source WS (Copy)");
+    let dup_id = dup["result"]["workspace"]["id"]
+        .as_str()
+        .expect("dup id")
+        .to_string();
+    assert_ne!(dup_id, ws_id, "duplicate must mint a fresh id");
+
+    // Explicit newTitle overrides the auto-suffix.
+    let dup2 = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.duplicate","params":{{"workspaceId":"{ws_id}","newTitle":"Custom Copy"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(dup2["result"]["workspace"]["title"], "Custom Copy");
+
+    // workspace.restore alias of unarchive: archive first, then restore.
+    let _ = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"workspace.archive","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let restored = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"workspace.restore","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(restored["result"]["workspace"]["id"], ws_id);
+    assert_eq!(restored["result"]["workspace"]["archived"], false);
+
+    // workspace.cleanup returns { success: true } on an existing workspace.
+    let cleanup = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"workspace.cleanup","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(cleanup["result"], serde_json::json!({ "success": true }));
+
+    // workspace.cleanup on a missing workspace → -32602 "Workspace not found".
+    let cleanup_missing = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":7,"method":"workspace.cleanup","params":{"workspaceId":"ghost"}}"#,
+    )
+    .await;
+    assert_eq!(cleanup_missing["error"]["code"], -32602);
+    assert_eq!(cleanup_missing["error"]["message"], "Workspace not found");
+
+    // workspace.purge returns { removed, orphans } counters even when nothing
+    // is deleted; both counters are numbers.
+    let purge = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":8,"method":"workspace.purge","params":{}}"#,
+    )
+    .await;
+    assert!(
+        purge["result"]["removed"].is_number(),
+        "removed is a number"
+    );
+    assert!(
+        purge["result"]["orphans"].is_number(),
+        "orphans is a number"
+    );
+
+    // workspace.findRepositories returns { repositories: string[] }. Seed a
+    // scratch dir with a fake `.git` folder so the scan produces a match.
+    let scratch =
+        std::env::temp_dir().join(format!("itd-find-repos-{}", uuid::Uuid::new_v4().simple()));
+    let repo_a = scratch.join("repo-a");
+    std::fs::create_dir_all(repo_a.join(".git")).expect("mkdir repo-a/.git");
+    std::fs::create_dir_all(scratch.join("plain")).expect("mkdir plain");
+    let find = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"workspace.findRepositories","params":{{"directory":"{}"}}}}"#,
+            scratch.display()
+        ),
+    )
+    .await;
+    let repos = find["result"]["repositories"]
+        .as_array()
+        .expect("repositories array");
+    assert!(
+        repos
+            .iter()
+            .any(|r| r.as_str() == Some(repo_a.to_str().unwrap())),
+        "repo-a must be in {repos:?}"
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    // workspace.findRepositories without `directory` → -32602.
+    let find_missing = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":10,"method":"workspace.findRepositories","params":{}}"#,
+    )
+    .await;
+    assert_eq!(find_missing["error"]["code"], -32602);
+
+    // workspace.initializeRepository returns { success: true }. Point it at a
+    // fresh scratch dir and assert `.git` shows up. Gated on `git` being on
+    // PATH; skip the assertion cleanly when it's absent.
+    if std::process::Command::new("git")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        let init_path =
+            std::env::temp_dir().join(format!("itd-init-{}", uuid::Uuid::new_v4().simple()));
+        let init = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":11,"method":"workspace.initializeRepository","params":{{"path":"{}"}}}}"#,
+                init_path.display()
+            ),
+        )
+        .await;
+        assert_eq!(init["result"], serde_json::json!({ "success": true }));
+        assert!(init_path.join(".git").exists(), ".git directory seeded");
+        assert!(init_path.join("README.md").exists(), "README seeded");
+        assert!(init_path.join(".gitignore").exists(), ".gitignore seeded");
+        let _ = std::fs::remove_dir_all(&init_path);
+    }
+
+    // workspace.initializeRepository without `path` → -32602.
+    let init_missing = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":12,"method":"workspace.initializeRepository","params":{}}"#,
+    )
+    .await;
+    assert_eq!(init_missing["error"]["code"], -32602);
 
     srv.ws.stop().await;
 }

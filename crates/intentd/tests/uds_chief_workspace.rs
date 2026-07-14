@@ -194,29 +194,42 @@ async fn chief_workspace_over_uds() {
 
     // (e) Archive / delete on Chief are safe no-ops — the seeded row is never
     //     torn down or flipped to `archived = 1` and Chief remains reachable
-    //     via `workspace.get` after both. `workspace.archive` and
-    //     `workspace.delete` respond with `{ success: true }`
+    //     via `workspace.get` after both. `workspace.archive` returns the
+    //     synthesized Chief `Workspace` (§5.1) with `archived = false` so
+    //     callers can trust the wire without a follow-up `workspace.get`;
+    //     `workspace.delete` still responds with `{ success: true }`
     //     (`intent-transport/src/router.rs` §5.1); `dismissAttention` returns
     //     `{ workspace: ... }` (the synthesized Chief shape). We assert on
     //     each exact envelope, then re-`get` to verify Chief is unchanged.
-    for (id, method) in [(7, "workspace.archive"), (8, "workspace.delete")] {
-        let resp = send(
-            &config.socket_path,
-            &format!(
-                r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{"workspaceId":"{CHIEF_WORKSPACE_ID}"}}}}"#
-            ),
-        )
-        .await;
-        assert!(
-            resp.get("error").is_none() || resp["error"].is_null(),
-            "{method} on Chief must succeed: {resp}"
-        );
-        assert_eq!(
-            resp["result"]["success"],
-            json!(true),
-            "{method} returns {{success:true}}: {resp}"
-        );
-    }
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"workspace.archive","params":{{"workspaceId":"{CHIEF_WORKSPACE_ID}"}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none() || resp["error"].is_null(),
+        "workspace.archive on Chief must succeed: {resp}"
+    );
+    assert_eq!(resp["result"]["workspace"]["id"], json!(CHIEF_WORKSPACE_ID));
+    assert_eq!(resp["result"]["workspace"]["archived"], json!(false));
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"workspace.delete","params":{{"workspaceId":"{CHIEF_WORKSPACE_ID}"}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none() || resp["error"].is_null(),
+        "workspace.delete on Chief must succeed: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["success"],
+        json!(true),
+        "workspace.delete returns {{success:true}}: {resp}"
+    );
     // dismissAttention returns the synthesized Chief workspace, not
     // { success: true } — assert the workspace envelope + pinned invariants.
     let resp = send(

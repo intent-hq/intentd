@@ -2687,6 +2687,7 @@ mod _dead_workspace_metadata_tool_tests {
                 pr_url: None,
                 pr_status: None,
                 active_pull_request: None,
+                pull_requests: None,
                 archived: false,
                 archived_at: None,
                 task_stats: None,
@@ -2976,6 +2977,7 @@ mod workspace_api_tool_tests {
                 pr_url: None,
                 pr_status: None,
                 active_pull_request: None,
+                pull_requests: None,
                 archived: false,
                 archived_at: None,
                 task_stats: None,
@@ -5429,6 +5431,9 @@ mod wsapi4_bindings_tests {
                 completion_report_timestamp: None,
                 delegation_depth: None,
                 initial_message: None,
+                sandbox_id: None,
+                sandbox_path: None,
+                sandbox_branch: None,
             },
         }
     }

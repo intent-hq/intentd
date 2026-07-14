@@ -13,6 +13,7 @@ pub use auth::{
     is_auth_enabled, is_discovery_enabled, validate_token, AsyncTokenStore, FileTokenStore,
     TokenStore,
 };
+pub use context::{is_tcp_connection, with_connection_context};
 pub use control::{SystemControl, SystemStatus};
 pub use discovery::{detect_display_server, detect_has_display, Discovery, SERVICE_TYPE};
 pub use host::{
@@ -26,6 +27,7 @@ pub use reverse::{
     DEFAULT_REVERSE_TIMEOUT,
 };
 pub use router::handle_message;
+pub use server::{PairingSnapshot, ServerPairingInfo};
 pub use tls::{cert_fingerprint, ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
 pub use ws::{WsApiServer, WsOptions};
 
@@ -33,6 +35,7 @@ pub mod auth;
 pub(crate) mod browser;
 mod client;
 mod conn;
+pub mod context;
 pub mod control;
 pub mod discovery;
 mod drafts;
@@ -44,6 +47,7 @@ pub mod lifecycle;
 pub mod listener;
 pub mod reverse;
 pub mod router;
+pub mod server;
 mod subscriptions;
 pub mod tls;
 pub mod ws;

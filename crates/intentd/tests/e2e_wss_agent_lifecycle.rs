@@ -68,12 +68,14 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    let secrets_file = data_dir.join("secrets.json");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
         .arg("--listen")
         .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
@@ -2636,6 +2638,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pr_url: None,
         pr_status: None,
         active_pull_request: None,
+        pull_requests: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -3547,6 +3550,148 @@ async fn queue_message_self_drains_on_idle_agent_over_wss() {
     )
     .await;
     assert!(q["queue"].as_array().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// STAB-4 regression: dequeued messages must publish agent:message events
+// so live subscribers see the user message in the transcript without a full
+// re-read. Subscribes to agent:* events, sends a message while the agent is
+// busy (queues it), waits for the queue to drain, and asserts an agent:message
+// event was published for the dequeued user message.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dequeued_message_publishes_agent_message_event_over_wss() {
+    let Some(script) = gate("WSS dequeued message event E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // First turn is slow to keep the agent busy while we queue the second message.
+    let behavior = json!({
+        "response": "mock reply",
+        "firstTurnDelayMs": 2000
+    })
+    .to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe to agent:* events BEFORE sending messages.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:queue:updated", "agent:message", "agent:stream:end"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "StabFour", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    // Send first message — agent will be busy for 2000ms (firstTurnDelayMs in mock config).
+    let send1 = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first message" }),
+    )
+    .await;
+    assert_eq!(send1["success"], true);
+    assert_eq!(send1["queued"], false);
+
+    // Give the agent a moment to start processing the first message.
+    sleep(Duration::from_millis(200)).await;
+
+    // Send second message while agent is busy — this will queue.
+    let send2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "queued message" }),
+    )
+    .await;
+    assert_eq!(send2["success"], true);
+    assert_eq!(send2["queued"], true, "second message should be queued");
+
+    // Collect events and look for the agent:message event for the dequeued message.
+    let mut saw_dequeued_user_message = false;
+    let mut saw_queue_drain = false;
+    let mut stream_end_count = 0;
+
+    for i in 0..120 {
+        let frame = wss_event(&mut sub, 30).await;
+        let evt = &frame["params"]["event"];
+        match evt["type"].as_str() {
+            Some("agent:queue:updated") => {
+                // After the first turn completes, the queue drains to empty
+                if stream_end_count >= 1
+                    && evt["data"]["queue"]
+                        .as_array()
+                        .map(|q| q.is_empty())
+                        .unwrap_or(false)
+                {
+                    saw_queue_drain = true;
+                }
+            }
+            Some("agent:message") => {
+                assert_eq!(evt["data"]["agentId"].as_str(), Some(agent_id.as_str()));
+                let role = evt["data"]["role"].as_str();
+                // The dequeued message event should arrive after the queue drain
+                if role == Some("user") && saw_queue_drain {
+                    saw_dequeued_user_message = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                stream_end_count += 1;
+                // After two turns complete and we've seen the dequeued message event, we're done
+                if stream_end_count >= 2 && saw_dequeued_user_message {
+                    break;
+                }
+                // Give up after seeing both stream ends + some extra iterations
+                if stream_end_count >= 2 && i >= 10 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_queue_drain,
+        "queue should have drained after first turn"
+    );
+    assert!(
+        saw_dequeued_user_message,
+        "agent:message event for dequeued user message — STAB-4 fix"
+    );
 }
 
 #[tokio::test]
