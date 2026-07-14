@@ -18,6 +18,10 @@ use intent_core::{Error, Result};
 
 use crate::map_git_err;
 
+/// Error message returned when the staged tree matches the parent commit exactly
+/// (nothing to commit). Public so auto-commit can recognize this benign skip condition.
+pub const CLEAN_TREE_ERROR: &str = "nothing to commit, working tree clean";
+
 /// The outcome of creating a commit: the new commit SHA and the files it changed.
 #[derive(Debug, Clone)]
 pub struct CommitOutcome {
@@ -42,9 +46,7 @@ pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
     // Reject an empty commit, mirroring the TS "nothing to commit" failure.
     if let Some(parent) = &parent {
         if parent.tree_id() == tree_oid {
-            return Err(Error::Internal(
-                "nothing to commit, working tree clean".to_string(),
-            ));
+            return Err(Error::Internal(CLEAN_TREE_ERROR.to_string()));
         }
     }
 

@@ -12,6 +12,7 @@
 
 use intent_core::events::AGENT_IDLE;
 use intent_core::{AgentId, AgentSession, Error, Event, NoteId, WorkspaceApi};
+use intent_git::commit::CLEAN_TREE_ERROR;
 
 use crate::events::SubscriptionFilter;
 use crate::Services;
@@ -149,7 +150,9 @@ impl Services {
                 );
             }
             Err(Error::Internal(msg))
-                if msg.contains(AUTO_COMMIT_DISABLED_MARK) || msg.contains(NO_CHANGES_MARK) =>
+                if msg.contains(AUTO_COMMIT_DISABLED_MARK)
+                    || msg.contains(NO_CHANGES_MARK)
+                    || msg.contains(CLEAN_TREE_ERROR) =>
             {
                 tracing::debug!(
                     agent = %agent_id.0,
