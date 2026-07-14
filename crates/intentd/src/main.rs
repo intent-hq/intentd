@@ -561,6 +561,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             token_store: token_store.clone(),
             ws_options: ws_options.clone(),
             reverse_registry: reverse_registry.clone(),
+            data_dir: config.data_dir.clone(),
             state: tokio::sync::Mutex::new(WsRuntimeState {
                 ws_server: None,
                 port: None,
@@ -740,6 +741,8 @@ struct WsRuntimeControl {
     token_store: Option<Arc<AsyncTokenStore>>,
     ws_options: WsOptions,
     reverse_registry: Arc<PrimaryReverseRegistry>,
+    /// Data directory for building pairing info provider (§5.2) in start_ws_listener.
+    data_dir: PathBuf,
     /// Mutable runtime state: the live WsApiServer (when started) plus mDNS.
     state: tokio::sync::Mutex<WsRuntimeState>,
 }
@@ -857,7 +860,7 @@ impl intent_core::ServerControl for DaemonControl {
             }
 
             // Build a fresh WsApiServer and start it
-            let server = if let Some(ref tls) = runtime.tls_cert {
+            let mut server = if let Some(ref tls) = runtime.tls_cert {
                 // Secure mode
                 let token_store = runtime
                     .token_store
@@ -872,7 +875,7 @@ impl intent_core::ServerControl for DaemonControl {
                     runtime.api.clone(),
                     runtime.bus.clone(),
                     tls,
-                    token_store,
+                    token_store.clone(),
                     runtime.ws_options.clone(),
                     runtime.reverse_registry.clone(),
                 )
@@ -886,6 +889,17 @@ impl intent_core::ServerControl for DaemonControl {
                     runtime.reverse_registry.clone(),
                 )
             };
+
+            // Install pairing info provider (§5.2) on runtime-started servers
+            if runtime.token_store.is_some() {
+                let pairing_provider = Arc::new(DaemonPairingInfo {
+                    data_dir: runtime.data_dir.clone(),
+                    token_store: runtime.token_store.clone().unwrap(),
+                    ws_runtime: Some(self.ws_runtime.clone().unwrap()),
+                })
+                    as Arc<dyn intent_transport::ServerPairingInfo>;
+                server.install_pairing_info(pairing_provider);
+            }
 
             let port = server.start().await.map_err(|e| {
                 intent_core::Error::Internal(format!("failed to start WSS listener: {}", e))
