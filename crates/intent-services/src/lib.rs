@@ -9895,7 +9895,7 @@ impl WorkspaceApi for Services {
                         context_references,
                         image_blocks,
                         file_blocks,
-                        message_metadata: message_metadata.clone(),
+                        message_metadata,
                     };
                     if crate::agent_ops::is_interrupt_priority(priority.as_deref()) {
                         manager
