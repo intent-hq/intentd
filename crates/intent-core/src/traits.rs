@@ -1700,6 +1700,36 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `sandbox.merge`: manually trigger merge-back for a sandboxed agent (PROTOCOL §5.34).
+    /// Returns `{ ok, status, ... }` with merge outcome (merged | conflict | blocked | merge_pending).
+    fn sandbox_merge(
+        &self,
+        workspace_id: WorkspaceId,
+        sandbox_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, sandbox_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sandbox_merge not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sandbox.discard`: manually discard a sandbox (PROTOCOL §5.34).
+    /// Returns `{ ok }`.
+    fn sandbox_discard(
+        &self,
+        workspace_id: WorkspaceId,
+        sandbox_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, sandbox_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sandbox_discard not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `comment.add`: text-anchored comment via searchContext + commentTarget (§5.3).
     ///
     /// `idempotency_key` is the optional `params.idempotencyKey` (design note TB-0

@@ -10758,6 +10758,115 @@ impl WorkspaceApi for Services {
     }
 
     // ========================================================================
+    // sandbox.* surface (PROTOCOL §5.34). Manual escape-hatch RPCs for
+    // triggering merge-back or discarding a sandbox when auto-merge fails.
+    // ========================================================================
+
+    fn sandbox_merge(
+        &self,
+        workspace_id: WorkspaceId,
+        sandbox_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let event_bus = self.event_bus.clone();
+        Box::pin(async move {
+            use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
+            use intent_store::SandboxStatus;
+
+            // Attempt merge
+            let outcome = merge_sandbox(&store, &workspace_id, &sandbox_id).await?;
+
+            match outcome {
+                MergeOutcome::Merged { commit_range, canonical_head } => {
+                    // Mark merged
+                    let _ = store.update_sandbox_status(
+                        &workspace_id,
+                        &sandbox_id,
+                        SandboxStatus::Merged,
+                        &now_iso(),
+                    ).await;
+
+                    // Discard sandbox
+                    let _ = crate::sandbox_ops::discard_sandbox(&store, &workspace_id, &sandbox_id).await;
+
+                    // Emit event
+                    let event = NewEvent {
+                        workspace_id: workspace_id.clone(),
+                        timestamp: now_iso(),
+                        event_type: "sandbox:merged".to_string(),
+                        actor: intent_core::EventActor {
+                            actor_type: ActorType::System,
+                            id: Some("intentd".to_string()),
+                            name: Some("intentd".to_string()),
+                            ..Default::default()
+                        },
+                        session_id: Some(sandbox_id.0.clone()),
+                        correlation_id: None,
+                        parent_event_id: None,
+                        metadata: None,
+                        data: serde_json::json!({
+                            "workspaceId": workspace_id.0,
+                            "agentId": sandbox_id.0,
+                            "commitRange": commit_range,
+                            "canonicalHead": canonical_head,
+                        }),
+                    };
+                    crate::publish_event(&event_bus, event).await;
+
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "status": "merged",
+                        "commitRange": commit_range,
+                        "canonicalHead": canonical_head,
+                    }))
+                }
+                MergeOutcome::Conflict { conflicting_paths, canonical_head } => {
+                    let _ = store.update_sandbox_status(
+                        &workspace_id,
+                        &sandbox_id,
+                        SandboxStatus::ConflictBounced,
+                        &now_iso(),
+                    ).await;
+
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "status": "conflict",
+                        "conflictingPaths": conflicting_paths,
+                        "canonicalHead": canonical_head,
+                    }))
+                }
+                MergeOutcome::Blocked { reason, overlapping_paths } => {
+                    let _ = store.update_sandbox_status(
+                        &workspace_id,
+                        &sandbox_id,
+                        SandboxStatus::MergePending,
+                        &now_iso(),
+                    ).await;
+
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "status": "blocked",
+                        "reason": reason,
+                        "overlappingPaths": overlapping_paths,
+                    }))
+                }
+            }
+        })
+    }
+
+    fn sandbox_discard(
+        &self,
+        workspace_id: WorkspaceId,
+        sandbox_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            crate::sandbox_ops::discard_sandbox(&store, &workspace_id, &sandbox_id).await?;
+            Ok(serde_json::json!({ "ok": true }))
+        })
+    }
+
+    // ========================================================================
     // pr.* read surface (PROTOCOL §5.7). Maps onto the host-agnostic
     // `SourceControl` trait (§7.5); every method requires an active PR on the
     // workspace (else `-32603`). Pure mapping/aggregation lives in `pr_ops`.
