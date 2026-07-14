@@ -1,0 +1,1 @@
+Fixed in commit 5dd6489. Now pattern-matches Error::InvalidParams, Error::NotFound, and Error::Conflict as non-retryable up front. Changed default from retryable to non-retryable (only explicitly-known transient failures like session/new timeout, session/load timeout, handshake failures, and stdout-closed are retried). Added unit tests for InvalidParams and Conflict.

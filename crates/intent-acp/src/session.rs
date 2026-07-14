@@ -33,7 +33,7 @@ pub use agent_client_protocol::schema::{
 
 /// Timeout for session setup requests (`session/new`, `session/load`). Generous
 /// relative to `initialize` because the agent may connect MCP servers here.
-/// Overridable via `INTENTD_SESSION_SETUP_TIMEOUT_MS` for test-only fast retries.
+/// Overridable via `INTENTD_SESSION_SETUP_TIMEOUT_MS` (primarily for tests/CI).
 fn session_setup_timeout() -> Duration {
     if let Ok(val) = std::env::var("INTENTD_SESSION_SETUP_TIMEOUT_MS") {
         if let Ok(ms) = val.parse::<u64>() {

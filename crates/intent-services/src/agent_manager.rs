@@ -1895,7 +1895,7 @@ impl AgentManager {
     pub async fn agent_retry(
         self: &Arc<Self>,
         agent_id: AgentId,
-        workspace_id: WorkspaceId,
+        _workspace_id: WorkspaceId,
     ) -> Result<Value> {
         // Fetch current session status
         let session = self.services.store.get_agent_session(&agent_id).await?;
@@ -1905,11 +1905,14 @@ impl AgentManager {
             return Ok(json!({ "ok": false }));
         }
 
+        // Use the session's persisted workspace_id for safety (cross-workspace guard)
+        let workspace_id = &session.workspace_id;
+
         // Clear the error status back to pending
         let ts = now_iso();
         self.services
             .store
-            .set_agent_session_status(&workspace_id, &agent_id, AgentStatus::Pending, false, &ts)
+            .set_agent_session_status(workspace_id, &agent_id, AgentStatus::Pending, false, &ts)
             .await?;
 
         // Emit agent:status-changed
@@ -1930,18 +1933,18 @@ impl AgentManager {
         };
         crate::publish_event(&self.services.event_bus, event).await;
 
-        // Abort any in-flight worker task and clear the busy flag
+        // Abort any in-flight worker task and release the in-flight slot
         if let Some(worker) = self.workers.lock().unwrap().remove(&agent_id) {
             worker.abort();
         }
-        self.busy.lock().unwrap().remove(&agent_id);
+        self.release_in_flight_slot(&agent_id).await;
 
         // Tear down any stale child handle (use kill_child_only to avoid
         // overwriting the status we just set to Pending)
         self.kill_child_only(&agent_id).await;
 
         // Start the drain loop to redrive the requeued message
-        self.clone().try_drain_queue(agent_id, workspace_id).await;
+        self.clone().try_drain_queue(agent_id, workspace_id.clone()).await;
 
         Ok(json!({ "ok": true }))
     }
@@ -2539,7 +2542,7 @@ const MAX_SPAWN_ATTEMPTS: u32 = 3;
 const DEFAULT_RETRY_BACKOFF_MS: &[u64] = &[2000, 5000];
 
 /// Get retry backoff delays, overridable via INTENTD_SPAWN_RETRY_BACKOFF_MS
-/// for test-only fast retries (comma-separated milliseconds, e.g. "100,200").
+/// (comma-separated milliseconds, e.g. "100,200"). Primarily for tests/CI.
 fn retry_backoff_ms() -> Vec<u64> {
     if let Ok(val) = std::env::var("INTENTD_SPAWN_RETRY_BACKOFF_MS") {
         let mut delays = Vec::new();
@@ -2559,11 +2562,11 @@ fn retry_backoff_ms() -> Vec<u64> {
 }
 
 /// Classify whether an error from `ensure_started` is retryable. Retryable
-/// errors include session/new or session/load timeouts, handshake failures
-/// (e.g., "agent stdout closed" when the child dies immediately), and generic
-/// internal transport errors. Non-retryable errors include InvalidParams,
-/// NotFound, Conflict, provider resolution failures, and mock provider missing
-/// env (fail-fast).
+/// errors include session/new or session/load timeouts and handshake failures
+/// (e.g., "agent stdout closed" when the child dies immediately). Non-retryable
+/// errors include InvalidParams, NotFound, Conflict, provider resolution
+/// failures, mock provider missing env, and unknown Internal errors (fail-fast
+/// by default to avoid retry loops on non-transient errors).
 fn is_retryable_spawn_error(err: &Error) -> bool {
     // Non-retryable: InvalidParams, NotFound, Conflict are client/state issues,
     // not transient spawn failures that benefit from retry.

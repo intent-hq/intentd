@@ -1,0 +1,1 @@
+Fixed in commit 5dd6489. Removed stderr inclusion from the agent:failed event entirely. Stderr can expose secrets (API keys, tokens, file paths) to any subscribed client. Server-side logs already capture stderr for debugging, so there's no loss of diagnostic capability.
