@@ -5427,7 +5427,7 @@ impl WorkspaceApi for Services {
                                         .await
                                 }
                                 None => {
-                                    services.agent_send_message_op(child, prompt, None).await
+                                    services.agent_send_message_op(child, prompt, None, None, None).await
                                 }
                             };
                             if let Err(e) = send {
@@ -9889,8 +9889,8 @@ impl WorkspaceApi for Services {
                 stdin_context,
                 note_ids,
                 context_references,
-                image_blocks,
-                file_blocks,
+                image_blocks: image_blocks.clone(),
+                file_blocks: file_blocks.clone(),
                 message_metadata: message_metadata.clone(),
             };
             match self.agent_manager() {
@@ -9914,14 +9914,20 @@ impl WorkspaceApi for Services {
                 None => {
                     // Read-only fallback (no `agent_manager` wired): the
                     // router has already extracted `messageMetadata`, but
-                    // the store-only op keeps its unchanged 3-arg signature
-                    // since none of its internal callers carry metadata;
-                    // the payload is dropped on this fallback path
-                    // (metadata IS preserved on the production
-                    // `AgentManager::send_message` path above).
+                    // the store-only op doesn't accept metadata since none
+                    // of its internal callers carry it; the payload is dropped
+                    // on this fallback path (metadata IS preserved on the
+                    // production `AgentManager::send_message` path above).
+                    // STAB-7: image_blocks and file_blocks ARE forwarded now.
                     let _ = message_metadata;
-                    self.agent_send_message_op(agent_id, content, message_id)
-                        .await
+                    self.agent_send_message_op(
+                        agent_id,
+                        content,
+                        message_id,
+                        image_blocks,
+                        file_blocks,
+                    )
+                    .await
                 }
             }
         })
