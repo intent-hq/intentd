@@ -2412,7 +2412,7 @@ async fn persist_user(
             if let Err(e) = mgr
                 .services
                 .store
-                .refresh_agent_session_timestamp(agent_id, &created_at)
+                .refresh_agent_session_timestamp(workspace_id, agent_id, &created_at)
                 .await
             {
                 tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");

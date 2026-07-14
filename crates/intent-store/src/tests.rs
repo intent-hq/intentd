@@ -2252,7 +2252,7 @@ async fn agent_message_append_refreshes_updated_at() {
     // STAB-19 fix: refresh_agent_session_timestamp is called by the services
     // layer after append_agent_message. Simulate that here.
     store
-        .refresh_agent_session_timestamp(&agent_id, later)
+        .refresh_agent_session_timestamp(&ws, &agent_id, later)
         .await
         .expect("refresh timestamp");
 

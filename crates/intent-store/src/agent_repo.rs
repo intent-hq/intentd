@@ -252,19 +252,27 @@ impl Store {
     /// appended to an agent session (STAB-19 fix). The FE agent-card timestamp
     /// is derived from `agent_session.updated_at`, so bumping it on every message
     /// (both user and agent messages, including the dequeued-message path) ensures
-    /// the UI reflects real activity, not just status transitions.
+    /// the UI reflects real activity, not just status transitions. Scoped to
+    /// `workspace_id` (defense-in-depth guard — matches the pattern of
+    /// `set_agent_session_status` and `update_agent_session`). `NotFound` if
+    /// the session is absent or the workspace does not match.
     pub async fn refresh_agent_session_timestamp(
         &self,
+        workspace_id: &WorkspaceId,
         id: &AgentId,
         updated_at: &str,
     ) -> Result<()> {
-        let rows = sqlx::query("UPDATE agent_session SET updated_at=? WHERE id=?")
-            .bind(updated_at)
-            .bind(&id.0)
-            .execute(self.pool())
-            .await
-            .map_err(|e| Error::Internal(format!("refresh agent session timestamp failed: {e}")))?
-            .rows_affected();
+        let rows =
+            sqlx::query("UPDATE agent_session SET updated_at=? WHERE id=? AND workspace_id=?")
+                .bind(updated_at)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .execute(self.pool())
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("refresh agent session timestamp failed: {e}"))
+                })?
+                .rows_affected();
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }

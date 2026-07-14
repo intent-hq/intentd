@@ -609,9 +609,17 @@ async fn wss_agent_session_shape_rpcs_round_trip() {
             format!(
                 r#"{{"jsonrpc":"2.0","id":13,"method":"agent.update","params":{{"agentId":"{agent_id}","changes":{{"nope":"x"}}}}}}"#
             ),
+            // STAB-19: getSession before append to capture baseline updated_at.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":13.5,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
+            ),
             // agent.appendMessage — append one user message.
             format!(
                 r#"{{"jsonrpc":"2.0","id":14,"method":"agent.appendMessage","params":{{"agentId":"{agent_id}","role":"user","contentBlocks":[{{"type":"text","text":"wake"}}]}}}}"#
+            ),
+            // STAB-19: getSession after append to verify updated_at advanced.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":14.5,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
             ),
             // agent.replaceMessages — atomic swap → seq 0/1.
             format!(
@@ -668,13 +676,29 @@ async fn wss_agent_session_shape_rpcs_round_trip() {
         sess[3]
     );
 
+    // STAB-19: capture updated_at before append.
+    let before_updated_at = sess[4]["result"]["session"]["updatedAt"]
+        .as_str()
+        .expect("updated_at before append");
+
     // appendMessage persists one row.
-    assert_eq!(sess[4]["result"]["success"], Value::Bool(true));
-    assert_eq!(sess[4]["result"]["message"]["role"].as_str(), Some("user"));
+    assert_eq!(sess[5]["result"]["success"], Value::Bool(true));
+    assert_eq!(sess[5]["result"]["message"]["role"].as_str(), Some("user"));
+
+    // STAB-19: updated_at must advance after append (STAB-19 regression).
+    let after_updated_at = sess[6]["result"]["session"]["updatedAt"]
+        .as_str()
+        .expect("updated_at after append");
+    assert!(
+        after_updated_at > before_updated_at,
+        "agent_session.updated_at must advance when a message is appended (STAB-19): before={}, after={}",
+        before_updated_at,
+        after_updated_at
+    );
 
     // replaceMessages atomically swaps under fresh seq.
-    assert_eq!(sess[5]["result"]["success"], Value::Bool(true));
-    let swapped = sess[5]["result"]["messages"]
+    assert_eq!(sess[7]["result"]["success"], Value::Bool(true));
+    let swapped = sess[7]["result"]["messages"]
         .as_array()
         .expect("messages array");
     assert_eq!(swapped.len(), 2);
@@ -683,13 +707,13 @@ async fn wss_agent_session_shape_rpcs_round_trip() {
 
     // Unknown-agent lookups surface as -32602 "Agent not found".
     assert_eq!(
-        sess[6]["error"]["code"].as_i64(),
+        sess[8]["error"]["code"].as_i64(),
         Some(-32602),
         "unknown agent must be -32602: {}",
-        sess[6]
+        sess[8]
     );
     assert_eq!(
-        sess[6]["error"]["message"].as_str(),
+        sess[8]["error"]["message"].as_str(),
         Some("Agent not found")
     );
 
