@@ -216,6 +216,7 @@ async fn delegate(
         behavior_prompt: opt_str(args, "behaviorPrompt"),
         wait_mode: opt_str(args, "waitMode"),
         skip_auto_commit: opt_bool(args, "skipAutoCommit"),
+        isolation: opt_str(args, "isolation"),
     };
     let v = api
         .agent_delegate(ws.clone(), input, caller.cloned())

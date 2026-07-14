@@ -443,6 +443,9 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         metadata,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
     })
 }
 

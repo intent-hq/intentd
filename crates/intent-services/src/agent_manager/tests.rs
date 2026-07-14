@@ -731,6 +731,9 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         metadata: None,
         created_at: ts.clone(),
         updated_at: ts,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
     };
     mgr.services
         .store
@@ -1601,6 +1604,9 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         metadata: None,
         created_at: now_iso(),
         updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
     }
 }
 
@@ -1848,6 +1854,9 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         metadata: None,
         created_at: ts.clone(),
         updated_at: ts,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
     };
     mgr.services
         .store

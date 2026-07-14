@@ -208,6 +208,9 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         metadata: None,
         created_at: now_iso(),
         updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
     };
     store
         .insert_agent_session(&mk_agent("agent-1", "Builder", Some("implementor")))
@@ -1368,6 +1371,9 @@ async fn note_add_stamps_agent_author_with_session_name() {
         metadata: None,
         created_at: now_iso(),
         updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
     };
     svc.store
         .insert_agent_session(&session)
@@ -2799,6 +2805,9 @@ mod change_event_parity {
             metadata: None,
             created_at: now_iso(),
             updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         };
         h.store
             .insert_agent_session(&session)
@@ -4252,6 +4261,9 @@ mod mcp_callback {
             metadata: None,
             created_at: now_iso(),
             updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         };
         store.insert_agent_session(&session).await.expect("session");
 
@@ -6797,6 +6809,9 @@ mod search_adapters {
             metadata: None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         };
         store.insert_agent_session(&session).await.expect("session");
         for (role, content) in messages {
@@ -10022,6 +10037,9 @@ mod heal_stale_agent_sessions {
             metadata: None,
             created_at: ts.clone(),
             updated_at: ts,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         }
     }
 

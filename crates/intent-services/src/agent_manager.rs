@@ -2327,10 +2327,19 @@ fn resolve_spawn(
     // spawn `cwd` to `/tmp` so provider processes have a stable, existing
     // working directory instead of `std::env::temp_dir()`'s longer
     // `/var/folders/…/T/` path.
-    let cwd = workspace
-        .and_then(|w| w.path.clone().or_else(|| w.worktree_path.clone()))
+    //
+    // Task 3: If the session has a sandbox_path (CoW isolation), use it as the cwd.
+    let cwd = session
+        .sandbox_path
+        .clone()
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
+        .or_else(|| {
+            workspace
+                .and_then(|w| w.path.clone().or_else(|| w.worktree_path.clone()))
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+        })
         .or_else(|| {
             workspace
                 .filter(|w| w.id.is_chief())
@@ -2857,6 +2866,9 @@ mod role_reminder_tests {
             metadata: None,
             created_at: ts.clone(),
             updated_at: ts,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         }
     }
 
@@ -3227,6 +3239,9 @@ mod agent_retry_tests {
             metadata: None,
             created_at: ts.clone(),
             updated_at: ts,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         }
     }
 

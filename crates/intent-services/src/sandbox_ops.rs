@@ -74,37 +74,43 @@ pub async fn provision_sandbox(
     cow_clone(&user_dir, &sandbox_path)?;
 
     // Open the sandbox repo and record the base commit SHA
-    let sandbox_repo = git2::Repository::open(&sandbox_path)
-        .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
-    let base_commit_sha = sandbox_repo
-        .head()
-        .ok()
-        .and_then(|h| h.target())
-        .map(|oid| oid.to_string())
-        .ok_or_else(|| Error::Internal("sandbox has no HEAD commit".to_string()))?;
+    // Scope git2 objects to ensure they're dropped before any await points
+    let (base_commit_sha, branch_name, snapshot_commit_sha) = {
+        let sandbox_repo = git2::Repository::open(&sandbox_path)
+            .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
+        let base_commit_sha = sandbox_repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .map(|oid| oid.to_string())
+            .ok_or_else(|| Error::Internal("sandbox has no HEAD commit".to_string()))?;
 
-    // Create branch sb/<agentId> in the sandbox
-    let branch_name = format!("sb/{}", &agent_id.0);
-    let head_commit = sandbox_repo
-        .head()
-        .map_err(|e| Error::Internal(format!("get HEAD failed: {e}")))?
-        .peel_to_commit()
-        .map_err(|e| Error::Internal(format!("peel HEAD to commit failed: {e}")))?;
-    sandbox_repo
-        .branch(&branch_name, &head_commit, false)
-        .map_err(|e| Error::Internal(format!("create branch failed: {e}")))?;
+        // Create branch sb/<agentId> in the sandbox
+        let branch_name = format!("sb/{}", &agent_id.0);
+        let head_commit = sandbox_repo
+            .head()
+            .map_err(|e| Error::Internal(format!("get HEAD failed: {e}")))?
+            .peel_to_commit()
+            .map_err(|e| Error::Internal(format!("peel HEAD to commit failed: {e}")))?;
+        sandbox_repo
+            .branch(&branch_name, &head_commit, false)
+            .map_err(|e| Error::Internal(format!("create branch failed: {e}")))?;
 
-    // Check out the new branch
-    let refname = format!("refs/heads/{}", branch_name);
-    sandbox_repo
-        .set_head(&refname)
-        .map_err(|e| Error::Internal(format!("set HEAD failed: {e}")))?;
+        // Check out the new branch
+        let refname = format!("refs/heads/{}", branch_name);
+        sandbox_repo
+            .set_head(&refname)
+            .map_err(|e| Error::Internal(format!("set HEAD failed: {e}")))?;
 
-    // Check for dirty state and create a snapshot commit if needed
-    let snapshot_commit_sha = if is_dirty(&sandbox_repo)? {
-        Some(create_snapshot_commit(&sandbox_repo, agent_id)?)
-    } else {
-        None
+        // Check for dirty state and create a snapshot commit if needed
+        let snapshot_commit_sha = if is_dirty(&sandbox_repo)? {
+            Some(create_snapshot_commit(&sandbox_repo, agent_id)?)
+        } else {
+            None
+        };
+
+        // Return the values we need, git2 objects will be dropped here
+        (base_commit_sha, branch_name, snapshot_commit_sha)
     };
 
     // Persist the sandbox record
@@ -496,6 +502,9 @@ mod tests {
             metadata: None,
             created_at: now_iso(),
             updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -638,6 +647,9 @@ mod tests {
             metadata: None,
             created_at: now_iso(),
             updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -762,6 +774,9 @@ mod tests {
             metadata: None,
             created_at: now_iso(),
             updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -855,6 +870,9 @@ mod tests {
             metadata: None,
             created_at: now_iso(),
             updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -925,6 +943,9 @@ mod tests {
             metadata: None,
             created_at: now_iso(),
             updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 

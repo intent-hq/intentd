@@ -273,6 +273,9 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         metadata: None,
         created_at: ts.clone(),
         updated_at: ts,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
     }
 }
 

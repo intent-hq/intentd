@@ -1335,6 +1335,9 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         metadata: None,
         created_at: ts.clone(),
         updated_at: ts,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
     }
 }
 #[tokio::test]
