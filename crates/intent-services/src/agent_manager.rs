@@ -2399,13 +2399,24 @@ async fn persist_user(
     workspace_id: &WorkspaceId,
     content: &str,
 ) {
+    let created_at = now_iso();
     match mgr
         .services
         .store
-        .append_agent_message(agent_id, "user", &user_text_blocks(content), &now_iso())
+        .append_agent_message(agent_id, "user", &user_text_blocks(content), &created_at)
         .await
     {
         Ok(message) => {
+            // Refresh agent_session.updated_at so the FE agent-card timestamp
+            // reflects message activity, not just status transitions (STAB-19).
+            if let Err(e) = mgr
+                .services
+                .store
+                .refresh_agent_session_timestamp(agent_id, &created_at)
+                .await
+            {
+                tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+            }
             mgr.services
                 .publish_agent_mutation_event(
                     workspace_id,

@@ -1373,6 +1373,15 @@ impl Services {
                 &created_at,
             )
             .await?;
+        // Refresh agent_session.updated_at so the FE agent-card timestamp
+        // reflects message activity, not just status transitions (STAB-19).
+        if let Err(e) = self
+            .store
+            .refresh_agent_session_timestamp(&agent_id, &created_at)
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+        }
         self.publish_agent_mutation_event(
             &session.workspace_id,
             &agent_id,
@@ -1655,12 +1664,24 @@ impl Services {
     ) -> Result<Value> {
         let message_id = message_id.unwrap_or_else(new_message_id);
         let blocks = user_content_blocks(&content);
+        let created_at = now_iso();
         match self
             .store
-            .append_agent_message(&agent_id, "user", &blocks, &now_iso())
+            .append_agent_message(&agent_id, "user", &blocks, &created_at)
             .await
         {
-            Ok(_) => Ok(json!({ "success": true, "queued": false, "messageId": message_id })),
+            Ok(_) => {
+                // Refresh agent_session.updated_at so the FE agent-card timestamp
+                // reflects message activity, not just status transitions (STAB-19).
+                if let Err(e) = self
+                    .store
+                    .refresh_agent_session_timestamp(&agent_id, &created_at)
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+                }
+                Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+            }
             Err(_) => {
                 let (queued, position) = self.enqueue_message(&agent_id, content, None, None);
                 let result = json!({

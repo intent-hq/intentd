@@ -248,6 +248,29 @@ impl Store {
         Ok(())
     }
 
+    /// Refresh `updated_at` to the current timestamp whenever a message is
+    /// appended to an agent session (STAB-19 fix). The FE agent-card timestamp
+    /// is derived from `agent_session.updated_at`, so bumping it on every message
+    /// (both user and agent messages, including the dequeued-message path) ensures
+    /// the UI reflects real activity, not just status transitions.
+    pub async fn refresh_agent_session_timestamp(
+        &self,
+        id: &AgentId,
+        updated_at: &str,
+    ) -> Result<()> {
+        let rows = sqlx::query("UPDATE agent_session SET updated_at=? WHERE id=?")
+            .bind(updated_at)
+            .bind(&id.0)
+            .execute(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("refresh agent session timestamp failed: {e}")))?
+            .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(())
+    }
+
     /// Set `acp_session_id` write-once (the provider `session:created` path).
     /// Scoped to `workspace_id` (defense-in-depth). Errors if it is already set
     /// to a different value (§9.5). `NotFound` if the session is absent or the
