@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -21,11 +21,16 @@ use intent_transport::{
     SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
+use sqlx::Row;
 
 mod client;
 mod import;
 mod service;
 use client::rpc_call;
+
+/// Global guard for the file log writer thread. Must be kept alive for the
+/// process lifetime to ensure file logging continues working.
+static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
 /// intentd — local-first JSON-RPC daemon for the Intent domain model.
 #[derive(Debug, Parser)]
@@ -130,6 +135,7 @@ enum ServiceAction {
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
+    install_panic_hook();
     match Cli::parse().command {
         Command::Serve {
             listen,
@@ -234,12 +240,119 @@ fn to_exit(result: anyhow::Result<()>) -> ExitCode {
 }
 
 fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+    // Resolve the log file path: INTENTD_DATA_DIR/intentd.log
+    let log_dir = match std::env::var_os("INTENTD_DATA_DIR") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            if let Some(proj) = directories::ProjectDirs::from("", "", "intentd") {
+                proj.data_dir().to_path_buf()
+            } else {
+                // Fallback to current directory if platform dirs unavailable
+                std::path::PathBuf::from(".")
+            }
+        }
+    };
+
+    // Create the data directory if it doesn't exist
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("WARN: failed to create log directory {:?}: {}", log_dir, e);
+    }
+
+    // Set up file appender with rotation: keep ~5 files, rotate daily
+    // Note: tracing-appender's max_log_files works with time-based rotation
+    // (DAILY/HOURLY/etc), not size-based rotation. We use daily rotation
+    // to prevent unbounded growth on long-running daemons.
+    let file_appender = match tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .max_log_files(5)
+        .filename_prefix("intentd")
+        .filename_suffix("log")
+        .build(log_dir)
+    {
+        Ok(appender) => Some(appender),
+        Err(e) => {
+            eprintln!(
+                "WARN: failed to create log file appender: {}, continuing with stderr-only logging",
+                e
+            );
+            None
+        }
+    };
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
+
+    // Set up dual output: stderr (for interactive use) and optionally file (for diagnostics)
+    let stderr_layer = fmt::layer().with_writer(std::io::stderr);
+
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr_layer);
+
+    if let Some(appender) = file_appender {
+        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+        let file_layer = fmt::layer().with_writer(non_blocking).with_ansi(false);
+        match subscriber.with(file_layer).try_init() {
+            Ok(_) => {
+                // Store the guard in a static to keep it alive for the process lifetime.
+                // Dropping it would stop the background file writer thread.
+                let _ = LOG_GUARD.set(guard);
+            }
+            Err(e) => eprintln!(
+                "WARN: failed to initialize tracing (already initialized?): {}",
+                e
+            ),
+        }
+    } else {
+        match subscriber.try_init() {
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "WARN: failed to initialize tracing (already initialized?): {}",
+                e
+            ),
+        }
+    }
+}
+
+/// Install a panic hook that logs the panic message and backtrace to the
+/// tracing log. This ensures panic details are written to the rotating log
+/// file (INTENTD_DATA_DIR/intentd.log) for post-mortem diagnosis of unexpected
+/// daemon deaths. Chains the default panic hook to preserve standard Rust
+/// panic formatting (thread name, etc.). The process will panic/unwind/abort
+/// according to Rust's standard behavior after both hooks run.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+
+        let location = panic_info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+
+        let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+
+        tracing::error!(
+            location = %location,
+            message = %message,
+            backtrace = %backtrace,
+            "PANIC: daemon panicked"
+        );
+
+        // Also write to stderr so it's visible in immediate context
+        eprintln!("PANIC at {}: {}", location, message);
+        eprintln!("Backtrace:\n{}", backtrace);
+
+        // Chain the default hook to preserve standard Rust panic formatting
+        default_hook(panic_info);
+    }));
 }
 
 fn resolve_config() -> anyhow::Result<Config> {
@@ -1252,6 +1365,9 @@ async fn cmd_doctor() -> ExitCode {
                     println!("[FAIL] migration status: {e}");
                 }
             }
+
+            // DB health checks (STAB-15 observability)
+            report_db_health(&store).await;
         }
         Err(e) => {
             ok = false;
@@ -1487,6 +1603,91 @@ fn check_data_dir_writable(config: &Config) -> anyhow::Result<()> {
     std::fs::write(&probe, b"ok")?;
     std::fs::remove_file(&probe)?;
     Ok(())
+}
+
+/// Report database health metrics for diagnostics (STAB-15 observability).
+/// Runs PRAGMA integrity_check, PRAGMA wal_checkpoint(PASSIVE), and reports
+/// connection pool stats. Never fails the doctor check — all checks are
+/// informational.
+async fn report_db_health(store: &Store) {
+    println!("database health:");
+
+    // PRAGMA integrity_check: verify DB structural integrity
+    // Can return multiple rows if issues are found; treat anything other
+    // than a single "ok" row as a warning.
+    match sqlx::query("PRAGMA integrity_check")
+        .fetch_all(store.pool())
+        .await
+    {
+        Ok(rows) => {
+            if rows.len() == 1 {
+                match rows[0].try_get::<String, _>(0) {
+                    Ok(result) if result == "ok" => println!("  [ok] integrity_check: ok"),
+                    Ok(result) => println!("  [WARN] integrity_check: {}", result),
+                    Err(e) => println!("  [WARN] integrity_check: failed to decode result: {}", e),
+                }
+            } else {
+                println!("  [WARN] integrity_check: {} issues found", rows.len());
+                for row in rows {
+                    match row.try_get::<String, _>(0) {
+                        Ok(result) => println!("    - {}", result),
+                        Err(e) => println!("    - [decode error: {}]", e),
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            println!("  [WARN] integrity_check failed: {}", e);
+        }
+    }
+
+    // PRAGMA wal_checkpoint(PASSIVE): report checkpoint stats
+    // Returns (busy, log, checkpointed) — number of frames in WAL and how many
+    // were checkpointed. PASSIVE mode does not block writers. busy > 0 means the
+    // checkpoint couldn't complete.
+    match sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+        .fetch_one(store.pool())
+        .await
+    {
+        Ok(row) => {
+            let busy = row.try_get::<i64, _>(0);
+            let log = row.try_get::<i64, _>(1);
+            let checkpointed = row.try_get::<i64, _>(2);
+
+            match (busy, log, checkpointed) {
+                (Ok(busy), Ok(log), Ok(checkpointed)) => {
+                    if busy != 0 {
+                        println!(
+                            "  [WARN] wal_checkpoint(PASSIVE): busy={}, log={} frames, checkpointed={} frames (checkpoint incomplete)",
+                            busy, log, checkpointed
+                        );
+                    } else if checkpointed < log {
+                        println!(
+                            "  [WARN] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames (partial checkpoint)",
+                            log, checkpointed
+                        );
+                    } else {
+                        println!(
+                            "  [ok] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames",
+                            log, checkpointed
+                        );
+                    }
+                }
+                _ => {
+                    println!("  [WARN] wal_checkpoint(PASSIVE): failed to decode PRAGMA result");
+                }
+            }
+        }
+        Err(e) => {
+            println!("  [WARN] wal_checkpoint failed: {}", e);
+        }
+    }
+
+    // Connection pool stats: report size and idle connections
+    let pool = store.pool();
+    let size = pool.size();
+    let idle = pool.num_idle();
+    println!("  [ok] pool: size={}, idle={}", size, idle);
 }
 
 #[cfg(unix)]
