@@ -623,7 +623,8 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
 
     // Wire ServerControl to Services for settings-driven runtime control (§5.12).
     // The control is attached after the api Arc is built via the `OnceLock` seam.
-    services.attach_server_control(control.clone() as Arc<dyn intent_core::ServerControl>);
+    let server_control: Arc<dyn intent_core::ServerControl> = control.clone();
+    services.attach_server_control(server_control);
 
     let shutdown = {
         let notify = shutdown_notify.clone();
@@ -637,11 +638,12 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
 
     if serve_uds_enabled {
         tracing::info!(socket = %config.socket_path.display(), "starting intentd");
+        let system_control: Arc<dyn SystemControl> = control.clone();
         serve_uds_with_reverse(
             api,
             bus,
             &config.socket_path,
-            Some(control.clone() as Arc<dyn SystemControl>),
+            Some(system_control),
             reverse_registry.clone(),
             shutdown,
         )
