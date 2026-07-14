@@ -653,7 +653,9 @@ impl Store {
                 .bind(&agent_id.0)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| Error::Internal(format!("replace agent messages clear failed: {e}")))?;
+                .map_err(|e| {
+                    Error::Internal(format!("replace agent messages clear failed: {e}"))
+                })?;
             let mut inserted = Vec::with_capacity(owned_messages.len());
             let insert_sql =
                 format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
@@ -692,9 +694,9 @@ impl Store {
                     created_at: created_at.clone(),
                 });
             }
-            tx.commit()
-                .await
-                .map_err(|e| Error::Internal(format!("replace agent messages commit failed: {e}")))?;
+            tx.commit().await.map_err(|e| {
+                Error::Internal(format!("replace agent messages commit failed: {e}"))
+            })?;
             Ok(inserted)
         })
         .await

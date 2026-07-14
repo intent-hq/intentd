@@ -275,7 +275,9 @@ impl Store {
                     .bind(&workspace_id.0)
                     .fetch_optional(&mut *tx)
                     .await
-                    .map_err(|e| Error::Internal(format!("recheck spec precondition failed: {e}")))?;
+                    .map_err(|e| {
+                        Error::Internal(format!("recheck spec precondition failed: {e}"))
+                    })?;
             if existing_spec.is_some() {
                 tx.rollback()
                     .await
@@ -342,12 +344,14 @@ impl Store {
                     .map_err(|e| Error::Internal(format!("rollback adopt_spec tx failed: {e}")))?;
                 return Ok(None);
             }
-            sqlx::query("UPDATE note SET parent_id = 'spec' WHERE parent_id = ? AND workspace_id = ?")
-                .bind(&old_id)
-                .bind(&workspace_id.0)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("reparent spec children failed: {e}")))?;
+            sqlx::query(
+                "UPDATE note SET parent_id = 'spec' WHERE parent_id = ? AND workspace_id = ?",
+            )
+            .bind(&old_id)
+            .bind(&workspace_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("reparent spec children failed: {e}")))?;
             sqlx::query(
                 "UPDATE note_version SET note_id = 'spec' WHERE note_id = ? AND workspace_id = ?",
             )
@@ -365,12 +369,14 @@ impl Store {
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("move spec line attribution failed: {e}")))?;
-            sqlx::query("UPDATE comment SET note_id = 'spec' WHERE note_id = ? AND workspace_id = ?")
-                .bind(&old_id)
-                .bind(&workspace_id.0)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("move spec comments failed: {e}")))?;
+            sqlx::query(
+                "UPDATE comment SET note_id = 'spec' WHERE note_id = ? AND workspace_id = ?",
+            )
+            .bind(&old_id)
+            .bind(&workspace_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("move spec comments failed: {e}")))?;
             tx.commit()
                 .await
                 .map_err(|e| Error::Internal(format!("commit adopt_spec tx failed: {e}")))?;

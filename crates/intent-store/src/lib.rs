@@ -76,8 +76,8 @@ where
                 // Exponential backoff with jitter: 50ms, 100ms, 200ms, 400ms, ...
                 let delay_ms = BASE_DELAY_MS * (1 << attempt);
                 let jitter_ms = (delay_ms / 4) as i64; // ±25% jitter
-                let jittered_delay = delay_ms as i64
-                    + (rand::random::<i64>() % (2 * jitter_ms + 1)) - jitter_ms;
+                let jittered_delay =
+                    delay_ms as i64 + (rand::random::<i64>() % (2 * jitter_ms + 1)) - jitter_ms;
                 tokio::time::sleep(Duration::from_millis(jittered_delay.max(0) as u64)).await;
             }
         }
