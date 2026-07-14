@@ -104,10 +104,7 @@ async fn disabling_listener_stops_discovery() {
     let port = free_port();
     let port_s = port.to_string();
     let token = "abababababababababababababababababababababababababababababababab";
-    let env = [
-        ("INTENTD_AUTH_TOKEN", token),
-        ("INTENTD_TCP_PORT", &port_s),
-    ];
+    let env = [("INTENTD_AUTH_TOKEN", token), ("INTENTD_TCP_PORT", &port_s)];
     let child = spawn_serve(&data_dir, "both", &env);
     let mut daemon = Daemon { child, data_dir };
     assert!(await_uds(&socket).await, "daemon should start within 10s");
@@ -190,10 +187,7 @@ async fn toggle_discovery_while_listener_runs() {
     let port = free_port();
     let port_s = port.to_string();
     let token = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
-    let env = [
-        ("INTENTD_AUTH_TOKEN", token),
-        ("INTENTD_TCP_PORT", &port_s),
-    ];
+    let env = [("INTENTD_AUTH_TOKEN", token), ("INTENTD_TCP_PORT", &port_s)];
     let child = spawn_serve(&data_dir, "both", &env);
     let mut daemon = Daemon { child, data_dir };
     assert!(await_uds(&socket).await, "daemon should start within 10s");
@@ -271,10 +265,7 @@ async fn batch_ordering_enforces_listener_before_discovery() {
     let port = free_port();
     let port_s = port.to_string();
     let token = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
-    let env = [
-        ("INTENTD_AUTH_TOKEN", token),
-        ("INTENTD_TCP_PORT", &port_s),
-    ];
+    let env = [("INTENTD_AUTH_TOKEN", token), ("INTENTD_TCP_PORT", &port_s)];
     let child = spawn_serve(&data_dir, "both", &env);
     let mut daemon = Daemon { child, data_dir };
     assert!(await_uds(&socket).await);
