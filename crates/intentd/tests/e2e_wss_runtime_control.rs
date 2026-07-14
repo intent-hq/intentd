@@ -359,11 +359,11 @@ async fn runtime_ws_listener_toggle_over_wss() {
 }
 
 /// Batch hook ordering: settings.update with {wsApi.enabled=true, discovery.enabled=true}
-/// in a single batch must apply hooks in deterministic order. This proves the ordering rule:
-/// within the same priority tier (both are enabled-flags, but discovery.enabled has no hook
-/// so only wsApi.enabled triggers action), keys process in lexicographic order.
-/// Key test: a batch with both wsApi.enabled and discovery.enabled succeeds (no arbitrary
-/// map-iteration order causing race conditions).
+/// in a single batch must apply hooks in deterministic, dependency-aware order.
+/// server.wsApi.enabled (priority 10) applies before server.discovery.enabled (priority 11)
+/// because mDNS discovery depends on the WSS listener being active.
+/// Key test: a batch with both wsApi.enabled and discovery.enabled succeeds (no
+/// "WSS listener not started" error from non-deterministic map iteration order).
 #[tokio::test]
 async fn batch_hook_ordering_enable_both_services() {
     let data_dir = temp_data_dir();
@@ -397,8 +397,8 @@ async fn batch_hook_ordering_enable_both_services() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Batch update: enable both in arbitrary input order (wsApi.enabled first in the array).
-    // The ordering rule ensures deterministic application: both are action-triggering keys
-    // (priority 10), so they apply in lexicographic order: discovery.enabled < wsApi.enabled.
+    // The ordering rule ensures deterministic application: wsApi.enabled (priority 10) applies
+    // before discovery.enabled (priority 11), so the listener starts before mDNS discovery.
     let batch_enable = uds_rpc(
         &socket,
         2,
@@ -470,8 +470,8 @@ async fn batch_hook_ordering_disable_both() {
 
     // Batch update: disable both wsApi and discovery in a SINGLE batch, in reverse
     // lexicographic input order (wsApi.enabled appears before discovery.enabled in the array).
-    // The ordering rule ensures deterministic application: both are action-triggering keys
-    // (priority 10), so they apply in lexicographic order: discovery.enabled < wsApi.enabled.
+    // The ordering rule ensures deterministic application: wsApi.enabled (priority 10) applies
+    // before discovery.enabled (priority 11), so the listener stops after mDNS is stopped.
     let batch_disable = uds_rpc(
         &socket,
         2,
@@ -547,7 +547,8 @@ async fn batch_hook_ordering_reverse_input_order() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Batch update: provide changes in REVERSE lexicographic order (wsApi.enabled before discovery.enabled).
-    // The hook ordering ensures they still apply in deterministic order: discovery.enabled < wsApi.enabled.
+    // The hook ordering ensures they still apply in deterministic, dependency-aware order:
+    // wsApi.enabled (priority 10) before discovery.enabled (priority 11).
     let batch_reverse = uds_rpc(
         &socket,
         2,

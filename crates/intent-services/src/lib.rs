@@ -4343,11 +4343,13 @@ impl Services {
             }
         }
 
-        // Sort changes by (priority, path) to ensure deterministic, dependency-aware order
+        // Sort changes by (priority, path) to ensure deterministic, dependency-aware order.
+        // Use stable sort so duplicate paths maintain their input order (tie-breaker).
         let mut sorted_changes: Vec<&serde_json::Value> = applied.iter().collect();
-        sorted_changes.sort_by_key(|change| {
-            let path = change.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            (hook_priority(path), path)
+        sorted_changes.sort_by(|a, b| {
+            let path_a = a.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path_b = b.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            (hook_priority(path_a), path_a).cmp(&(hook_priority(path_b), path_b))
         });
 
         for change in sorted_changes {
