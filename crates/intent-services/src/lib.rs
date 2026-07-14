@@ -3533,11 +3533,28 @@ impl Services {
                         }
                     }
                     "server.discovery.enabled" => {
-                        // mDNS control will be implemented later when Discovery is wired
-                        tracing::debug!(
-                            key,
-                            "server.discovery.enabled changed (mDNS control not yet wired)"
-                        );
+                        if let Some(enabled) = change.get("value").and_then(|v| v.as_bool()) {
+                            if enabled {
+                                match control.start_discovery().await {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            "server.discovery.enabled → true: started mDNS discovery"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = ?e,
+                                            "server.discovery.enabled → true: failed to start mDNS discovery"
+                                        );
+                                    }
+                                }
+                            } else {
+                                control.stop_discovery().await;
+                                tracing::info!(
+                                    "server.discovery.enabled → false: stopped mDNS discovery"
+                                );
+                            }
+                        }
                     }
                     _ => {}
                 }

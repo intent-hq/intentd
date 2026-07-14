@@ -17,8 +17,8 @@ use intent_services::{
 use intent_store::Store;
 use intent_transport::{
     detect_has_display, ensure_tls_certificate, generate_token, get_or_create_token,
-    serve_uds_with_reverse, AsyncTokenStore, CertStatus, Discovery, FileTokenStore,
-    PrimaryReverseRegistry, SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
+    serve_uds_with_reverse, AsyncTokenStore, CertStatus, FileTokenStore, PrimaryReverseRegistry,
+    SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
 
@@ -436,7 +436,6 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             reverse_registry: reverse_registry.clone(),
             state: tokio::sync::Mutex::new(WsRuntimeState {
                 ws_server: None,
-                discovery: None,
                 port: None,
             }),
         });
@@ -466,30 +465,13 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             None => tracing::info!(port, "intentd WS listening (insecure, no TLS)"),
         }
 
-        // Start mDNS discovery if enabled
-        let discovery = if ws_options.discovery_enabled {
-            server.fingerprint().and_then(|fp| {
-                let is_local = ws_options.locality_override.unwrap_or(false);
-                match Discovery::start(port, fp, is_local) {
-                    Ok(d) => {
-                        tracing::info!("mDNS discovery started");
-                        Some(d)
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = ?e, "failed to start mDNS");
-                        None
-                    }
-                }
-            })
-        } else {
-            None
-        };
+        // mDNS discovery is now managed internally by WsApiServer.start() based on
+        // ws_options.discovery_enabled. No manual Discovery::start needed here.
 
-        // Store the server and discovery in runtime state
+        // Store the server in runtime state (discovery is managed by WsApiServer)
         {
             let mut state = runtime.state.lock().await;
             state.ws_server = Some(server.clone());
-            state.discovery = discovery;
             state.port = Some(port);
         }
 
@@ -605,7 +587,6 @@ struct WsRuntimeControl {
 
 struct WsRuntimeState {
     ws_server: Option<WsApiServer>,
-    discovery: Option<Discovery>,
     /// Cached port for sync system.status access
     port: Option<u16>,
 }
@@ -715,27 +696,13 @@ impl intent_core::ServerControl for DaemonControl {
                 intent_core::Error::Internal(format!("failed to start WSS listener: {}", e))
             })?;
 
-            // Start mDNS if enabled
-            let discovery = if runtime.ws_options.discovery_enabled {
-                server.fingerprint().and_then(|fp| {
-                    let is_local = runtime.ws_options.locality_override.unwrap_or(false);
-                    match Discovery::start(port, fp, is_local) {
-                        Ok(d) => Some(d),
-                        Err(e) => {
-                            tracing::warn!(error = ?e, "failed to start mDNS");
-                            None
-                        }
-                    }
-                })
-            } else {
-                None
-            };
+            // mDNS discovery is now managed internally by WsApiServer.start() based on
+            // ws_options.discovery_enabled. No manual Discovery::start needed here.
 
-            // Store server + discovery + port (acquire lock only after all awaits done)
+            // Store server + port (acquire lock only after all awaits done)
             {
                 let mut state = runtime.state.lock().await;
                 state.ws_server = Some(server);
-                state.discovery = discovery;
                 state.port = Some(port);
             }
 
@@ -748,19 +715,14 @@ impl intent_core::ServerControl for DaemonControl {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             if let Some(runtime) = &self.ws_runtime {
-                // Extract server + discovery without holding lock across await
-                let (server, discovery) = {
+                // Extract server without holding lock across await
+                let server = {
                     let mut state = runtime.state.lock().await;
                     state.port = None;
-                    (state.ws_server.take(), state.discovery.take())
+                    state.ws_server.take()
                 };
 
-                // Stop mDNS first (synchronous)
-                if let Some(d) = discovery {
-                    d.stop();
-                }
-
-                // Stop the WS server (async)
+                // Stop the WS server (async, handles mDNS internally)
                 if let Some(s) = server {
                     s.stop().await;
                 }
@@ -795,6 +757,69 @@ impl intent_core::ServerControl for DaemonControl {
         // When implemented, return true for TCP connections to block
         // self-terminating calls per ServerControl contract.
         false
+    }
+
+    fn start_discovery(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<()>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let runtime = self.ws_runtime.as_ref().ok_or_else(|| {
+                intent_core::Error::Internal(
+                    "WSS listener not available (daemon started with --listen uds)".to_string(),
+                )
+            })?;
+
+            // Get the server without holding lock across await
+            let server = {
+                let state = runtime.state.lock().await;
+                state.ws_server.clone()
+            };
+
+            let server = server.ok_or_else(|| {
+                intent_core::Error::Internal("WSS listener not started".to_string())
+            })?;
+
+            server.start_discovery().await
+        })
+    }
+
+    fn stop_discovery(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if let Some(runtime) = &self.ws_runtime {
+                let server = {
+                    let state = runtime.state.lock().await;
+                    state.ws_server.clone()
+                };
+
+                if let Some(s) = server {
+                    s.stop_discovery().await;
+                }
+            }
+        })
+    }
+
+    fn is_discovery_active(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async move {
+            if let Some(runtime) = &self.ws_runtime {
+                let server = {
+                    let state = runtime.state.lock().await;
+                    state.ws_server.clone()
+                };
+
+                if let Some(s) = server {
+                    s.is_discovery_active().await
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        })
     }
 }
 

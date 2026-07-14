@@ -30,4 +30,16 @@ pub trait ServerControl: Send + Sync {
     /// against stopping the listener while the settings.update caller is on it.
     /// Always returns `false` for UDS connections.
     fn is_tcp_connection(&self) -> bool;
+
+    /// Start mDNS discovery advertisement for the WSS listener if not already
+    /// running. Returns `Ok(())` on success or if already active; returns an error
+    /// if the listener is not running or in insecure mode. Idempotent.
+    fn start_discovery(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// Stop mDNS discovery advertisement if currently active. Idempotent: if not
+    /// active, does nothing.
+    fn stop_discovery(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+    /// Whether mDNS discovery is currently active.
+    fn is_discovery_active(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
 }

@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use futures::future::{BoxFuture, Shared};
 use futures::FutureExt;
+use intent_core::Error;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -185,5 +186,67 @@ impl WsInner {
         let mut st = self.state.lock().await;
         st.shutting_down = false;
         st.port = None;
+    }
+
+    /// Start mDNS discovery advertisement if not already running and the listener
+    /// is started. Idempotent: if discovery is already active, does nothing.
+    pub(crate) async fn start_discovery(self: &Arc<Self>) -> Result<(), Error> {
+        let mut st = self.state.lock().await;
+
+        // Check if listener is running
+        if !st.started {
+            return Err(Error::Internal(
+                "cannot start discovery: listener not running".to_string(),
+            ));
+        }
+
+        // Check if discovery is already active
+        if let Some(ref running) = st.running {
+            if running.discovery.is_some() {
+                return Ok(()); // Already active, idempotent
+            }
+        }
+
+        // Get the port and fingerprint
+        let port = st
+            .port
+            .ok_or_else(|| Error::Internal("listener started but port not set".to_string()))?;
+
+        let fingerprint = self.fingerprint.as_deref().ok_or_else(|| {
+            Error::Internal("cannot start discovery in insecure mode (no fingerprint)".to_string())
+        })?;
+
+        // Start discovery
+        let discovery = advertise_if_enabled(true, port, fingerprint, self.locality_is_local);
+
+        // Store the discovery handle
+        if let Some(ref mut running) = st.running {
+            running.discovery = discovery;
+        }
+
+        Ok(())
+    }
+
+    /// Stop mDNS discovery advertisement if currently running. Idempotent: if
+    /// discovery is not active, does nothing.
+    pub(crate) async fn stop_discovery(self: &Arc<Self>) {
+        let mut st = self.state.lock().await;
+
+        if let Some(ref mut running) = st.running {
+            if let Some(discovery) = running.discovery.take() {
+                discovery.stop();
+            }
+        }
+    }
+
+    /// Whether mDNS discovery is currently active.
+    pub(crate) async fn is_discovery_active(self: &Arc<Self>) -> bool {
+        let st = self.state.lock().await;
+
+        if let Some(ref running) = st.running {
+            running.discovery.is_some()
+        } else {
+            false
+        }
     }
 }

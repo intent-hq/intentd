@@ -293,6 +293,25 @@ impl WsApiServer {
     pub fn is_insecure(&self) -> bool {
         self.inner.acceptor.is_none()
     }
+
+    /// Start mDNS discovery advertisement if not already running and the listener
+    /// is started. Idempotent: if discovery is already active, does nothing.
+    /// Returns `Ok(())` on success or if already running; `Err` if the listener
+    /// is not started or if there is no fingerprint (insecure mode).
+    pub async fn start_discovery(&self) -> Result<()> {
+        self.inner.start_discovery().await
+    }
+
+    /// Stop mDNS discovery advertisement if currently running. Idempotent: if
+    /// discovery is not active, does nothing.
+    pub async fn stop_discovery(&self) {
+        self.inner.stop_discovery().await
+    }
+
+    /// Whether mDNS discovery is currently active.
+    pub async fn is_discovery_active(&self) -> bool {
+        self.inner.is_discovery_active().await
+    }
 }
 
 impl WsInner {
