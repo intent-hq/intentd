@@ -166,10 +166,10 @@ pub async fn prompt(
     let params = serde_json::to_value(&request)?;
     let idle_window = prompt_idle_timeout();
 
-    // Wrap the request/response with an idle-aware timeout: poll every second
-    // to check whether the idle window has elapsed since the last activity.
-    // Use a very large request timeout (24 hours) since the idle timeout
-    // provides the real bound.
+    // Use a very large fallback timeout (24h) to catch agent-died-without-
+    // closing-stdout edge cases, but the idle timeout below provides the real
+    // bound. The large timeout ensures request_timeout cleans up its pending
+    // entry eventually even if we return early on idle timeout.
     let fallback_timeout = Duration::from_secs(24 * 60 * 60);
     let req_fut = conn.request_timeout("session/prompt", params, fallback_timeout);
     tokio::pin!(req_fut);
@@ -185,6 +185,12 @@ pub async fn prompt(
             _ = tokio::time::sleep(poll_interval) => {
                 let idle = Duration::from_millis(activity.idle_ms());
                 if idle >= idle_window {
+                    // Dropping req_fut here leaves its pending-map entry until
+                    // the fallback timeout (24h) or agent-stdout-close, but
+                    // that's acceptable: one leaked entry per idle-timed-out
+                    // turn, cleaned within 24h. The alternative (manual request
+                    // ID tracking + pending.remove) couples this to Connection
+                    // internals. Future: expose a cancel(id) helper on Connection.
                     return Err(AcpError::Timeout(format!(
                         "session/prompt idle timeout ({idle_window:?} of silence)"
                     )));

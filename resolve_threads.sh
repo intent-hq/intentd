@@ -33,6 +33,9 @@ PRRT_kwDOS9Wxuc6QyyT2
 )
 
 for thread_id in "${threads[@]}"; do
-  gh api graphql -f query='mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id } } }' -f id="$thread_id" > /dev/null 2>&1
-  echo "Resolved $thread_id"
+  if gh api graphql -f query='mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id } } }' -f id="$thread_id"; then
+    echo "✓ Resolved $thread_id"
+  else
+    echo "✗ Failed to resolve $thread_id" >&2
+  fi
 done
