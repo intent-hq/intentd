@@ -496,6 +496,25 @@ impl Store {
     /// `messageId` at turn start so streaming block ids `{messageId}:{index}`
     /// match the persisted blocks — CS-0 D1), allocating the next monotonic
     /// `seq` and returning the persisted [`AgentMessage`].
+    ///
+    /// ## Transaction boundary
+    ///
+    /// This operation executes TWO separate queries (SELECT next seq, INSERT
+    /// message) without an explicit transaction wrapper. Each query runs in
+    /// SQLite's autocommit mode as its own implicit transaction. The schema
+    /// enforces `UNIQUE(agent_id, seq)`, so concurrent appends racing on the
+    /// SELECT phase will cause one INSERT to fail with a constraint violation.
+    ///
+    /// **Crash safety**: A crash between SELECT and INSERT leaves a seq gap
+    /// (the next caller sees a higher seq) but does NOT lose any committed
+    /// message — only the INSERT commits data. Once INSERT completes, the
+    /// message row is durable. Assistant-message append (the streaming path)
+    /// is additionally protected by the AgentManager's per-agent single-flight
+    /// slot, serializing turns for one agent and eliminating the seq-race
+    /// window on that hot path. User-message appends (sendMessage, forceMessage,
+    /// wake delivery) can still race if fired concurrently for one agent, but
+    /// the UNIQUE constraint will reject duplicates rather than silently
+    /// corrupting the seq order.
     pub async fn append_agent_message_with_id(
         &self,
         agent_id: &AgentId,
