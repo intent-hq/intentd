@@ -8030,6 +8030,8 @@ mod rules {
             None,
             false,
             false,
+            None,
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -8068,6 +8070,8 @@ mod rules {
             None,
             false,
             false,
+            None,
+            None,
         )
         .await
         .expect("assembled prompt (file still applies)");
@@ -8141,6 +8145,8 @@ mod rules {
             None,
             true,
             false,
+            None,
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -8184,6 +8190,8 @@ mod rules {
             Some(&injection),
             true,
             false,
+            None,
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -8230,6 +8238,8 @@ mod rules {
             Some(&injection),
             true,
             false,
+            None,
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -8255,6 +8265,8 @@ mod rules {
             None,
             false,
             false,
+            None,
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -8302,6 +8314,8 @@ mod rules {
             None,
             true,
             false,
+            None,
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -8330,6 +8344,8 @@ mod rules {
             None,
             false,
             true,
+            None,
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -8383,6 +8399,458 @@ mod rules {
 
     async fn recv(sub: &mut Subscription) -> Vec<intent_core::Event> {
         sub.recv().await.expect("subscription open")
+    }
+
+    /// Task 6: sandboxed implementor sessions get an isolation context block
+    /// with sandbox path, branch, and conflict-resolution instructions.
+    #[tokio::test]
+    async fn assembly_injects_sandbox_context_for_sandboxed_implementor() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+
+        let injection = crate::rules::SpecialistPromptInjection {
+            behavior_prompt: Some("Implement your task.".into()),
+            specialist_name: Some("Implementor".into()),
+            role_reminder: Some("Stay in scope.".into()),
+        };
+
+        // Create a mock workspace (direct mode + CoW supported)
+        let workspace = intent_core::Workspace {
+            id: intent_core::WorkspaceId::from("ws-1"),
+            title: "Test".into(),
+            branch: "main".into(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: intent_core::WorkspaceStatus::Active,
+            status_message: None,
+            activity: intent_core::WorkspaceActivity::Idle,
+            attention: intent_core::WorkspaceAttention::None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_activity: None,
+            tags: vec![],
+            path: Some("/test/path".into()),
+            repository_path: Some("/test/repo".into()),
+            repository_owner: None,
+            repository_name: Some("test-repo".into()),
+            worktree_path: None,
+            scope: None,
+            skip_worktree: true,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: Some(true),
+        };
+
+        // Create a mock agent session with sandbox fields
+        let agent_session = intent_core::AgentSession {
+            id: intent_core::AgentId::from("agent-1"),
+            workspace_id: intent_core::WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Test Agent".into(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: Some("implementor".into()),
+            status: intent_core::AgentStatus::Active,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            sandbox_id: Some("sandbox-123".into()),
+            sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()),
+            sandbox_branch: Some("sb/agent-1".into()),
+            is_background: false,
+            metadata: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            Some(&workspace),
+            Some(&agent_session),
+        )
+        .await
+        .expect("assembled prompt");
+
+        assert!(
+            prompt.contains("## Workspace Isolation"),
+            "isolation header"
+        );
+        assert!(
+            prompt.contains("isolated CoW (copy-on-write) sandbox"),
+            "CoW mention"
+        );
+        assert!(
+            prompt.contains("/test/sandboxes/agent-1/test-repo"),
+            "sandbox path"
+        );
+        assert!(prompt.contains("sb/agent-1"), "sandbox branch");
+        assert!(prompt.contains("Do NOT switch branches"), "branch warning");
+        assert!(
+            prompt.contains("woken with the conflicting paths"),
+            "conflict bounce"
+        );
+        assert!(
+            prompt.contains("resolve the conflicts **in your sandbox only**"),
+            "sandbox-only fix"
+        );
+    }
+
+    /// Task 6: coordinator (spec-writer specialist) in CoW-enabled direct-mode
+    /// workspace gets parallel delegation safety guidance.
+    #[tokio::test]
+    async fn assembly_injects_parallel_delegation_hint_for_coordinator() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+
+        let injection = crate::rules::SpecialistPromptInjection {
+            behavior_prompt: Some("Plan and delegate.".into()),
+            specialist_name: Some("Coordinator".into()),
+            role_reminder: Some("Delegate to implementors.".into()),
+        };
+
+        // Create a mock workspace (direct mode + CoW supported)
+        let workspace = intent_core::Workspace {
+            id: intent_core::WorkspaceId::from("ws-1"),
+            title: "Test".into(),
+            branch: "main".into(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: intent_core::WorkspaceStatus::Active,
+            status_message: None,
+            activity: intent_core::WorkspaceActivity::Idle,
+            attention: intent_core::WorkspaceAttention::None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_activity: None,
+            tags: vec![],
+            path: Some("/test/path".into()),
+            repository_path: Some("/test/repo".into()),
+            repository_owner: None,
+            repository_name: Some("test-repo".into()),
+            worktree_path: None,
+            scope: None,
+            skip_worktree: true,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: Some(true),
+        };
+
+        // Coordinator session (no sandbox fields — coordinators don't run in sandboxes)
+        let agent_session = intent_core::AgentSession {
+            id: intent_core::AgentId::from("agent-coordinator"),
+            workspace_id: intent_core::WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Coordinator Agent".into(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: Some("spec-writer".into()),
+            status: intent_core::AgentStatus::Active,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            is_background: false,
+            metadata: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            Some(&workspace),
+            Some(&agent_session),
+        )
+        .await
+        .expect("assembled prompt");
+
+        assert!(
+            prompt.contains("## Agent Delegation & Isolation"),
+            "delegation header"
+        );
+        assert!(prompt.contains("isolated CoW sandboxes"), "sandbox mention");
+        assert!(
+            prompt.contains("parallel delegation is safe"),
+            "parallel safety"
+        );
+        assert!(prompt.contains("Merge-back is automatic"), "auto merge");
+        assert!(
+            prompt.contains("only handle `blocked` outcomes"),
+            "coordinator scope"
+        );
+    }
+
+    /// Task 6: worktree-mode workspaces get no isolation hints (behavior unchanged).
+    #[tokio::test]
+    async fn assembly_omits_hints_for_worktree_mode() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+
+        let injection = crate::rules::SpecialistPromptInjection {
+            behavior_prompt: Some("Implement your task.".into()),
+            specialist_name: Some("Implementor".into()),
+            role_reminder: Some("Stay in scope.".into()),
+        };
+
+        // Worktree-mode workspace (worktree_path present)
+        let workspace = intent_core::Workspace {
+            id: intent_core::WorkspaceId::from("ws-1"),
+            title: "Test".into(),
+            branch: "main".into(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: intent_core::WorkspaceStatus::Active,
+            status_message: None,
+            activity: intent_core::WorkspaceActivity::Idle,
+            attention: intent_core::WorkspaceAttention::None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_activity: None,
+            tags: vec![],
+            path: Some("/test/worktree".into()),
+            repository_path: Some("/test/repo".into()),
+            repository_owner: None,
+            repository_name: Some("test-repo".into()),
+            worktree_path: Some("/test/worktree".into()), // Worktree mode!
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None, // Not computed for worktree mode
+        };
+
+        let agent_session = intent_core::AgentSession {
+            id: intent_core::AgentId::from("agent-1"),
+            workspace_id: intent_core::WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Test Agent".into(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: Some("implementor".into()),
+            status: intent_core::AgentStatus::Active,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            is_background: false,
+            metadata: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            Some(&workspace),
+            Some(&agent_session),
+        )
+        .await
+        .expect("assembled prompt");
+
+        // No isolation hints in worktree mode
+        assert!(
+            !prompt.contains("## Workspace Isolation"),
+            "no isolation header"
+        );
+        assert!(
+            !prompt.contains("## Agent Delegation & Isolation"),
+            "no delegation header"
+        );
+        assert!(!prompt.contains("CoW sandbox"), "no CoW mention");
+    }
+
+    /// Task 6: shared-mode direct workspace (CoW unsupported) gets no hints.
+    #[tokio::test]
+    async fn assembly_omits_hints_for_shared_mode_direct() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+
+        let injection = crate::rules::SpecialistPromptInjection {
+            behavior_prompt: Some("Implement your task.".into()),
+            specialist_name: Some("Implementor".into()),
+            role_reminder: Some("Stay in scope.".into()),
+        };
+
+        // Direct-mode workspace but CoW unsupported
+        let workspace = intent_core::Workspace {
+            id: intent_core::WorkspaceId::from("ws-1"),
+            title: "Test".into(),
+            branch: "main".into(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: intent_core::WorkspaceStatus::Active,
+            status_message: None,
+            activity: intent_core::WorkspaceActivity::Idle,
+            attention: intent_core::WorkspaceAttention::None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_activity: None,
+            tags: vec![],
+            path: Some("/test/path".into()),
+            repository_path: Some("/test/repo".into()),
+            repository_owner: None,
+            repository_name: Some("test-repo".into()),
+            worktree_path: None,
+            scope: None,
+            skip_worktree: true,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: Some(false), // CoW not supported!
+        };
+
+        let agent_session = intent_core::AgentSession {
+            id: intent_core::AgentId::from("agent-1"),
+            workspace_id: intent_core::WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Test Agent".into(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: Some("implementor".into()),
+            status: intent_core::AgentStatus::Active,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            is_background: false,
+            metadata: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            Some(&workspace),
+            Some(&agent_session),
+        )
+        .await
+        .expect("assembled prompt");
+
+        // No isolation hints when CoW is unsupported
+        assert!(
+            !prompt.contains("## Workspace Isolation"),
+            "no isolation header"
+        );
+        assert!(!prompt.contains("CoW sandbox"), "no CoW mention");
     }
 }
 

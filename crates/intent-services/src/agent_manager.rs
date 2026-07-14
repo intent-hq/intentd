@@ -779,6 +779,8 @@ impl AgentManager {
             // failures).
             let session = self.services.store.get_agent_session(&agent_id).await?;
             let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
+            // Fetch workspace for mode-dependent prompt hints (Task 6).
+            let workspace = self.services.store.get_workspace(&workspace_id).await.ok();
             if let Some(prompt) = crate::rules::assemble_system_prompt(
                 &self.services.store,
                 Some(&cwd),
@@ -786,6 +788,8 @@ impl AgentManager {
                 specialist.as_ref(),
                 is_sub_agent,
                 auto_commit_enabled,
+                workspace.as_ref(),
+                Some(&session),
             )
             .await
             {

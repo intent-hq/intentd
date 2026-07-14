@@ -233,12 +233,106 @@ pub(crate) struct SpecialistPromptInjection {
     pub role_reminder: Option<String>,
 }
 
+/// Build the mode-dependent isolation hint for Task 6 (CoW agent sandboxes).
+/// Returns `Some(hint)` when the agent's isolation mode and specialist warrant
+/// a context block, `None` otherwise. The hint selection keys off the agent's
+/// actual effective isolation (session.sandbox_path presence) and workspace mode,
+/// not just the workspace cowIsolation setting, so it reflects what the agent is
+/// actually running under.
+///
+/// Hint matrix (per spec line 104-110):
+/// - Sandboxed implementor (session.sandbox_path present + specialist="implementor"):
+///   isolation context block with sandbox path, branch, base commit, caches-warm
+///   notice, branch-switching warning, and conflict-bounce resolution instructions.
+/// - Coordinator in CoW-enabled workspace (specialist="spec-writer" + workspace
+///   direct-mode + cow_supported=true): parallel delegation safety guidance.
+/// - All other modes: no hint (worktree-mode unchanged, shared-mode direct unchanged).
+fn build_isolation_hint(
+    workspace: Option<&intent_core::Workspace>,
+    agent_session: Option<&intent_core::AgentSession>,
+    specialist: Option<&SpecialistPromptInjection>,
+) -> Option<String> {
+
+    // Determine if this agent is a sandboxed implementor
+    let is_sandboxed = agent_session
+        .and_then(|s| s.sandbox_path.as_ref())
+        .is_some();
+
+    let specialist_name = specialist
+        .and_then(|s| s.specialist_name.as_deref())
+        .unwrap_or("");
+
+    // Case 1: Sandboxed implementor — inject isolation context
+    if is_sandboxed && specialist_name.eq_ignore_ascii_case("implementor") {
+        let session = agent_session?;
+        let sandbox_path = session.sandbox_path.as_deref().unwrap_or("<sandbox-path>");
+        let sandbox_branch = session.sandbox_branch.as_deref().unwrap_or("sb/<id>");
+
+        // We don't have base_commit_sha in AgentSession, but we can get it from the
+        // Sandbox record if needed. For now, use a placeholder as the base is tracked
+        // in the sandbox record.
+        let base_sha_note = "base commit tracked in sandbox metadata";
+
+        return Some(format!(
+            "## Workspace Isolation\n\n\
+             You are working in an **isolated CoW (copy-on-write) sandbox** at `{sandbox_path}` \
+             on branch `{sandbox_branch}` ({base_sha_note}). Your dependency caches (node_modules, \
+             target/, .venv, etc.) are warm — you inherited them from the canonical workspace.\n\n\
+             **Critical constraints:**\n\
+             - Do NOT switch branches or checkout other refs in your sandbox.\n\
+             - On completion, the system automatically merges your branch back to the canonical workspace.\n\
+             - If your changes conflict with canonical, you will be **woken with the conflicting paths** \
+             and a ref to reconcile against. When that happens, resolve the conflicts **in your sandbox only** \
+             (rebase or merge onto the fetched canonical ref), then end your turn again. The system will \
+             retry the merge. Do NOT attempt to touch other checkouts or the canonical workspace directly.\n\
+             - You have up to 2 conflict-resolution attempts before the merge is deferred to manual intervention."
+        ));
+    }
+
+    // Case 2: Coordinator in CoW-enabled direct-mode workspace
+    // "spec-writer" is the coordinator specialist (per SPECIALISTS constant in FE)
+    if specialist_name.eq_ignore_ascii_case("coordinator")
+        || specialist_name.eq_ignore_ascii_case("spec-writer")
+    {
+        if let Some(ws) = workspace {
+            // Direct mode: skip_worktree=true OR worktree_path=None
+            let is_direct_mode = ws.skip_worktree || ws.worktree_path.is_none();
+            let cow_supported = ws.cow_supported.unwrap_or(false);
+
+            if is_direct_mode && cow_supported {
+                return Some(
+                    "## Agent Delegation & Isolation\n\n\
+                     Delegated agents in this workspace run in **isolated CoW sandboxes** when you \
+                     use `isolation: \"cow\"` (or when the workspace's `cowIsolation` setting defaults it). \
+                     Each sandboxed agent works in its own copy-on-write clone of the workspace directory, \
+                     so parallel delegation is safe even when tasks touch overlapping files — agents cannot \
+                     stomp each other's work.\n\n\
+                     **Merge-back is automatic:** when a sandboxed agent completes, the system merges its \
+                     commits back into the canonical workspace **before** waking you. Clean merges propagate \
+                     completion normally. Conflicts suppress completion propagation and wake the agent (not you) \
+                     with conflict paths and resolution instructions; the agent fixes its sandbox and retries \
+                     the merge (up to 2 attempts).\n\n\
+                     **You only handle `blocked` outcomes:** if the canonical workspace has uncommitted changes \
+                     overlapping with the agent's work, or if conflict retries are exhausted, completion propagates \
+                     with `merge_pending` status. Use `sandbox.merge` or `sandbox.discard` RPCs, or ask the user \
+                     to commit/stash their WIP, then manually merge.".to_string()
+                );
+            }
+        }
+    }
+
+    // Case 3: Worktree mode or shared-mode direct — no hint (behavior unchanged)
+    None
+}
+
 /// Assemble the effective system prompt (the **internal** injection pipeline,
 /// §18.1) in documented precedence: base-system-prompt override →
 /// specialization rules (the 3-tier resolver: agent-type override → workspace
 /// `.augment/agent-rules/{type}.md` → bundled built-in) → workspace override →
-/// live workspace rule files → specialist role section (PP-1, reference layer
-/// 4.8: after specialization/user rules, when the session has one) →
+/// live workspace rule files → mode-dependent isolation hints (Task 6: CoW
+/// sandboxing context for implementors, parallel delegation safety for
+/// coordinators when CoW is enabled) → specialist role section (PP-1, reference
+/// layer 4.8: after specialization/user rules, when the session has one) →
 /// mandatory-actions footer (recency; the reference `getMandatoryActionsFooter`)
 /// which contributes the `## Role Reminder` (specialist agents only) and — for
 /// top-level (non-sub-agent) interactive agents — the `## Suggested Next Steps`
@@ -246,6 +340,7 @@ pub(crate) struct SpecialistPromptInjection {
 /// block at the end of user-facing responses. The specialization slot is always
 /// populated (tier 3 always resolves), so this returns `None` only in the
 /// unreachable case where even the bundled specialization is empty.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn assemble_system_prompt(
     store: &Store,
     workspace_path: Option<&Path>,
@@ -253,6 +348,8 @@ pub(crate) async fn assemble_system_prompt(
     specialist: Option<&SpecialistPromptInjection>,
     is_sub_agent: bool,
     auto_commit_enabled: bool,
+    workspace: Option<&intent_core::Workspace>,
+    agent_session: Option<&intent_core::AgentSession>,
 ) -> Option<String> {
     let overrides = read_overrides(store).await;
     let mut parts: Vec<String> = Vec::new();
@@ -272,6 +369,13 @@ pub(crate) async fn assemble_system_prompt(
                 parts.push(format_user_rules_for_context(&content, &source));
             }
         }
+    }
+    // Mode-dependent isolation hints (Task 6): inject context about CoW
+    // sandboxing for implementors and parallel delegation safety for coordinators
+    // when appropriate, before the specialist role section so the specialist
+    // behavior prompt can reference them.
+    if let Some(hint) = build_isolation_hint(workspace, agent_session, specialist) {
+        parts.push(hint);
     }
     // Specialist role section (reference layer 4.8: after specialization
     // rules, user rules, and skills — before the parent-only layers).
