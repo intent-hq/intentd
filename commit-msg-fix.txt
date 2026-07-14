@@ -1,0 +1,8 @@
+fix(intent-services): use stable sort for batch hooks, fix test comments
+
+Address review feedback from PR #157:
+- Use stable sort_by instead of sort_by_key for deterministic ordering
+  when duplicate paths exist in a batch
+- Fix test comments to accurately reflect dependency-aware priority ordering:
+  server.wsApi.enabled (priority 10) applies before server.discovery.enabled
+  (priority 11), not lexicographic ordering within same tier

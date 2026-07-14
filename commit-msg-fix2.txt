@@ -1,0 +1,6 @@
+fix: address review feedback on batch hook ordering
+
+- Fix comment: non-server keys are sorted lexicographically, not stable
+- Fix test comment: wsApi.enabled is priority 10, discovery.enabled is priority 11
+- Clarify disable sequence: listener shutdown unpublishes mDNS first
+- Fix reverse-input test: send discovery.enabled FIRST to prove input-order independence

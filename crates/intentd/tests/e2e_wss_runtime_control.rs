@@ -447,8 +447,8 @@ async fn batch_hook_ordering_enable_both_services() {
 }
 
 /// Batch hook ordering: disable case. A batch with {wsApi.enabled=false, discovery.enabled=false}
-/// should stop both services. This tests the ordering is stable for the disable direction
-/// (both are priority 10 action-keys, process in lexicographic order).
+/// should stop both services. This tests the ordering is stable for the disable direction:
+/// wsApi.enabled (priority 10) applies before discovery.enabled (priority 11).
 #[tokio::test]
 async fn batch_hook_ordering_disable_both() {
     let data_dir = temp_data_dir();
@@ -471,7 +471,8 @@ async fn batch_hook_ordering_disable_both() {
     // Batch update: disable both wsApi and discovery in a SINGLE batch, in reverse
     // lexicographic input order (wsApi.enabled appears before discovery.enabled in the array).
     // The ordering rule ensures deterministic application: wsApi.enabled (priority 10) applies
-    // before discovery.enabled (priority 11), so the listener stops after mDNS is stopped.
+    // before discovery.enabled (priority 11). Note: stopping the WSS listener internally
+    // unpublishes mDNS first, so the subsequent discovery.enabled=false hook is a no-op.
     let batch_disable = uds_rpc(
         &socket,
         2,
@@ -546,17 +547,17 @@ async fn batch_hook_ordering_reverse_input_order() {
     );
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Batch update: provide changes in REVERSE lexicographic order (wsApi.enabled before discovery.enabled).
+    // Batch update: provide changes in REVERSE dependency order (discovery.enabled before wsApi.enabled).
     // The hook ordering ensures they still apply in deterministic, dependency-aware order:
-    // wsApi.enabled (priority 10) before discovery.enabled (priority 11).
+    // wsApi.enabled (priority 10) before discovery.enabled (priority 11), regardless of input order.
     let batch_reverse = uds_rpc(
         &socket,
         2,
         "settings.update",
         json!({
             "changes": [
-                { "path": "server.wsApi.enabled", "value": true },
-                { "path": "server.discovery.enabled", "value": true }
+                { "path": "server.discovery.enabled", "value": true },
+                { "path": "server.wsApi.enabled", "value": true }
             ]
         }),
     )

@@ -4338,7 +4338,7 @@ impl Services {
                 "server.discovery.enabled" => 11,
                 // Value-setting keys (port, locality, discovery config) apply first
                 _ if path.starts_with("server.") => 0,
-                // Non-server keys (no hooks, but maintain stable order)
+                // Non-server keys (no hooks, sorted lexicographically within this tier)
                 _ => 255,
             }
         }
