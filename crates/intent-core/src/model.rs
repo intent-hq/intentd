@@ -185,6 +185,11 @@ pub struct Workspace {
     /// Omitted (not `null`) until the first scan writes a snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
+    /// Whether CoW agent isolation is supported for this workspace. Computed as:
+    /// direct mode AND git repo AND cow_probe(userDir, workspacesRoot) Supported.
+    /// Used by the FE to gate the "Use Copy-on-Write for Agent Isolation" toggle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cow_supported: Option<bool>,
 }
 
 /// Fixed timestamp for the synthetic Chief workspace (TS
@@ -235,6 +240,7 @@ pub fn chief_workspace() -> Workspace {
         agent_summary: None,
         diff_summary: None,
         token_usage: None,
+        cow_supported: None,
     }
 }
 
@@ -2630,6 +2636,7 @@ mod tests {
             agent_summary: None,
             diff_summary: None,
             token_usage: None,
+            cow_supported: None,
         };
         let v = serde_json::to_value(&ws).unwrap();
         assert_eq!(v["status"], "Active");

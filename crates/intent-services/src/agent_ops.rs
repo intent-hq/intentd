@@ -2180,7 +2180,20 @@ impl Services {
 
         // Provision sandbox if isolation=cow is requested (Task 3).
         // Check if isolation is "cow" (explicit or defaulted from workspace setting).
-        let isolation = input.isolation.clone();
+        // Default to "cow" if workspace.cowIsolation setting is enabled and no explicit
+        // isolation parameter was provided (Task 5).
+        let mut isolation = input.isolation.clone();
+        if isolation.is_none() {
+            // Check workspace.cowIsolation setting
+            if let Ok(value) = self
+                .settings_get("workspace.cowIsolation".to_string())
+                .await
+            {
+                if value.as_bool().unwrap_or(false) {
+                    isolation = Some("cow".to_string());
+                }
+            }
+        }
         if isolation.as_deref() == Some("cow") {
             use crate::sandbox_ops::{provision_sandbox, ProvisionConfig, ProvisionOutcome};
             let workspace = self.store.get_workspace(&workspace_id).await.ok();

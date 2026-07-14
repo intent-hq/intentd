@@ -494,6 +494,7 @@ async fn seed_workspace_with_path(data_dir: &Path, root: &Path) -> String {
         agent_summary: None,
         diff_summary: None,
         token_usage: None,
+        cow_supported: None,
     };
     store.insert_workspace(&ws).await.expect("insert ws");
     ws_id.0

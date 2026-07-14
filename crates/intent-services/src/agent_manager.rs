@@ -2884,6 +2884,7 @@ mod role_reminder_tests {
             agent_summary: None,
             diff_summary: None,
             token_usage: None,
+            cow_supported: None,
         }
     }
 
@@ -3260,6 +3261,7 @@ mod agent_retry_tests {
             agent_summary: None,
             diff_summary: None,
             token_usage: None,
+            cow_supported: None,
             task_stats: None,
         }
     }
