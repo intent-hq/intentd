@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 use crate::discovery::detect_has_display;
 use crate::events::{error_frame, success_frame};
+use crate::protocol::PROTOCOL_VERSION;
 
 /// A classified `client.hello` request awaiting handling by the connection task.
 pub(crate) struct ClientRequest {
@@ -66,9 +67,10 @@ pub(crate) fn classify(value: &Value) -> Option<ClientRequest> {
 }
 
 /// Build the `server` capability block (§5.17): `{ locality, hasDisplay, osArch,
-/// version, capabilities }`. `osArch` is the daemon host's `os/arch` (e.g.
-/// `darwin/arm64`). `capabilities.liveState` advertises the live-state push
-/// surface (D+E) so the FE can feature-detect it without version-sniffing.
+/// version, protocolVersion, capabilities }`. `osArch` is the daemon host's
+/// `os/arch` (e.g. `darwin/arm64`). `protocolVersion` is the frozen JSON-RPC
+/// surface version (v2.0). `capabilities.liveState` advertises the live-state
+/// push surface (D+E) so the FE can feature-detect it without version-sniffing.
 /// Pure (inputs injected) so it is unit-testable.
 pub(crate) fn server_json(
     has_display: bool,
@@ -82,6 +84,7 @@ pub(crate) fn server_json(
         "hasDisplay": has_display,
         "osArch": format!("{os}/{arch}"),
         "version": version,
+        "protocolVersion": PROTOCOL_VERSION,
         "capabilities": { "liveState": true },
     })
 }

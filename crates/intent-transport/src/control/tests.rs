@@ -64,12 +64,14 @@ fn status_json_local_vs_remote_locality() {
     assert_eq!(local["clients"], 2);
     assert_eq!(local["agents"], 1);
     assert_eq!(local["fingerprint"], "AB:CD");
+    assert_eq!(local["protocolVersion"], "2.0");
     assert_eq!(local["host"]["os"], "macos");
     assert_eq!(local["host"]["arch"], "aarch64");
     assert_eq!(local["host"]["hasDisplay"], true);
 
     let remote = status_json(&status, false);
     assert_eq!(remote["host"]["locality"], "remote");
+    assert_eq!(remote["protocolVersion"], "2.0");
 }
 
 #[test]
