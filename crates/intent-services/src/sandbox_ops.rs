@@ -302,7 +302,10 @@ pub async fn merge_sandbox(
         let canonical_changed = get_changed_files(&canonical_repo)?;
 
         // Get the list of files changed by the sandbox (from base to HEAD)
-        let base_sha = sandbox.snapshot_commit_sha.as_ref().unwrap_or(&sandbox.base_commit_sha);
+        let base_sha = sandbox
+            .snapshot_commit_sha
+            .as_ref()
+            .unwrap_or(&sandbox.base_commit_sha);
         let sandbox_changed = get_files_in_range(&sandbox_repo, base_sha, "HEAD")?;
 
         // Check for overlap
@@ -314,7 +317,9 @@ pub async fn merge_sandbox(
 
         if !overlap.is_empty() {
             return Ok(MergeOutcome::Blocked {
-                reason: "Canonical repository has uncommitted changes overlapping with sandbox changes".to_string(),
+                reason:
+                    "Canonical repository has uncommitted changes overlapping with sandbox changes"
+                        .to_string(),
                 overlapping_paths: overlap,
             });
         }
@@ -328,13 +333,14 @@ pub async fn merge_sandbox(
 
     canonical_repo
         .remote_anonymous(sandbox_path_str)
-        .and_then(|mut remote| {
-            remote.fetch(&[&sandbox.branch], None, None)
-        })
+        .and_then(|mut remote| remote.fetch(&[&sandbox.branch], None, None))
         .map_err(|e| Error::Internal(format!("fetch sandbox branch failed: {e}")))?;
 
     // Get the range of commits to cherry-pick: from snapshot (or base) to sandbox HEAD
-    let start_sha = sandbox.snapshot_commit_sha.as_ref().unwrap_or(&sandbox.base_commit_sha);
+    let start_sha = sandbox
+        .snapshot_commit_sha
+        .as_ref()
+        .unwrap_or(&sandbox.base_commit_sha);
     let sandbox_head = sandbox_repo
         .head()
         .map_err(|e| Error::Internal(format!("get sandbox HEAD failed: {e}")))?
@@ -388,7 +394,9 @@ pub async fn merge_sandbox(
                             git2::ResetType::Hard,
                             None,
                         )
-                        .map_err(|e| Error::Internal(format!("reset after conflict failed: {e}")))?;
+                        .map_err(|e| {
+                            Error::Internal(format!("reset after conflict failed: {e}"))
+                        })?;
 
                     return Ok(MergeOutcome::Conflict {
                         conflicting_paths,
@@ -572,7 +580,11 @@ fn get_changed_files(repo: &git2::Repository) -> Result<Vec<String>> {
 }
 
 /// Get the list of files changed in a commit range.
-fn get_files_in_range(repo: &git2::Repository, start_sha: &str, end_sha: &str) -> Result<Vec<String>> {
+fn get_files_in_range(
+    repo: &git2::Repository,
+    start_sha: &str,
+    end_sha: &str,
+) -> Result<Vec<String>> {
     let start_oid = git2::Oid::from_str(start_sha)
         .map_err(|e| Error::Internal(format!("parse start OID failed: {e}")))?;
     let end_oid = if end_sha == "HEAD" {
@@ -623,7 +635,11 @@ fn get_files_in_range(repo: &git2::Repository, start_sha: &str, end_sha: &str) -
 }
 
 /// Get the list of commits after start_sha up to end_sha (exclusive of start, inclusive of end).
-fn get_commits_after(repo: &git2::Repository, start_sha: &str, end_sha: &str) -> Result<Vec<String>> {
+fn get_commits_after(
+    repo: &git2::Repository,
+    start_sha: &str,
+    end_sha: &str,
+) -> Result<Vec<String>> {
     let start_oid = git2::Oid::from_str(start_sha)
         .map_err(|e| Error::Internal(format!("parse start OID failed: {e}")))?;
     let end_oid = git2::Oid::from_str(end_sha)
@@ -653,10 +669,12 @@ fn get_commits_after(repo: &git2::Repository, start_sha: &str, end_sha: &str) ->
 /// Get the list of conflicting file paths from an index with conflicts.
 fn get_conflicting_paths(index: &git2::Index) -> Result<Vec<String>> {
     let mut paths = Vec::new();
-    for entry in index.conflicts()
+    for entry in index
+        .conflicts()
         .map_err(|e| Error::Internal(format!("get conflicts failed: {e}")))?
     {
-        let conflict = entry.map_err(|e| Error::Internal(format!("iterate conflicts failed: {e}")))?;
+        let conflict =
+            entry.map_err(|e| Error::Internal(format!("iterate conflicts failed: {e}")))?;
         // Use the "our" side path (or "their" side if "our" is missing)
         if let Some(our) = conflict.our {
             let path = String::from_utf8_lossy(&our.path).to_string();
@@ -1428,8 +1446,13 @@ mod tests {
         let config = ProvisionConfig {
             workspaces_root: workspaces_root.clone(),
         };
-        let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config).await.unwrap();
-        let ProvisionOutcome::Supported { path: sandbox_path, .. } = outcome else {
+        let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Supported {
+            path: sandbox_path, ..
+        } = outcome
+        else {
             panic!("Expected Supported outcome");
         };
 
@@ -1511,14 +1534,23 @@ mod tests {
         let config = ProvisionConfig {
             workspaces_root: workspaces_root.clone(),
         };
-        let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config).await.unwrap();
-        let ProvisionOutcome::Supported { path: sandbox_path, .. } = outcome else {
+        let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Supported {
+            path: sandbox_path, ..
+        } = outcome
+        else {
             panic!("Expected Supported outcome");
         };
 
         // Modify same file in sandbox
         let sandbox_repo = Repository::open(&sandbox_path).unwrap();
-        fs::write(PathBuf::from(&sandbox_path).join("file.txt"), "line1\nsandbox change\n").unwrap();
+        fs::write(
+            PathBuf::from(&sandbox_path).join("file.txt"),
+            "line1\nsandbox change\n",
+        )
+        .unwrap();
         let mut sandbox_index = sandbox_repo.index().unwrap();
         sandbox_index.add_path(Path::new("file.txt")).unwrap();
         sandbox_index.write().unwrap();
@@ -1559,7 +1591,9 @@ mod tests {
 
         // Verify conflict detected
         match outcome {
-            MergeOutcome::Conflict { conflicting_paths, .. } => {
+            MergeOutcome::Conflict {
+                conflicting_paths, ..
+            } => {
                 assert!(conflicting_paths.contains(&"file.txt".to_string()));
                 // Verify canonical is pristine (not mid-merge)
                 assert!(repo.state() == git2::RepositoryState::Clean);
@@ -1603,17 +1637,23 @@ mod tests {
         let config = ProvisionConfig {
             workspaces_root: workspaces_root.clone(),
         };
-        let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config).await.unwrap();
+        let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config)
+            .await
+            .unwrap();
         let ProvisionOutcome::Supported {
             path: sandbox_path,
             snapshot_commit_sha,
             ..
-        } = outcome else {
+        } = outcome
+        else {
             panic!("Expected Supported outcome");
         };
 
         // Verify snapshot was created
-        assert!(snapshot_commit_sha.is_some(), "Snapshot should be created for WIP");
+        assert!(
+            snapshot_commit_sha.is_some(),
+            "Snapshot should be created for WIP"
+        );
 
         // Make agent commit in sandbox
         let sandbox_repo = Repository::open(&sandbox_path).unwrap();
@@ -1647,7 +1687,10 @@ mod tests {
                 // Verify agent work landed
                 assert!(canonical_path.join("agent_work.txt").exists());
                 // Verify WIP snapshot did NOT land (critical!)
-                assert!(!canonical_path.join("wip.txt").exists(), "WIP snapshot must not be merged");
+                assert!(
+                    !canonical_path.join("wip.txt").exists(),
+                    "WIP snapshot must not be merged"
+                );
             }
             _ => panic!("Expected Merged outcome, got {:?}", outcome),
         }

@@ -118,14 +118,16 @@ impl Store {
         status: SandboxStatus,
         updated_at: &str,
     ) -> Result<()> {
-        sqlx::query("UPDATE sandbox SET status = ?, updated_at = ? WHERE workspace_id = ? AND agent_id = ?")
-            .bind(status.to_db())
-            .bind(updated_at)
-            .bind(&workspace_id.0)
-            .bind(&agent_id.0)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| intent_core::Error::Internal(format!("update sandbox status failed: {e}")))?;
+        sqlx::query(
+            "UPDATE sandbox SET status = ?, updated_at = ? WHERE workspace_id = ? AND agent_id = ?",
+        )
+        .bind(status.to_db())
+        .bind(updated_at)
+        .bind(&workspace_id.0)
+        .bind(&agent_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| intent_core::Error::Internal(format!("update sandbox status failed: {e}")))?;
         Ok(())
     }
 
