@@ -39,45 +39,66 @@ impl Store {
             .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("begin IMMEDIATE failed: {e}")))?;
-        let next_v: i64 = sqlx::query(
-            "SELECT COALESCE(MAX(v), 0) + 1 AS v FROM note_version \
-             WHERE note_id = ? AND workspace_id = ?",
-        )
-        .bind(&note.id.0)
-        .bind(&note.workspace_id.0)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|e| Error::Internal(format!("next note_version failed: {e}")))?
-        .try_get("v")
-        .map_err(|e| Error::Internal(format!("column v: {e}")))?;
-        sqlx::query(
-            "INSERT INTO note_version (note_id, workspace_id, v, date, author_id, author_name, \
-             author_type, title, content) VALUES (?,?,?,?,?,?,?,?,?)",
-        )
-        .bind(&note.id.0)
-        .bind(&note.workspace_id.0)
-        .bind(next_v)
-        .bind(date)
-        .bind(&author.id)
-        .bind(&author.name)
-        .bind(&author.author_type)
-        .bind(&note.title)
-        .bind(&note.content)
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| Error::Internal(format!("insert note_version failed: {e}")))?;
-        sqlx::query("DELETE FROM note_version WHERE note_id = ? AND workspace_id = ? AND v <= ?")
+
+        // Execute the transaction body; rollback explicitly on error.
+        let result = async {
+            let next_v: i64 = sqlx::query(
+                "SELECT COALESCE(MAX(v), 0) + 1 AS v FROM note_version \
+                 WHERE note_id = ? AND workspace_id = ?",
+            )
+            .bind(&note.id.0)
+            .bind(&note.workspace_id.0)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("next note_version failed: {e}")))?
+            .try_get("v")
+            .map_err(|e| Error::Internal(format!("column v: {e}")))?;
+
+            sqlx::query(
+                "INSERT INTO note_version (note_id, workspace_id, v, date, author_id, author_name, \
+                 author_type, title, content) VALUES (?,?,?,?,?,?,?,?,?)",
+            )
+            .bind(&note.id.0)
+            .bind(&note.workspace_id.0)
+            .bind(next_v)
+            .bind(date)
+            .bind(&author.id)
+            .bind(&author.name)
+            .bind(&author.author_type)
+            .bind(&note.title)
+            .bind(&note.content)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("insert note_version failed: {e}")))?;
+
+            sqlx::query(
+                "DELETE FROM note_version WHERE note_id = ? AND workspace_id = ? AND v <= ?",
+            )
             .bind(&note.id.0)
             .bind(&note.workspace_id.0)
             .bind(next_v - MAX_NOTE_VERSIONS)
             .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("prune note_version failed: {e}")))?;
-        sqlx::query("COMMIT")
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("commit note_version tx failed: {e}")))?;
-        Ok(next_v)
+
+            Ok(next_v)
+        }
+        .await;
+
+        match result {
+            Ok(v) => {
+                sqlx::query("COMMIT")
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| Error::Internal(format!("commit note_version tx failed: {e}")))?;
+                Ok(v)
+            }
+            Err(e) => {
+                // Best-effort rollback to avoid leaving connection with open transaction.
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
     }
 
     /// List a note's stored versions ascending by `v`, without content blobs
