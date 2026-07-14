@@ -246,6 +246,7 @@ pub async fn serve_uds_with_reverse<F>(
     _bus: EventBus,
     _socket_path: &Path,
     _control: Option<Arc<dyn SystemControl>>,
+    _server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
     _reverse_registry: Arc<PrimaryReverseRegistry>,
     _shutdown: F,
 ) -> std::io::Result<()>
