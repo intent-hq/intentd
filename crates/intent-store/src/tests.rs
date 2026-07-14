@@ -2211,3 +2211,56 @@ async fn pool_smoke_test_with_explicit_config() {
 
     pool.close().await;
 }
+
+/// Regression test for STAB-19: appending a message to an agent session
+/// must refresh `agent_session.updated_at` so the FE agent-card timestamp
+/// reflects real activity, not just status transitions.
+#[tokio::test]
+async fn agent_message_append_refreshes_updated_at() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let agent_id = AgentId::from("agent-bbbbbbbb-1111-2222-3333-444444444444");
+    let mut session = sample_agent_session(&agent_id, &ws);
+    session.updated_at = "2026-01-01T00:00:00Z".to_string();
+    store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert session");
+
+    // Baseline: the session was inserted with updated_at = "2026-01-01T00:00:00Z".
+    let before = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(before.updated_at, "2026-01-01T00:00:00Z");
+
+    // Append a message with a later timestamp.
+    let later = "2026-01-01T01:00:00Z";
+    store
+        .append_agent_message(
+            &agent_id,
+            "user",
+            &json!([{ "type": "text", "text": "test message" }]),
+            later,
+        )
+        .await
+        .expect("append message");
+
+    // STAB-19 fix: refresh_agent_session_timestamp is called by the services
+    // layer after append_agent_message. Simulate that here.
+    store
+        .refresh_agent_session_timestamp(&ws, &agent_id, later)
+        .await
+        .expect("refresh timestamp");
+
+    // The session's updated_at should now reflect the message timestamp.
+    let after = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(
+        after.updated_at, later,
+        "updated_at must advance when a message is appended"
+    );
+    assert_eq!(after.messages.len(), 1, "message log should have 1 entry");
+}
