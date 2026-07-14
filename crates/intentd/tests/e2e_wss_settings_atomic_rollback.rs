@@ -255,10 +255,17 @@ async fn mixed_batch_rollback_over_wss() {
 
     // Baseline: git.autoCommit=true, server.port=5181 (default)
     // Note: server.wsApi.enabled setting is false by default, but the listener is running because of --listen both
-    let r = uds_rpc(&socket, 1, "settings.get", json!({"path": "git.autoCommit"})).await;
+    let r = uds_rpc(
+        &socket,
+        1,
+        "settings.get",
+        json!({"path": "git.autoCommit"}),
+    )
+    .await;
     assert_eq!(r["result"]["value"], json!(true));
     let r = uds_rpc(&socket, 2, "settings.get", json!({"path": "server.port"})).await;
-    assert_eq!(r["result"]["value"].as_f64().unwrap() as i64, 5181);
+    // server.port is stored as a JSON number (float); compare numerically
+    assert_eq!(r["result"]["value"], json!(5181.0));
 
     // Get server fingerprint and port from system.status (WSS listener started at boot with --listen both)
     let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
@@ -294,14 +301,49 @@ async fn mixed_batch_rollback_over_wss() {
     // Assert error response with failing key
     assert!(batch_resp.get("error").is_some(), "expected error response");
     let error = &batch_resp["error"];
-    assert!(error["message"].as_str().unwrap().contains("TCP connection") || error["message"].as_str().unwrap().contains("self-terminate"), "error should mention TCP connection guard");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("TCP connection")
+            || error["message"]
+                .as_str()
+                .unwrap()
+                .contains("self-terminate"),
+        "error should mention TCP connection guard"
+    );
 
     // Verify rollback: all three settings should be back to baseline via UDS
     // (The WSS connection was dropped because the compensating rollback stopped the listener when reverting wsApi.enabled)
-    let r = uds_rpc(&socket, 10, "settings.get", json!({"path": "git.autoCommit"})).await;
-    assert_eq!(r["result"]["value"], json!(true), "git.autoCommit should be rolled back to true");
+    let r = uds_rpc(
+        &socket,
+        10,
+        "settings.get",
+        json!({"path": "git.autoCommit"}),
+    )
+    .await;
+    assert_eq!(
+        r["result"]["value"],
+        json!(true),
+        "git.autoCommit should be rolled back to true"
+    );
     let r = uds_rpc(&socket, 11, "settings.get", json!({"path": "server.port"})).await;
-    assert_eq!(r["result"]["value"].as_f64().unwrap() as i64, 5181, "server.port should be rolled back to 5181");
-    let r = uds_rpc(&socket, 12, "settings.get", json!({"path": "server.wsApi.enabled"})).await;
-    assert_eq!(r["result"]["value"], json!(false), "server.wsApi.enabled should be rolled back to false (default)");
+    // server.port is stored as a JSON number (float); compare numerically
+    assert_eq!(
+        r["result"]["value"],
+        json!(5181.0),
+        "server.port should be rolled back to 5181"
+    );
+    let r = uds_rpc(
+        &socket,
+        12,
+        "settings.get",
+        json!({"path": "server.wsApi.enabled"}),
+    )
+    .await;
+    assert_eq!(
+        r["result"]["value"],
+        json!(false),
+        "server.wsApi.enabled should be rolled back to false (default)"
+    );
 }

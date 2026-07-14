@@ -4519,13 +4519,16 @@ impl WorkspaceApi for Services {
                                     "settings.update rollback failed for key"
                                 );
                                 rollback_failed = true;
-                            } else {
-                                // Build a change record for compensating hook application
-                                let val_json = if let Some(val) = old_val {
-                                    serde_json::from_str(&val).unwrap_or(serde_json::Value::Null)
-                                } else {
-                                    serde_json::Value::Null
-                                };
+                            } else if let Some(val) = old_val {
+                                // Build a change record for compensating hook application.
+                                // Only include settings that had a prior value — server hooks
+                                // (wsApi.enabled, discovery.enabled) check .as_bool() and no-op
+                                // on Value::Null. For settings that were unset (old_val == None),
+                                // omit them from compensating_changes; persistence rollback (delete
+                                // above) is sufficient, and the runtime defaults (listener stopped,
+                                // discovery stopped) are already correct.
+                                let val_json =
+                                    serde_json::from_str(&val).unwrap_or(serde_json::Value::Null);
                                 compensating_changes.push(serde_json::json!({
                                     "path": path,
                                     "value": val_json
