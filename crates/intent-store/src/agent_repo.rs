@@ -279,6 +279,20 @@ impl Store {
         Ok(())
     }
 
+    /// Reset all `is_active=1` rows to `is_active=0` unconditionally (Wave B
+    /// post-restart recovery). ACP sessions are process-local and cannot survive
+    /// a daemon restart, so any `is_active=1` flag after boot is stale. Called
+    /// early in startup (before listeners) to ensure no races with live turn
+    /// spawns. Returns the count of rows reset.
+    pub async fn reset_all_active_flags(&self) -> Result<usize> {
+        let rows = sqlx::query("UPDATE agent_session SET is_active=0 WHERE is_active=1")
+            .execute(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("reset active flags failed: {e}")))?
+            .rows_affected();
+        Ok(rows as usize)
+    }
+
     /// Set `acp_session_id` write-once (the provider `session:created` path).
     /// Scoped to `workspace_id` (defense-in-depth). Errors if it is already set
     /// to a different value (§9.5). `NotFound` if the session is absent or the

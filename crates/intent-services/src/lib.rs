@@ -1224,7 +1224,9 @@ impl Services {
     /// Wake every parent whose oneShot watch matches child_id, then drop that
     /// watch. group_id = Some watches defer to the AS-4 delegation-group fan-in
     /// and are left untouched. A single failed delivery is logged and skipped so
-    /// the remaining watches still fire.
+    /// the remaining watches still fire. Wave B: remove oneShot watches BEFORE
+    /// delivery to prevent duplicate wakes if the same event is reprocessed or
+    /// the delivery loop is reentrant.
     pub(crate) async fn deliver_completion_to_watches(
         &self,
         workspace_id: &WorkspaceId,
@@ -1259,6 +1261,25 @@ impl Services {
                 self.try_fire_group(workspace_id, &gid).await;
                 continue;
             }
+            // Wave B (STAB-18 fix): remove oneShot watch BEFORE delivery so a
+            // reprocessed event or reentrant loop cannot deliver the same
+            // completion twice. The watch is atomically removed from the registry;
+            // if delivery fails the parent misses the wake, but that's safer than
+            // duplicate delivery (which we observed in production: STAB-5). Group
+            // watches are still removed AFTER group settlement as before.
+            if watch.one_shot {
+                let removed = self.remove_watch(workspace_id, &watch.id);
+                if !removed {
+                    // Watch was concurrently removed (e.g. by another event or
+                    // cancelSubscriptions); skip delivery to avoid a duplicate.
+                    tracing::debug!(
+                        child = %child_id.0,
+                        parent = %watch.parent_agent_id.0,
+                        "oneShot watch already removed, skipping delivery"
+                    );
+                    continue;
+                }
+            }
             let wake = format_completion_wake(child_id, event);
             let metadata = build_event_notification_metadata(&[event]);
             if let Err(e) = self
@@ -1278,7 +1299,6 @@ impl Services {
                 continue;
             }
             if watch.one_shot {
-                self.remove_watch(workspace_id, &watch.id);
                 self.publish_subscriptions_changed(workspace_id, &watch.parent_agent_id)
                     .await;
             }
