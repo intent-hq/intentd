@@ -1872,6 +1872,59 @@ impl AgentManager {
         self.try_begin(agent_id, workspace_id).await
     }
 
+    /// Retry a failed agent spawn (`agent.retry` RPC path). Only valid when
+    /// the agent status is `error`; returns `{ ok: false }` otherwise. Clears
+    /// the error status back to pending, tears down any stale child, and
+    /// attempts to redrive the front-of-queue message (requeued at exhaustion)
+    /// plus any subsequent messages. Reuses the spawn-retry/backoff machinery,
+    /// so a retry that fails again lands back in the `error` state with events.
+    pub async fn agent_retry(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+    ) -> Result<Value> {
+        // Fetch current session status
+        let session = self.services.store.get_agent_session(&agent_id).await?;
+
+        // Only allow retry when the session status is `error`
+        if session.status != AgentStatus::Error {
+            return Ok(json!({ "ok": false }));
+        }
+
+        // Clear the error status back to pending
+        let ts = now_iso();
+        self.services
+            .store
+            .set_agent_session_status(&workspace_id, &agent_id, AgentStatus::Pending, false, &ts)
+            .await?;
+
+        // Emit agent:status-changed
+        let event = NewEvent {
+            workspace_id: workspace_id.clone(),
+            timestamp: ts,
+            event_type: AGENT_STATUS_CHANGED.to_string(),
+            actor: agent_actor(&agent_id),
+            session_id: Some(agent_id.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({
+                "agentId": agent_id.0,
+                "status": "pending",
+                "isActive": false,
+            }),
+        };
+        crate::publish_event(&self.services.event_bus, event).await;
+
+        // Tear down any stale child handle
+        self.stop(&agent_id).await;
+
+        // Start the drain loop to redrive the requeued message
+        self.clone().try_drain_queue(agent_id, workspace_id).await;
+
+        Ok(json!({ "ok": true }))
+    }
+
     /// Spawn the background turn worker after the caller has already claimed
     /// the in-flight slot via [`AgentManager::try_begin_turn`] AND persisted
     /// the user-message row. The worker path does NOT re-persist the initial
@@ -2962,5 +3015,177 @@ mod retry_tests {
     fn generic_internal_error_is_retryable() {
         let err = Error::Internal("transport error: connection reset".to_string());
         assert!(is_retryable_spawn_error(&err));
+    }
+}
+
+#[cfg(test)]
+mod agent_retry_tests {
+    //! Unit tests for agent.retry RPC (retry a failed agent spawn).
+
+    use super::*;
+    use crate::events::EventBus;
+    use crate::BusEventSink;
+    use intent_core::{
+        AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
+        WorkspaceStatus,
+    };
+    use intent_store::Store;
+    use std::sync::Arc;
+
+    fn workspace(id: &WorkspaceId) -> Workspace {
+        let ts = now_iso();
+        Workspace {
+            id: id.clone(),
+            title: "Test WS".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            archived: false,
+            archived_at: None,
+            active_pull_request: None,
+            pr_number: None,
+            pr_status: None,
+            pr_url: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            task_stats: None,
+        }
+    }
+
+    fn session(agent_id: &AgentId, ws: &WorkspaceId, status: AgentStatus) -> AgentSession {
+        let ts = now_iso();
+        AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: Some("session-1".to_string()),
+            name: "Agent".to_string(),
+            name_explicitly_set: false,
+            model: Some("model-1".to_string()),
+            provider: Some("provider-1".to_string()),
+            system_prompt: None,
+            specialist: None,
+            status,
+            is_active: false,
+            messages: Vec::new(),
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    }
+
+    async fn manager_with_session(
+        agent_id: &AgentId,
+        ws: &WorkspaceId,
+        status: AgentStatus,
+    ) -> Arc<AgentManager> {
+        let path = std::env::temp_dir().join(format!("intentd-retry-{}.db", uuid::Uuid::new_v4()));
+        let db = Store::open(&path).await.expect("temp store");
+        db.insert_workspace(&workspace(ws))
+            .await
+            .expect("insert workspace");
+        db.insert_agent_session(&session(agent_id, ws, status))
+            .await
+            .expect("insert session");
+        let bus = EventBus::new(db.clone());
+        let services = Services::new(db).with_event_bus(bus.clone());
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+        Arc::new(AgentManager::new(services, sink, 8))
+    }
+
+    #[tokio::test]
+    async fn retry_from_error_status_returns_ok_true() {
+        let agent_id = AgentId::from("agent-1");
+        let ws = WorkspaceId::from("ws-1");
+        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+
+        let result = mgr
+            .agent_retry(agent_id.clone(), ws.clone())
+            .await
+            .expect("retry");
+        assert_eq!(result["ok"], true);
+
+        // Status should be cleared to Pending
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .expect("session");
+        assert_eq!(session.status, AgentStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn retry_from_pending_status_returns_ok_false() {
+        let agent_id = AgentId::from("agent-2");
+        let ws = WorkspaceId::from("ws-2");
+        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Pending).await;
+
+        let result = mgr
+            .agent_retry(agent_id.clone(), ws.clone())
+            .await
+            .expect("retry");
+        assert_eq!(result["ok"], false);
+
+        // Status should remain Pending
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .expect("session");
+        assert_eq!(session.status, AgentStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn retry_from_active_status_returns_ok_false() {
+        let agent_id = AgentId::from("agent-3");
+        let ws = WorkspaceId::from("ws-3");
+        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Active).await;
+
+        let result = mgr
+            .agent_retry(agent_id.clone(), ws.clone())
+            .await
+            .expect("retry");
+        assert_eq!(result["ok"], false);
+
+        // Status should remain Active
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .expect("session");
+        assert_eq!(session.status, AgentStatus::Active);
     }
 }

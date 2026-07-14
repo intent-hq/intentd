@@ -8432,6 +8432,20 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_retry(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            if let Some(manager) = self.agent_manager() {
+                manager.agent_retry(agent_id, workspace_id).await
+            } else {
+                Ok(serde_json::json!({ "ok": false }))
+            }
+        })
+    }
+
     fn agent_set_model(
         &self,
         _workspace_id: WorkspaceId,

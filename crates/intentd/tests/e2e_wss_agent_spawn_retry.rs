@@ -1,6 +1,12 @@
 //! WSS end-to-end agent spawn retry and exhaustion (RETRY-1): prove the retry
 //! behavior over the real WSS transport per packages/intentd/AGENTS.md (every
 //! feature needs a WSS e2e, not just unit tests).
+//!
+//! Drives the full spawn → retry → success or terminal-failure → agent:failed
+//! paths over a pinned TLS WebSocket, asserting retry hints (agent:stream:status)
+//! and terminal events reach the subscriber at the right ordinals.
+//!
+//! Gated on `node` + the mock script; skips cleanly otherwise.
 
 #![cfg(unix)]
 
@@ -106,7 +112,6 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
 
-/// Pin the server's SHA-256 fingerprint (colon-UPPER hex over the DER cert).
 #[derive(Debug)]
 struct PinnedVerifier {
     fingerprint: String,
@@ -194,7 +199,6 @@ async fn tls_connect(
         .expect("tls connect")
 }
 
-/// Open an authenticated WSS connection (token in the query string).
 async fn connect_ws(
     port: u16,
     cfg: Arc<ClientConfig>,
@@ -207,8 +211,6 @@ async fn connect_ws(
     ws
 }
 
-/// Send one JSON-RPC frame and return the result whose id matches; any
-/// out-of-band notifications (`events.event`) are ignored.
 async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -238,7 +240,6 @@ where
     }
 }
 
-/// Read one `events.event` notification from a subscriber connection (bounded).
 async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -252,41 +253,6 @@ where
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["method"] == "events.event" {
                     return v;
-                }
-            }
-            Some(Ok(Message::Ping(p))) => {
-                let _ = ws.send(Message::Pong(p)).await;
-            }
-            Some(Ok(_)) => continue,
-            other => panic!("expected text frame, got {other:?}"),
-        }
-    }
-}
-
-/// Variant of `wss_event` that returns `None` on timeout instead of panicking,
-/// for tests that assert an event stream stayed silent (e.g. no-prompt initial
-/// agent must not emit any `agent:stream:*` frame). Uses a single deadline so
-/// periodic non-`events.event` frames (heartbeat `Ping`, unrelated pushes) do
-/// not reset the wait window and hide silence-violations.
-async fn wss_event_opt<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Option<Value>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    loop {
-        let remaining = match deadline.checked_duration_since(tokio::time::Instant::now()) {
-            Some(d) if !d.is_zero() => d,
-            _ => return None,
-        };
-        let next = match timeout(remaining, ws.next()).await {
-            Ok(next) => next,
-            Err(_) => return None,
-        };
-        match next {
-            Some(Ok(Message::Text(text))) => {
-                let v: Value = serde_json::from_str(&text).expect("json frame");
-                if v["method"] == "events.event" {
-                    return Some(v);
                 }
             }
             Some(Ok(Message::Ping(p))) => {
@@ -370,6 +336,9 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 }
 
 /// RETRY-1a: session/new stall → retry with status hint → success.
+/// Mock ignores session/new on the first attempt (timeout), then succeeds on
+/// retry. Assert agent:stream:status retry hint is observed before the turn
+/// completes with agent:stream:chunk + agent:stream:end.
 #[tokio::test]
 async fn agent_spawn_retry_session_new_stall_over_wss() {
     let Some(script) = gate("WSS spawn retry session/new stall E2E") else {
@@ -385,6 +354,7 @@ async fn agent_spawn_retry_session_new_stall_over_wss() {
     })
     .to_string();
     let port_s = free_port().to_string();
+    // Fast retry: 500ms timeout so the e2e doesn't wait 60s per attempt
     let env: [(&str, &str); 6] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", &port_s),
@@ -443,6 +413,8 @@ async fn agent_spawn_retry_session_new_stall_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
+    // Collect events until terminal: expect >=1 agent:stream:status retry hint
+    // (warning level, attempt N/3), then >=1 chunk, then exactly one stream:end.
     let mut status_frames = Vec::new();
     let mut chunks = 0u32;
     let mut ends = 0u32;
@@ -487,6 +459,9 @@ async fn agent_spawn_retry_session_new_stall_over_wss() {
 }
 
 /// RETRY-1b: stdout closed (immediate exit) → retry with status hint → success.
+/// Mock exits immediately on launch for the first attempt (handshake failure),
+/// then succeeds on retry. Assert agent:stream:status retry hint is observed
+/// before the turn completes.
 #[tokio::test]
 async fn agent_spawn_retry_stdout_closed_over_wss() {
     let Some(script) = gate("WSS spawn retry stdout closed E2E") else {
@@ -593,7 +568,10 @@ async fn agent_spawn_retry_stdout_closed_over_wss() {
     assert_eq!(ends, 1, "exactly one terminal agent:stream:end over WSS");
 }
 
-/// RETRY-1c: terminal failure (always fails session/new) → agent:failed + agent:stream:end.
+/// RETRY-1c: terminal failure (always fails session/new) → agent:failed +
+/// agent:stream:end. Mock ignores session/new on all 3 attempts (exhaustion),
+/// then the daemon emits terminal agent:failed + agent:stream:end events with
+/// no streaming chunks.
 #[tokio::test]
 async fn agent_spawn_exhaustion_terminal_failure_over_wss() {
     let Some(script) = gate("WSS spawn exhaustion terminal failure E2E") else {
@@ -603,6 +581,7 @@ async fn agent_spawn_exhaustion_terminal_failure_over_wss() {
     let ws_id = seed_workspace_only(&data_dir).await;
     let attempt_file = data_dir.join("attempts.txt");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
+    // Ignore session/new on all 3 attempts → terminal failure
     let behavior = json!({
         "ignoreSessionNewAttempts": 999,
     })
@@ -666,6 +645,8 @@ async fn agent_spawn_exhaustion_terminal_failure_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
+    // Collect events until terminal: expect >=1 agent:stream:status retry hints,
+    // then agent:failed + agent:stream:end (no chunks since all spawns failed).
     let mut status_frames = Vec::new();
     let mut saw_failed = false;
     let mut saw_end = false;

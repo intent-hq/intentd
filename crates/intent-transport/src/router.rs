@@ -1122,6 +1122,12 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.retry" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = require_ws_note(params)?;
+            let result = api.agent_retry(ws, agent_id).await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.wakeOrCreate" => {
             let ws = require_ws_note(params)?;
             let task_note_id = require_str_param(params, "taskNoteId").map(NoteId::from)?;
