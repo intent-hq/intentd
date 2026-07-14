@@ -318,7 +318,8 @@ mod tests {
 
     impl TempDb {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("sandbox-test-{}.db", uuid::Uuid::new_v4()));
+            let path =
+                std::env::temp_dir().join(format!("sandbox-test-{}.db", uuid::Uuid::new_v4()));
             Self { path }
         }
     }
@@ -326,7 +327,8 @@ mod tests {
     impl Drop for TempDb {
         fn drop(&mut self) {
             for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
+                let _ =
+                    std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
             }
         }
     }
@@ -415,14 +417,7 @@ mod tests {
         let parent = source_repo.head().unwrap().peel_to_commit().unwrap();
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
         source_repo
-            .commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                "Add test file",
-                &tree,
-                &[&parent],
-            )
+            .commit(Some("HEAD"), &sig, &sig, "Add test file", &tree, &[&parent])
             .unwrap();
 
         // Get the HEAD sha before provisioning
@@ -738,10 +733,7 @@ mod tests {
         store.insert_sandbox(&sandbox).await.unwrap();
 
         // Now delete the agent session to make the sandbox orphaned
-        store
-            .delete_agent_session(&ws_id, &agent_id)
-            .await
-            .unwrap();
+        store.delete_agent_session(&ws_id, &agent_id).await.unwrap();
 
         // Run GC
         gc_orphaned_sandboxes(&store).await.unwrap();
