@@ -155,6 +155,10 @@ async fn handle_pairing_info_remote_rejects() {
 #[tokio::test]
 async fn handle_rotate_token_local_success() {
     use std::env;
+    // Temporarily clear INTENTD_AUTH_TOKEN to ensure rotation succeeds in this test
+    let env_backup = env::var("INTENTD_AUTH_TOKEN").ok();
+    env::remove_var("INTENTD_AUTH_TOKEN");
+
     let tmpdir = env::temp_dir().join(format!(
         "intentd-test-{}-{}",
         std::process::id(),
@@ -181,5 +185,10 @@ async fn handle_rotate_token_local_success() {
     let new_token = parsed["result"]["token"].as_str().unwrap();
     assert_ne!(new_token, "old-token");
     assert_eq!(new_token.len(), 64);
+
+    // Restore env var
+    if let Some(val) = env_backup {
+        env::set_var("INTENTD_AUTH_TOKEN", val);
+    }
     let _ = std::fs::remove_dir_all(&tmpdir);
 }
