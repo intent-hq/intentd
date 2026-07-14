@@ -325,4 +325,9 @@ pub const NOTIFICATIONS: &[&str] = &["events.event"];
 /// connected frontend. The daemon validates the envelope, then dispatches a
 /// reverse RPC back to the client with a synthetic `rev-<n>` request id and
 /// echoes the client's result back to the original caller.
-pub const REVERSE_METHODS: &[&str] = &["browser.exec", "host.openExternal", "host.pickApplication"];
+pub const REVERSE_METHODS: &[&str] = &[
+    "browser.exec",
+    "host.openExternal",
+    "host.openInEditor",
+    "host.pickApplication",
+];

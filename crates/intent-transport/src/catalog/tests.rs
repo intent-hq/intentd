@@ -3,6 +3,11 @@
 //! These tests enforce that any surface drift (added/removed/renamed methods)
 //! fails CI with a clear "update the catalog + PROTOCOL.md + bump protocol
 //! version" message.
+//!
+//! Router and fast-path methods are mechanically extracted from source at test
+//! runtime to detect drift. Notifications and reverse RPCs use count-based
+//! checks only (extracting reverse `.request("...")` call sites would be
+//! fragile); renames are a lower-risk edge case caught during code review.
 
 use super::{FASTPATH_METHODS, METHOD_ALIASES, NOTIFICATIONS, REVERSE_METHODS, ROUTER_METHODS};
 use std::collections::HashSet;
@@ -130,7 +135,7 @@ const EXPECTED_ALIASES: usize = 2;
 const EXPECTED_NOTIFICATIONS: usize = 1;
 
 /// Golden count: client-served reverse RPCs.
-const EXPECTED_REVERSE_METHODS: usize = 3;
+const EXPECTED_REVERSE_METHODS: usize = 4;
 
 #[test]
 fn router_methods_match_actual_source() {
