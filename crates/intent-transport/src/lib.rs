@@ -13,6 +13,9 @@ pub use auth::{
     is_auth_enabled, is_discovery_enabled, validate_token, AsyncTokenStore, FileTokenStore,
     TokenStore,
 };
+pub use catalog::{
+    FASTPATH_METHODS, METHOD_ALIASES, NOTIFICATIONS, REVERSE_METHODS, ROUTER_METHODS,
+};
 pub use context::{is_tcp_connection, with_connection_context};
 pub use control::{SystemControl, SystemStatus};
 pub use discovery::{detect_display_server, detect_has_display, Discovery, SERVICE_TYPE};
@@ -20,9 +23,6 @@ pub use host::{
     open_external, open_in_editor, pick_application, resolve_is_local, AppPicker, EditorLauncher,
     EditorTarget, ExternalOpener, NoopAppPicker, OpenExternalError, OpenInEditorError,
     OsEditorLauncher, OsOpener, PickApplicationError, ResolvedEditor,
-};
-pub use catalog::{
-    FASTPATH_METHODS, METHOD_ALIASES, NOTIFICATIONS, REVERSE_METHODS, ROUTER_METHODS,
 };
 pub use listener::{serve_uds, serve_uds_with_reverse};
 pub use protocol::PROTOCOL_VERSION;
