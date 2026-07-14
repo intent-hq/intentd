@@ -1549,7 +1549,8 @@ impl Services {
                     )
                     .await;
 
-                self.increment_sandbox_retry_count(workspace_id, agent_id).await;
+                self.increment_sandbox_retry_count(workspace_id, agent_id)
+                    .await;
 
                 // Fetch canonical state into sandbox
                 if let Err(e) = self
@@ -1646,7 +1647,7 @@ impl Services {
                     "merge blocked; marking merge-pending"
                 );
 
-                self.clear_sandbox_retry_count(workspace_id, agent_id);
+                self.clear_sandbox_retry_count(workspace_id, agent_id).await;
 
                 // Propagate completion (coordinator/user will see merge-pending status)
                 true
@@ -1682,33 +1683,21 @@ impl Services {
         Ok(())
     }
 
-    async fn get_sandbox_retry_count(
-        &self,
-        workspace_id: &WorkspaceId,
-        agent_id: &AgentId,
-    ) -> i64 {
+    async fn get_sandbox_retry_count(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) -> i64 {
         self.store
             .get_sandbox_retry_count(workspace_id, agent_id)
             .await
             .unwrap_or(0)
     }
 
-    async fn increment_sandbox_retry_count(
-        &self,
-        workspace_id: &WorkspaceId,
-        agent_id: &AgentId,
-    ) {
+    async fn increment_sandbox_retry_count(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) {
         let _ = self
             .store
             .increment_sandbox_retry_count(workspace_id, agent_id)
             .await;
     }
 
-    async fn clear_sandbox_retry_count(
-        &self,
-        workspace_id: &WorkspaceId,
-        agent_id: &AgentId,
-    ) {
+    async fn clear_sandbox_retry_count(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) {
         let _ = self
             .store
             .clear_sandbox_retry_count(workspace_id, agent_id)

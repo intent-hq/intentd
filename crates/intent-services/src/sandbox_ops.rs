@@ -1884,22 +1884,49 @@ mod tests {
         store.insert_sandbox(&sandbox).await.unwrap();
 
         // Initial retry count should be 0
-        let retry_count = store.get_sandbox_retry_count(&ws.id, &agent_id).await.unwrap();
+        let retry_count = store
+            .get_sandbox_retry_count(&ws.id, &agent_id)
+            .await
+            .unwrap();
         assert_eq!(retry_count, 0, "Initial retry count should be 0");
 
         // Increment once
-        store.increment_sandbox_retry_count(&ws.id, &agent_id).await.unwrap();
-        let retry_count = store.get_sandbox_retry_count(&ws.id, &agent_id).await.unwrap();
-        assert_eq!(retry_count, 1, "Retry count should be 1 after first increment");
+        store
+            .increment_sandbox_retry_count(&ws.id, &agent_id)
+            .await
+            .unwrap();
+        let retry_count = store
+            .get_sandbox_retry_count(&ws.id, &agent_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            retry_count, 1,
+            "Retry count should be 1 after first increment"
+        );
 
         // Increment again
-        store.increment_sandbox_retry_count(&ws.id, &agent_id).await.unwrap();
-        let retry_count = store.get_sandbox_retry_count(&ws.id, &agent_id).await.unwrap();
-        assert_eq!(retry_count, 2, "Retry count should be 2 after second increment");
+        store
+            .increment_sandbox_retry_count(&ws.id, &agent_id)
+            .await
+            .unwrap();
+        let retry_count = store
+            .get_sandbox_retry_count(&ws.id, &agent_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            retry_count, 2,
+            "Retry count should be 2 after second increment"
+        );
 
         // Clear retry count
-        store.clear_sandbox_retry_count(&ws.id, &agent_id).await.unwrap();
-        let retry_count = store.get_sandbox_retry_count(&ws.id, &agent_id).await.unwrap();
+        store
+            .clear_sandbox_retry_count(&ws.id, &agent_id)
+            .await
+            .unwrap();
+        let retry_count = store
+            .get_sandbox_retry_count(&ws.id, &agent_id)
+            .await
+            .unwrap();
         assert_eq!(retry_count, 0, "Retry count should be 0 after clear");
 
         // Clean up

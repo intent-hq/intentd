@@ -77,7 +77,8 @@ const COLUMNS: &str = "id, workspace_id, agent_id, path, branch, base_commit_sha
 impl Store {
     /// Insert a new sandbox record.
     pub async fn insert_sandbox(&self, s: &Sandbox) -> Result<()> {
-        let sql = format!("INSERT INTO sandbox ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql =
+            format!("INSERT INTO sandbox ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         sqlx::query(&sql)
             .bind(&s.id)
             .bind(&s.workspace_id.0)
@@ -175,14 +176,19 @@ impl Store {
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
     ) -> Result<i64> {
-        let row = sqlx::query("SELECT retry_count FROM sandbox WHERE workspace_id = ? AND agent_id = ?")
-            .bind(&workspace_id.0)
-            .bind(&agent_id.0)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| intent_core::Error::Internal(format!("get sandbox retry count failed: {e}")))?;
+        let row =
+            sqlx::query("SELECT retry_count FROM sandbox WHERE workspace_id = ? AND agent_id = ?")
+                .bind(&workspace_id.0)
+                .bind(&agent_id.0)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    intent_core::Error::Internal(format!("get sandbox retry count failed: {e}"))
+                })?;
 
-        Ok(row.map(|r| r.try_get("retry_count").unwrap_or(0)).unwrap_or(0))
+        Ok(row
+            .map(|r| r.try_get("retry_count").unwrap_or(0))
+            .unwrap_or(0))
     }
 
     /// Increment the retry count for a sandbox.
@@ -211,7 +217,9 @@ impl Store {
             .bind(&agent_id.0)
             .execute(&self.pool)
             .await
-            .map_err(|e| intent_core::Error::Internal(format!("clear sandbox retry count failed: {e}")))?;
+            .map_err(|e| {
+                intent_core::Error::Internal(format!("clear sandbox retry count failed: {e}"))
+            })?;
         Ok(())
     }
 }
