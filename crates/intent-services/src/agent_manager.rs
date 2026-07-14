@@ -2500,19 +2500,13 @@ fn retry_backoff_ms() -> Vec<u64> {
                 delays.push(ms);
             } else {
                 // Invalid format, fall back to default
-                eprintln!("[retry_backoff_ms] invalid format, using default");
                 return DEFAULT_RETRY_BACKOFF_MS.to_vec();
             }
         }
         if !delays.is_empty() {
-            eprintln!("[retry_backoff_ms] using override: {:?}", delays);
             return delays;
         }
     }
-    eprintln!(
-        "[retry_backoff_ms] using default: {:?}",
-        DEFAULT_RETRY_BACKOFF_MS
-    );
     DEFAULT_RETRY_BACKOFF_MS.to_vec()
 }
 
