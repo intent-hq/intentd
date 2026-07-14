@@ -301,20 +301,20 @@ async fn mixed_batch_rollback_over_wss() {
     // Assert error response with failing key
     assert!(batch_resp.get("error").is_some(), "expected error response");
     let error = &batch_resp["error"];
+    let msg = error["message"].as_str().unwrap();
     assert!(
-        error["message"]
-            .as_str()
-            .unwrap()
-            .contains("TCP connection")
-            || error["message"]
-                .as_str()
-                .unwrap()
-                .contains("self-terminate"),
+        msg.contains("TCP connection") || msg.contains("self-terminate"),
         "error should mention TCP connection guard"
+    );
+    assert!(
+        msg.contains("server.wsApi.enabled"),
+        "error should include the failing key (server.wsApi.enabled)"
     );
 
     // Verify rollback: all three settings should be back to baseline via UDS
-    // (The WSS connection was dropped because the compensating rollback stopped the listener when reverting wsApi.enabled)
+    // (Note: In this test the hook failure was the TCP self-termination guard, so no
+    // listener stop occurred. The WSS connection remains open, but we use UDS to verify
+    // rollback to avoid any ambiguity.)
     let r = uds_rpc(
         &socket,
         10,
