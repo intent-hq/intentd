@@ -258,29 +258,52 @@ fn init_tracing() {
     // Note: tracing-appender's max_log_files works with time-based rotation
     // (DAILY/HOURLY/etc), not size-based rotation. We use daily rotation
     // to prevent unbounded growth on long-running daemons.
-    let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+    let file_appender = match tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .max_log_files(5)
         .filename_prefix("intentd")
         .filename_suffix("log")
         .build(log_dir)
-        .expect("failed to create log file appender");
+    {
+        Ok(appender) => Some(appender),
+        Err(e) => {
+            eprintln!("WARN: failed to create log file appender: {}, continuing with stderr-only logging", e);
+            None
+        }
+    };
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // Set up dual output: stderr (for interactive use) and file (for diagnostics)
-    tracing_subscriber::registry()
+    // Set up dual output: stderr (for interactive use) and optionally file (for diagnostics)
+    let stderr_layer = fmt::layer().with_writer(std::io::stderr);
+
+    let subscriber = tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_writer(std::io::stderr))
-        .with(fmt::layer().with_writer(file_appender).with_ansi(false))
-        .init();
+        .with(stderr_layer);
+
+    if let Some(appender) = file_appender {
+        let (non_blocking, _guard) = tracing_appender::non_blocking(appender);
+        let file_layer = fmt::layer()
+            .with_writer(non_blocking)
+            .with_ansi(false);
+        match subscriber.with(file_layer).try_init() {
+            Ok(_) => {},
+            Err(e) => eprintln!("WARN: failed to initialize tracing (already initialized?): {}", e),
+        }
+    } else {
+        match subscriber.try_init() {
+            Ok(_) => {},
+            Err(e) => eprintln!("WARN: failed to initialize tracing (already initialized?): {}", e),
+        }
+    }
 }
 
 /// Install a panic hook that logs the panic message and backtrace to the
-/// tracing log before aborting. This ensures panic details are written to
-/// the rotating log file (INTENTD_DATA_DIR/intentd.log) for post-mortem
-/// diagnosis of unexpected daemon deaths. Chains the default panic hook
-/// to preserve standard Rust panic formatting (thread name, etc.).
+/// tracing log. This ensures panic details are written to the rotating log
+/// file (INTENTD_DATA_DIR/intentd.log) for post-mortem diagnosis of unexpected
+/// daemon deaths. Chains the default panic hook to preserve standard Rust
+/// panic formatting (thread name, etc.). The process will panic/unwind/abort
+/// according to Rust's standard behavior after both hooks run.
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -1602,7 +1625,8 @@ async fn report_db_health(store: &Store) {
 
     // PRAGMA wal_checkpoint(PASSIVE): report checkpoint stats
     // Returns (busy, log, checkpointed) — number of frames in WAL and how many
-    // were checkpointed. PASSIVE mode does not block writers.
+    // were checkpointed. PASSIVE mode does not block writers. busy > 0 means the
+    // checkpoint couldn't complete.
     match sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
         .fetch_one(store.pool())
         .await
@@ -1611,10 +1635,22 @@ async fn report_db_health(store: &Store) {
             let busy: i64 = row.get(0);
             let log: i64 = row.get(1);
             let checkpointed: i64 = row.get(2);
-            println!(
-                "  [ok] wal_checkpoint(PASSIVE): busy={}, log={} frames, checkpointed={} frames",
-                busy, log, checkpointed
-            );
+            if busy != 0 {
+                println!(
+                    "  [WARN] wal_checkpoint(PASSIVE): busy={}, log={} frames, checkpointed={} frames (checkpoint incomplete)",
+                    busy, log, checkpointed
+                );
+            } else if checkpointed < log {
+                println!(
+                    "  [WARN] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames (partial checkpoint)",
+                    log, checkpointed
+                );
+            } else {
+                println!(
+                    "  [ok] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames",
+                    log, checkpointed
+                );
+            }
         }
         Err(e) => {
             println!("  [WARN] wal_checkpoint failed: {}", e);
