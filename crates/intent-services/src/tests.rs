@@ -8852,6 +8852,235 @@ mod rules {
         );
         assert!(!prompt.contains("CoW sandbox"), "no CoW mention");
     }
+
+    /// Task 6 (verifier requirement): explicit isolation:"shared" override must prevent
+    /// sandbox hint even when workspace has cow_supported=true and setting ON. This
+    /// mutation test ensures build_isolation_hint keys off session.sandbox_path (actual
+    /// effective isolation), not workspace.cow_supported (capability).
+    #[tokio::test]
+    async fn assembly_omits_sandbox_hint_when_explicit_shared_override() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+
+        let injection = crate::rules::SpecialistPromptInjection {
+            behavior_prompt: Some("Implement your task.".into()),
+            specialist_name: Some("Implementor".into()),
+            role_reminder: Some("Stay in scope.".into()),
+        };
+
+        // Workspace with cow_supported=true (capability present)
+        let workspace = intent_core::Workspace {
+            id: intent_core::WorkspaceId::from("ws-1"),
+            title: "Test".into(),
+            branch: "main".into(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: intent_core::WorkspaceStatus::Active,
+            status_message: None,
+            activity: intent_core::WorkspaceActivity::Idle,
+            attention: intent_core::WorkspaceAttention::None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_activity: None,
+            tags: vec![],
+            path: Some("/test/path".into()),
+            repository_path: Some("/test/repo".into()),
+            repository_owner: None,
+            repository_name: Some("test-repo".into()),
+            worktree_path: None,
+            scope: None,
+            skip_worktree: true,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: Some(true), // CoW capable!
+        };
+
+        // Agent session WITHOUT sandbox fields (explicit isolation:"shared" override)
+        let agent_session = intent_core::AgentSession {
+            id: intent_core::AgentId::from("agent-1"),
+            workspace_id: intent_core::WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Test Agent".into(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: Some("implementor".into()),
+            status: intent_core::AgentStatus::Active,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            sandbox_id: None,
+            sandbox_path: None, // NO sandbox — explicit "shared" override!
+            sandbox_branch: None,
+            is_background: false,
+            metadata: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            Some(&workspace),
+            Some(&agent_session),
+        )
+        .await
+        .expect("assembled prompt");
+
+        // No sandbox hint when explicit shared override, even though workspace is CoW-capable
+        assert!(
+            !prompt.contains("## Workspace Isolation"),
+            "no sandbox hint for explicit shared override"
+        );
+        assert!(
+            !prompt.contains("isolated CoW"),
+            "no CoW mention for shared mode"
+        );
+    }
+
+    /// Task 6 (verifier requirement): explicit isolation:"cow" override in a setting-OFF
+    /// workspace must still inject sandbox hint when session has sandbox_path. This
+    /// mutation test proves build_isolation_hint respects actual session.sandbox_path
+    /// (effective isolation), not just workspace.cow_supported + setting.
+    #[tokio::test]
+    async fn assembly_injects_sandbox_hint_when_explicit_cow_override() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+
+        let injection = crate::rules::SpecialistPromptInjection {
+            behavior_prompt: Some("Implement your task.".into()),
+            specialist_name: Some("Implementor".into()),
+            role_reminder: Some("Stay in scope.".into()),
+        };
+
+        // Workspace with cow_supported=true but hypothetically setting OFF
+        // (doesn't matter — the agent session has sandbox_path, so it's sandboxed)
+        let workspace = intent_core::Workspace {
+            id: intent_core::WorkspaceId::from("ws-1"),
+            title: "Test".into(),
+            branch: "main".into(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: intent_core::WorkspaceStatus::Active,
+            status_message: None,
+            activity: intent_core::WorkspaceActivity::Idle,
+            attention: intent_core::WorkspaceAttention::None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_activity: None,
+            tags: vec![],
+            path: Some("/test/path".into()),
+            repository_path: Some("/test/repo".into()),
+            repository_owner: None,
+            repository_name: Some("test-repo".into()),
+            worktree_path: None,
+            scope: None,
+            skip_worktree: true,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
+        };
+
+        // Agent session WITH sandbox fields (explicit isolation:"cow" override)
+        let agent_session = intent_core::AgentSession {
+            id: intent_core::AgentId::from("agent-1"),
+            workspace_id: intent_core::WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Test Agent".into(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: Some("implementor".into()),
+            status: intent_core::AgentStatus::Active,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            sandbox_id: Some("sandbox-explicit".into()),
+            sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()), // Sandboxed!
+            sandbox_branch: Some("sb/agent-1".into()),
+            is_background: false,
+            metadata: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            Some(&workspace),
+            Some(&agent_session),
+        )
+        .await
+        .expect("assembled prompt");
+
+        // Sandbox hint IS present when session has sandbox_path, regardless of setting
+        assert!(
+            prompt.contains("## Workspace Isolation"),
+            "sandbox hint when explicit cow override"
+        );
+        assert!(
+            prompt.contains("isolated CoW"),
+            "CoW mention for sandboxed session"
+        );
+        assert!(
+            prompt.contains("/test/sandboxes/agent-1/test-repo"),
+            "sandbox path included"
+        );
+    }
 }
 
 mod known_repo {

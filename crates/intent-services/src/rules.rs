@@ -252,7 +252,6 @@ fn build_isolation_hint(
     agent_session: Option<&intent_core::AgentSession>,
     specialist: Option<&SpecialistPromptInjection>,
 ) -> Option<String> {
-
     // Determine if this agent is a sandboxed implementor
     let is_sandboxed = agent_session
         .and_then(|s| s.sandbox_path.as_ref())
