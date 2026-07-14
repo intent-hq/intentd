@@ -11,28 +11,42 @@ use crate::Store;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxStatus {
+    /// Initial state after provisioning
     Created,
+    /// Merge-back is in progress
+    Merging,
+    /// Successfully merged to canonical and discarded
     Merged,
+    /// Discarded without merging
     Discarded,
-    Conflict,
+    /// Conflict detected, agent bounced with instructions
+    ConflictBounced,
+    /// Merge pending manual resolution (blocked or retry exhausted)
+    MergePending,
 }
 
 impl SandboxStatus {
     fn to_db(self) -> &'static str {
         match self {
             SandboxStatus::Created => "created",
+            SandboxStatus::Merging => "merging",
             SandboxStatus::Merged => "merged",
             SandboxStatus::Discarded => "discarded",
-            SandboxStatus::Conflict => "conflict",
+            SandboxStatus::ConflictBounced => "conflict_bounced",
+            SandboxStatus::MergePending => "merge_pending",
         }
     }
 
     fn from_db(s: &str) -> Result<Self> {
         match s {
             "created" => Ok(SandboxStatus::Created),
+            "merging" => Ok(SandboxStatus::Merging),
             "merged" => Ok(SandboxStatus::Merged),
             "discarded" => Ok(SandboxStatus::Discarded),
-            "conflict" => Ok(SandboxStatus::Conflict),
+            "conflict_bounced" => Ok(SandboxStatus::ConflictBounced),
+            "merge_pending" => Ok(SandboxStatus::MergePending),
+            // Handle legacy "conflict" status from migration 0038
+            "conflict" => Ok(SandboxStatus::ConflictBounced),
             _ => Err(intent_core::Error::Internal(format!(
                 "invalid sandbox status: {s}"
             ))),
@@ -94,6 +108,25 @@ impl Store {
             .await
             .map_err(|e| intent_core::Error::Internal(format!("get sandbox failed: {e}")))?;
         row.map(|r| sandbox_from_row(&r)).transpose()
+    }
+
+    /// Update a sandbox status and timestamp.
+    pub async fn update_sandbox_status(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        status: SandboxStatus,
+        updated_at: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE sandbox SET status = ?, updated_at = ? WHERE workspace_id = ? AND agent_id = ?")
+            .bind(status.to_db())
+            .bind(updated_at)
+            .bind(&workspace_id.0)
+            .bind(&agent_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| intent_core::Error::Internal(format!("update sandbox status failed: {e}")))?;
+        Ok(())
     }
 
     /// Delete a sandbox by workspace and agent.

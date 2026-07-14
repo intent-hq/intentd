@@ -22,6 +22,26 @@ pub enum ProvisionOutcome {
     Unsupported,
 }
 
+/// Outcome of a merge-back attempt.
+#[derive(Debug, Clone)]
+pub enum MergeOutcome {
+    /// Clean merge; sandbox commits applied to canonical.
+    Merged {
+        commit_range: String,
+        canonical_head: String,
+    },
+    /// Conflicts detected; user's repo left pristine.
+    Conflict {
+        conflicting_paths: Vec<String>,
+        canonical_head: String,
+    },
+    /// Blocked: canonical has uncommitted user edits overlapping merge paths.
+    Blocked {
+        reason: String,
+        overlapping_paths: Vec<String>,
+    },
+}
+
 /// Configuration for sandbox provisioning.
 pub struct ProvisionConfig {
     /// Workspaces root directory (from config.workspaces_root).
@@ -195,6 +215,227 @@ pub async fn gc_orphaned_sandboxes(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// Merge sandbox commits back to the canonical repository.
+///
+/// 1. Auto-commit any dirty sandbox state (if present).
+/// 2. Check canonical repository for dirty state overlapping with sandbox changes.
+/// 3. Fetch sandbox branch into canonical.
+/// 4. Apply commits after the snapshot (or base if no snapshot) via cherry-pick.
+/// 5. On conflict: abort cleanly, return Conflict with paths.
+/// 6. On dirty overlap: return Blocked.
+/// 7. On success: return Merged with the applied range.
+///
+/// The canonical repository is never left mid-merge/cherry-pick (always abort on failure).
+pub async fn merge_sandbox(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Result<MergeOutcome> {
+    // Load sandbox record
+    let sandbox = store
+        .get_sandbox(workspace_id, agent_id)
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("sandbox not found for agent {}", agent_id.0)))?;
+
+    // Load workspace to get canonical repo path
+    let workspace = store.get_workspace(workspace_id).await?;
+    let canonical_path = resolve_user_directory(&workspace)?;
+    let sandbox_path = PathBuf::from(&sandbox.path);
+
+    // Open both repositories
+    let canonical_repo = git2::Repository::open(&canonical_path)
+        .map_err(|e| Error::Internal(format!("open canonical repo failed: {e}")))?;
+    let sandbox_repo = git2::Repository::open(&sandbox_path)
+        .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
+
+    // Auto-commit any dirty sandbox state (preserving agent attribution)
+    if is_dirty(&sandbox_repo)? {
+        let sig = sandbox_repo
+            .signature()
+            .map_err(|e| Error::Internal(format!("get sandbox signature failed: {e}")))?;
+        let mut index = sandbox_repo
+            .index()
+            .map_err(|e| Error::Internal(format!("get sandbox index failed: {e}")))?;
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .map_err(|e| Error::Internal(format!("stage sandbox changes failed: {e}")))?;
+        index
+            .write()
+            .map_err(|e| Error::Internal(format!("write sandbox index failed: {e}")))?;
+        let tree_oid = index
+            .write_tree()
+            .map_err(|e| Error::Internal(format!("write sandbox tree failed: {e}")))?;
+        let tree = sandbox_repo
+            .find_tree(tree_oid)
+            .map_err(|e| Error::Internal(format!("find sandbox tree failed: {e}")))?;
+        let head = sandbox_repo
+            .head()
+            .map_err(|e| Error::Internal(format!("get sandbox HEAD failed: {e}")))?;
+        let parent = head
+            .peel_to_commit()
+            .map_err(|e| Error::Internal(format!("peel sandbox HEAD failed: {e}")))?;
+        sandbox_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                &format!("Auto-commit dirty state for {}", agent_id.0),
+                &tree,
+                &[&parent],
+            )
+            .map_err(|e| Error::Internal(format!("auto-commit sandbox failed: {e}")))?;
+    }
+
+    // Get canonical HEAD
+    let canonical_head_ref = canonical_repo
+        .head()
+        .map_err(|e| Error::Internal(format!("get canonical HEAD failed: {e}")))?;
+    let canonical_head_commit = canonical_head_ref
+        .peel_to_commit()
+        .map_err(|e| Error::Internal(format!("peel canonical HEAD failed: {e}")))?;
+    let canonical_head_sha = canonical_head_commit.id().to_string();
+
+    // Check for dirty state in canonical
+    let canonical_dirty = is_dirty(&canonical_repo)?;
+    if canonical_dirty {
+        // Get the list of changed files in canonical
+        let canonical_changed = get_changed_files(&canonical_repo)?;
+
+        // Get the list of files changed by the sandbox (from base to HEAD)
+        let base_sha = sandbox.snapshot_commit_sha.as_ref().unwrap_or(&sandbox.base_commit_sha);
+        let sandbox_changed = get_files_in_range(&sandbox_repo, base_sha, "HEAD")?;
+
+        // Check for overlap
+        let overlap: Vec<String> = canonical_changed
+            .iter()
+            .filter(|f| sandbox_changed.contains(f))
+            .cloned()
+            .collect();
+
+        if !overlap.is_empty() {
+            return Ok(MergeOutcome::Blocked {
+                reason: "Canonical repository has uncommitted changes overlapping with sandbox changes".to_string(),
+                overlapping_paths: overlap,
+            });
+        }
+    }
+
+    // Fetch sandbox branch into canonical (no checkout, just fetch)
+    // Use the filesystem path as a remote
+    let sandbox_path_str = sandbox_path
+        .to_str()
+        .ok_or_else(|| Error::Internal("sandbox path not UTF-8".to_string()))?;
+
+    canonical_repo
+        .remote_anonymous(sandbox_path_str)
+        .and_then(|mut remote| {
+            remote.fetch(&[&sandbox.branch], None, None)
+        })
+        .map_err(|e| Error::Internal(format!("fetch sandbox branch failed: {e}")))?;
+
+    // Get the range of commits to cherry-pick: from snapshot (or base) to sandbox HEAD
+    let start_sha = sandbox.snapshot_commit_sha.as_ref().unwrap_or(&sandbox.base_commit_sha);
+    let sandbox_head = sandbox_repo
+        .head()
+        .map_err(|e| Error::Internal(format!("get sandbox HEAD failed: {e}")))?
+        .peel_to_commit()
+        .map_err(|e| Error::Internal(format!("peel sandbox HEAD failed: {e}")))?;
+    let sandbox_head_sha = sandbox_head.id().to_string();
+
+    // Get commits to apply (reversed for cherry-pick order)
+    let commits_to_apply = get_commits_after(&sandbox_repo, start_sha, &sandbox_head_sha)?;
+
+    if commits_to_apply.is_empty() {
+        // No commits to apply (only the snapshot, or base == HEAD)
+        return Ok(MergeOutcome::Merged {
+            commit_range: format!("{}..{} (empty)", start_sha, sandbox_head_sha),
+            canonical_head: canonical_head_sha,
+        });
+    }
+
+    // Cherry-pick each commit onto canonical
+    let canonical_oid = canonical_head_commit.id();
+    let mut current_oid = canonical_oid;
+
+    for commit_sha in &commits_to_apply {
+        let commit_oid = git2::Oid::from_str(commit_sha)
+            .map_err(|e| Error::Internal(format!("parse commit OID failed: {e}")))?;
+        let commit = canonical_repo
+            .find_commit(commit_oid)
+            .map_err(|e| Error::Internal(format!("find commit failed: {e}")))?;
+
+        let current_commit = canonical_repo
+            .find_commit(current_oid)
+            .map_err(|e| Error::Internal(format!("find current commit failed: {e}")))?;
+
+        // Try to cherry-pick
+        let mut cherry_pick_opts = git2::CherrypickOptions::new();
+        match canonical_repo.cherrypick(&commit, Some(&mut cherry_pick_opts)) {
+            Ok(()) => {
+                // Check if there are conflicts
+                let mut index = canonical_repo
+                    .index()
+                    .map_err(|e| Error::Internal(format!("get index failed: {e}")))?;
+
+                if index.has_conflicts() {
+                    // Get conflicting paths before cleanup
+                    let conflicting_paths = get_conflicting_paths(&index)?;
+
+                    // Clean up the repository state (reset index and working directory)
+                    canonical_repo
+                        .reset(
+                            canonical_head_commit.as_object(),
+                            git2::ResetType::Hard,
+                            None,
+                        )
+                        .map_err(|e| Error::Internal(format!("reset after conflict failed: {e}")))?;
+
+                    return Ok(MergeOutcome::Conflict {
+                        conflicting_paths,
+                        canonical_head: canonical_head_sha,
+                    });
+                }
+
+                // Commit the cherry-pick
+                let tree_oid = index
+                    .write_tree()
+                    .map_err(|e| Error::Internal(format!("write tree failed: {e}")))?;
+                let tree = canonical_repo
+                    .find_tree(tree_oid)
+                    .map_err(|e| Error::Internal(format!("find tree failed: {e}")))?;
+
+                // Preserve original commit message and author
+                let new_oid = canonical_repo
+                    .commit(
+                        Some("HEAD"),
+                        &commit.author(),
+                        &commit.committer(),
+                        commit.message().unwrap_or(""),
+                        &tree,
+                        &[&current_commit],
+                    )
+                    .map_err(|e| Error::Internal(format!("commit cherry-pick failed: {e}")))?;
+
+                current_oid = new_oid;
+            }
+            Err(e) => {
+                // Cherry-pick failed, reset to clean state
+                let _ = canonical_repo.reset(
+                    canonical_head_commit.as_object(),
+                    git2::ResetType::Hard,
+                    None,
+                );
+                return Err(Error::Internal(format!("cherrypick failed: {e}")));
+            }
+        }
+    }
+
+    Ok(MergeOutcome::Merged {
+        commit_range: format!("{}..{}", start_sha, sandbox_head_sha),
+        canonical_head: current_oid.to_string(),
+    })
+}
+
 /// Resolve the user's repository directory from a workspace.
 /// Returns an error if the workspace is not direct-mode or doesn't have a repository path.
 fn resolve_user_directory(workspace: &Workspace) -> Result<PathBuf> {
@@ -309,6 +550,124 @@ fn create_snapshot_commit(repo: &git2::Repository, agent_id: &AgentId) -> Result
         .map_err(|e| Error::Internal(format!("create commit failed: {e}")))?;
 
     Ok(oid.to_string())
+}
+
+/// Get the list of changed files in a repository (dirty state).
+fn get_changed_files(repo: &git2::Repository) -> Result<Vec<String>> {
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
+    let statuses = repo
+        .statuses(Some(&mut opts))
+        .map_err(|e| Error::Internal(format!("git status failed: {e}")))?;
+
+    let mut files = Vec::new();
+    for entry in statuses.iter() {
+        if let Ok(path) = entry.path() {
+            files.push(path.to_string());
+        }
+    }
+    Ok(files)
+}
+
+/// Get the list of files changed in a commit range.
+fn get_files_in_range(repo: &git2::Repository, start_sha: &str, end_sha: &str) -> Result<Vec<String>> {
+    let start_oid = git2::Oid::from_str(start_sha)
+        .map_err(|e| Error::Internal(format!("parse start OID failed: {e}")))?;
+    let end_oid = if end_sha == "HEAD" {
+        repo.head()
+            .map_err(|e| Error::Internal(format!("get HEAD failed: {e}")))?
+            .target()
+            .ok_or_else(|| Error::Internal("HEAD has no target".to_string()))?
+    } else {
+        git2::Oid::from_str(end_sha)
+            .map_err(|e| Error::Internal(format!("parse end OID failed: {e}")))?
+    };
+
+    let start_commit = repo
+        .find_commit(start_oid)
+        .map_err(|e| Error::Internal(format!("find start commit failed: {e}")))?;
+    let end_commit = repo
+        .find_commit(end_oid)
+        .map_err(|e| Error::Internal(format!("find end commit failed: {e}")))?;
+
+    let start_tree = start_commit
+        .tree()
+        .map_err(|e| Error::Internal(format!("get start tree failed: {e}")))?;
+    let end_tree = end_commit
+        .tree()
+        .map_err(|e| Error::Internal(format!("get end tree failed: {e}")))?;
+
+    let diff = repo
+        .diff_tree_to_tree(Some(&start_tree), Some(&end_tree), None)
+        .map_err(|e| Error::Internal(format!("diff trees failed: {e}")))?;
+
+    let mut files = Vec::new();
+    diff.foreach(
+        &mut |delta, _| {
+            if let Some(path) = delta.new_file().path() {
+                if let Some(path_str) = path.to_str() {
+                    files.push(path_str.to_string());
+                }
+            }
+            true
+        },
+        None,
+        None,
+        None,
+    )
+    .map_err(|e| Error::Internal(format!("diff foreach failed: {e}")))?;
+
+    Ok(files)
+}
+
+/// Get the list of commits after start_sha up to end_sha (exclusive of start, inclusive of end).
+fn get_commits_after(repo: &git2::Repository, start_sha: &str, end_sha: &str) -> Result<Vec<String>> {
+    let start_oid = git2::Oid::from_str(start_sha)
+        .map_err(|e| Error::Internal(format!("parse start OID failed: {e}")))?;
+    let end_oid = git2::Oid::from_str(end_sha)
+        .map_err(|e| Error::Internal(format!("parse end OID failed: {e}")))?;
+
+    let mut revwalk = repo
+        .revwalk()
+        .map_err(|e| Error::Internal(format!("create revwalk failed: {e}")))?;
+    revwalk
+        .push(end_oid)
+        .map_err(|e| Error::Internal(format!("push end OID failed: {e}")))?;
+    revwalk
+        .hide(start_oid)
+        .map_err(|e| Error::Internal(format!("hide start OID failed: {e}")))?;
+
+    let mut commits = Vec::new();
+    for oid in revwalk {
+        let oid = oid.map_err(|e| Error::Internal(format!("revwalk iteration failed: {e}")))?;
+        commits.push(oid.to_string());
+    }
+
+    // Reverse to get chronological order (oldest first)
+    commits.reverse();
+    Ok(commits)
+}
+
+/// Get the list of conflicting file paths from an index with conflicts.
+fn get_conflicting_paths(index: &git2::Index) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for entry in index.conflicts()
+        .map_err(|e| Error::Internal(format!("get conflicts failed: {e}")))?
+    {
+        let conflict = entry.map_err(|e| Error::Internal(format!("iterate conflicts failed: {e}")))?;
+        // Use the "our" side path (or "their" side if "our" is missing)
+        if let Some(our) = conflict.our {
+            let path = String::from_utf8_lossy(&our.path).to_string();
+            paths.push(path);
+        } else if let Some(their) = conflict.their {
+            let path = String::from_utf8_lossy(&their.path).to_string();
+            paths.push(path);
+        }
+    }
+
+    Ok(paths)
 }
 
 #[cfg(test)]
