@@ -102,10 +102,11 @@ async fn disabling_listener_stops_discovery() {
     let data_dir = temp_data_dir();
     let socket = data_dir.join("intentd.sock");
     let port = free_port();
+    let port_s = port.to_string();
     let token = "abababababababababababababababababababababababababababababababab";
     let env = [
         ("INTENTD_AUTH_TOKEN", token),
-        ("INTENTD_TCP_PORT", &port.to_string()),
+        ("INTENTD_TCP_PORT", &port_s),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let mut daemon = Daemon { child, data_dir };
@@ -187,10 +188,11 @@ async fn toggle_discovery_while_listener_runs() {
     let data_dir = temp_data_dir();
     let socket = data_dir.join("intentd.sock");
     let port = free_port();
+    let port_s = port.to_string();
     let token = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
     let env = [
         ("INTENTD_AUTH_TOKEN", token),
-        ("INTENTD_TCP_PORT", &port.to_string()),
+        ("INTENTD_TCP_PORT", &port_s),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let mut daemon = Daemon { child, data_dir };
@@ -267,10 +269,11 @@ async fn batch_ordering_enforces_listener_before_discovery() {
     let data_dir = temp_data_dir();
     let socket = data_dir.join("intentd.sock");
     let port = free_port();
+    let port_s = port.to_string();
     let token = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
     let env = [
         ("INTENTD_AUTH_TOKEN", token),
-        ("INTENTD_TCP_PORT", &port.to_string()),
+        ("INTENTD_TCP_PORT", &port_s),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let mut daemon = Daemon { child, data_dir };
