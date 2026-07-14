@@ -1408,9 +1408,8 @@ impl Services {
         };
 
         // Check retry count (cap at 2 bounces)
-        // For now, track bounces in memory; TODO: add retry_count to sandbox table
-        const MAX_RETRIES: usize = 2;
-        let retry_count = self.get_sandbox_retry_count(workspace_id, agent_id);
+        const MAX_RETRIES: i64 = 2;
+        let retry_count = self.get_sandbox_retry_count(workspace_id, agent_id).await;
 
         // Update sandbox status to Merging
         let now = now_iso();
@@ -1507,7 +1506,7 @@ impl Services {
                 );
 
                 // Clear retry count
-                self.clear_sandbox_retry_count(workspace_id, agent_id);
+                self.clear_sandbox_retry_count(workspace_id, agent_id).await;
 
                 // Propagate completion normally
                 true
@@ -1535,7 +1534,7 @@ impl Services {
                         "conflict retry limit exhausted; marking merge-pending"
                     );
 
-                    self.clear_sandbox_retry_count(workspace_id, agent_id);
+                    self.clear_sandbox_retry_count(workspace_id, agent_id).await;
                     return true;
                 }
 
@@ -1550,7 +1549,7 @@ impl Services {
                     )
                     .await;
 
-                self.increment_sandbox_retry_count(workspace_id, agent_id);
+                self.increment_sandbox_retry_count(workspace_id, agent_id).await;
 
                 // Fetch canonical state into sandbox
                 if let Err(e) = self
@@ -1683,18 +1682,37 @@ impl Services {
         Ok(())
     }
 
-    // Temporary in-memory retry tracking (TODO: add retry_count column to sandbox table)
-    fn get_sandbox_retry_count(&self, _workspace_id: &WorkspaceId, _agent_id: &AgentId) -> usize {
-        // For now, always return 0; proper impl requires migration
-        0
+    async fn get_sandbox_retry_count(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) -> i64 {
+        self.store
+            .get_sandbox_retry_count(workspace_id, agent_id)
+            .await
+            .unwrap_or(0)
     }
 
-    fn increment_sandbox_retry_count(&self, _workspace_id: &WorkspaceId, _agent_id: &AgentId) {
-        // TODO: implement with sandbox table column
+    async fn increment_sandbox_retry_count(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        let _ = self
+            .store
+            .increment_sandbox_retry_count(workspace_id, agent_id)
+            .await;
     }
 
-    fn clear_sandbox_retry_count(&self, _workspace_id: &WorkspaceId, _agent_id: &AgentId) {
-        // TODO: implement with sandbox table column
+    async fn clear_sandbox_retry_count(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        let _ = self
+            .store
+            .clear_sandbox_retry_count(workspace_id, agent_id)
+            .await;
     }
 
     /// Deliver an internal parent wake through the runtime [`AgentManager`]

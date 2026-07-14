@@ -144,6 +144,7 @@ pub async fn provision_sandbox(
         base_commit_sha: base_commit_sha.clone(),
         snapshot_commit_sha: snapshot_commit_sha.clone(),
         status: SandboxStatus::Created,
+        retry_count: 0,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -1303,6 +1304,7 @@ mod tests {
             base_commit_sha: "abc123".to_string(),
             snapshot_commit_sha: None,
             status: intent_store::SandboxStatus::Created,
+            retry_count: 0,
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -1543,6 +1545,7 @@ mod tests {
             base_commit_sha: base_sha,
             snapshot_commit_sha: None,
             status: SandboxStatus::Created,
+            retry_count: 0,
             created_at: now_iso(),
             updated_at: now_iso(),
         };
