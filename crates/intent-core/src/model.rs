@@ -1722,6 +1722,18 @@ pub struct AgentSession {
     /// `imageBlocks`); an opaque JSON array persisted verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_blocks: Option<serde_json::Value>,
+    /// Sandbox ID when this agent runs in a CoW-isolated sandbox (direct-mode
+    /// workspaces with CoW support). `None` for shared-mode agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_id: Option<String>,
+    /// Sandbox path when this agent runs in a CoW-isolated sandbox. The full path
+    /// to the CoW clone of the workspace directory that serves as this agent's
+    /// working root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_path: Option<String>,
+    /// Sandbox branch name (e.g., "sb/<agentId>") when this agent runs in a sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_branch: Option<String>,
     /// Whether the agent runs in the background (FE `metadata.isBackground`;
     /// G-A1/P3-1.2c). Persisted at `agent.create`/`agent.delegate` and served
     /// as `metadata.isBackground` in the [`AgentLite`] projection — the FE
@@ -1769,6 +1781,15 @@ pub struct AgentMetadata {
     pub delegation_depth: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_message: Option<String>,
+    /// Sandbox ID when this agent runs in a CoW-isolated sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_id: Option<String>,
+    /// Sandbox path when this agent runs in a CoW-isolated sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_path: Option<String>,
+    /// Sandbox branch name when this agent runs in a sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_branch: Option<String>,
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
@@ -1875,6 +1896,9 @@ impl AgentLite {
             completion_report_timestamp: session.completion_report_timestamp,
             delegation_depth: session.delegation_depth,
             initial_message: session.initial_message,
+            sandbox_id: session.sandbox_id.clone(),
+            sandbox_path: session.sandbox_path.clone(),
+            sandbox_branch: session.sandbox_branch.clone(),
         };
         Self {
             id: session.id,
@@ -1958,6 +1982,10 @@ pub struct AgentDelegateInput {
     pub behavior_prompt: Option<String>,
     pub wait_mode: Option<String>,
     pub skip_auto_commit: Option<bool>,
+    /// Sandbox isolation mode: "cow" (copy-on-write sandbox) or "shared" (default).
+    /// When "cow" and CoW is supported, the agent runs in an isolated CoW clone of
+    /// the workspace directory. Falls back to shared mode if CoW is unsupported.
+    pub isolation: Option<String>,
 }
 
 /// Optional `create.*` payload on [`AgentWakeOrCreateInput`] — the fields the
@@ -2915,6 +2943,9 @@ mod tests {
             metadata: None,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         };
         let lite = AgentLite::from_session(session, 0, None, Some("hi".to_string()), None);
         let v = serde_json::to_value(&lite).unwrap();
@@ -2976,6 +3007,9 @@ mod tests {
             metadata: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         };
         assert_eq!(
             serde_json::to_value(&session).unwrap(),

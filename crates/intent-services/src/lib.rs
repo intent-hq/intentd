@@ -4298,7 +4298,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let opts = search_ops::parse_opts(opts)?;
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let root = match search_ops::search_root(&store, &workspace_id).await? {
+            let root = match search_ops::search_root(&store, &workspace_id, None).await? {
                 Some(root) => root,
                 None => {
                     return Ok(serde_json::json!({
@@ -4341,7 +4341,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let limit = limit.and_then(|n| usize::try_from(n).ok());
-            let root = match search_ops::search_root(&store, &workspace_id).await? {
+            let root = match search_ops::search_root(&store, &workspace_id, None).await? {
                 Some(root) => root,
                 None => {
                     return Ok(serde_json::json!({
@@ -4485,7 +4485,7 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let root = match search_ops::search_root(&store, &workspace_id).await? {
+            let root = match search_ops::search_root(&store, &workspace_id, None).await? {
                 Some(root) => root,
                 None => return Ok(serde_json::json!({ "requestId": request_id, "matches": [] })),
             };
@@ -4637,10 +4637,12 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         path: String,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
-            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            let root =
+                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             file_ops::read(&root, &path)
         })
     }
@@ -4650,10 +4652,12 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         path: String,
         content: String,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
-            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            let root =
+                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             file_ops::write(&root, &path, &content)
         })
     }
@@ -4662,10 +4666,12 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         path: String,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
-            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            let root =
+                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             file_ops::list(&root, &path)
         })
     }
@@ -4674,10 +4680,12 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         path: String,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
-            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            let root =
+                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             file_ops::delete(&root, &path)
         })
     }
@@ -4686,10 +4694,12 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         path: String,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
-            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            let root =
+                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             file_ops::mkdir(&root, &path)
         })
     }
@@ -4699,10 +4709,12 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         old_path: String,
         new_path: String,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
-            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            let root =
+                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             file_ops::rename(&root, &old_path, &new_path)
         })
     }
@@ -4714,7 +4726,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
-            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            let root = file_ops::resolve_root(&store, &workspace_id, None).await;
             file_ops::tree(&root, &path)
         })
     }
@@ -4726,7 +4738,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
-            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            let root = file_ops::resolve_root(&store, &workspace_id, None).await;
             file_ops::exists(&root, &path)
         })
     }
@@ -4738,7 +4750,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
-            let root = file_ops::resolve_root(&store, &workspace_id).await;
+            let root = file_ops::resolve_root(&store, &workspace_id, None).await;
             file_ops::stat(&root, &path)
         })
     }

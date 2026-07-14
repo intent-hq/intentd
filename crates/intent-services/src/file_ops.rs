@@ -27,10 +27,23 @@ pub(crate) fn workspace_root(ws: &Workspace) -> String {
         .unwrap_or_default()
 }
 
-/// Load the workspace and resolve its filesystem root. A missing workspace (or
-/// any load error) falls through to an empty root, mirroring the TS handler
+/// Load the workspace and resolve its filesystem root, preferring the calling
+/// agent's sandbox path when available (CoW containment). A missing workspace
+/// (or any load error) falls through to an empty root, mirroring the TS handler
 /// which swallows `getWorkspace` failures and proceeds with `workspacePath=''`.
-pub(crate) async fn resolve_root(store: &Store, workspace_id: &WorkspaceId) -> String {
+pub(crate) async fn resolve_root(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    caller_agent_id: Option<&intent_core::AgentId>,
+) -> String {
+    // CoW containment: prefer the calling agent's sandbox path when present.
+    if let Some(agent_id) = caller_agent_id {
+        if let Ok(session) = store.get_agent_session(agent_id).await {
+            if let Some(sandbox_path) = session.sandbox_path {
+                return sandbox_path;
+            }
+        }
+    }
     match store.get_workspace(workspace_id).await {
         Ok(ws) => workspace_root(&ws),
         Err(_) => String::new(),

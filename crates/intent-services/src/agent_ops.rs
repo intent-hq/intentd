@@ -1024,6 +1024,9 @@ impl Services {
             metadata,
             created_at: now.clone(),
             updated_at: now,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
         };
         self.store.insert_agent_session(&session).await?;
         self.publish_agent_mutation_event(
@@ -2157,7 +2160,7 @@ impl Services {
                 input.model,
                 input.specialist,
                 parent_agent_id.clone(),
-                session_task_note_id,
+                session_task_note_id.clone(),
                 input.skip_auto_commit.unwrap_or(false),
                 None,
                 extra,
@@ -2171,6 +2174,98 @@ impl Services {
             .as_str()
             .unwrap_or_default()
             .to_string();
+
+        // Track effective isolation mode for the result
+        let mut effective_isolation: Option<&str> = None;
+
+        // Provision sandbox if isolation=cow is requested (Task 3).
+        // Check if isolation is "cow" (explicit or defaulted from workspace setting).
+        let isolation = input.isolation.clone();
+        if isolation.as_deref() == Some("cow") {
+            use crate::sandbox_ops::{provision_sandbox, ProvisionConfig, ProvisionOutcome};
+            let workspace = self.store.get_workspace(&workspace_id).await.ok();
+            if let Some(ws) = workspace {
+                // Only direct-mode workspaces (no worktree or skip_worktree=true)
+                let is_direct_mode = ws.skip_worktree || ws.worktree_path.is_none();
+                if is_direct_mode && ws.repository_path.is_some() {
+                    if let Some(root) = self.workspaces_root.clone() {
+                        let config = ProvisionConfig {
+                            workspaces_root: root,
+                        };
+                        let aid = AgentId::from(agent_id.as_str());
+                        match provision_sandbox(&self.store, &workspace_id, &aid, &config).await {
+                            Ok(ProvisionOutcome::Supported {
+                                path,
+                                branch,
+                                base_commit_sha,
+                                snapshot_commit_sha,
+                            }) => {
+                                // Update the session with sandbox metadata
+                                if let Ok(mut session) = self.store.get_agent_session(&aid).await {
+                                    session.sandbox_id = Some(format!(
+                                        "sandbox-{}-{}",
+                                        workspace_id.as_str(),
+                                        aid.as_str()
+                                    ));
+                                    session.sandbox_path = Some(path.to_string_lossy().to_string());
+                                    session.sandbox_branch = Some(branch.clone());
+                                    let _ = self
+                                        .store
+                                        .update_agent_session(&workspace_id, &session)
+                                        .await;
+
+                                    // Track successful CoW provisioning
+                                    effective_isolation = Some("cow");
+
+                                    // Emit sandbox:created event
+                                    crate::publish_event(
+                                        &self.event_bus,
+                                        intent_store::NewEvent {
+                                            workspace_id: workspace_id.clone(),
+                                            timestamp: crate::now_iso(),
+                                            event_type: "sandbox:created".to_string(),
+                                            actor: crate::system_actor(),
+                                            session_id: Some(aid.0.clone()),
+                                            correlation_id: None,
+                                            parent_event_id: None,
+                                            metadata: None,
+                                            data: json!({
+                                                "workspaceId": workspace_id.as_str(),
+                                                "agentId": agent_id,
+                                                "sandboxPath": path.to_string_lossy(),
+                                                "branch": branch,
+                                                "baseCommitSha": base_commit_sha,
+                                                "snapshotCommitSha": snapshot_commit_sha,
+                                            }),
+                                        },
+                                    )
+                                    .await;
+                                }
+                            }
+                            Ok(ProvisionOutcome::Unsupported) => {
+                                // Fallback to shared mode (no action needed, session stays without sandbox fields)
+                                effective_isolation = Some("direct");
+                                tracing::debug!(
+                                    workspace = %workspace_id,
+                                    agent = %agent_id,
+                                    "CoW not supported; fallback to shared mode"
+                                );
+                            }
+                            Err(e) => {
+                                effective_isolation = Some("direct");
+                                tracing::warn!(
+                                    workspace = %workspace_id,
+                                    agent = %agent_id,
+                                    error = %e,
+                                    "Sandbox provisioning failed; fallback to shared mode"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(task_note_id) = input.task_note_id.clone().or(input.note_id.clone()) {
             let _ = self
                 .assign_agent(workspace_id.clone(), task_note_id, agent_id.clone())
@@ -2252,7 +2347,16 @@ impl Services {
                 tracing::warn!(agent = %agent_id, error = %e, "delegate: failed to start child turn");
             }
         }
-        Ok(json!({ "ok": true, "agentId": agent_id, "name": name }))
+
+        // Include effective isolation in the result when isolation was requested
+        let mut result = json!({ "ok": true, "agentId": agent_id, "name": name });
+        if let Some(eff_iso) = effective_isolation {
+            result
+                .as_object_mut()
+                .unwrap()
+                .insert("effectiveIsolation".to_string(), json!(eff_iso));
+        }
+        Ok(result)
     }
 
     /// Auto-subscribe `parent_agent_id` to `child_agent_id`'s completion

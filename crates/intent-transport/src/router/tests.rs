@@ -1182,7 +1182,12 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn file_read(&self, workspace_id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+    fn file_read(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+        _caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Value>> {
         // Echo a bare string so the wire test can assert file.read is NOT
         // wrapped in an object.
         Box::pin(async move { Ok(Value::String(format!("{}:{path}", workspace_id.as_str()))) })
@@ -1193,6 +1198,7 @@ impl WorkspaceApi for FakeApi {
         _workspace_id: WorkspaceId,
         path: String,
         content: String,
+        _caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             Ok(
@@ -1201,7 +1207,12 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn file_list(&self, _workspace_id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+    fn file_list(
+        &self,
+        _workspace_id: WorkspaceId,
+        path: String,
+        _caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move { Ok(serde_json::json!([{ "name": path, "type": "file" }])) })
     }
 
@@ -1215,13 +1226,19 @@ impl WorkspaceApi for FakeApi {
         &self,
         _workspace_id: WorkspaceId,
         path: String,
+        _caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(
             async move { Ok(serde_json::json!({ "ok": true, "path": path, "deleted": true })) },
         )
     }
 
-    fn file_mkdir(&self, _workspace_id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+    fn file_mkdir(
+        &self,
+        _workspace_id: WorkspaceId,
+        path: String,
+        _caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(
             async move { Ok(serde_json::json!({ "ok": true, "path": path, "created": true })) },
         )
@@ -1232,6 +1249,7 @@ impl WorkspaceApi for FakeApi {
         _workspace_id: WorkspaceId,
         old_path: String,
         new_path: String,
+        _caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             Ok(serde_json::json!({

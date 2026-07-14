@@ -20,7 +20,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, \
     parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, \
     completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
-    is_background, metadata";
+    is_background, metadata, sandbox_id, sandbox_path, sandbox_branch";
 
 /// Encode an optional JSON payload column (`context_references` /
 /// `image_blocks`) as its TEXT form, `None` staying NULL.
@@ -48,7 +48,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&s.id.0)
@@ -76,6 +76,9 @@ impl Store {
             .bind(json_col_to_db(&s.image_blocks)?)
             .bind(s.is_background as i64)
             .bind(encode_metadata(s.metadata.as_ref())?)
+            .bind(&s.sandbox_id)
+            .bind(&s.sandbox_path)
+            .bind(&s.sandbox_branch)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
@@ -177,7 +180,8 @@ impl Store {
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, is_background=?, \
-             metadata=? WHERE id=? AND workspace_id=?",
+             metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=? \
+             WHERE id=? AND workspace_id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.acp_session_id)
@@ -201,6 +205,9 @@ impl Store {
         .bind(json_col_to_db(&s.image_blocks)?)
         .bind(s.is_background as i64)
         .bind(encode_metadata(s.metadata.as_ref())?)
+        .bind(&s.sandbox_id)
+        .bind(&s.sandbox_path)
+        .bind(&s.sandbox_branch)
         .bind(&s.id.0)
         .bind(&workspace_id.0)
         .execute(self.pool())
@@ -443,6 +450,9 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         metadata,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
+        sandbox_id: col(row, "sandbox_id")?,
+        sandbox_path: col(row, "sandbox_path")?,
+        sandbox_branch: col(row, "sandbox_branch")?,
     })
 }
 

@@ -5431,6 +5431,9 @@ mod wsapi4_bindings_tests {
                 completion_report_timestamp: None,
                 delegation_depth: None,
                 initial_message: None,
+                sandbox_id: None,
+                sandbox_path: None,
+                sandbox_branch: None,
             },
         }
     }

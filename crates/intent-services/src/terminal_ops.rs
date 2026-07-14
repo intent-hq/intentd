@@ -73,7 +73,7 @@ pub(crate) async fn create(
     spec.cwd = match cwd {
         Some(cwd) => Some(PathBuf::from(cwd)),
         None => match store.as_ref() {
-            Some(store) => default_cwd(store, &workspace_id).await,
+            Some(store) => default_cwd(store, &workspace_id, None).await,
             None => None,
         },
     };
@@ -88,10 +88,23 @@ pub(crate) async fn create(
 
 /// Default working directory when `terminal.create` omits `cwd`: the
 /// workspace's worktree root, resolved the same way `script_ops` resolves a
-/// script cwd (`worktreePath`, else `repositoryPath`). A missing workspace row
+/// script cwd (`worktreePath`, else `repositoryPath`). When `caller_agent_id`
+/// is provided and the agent has a sandbox, the sandbox path overrides the
+/// workspace worktree (sandboxed agent containment). A missing workspace row
 /// or one without a resolvable worktree yields `None`, so the PTY inherits the
 /// daemon's cwd (the prior behavior).
-async fn default_cwd(store: &Store, workspace_id: &WorkspaceId) -> Option<PathBuf> {
+async fn default_cwd(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    caller_agent_id: Option<&intent_core::AgentId>,
+) -> Option<PathBuf> {
+    if let Some(agent_id) = caller_agent_id {
+        if let Ok(session) = store.get_agent_session(agent_id).await {
+            if let Some(sandbox_path) = session.sandbox_path {
+                return Some(sandbox_path.into());
+            }
+        }
+    }
     let workspace = store.get_workspace(workspace_id).await.ok()?;
     crate::git_ops::worktree_path(&workspace)
 }
@@ -852,10 +865,10 @@ mod tests {
             .await
             .expect("insert ws without worktree");
 
-        assert_eq!(default_cwd(&store, &with).await, Some(worktree));
-        assert_eq!(default_cwd(&store, &without).await, None);
+        assert_eq!(default_cwd(&store, &with, None).await, Some(worktree));
+        assert_eq!(default_cwd(&store, &without, None).await, None);
         // Unknown workspace rows fall back without erroring.
-        assert_eq!(default_cwd(&store, &ws("ws-missing")).await, None);
+        assert_eq!(default_cwd(&store, &ws("ws-missing"), None).await, None);
     }
 
     #[tokio::test]
