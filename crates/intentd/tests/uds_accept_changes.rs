@@ -110,6 +110,7 @@ fn workspace(id: &WorkspaceId, worktree: &str, branch: &str) -> Workspace {
         agent_summary: None,
         diff_summary: None,
         token_usage: None,
+        cow_supported: None,
     }
 }
 

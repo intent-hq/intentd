@@ -2645,6 +2645,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         agent_summary: None,
         diff_summary: None,
         token_usage: None,
+        cow_supported: None,
     }
 }
 

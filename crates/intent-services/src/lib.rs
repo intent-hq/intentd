@@ -570,6 +570,30 @@ impl Services {
         if activity_max.is_some() {
             ws.last_activity = activity_max;
         }
+        // Compute cow_supported (Task 5): direct mode + git repo + CoW probe Supported.
+        ws.cow_supported = self.compute_cow_supported(ws);
+    }
+
+    /// Compute whether CoW agent isolation is supported for this workspace (Task 5).
+    /// Returns Some(true) if direct mode + git repo + CoW probe Supported; Some(false)
+    /// if worktree mode or unsupported filesystem; None if probe fails.
+    fn compute_cow_supported(&self, ws: &Workspace) -> Option<bool> {
+        // Only direct-mode workspaces
+        let is_direct_mode = ws.skip_worktree || ws.worktree_path.is_none();
+        if !is_direct_mode {
+            return Some(false);
+        }
+        // Must have a repository path
+        let repo_path = ws.repository_path.as_ref()?;
+        // Must have workspaces root
+        let workspaces_root = self.workspaces_root.as_ref()?;
+
+        // Probe CoW support for the (repo, workspaces_root) pair
+        match intent_git::cow_probe(std::path::Path::new(repo_path), workspaces_root) {
+            Ok(intent_git::CowSupport::Supported) => Some(true),
+            Ok(intent_git::CowSupport::Unsupported) => Some(false),
+            Err(_) => None, // Probe failed; omit the field
+        }
     }
 
     /// Record an agent session entering flight for `workspace_id`. On the
@@ -5687,6 +5711,7 @@ impl WorkspaceApi for Services {
                         agent_summary: None,
                         diff_summary: None,
                         token_usage: None,
+                        cow_supported: None,
                     };
                     // Provision the git worktree (TS `createGitWorktree` parity):
                     // a local workspace created off a local git repo gets a
@@ -6428,6 +6453,7 @@ impl WorkspaceApi for Services {
                 agent_summary: None,
                 diff_summary: None,
                 token_usage: None,
+                cow_supported: None,
             };
             // Provision the git worktree for the duplicate (TS
             // `duplicateWorkspace` parity, mirroring the `workspace.create`

@@ -790,6 +790,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "git",
             true,
         ),
+        boolean(
+            "workspace.cowIsolation",
+            "Copy-on-Write Agent Isolation",
+            "Enable CoW agent sandboxing for direct-mode delegations (requires CoW filesystem support)",
+            "workspace",
+            false,
+        ),
         // --- Group A: MCP ----------------------------------------------------
         boolean(
             "mcp.enableUserServers",
