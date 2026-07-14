@@ -147,7 +147,6 @@ impl ServerCertVerifier for PinnedVerifier {
         )
     }
     fn verify_tls13_signature(
-
         &self,
         message: &[u8],
         cert: &CertificateDer<'_>,
@@ -268,7 +267,10 @@ async fn agents_max_concurrent_setting_over_wss() {
     )
     .await;
     assert_eq!(resp["jsonrpc"], json!("2.0"));
-    assert!(resp.get("error").is_none(), "settings.update errored: {resp}");
+    assert!(
+        resp.get("error").is_none(),
+        "settings.update errored: {resp}"
+    );
     assert_eq!(resp["result"]["success"], json!(true));
 
     // (b) Read it back via settings.get
@@ -290,7 +292,10 @@ async fn agents_max_concurrent_setting_over_wss() {
         json!({ "changes": { "agents.maxConcurrent": 2.5 } }),
     )
     .await;
-    assert!(resp.get("error").is_none(), "settings.update with non-integer should succeed");
+    assert!(
+        resp.get("error").is_none(),
+        "settings.update with non-integer should succeed"
+    );
 
     // When read back, the helper should treat 2.5 as invalid (returns auto)
     let resp = wss_rpc_envelope(
@@ -302,5 +307,8 @@ async fn agents_max_concurrent_setting_over_wss() {
     .await;
     // The setting is stored as 2.5 in the store, but max_concurrent_agents helper
     // will reject it and return None (auto). This is integration-level validation.
-    assert_eq!(resp["result"]["settings"]["agents.maxConcurrent"], json!(2.5));
+    assert_eq!(
+        resp["result"]["settings"]["agents.maxConcurrent"],
+        json!(2.5)
+    );
 }
