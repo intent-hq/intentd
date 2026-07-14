@@ -513,7 +513,7 @@ async fn batch_hook_ordering_disable_both() {
 
 /// Batch hook ordering: reverse input order test. A batch with changes in non-lexicographic
 /// input order should still apply hooks deterministically. This test provides
-/// {wsApi.enabled=true, discovery.enabled=true} with wsApi.enabled FIRST in the input array,
+/// {wsApi.enabled=true, discovery.enabled=true} with discovery.enabled FIRST in the input array,
 /// proving the sort happens before application (not dependent on input order).
 #[tokio::test]
 async fn batch_hook_ordering_reverse_input_order() {

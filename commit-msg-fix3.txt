@@ -1,0 +1,4 @@
+fix: correct test comment and remove stray commit message files
+
+- Fix e2e_wss_runtime_control.rs comment: test sends discovery.enabled FIRST
+- Remove commit-msg-fix.txt and commit-msg-fix2.txt leftover files
