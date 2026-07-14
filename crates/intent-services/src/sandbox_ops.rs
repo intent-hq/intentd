@@ -1494,6 +1494,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sandbox_merge_dirty_overlap_blocked() {
+        let (store, _db) = temp_store().await;
+        let (test_root, canonical_path) = temp_repo_in_target("canonical");
+        let (_, sandbox_path) = temp_repo_in_target("sandbox");
+
+        // Create workspace
+        let ws = workspace_for_repo(&canonical_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId(uuid::Uuid::new_v4().to_string());
+        create_test_agent(&store, &ws.id, &agent_id).await;
+        let base_sha = {
+            let canonical_repo = git2::Repository::open(&canonical_path).unwrap();
+            let head_ref = canonical_repo.head().unwrap();
+            let oid = head_ref.target().unwrap();
+            oid.to_string()
+        };
+
+        // Make a change in sandbox
+        let sandbox_file = sandbox_path.join("file1.txt");
+        fs::write(&sandbox_file, "sandbox change").unwrap();
+        {
+            let sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+            let mut index = sandbox_repo.index().unwrap();
+            index.add_path(Path::new("file1.txt")).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = sandbox_repo.find_tree(tree_oid).unwrap();
+            let sig = sandbox_repo.signature().unwrap();
+            let parent = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+            sandbox_repo
+                .commit(Some("HEAD"), &sig, &sig, "Sandbox work", &tree, &[&parent])
+                .unwrap();
+        }
+
+        // Make a DIFFERENT change in canonical (but to the SAME file) and leave it uncommitted
+        let canonical_file = canonical_path.join("file1.txt");
+        fs::write(&canonical_file, "canonical dirty change").unwrap();
+
+        // Create sandbox record
+        let sandbox = Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.id.clone(),
+            agent_id: agent_id.clone(),
+            path: sandbox_path.to_string_lossy().to_string(),
+            branch: "sb/test".to_string(),
+            base_commit_sha: base_sha,
+            snapshot_commit_sha: None,
+            status: SandboxStatus::Created,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        // Attempt merge - should be Blocked due to dirty overlap
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id).await.unwrap();
+        match outcome {
+            MergeOutcome::Blocked {
+                reason,
+                overlapping_paths,
+            } => {
+                assert!(reason.contains("uncommitted"));
+                assert_eq!(overlapping_paths.len(), 1);
+                assert_eq!(overlapping_paths[0], "file1.txt");
+            }
+            _ => panic!("Expected Blocked outcome, got {:?}", outcome),
+        }
+
+        // Cleanup
+        let _ = fs::remove_dir_all(test_root);
+    }
+
+    #[tokio::test]
     async fn test_sandbox_merge_conflict() {
         use git2::Repository;
         use std::fs;
@@ -1628,7 +1701,7 @@ mod tests {
         let agent_id = AgentId::from("agent-test-snapshot");
         create_test_agent(&store, &ws.id, &agent_id).await;
         let canonical_path = repo_path.clone();
-        let repo = Repository::open(&canonical_path).unwrap();
+        let _repo = Repository::open(&canonical_path).unwrap();
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
 
         // Add dirty file to canonical before provisioning
@@ -1694,6 +1767,85 @@ mod tests {
             }
             _ => panic!("Expected Merged outcome, got {:?}", outcome),
         }
+
+        // Clean up
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_merge_preserves_attribution() {
+        // This test verifies that agent commits preserve the agent's identity in canonical
+        use git2::Repository;
+        use std::fs;
+
+        let (store, _db) = temp_store().await;
+        let (test_root, repo_path) = temp_repo_in_target("attribution");
+        let workspaces_root = test_root.join("workspaces");
+
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported");
+            let _ = fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        // Create workspace
+        let ws = workspace_for_repo(&repo_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId("agent-test-123".to_string());
+        create_test_agent(&store, &ws.id, &agent_id).await;
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        let provision_outcome = provision_sandbox(&store, &ws.id, &agent_id, &config)
+            .await
+            .unwrap();
+        let sandbox_path = match provision_outcome {
+            ProvisionOutcome::Supported { path, .. } => path,
+            _ => panic!("Expected Supported"),
+        };
+
+        // In the sandbox, make a commit with a specific author (simulating the agent)
+        let agent_work = sandbox_path.join("agent_work.txt");
+        fs::write(&agent_work, "work by agent").unwrap();
+        let sandbox_repo = Repository::open(&sandbox_path).unwrap();
+        let mut index = sandbox_repo.index().unwrap();
+        index.add_path(Path::new("agent_work.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = sandbox_repo.find_tree(tree_oid).unwrap();
+        let parent = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+
+        // Use a custom signature for the agent
+        let agent_sig = git2::Signature::now("Agent Bot", "agent@example.com").unwrap();
+        let _commit_oid = sandbox_repo
+            .commit(
+                Some("HEAD"),
+                &agent_sig,
+                &agent_sig,
+                "Agent's work",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+
+        // Merge back
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id).await.unwrap();
+        match outcome {
+            MergeOutcome::Merged { .. } => {}
+            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+        }
+
+        // Verify attribution was preserved in canonical
+        let canonical_repo = Repository::open(&repo_path).unwrap();
+        let head_commit = canonical_repo.head().unwrap().peel_to_commit().unwrap();
+
+        // The latest commit should have the agent's signature
+        assert_eq!(head_commit.author().name().unwrap(), "Agent Bot");
+        assert_eq!(head_commit.author().email().unwrap(), "agent@example.com");
+        assert_eq!(head_commit.message().unwrap(), "Agent's work");
 
         // Clean up
         let _ = fs::remove_dir_all(&test_root);

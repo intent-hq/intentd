@@ -194,7 +194,11 @@ fn sandbox_from_row(row: &SqliteRow) -> Result<Sandbox> {
         base_commit_sha: row.try_get("base_commit_sha").map_err(|e| {
             intent_core::Error::Internal(format!("get base_commit_sha failed: {e}"))
         })?,
-        snapshot_commit_sha: row.try_get("snapshot_commit_sha").ok(),
+        snapshot_commit_sha: row
+            .try_get::<Option<String>, _>("snapshot_commit_sha")
+            .ok()
+            .flatten()
+            .and_then(|s| if s.is_empty() { None } else { Some(s) }),
         status: SandboxStatus::from_db(&status_str)?,
         created_at: row
             .try_get("created_at")
