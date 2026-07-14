@@ -747,6 +747,42 @@ mod tests {
             .unwrap();
     }
 
+    async fn create_test_agent(store: &Store, ws_id: &WorkspaceId, agent_id: &AgentId) {
+        let agent = intent_core::AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws_id.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Test Agent".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: intent_core::AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        };
+        store.insert_agent_session(&agent).await.unwrap();
+    }
+
     fn workspace_for_repo(repo_path: &PathBuf) -> Workspace {
         let now = now_iso();
         Workspace {
@@ -1356,5 +1392,267 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_dir_all(&cross_volume_root);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_merge_clean() {
+        use git2::Repository;
+        use std::fs;
+
+        let (store, _db) = temp_store().await;
+        let (test_root, repo_path) = temp_repo_in_target("merge-clean");
+        let workspaces_root = test_root.join("workspaces");
+
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported on this filesystem");
+            let _ = fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        let ws = workspace_for_repo(&repo_path);
+        store.insert_workspace(&ws).await.unwrap();
+        let agent_id = AgentId::from("agent-test-merge");
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        // Canonical repo already initialized by temp_repo_in_target
+        let canonical_path = repo_path.clone();
+        let repo = Repository::open(&canonical_path).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+
+        // Get base commit
+        let base_commit = repo.head().unwrap().peel_to_commit().unwrap().id();
+
+        // Provision sandbox
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config).await.unwrap();
+        let ProvisionOutcome::Supported { path: sandbox_path, .. } = outcome else {
+            panic!("Expected Supported outcome");
+        };
+
+        // Make a commit in the sandbox
+        let sandbox_repo = Repository::open(&sandbox_path).unwrap();
+        fs::write(PathBuf::from(&sandbox_path).join("file2.txt"), "content2").unwrap();
+        let mut sandbox_index = sandbox_repo.index().unwrap();
+        sandbox_index.add_path(Path::new("file2.txt")).unwrap();
+        sandbox_index.write().unwrap();
+        let sandbox_tree_oid = sandbox_index.write_tree().unwrap();
+        let sandbox_tree = sandbox_repo.find_tree(sandbox_tree_oid).unwrap();
+        let parent = sandbox_repo.find_commit(base_commit).unwrap();
+        sandbox_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Sandbox work",
+                &sandbox_tree,
+                &[&parent],
+            )
+            .unwrap();
+
+        // Attempt merge
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id).await.unwrap();
+
+        // Verify clean merge
+        match outcome {
+            MergeOutcome::Merged { commit_range, .. } => {
+                assert!(!commit_range.is_empty());
+                // Verify file2.txt is in canonical
+                assert!(canonical_path.join("file2.txt").exists());
+            }
+            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+        }
+
+        // Clean up
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_merge_conflict() {
+        use git2::Repository;
+        use std::fs;
+
+        let (store, _db) = temp_store().await;
+        let (test_root, repo_path) = temp_repo_in_target("merge-conflict");
+        let workspaces_root = test_root.join("workspaces");
+
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported");
+            let _ = fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        let ws = workspace_for_repo(&repo_path);
+        store.insert_workspace(&ws).await.unwrap();
+        let agent_id = AgentId::from("agent-test-conflict");
+        create_test_agent(&store, &ws.id, &agent_id).await;
+        let canonical_path = repo_path.clone();
+        let repo = Repository::open(&canonical_path).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+
+        // Add a file to work with
+        fs::write(canonical_path.join("file.txt"), "line1\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("file.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let base_commit = repo
+            .commit(Some("HEAD"), &sig, &sig, "Add file", &tree, &[&head])
+            .unwrap();
+
+        // Provision sandbox
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config).await.unwrap();
+        let ProvisionOutcome::Supported { path: sandbox_path, .. } = outcome else {
+            panic!("Expected Supported outcome");
+        };
+
+        // Modify same file in sandbox
+        let sandbox_repo = Repository::open(&sandbox_path).unwrap();
+        fs::write(PathBuf::from(&sandbox_path).join("file.txt"), "line1\nsandbox change\n").unwrap();
+        let mut sandbox_index = sandbox_repo.index().unwrap();
+        sandbox_index.add_path(Path::new("file.txt")).unwrap();
+        sandbox_index.write().unwrap();
+        let sandbox_tree_oid = sandbox_index.write_tree().unwrap();
+        let sandbox_tree = sandbox_repo.find_tree(sandbox_tree_oid).unwrap();
+        let parent = sandbox_repo.find_commit(base_commit).unwrap();
+        sandbox_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Sandbox change",
+                &sandbox_tree,
+                &[&parent],
+            )
+            .unwrap();
+
+        // Modify same file in canonical to create conflict
+        fs::write(canonical_path.join("file.txt"), "line1\ncanonical change\n").unwrap();
+        let mut canonical_index = repo.index().unwrap();
+        canonical_index.add_path(Path::new("file.txt")).unwrap();
+        canonical_index.write().unwrap();
+        let canonical_tree_oid = canonical_index.write_tree().unwrap();
+        let canonical_tree = repo.find_tree(canonical_tree_oid).unwrap();
+        let canonical_parent = repo.find_commit(base_commit).unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "Canonical change",
+            &canonical_tree,
+            &[&canonical_parent],
+        )
+        .unwrap();
+
+        // Attempt merge - should detect conflict
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id).await.unwrap();
+
+        // Verify conflict detected
+        match outcome {
+            MergeOutcome::Conflict { conflicting_paths, .. } => {
+                assert!(conflicting_paths.contains(&"file.txt".to_string()));
+                // Verify canonical is pristine (not mid-merge)
+                assert!(repo.state() == git2::RepositoryState::Clean);
+            }
+            _ => panic!("Expected Conflict outcome, got {:?}", outcome),
+        }
+
+        // Clean up
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_excluded_from_merge() {
+        // This test verifies that WIP snapshot commits are NOT merged back to canonical
+        use git2::Repository;
+        use std::fs;
+
+        let (store, _db) = temp_store().await;
+        let (test_root, repo_path) = temp_repo_in_target("snapshot-exclude");
+        let workspaces_root = test_root.join("workspaces");
+
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported");
+            let _ = fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        let ws = workspace_for_repo(&repo_path);
+        store.insert_workspace(&ws).await.unwrap();
+        let agent_id = AgentId::from("agent-test-snapshot");
+        create_test_agent(&store, &ws.id, &agent_id).await;
+        let canonical_path = repo_path.clone();
+        let repo = Repository::open(&canonical_path).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+
+        // Add dirty file to canonical before provisioning
+        fs::write(canonical_path.join("wip.txt"), "user wip").unwrap();
+
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config).await.unwrap();
+        let ProvisionOutcome::Supported {
+            path: sandbox_path,
+            snapshot_commit_sha,
+            ..
+        } = outcome else {
+            panic!("Expected Supported outcome");
+        };
+
+        // Verify snapshot was created
+        assert!(snapshot_commit_sha.is_some(), "Snapshot should be created for WIP");
+
+        // Make agent commit in sandbox
+        let sandbox_repo = Repository::open(&sandbox_path).unwrap();
+        fs::write(sandbox_path.join("agent_work.txt"), "agent work").unwrap();
+        let mut sandbox_index = sandbox_repo.index().unwrap();
+        sandbox_index.add_path(Path::new("agent_work.txt")).unwrap();
+        sandbox_index.write().unwrap();
+        let sandbox_tree_oid = sandbox_index.write_tree().unwrap();
+        let sandbox_tree = sandbox_repo.find_tree(sandbox_tree_oid).unwrap();
+        let head = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+        sandbox_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Agent work",
+                &sandbox_tree,
+                &[&head],
+            )
+            .unwrap();
+
+        // Clean canonical WIP so merge can proceed
+        fs::remove_file(canonical_path.join("wip.txt")).unwrap();
+
+        // Attempt merge
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id).await.unwrap();
+
+        // Verify merge succeeded and WIP snapshot was excluded
+        match outcome {
+            MergeOutcome::Merged { .. } => {
+                // Verify agent work landed
+                assert!(canonical_path.join("agent_work.txt").exists());
+                // Verify WIP snapshot did NOT land (critical!)
+                assert!(!canonical_path.join("wip.txt").exists(), "WIP snapshot must not be merged");
+            }
+            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+        }
+
+        // Clean up
+        let _ = fs::remove_dir_all(&test_root);
     }
 }
