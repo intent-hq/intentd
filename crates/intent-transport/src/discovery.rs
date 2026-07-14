@@ -12,6 +12,29 @@
 //! it is gated behind the discovery-enable flag (`is_discovery_enabled`,
 //! default false) and only runs for the TCP/both listen modes, since the WSS
 //! listener itself only exists then.
+//!
+//! ## Ownership and Lifecycle Invariant
+//!
+//! Discovery handles are owned by the [`WsApiServer`](crate::ws::WsApiServer)
+//! and stored in [`crate::lifecycle::RunningHandles`]. This coupling enforces
+//! the **product invariant** that mDNS advertisement **requires an active
+//! listener**: advertising a service (port + TLS fingerprint) that clients
+//! cannot connect to violates the mDNS service contract. The coupling is
+//! intentional and correct:
+//!
+//! 1. **Service contract**: Clients expect advertised services to be reachable.
+//! 2. **Settings ordering**: The batch-update system (§5.12) enforces that
+//!    `server.wsApi.enabled` (priority 10) runs before `server.discovery.enabled`
+//!    (priority 11), ensuring the listener starts before discovery. On shutdown,
+//!    the listener's internal teardown unpublishes mDNS before stopping.
+//! 3. **Runtime guards**: [`crate::ws::WsInner::start_discovery`] returns
+//!    an error if the listener is not running.
+//! 4. **Secure mode requirement**: Discovery advertises the TLS fingerprint;
+//!    insecure mode has no fingerprint and forces `discovery_enabled = false`.
+//!
+//! Independent runtime control (`start_discovery` / `stop_discovery` /
+//! `is_discovery_active`) allows toggling discovery on/off while the listener
+//! runs, without restarting the listener itself.
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 

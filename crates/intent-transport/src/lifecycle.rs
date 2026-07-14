@@ -38,6 +38,18 @@ pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 type StartFuture = Shared<BoxFuture<'static, Result<u16, Arc<io::Error>>>>;
 
 /// Handles for a running listener, taken by `stop()` to tear it down in order.
+///
+/// Discovery ownership rationale: The [`Discovery`] handle is owned here
+/// (rather than in a separate manager) to enforce the product invariant that
+/// mDNS advertisement **requires an active listener**. This coupling prevents
+/// advertising a service that clients cannot connect to, which would violate
+/// the mDNS contract. The ownership model ensures:
+/// - Discovery is created only after the listener binds (uses the real port)
+/// - Discovery is unpublished **before** the listener stops (no stale records)
+/// - Discovery cannot exist without a running listener (enforced by runtime guards)
+///
+/// Independent runtime control (`start_discovery` / `stop_discovery`) allows
+/// toggling discovery while the listener runs, without restarting the listener.
 pub(crate) struct RunningHandles {
     pub accept_task: JoinHandle<()>,
     pub heartbeat_task: JoinHandle<()>,
