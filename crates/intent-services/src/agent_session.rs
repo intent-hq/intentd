@@ -266,7 +266,7 @@ fn last_response_summary(blocks: &[Value]) -> Option<String> {
 }
 
 /// The `agent` actor stamped on streaming events (carries the agent id).
-fn agent_actor(agent_id: &AgentId) -> EventActor {
+pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
     EventActor {
         actor_type: ActorType::Agent,
         id: Some(agent_id.0.clone()),

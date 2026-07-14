@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::agent_ops::new_message_id;
-
+use crate::agent_session::agent_actor;
 use crate::events::EventBus;
 use crate::Services;
 
@@ -2308,7 +2308,7 @@ async fn run_message_worker(
     // agent with the same ACP content blocks as if it had run inline.
     let mut options = initial_options;
     'outer: loop {
-        match mgr.ensure_started(&agent_id, &workspace_id).await {
+        match retry_spawn(&mgr, &agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
                 let prompt = mgr
                     .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
@@ -2321,7 +2321,17 @@ async fn run_message_worker(
                 }
             }
             Err(e) => {
-                tracing::warn!(agent = %agent_id, error = %e, "agent spawn failed");
+                tracing::warn!(agent = %agent_id, error = %e, "agent spawn failed after all retries");
+                handle_terminal_spawn_failure(
+                    &mgr,
+                    &agent_id,
+                    &workspace_id,
+                    &content,
+                    &options,
+                    &e,
+                )
+                .await;
+                break 'outer;
             }
         }
         // Drain the next queued message while still holding the in-flight slot.
@@ -2400,6 +2410,197 @@ async fn persist_user(mgr: &AgentManager, agent_id: &AgentId, content: &str) {
     {
         tracing::warn!(agent = %agent_id, error = %e, "failed to persist queued user message");
     }
+}
+
+/// Max number of spawn attempts (includes the initial attempt).
+const MAX_SPAWN_ATTEMPTS: u32 = 3;
+/// Backoff delays between retry attempts (in seconds).
+const RETRY_BACKOFF_MS: &[u64] = &[2000, 5000];
+
+/// Classify whether an error from `ensure_started` is retryable. Retryable
+/// errors include session/new or session/load timeouts, handshake failures
+/// (e.g., "agent stdout closed" when the child dies immediately), and
+/// transport errors. Non-retryable errors include store NotFound, provider
+/// resolution failures, and mock provider missing env (fail-fast).
+fn is_retryable_spawn_error(err: &Error) -> bool {
+    let msg = err.to_string();
+    // Retryable: session setup timeout, handshake failures, transport errors
+    if msg.contains("session/new failed")
+        || msg.contains("session/load failed")
+        || msg.contains("handshake failed")
+        || msg.contains("agent stdout closed")
+        || msg.contains("timed out")
+    {
+        return true;
+    }
+    // Non-retryable: store errors, provider resolution failures
+    if msg.contains("not found") || msg.contains("NotFound") {
+        return false;
+    }
+    if msg.contains("provider") && msg.contains("missing") {
+        return false;
+    }
+    // Default to retryable for transport/spawn-related errors
+    true
+}
+
+/// Retry `ensure_started` up to `MAX_SPAWN_ATTEMPTS` times with exponential
+/// backoff. On each retry (after the first failure), tear down the failed
+/// child, publish an `agent:stream:status` retry hint, and spawn a fresh
+/// process. Returns the `acpSessionId` on success, or the final error after
+/// exhausting all attempts.
+async fn retry_spawn(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+) -> Result<String> {
+    let mut last_error: Option<Error> = None;
+
+    for attempt in 1..=MAX_SPAWN_ATTEMPTS {
+        match mgr.ensure_started(agent_id, workspace_id).await {
+            Ok(session_id) => return Ok(session_id),
+            Err(e) => {
+                let retryable = is_retryable_spawn_error(&e);
+                tracing::warn!(
+                    agent = %agent_id,
+                    attempt = attempt,
+                    max = MAX_SPAWN_ATTEMPTS,
+                    retryable = retryable,
+                    error = %e,
+                    "agent spawn attempt failed"
+                );
+
+                last_error = Some(e);
+
+                // If non-retryable or last attempt, fail immediately
+                if !retryable || attempt == MAX_SPAWN_ATTEMPTS {
+                    break;
+                }
+
+                // Tear down the failed child so the next attempt spawns fresh
+                mgr.stop(agent_id).await;
+
+                // Publish retry status hint
+                let retry_num = attempt;
+                let message = format!(
+                    "Agent session timed out — retrying (attempt {}/3)…",
+                    retry_num + 1
+                );
+                mgr.services
+                    .publish_status_event(
+                        workspace_id,
+                        agent_id,
+                        "spawn-retry",
+                        &message,
+                        "warning",
+                    )
+                    .await;
+
+                // Backoff before retry
+                if let Some(&delay_ms) = RETRY_BACKOFF_MS.get((attempt - 1) as usize) {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| Error::Internal("spawn retry loop exhausted without error".to_string())))
+}
+
+/// Handle terminal spawn failure after all retries are exhausted. Publishes
+/// terminal `agent:failed` and `agent:stream:end` events, persists the agent
+/// status as `Error`, requeues the failed message to the front of the queue,
+/// and stops draining further messages.
+async fn handle_terminal_spawn_failure(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    content: &str,
+    options: &TurnOptions,
+    error: &Error,
+) {
+    use intent_core::events::{AGENT_FAILED, AGENT_STATUS_CHANGED, AGENT_STREAM_END};
+    use serde_json::json;
+
+    // Build error message, enriched with recent stderr when available
+    let mut error_msg = error.to_string();
+    if let Some(handle) = mgr.handles.lock().unwrap().get(agent_id) {
+        let stderr_lines = handle.connection.recent_stderr();
+        if !stderr_lines.is_empty() {
+            error_msg.push_str("\n\nRecent stderr:\n");
+            error_msg.push_str(&stderr_lines.join("\n"));
+        }
+    }
+
+    // Publish terminal agent:failed event
+    mgr.services
+        .publish_agent_event(
+            workspace_id,
+            agent_id,
+            AGENT_FAILED,
+            json!({ "agentId": agent_id.0, "error": error_msg }),
+        )
+        .await;
+
+    // Publish terminal agent:stream:end event
+    mgr.services
+        .publish_agent_event(
+            workspace_id,
+            agent_id,
+            AGENT_STREAM_END,
+            json!({ "agentId": agent_id.0 }),
+        )
+        .await;
+
+    // Persist agent status as Error and emit agent:status-changed
+    let ts = now_iso();
+    if let Err(e) = mgr
+        .services
+        .store
+        .set_agent_session_status(workspace_id, agent_id, AgentStatus::Error, false, &ts)
+        .await
+    {
+        tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status");
+    } else {
+        // Emit agent:status-changed
+        let event = NewEvent {
+            workspace_id: workspace_id.clone(),
+            timestamp: ts,
+            event_type: AGENT_STATUS_CHANGED.to_string(),
+            actor: agent_actor(agent_id),
+            session_id: Some(agent_id.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({
+                "agentId": agent_id.0,
+                "status": "error",
+                "isActive": false,
+            }),
+        };
+        crate::publish_event(&mgr.services.event_bus, event).await;
+    }
+
+    // Requeue the failed message to the front of the queue
+    let queued = crate::agent_ops::QueuedMessage {
+        id: new_message_id(),
+        content: content.to_string(),
+        image_blocks: options.image_blocks.clone(),
+        file_blocks: options.file_blocks.clone(),
+        queued_at: now_iso(),
+        editing: false,
+    };
+    mgr.services.requeue_front(agent_id, queued);
+
+    // Publish queue updated so FE reflects the requeued message
+    mgr.services
+        .publish_queue_updated_for(
+            agent_id,
+            workspace_id,
+            mgr.services.queue_snapshot(agent_id),
+        )
+        .await;
 }
 
 #[cfg(test)]
@@ -2714,5 +2915,52 @@ mod role_reminder_tests {
             .agent_specialist_injection(&agent_id, None)
             .await
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    //! Unit tests for spawn retry logic (classify retryable errors, tear down
+    //! failed child between attempts, emit terminal failure events).
+
+    use super::*;
+
+    #[test]
+    fn session_new_timeout_is_retryable() {
+        let err =
+            Error::Internal("session/new failed: request `session/new` timed out".to_string());
+        assert!(is_retryable_spawn_error(&err));
+    }
+
+    #[test]
+    fn session_load_timeout_is_retryable() {
+        let err = Error::Internal("session/load failed: timed out after 60s".to_string());
+        assert!(is_retryable_spawn_error(&err));
+    }
+
+    #[test]
+    fn handshake_agent_stdout_closed_is_retryable() {
+        let err =
+            Error::Internal("handshake failed: JSON-RPC error 0: agent stdout closed".to_string());
+        assert!(is_retryable_spawn_error(&err));
+    }
+
+    #[test]
+    fn not_found_is_not_retryable() {
+        let err = Error::NotFound("agent session not found".to_string());
+        assert!(!is_retryable_spawn_error(&err));
+    }
+
+    #[test]
+    fn provider_missing_is_not_retryable() {
+        let err =
+            Error::Internal("provider auggie missing required env ANTHROPIC_API_KEY".to_string());
+        assert!(!is_retryable_spawn_error(&err));
+    }
+
+    #[test]
+    fn generic_internal_error_is_retryable() {
+        let err = Error::Internal("transport error: connection reset".to_string());
+        assert!(is_retryable_spawn_error(&err));
     }
 }
