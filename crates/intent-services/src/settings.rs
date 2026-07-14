@@ -879,6 +879,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             5181.0,
         ),
         boolean(
+            "server.wsApi.enabled",
+            "WS API enabled",
+            "Enable the TCP/WSS listener at runtime",
+            "server",
+            false,
+        ),
+        boolean(
             "server.tls.enabled",
             "TLS enabled",
             "Enable TLS for the TCP listener",

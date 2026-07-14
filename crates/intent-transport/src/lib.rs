@@ -13,6 +13,7 @@ pub use auth::{
     is_auth_enabled, is_discovery_enabled, validate_token, AsyncTokenStore, FileTokenStore,
     TokenStore,
 };
+pub use context::{is_tcp_connection, with_connection_context};
 pub use control::{SystemControl, SystemStatus};
 pub use discovery::{detect_display_server, detect_has_display, Discovery, SERVICE_TYPE};
 pub use host::{
@@ -33,6 +34,7 @@ pub mod auth;
 pub(crate) mod browser;
 mod client;
 mod conn;
+pub mod context;
 pub mod control;
 pub mod discovery;
 mod drafts;

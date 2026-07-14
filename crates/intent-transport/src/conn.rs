@@ -191,13 +191,19 @@ pub(crate) async fn process_frame(
     }
     // Slow path: the ported-methods dispatcher can touch any service, so spawn
     // it too. Owns the raw frame so the read loop can advance to the next line.
+    // Thread connection context (UDS vs TCP) through so ServerControl can guard
+    // self-terminating stop calls.
     let api = api.clone();
     let out_tx = out_tx.clone();
     let raw = raw.to_string();
+    let is_tcp = !is_local;
     tokio::spawn(async move {
-        if let Some(response) = handle_message(api.as_ref(), &raw).await {
-            let _ = out_tx.send(response).await;
-        }
+        crate::context::with_connection_context(is_tcp, async {
+            if let Some(response) = handle_message(api.as_ref(), &raw).await {
+                let _ = out_tx.send(response).await;
+            }
+        })
+        .await
     });
     true
 }

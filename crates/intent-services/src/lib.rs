@@ -290,6 +290,12 @@ pub struct Services {
     /// client-triggered `browser.exec` path already produces. Shared across
     /// clones so every service handle sees the same live-client set.
     reverse_dispatch: Option<Arc<dyn AgentReverseDispatch>>,
+    /// Runtime control for the WSS listener + mDNS (server settings apply
+    /// hooks, §5.12). When wired, `settings.update` on `server.wsApi.enabled`
+    /// / `server.discovery.enabled` starts/stops the listener at runtime.
+    /// Held as `Arc<OnceLock>` so the control can be attached after the `api`
+    /// Arc is built (composition-root wiring, §5.12). Shared across clones.
+    server_control: Arc<OnceLock<Arc<dyn intent_core::ServerControl>>>,
 }
 
 impl Services {
@@ -327,6 +333,7 @@ impl Services {
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
             reverse_dispatch: None,
+            server_control: Arc::new(OnceLock::new()),
         }
     }
 
@@ -845,6 +852,14 @@ impl Services {
     pub fn with_reverse_dispatch(mut self, dispatch: Arc<dyn AgentReverseDispatch>) -> Self {
         self.reverse_dispatch = Some(dispatch);
         self
+    }
+
+    /// Attach the runtime [`ServerControl`] so `settings.update` can start/stop
+    /// the WSS listener + mDNS on `server.wsApi.enabled` /
+    /// `server.discovery.enabled` changes (server settings apply hooks, §5.12).
+    /// Idempotent: a second call is a no-op (the `OnceLock` keeps the first).
+    pub fn attach_server_control(&self, control: Arc<dyn intent_core::ServerControl>) {
+        let _ = self.server_control.set(control);
     }
 
     /// Borrow the shared [`McpHub`] (composition root: spawn the health monitor
@@ -3940,6 +3955,78 @@ impl Services {
         });
         serde_json::json!({ "requestId": request_id, "matches": [] })
     }
+
+    /// Apply server runtime control hooks after `settings.update` persists
+    /// `server.wsApi.enabled` / `server.discovery.enabled` changes (§5.12).
+    /// Returns an error if the operation fails (e.g., TCP client trying to disable
+    /// the WSS listener, or listener start failure), allowing the caller to rollback.
+    async fn apply_server_setting_hooks(
+        &self,
+        applied: &[serde_json::Value],
+        control: &Arc<dyn intent_core::ServerControl>,
+    ) -> Result<()> {
+        for change in applied {
+            if let Some(path) = change.get("path").and_then(|v| v.as_str()) {
+                match path {
+                    "server.wsApi.enabled" => {
+                        if let Some(enabled) = change.get("value").and_then(|v| v.as_bool()) {
+                            if enabled {
+                                // Attempt to start the listener
+                                let port = control.start_ws_listener().await.map_err(|e| {
+                                    tracing::error!(
+                                        error = ?e,
+                                        "server.wsApi.enabled → true: failed to start WSS listener"
+                                    );
+                                    Error::Internal(format!("failed to start WSS listener: {}", e))
+                                })?;
+                                tracing::info!(
+                                    port,
+                                    "server.wsApi.enabled → true: started WSS listener"
+                                );
+                            } else {
+                                // Guard: refuse to stop the listener from a TCP connection
+                                if control.is_tcp_connection() {
+                                    return Err(Error::InvalidParams(
+                                        "cannot disable server.wsApi.enabled from a TCP connection (would self-terminate)".to_string()
+                                    ));
+                                }
+                                control.stop_ws_listener().await;
+                                tracing::info!(
+                                    "server.wsApi.enabled → false: stopped WSS listener"
+                                );
+                            }
+                        }
+                    }
+                    "server.discovery.enabled" => {
+                        if let Some(enabled) = change.get("value").and_then(|v| v.as_bool()) {
+                            if enabled {
+                                control.start_discovery().await.map_err(|e| {
+                                    tracing::error!(
+                                        error = ?e,
+                                        "server.discovery.enabled → true: failed to start mDNS discovery"
+                                    );
+                                    Error::Internal(format!(
+                                        "failed to start mDNS discovery: {}",
+                                        e
+                                    ))
+                                })?;
+                                tracing::info!(
+                                    "server.discovery.enabled → true: started mDNS discovery"
+                                );
+                            } else {
+                                control.stop_discovery().await;
+                                tracing::info!(
+                                    "server.discovery.enabled → false: stopped mDNS discovery"
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl WorkspaceApi for Services {
@@ -3956,8 +4043,46 @@ impl WorkspaceApi for Services {
         changes: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            // Capture old values for server.* settings so we can rollback on hook failure
+            let old_values = if let Some(entries) = changes.as_array() {
+                let mut old = Vec::new();
+                for entry in entries {
+                    if let Some(path) = entry.get("path").and_then(|v| v.as_str()) {
+                        if path.starts_with("server.") {
+                            if let Ok(Some(raw)) = self.store.get_setting(path).await {
+                                old.push((path.to_string(), raw));
+                            } else {
+                                // No prior value; mark for deletion on rollback
+                                old.push((path.to_string(), String::new()));
+                            }
+                        }
+                    }
+                }
+                old
+            } else {
+                Vec::new()
+            };
+
             let applied = self.settings_service().update(&changes).await?;
             if !applied.is_empty() {
+                // Apply server runtime hooks (§5.12): start/stop WSS listener + mDNS
+                // when server.wsApi.enabled / server.discovery.enabled change.
+                if let Some(control) = self.server_control.get() {
+                    if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
+                        // Rollback: restore old values for server.* settings
+                        for (path, old_raw) in old_values {
+                            if old_raw.is_empty() {
+                                // Was not set before; delete it
+                                let _ = self.store.delete_setting(&path).await;
+                            } else {
+                                // Restore old value
+                                let _ = self.store.set_setting(&path, &old_raw).await;
+                            }
+                        }
+                        // Return the hook error to the caller
+                        return Err(e);
+                    }
+                }
                 publish_event(&self.event_bus, settings_changed_event(applied.clone())).await;
             }
             Ok(serde_json::json!({ "applied": applied }))
