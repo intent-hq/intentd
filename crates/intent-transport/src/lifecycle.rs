@@ -231,12 +231,19 @@ impl WsInner {
     /// Stop mDNS discovery advertisement if currently running. Idempotent: if
     /// discovery is not active, does nothing.
     pub(crate) async fn stop_discovery(self: &Arc<Self>) {
-        let mut st = self.state.lock().await;
-
-        if let Some(ref mut running) = st.running {
-            if let Some(discovery) = running.discovery.take() {
-                discovery.stop();
+        // Extract discovery handle without holding lock across the blocking stop() call
+        let discovery = {
+            let mut st = self.state.lock().await;
+            if let Some(ref mut running) = st.running {
+                running.discovery.take()
+            } else {
+                None
             }
+        };
+
+        // Stop outside the lock (discovery.stop() can do blocking work)
+        if let Some(d) = discovery {
+            d.stop();
         }
     }
 

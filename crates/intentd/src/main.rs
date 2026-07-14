@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use intent_core::{Config, WorkspaceApi};
+use intent_core::{Config, ServerControl, WorkspaceApi};
 use intent_services::{
     default_process_cap, AgentManager, BusEventSink, EventBus, FileWatcher, PermissionPolicy,
     Services,
@@ -532,7 +532,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     // toggle the listener on/off. The CLI --listen flag + env (INTENTD_TCP_PORT,
     // INTENTD_DISCOVERY, --insecure) override persisted settings, logged when they
     // win. TLS and bearer auth are auto-on for TCP (§5.2/§5.3) unless --insecure.
-    let (ws_server, _ws_port, ws_runtime) = if serve_tcp_enabled {
+    let (_ws_server, _ws_port, ws_runtime) = if serve_tcp_enabled {
         let mut ws_options = ws_options_from_env();
         ws_options.locality_override = locality_override;
 
@@ -656,10 +656,9 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     // Clean shutdown: stop the WSS listener (graceful close + port release),
     // stop the PR refresh loop, then kill every spawned agent child and clear
     // the registry (§6.8 teardown). Idle reaping during the run is the M5
-    // `reap_idle` hook.
-    if let Some(server) = ws_server {
-        server.stop().await;
-    }
+    // `reap_idle` hook. Stop via ServerControl so we stop the runtime listener
+    // (ws_runtime.state.ws_server), not the stale boot-time ws_server variable.
+    control.stop_ws_listener().await;
     pr_refresh.abort();
     token_usage_scan.abort();
     completion_delivery.abort();

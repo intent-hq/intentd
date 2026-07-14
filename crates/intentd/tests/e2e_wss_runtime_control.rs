@@ -256,7 +256,9 @@ async fn runtime_ws_listener_toggle_over_wss() {
 
     // Verify initial system.status shows the WSS listener (started at boot)
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
-    let initial_port = status["result"]["port"].as_u64().expect("port should be set at boot") as u16;
+    let initial_port = status["result"]["port"]
+        .as_u64()
+        .expect("port should be set at boot") as u16;
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint should be set")
@@ -265,9 +267,21 @@ async fn runtime_ws_listener_toggle_over_wss() {
     // Connect over WSS and verify RPCs work
     let cfg = client_config(&fingerprint);
     let mut ws = connect_ws(initial_port, cfg.clone()).await;
-    let sub_resp = wss_rpc(&mut ws, 10, "events.subscribe", json!({ "eventTypes": ["agent:*"] })).await;
-    assert!(sub_resp.get("error").is_none(), "events.subscribe over WSS should work: {sub_resp}");
-    assert!(sub_resp["result"]["subscriptionId"].is_string(), "subscriptionId should be returned");
+    let sub_resp = wss_rpc(
+        &mut ws,
+        10,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp.get("error").is_none(),
+        "events.subscribe over WSS should work: {sub_resp}"
+    );
+    assert!(
+        sub_resp["result"]["subscriptionId"].is_string(),
+        "subscriptionId should be returned"
+    );
 
     // Disable the WSS listener via settings.update over UDS (not over WSS to avoid self-termination)
     let disable = uds_rpc(
@@ -277,17 +291,27 @@ async fn runtime_ws_listener_toggle_over_wss() {
         json!({ "changes": [{ "path": "server.wsApi.enabled", "value": false }] }),
     )
     .await;
-    assert!(disable.get("error").is_none(), "settings.update disable should succeed: {disable}");
+    assert!(
+        disable.get("error").is_none(),
+        "settings.update disable should succeed: {disable}"
+    );
 
     // Give the listener a moment to stop
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Verify system.status shows no listener
     let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
-    assert!(status["result"]["port"].is_null(), "port should be null after disable");
+    assert!(
+        status["result"]["port"].is_null(),
+        "port should be null after disable"
+    );
 
     // Verify new WSS connections are refused (TCP listener should be closed)
-    let connect_result = timeout(Duration::from_secs(2), TcpStream::connect((Ipv4Addr::LOCALHOST, initial_port))).await;
+    let connect_result = timeout(
+        Duration::from_secs(2),
+        TcpStream::connect((Ipv4Addr::LOCALHOST, initial_port)),
+    )
+    .await;
     assert!(
         connect_result.is_err() || connect_result.unwrap().is_err(),
         "TCP connection should fail after listener is stopped"
@@ -301,19 +325,35 @@ async fn runtime_ws_listener_toggle_over_wss() {
         json!({ "changes": [{ "path": "server.wsApi.enabled", "value": true }] }),
     )
     .await;
-    assert!(enable.get("error").is_none(), "settings.update enable should succeed: {enable}");
+    assert!(
+        enable.get("error").is_none(),
+        "settings.update enable should succeed: {enable}"
+    );
 
     // Give the listener a moment to start
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Verify system.status shows the WSS listener again
     let status = uds_rpc(&socket, 5, "system.status", json!({})).await;
-    let new_port = status["result"]["port"].as_u64().expect("port should be set after re-enable") as u16;
+    let new_port = status["result"]["port"]
+        .as_u64()
+        .expect("port should be set after re-enable") as u16;
 
     // Connect over WSS again and verify RPCs work
     let mut ws2 = connect_ws(new_port, cfg.clone()).await;
-    let sub_resp2 = wss_rpc(&mut ws2, 20, "events.subscribe", json!({ "eventTypes": ["agent:*"] })).await;
-    assert!(sub_resp2.get("error").is_none(), "events.subscribe over WSS should work after re-enable: {sub_resp2}");
-    assert!(sub_resp2["result"]["subscriptionId"].is_string(), "subscriptionId should be returned after re-enable");
+    let sub_resp2 = wss_rpc(
+        &mut ws2,
+        20,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp2.get("error").is_none(),
+        "events.subscribe over WSS should work after re-enable: {sub_resp2}"
+    );
+    assert!(
+        sub_resp2["result"]["subscriptionId"].is_string(),
+        "subscriptionId should be returned after re-enable"
+    );
 }
-
