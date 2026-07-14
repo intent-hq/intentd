@@ -120,8 +120,8 @@ pub fn compute_process_cap(total_memory_bytes: u64) -> usize {
 }
 
 /// Best-effort process cap from detected system RAM, falling back to
-/// [`DEFAULT_PROCESS_CAP`] when total memory is unknown (RAM detection is
-/// currently Linux-only; broader detection is deferred).
+/// [`DEFAULT_PROCESS_CAP`] when total memory is unknown (RAM detection
+/// supports Linux and macOS; other platforms fall back to the default).
 pub fn default_process_cap() -> usize {
     match total_memory_bytes() {
         Some(bytes) => compute_process_cap(bytes),

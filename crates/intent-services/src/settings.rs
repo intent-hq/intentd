@@ -1152,7 +1152,7 @@ pub async fn max_concurrent_agents(store: &Store) -> Option<usize> {
         Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
             .ok()
             .and_then(|v| v.as_f64())
-            .filter(|&n| n > 0.0)
+            .filter(|&n| n > 0.0 && n.fract() == 0.0) // reject non-integer values
             .and_then(|n| usize::try_from(n as i64).ok()),
         _ => None,
     }
