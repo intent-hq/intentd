@@ -4453,17 +4453,30 @@ impl WorkspaceApi for Services {
         changes: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            // Capture old values for server.* settings so we can rollback on hook failure
+            // Capture old values for ALL settings in the batch so we can rollback on hook failure.
+            // Store holds non-sensitive settings; secrets holds sensitive ones (§9.8).
             let old_values = if let Some(entries) = changes.as_array() {
                 let mut old = Vec::new();
                 for entry in entries {
                     if let Some(path) = entry.get("path").and_then(|v| v.as_str()) {
-                        if path.starts_with("server.") {
-                            if let Ok(Some(raw)) = self.store.get_setting(path).await {
-                                old.push((path.to_string(), raw));
+                        // Look up the definition to check if this setting is sensitive
+                        if let Some(def) = crate::settings::find_definition(path) {
+                            if def.sensitive {
+                                // Sensitive setting: capture from secrets store
+                                if let Some(secret_val) = self.secrets.load(path).await {
+                                    old.push((path.to_string(), Some(secret_val), true));
+                                } else {
+                                    // No prior secret value; mark for deletion on rollback
+                                    old.push((path.to_string(), None, true));
+                                }
                             } else {
-                                // No prior value; mark for deletion on rollback
-                                old.push((path.to_string(), String::new()));
+                                // Non-sensitive setting: capture from DB
+                                if let Ok(Some(raw)) = self.store.get_setting(path).await {
+                                    old.push((path.to_string(), Some(raw), false));
+                                } else {
+                                    // No prior value; mark for deletion on rollback
+                                    old.push((path.to_string(), None, false));
+                                }
                             }
                         }
                     }
@@ -4479,14 +4492,22 @@ impl WorkspaceApi for Services {
                 // when server.wsApi.enabled / server.discovery.enabled change.
                 if let Some(control) = self.server_control.get() {
                     if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
-                        // Rollback: restore old values for server.* settings
-                        for (path, old_raw) in old_values {
-                            if old_raw.is_empty() {
-                                // Was not set before; delete it
-                                let _ = self.store.delete_setting(&path).await;
+                        // Rollback: restore old values for ALL settings in the batch
+                        for (path, old_val, is_sensitive) in old_values {
+                            if is_sensitive {
+                                // Sensitive setting: restore to secrets store or delete
+                                if let Some(val) = old_val {
+                                    let _ = self.secrets.store(&path, &val).await;
+                                } else {
+                                    let _ = self.secrets.delete(&path).await;
+                                }
                             } else {
-                                // Restore old value
-                                let _ = self.store.set_setting(&path, &old_raw).await;
+                                // Non-sensitive setting: restore to DB or delete
+                                if let Some(val) = old_val {
+                                    let _ = self.store.set_setting(&path, &val).await;
+                                } else {
+                                    let _ = self.store.delete_setting(&path).await;
+                                }
                             }
                         }
                         // Return the hook error to the caller
