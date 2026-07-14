@@ -598,18 +598,6 @@ where
     Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
-/// Wire result for `workspace.purge` (PROTOCOL §5.1). Counters returned by a
-/// best-effort sweep of the daemon-owned workspaces root: `removed` is the
-/// number of workspace rows whose status was `Deleted` and whose on-disk
-/// directory was reclaimed; `orphans` is the number of stray `<root>/<id>/`
-/// directories reclaimed because no matching row exists.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspacePurgeResult {
-    pub removed: u32,
-    pub orphans: u32,
-}
-
 /// Additional per-note metadata that ships nested under `metadata` on the wire
 /// (§9.1). Mirrors the TS `NoteMetadata` shape; today only carries the optional
 /// [`TaskMetadata`] for task notes. Kept as its own struct so future fields

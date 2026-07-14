@@ -40,8 +40,7 @@ use intent_core::{
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceEventSummary,
-    WorkspaceId, WorkspacePurgeResult, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
-    WorkspaceUpdate,
+    WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -6730,120 +6729,6 @@ impl WorkspaceApi for Services {
                 }
             }
             Ok(())
-        })
-    }
-
-    fn purge_workspaces(&self) -> BoxFuture<'_, Result<WorkspacePurgeResult>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
-        let workspaces_root = self
-            .workspaces_root
-            .clone()
-            .unwrap_or_else(default_workspaces_root);
-        Box::pin(async move {
-            let mut removed: u32 = 0;
-            let mut orphans: u32 = 0;
-            // Pass 1: drop every workspace whose stored status is `Deleted`.
-            // `list_workspaces(true)` includes archived rows; we filter by
-            // status manually so the pass is independent of the `archived`
-            // flag semantics. If the store call fails we must propagate:
-            // treating an empty list as ground truth would make pass 2 sweep
-            // every non-dot/non-`clones` directory under `workspaces_root` as
-            // an orphan, which is a data-loss hazard.
-            let all = store.list_workspaces(true).await?;
-            let mut live_ids: HashSet<String> = HashSet::new();
-            for ws in &all {
-                if ws.status == WorkspaceStatus::Deleted {
-                    let dir = workspaces_root.join(ws.id.as_str());
-                    let cleanup =
-                        tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&dir) {
-                            Ok(()) => Ok(()),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                            Err(e) => Err(e),
-                        })
-                        .await;
-                    if let Ok(Err(e)) = cleanup {
-                        tracing::warn!(
-                            workspace = %ws.id.as_str(),
-                            error = %e,
-                            "workspace.purge: failed to remove deleted workspace directory"
-                        );
-                    }
-                    match store.delete_workspace(&ws.id).await {
-                        Ok(()) => {
-                            removed = removed.saturating_add(1);
-                            publish_event(&bus, workspace_deleted_event(&ws.id)).await;
-                        }
-                        Err(Error::NotFound(_)) => {}
-                        Err(e) => tracing::warn!(
-                            workspace = %ws.id.as_str(),
-                            error = %e,
-                            "workspace.purge: failed to delete row for deleted workspace"
-                        ),
-                    }
-                } else {
-                    live_ids.insert(ws.id.0.clone());
-                }
-            }
-            // Pass 2: sweep `<workspaces_root>/` for `<id>/` directories that
-            // no longer have a matching live row. Best-effort; anything we
-            // cannot read is logged and skipped.
-            let root_for_scan = workspaces_root.clone();
-            let scan = tokio::task::spawn_blocking(move || -> Vec<PathBuf> {
-                let mut orphan_paths = Vec::new();
-                let read = match std::fs::read_dir(&root_for_scan) {
-                    Ok(r) => r,
-                    Err(_) => return orphan_paths,
-                };
-                for entry in read.flatten() {
-                    let path = entry.path();
-                    if !path.is_dir() {
-                        continue;
-                    }
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        // Skip reserved siblings inside the root (`clones/`,
-                        // any dotdir the daemon writes) and every live id.
-                        if name.starts_with('.') || name == "clones" {
-                            continue;
-                        }
-                        orphan_paths.push(path);
-                    }
-                }
-                orphan_paths
-            })
-            .await
-            .unwrap_or_default();
-            for path in scan {
-                let name = match path.file_name().and_then(|n| n.to_str()) {
-                    Some(n) => n.to_string(),
-                    None => continue,
-                };
-                if live_ids.contains(&name) {
-                    continue;
-                }
-                let target = path.clone();
-                let removed_ok =
-                    tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&target) {
-                        Ok(()) => Ok(()),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                        Err(e) => Err(e),
-                    })
-                    .await;
-                match removed_ok {
-                    Ok(Ok(())) => orphans = orphans.saturating_add(1),
-                    Ok(Err(e)) => tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "workspace.purge: failed to remove orphan directory"
-                    ),
-                    Err(join_err) => tracing::warn!(
-                        path = %path.display(),
-                        error = %join_err,
-                        "workspace.purge: orphan cleanup task failed"
-                    ),
-                }
-            }
-            Ok(WorkspacePurgeResult { removed, orphans })
         })
     }
 

@@ -276,10 +276,6 @@ async fn dispatch(
             api.cleanup_workspace(id).await.map_err(workspace_err)?;
             Ok(json!({ "success": true }))
         }
-        "workspace.purge" => {
-            let result = api.purge_workspaces().await.map_err(domain_to_rpc)?;
-            Ok(json!({ "removed": result.removed, "orphans": result.orphans }))
-        }
         "workspace.findRepositories" => {
             let directory = require_str_param(params, "directory")?;
             let repositories = api
