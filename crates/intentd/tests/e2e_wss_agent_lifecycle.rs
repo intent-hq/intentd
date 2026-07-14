@@ -3599,7 +3599,7 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:queue:updated", "agent:message", "agent:stream:end"], "workspaceId": ws_id }),
     )
     .await;
     assert!(sub_resp["subscriptionId"].is_string());
@@ -3614,7 +3614,7 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
 
-    // Send first message — agent will be busy for 2000ms (firstTurnDelayMs).
+    // Send first message — agent will be busy for 2000ms (firstTurnDelayMs in mock config).
     let send1 = wss_rpc(
         &mut rpc,
         11,
@@ -3639,7 +3639,7 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
     assert_eq!(send2["success"], true);
     assert_eq!(send2["queued"], true, "second message should be queued");
 
-    // Collect events and look for agent:message events for both user messages.
+    // Collect events and look for the agent:message event for the dequeued message.
     let mut saw_dequeued_user_message = false;
     let mut saw_queue_drain = false;
     let mut stream_end_count = 0;
