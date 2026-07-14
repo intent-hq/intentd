@@ -1536,6 +1536,20 @@ impl AgentManager {
         claimed
     }
 
+    /// Release the in-flight slot without persisting agent status (used when
+    /// terminal spawn failure already persisted Error status and we only need
+    /// to release busy/agent_ws so a future message can restart the worker).
+    async fn release_in_flight_slot(&self, agent_id: &AgentId) {
+        let was_busy = self.busy.lock().unwrap().remove(agent_id);
+        if !was_busy {
+            return;
+        }
+        let workspace_id = self.agent_ws.lock().unwrap().remove(agent_id);
+        if let Some(workspace_id) = workspace_id {
+            self.services.agent_activity_end(&workspace_id).await;
+        }
+    }
+
     /// Release the in-flight slot, recomputing the owning workspace's derived
     /// `WorkspaceActivity` (§9.9) and emitting `workspace:activity-changed` on
     /// the `AgentRunning → Idle` edge. Also persists the `agent_session.status`
@@ -2404,6 +2418,10 @@ async fn run_message_worker(
                     &e,
                 )
                 .await;
+                // Release the in-flight slot without overwriting the Error status
+                // that handle_terminal_spawn_failure just persisted. This allows
+                // a future message (or agent.retry) to restart the worker.
+                mgr.release_in_flight_slot(&agent_id).await;
                 break 'outer;
             }
         }
@@ -2542,10 +2560,20 @@ fn retry_backoff_ms() -> Vec<u64> {
 
 /// Classify whether an error from `ensure_started` is retryable. Retryable
 /// errors include session/new or session/load timeouts, handshake failures
-/// (e.g., "agent stdout closed" when the child dies immediately), and
-/// transport errors. Non-retryable errors include store NotFound, provider
-/// resolution failures, and mock provider missing env (fail-fast).
+/// (e.g., "agent stdout closed" when the child dies immediately), and generic
+/// internal transport errors. Non-retryable errors include InvalidParams,
+/// NotFound, Conflict, provider resolution failures, and mock provider missing
+/// env (fail-fast).
 fn is_retryable_spawn_error(err: &Error) -> bool {
+    // Non-retryable: InvalidParams, NotFound, Conflict are client/state issues,
+    // not transient spawn failures that benefit from retry.
+    match err {
+        Error::InvalidParams(_) | Error::NotFound(_) | Error::Conflict { .. } => {
+            return false;
+        }
+        _ => {}
+    }
+
     let msg = err.to_string();
     // Retryable: session setup timeout, handshake failures, transport errors
     if msg.contains("session/new failed")
@@ -2556,15 +2584,13 @@ fn is_retryable_spawn_error(err: &Error) -> bool {
     {
         return true;
     }
-    // Non-retryable: store errors, provider resolution failures
-    if msg.contains("not found") || msg.contains("NotFound") {
-        return false;
-    }
+    // Non-retryable: provider resolution failures (missing env, etc.)
     if msg.contains("provider") && msg.contains("missing") {
         return false;
     }
-    // Default to retryable for transport/spawn-related errors
-    true
+    // Default to non-retryable for unexpected Internal errors (conservative:
+    // only retry explicitly-known transient failures to avoid masking bugs).
+    false
 }
 
 /// Retry `ensure_started` up to `MAX_SPAWN_ATTEMPTS` times with exponential
@@ -2584,6 +2610,7 @@ async fn retry_spawn(
             Ok(session_id) => return Ok(session_id),
             Err(e) => {
                 let retryable = is_retryable_spawn_error(&e);
+                let error_msg = e.to_string();
                 tracing::warn!(
                     agent = %agent_id,
                     attempt = attempt,
@@ -2604,11 +2631,20 @@ async fn retry_spawn(
                 // (narrower than full stop() — only kills child/handle, no worker/busy-flag touch)
                 mgr.kill_child_only(agent_id).await;
 
-                // Publish retry status hint
+                // Publish retry status hint with the actual failure kind
                 let retry_num = attempt;
+                let failure_kind = if error_msg.contains("timed out") {
+                    "timed out"
+                } else if error_msg.contains("agent stdout closed") {
+                    "stdout closed"
+                } else {
+                    "failed"
+                };
                 let message = format!(
-                    "Agent session timed out — retrying (attempt {}/3)…",
-                    retry_num + 1
+                    "Agent spawn {} — retrying (attempt {}/{})…",
+                    failure_kind,
+                    retry_num + 1,
+                    MAX_SPAWN_ATTEMPTS
                 );
                 mgr.services
                     .publish_status_event(
@@ -2648,15 +2684,10 @@ async fn handle_terminal_spawn_failure(
     use intent_core::events::{AGENT_FAILED, AGENT_STATUS_CHANGED, AGENT_STREAM_END};
     use serde_json::json;
 
-    // Build error message, enriched with recent stderr when available
-    let mut error_msg = error.to_string();
-    if let Some(handle) = mgr.handles.lock().unwrap().get(agent_id) {
-        let stderr_lines = handle.connection.recent_stderr();
-        if !stderr_lines.is_empty() {
-            error_msg.push_str("\n\nRecent stderr:\n");
-            error_msg.push_str(&stderr_lines.join("\n"));
-        }
-    }
+    // Build error message. We do NOT include recent stderr in the agent:failed
+    // event to avoid leaking secrets (API keys, tokens, file paths) to subscribed
+    // clients. Stderr is available server-side in logs for debugging.
+    let error_msg = error.to_string();
 
     // Publish terminal agent:failed event
     mgr.services
@@ -3085,9 +3116,25 @@ mod retry_tests {
     }
 
     #[test]
-    fn generic_internal_error_is_retryable() {
+    fn generic_internal_error_is_not_retryable() {
+        // Default changed to non-retryable for unknown Internal errors to avoid
+        // masking bugs — only explicitly-known transient failures are retried.
         let err = Error::Internal("transport error: connection reset".to_string());
-        assert!(is_retryable_spawn_error(&err));
+        assert!(!is_retryable_spawn_error(&err));
+    }
+
+    #[test]
+    fn invalid_params_is_not_retryable() {
+        let err = Error::InvalidParams("missing required parameter".to_string());
+        assert!(!is_retryable_spawn_error(&err));
+    }
+
+    #[test]
+    fn conflict_is_not_retryable() {
+        let err = Error::Conflict {
+            current: serde_json::json!({"rev": 2}),
+        };
+        assert!(!is_retryable_spawn_error(&err));
     }
 }
 
@@ -3126,6 +3173,7 @@ mod agent_retry_tests {
             repository_owner: None,
             repository_name: None,
             worktree_path: None,
+            pull_requests: None,
             scope: None,
             skip_worktree: false,
             setup_script: None,
