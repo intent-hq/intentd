@@ -522,7 +522,9 @@ impl Services {
             "info",
         )
         .await;
-        let prompt_fut = session::prompt(conn, acp_session_id, prompt);
+        // Activity tracker for idle-based timeout: reset on every notification.
+        let activity = session::ActivityTracker::new();
+        let prompt_fut = session::prompt(conn, acp_session_id, prompt, &activity);
         tokio::pin!(prompt_fut);
         let mut closed = false;
         let result = loop {
@@ -530,6 +532,7 @@ impl Services {
                 res = &mut prompt_fut => break res,
                 maybe = notifications.recv(), if !closed => match maybe {
                     Some(note) => {
+                        activity.touch();
                         self.route_notification(&note, agent_id, workspace_id, &mut transcript)
                             .await;
                     }

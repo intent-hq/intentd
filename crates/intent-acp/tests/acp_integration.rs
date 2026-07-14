@@ -535,7 +535,8 @@ async fn happy_path_streams_chunk_then_end_turn() {
         Vec::new(),
     );
     let sid = open_session(&s).await;
-    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("hi")])
+    let activity = session::ActivityTracker::new();
+    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("hi")], &activity)
         .await
         .expect("prompt resolves");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
@@ -572,10 +573,10 @@ async fn mid_turn_cancel_resolves_cancelled() {
     let sid = open_session(&s).await;
     let conn = s.conn.clone();
     let sid2 = sid.clone();
-    let task =
-        tokio::spawn(
-            async move { session::prompt(conn.as_ref(), &sid2, vec![text_block("go")]).await },
-        );
+    let task = tokio::spawn(async move {
+        let activity = session::ActivityTracker::new();
+        session::prompt(conn.as_ref(), &sid2, vec![text_block("go")], &activity).await
+    });
 
     // The agent streams a chunk; only then do we cancel the in-flight turn.
     let note = recv_note(&mut s.notes).await;
@@ -599,10 +600,10 @@ async fn run_permission(option_id: &str) -> Value {
     );
     let sid = open_session(&s).await;
     let conn = s.conn.clone();
-    let task =
-        tokio::spawn(
-            async move { session::prompt(conn.as_ref(), &sid, vec![text_block("act")]).await },
-        );
+    let task = tokio::spawn(async move {
+        let activity = session::ActivityTracker::new();
+        session::prompt(conn.as_ref(), &sid, vec![text_block("act")], &activity).await
+    });
 
     let request_id = loop {
         if let Some(p) = s.registry.pending().first() {
@@ -657,7 +658,8 @@ async fn fs_read_request_served_from_sandbox() {
     );
     std::fs::write(s.root.join("data.txt"), "file data here").unwrap();
     let sid = open_session(&s).await;
-    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("read")])
+    let activity = session::ActivityTracker::new();
+    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("read")], &activity)
         .await
         .expect("prompt resolves");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
@@ -680,7 +682,8 @@ async fn oversized_stderr_truncated_and_terminal_stub() {
         Vec::new(),
     );
     let sid = open_session(&s).await;
-    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("term")])
+    let activity = session::ActivityTracker::new();
+    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("term")], &activity)
         .await
         .expect("prompt resolves");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
@@ -730,7 +733,8 @@ async fn malformed_frame_recovery_resyncs_on_newline() {
         Vec::new(),
     );
     let sid = open_session(&s).await;
-    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("x")])
+    let activity = session::ActivityTracker::new();
+    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("x")], &activity)
         .await
         .expect("prompt resolves after garbage frame");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
@@ -862,7 +866,8 @@ async fn terminal_requests_run_on_real_pty_host() {
         host,
     );
     let sid = open_session(&s).await;
-    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("term")])
+    let activity = session::ActivityTracker::new();
+    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("term")], &activity)
         .await
         .expect("prompt resolves");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));

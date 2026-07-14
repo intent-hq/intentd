@@ -298,7 +298,8 @@ mod session_tests {
             .expect("session/load succeeds when capability present");
 
         let block = ContentBlock::Text(TextContent::new("hello"));
-        let stop = session::prompt(&conn, "acp-session-1", vec![block])
+        let activity = session::ActivityTracker::new();
+        let stop = session::prompt(&conn, "acp-session-1", vec![block], &activity)
             .await
             .expect("session/prompt resolves");
         assert_eq!(

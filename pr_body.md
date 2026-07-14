@@ -1,62 +1,45 @@
-## Summary
+Fixes STAB-33: activity-based session/prompt idle timeout.
 
-Implements three observability features to make the next unexplained daemon death diagnosable from disk (addresses gaps identified in STAB-15 investigation):
+## Problem
 
-1. **File logging with rotation**
-2. **Panic hook with backtrace logging**  
-3. **DB health section in intentd doctor**
+The fixed 1-hour `PROMPT_TIMEOUT` kills healthy long-running turns that actively stream `session/update` notifications. Any turn exceeding 60 minutes dies with "request `session/prompt` timed out", even while the agent is working. Observed during implementor turns combining CI watches with multi-thread review sweeps.
 
-## Changes
+## Solution
 
-### File Logging
-- Uses tracing-appender::rolling with **daily rotation** (time-based, not size-based)
-- Logs to INTENTD_DATA_DIR/intentd.log
-- Keeps 5 most recent files (hardcoded `max_log_files(5)`)
-- INFO default, RUST_LOG override respected
-- Dual output: stderr (interactive) + file (diagnostics)
-- Degrades gracefully: if file appender fails, continues with stderr-only logging
-- WorkerGuard stored in static to keep background writer thread alive for process lifetime
+Replace the fixed deadline with an **idle-based timeout** (default 15 minutes, configurable via `INTENTD_PROMPT_IDLE_TIMEOUT_MS`):
+- The timer resets on every `session/update` notification
+- Actively-streaming turns never time out
+- Only silent/wedged turns are killed after sustained idle period
 
-### Panic Hook
-- Installed via std::panic::set_hook
-- Captures full backtrace using std::backtrace::Backtrace::force_capture()
-- Logs to tracing (which writes to file) with location, message, and backtrace
-- Also writes to stderr for immediate visibility
-- Chains default panic hook to preserve standard Rust panic formatting (thread name, etc.)
-- Process panics/unwinds/aborts according to Rust's standard behavior after both hooks run
+## Implementation
 
-### DB Health Section
-- Added report_db_health() function called from cmd_doctor()
-- Runs PRAGMA integrity_check (reports all issues, not just the first)
-- Runs PRAGMA wal_checkpoint(PASSIVE) and reports frame counts
-  - Marks as [WARN] when busy != 0 (checkpoint incomplete) or checkpointed < log (partial checkpoint)
-- Reports connection pool stats (size, idle connections)
-- All checks informational, never fail doctor
-- Uses `try_get` instead of `get` to avoid panics on unexpected PRAGMA results
+1. **ActivityTracker**: atomic timestamp tracker updated on each notification
+2. **session::prompt**: polls idle duration every second instead of fixed deadline
+3. **run_prompt_turn**: touches activity tracker on every incoming notification
+4. **Error message**: distinguishes idle timeouts from other failures
+5. **Regression tests**: verify ActivityTracker idle measurement, reset on touch, and periodic activity behavior
 
-## Verification
+## Testing
 
-```
-make check && make test
+All existing tests pass. New tests in `crates/intent-acp/tests/idle_timeout.rs` verify ActivityTracker correctness.
+
+```bash
+cargo fmt --check
+cargo clippy -- -D warnings
+cargo test
 ```
 
-**Doctor output:**
-```
-database health:
-  [ok] integrity_check: ok
-  [ok] wal_checkpoint(PASSIVE): busy=0, log=636 frames, checkpointed=636 frames
-  [ok] pool: size=1, idle=0
-```
+## Design Decision: No Absolute Ceiling
 
-## Files Changed
+This implementation has **no absolute ceiling** — an actively-streaming turn can run indefinitely as long as notifications arrive within the idle window. This matches the task requirement and is justified by:
+- Real cancellation flows through `session/cancel`, not timeout
+- Long CI watches + review sweeps are legitimate use cases
+- The idle timeout catches truly stuck/silent processes
+- Users can still interrupt via normal cancellation if needed
 
-- crates/intentd/src/main.rs: Updated init_tracing(), added install_panic_hook(), added report_db_health()
-- crates/intentd/Cargo.toml: Added tracing-appender, directories, sqlx dependencies
-- Cargo.lock: Updated lockfile
+If a ceiling is desired later, it can be added with a separate env var (e.g., `INTENTD_PROMPT_MAX_DURATION_MS`) without changing the idle-timeout semantics.
 
-## Notes
+## Known Limitations
 
-- Does NOT touch pool sizing, busy_timeout, or WAL settings (owned by sibling workspace)
-- Log file appears with rotation on fresh run
-- Forced panic writes backtrace to file
-- Unit/integration coverage for doctor section feasible but not required (informational checks)
+- **Pending-map leak**: The idle timeout returns early without cleaning up the Connection's pending request map entry. The entry will leak until the 24h fallback timeout expires or the agent closes stdout. This is acceptable for the current use case (one leaked entry per idle-timed-out turn, cleaned within 24h), but a future `Connection::cancel(id)` API would allow proper cleanup.
+- **Integration test coverage**: Full end-to-end integration tests (asserting that `session::prompt` actually times out after the idle window with the mock ACP agent) are deferred.
