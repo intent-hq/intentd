@@ -9119,7 +9119,12 @@ impl WorkspaceApi for Services {
                                 }
                             })
                             .unwrap_or_else(|| content.trim());
-                        let gitdir_path = std::path::PathBuf::from(gitdir);
+                        // Resolve relative gitdir paths against the worktree directory.
+                        let gitdir_path = if std::path::Path::new(gitdir).is_relative() {
+                            path.join(gitdir)
+                        } else {
+                            std::path::PathBuf::from(gitdir)
+                        };
                         // Check for commondir (points to main repo .git for linked worktrees).
                         let commondir_path = gitdir_path.join("commondir");
                         if let Ok(commondir_content) =
