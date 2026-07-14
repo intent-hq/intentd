@@ -435,26 +435,49 @@ async fn process_cap_events_queued_resumed_evicted() {
     assert_eq!(events[0].data["used"], 2, "used count at queue");
     assert_eq!(events[0].data["cap"], 2, "cap value");
 
-    // Mark B idle → should resume D.
+    // Mark B idle → should resume D (which loops, evicts B, and completes).
     mgr.registry.mark_idle(&b);
     queued_acquire.await.expect("task ok");
 
-    // Collect resume event.
-    let events = timeout(Duration::from_secs(2), sub.recv())
+    // Collect events from the resume path. Because mark_idle and the subsequent eviction
+    // both emit via tokio::spawn, the event bus makes no cross-event ordering guarantee.
+    // We expect BOTH agent:process:resumed (for D) and agent:process:evicted (for B),
+    // but they can arrive in either order.
+    let first_batch = timeout(Duration::from_secs(2), sub.recv())
         .await
         .expect("recv timed out")
         .expect("subscription closed");
-    assert_eq!(events.len(), 1, "resume emits one event");
+    let second_batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+
+    // Collect all events and match by type.
+    let mut all_events = first_batch;
+    all_events.extend(second_batch);
+    assert_eq!(all_events.len(), 2, "resume path emits two events");
+
+    let resumed = all_events
+        .iter()
+        .find(|e| e.event_type == AGENT_PROCESS_RESUMED)
+        .expect("resume path emits agent:process:resumed");
     assert_eq!(
-        events[0].event_type, AGENT_PROCESS_RESUMED,
-        "resume path emits agent:process:resumed"
-    );
-    assert_eq!(
-        events[0].data["agentId"], d.0,
+        resumed.data["agentId"], d.0,
         "resumed event carries resumed agent id"
     );
-    assert_eq!(events[0].data["used"], 2, "used count after resume");
-    assert_eq!(events[0].data["cap"], 2, "cap value");
+    assert_eq!(resumed.data["used"], 2, "used count at resume");
+    assert_eq!(resumed.data["cap"], 2, "cap value");
+
+    let evicted = all_events
+        .iter()
+        .find(|e| e.event_type == AGENT_PROCESS_EVICTED)
+        .expect("resume path evicts idle process B");
+    assert_eq!(
+        evicted.data["agentId"], b.0,
+        "evicted event carries evicted agent id"
+    );
+    assert_eq!(evicted.data["used"], 2, "used count at eviction");
+    assert_eq!(evicted.data["cap"], 2, "cap value");
 }
 
 async fn manager() -> (TempDb, AgentManager) {
