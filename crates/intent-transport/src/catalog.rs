@@ -89,10 +89,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "git.discard",
     "git.fetch",
     "git.getBranches",
-<<<<<<< HEAD
-=======
     "git.getConfig",
->>>>>>> 3fda0f7 (fix: add catalog module with git.getConfig entry)
     "git.getRemoteUrl",
     "git.numstat",
     "git.pull",
