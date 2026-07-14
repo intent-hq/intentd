@@ -939,13 +939,22 @@ async fn archive_workspace_emits_workspace_updated_over_wss() {
     assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
-    wss_rpc(
+    let archive_res = wss_rpc(
         &mut rpc,
         2,
         "workspace.archive",
         json!({ "workspaceId": ws_id }),
     )
     .await;
+    // §5.1 return shape: `workspace.archive` returns the refreshed record so
+    // callers do not need a follow-up `workspace.get`. `lastActivity` is
+    // BE-derived and always populated on the wire (§9.1).
+    assert_eq!(archive_res["workspace"]["id"], ws_id.as_str());
+    assert_eq!(archive_res["workspace"]["archived"], json!(true));
+    assert_eq!(archive_res["workspace"]["status"], json!("Archived"));
+    assert!(archive_res["workspace"]["archivedAt"].is_string());
+    assert!(archive_res["workspace"]["lastActivity"].is_string());
+    assert!(archive_res.get("success").is_none());
 
     let evt = next_event(&mut sub, &["workspace:updated"], 10).await;
     assert_eq!(evt["workspaceId"], ws_id.as_str());
@@ -999,13 +1008,21 @@ async fn unarchive_workspace_emits_workspace_updated_over_wss() {
     assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
-    wss_rpc(
+    let unarchive_res = wss_rpc(
         &mut rpc,
         2,
         "workspace.unarchive",
         json!({ "workspaceId": ws_id }),
     )
     .await;
+    // §5.1 return shape mirror of archive: `archivedAt` cleared (omitted),
+    // `archived: false`, `status: "Active"`.
+    assert_eq!(unarchive_res["workspace"]["id"], ws_id.as_str());
+    assert_eq!(unarchive_res["workspace"]["archived"], json!(false));
+    assert_eq!(unarchive_res["workspace"]["status"], json!("Active"));
+    assert!(unarchive_res["workspace"].get("archivedAt").is_none());
+    assert!(unarchive_res["workspace"]["lastActivity"].is_string());
+    assert!(unarchive_res.get("success").is_none());
 
     let evt = next_event(&mut sub, &["workspace:updated"], 10).await;
     assert_eq!(evt["workspaceId"], ws_id.as_str());

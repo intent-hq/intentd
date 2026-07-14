@@ -17,9 +17,10 @@
 //! - `workspace.update({ workspaceId: "__chief__", … })` → returns the
 //!   applied delta layered over the synthesized shape without persisting;
 //!   pinned timestamps are preserved.
-//! - `workspace.archive` / `workspace.delete` → `{ success: true }`;
-//!   `workspace.dismissAttention` → `{ workspace: … }` with the
-//!   synthesized shape. Chief remains reachable via `workspace.get`.
+//! - `workspace.archive` → `{ workspace: … }` with the synthesized shape
+//!   (Chief cannot be archived, so `archived = false` is preserved);
+//!   `workspace.delete` → `{ success: true }`; `workspace.dismissAttention`
+//!   → `{ workspace: … }`. Chief remains reachable via `workspace.get`.
 
 #![cfg(unix)]
 
@@ -396,26 +397,39 @@ async fn chief_workspace_over_wss() {
         .map(Value::is_null)
         .unwrap_or(true));
 
-    // (e) `workspace.archive` / `workspace.delete` return `{ success: true }`
-    //     on Chief; the seeded row is not torn down.
-    for (id, method) in [(8, "workspace.archive"), (9, "workspace.delete")] {
-        let resp = wss_rpc_envelope(
-            &mut ws,
-            id,
-            method,
-            json!({ "workspaceId": CHIEF_WORKSPACE_ID }),
-        )
-        .await;
-        assert!(
-            resp.get("error").is_none(),
-            "{method} on Chief must succeed over WSS: {resp}"
-        );
-        assert_eq!(
-            resp["result"]["success"],
-            json!(true),
-            "{method} returns {{success:true}} over WSS: {resp}"
-        );
-    }
+    // (e) On Chief: `workspace.archive` returns the synthesized `Workspace`
+    //     (Chief cannot be archived, so `archived = false` is preserved);
+    //     `workspace.delete` still returns `{ success: true }`. The seeded
+    //     row is not torn down in either case.
+    let resp = wss_rpc_envelope(
+        &mut ws,
+        8,
+        "workspace.archive",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "workspace.archive on Chief must succeed over WSS: {resp}"
+    );
+    assert_eq!(resp["result"]["workspace"]["id"], json!(CHIEF_WORKSPACE_ID));
+    assert_eq!(resp["result"]["workspace"]["archived"], json!(false));
+    let resp = wss_rpc_envelope(
+        &mut ws,
+        9,
+        "workspace.delete",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "workspace.delete on Chief must succeed over WSS: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["success"],
+        json!(true),
+        "workspace.delete returns {{success:true}} over WSS: {resp}"
+    );
     // `workspace.dismissAttention` returns `{ workspace: ... }` — the
     // synthesized Chief shape, not `{ success: true }`.
     let resp = wss_rpc_envelope(

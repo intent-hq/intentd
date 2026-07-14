@@ -87,6 +87,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         pr_url: None,
         pr_status: None,
         active_pull_request: None,
+        pull_requests: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -3126,6 +3127,45 @@ mod change_event_parity {
         );
     }
 
+    /// `update_workspace` normalises the delta snapshot published as
+    /// `workspace:updated { changes }` (§6.5) so subscribers can mirror the
+    /// applied delta without a follow-up read: a raw `baseRef: "origin/main"`
+    /// collapses to canonical `"main"`, and a whitespace-only `statusMessage`
+    /// folds to the empty-string clear signal (preserving the "clear" vs
+    /// "no change" distinction, which a `None` snapshot would erase via
+    /// `skip_serializing_if`).
+    #[tokio::test]
+    async fn update_workspace_event_delta_matches_persisted_normalisation() {
+        use intent_core::{WorkspaceApi, WorkspaceUpdate};
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let ws = h
+            .services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    base_ref: Some("origin/main".to_string()),
+                    status_message: Some("   \t ".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update");
+        // Persisted / returned workspace carries the canonical values.
+        assert_eq!(ws.base_ref.as_deref(), Some("main"));
+        assert!(ws.status_message.is_none());
+
+        // The emitted `changes` mirrors those canonical values (raw
+        // `origin/main` and whitespace-only `statusMessage` would surface as
+        // state divergence for subscribers). `statusMessage: ""` is the
+        // explicit clear wire value; omitting it would collapse to
+        // "no change" via `skip_serializing_if`.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(ev["data"]["changes"]["baseRef"], json!("main"));
+        assert_eq!(ev["data"]["changes"]["statusMessage"], json!(""));
+    }
+
     /// Derived `activity` flips `Idle → AgentRunning → Idle` across in-flight
     /// session begin/end, reflected by `get_workspace`, and emits
     /// `workspace:activity-changed` ONLY on the zero/non-zero edges (§9.9/§10.1).
@@ -5259,6 +5299,43 @@ mod pr {
         assert_eq!(outcome, crate::PrRefreshOutcome::Skipped);
         let evs = svc.store().events_by_workspace(&ws_id, 10).await.unwrap();
         assert!(evs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_all_discovers_unlinked_workspaces() {
+        // STAB-3 regression test: `refresh_all_workspace_prs()` (the background
+        // 60s loop) should discover and link PRs for unlinked workspaces, not just
+        // refresh already-linked ones. Without the fix, the background loop
+        // skipped workspaces with `pr_number.is_none()`, so discovery was
+        // on-demand only. This test asserts that an unlinked workspace on branch X
+        // with an open PR whose head ref is X gets linked when
+        // `refresh_all_workspace_prs()` runs (simulating the background loop).
+        let forge = StubForge {
+            discover: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) = refresh_setup(forge, "feature", None, false).await;
+
+        // Before the sweep the workspace is unlinked (no pr_number).
+        let before = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(before.pr_number, None);
+
+        // Run the same sweep the background loop runs.
+        svc.refresh_all_workspace_prs().await;
+
+        // After the sweep the workspace is linked to PR #42.
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+
+        // A `pr:linked` event was emitted.
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:linked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data["prNumber"], 42);
     }
 
     // ------------------------------------------------------------------------
