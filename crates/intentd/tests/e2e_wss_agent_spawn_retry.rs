@@ -700,3 +700,187 @@ async fn agent_spawn_exhaustion_terminal_failure_over_wss() {
         "terminal agent:stream:end emitted after exhaustion"
     );
 }
+
+/// RETRY-4: agent.retry recovery path — exhaust spawn retries → assert error
+/// status persisted → reconfigure mock to succeed → call agent.retry over WSS
+/// → assert queued message is redriven, turn completes, and status recovers.
+/// Also assert agent.retry on a non-failed agent is rejected.
+#[tokio::test]
+async fn agent_retry_rpc_recovery_path_over_wss() {
+    let Some(script) = gate("WSS agent.retry recovery E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let attempt_file = data_dir.join("attempts.txt");
+    let attempt_file_s = attempt_file.to_string_lossy().into_owned();
+    // Behavior that fails many spawn attempts (guarantees exhaustion),
+    // but we'll reset the counter before agent.retry so it succeeds
+    let behavior = json!({
+        "exitImmediatelyAttempts": 999,
+        "response": "retry recovery succeeded",
+    })
+    .to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 7] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
+        ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "500"),
+        ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // Create agent and send message — will exhaust retries
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-RETRY-RECOVER", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "will fail" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Wait for agent:failed terminal event AND the subsequent agent:stream:end
+    let mut saw_failed = false;
+    let mut saw_end_from_exhaustion = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:failed" {
+            saw_failed = true;
+        }
+        if frame["params"]["event"]["type"] == "agent:stream:end" {
+            saw_end_from_exhaustion = true;
+            break; // Stop after consuming the exhaustion's stream:end
+        }
+    }
+    assert!(saw_failed, "agent:failed emitted after exhaustion");
+    assert!(
+        saw_end_from_exhaustion,
+        "agent:stream:end emitted after exhaustion"
+    );
+
+    // Assert persisted error status via agent.getSession
+    let session = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        session["session"]["status"], "error",
+        "session status is error after exhaustion"
+    );
+
+    // Reset the attempt counter so the next spawn (from agent.retry) will succeed
+    std::fs::write(&attempt_file, "1000").expect("reset attempt counter");
+
+    // Now call agent.retry over WSS to redrive the failed spawn
+    let retry_result = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.retry",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        retry_result["ok"], true,
+        "agent.retry succeeded on error status"
+    );
+
+    // Give the retry spawn a moment to start and complete
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Wait for the turn to complete: expect agent:stream:chunk and agent:stream:end
+    let mut saw_chunk = false;
+    let mut saw_end = false;
+    for _ in 0..100 {
+        let frame = wss_event(&mut sub, 30).await;
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:stream:chunk") => {
+                saw_chunk = true;
+            }
+            Some("agent:stream:end") => {
+                saw_end = true;
+                break;
+            }
+            Some("agent:failed") => {
+                panic!(
+                    "agent:failed emitted AGAIN after retry - retry did not fix the spawn issue!"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_chunk, "agent:stream:chunk emitted after retry recovery");
+    assert!(saw_end, "agent:stream:end emitted after retry recovery");
+
+    // Verify final status is no longer error
+    let final_session = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_ne!(
+        final_session["session"]["status"], "error",
+        "session status recovered from error after agent.retry"
+    );
+
+    // Test rejection: retry again on the same agent (now active/idle) should return ok:false
+    let retry_again = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.retry",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        retry_again["ok"], false,
+        "agent.retry on non-error agent returns ok:false"
+    );
+}

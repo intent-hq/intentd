@@ -1916,8 +1916,15 @@ impl AgentManager {
         };
         crate::publish_event(&self.services.event_bus, event).await;
 
-        // Tear down any stale child handle
-        self.stop(&agent_id).await;
+        // Abort any in-flight worker task and clear the busy flag
+        if let Some(worker) = self.workers.lock().unwrap().remove(&agent_id) {
+            worker.abort();
+        }
+        self.busy.lock().unwrap().remove(&agent_id);
+
+        // Tear down any stale child handle (use kill_child_only to avoid
+        // overwriting the status we just set to Pending)
+        self.kill_child_only(&agent_id).await;
 
         // Start the drain loop to redrive the requeued message
         self.clone().try_drain_queue(agent_id, workspace_id).await;
