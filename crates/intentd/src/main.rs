@@ -267,7 +267,10 @@ fn init_tracing() {
     {
         Ok(appender) => Some(appender),
         Err(e) => {
-            eprintln!("WARN: failed to create log file appender: {}, continuing with stderr-only logging", e);
+            eprintln!(
+                "WARN: failed to create log file appender: {}, continuing with stderr-only logging",
+                e
+            );
             None
         }
     };
@@ -283,17 +286,21 @@ fn init_tracing() {
 
     if let Some(appender) = file_appender {
         let (non_blocking, _guard) = tracing_appender::non_blocking(appender);
-        let file_layer = fmt::layer()
-            .with_writer(non_blocking)
-            .with_ansi(false);
+        let file_layer = fmt::layer().with_writer(non_blocking).with_ansi(false);
         match subscriber.with(file_layer).try_init() {
-            Ok(_) => {},
-            Err(e) => eprintln!("WARN: failed to initialize tracing (already initialized?): {}", e),
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "WARN: failed to initialize tracing (already initialized?): {}",
+                e
+            ),
         }
     } else {
         match subscriber.try_init() {
-            Ok(_) => {},
-            Err(e) => eprintln!("WARN: failed to initialize tracing (already initialized?): {}", e),
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "WARN: failed to initialize tracing (already initialized?): {}",
+                e
+            ),
         }
     }
 }
