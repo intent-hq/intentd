@@ -9885,16 +9885,18 @@ impl WorkspaceApi for Services {
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive
             // (the child is never killed) and streams the message immediately.
-            let options = crate::agent_manager::TurnOptions {
-                stdin_context,
-                note_ids,
-                context_references,
-                image_blocks: image_blocks.clone(),
-                file_blocks: file_blocks.clone(),
-                message_metadata: message_metadata.clone(),
-            };
             match self.agent_manager() {
                 Some(manager) => {
+                    // Construct TurnOptions only when the manager is attached
+                    // to avoid cloning large payloads on the fallback path.
+                    let options = crate::agent_manager::TurnOptions {
+                        stdin_context,
+                        note_ids,
+                        context_references,
+                        image_blocks,
+                        file_blocks,
+                        message_metadata: message_metadata.clone(),
+                    };
                     if crate::agent_ops::is_interrupt_priority(priority.as_deref()) {
                         manager
                             .interrupt_send_message(
