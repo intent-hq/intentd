@@ -71,6 +71,16 @@ pub const AGENT_QUEUE_PROCESSING: &str = "agent:queue:processing";
 pub const AGENT_QUEUE_PROCESSING_CANCELLED: &str = "agent:queue:processing-cancelled";
 pub const AGENT_QUEUE_STALE_MESSAGE: &str = "agent:queue:stale-message";
 
+// Agent process-registry lifecycle events (new in intentd; PROTOCOL §6.5). Emitted
+// by the daemon-internal `ProcessRegistry` when a spawn queues for a concurrency
+// slot (all slots active), when a queued spawn resumes (a slot freed), and when
+// the registry evicts the LRU idle process. Self-sufficient payloads carry
+// `{ agentId, used, cap }` so a client can render the cap-saturation state without
+// polling. Mirrors the TS reference `agent-process-registry.ts` logging.
+pub const AGENT_PROCESS_QUEUED: &str = "agent:process:queued";
+pub const AGENT_PROCESS_RESUMED: &str = "agent:process:resumed";
+pub const AGENT_PROCESS_EVICTED: &str = "agent:process:evicted";
+
 // Agent user message events (cross-client sync).
 pub const AGENT_USER_MESSAGE_SENT: &str = "agent:user-message:sent";
 
@@ -304,6 +314,9 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_QUEUE_PROCESSING,
     AGENT_QUEUE_PROCESSING_CANCELLED,
     AGENT_QUEUE_STALE_MESSAGE,
+    AGENT_PROCESS_QUEUED,
+    AGENT_PROCESS_RESUMED,
+    AGENT_PROCESS_EVICTED,
     AGENT_USER_MESSAGE_SENT,
     AGENT_PERMISSION_REQUEST,
     AGENT_PERMISSION_RESOLVED,

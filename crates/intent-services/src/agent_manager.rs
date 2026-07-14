@@ -184,6 +184,12 @@ fn now_ms() -> u64 {
 /// drop the agent's [`AgentHandle`], killing the child and aborting its tasks.
 pub type KillFn = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
+/// Async callback for process-cap lifecycle events (queueing/resuming/eviction).
+/// Invoked by the registry when a spawn queues, resumes, or an idle process is
+/// evicted; the manager wires this to log + publish workspace events.
+pub type ProcessEventFn =
+    Arc<dyn Fn(&AgentId, &str, usize, usize) -> BoxFuture<'static, ()> + Send + Sync>;
+
 struct ProcessEntry {
     last_active_ms: u64,
     is_active: bool,
@@ -193,10 +199,11 @@ struct ProcessEntry {
 #[derive(Default)]
 struct RegistryInner {
     entries: HashMap<AgentId, ProcessEntry>,
-    wait_queue: Vec<tokio::sync::oneshot::Sender<()>>,
+    /// Queue of waiting spawns, each carrying the agent id + oneshot channel.
+    wait_queue: Vec<(AgentId, tokio::sync::oneshot::Sender<()>)>,
 }
 
-fn pop_waiter(inner: &mut RegistryInner) -> Option<tokio::sync::oneshot::Sender<()>> {
+fn pop_waiter(inner: &mut RegistryInner) -> Option<(AgentId, tokio::sync::oneshot::Sender<()>)> {
     if inner.wait_queue.is_empty() {
         None
     } else {
@@ -374,6 +381,9 @@ impl BusEventSink {
 pub struct ProcessRegistry {
     cap: usize,
     inner: Mutex<RegistryInner>,
+    /// Optional callback for lifecycle events (queue/resume/evict). Wired by the
+    /// manager to publish events + log; the registry stays testable without it.
+    event_fn: Option<ProcessEventFn>,
 }
 
 impl ProcessRegistry {
@@ -382,7 +392,16 @@ impl ProcessRegistry {
         Self {
             cap: cap.max(1),
             inner: Mutex::new(RegistryInner::default()),
+            event_fn: None,
         }
+    }
+
+    /// Attach an event callback for lifecycle events (queueing/resuming/eviction).
+    /// Chainable builder; returns `Self` so the manager can wire this after
+    /// construction. The callback signature is `(agent_id, event_type, used, cap)`.
+    pub fn with_event_fn(mut self, f: ProcessEventFn) -> Self {
+        self.event_fn = Some(f);
+        self
     }
 
     /// The configured concurrency cap.
@@ -413,16 +432,32 @@ impl ProcessRegistry {
         );
     }
 
-    /// Remove a process and wake the next queued spawn, if any.
+    /// Remove a process and wake the next queued spawn, if any. When a waiter is
+    /// resumed, logs + emits `agent:process:resumed` via the event callback.
     pub fn deregister(&self, agent_id: &AgentId) -> bool {
-        let mut inner = self.inner.lock().unwrap();
-        let had = inner.entries.remove(agent_id).is_some();
-        if had {
-            if let Some(waiter) = pop_waiter(&mut inner) {
-                let _ = waiter.send(());
+        let resumed_agent = {
+            let mut inner = self.inner.lock().unwrap();
+            let had = inner.entries.remove(agent_id).is_some();
+            if !had {
+                return false;
+            }
+            pop_waiter(&mut inner)
+        };
+        if let Some((resumed_id, tx)) = resumed_agent {
+            let _ = tx.send(());
+            let used = self.size();
+            tracing::info!(
+                agent = %resumed_id,
+                used = used,
+                cap = self.cap,
+                "process registry: queued spawn resumed"
+            );
+            if let Some(ref f) = self.event_fn {
+                let fut = f(&resumed_id, "agent:process:resumed", used, self.cap);
+                tokio::spawn(fut);
             }
         }
-        had
+        true
     }
 
     /// Mark a process as actively streaming (never evicted while active).
@@ -435,27 +470,44 @@ impl ProcessRegistry {
     }
 
     /// Mark a process idle (eligible for eviction) and wake a queued spawn so it
-    /// can take the freed slot immediately.
+    /// can take the freed slot immediately. When a waiter is resumed, logs + emits
+    /// `agent:process:resumed` via the event callback.
     pub fn mark_idle(&self, agent_id: &AgentId) {
-        let mut inner = self.inner.lock().unwrap();
-        let existed = match inner.entries.get_mut(agent_id) {
-            Some(entry) => {
-                entry.is_active = false;
-                entry.last_active_ms = now_ms();
-                true
+        let resumed_agent = {
+            let mut inner = self.inner.lock().unwrap();
+            let existed = match inner.entries.get_mut(agent_id) {
+                Some(entry) => {
+                    entry.is_active = false;
+                    entry.last_active_ms = now_ms();
+                    true
+                }
+                None => false,
+            };
+            if !existed {
+                return;
             }
-            None => false,
+            pop_waiter(&mut inner)
         };
-        if existed {
-            if let Some(waiter) = pop_waiter(&mut inner) {
-                let _ = waiter.send(());
+        if let Some((resumed_id, tx)) = resumed_agent {
+            let _ = tx.send(());
+            let used = self.size();
+            tracing::info!(
+                agent = %resumed_id,
+                used = used,
+                cap = self.cap,
+                "process registry: queued spawn resumed"
+            );
+            if let Some(ref f) = self.event_fn {
+                let fut = f(&resumed_id, "agent:process:resumed", used, self.cap);
+                tokio::spawn(fut);
             }
         }
     }
 
     /// Ensure a slot is free before spawning: returns immediately under the cap,
-    /// otherwise evicts the LRU idle process, or queues until one frees.
-    pub async fn acquire(&self) {
+    /// otherwise evicts the LRU idle process, or queues until one frees. Logs +
+    /// emits `agent:process:queued` / `agent:process:evicted` via the event callback.
+    pub async fn acquire(&self, agent_id: &AgentId) {
         loop {
             enum Action {
                 Slot,
@@ -470,13 +522,35 @@ impl ProcessRegistry {
                     Action::Evict(id, kill)
                 } else {
                     let (tx, rx) = tokio::sync::oneshot::channel();
-                    inner.wait_queue.push(tx);
+                    inner.wait_queue.push((agent_id.clone(), tx));
+                    let used = inner.entries.len();
+                    tracing::info!(
+                        agent = %agent_id,
+                        used = used,
+                        cap = self.cap,
+                        "process registry: spawn queued (all slots active)"
+                    );
+                    if let Some(ref f) = self.event_fn {
+                        let fut = f(agent_id, "agent:process:queued", used, self.cap);
+                        tokio::spawn(fut);
+                    }
                     Action::Wait(rx)
                 }
             };
             match action {
                 Action::Slot => return,
                 Action::Evict(id, kill) => {
+                    let used = self.size();
+                    tracing::info!(
+                        evicted = %id,
+                        used = used,
+                        cap = self.cap,
+                        "process registry: LRU idle process evicted"
+                    );
+                    if let Some(ref f) = self.event_fn {
+                        let fut = f(&id, "agent:process:evicted", used, self.cap);
+                        tokio::spawn(fut);
+                    }
                     kill().await;
                     self.deregister(&id);
                 }
@@ -630,9 +704,39 @@ impl AgentManager {
     /// Wire a manager over the services surface and a concrete event sink, with
     /// a global concurrency `cap`.
     pub fn new(services: Services, sink: Arc<dyn EventSink>, cap: usize) -> Self {
+        // Wire the registry event function to publish process-cap lifecycle events.
+        let services_clone = services.clone();
+        let event_fn: ProcessEventFn = Arc::new(move |agent_id, event_type, used, cap| {
+            let services = services_clone.clone();
+            let agent_id = agent_id.clone();
+            let event_type = event_type.to_string();
+            Box::pin(async move {
+                // Best-effort workspace lookup: process-cap events are global across
+                // workspaces, so when the session row is missing (mid-create or already
+                // deleted) swallow the lookup error and skip the publish rather than
+                // blocking the registry path. The tracing log still fires above.
+                let workspace_id = match services.store.get_agent_session(&agent_id).await {
+                    Ok(session) => session.workspace_id,
+                    Err(_) => return,
+                };
+                services
+                    .publish_agent_event(
+                        &workspace_id,
+                        &agent_id,
+                        &event_type,
+                        json!({
+                            "agentId": agent_id.0,
+                            "used": used,
+                            "cap": cap,
+                        }),
+                    )
+                    .await;
+            })
+        });
+
         Self {
             services,
-            registry: Arc::new(ProcessRegistry::new(cap)),
+            registry: Arc::new(ProcessRegistry::new(cap).with_event_fn(event_fn)),
             handles: Arc::new(Mutex::new(HashMap::new())),
             sink,
             permissions: Arc::new(PermissionRegistry::new()),
@@ -722,7 +826,7 @@ impl AgentManager {
         cwd: PathBuf,
         opts: &SpawnOptions<'_>,
     ) -> Result<()> {
-        self.registry.acquire().await;
+        self.registry.acquire(&agent_id).await;
 
         // Per-agent in-process MCP server over the SAME services surface the FE
         // uses, with the §18.4 denylist for this agent type applied, served over
