@@ -11,28 +11,42 @@ use crate::Store;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxStatus {
+    /// Initial state after provisioning
     Created,
+    /// Merge-back is in progress
+    Merging,
+    /// Successfully merged to canonical and discarded
     Merged,
+    /// Discarded without merging
     Discarded,
-    Conflict,
+    /// Conflict detected, agent bounced with instructions
+    ConflictBounced,
+    /// Merge pending manual resolution (blocked or retry exhausted)
+    MergePending,
 }
 
 impl SandboxStatus {
     fn to_db(self) -> &'static str {
         match self {
             SandboxStatus::Created => "created",
+            SandboxStatus::Merging => "merging",
             SandboxStatus::Merged => "merged",
             SandboxStatus::Discarded => "discarded",
-            SandboxStatus::Conflict => "conflict",
+            SandboxStatus::ConflictBounced => "conflict_bounced",
+            SandboxStatus::MergePending => "merge_pending",
         }
     }
 
     fn from_db(s: &str) -> Result<Self> {
         match s {
             "created" => Ok(SandboxStatus::Created),
+            "merging" => Ok(SandboxStatus::Merging),
             "merged" => Ok(SandboxStatus::Merged),
             "discarded" => Ok(SandboxStatus::Discarded),
-            "conflict" => Ok(SandboxStatus::Conflict),
+            "conflict_bounced" => Ok(SandboxStatus::ConflictBounced),
+            "merge_pending" => Ok(SandboxStatus::MergePending),
+            // Handle legacy "conflict" status from migration 0038
+            "conflict" => Ok(SandboxStatus::ConflictBounced),
             _ => Err(intent_core::Error::Internal(format!(
                 "invalid sandbox status: {s}"
             ))),
@@ -52,17 +66,19 @@ pub struct Sandbox {
     pub base_commit_sha: String,
     pub snapshot_commit_sha: Option<String>,
     pub status: SandboxStatus,
+    pub retry_count: i64,
     pub created_at: String,
     pub updated_at: String,
 }
 
 const COLUMNS: &str = "id, workspace_id, agent_id, path, branch, base_commit_sha, \
-    snapshot_commit_sha, status, created_at, updated_at";
+    snapshot_commit_sha, status, retry_count, created_at, updated_at";
 
 impl Store {
     /// Insert a new sandbox record.
     pub async fn insert_sandbox(&self, s: &Sandbox) -> Result<()> {
-        let sql = format!("INSERT INTO sandbox ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql =
+            format!("INSERT INTO sandbox ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         sqlx::query(&sql)
             .bind(&s.id)
             .bind(&s.workspace_id.0)
@@ -72,6 +88,7 @@ impl Store {
             .bind(&s.base_commit_sha)
             .bind(&s.snapshot_commit_sha)
             .bind(s.status.to_db())
+            .bind(s.retry_count)
             .bind(&s.created_at)
             .bind(&s.updated_at)
             .execute(&self.pool)
@@ -94,6 +111,27 @@ impl Store {
             .await
             .map_err(|e| intent_core::Error::Internal(format!("get sandbox failed: {e}")))?;
         row.map(|r| sandbox_from_row(&r)).transpose()
+    }
+
+    /// Update a sandbox status and timestamp.
+    pub async fn update_sandbox_status(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        status: SandboxStatus,
+        updated_at: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE sandbox SET status = ?, updated_at = ? WHERE workspace_id = ? AND agent_id = ?",
+        )
+        .bind(status.to_db())
+        .bind(updated_at)
+        .bind(&workspace_id.0)
+        .bind(&agent_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| intent_core::Error::Internal(format!("update sandbox status failed: {e}")))?;
+        Ok(())
     }
 
     /// Delete a sandbox by workspace and agent.
@@ -131,6 +169,59 @@ impl Store {
             .map_err(|e| intent_core::Error::Internal(format!("list all sandboxes failed: {e}")))?;
         rows.iter().map(sandbox_from_row).collect()
     }
+
+    /// Get the retry count for a sandbox.
+    pub async fn get_sandbox_retry_count(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) -> Result<i64> {
+        let row =
+            sqlx::query("SELECT retry_count FROM sandbox WHERE workspace_id = ? AND agent_id = ?")
+                .bind(&workspace_id.0)
+                .bind(&agent_id.0)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    intent_core::Error::Internal(format!("get sandbox retry count failed: {e}"))
+                })?;
+
+        Ok(row
+            .map(|r| r.try_get("retry_count").unwrap_or(0))
+            .unwrap_or(0))
+    }
+
+    /// Increment the retry count for a sandbox.
+    pub async fn increment_sandbox_retry_count(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) -> Result<()> {
+        sqlx::query("UPDATE sandbox SET retry_count = retry_count + 1 WHERE workspace_id = ? AND agent_id = ?")
+            .bind(&workspace_id.0)
+            .bind(&agent_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| intent_core::Error::Internal(format!("increment sandbox retry count failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Clear the retry count for a sandbox (on successful merge).
+    pub async fn clear_sandbox_retry_count(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) -> Result<()> {
+        sqlx::query("UPDATE sandbox SET retry_count = 0 WHERE workspace_id = ? AND agent_id = ?")
+            .bind(&workspace_id.0)
+            .bind(&agent_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!("clear sandbox retry count failed: {e}"))
+            })?;
+        Ok(())
+    }
 }
 
 fn sandbox_from_row(row: &SqliteRow) -> Result<Sandbox> {
@@ -159,8 +250,15 @@ fn sandbox_from_row(row: &SqliteRow) -> Result<Sandbox> {
         base_commit_sha: row.try_get("base_commit_sha").map_err(|e| {
             intent_core::Error::Internal(format!("get base_commit_sha failed: {e}"))
         })?,
-        snapshot_commit_sha: row.try_get("snapshot_commit_sha").ok(),
+        snapshot_commit_sha: row
+            .try_get::<Option<String>, _>("snapshot_commit_sha")
+            .ok()
+            .flatten()
+            .and_then(|s| if s.is_empty() { None } else { Some(s) }),
         status: SandboxStatus::from_db(&status_str)?,
+        retry_count: row
+            .try_get("retry_count")
+            .map_err(|e| intent_core::Error::Internal(format!("get retry_count failed: {e}")))?,
         created_at: row
             .try_get("created_at")
             .map_err(|e| intent_core::Error::Internal(format!("get created_at failed: {e}")))?,

@@ -55,6 +55,8 @@ mod auto_commit;
 pub mod browser_ops;
 mod clone_ops;
 mod complete_ops;
+#[cfg(test)]
+mod completion_interception_tests;
 mod crdt_notes;
 mod drafts;
 mod enhance_ops;
@@ -1226,6 +1228,26 @@ impl Services {
             return;
         };
         let child = AgentId::from(child_id.as_str());
+
+        // BEFORE waking the coordinator: if this is a sandboxed agent completion,
+        // attempt the merge-back. On clean merge, proceed normally. On conflict,
+        // suppress completion propagation and bounce the agent. On blocked or
+        // retry-exhausted, propagate with merge-pending status.
+        if event.event_type == AGENT_IDLE {
+            if let Ok(session) = self.store.get_agent_session(&child).await {
+                if session.sandbox_path.is_some() {
+                    let should_propagate = self
+                        .handle_sandbox_merge_on_completion(&event.workspace_id, &child, &session)
+                        .await;
+                    if !should_propagate {
+                        // Conflict bounce: agent was woken with instructions; do NOT
+                        // wake coordinator yet. The agent's next completion will retry.
+                        return;
+                    }
+                }
+            }
+        }
+
         self.deliver_completion_to_watches(&event.workspace_id, &child, event)
             .await;
         // An agent going idle ends its delegating turn, so seal that parent's
@@ -1352,6 +1374,335 @@ impl Services {
         }
         self.remove_group_watches(workspace_id, group_id);
         self.publish_subscriptions_changed(workspace_id, &group.parent_agent_id)
+            .await;
+    }
+
+    /// Handle sandbox merge-back on agent completion.
+    /// Returns `true` if completion should propagate normally (clean merge or blocked/retry-exhausted).
+    /// Returns `false` if completion was suppressed (conflict bounce).
+    async fn handle_sandbox_merge_on_completion(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        session: &AgentSession,
+    ) -> bool {
+        use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
+        use intent_store::SandboxStatus;
+
+        // Load sandbox record
+        let _sandbox = match self.store.get_sandbox(workspace_id, agent_id).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    "agent has sandbox_path but no sandbox record; skipping merge"
+                );
+                return true;
+            }
+            Err(e) => {
+                tracing::error!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "failed to load sandbox record; propagating completion"
+                );
+                return true;
+            }
+        };
+
+        // Check retry count (cap at 2 bounces)
+        const MAX_RETRIES: i64 = 2;
+        let retry_count = self.get_sandbox_retry_count(workspace_id, agent_id).await;
+
+        // Update sandbox status to Merging
+        let now = now_iso();
+        if let Err(e) = self
+            .store
+            .update_sandbox_status(workspace_id, agent_id, SandboxStatus::Merging, &now)
+            .await
+        {
+            tracing::error!(
+                agent = %agent_id.0,
+                error = %e,
+                "failed to update sandbox status to merging"
+            );
+        }
+
+        // Attempt merge
+        let outcome = match merge_sandbox(&self.store, workspace_id, agent_id).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::error!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "sandbox merge failed with error; marking merge-pending"
+                );
+                let _ = self
+                    .store
+                    .update_sandbox_status(
+                        workspace_id,
+                        agent_id,
+                        SandboxStatus::MergePending,
+                        &now_iso(),
+                    )
+                    .await;
+                // Propagate completion with error status
+                return true;
+            }
+        };
+
+        match outcome {
+            MergeOutcome::Merged {
+                commit_range,
+                canonical_head,
+            } => {
+                // Success! Mark merged, discard sandbox, emit event
+                let _ = self
+                    .store
+                    .update_sandbox_status(
+                        workspace_id,
+                        agent_id,
+                        SandboxStatus::Merged,
+                        &now_iso(),
+                    )
+                    .await;
+
+                // Discard the sandbox
+                if let Err(e) =
+                    crate::sandbox_ops::discard_sandbox(&self.store, workspace_id, agent_id).await
+                {
+                    tracing::warn!(
+                        agent = %agent_id.0,
+                        error = %e,
+                        "failed to discard sandbox after successful merge"
+                    );
+                }
+
+                // Emit sandbox:merged event
+                let event = NewEvent {
+                    workspace_id: workspace_id.clone(),
+                    timestamp: now_iso(),
+                    event_type: "sandbox:merged".to_string(),
+                    actor: intent_core::EventActor {
+                        actor_type: ActorType::System,
+                        id: Some("intentd".to_string()),
+                        name: Some("intentd".to_string()),
+                        ..Default::default()
+                    },
+                    session_id: Some(agent_id.0.clone()),
+                    correlation_id: None,
+                    parent_event_id: None,
+                    metadata: None,
+                    data: serde_json::json!({
+                        "workspaceId": workspace_id.0,
+                        "agentId": agent_id.0,
+                        "commitRange": commit_range,
+                        "canonicalHead": canonical_head,
+                    }),
+                };
+                crate::publish_event(&self.event_bus, event).await;
+
+                tracing::info!(
+                    agent = %agent_id.0,
+                    range = %commit_range,
+                    "sandbox merged successfully"
+                );
+
+                // Clear retry count
+                self.clear_sandbox_retry_count(workspace_id, agent_id).await;
+
+                // Propagate completion normally
+                true
+            }
+            MergeOutcome::Conflict {
+                conflicting_paths,
+                canonical_head,
+            } => {
+                // Conflict: check retry limit
+                if retry_count >= MAX_RETRIES {
+                    // Exhausted retries; mark merge-pending and propagate
+                    let _ = self
+                        .store
+                        .update_sandbox_status(
+                            workspace_id,
+                            agent_id,
+                            SandboxStatus::MergePending,
+                            &now_iso(),
+                        )
+                        .await;
+
+                    tracing::warn!(
+                        agent = %agent_id.0,
+                        retries = retry_count,
+                        "conflict retry limit exhausted; marking merge-pending"
+                    );
+
+                    self.clear_sandbox_retry_count(workspace_id, agent_id).await;
+                    return true;
+                }
+
+                // Bounce: update status, increment retry, fetch canonical, wake agent
+                let _ = self
+                    .store
+                    .update_sandbox_status(
+                        workspace_id,
+                        agent_id,
+                        SandboxStatus::ConflictBounced,
+                        &now_iso(),
+                    )
+                    .await;
+
+                self.increment_sandbox_retry_count(workspace_id, agent_id)
+                    .await;
+
+                // Fetch canonical state into sandbox
+                if let Err(e) = self
+                    .fetch_canonical_to_sandbox(
+                        workspace_id,
+                        agent_id,
+                        session.sandbox_path.as_ref().unwrap(),
+                        &canonical_head,
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        agent = %agent_id.0,
+                        error = %e,
+                        "failed to fetch canonical to sandbox; marking merge-pending"
+                    );
+                    let _ = self
+                        .store
+                        .update_sandbox_status(
+                            workspace_id,
+                            agent_id,
+                            SandboxStatus::MergePending,
+                            &now_iso(),
+                        )
+                        .await;
+                    return true;
+                }
+
+                // Wake agent with conflict instructions
+                let message = format!(
+                    "⚠️ Merge conflict detected. Your sandbox branch has conflicts with the canonical repository.\n\n\
+                    **Conflicting files:**\n{}\n\n\
+                    **Instructions:**\n\
+                    1. The canonical state has been fetched to your sandbox as `refs/remotes/canonical/HEAD`\n\
+                    2. Resolve conflicts by rebasing or merging: `git rebase canonical/HEAD` or `git merge canonical/HEAD`\n\
+                    3. Fix conflicts in the listed files\n\
+                    4. Commit the resolution: `git add <files> && git commit`\n\
+                    5. **Do not switch branches or touch other checkouts**\n\
+                    6. End your turn when ready - the system will retry the merge\n\n\
+                    You are working in an isolated sandbox at: `{}`\n\
+                    Retry {}/{} - fix conflicts in your sandbox only.",
+                    conflicting_paths.join("\n- "),
+                    session.sandbox_path.as_ref().unwrap(),
+                    retry_count + 1,
+                    MAX_RETRIES
+                );
+
+                if let Err(e) = self
+                    .agent_send_message_op(
+                        agent_id.clone(),
+                        message,
+                        None, // messageId
+                        None, // imageBlocks
+                        None, // fileBlocks
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        agent = %agent_id.0,
+                        error = %e,
+                        "failed to send conflict bounce message to agent"
+                    );
+                }
+
+                tracing::info!(
+                    agent = %agent_id.0,
+                    paths = ?conflicting_paths,
+                    retry = retry_count + 1,
+                    "conflict detected; agent bounced with instructions"
+                );
+
+                // Suppress completion propagation
+                false
+            }
+            MergeOutcome::Blocked {
+                reason,
+                overlapping_paths,
+            } => {
+                // Blocked: mark merge-pending and propagate with status
+                let _ = self
+                    .store
+                    .update_sandbox_status(
+                        workspace_id,
+                        agent_id,
+                        SandboxStatus::MergePending,
+                        &now_iso(),
+                    )
+                    .await;
+
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    reason = %reason,
+                    paths = ?overlapping_paths,
+                    "merge blocked; marking merge-pending"
+                );
+
+                self.clear_sandbox_retry_count(workspace_id, agent_id).await;
+
+                // Propagate completion (coordinator/user will see merge-pending status)
+                true
+            }
+        }
+    }
+
+    /// Fetch canonical repository state into sandbox for conflict resolution.
+    async fn fetch_canonical_to_sandbox(
+        &self,
+        workspace_id: &WorkspaceId,
+        _agent_id: &AgentId,
+        sandbox_path: &str,
+        _canonical_head: &str,
+    ) -> Result<()> {
+        // Load workspace to get canonical repo path
+        let workspace = self.store.get_workspace(workspace_id).await?;
+        let canonical_path = workspace
+            .repository_path
+            .as_ref()
+            .ok_or_else(|| Error::InvalidParams("workspace has no repository_path".to_string()))?;
+
+        // Open sandbox repository
+        let sandbox_repo = git2::Repository::open(sandbox_path)
+            .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
+
+        // Fetch canonical HEAD into sandbox as canonical/HEAD
+        sandbox_repo
+            .remote_anonymous(canonical_path)
+            .and_then(|mut remote| remote.fetch(&["HEAD:refs/remotes/canonical/HEAD"], None, None))
+            .map_err(|e| Error::Internal(format!("fetch canonical to sandbox failed: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn get_sandbox_retry_count(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) -> i64 {
+        self.store
+            .get_sandbox_retry_count(workspace_id, agent_id)
+            .await
+            .unwrap_or(0)
+    }
+
+    async fn increment_sandbox_retry_count(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) {
+        let _ = self
+            .store
+            .increment_sandbox_retry_count(workspace_id, agent_id)
+            .await;
+    }
+
+    async fn clear_sandbox_retry_count(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) {
+        let _ = self
+            .store
+            .clear_sandbox_retry_count(workspace_id, agent_id)
             .await;
     }
 
@@ -10442,6 +10793,131 @@ impl WorkspaceApi for Services {
                 return Err(Error::Internal("Subscription not found".to_string()));
             }
             Ok(serde_json::json!({ "success": true, "subscriptionId": subscription_id }))
+        })
+    }
+
+    // ========================================================================
+    // sandbox.* surface (PROTOCOL §5.34). Manual escape-hatch RPCs for
+    // triggering merge-back or discarding a sandbox when auto-merge fails.
+    // ========================================================================
+
+    fn sandbox_merge(
+        &self,
+        workspace_id: WorkspaceId,
+        sandbox_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let event_bus = self.event_bus.clone();
+        Box::pin(async move {
+            use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
+            use intent_store::SandboxStatus;
+
+            // Attempt merge
+            let outcome = merge_sandbox(&store, &workspace_id, &sandbox_id).await?;
+
+            match outcome {
+                MergeOutcome::Merged {
+                    commit_range,
+                    canonical_head,
+                } => {
+                    // Mark merged
+                    let _ = store
+                        .update_sandbox_status(
+                            &workspace_id,
+                            &sandbox_id,
+                            SandboxStatus::Merged,
+                            &now_iso(),
+                        )
+                        .await;
+
+                    // Discard sandbox
+                    let _ = crate::sandbox_ops::discard_sandbox(&store, &workspace_id, &sandbox_id)
+                        .await;
+
+                    // Emit event
+                    let event = NewEvent {
+                        workspace_id: workspace_id.clone(),
+                        timestamp: now_iso(),
+                        event_type: "sandbox:merged".to_string(),
+                        actor: intent_core::EventActor {
+                            actor_type: ActorType::System,
+                            id: Some("intentd".to_string()),
+                            name: Some("intentd".to_string()),
+                            ..Default::default()
+                        },
+                        session_id: Some(sandbox_id.0.clone()),
+                        correlation_id: None,
+                        parent_event_id: None,
+                        metadata: None,
+                        data: serde_json::json!({
+                            "workspaceId": workspace_id.0,
+                            "agentId": sandbox_id.0,
+                            "commitRange": commit_range,
+                            "canonicalHead": canonical_head,
+                        }),
+                    };
+                    crate::publish_event(&event_bus, event).await;
+
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "status": "merged",
+                        "commitRange": commit_range,
+                        "canonicalHead": canonical_head,
+                    }))
+                }
+                MergeOutcome::Conflict {
+                    conflicting_paths,
+                    canonical_head,
+                } => {
+                    let _ = store
+                        .update_sandbox_status(
+                            &workspace_id,
+                            &sandbox_id,
+                            SandboxStatus::ConflictBounced,
+                            &now_iso(),
+                        )
+                        .await;
+
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "status": "conflict",
+                        "conflictingPaths": conflicting_paths,
+                        "canonicalHead": canonical_head,
+                    }))
+                }
+                MergeOutcome::Blocked {
+                    reason,
+                    overlapping_paths,
+                } => {
+                    let _ = store
+                        .update_sandbox_status(
+                            &workspace_id,
+                            &sandbox_id,
+                            SandboxStatus::MergePending,
+                            &now_iso(),
+                        )
+                        .await;
+
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "status": "blocked",
+                        "reason": reason,
+                        "overlappingPaths": overlapping_paths,
+                    }))
+                }
+            }
+        })
+    }
+
+    fn sandbox_discard(
+        &self,
+        workspace_id: WorkspaceId,
+        sandbox_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            crate::sandbox_ops::discard_sandbox(&store, &workspace_id, &sandbox_id).await?;
+            Ok(serde_json::json!({ "ok": true }))
         })
     }
 

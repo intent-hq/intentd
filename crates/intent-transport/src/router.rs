@@ -1324,6 +1324,24 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "sandbox.merge" => {
+            let ws = require_ws_note(params)?;
+            let sandbox_id = require_agent_id(params)?;
+            let result = api
+                .sandbox_merge(ws, sandbox_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "sandbox.discard" => {
+            let ws = require_ws_note(params)?;
+            let sandbox_id = require_agent_id(params)?;
+            let result = api
+                .sandbox_discard(ws, sandbox_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "git.status" => {
             let ws = require_ws_note(params)?;
             let status = api.git_status(ws).await.map_err(domain_to_rpc)?;
