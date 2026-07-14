@@ -1664,6 +1664,8 @@ impl Services {
         agent_id: AgentId,
         content: String,
         message_id: Option<String>,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
     ) -> Result<Value> {
         let message_id = message_id.unwrap_or_else(new_message_id);
         let blocks = user_content_blocks(&content);
@@ -1693,7 +1695,10 @@ impl Services {
                 Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
             }
             Err(_) => {
-                let (queued, position) = self.enqueue_message(&agent_id, content, None, None);
+                // STAB-7: preserve image_blocks and file_blocks when auto-queueing
+                // on store failure, matching the runtime-manager path's behavior.
+                let (queued, position) =
+                    self.enqueue_message(&agent_id, content, image_blocks, file_blocks);
                 let result = json!({
                     "success": true,
                     "queued": true,
@@ -2238,7 +2243,10 @@ impl Services {
                         )
                         .await
                 }
-                None => self.agent_send_message_op(child, message, None).await,
+                None => {
+                    self.agent_send_message_op(child, message, None, None, None)
+                        .await
+                }
             };
             if let Err(e) = send {
                 tracing::warn!(agent = %agent_id, error = %e, "delegate: failed to start child turn");
@@ -2863,7 +2871,7 @@ impl Services {
                     .await?
             }
             (None, _) => {
-                self.agent_send_message_op(agent.clone(), message, None)
+                self.agent_send_message_op(agent.clone(), message, None, None, None)
                     .await?
             }
         };

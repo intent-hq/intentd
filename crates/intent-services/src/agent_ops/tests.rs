@@ -2184,7 +2184,7 @@ async fn send_message_delivers_when_agent_exists() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Recv").await;
     let r = svc
-        .agent_send_message_op(id.clone(), "do it".into(), Some("m1".into()))
+        .agent_send_message_op(id.clone(), "do it".into(), Some("m1".into()), None, None)
         .await
         .expect("send");
     assert_eq!(r["queued"], false);
@@ -2202,11 +2202,44 @@ async fn send_message_auto_queues_for_unknown_agent() {
     let (_t, svc, _ws) = setup().await;
     let id = AgentId::from("agent-00000000-0000-0000-0000-000000000000");
     let r = svc
-        .agent_send_message_op(id, "hi".into(), None)
+        .agent_send_message_op(id, "hi".into(), None, None, None)
         .await
         .expect("send");
     assert_eq!(r["queued"], true);
     assert_eq!(r["queuedMessage"]["content"], "hi");
+}
+
+/// STAB-7: agent_send_message_op fallback must preserve image_blocks and
+/// file_blocks when auto-queueing on store failure (matching the runtime
+/// manager path's behavior).
+#[tokio::test]
+async fn send_message_op_preserves_attachments_on_auto_queue() {
+    let (_t, svc, _ws) = setup().await;
+    let id = AgentId::from("agent-00000000-0000-0000-0000-000000000000");
+    let image_blocks = json!([
+        { "type": "image", "data": "base64data", "mimeType": "image/png" }
+    ]);
+    let file_blocks = json!([
+        { "type": "file", "data": "filedata", "mimeType": "text/plain", "fileName": "test.txt" }
+    ]);
+    let r = svc
+        .agent_send_message_op(
+            id.clone(),
+            "check these".into(),
+            None,
+            Some(image_blocks.clone()),
+            Some(file_blocks.clone()),
+        )
+        .await
+        .expect("send");
+    assert_eq!(r["queued"], true);
+    assert_eq!(r["queuedMessage"]["content"], "check these");
+    assert_eq!(r["queuedMessage"]["imageBlocks"], image_blocks);
+    assert_eq!(r["queuedMessage"]["fileBlocks"], file_blocks);
+    // Also verify getQueue returns the same attachments.
+    let queue = svc.agent_get_queue_op(id, None).await.expect("queue");
+    assert_eq!(queue["queue"][0]["imageBlocks"], image_blocks);
+    assert_eq!(queue["queue"][0]["fileBlocks"], file_blocks);
 }
 
 #[tokio::test]

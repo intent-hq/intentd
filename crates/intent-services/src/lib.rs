@@ -5427,7 +5427,7 @@ impl WorkspaceApi for Services {
                                         .await
                                 }
                                 None => {
-                                    services.agent_send_message_op(child, prompt, None).await
+                                    services.agent_send_message_op(child, prompt, None, None, None).await
                                 }
                             };
                             if let Err(e) = send {
@@ -9885,16 +9885,18 @@ impl WorkspaceApi for Services {
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive
             // (the child is never killed) and streams the message immediately.
-            let options = crate::agent_manager::TurnOptions {
-                stdin_context,
-                note_ids,
-                context_references,
-                image_blocks,
-                file_blocks,
-                message_metadata: message_metadata.clone(),
-            };
             match self.agent_manager() {
                 Some(manager) => {
+                    // Construct TurnOptions only when the manager is attached
+                    // to avoid cloning large payloads on the fallback path.
+                    let options = crate::agent_manager::TurnOptions {
+                        stdin_context,
+                        note_ids,
+                        context_references,
+                        image_blocks,
+                        file_blocks,
+                        message_metadata,
+                    };
                     if crate::agent_ops::is_interrupt_priority(priority.as_deref()) {
                         manager
                             .interrupt_send_message(
@@ -9914,14 +9916,20 @@ impl WorkspaceApi for Services {
                 None => {
                     // Read-only fallback (no `agent_manager` wired): the
                     // router has already extracted `messageMetadata`, but
-                    // the store-only op keeps its unchanged 3-arg signature
-                    // since none of its internal callers carry metadata;
-                    // the payload is dropped on this fallback path
-                    // (metadata IS preserved on the production
-                    // `AgentManager::send_message` path above).
+                    // the store-only op doesn't accept metadata since none
+                    // of its internal callers carry it; the payload is dropped
+                    // on this fallback path (metadata IS preserved on the
+                    // production `AgentManager::send_message` path above).
+                    // STAB-7: image_blocks and file_blocks ARE forwarded now.
                     let _ = message_metadata;
-                    self.agent_send_message_op(agent_id, content, message_id)
-                        .await
+                    self.agent_send_message_op(
+                        agent_id,
+                        content,
+                        message_id,
+                        image_blocks,
+                        file_blocks,
+                    )
+                    .await
                 }
             }
         })
