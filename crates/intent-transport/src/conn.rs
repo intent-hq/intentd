@@ -216,7 +216,7 @@ pub(crate) async fn process_frame(
     let api = api.clone();
     let out_tx = out_tx.clone();
     let raw = raw.to_string();
-    let is_tcp = !is_local;
+    let is_tcp = crate::context::is_tcp_connection();
     tokio::spawn(async move {
         crate::context::with_connection_context(is_tcp, async {
             if let Some(response) = handle_message(api.as_ref(), &raw).await {
