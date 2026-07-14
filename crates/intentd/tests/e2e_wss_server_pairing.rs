@@ -30,7 +30,8 @@ use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-const TOKEN: &str = "test-token-fixed-64-hex-cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+/// Fixed 64-char hex token (matching generated token shape) for e2e test.
+const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
     child: Child,

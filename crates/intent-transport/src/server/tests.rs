@@ -155,8 +155,20 @@ async fn handle_pairing_info_remote_rejects() {
 #[tokio::test]
 async fn handle_rotate_token_local_success() {
     use std::env;
+
+    // RAII guard to restore INTENTD_AUTH_TOKEN on drop (even if test panics).
+    struct EnvGuard(Option<String>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.0.as_ref() {
+                Some(val) => env::set_var("INTENTD_AUTH_TOKEN", val),
+                None => env::remove_var("INTENTD_AUTH_TOKEN"),
+            }
+        }
+    }
+
     // Temporarily clear INTENTD_AUTH_TOKEN to ensure rotation succeeds in this test
-    let env_backup = env::var("INTENTD_AUTH_TOKEN").ok();
+    let _guard = EnvGuard(env::var("INTENTD_AUTH_TOKEN").ok());
     env::remove_var("INTENTD_AUTH_TOKEN");
 
     let tmpdir = env::temp_dir().join(format!(
@@ -186,9 +198,6 @@ async fn handle_rotate_token_local_success() {
     assert_ne!(new_token, "old-token");
     assert_eq!(new_token.len(), 64);
 
-    // Restore env var
-    if let Some(val) = env_backup {
-        env::set_var("INTENTD_AUTH_TOKEN", val);
-    }
     let _ = std::fs::remove_dir_all(&tmpdir);
+    // _guard drops here, restoring the original env var value
 }
