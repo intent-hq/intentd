@@ -57,9 +57,7 @@ impl ServerControl for FailingServerControl {
         Box::pin(async {})
     }
 
-    fn is_discovery_active(
-        &self,
-    ) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+    fn is_discovery_active(&self) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         Box::pin(async { false })
     }
 }
