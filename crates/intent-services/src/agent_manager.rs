@@ -1504,6 +1504,34 @@ impl AgentManager {
                     json!({ "agentId": agent_id.0 }),
                 )
                 .await;
+            // STAB-28: emit agent:idle after interrupt so completion watches fire.
+            // The aborted worker never reaches run_prompt_turn's idle-emit path, so
+            // we must emit here. Without this, a parent that re-messages via agent.send
+            // after the child settles registers a completion watch that never fires
+            // (no idle event → watch never delivered). Only emit when the agent has
+            // no queued ready-to-send messages (mirrors run_prompt_turn line 587).
+            if !self.services.has_ready_to_send(agent_id) {
+                let mut data = json!({
+                    "agentId": agent_id.0,
+                    "reason": "interrupted",
+                    "status": "idle",
+                });
+                // Enrich with agentName + completion report (same as run_prompt_turn:603-608).
+                if let Ok(session) = self.services.store.get_agent_session(agent_id).await {
+                    data["agentName"] = json!(session.name);
+                    if let Some(report) = session.completion_report {
+                        data["report"] = json!(report);
+                    }
+                }
+                self.services
+                    .publish_agent_event(
+                        &workspace_id,
+                        agent_id,
+                        intent_core::events::AGENT_IDLE,
+                        data,
+                    )
+                    .await;
+            }
         }
         true
     }

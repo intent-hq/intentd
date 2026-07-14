@@ -31,12 +31,12 @@ use crate::agent_ops::{
 use crate::Services;
 use intent_core::MAX_DELEGATION_DEPTH;
 
-struct TempDb {
-    path: PathBuf,
+pub(super) struct TempDb {
+    pub(super) path: PathBuf,
 }
 
 impl TempDb {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let path =
             std::env::temp_dir().join(format!("intentd-agentops-{}.db", uuid::Uuid::new_v4()));
         Self { path }
@@ -51,7 +51,7 @@ impl Drop for TempDb {
     }
 }
 
-fn workspace(id: &WorkspaceId) -> Workspace {
+pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
     let ts = now_iso();
     Workspace {
         id: id.clone(),
@@ -111,7 +111,7 @@ async fn setup_with_bus() -> (TempDb, Services, WorkspaceId, EventBus) {
     (tmp, services, ws, bus)
 }
 
-fn completion_event(
+pub(super) fn completion_event(
     workspace_id: &WorkspaceId,
     event_type: &str,
     child_id: &AgentId,

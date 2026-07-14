@@ -1255,12 +1255,14 @@ async fn build_turn_prompt_skips_naming_instruction_after_first_turn() {
     assert_eq!(text, "follow-up");
 }
 
-/// The keep-alive interrupt path emits ONLY the terminal `agent:stream:end` and
-/// deliberately NOT `agent:idle`: an interrupted agent is about to resume, so
-/// waking parents on idle would be premature (mirrors the TS interrupt
-/// suppression in `emitAgentIdleEvent`).
+/// STAB-28: The keep-alive interrupt path emits `agent:stream:end` and NOW
+/// ALSO emits `agent:idle` when the agent has no queued ready-to-send messages.
+/// This fixes the bug where a parent that re-messages via agent.send after a
+/// child settles registers a completion watch that never fires (the aborted
+/// worker never reaches run_prompt_turn's idle-emit path). When the agent DOES
+/// have queued messages, idle is suppressed (the agent will resume immediately).
 #[tokio::test]
-async fn interrupt_emits_terminal_stream_end_but_no_idle() {
+async fn interrupt_emits_terminal_stream_end_and_idle_when_no_queue() {
     let (_tmp, mgr, bus) = manager_with_bus().await;
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int"));
     seed_agent(&mgr, &ws, &id).await;
@@ -1289,8 +1291,8 @@ async fn interrupt_emits_terminal_stream_end_but_no_idle() {
         "interrupt emits the terminal stream:end (got {types:?})"
     );
     assert!(
-        !types.contains(&"agent:idle"),
-        "interrupt suppresses agent:idle (got {types:?})"
+        types.contains(&"agent:idle"),
+        "STAB-28: interrupt NOW emits agent:idle when queue is empty (got {types:?})"
     );
 }
 
