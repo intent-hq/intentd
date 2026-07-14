@@ -67,6 +67,7 @@ where
         bus,
         socket_path,
         control,
+        None,
         Arc::new(PrimaryReverseRegistry::new()),
         shutdown,
     )
@@ -79,13 +80,15 @@ where
 /// agent-initiated reverse RPCs (§5.14/§12.4). Composition roots build ONE
 /// registry, hand it to both the UDS + WSS listeners, and hand it to
 /// `Services::with_reverse_dispatch` so agent-initiated `browser.exec` calls
-/// see the same live set of clients.
+/// see the same live set of clients. `server_pairing_info`, when present,
+/// exposes `server.pairingInfo`/`server.rotateToken` (§5.2) to local clients.
 #[cfg(unix)]
 pub async fn serve_uds_with_reverse<F>(
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
     socket_path: &Path,
     control: Option<Arc<dyn SystemControl>>,
+    server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
     reverse_registry: Arc<PrimaryReverseRegistry>,
     shutdown: F,
 ) -> std::io::Result<()>
@@ -113,9 +116,10 @@ where
                         let api = api.clone();
                         let bus = bus.clone();
                         let control = control.clone();
+                        let server_pairing_info = server_pairing_info.clone();
                         let reverse_registry = reverse_registry.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, api, bus, control, reverse_registry).await {
+                            if let Err(e) = handle_connection(stream, api, bus, control, server_pairing_info, reverse_registry).await {
                                 tracing::debug!(error = %e, "uds connection ended");
                             }
                         });
@@ -140,6 +144,7 @@ async fn handle_connection(
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
     control: Option<Arc<dyn SystemControl>>,
+    server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
     reverse_registry: Arc<PrimaryReverseRegistry>,
 ) -> std::io::Result<()> {
     let (read_half, write_half) = stream.into_split();
@@ -185,20 +190,26 @@ async fn handle_connection(
         }
         // A send failure means the writer/client is gone → end the connection.
         // UDS is the local control transport, so `is_local = true` (§12.3).
-        if !process_frame(
-            trimmed,
-            &api,
-            &bus,
-            &out_tx,
-            &mut subs,
-            &mut forwards,
-            &reverse,
-            control.as_ref(),
-            &mut client_id,
-            true,
-        )
-        .await
-        {
+        // Wrap in connection context (is_tcp=false for UDS) so server.* RPCs can
+        // gate on real origin (§5.2).
+        let frame_ok = crate::context::with_connection_context(false, async {
+            process_frame(
+                trimmed,
+                &api,
+                &bus,
+                &out_tx,
+                &mut subs,
+                &mut forwards,
+                &reverse,
+                control.as_ref(),
+                server_pairing_info.as_ref(),
+                &mut client_id,
+                true,
+            )
+            .await
+        })
+        .await;
+        if !frame_ok {
             break Ok(());
         }
     };
@@ -240,6 +251,7 @@ pub async fn serve_uds_with_reverse<F>(
     _bus: EventBus,
     _socket_path: &Path,
     _control: Option<Arc<dyn SystemControl>>,
+    _server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
     _reverse_registry: Arc<PrimaryReverseRegistry>,
     _shutdown: F,
 ) -> std::io::Result<()>
