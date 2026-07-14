@@ -439,22 +439,30 @@ async fn process_cap_events_queued_resumed_evicted() {
     mgr.registry.mark_idle(&b);
     queued_acquire.await.expect("task ok");
 
-    // Collect resume event.
-    let events = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
-    assert_eq!(events.len(), 1, "resume emits one event");
+    // Collect resume event. The event callback in mark_idle spawns async
+    // (tokio::spawn), so allow settling time and drain all events.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let mut all_events = Vec::new();
+    while let Ok(Some(batch)) = tokio::time::timeout(Duration::from_millis(50), sub.recv()).await {
+        all_events.extend(batch);
+    }
+
+    // Assert we got the resumed event (async spawn means order is not guaranteed).
+    let resumed_events: Vec<_> = all_events
+        .iter()
+        .filter(|e| e.event_type == AGENT_PROCESS_RESUMED)
+        .collect();
     assert_eq!(
-        events[0].event_type, AGENT_PROCESS_RESUMED,
+        resumed_events.len(),
+        1,
         "resume path emits agent:process:resumed"
     );
     assert_eq!(
-        events[0].data["agentId"], d.0,
+        resumed_events[0].data["agentId"], d.0,
         "resumed event carries resumed agent id"
     );
-    assert_eq!(events[0].data["used"], 2, "used count after resume");
-    assert_eq!(events[0].data["cap"], 2, "cap value");
+    assert_eq!(resumed_events[0].data["used"], 2, "used count after resume");
+    assert_eq!(resumed_events[0].data["cap"], 2, "cap value");
 }
 
 async fn manager() -> (TempDb, AgentManager) {
