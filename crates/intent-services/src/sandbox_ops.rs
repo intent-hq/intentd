@@ -1853,4 +1853,56 @@ mod tests {
         // Clean up
         let _ = fs::remove_dir_all(&test_root);
     }
+
+    #[tokio::test]
+    async fn test_sandbox_retry_tracking() {
+        // This test verifies that retry count get/increment/clear work correctly
+        let (store, _db) = temp_store().await;
+        let (test_root, canonical_path) = temp_repo_in_target("retry-track");
+
+        // Create workspace
+        let ws = workspace_for_repo(&canonical_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId(uuid::Uuid::new_v4().to_string());
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        // Create a minimal sandbox record (doesn't need real repo)
+        let sandbox = Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.id.clone(),
+            agent_id: agent_id.clone(),
+            path: "/tmp/fake".to_string(),
+            branch: "sb/test".to_string(),
+            base_commit_sha: "abc123".to_string(),
+            snapshot_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        // Initial retry count should be 0
+        let retry_count = store.get_sandbox_retry_count(&ws.id, &agent_id).await.unwrap();
+        assert_eq!(retry_count, 0, "Initial retry count should be 0");
+
+        // Increment once
+        store.increment_sandbox_retry_count(&ws.id, &agent_id).await.unwrap();
+        let retry_count = store.get_sandbox_retry_count(&ws.id, &agent_id).await.unwrap();
+        assert_eq!(retry_count, 1, "Retry count should be 1 after first increment");
+
+        // Increment again
+        store.increment_sandbox_retry_count(&ws.id, &agent_id).await.unwrap();
+        let retry_count = store.get_sandbox_retry_count(&ws.id, &agent_id).await.unwrap();
+        assert_eq!(retry_count, 2, "Retry count should be 2 after second increment");
+
+        // Clear retry count
+        store.clear_sandbox_retry_count(&ws.id, &agent_id).await.unwrap();
+        let retry_count = store.get_sandbox_retry_count(&ws.id, &agent_id).await.unwrap();
+        assert_eq!(retry_count, 0, "Retry count should be 0 after clear");
+
+        // Clean up
+        let _ = fs::remove_dir_all(&test_root);
+    }
 }
