@@ -1,9 +1,8 @@
-//! Regression tests for STAB-28: re-wake subscription loss + interrupt-path wedge.
+//! Regression test for STAB-28 completion-watch re-registration.
 //!
-//! Two failure modes:
-//! (a) A parent that re-messages a settled child via agent.send must be woken
-//!     when that child settles again (the re-wake watch must exist).
-//! (b) An interrupted agent must not wedge in is_active=1 with no output forever.
+//! Covers the re-wake subscription-loss failure mode: a parent that re-messages
+//! a settled child via agent.send must be woken when that child settles again.
+//! The interrupt-path wedge is tested in agent_manager/tests.rs.
 
 use intent_core::{AgentId, WorkspaceId};
 use intent_store::Store;
@@ -140,8 +139,7 @@ async fn parent_rewoken_after_send_to_settled_child() {
     );
 }
 
-// NOTE: The above test PASSES because it simulates the happy path where the child
-// actually settles (publishes agent:idle). The REAL bug is that when an interrupt
-// is delivered, the worker is aborted and never publishes agent:idle, so completion
-// watches never fire. This would require an integration test with AgentManager to
-// reproduce properly, which is beyond the scope of this unit test file.
+// NOTE: The above test covers the re-wake completion-watch registration/delivery
+// mechanism (failure mode (a)). The interrupt-path wedge (failure mode (b)) is
+// covered by agent_manager/tests.rs:interrupt_emits_terminal_stream_end_and_idle_when_no_queue,
+// which asserts that interrupt() now emits agent:idle after the worker is aborted.

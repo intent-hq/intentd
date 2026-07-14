@@ -1516,10 +1516,11 @@ impl AgentManager {
                     "reason": "interrupted",
                     "status": "idle",
                 });
-                // Enrich with agentName + completion report (same as run_prompt_turn:603-608).
-                if let Ok(session) = self.services.store.get_agent_session(agent_id).await {
+                // Enrich with agentName + completion report (reuse session loaded at
+                // line 1466; avoids duplicate I/O).
+                if let Some(ref session) = session {
                     data["agentName"] = json!(session.name);
-                    if let Some(report) = session.completion_report {
+                    if let Some(ref report) = session.completion_report {
                         data["report"] = json!(report);
                     }
                 }
