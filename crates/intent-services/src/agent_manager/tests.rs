@@ -4,7 +4,6 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use intent_acp::permission::{PermissionOptionView, RiskLevel};
 use intent_acp::{
@@ -20,7 +19,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{timeout, Duration};
 
 use super::{
     compute_process_cap, derive_agent_type, resolve_spawn, text_prompt, user_text_blocks,
@@ -99,14 +98,14 @@ async fn tracks_concurrent_processes_and_deregisters() {
 async fn acquire_evicts_lru_idle_when_full() {
     let reg = ProcessRegistry::new(2);
     let log = Arc::new(Mutex::new(Vec::new()));
-    let (a, b) = (AgentId::from("a"), AgentId::from("b"));
+    let (a, b, c) = (AgentId::from("a"), AgentId::from("b"), AgentId::from("c"));
     reg.register(a.clone(), recording_kill(a.clone(), log.clone()));
     reg.register(b.clone(), recording_kill(b.clone(), log.clone()));
     // `a` is the least-recently-used idle process.
     reg.set_last_active(&a, 100);
     reg.set_last_active(&b, 200);
 
-    reg.acquire().await;
+    reg.acquire(&c).await;
 
     assert_eq!(*log.lock().unwrap(), vec![a.clone()], "evicts LRU idle");
     assert!(!reg.is_registered(&a));
@@ -118,12 +117,12 @@ async fn acquire_evicts_lru_idle_when_full() {
 async fn acquire_queues_until_a_process_goes_idle() {
     let reg = Arc::new(ProcessRegistry::new(1));
     let log = Arc::new(Mutex::new(Vec::new()));
-    let a = AgentId::from("a");
+    let (a, b) = (AgentId::from("a"), AgentId::from("b"));
     reg.register(a.clone(), recording_kill(a.clone(), log.clone()));
     reg.mark_active(&a);
 
     let reg2 = reg.clone();
-    let acquired = tokio::spawn(async move { reg2.acquire().await });
+    let acquired = tokio::spawn(async move { reg2.acquire(&b).await });
     // All processes active → the acquire must block.
     assert!(timeout(Duration::from_millis(50), async {}).await.is_ok());
     assert!(!acquired.is_finished(), "acquire blocks while all active");
@@ -157,6 +156,305 @@ async fn lifecycle_active_processes_are_not_reaped() {
     );
     assert!(reg.is_registered(&a));
     assert!(!reg.is_registered(&b));
+}
+
+#[tokio::test]
+async fn process_cap_events_queued_resumed_evicted() {
+    use intent_core::events::{AGENT_PROCESS_EVICTED, AGENT_PROCESS_QUEUED, AGENT_PROCESS_RESUMED};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store.clone()).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = AgentManager::new(services, sink, 2); // cap=2 to test eviction and queueing
+
+    // Subscribe to process-cap events with no batching for determinism.
+    let mut filter = SubscriptionFilter {
+        event_types: vec![
+            AGENT_PROCESS_QUEUED.to_string(),
+            AGENT_PROCESS_RESUMED.to_string(),
+            AGENT_PROCESS_EVICTED.to_string(),
+        ],
+        ..Default::default()
+    };
+    filter.batch_window = None;
+    let mut sub = bus.subscribe(filter);
+
+    // Insert workspace + session rows so the event callback can resolve workspace_id.
+    let ws_id = WorkspaceId::from("test-ws");
+    let ts = now_iso();
+    let ws = Workspace {
+        id: ws_id.clone(),
+        title: "Test".into(),
+        branch: "main".into(),
+        base_ref: None,
+        base_commit_sha: None,
+        status: WorkspaceStatus::Active,
+        status_message: None,
+        activity: WorkspaceActivity::Idle,
+        attention: WorkspaceAttention::None,
+        created_at: ts.clone(),
+        updated_at: ts,
+        last_activity: None,
+        tags: vec![],
+        path: None,
+        repository_path: None,
+        repository_owner: None,
+        repository_name: None,
+        worktree_path: None,
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
+        pull_requests: None,
+        archived: false,
+        archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
+        token_usage: None,
+        cow_supported: None,
+    };
+    store.insert_workspace(&ws).await.unwrap();
+    let (a, b) = (AgentId::from("a"), AgentId::from("b"));
+    let ts = now_iso();
+    store
+        .insert_agent_session(&AgentSession {
+            id: a.clone(),
+            workspace_id: ws_id.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "A".into(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Pending,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        })
+        .await
+        .unwrap();
+    store
+        .insert_agent_session(&AgentSession {
+            id: b.clone(),
+            workspace_id: ws_id.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "B".into(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Pending,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        })
+        .await
+        .unwrap();
+
+    // Scenario: cap=2, register A and B (idle), then acquire for C (should evict LRU idle A).
+    let log = Arc::new(Mutex::new(Vec::new()));
+    mgr.registry
+        .register(a.clone(), recording_kill(a.clone(), log.clone()));
+    mgr.registry.set_last_active(&a, 100); // A is older
+    mgr.registry
+        .register(b.clone(), recording_kill(b.clone(), log.clone()));
+    mgr.registry.set_last_active(&b, 200); // B is newer
+
+    // Acquire for C — cap is full (A and B registered), so should evict LRU idle (A).
+    let c = AgentId::from("c");
+    let c_clone = c.clone();
+    let ts = now_iso();
+    store
+        .insert_agent_session(&AgentSession {
+            id: c_clone.clone(),
+            workspace_id: ws_id.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "C".into(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Pending,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        })
+        .await
+        .unwrap();
+
+    mgr.registry.acquire(&c).await;
+    // After acquiring, register C.
+    mgr.registry
+        .register(c.clone(), recording_kill(c.clone(), log.clone()));
+
+    // Wait briefly for async event emission to settle, then collect the eviction event.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let events = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(events.len(), 1, "eviction emits one event");
+    assert_eq!(
+        events[0].event_type, AGENT_PROCESS_EVICTED,
+        "eviction path emits agent:process:evicted"
+    );
+    assert_eq!(
+        events[0].data["agentId"], a.0,
+        "eviction event carries evicted agent id"
+    );
+    assert_eq!(events[0].data["used"], 2, "used count at eviction");
+    assert_eq!(events[0].data["cap"], 2, "cap value");
+
+    // Scenario: cap=2, B and C now registered, make both active, acquire for D → should queue.
+    mgr.registry.mark_active(&b);
+    mgr.registry.mark_active(&c);
+
+    let d = AgentId::from("d");
+    let ts = now_iso();
+    store
+        .insert_agent_session(&AgentSession {
+            id: d.clone(),
+            workspace_id: ws_id.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "D".into(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Pending,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        })
+        .await
+        .unwrap();
+
+    let reg2 = mgr.registry.clone();
+    let d_clone = d.clone();
+    let queued_acquire = tokio::spawn(async move { reg2.acquire(&d_clone).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !queued_acquire.is_finished(),
+        "acquire blocks when all active"
+    );
+
+    // Collect queue event.
+    let events = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(events.len(), 1, "queueing emits one event");
+    assert_eq!(
+        events[0].event_type, AGENT_PROCESS_QUEUED,
+        "queueing path emits agent:process:queued"
+    );
+    assert_eq!(
+        events[0].data["agentId"], d.0,
+        "queued event carries queued agent id"
+    );
+    assert_eq!(events[0].data["used"], 2, "used count at queue");
+    assert_eq!(events[0].data["cap"], 2, "cap value");
+
+    // Mark B idle → should resume D.
+    mgr.registry.mark_idle(&b);
+    queued_acquire.await.expect("task ok");
+
+    // Collect resume event.
+    let events = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(events.len(), 1, "resume emits one event");
+    assert_eq!(
+        events[0].event_type, AGENT_PROCESS_RESUMED,
+        "resume path emits agent:process:resumed"
+    );
+    assert_eq!(
+        events[0].data["agentId"], d.0,
+        "resumed event carries resumed agent id"
+    );
+    assert_eq!(events[0].data["used"], 2, "used count after resume");
+    assert_eq!(events[0].data["cap"], 2, "cap value");
 }
 
 async fn manager() -> (TempDb, AgentManager) {
