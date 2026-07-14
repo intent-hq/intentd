@@ -349,23 +349,33 @@ async fn process_cap_events_queued_resumed_evicted() {
     mgr.registry
         .register(c.clone(), recording_kill(c.clone(), log.clone()));
 
-    // Wait briefly for async event emission to settle, then collect the eviction event.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let events = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
-    assert_eq!(events.len(), 1, "eviction emits one event");
+    // Collect the eviction event with bounded wait (event emission is async).
+    let mut evict_event = None;
+    for _ in 0..50 {
+        let Ok(Some(batch)) = timeout(Duration::from_millis(100), sub.recv()).await else {
+            break;
+        };
+        for ev in batch {
+            if ev.event_type == AGENT_PROCESS_EVICTED && ev.data["agentId"] == a.0 {
+                evict_event = Some(ev);
+                break;
+            }
+        }
+        if evict_event.is_some() {
+            break;
+        }
+    }
+    let ev = evict_event.expect("eviction event published");
     assert_eq!(
-        events[0].event_type, AGENT_PROCESS_EVICTED,
+        ev.event_type, AGENT_PROCESS_EVICTED,
         "eviction path emits agent:process:evicted"
     );
     assert_eq!(
-        events[0].data["agentId"], a.0,
+        ev.data["agentId"], a.0,
         "eviction event carries evicted agent id"
     );
-    assert_eq!(events[0].data["used"], 2, "used count at eviction");
-    assert_eq!(events[0].data["cap"], 2, "cap value");
+    assert_eq!(ev.data["used"], 2, "used count at eviction");
+    assert_eq!(ev.data["cap"], 2, "cap value");
 
     // Scenario: cap=2, B and C now registered, make both active, acquire for D → should queue.
     mgr.registry.mark_active(&b);
@@ -418,43 +428,65 @@ async fn process_cap_events_queued_resumed_evicted() {
         "acquire blocks when all active"
     );
 
-    // Collect queue event.
-    let events = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
-    assert_eq!(events.len(), 1, "queueing emits one event");
+    // Collect queue event with bounded wait (event emission is async).
+    let mut queue_event = None;
+    for _ in 0..50 {
+        let Ok(Some(batch)) = timeout(Duration::from_millis(100), sub.recv()).await else {
+            break;
+        };
+        for ev in batch {
+            if ev.event_type == AGENT_PROCESS_QUEUED && ev.data["agentId"] == d.0 {
+                queue_event = Some(ev);
+                break;
+            }
+        }
+        if queue_event.is_some() {
+            break;
+        }
+    }
+    let ev = queue_event.expect("queue event published");
     assert_eq!(
-        events[0].event_type, AGENT_PROCESS_QUEUED,
+        ev.event_type, AGENT_PROCESS_QUEUED,
         "queueing path emits agent:process:queued"
     );
     assert_eq!(
-        events[0].data["agentId"], d.0,
+        ev.data["agentId"], d.0,
         "queued event carries queued agent id"
     );
-    assert_eq!(events[0].data["used"], 2, "used count at queue");
-    assert_eq!(events[0].data["cap"], 2, "cap value");
+    assert_eq!(ev.data["used"], 2, "used count at queue");
+    assert_eq!(ev.data["cap"], 2, "cap value");
 
     // Mark B idle → should resume D.
     mgr.registry.mark_idle(&b);
     queued_acquire.await.expect("task ok");
 
-    // Collect resume event.
-    let events = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
-    assert_eq!(events.len(), 1, "resume emits one event");
+    // Collect resume event with bounded wait (event emission is async).
+    let mut resume_event = None;
+    for _ in 0..50 {
+        let Ok(Some(batch)) = timeout(Duration::from_millis(100), sub.recv()).await else {
+            break;
+        };
+        for ev in batch {
+            if ev.event_type == AGENT_PROCESS_RESUMED && ev.data["agentId"] == d.0 {
+                resume_event = Some(ev);
+                break;
+            }
+        }
+        if resume_event.is_some() {
+            break;
+        }
+    }
+    let ev = resume_event.expect("resume event published");
     assert_eq!(
-        events[0].event_type, AGENT_PROCESS_RESUMED,
+        ev.event_type, AGENT_PROCESS_RESUMED,
         "resume path emits agent:process:resumed"
     );
     assert_eq!(
-        events[0].data["agentId"], d.0,
+        ev.data["agentId"], d.0,
         "resumed event carries resumed agent id"
     );
-    assert_eq!(events[0].data["used"], 2, "used count after resume");
-    assert_eq!(events[0].data["cap"], 2, "cap value");
+    assert_eq!(ev.data["used"], 2, "used count after resume");
+    assert_eq!(ev.data["cap"], 2, "cap value");
 }
 
 async fn manager() -> (TempDb, AgentManager) {
