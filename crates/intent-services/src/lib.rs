@@ -4495,18 +4495,19 @@ impl WorkspaceApi for Services {
                         // Rollback: restore old values for ALL settings in the batch.
                         // Log rollback failures but don't let them mask the original hook error.
                         let mut rollback_failed = false;
+                        let mut compensating_changes = Vec::new();
                         for (path, old_val, is_sensitive) in old_values {
                             let rollback_result = if is_sensitive {
                                 // Sensitive setting: restore to secrets store or delete
-                                if let Some(val) = old_val {
-                                    self.secrets.store(&path, &val).await
+                                if let Some(val) = &old_val {
+                                    self.secrets.store(&path, val).await
                                 } else {
                                     self.secrets.delete(&path).await
                                 }
                             } else {
                                 // Non-sensitive setting: restore to DB or delete
-                                if let Some(val) = old_val {
-                                    self.store.set_setting(&path, &val).await
+                                if let Some(val) = &old_val {
+                                    self.store.set_setting(&path, val).await
                                 } else {
                                     self.store.delete_setting(&path).await.map(|_| ())
                                 }
@@ -4518,8 +4519,37 @@ impl WorkspaceApi for Services {
                                     "settings.update rollback failed for key"
                                 );
                                 rollback_failed = true;
+                            } else {
+                                // Build a change record for compensating hook application
+                                let val_json = if let Some(val) = old_val {
+                                    serde_json::from_str(&val).unwrap_or(serde_json::Value::Null)
+                                } else {
+                                    serde_json::Value::Null
+                                };
+                                compensating_changes.push(serde_json::json!({
+                                    "path": path,
+                                    "value": val_json
+                                }));
                             }
                         }
+
+                        // Apply compensating hooks: re-apply the prior values through the same
+                        // hook path to restore runtime state (e.g., stop a listener that was
+                        // started before a later hook in the batch failed). This reuses the
+                        // deterministic priority-sorted dispatch from apply_server_setting_hooks.
+                        if !compensating_changes.is_empty() {
+                            if let Err(compensating_err) = self
+                                .apply_server_setting_hooks(&compensating_changes, control)
+                                .await
+                            {
+                                tracing::error!(
+                                    error = ?compensating_err,
+                                    "settings.update compensating hook application failed during rollback"
+                                );
+                                // Log but don't fail — the persistence rollback succeeded
+                            }
+                        }
+
                         // Return an error that indicates incomplete rollback if any writes failed
                         if rollback_failed {
                             return Err(Error::Internal(format!(
