@@ -784,23 +784,38 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // Wait for agent:failed terminal event AND the subsequent agent:stream:end
+    // Wait for agent:failed terminal event, agent:stream:end, AND agent:status-changed
+    // (the status-changed event is published AFTER the status is persisted, so
+    // waiting for it ensures the status write is visible to subsequent reads)
     let mut saw_failed = false;
     let mut saw_end_from_exhaustion = false;
+    let mut saw_status_error = false;
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:failed" {
-            saw_failed = true;
-        }
-        if frame["params"]["event"]["type"] == "agent:stream:end" {
-            saw_end_from_exhaustion = true;
-            break; // Stop after consuming the exhaustion's stream:end
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:failed") => {
+                saw_failed = true;
+            }
+            Some("agent:stream:end") => {
+                saw_end_from_exhaustion = true;
+            }
+            Some("agent:status-changed") => {
+                if frame["params"]["event"]["data"]["status"] == "error" {
+                    saw_status_error = true;
+                    break; // Stop after seeing the error status persisted
+                }
+            }
+            _ => {}
         }
     }
     assert!(saw_failed, "agent:failed emitted after exhaustion");
     assert!(
         saw_end_from_exhaustion,
         "agent:stream:end emitted after exhaustion"
+    );
+    assert!(
+        saw_status_error,
+        "agent:status-changed with status=error emitted after exhaustion"
     );
 
     // Assert persisted error status via agent.getSession
