@@ -88,7 +88,11 @@ fn classify_other_method() {
 #[tokio::test]
 async fn handle_pairing_info_local_success() {
     use std::env;
-    let tmpdir = env::temp_dir().join(format!("intentd-test-{}", std::process::id()));
+    let tmpdir = env::temp_dir().join(format!(
+        "intentd-test-{}-{}",
+        std::process::id(),
+        "pairing_info_local"
+    ));
     std::fs::create_dir_all(&tmpdir).unwrap();
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("test-token-abc123")));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
@@ -120,7 +124,11 @@ async fn handle_pairing_info_local_success() {
 #[tokio::test]
 async fn handle_pairing_info_remote_rejects() {
     use std::env;
-    let tmpdir = env::temp_dir().join(format!("intentd-test-{}", std::process::id()));
+    let tmpdir = env::temp_dir().join(format!(
+        "intentd-test-{}-{}",
+        std::process::id(),
+        "pairing_info_remote"
+    ));
     std::fs::create_dir_all(&tmpdir).unwrap();
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::default()));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
@@ -146,7 +154,11 @@ async fn handle_pairing_info_remote_rejects() {
 #[tokio::test]
 async fn handle_rotate_token_local_success() {
     use std::env;
-    let tmpdir = env::temp_dir().join(format!("intentd-test-{}", std::process::id()));
+    let tmpdir = env::temp_dir().join(format!(
+        "intentd-test-{}-{}",
+        std::process::id(),
+        "rotate_token_local"
+    ));
     std::fs::create_dir_all(&tmpdir).unwrap();
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("old-token")));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
