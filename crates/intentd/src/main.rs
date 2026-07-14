@@ -254,9 +254,12 @@ fn init_tracing() {
     // Create the data directory if it doesn't exist
     let _ = std::fs::create_dir_all(&log_dir);
 
-    // Set up file appender with rotation: keep ~5 files, ~10MB each
+    // Set up file appender with rotation: keep ~5 files, rotate daily
+    // Note: tracing-appender's max_log_files works with time-based rotation
+    // (DAILY/HOURLY/etc), not size-based rotation. We use daily rotation
+    // to prevent unbounded growth on long-running daemons.
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(tracing_appender::rolling::Rotation::NEVER) // Manual rotation based on size
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
         .max_log_files(5)
         .filename_prefix("intentd")
         .filename_suffix("log")
@@ -276,9 +279,11 @@ fn init_tracing() {
 /// Install a panic hook that logs the panic message and backtrace to the
 /// tracing log before aborting. This ensures panic details are written to
 /// the rotating log file (INTENTD_DATA_DIR/intentd.log) for post-mortem
-/// diagnosis of unexpected daemon deaths.
+/// diagnosis of unexpected daemon deaths. Chains the default panic hook
+/// to preserve standard Rust panic formatting (thread name, etc.).
 fn install_panic_hook() {
-    std::panic::set_hook(Box::new(|panic_info| {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
         let backtrace = std::backtrace::Backtrace::force_capture();
 
         let location = panic_info
@@ -304,6 +309,9 @@ fn install_panic_hook() {
         // Also write to stderr so it's visible in immediate context
         eprintln!("PANIC at {}: {}", location, message);
         eprintln!("Backtrace:\n{}", backtrace);
+
+        // Chain the default hook to preserve standard Rust panic formatting
+        default_hook(panic_info);
     }));
 }
 
@@ -1565,16 +1573,26 @@ async fn report_db_health(store: &Store) {
     println!("database health:");
 
     // PRAGMA integrity_check: verify DB structural integrity
+    // Can return multiple rows if issues are found; treat anything other
+    // than a single "ok" row as a warning.
     match sqlx::query("PRAGMA integrity_check")
-        .fetch_one(store.pool())
+        .fetch_all(store.pool())
         .await
     {
-        Ok(row) => {
-            let result: String = row.get(0);
-            if result == "ok" {
-                println!("  [ok] integrity_check: ok");
+        Ok(rows) => {
+            if rows.len() == 1 {
+                let result: String = rows[0].get(0);
+                if result == "ok" {
+                    println!("  [ok] integrity_check: ok");
+                } else {
+                    println!("  [WARN] integrity_check: {}", result);
+                }
             } else {
-                println!("  [WARN] integrity_check: {}", result);
+                println!("  [WARN] integrity_check: {} issues found", rows.len());
+                for row in rows {
+                    let result: String = row.get(0);
+                    println!("    - {}", result);
+                }
             }
         }
         Err(e) => {
