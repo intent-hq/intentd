@@ -247,6 +247,86 @@ where
     }
 }
 
+/// Poll agent.getSession until the session status matches the expected value or timeout.
+/// Eliminates races between event emission and async DB persistence of session status.
+async fn await_session_status<S>(
+    ws: &mut WebSocketStream<S>,
+    id_base: i64,
+    workspace_id: &str,
+    agent_id: &str,
+    expected_status: &str,
+    timeout_secs: u64,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let mut attempt = 0;
+    loop {
+        let session = wss_rpc(
+            ws,
+            id_base + attempt,
+            "agent.getSession",
+            json!({ "workspaceId": workspace_id, "agentId": agent_id }),
+        )
+        .await;
+
+        if session["session"]["status"] == expected_status {
+            return session;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "Timeout waiting for session status '{}'. Last status: {}",
+                expected_status, session["session"]["status"]
+            );
+        }
+
+        attempt += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Poll agent.getSession until the session status is NOT the excluded value or timeout.
+/// Useful when waiting for a status to change away from a known state (e.g., "error").
+async fn await_session_status_not<S>(
+    ws: &mut WebSocketStream<S>,
+    id_base: i64,
+    workspace_id: &str,
+    agent_id: &str,
+    excluded_status: &str,
+    timeout_secs: u64,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let mut attempt = 0;
+    loop {
+        let session = wss_rpc(
+            ws,
+            id_base + attempt,
+            "agent.getSession",
+            json!({ "workspaceId": workspace_id, "agentId": agent_id }),
+        )
+        .await;
+
+        if session["session"]["status"] != excluded_status {
+            return session;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "Timeout waiting for session status to change from '{}'. Still: {}",
+                excluded_status, session["session"]["status"]
+            );
+        }
+
+        attempt += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -828,13 +908,8 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
     );
 
     // Assert persisted error status via agent.getSession
-    let session = wss_rpc(
-        &mut rpc,
-        12,
-        "agent.getSession",
-        json!({ "workspaceId": ws_id, "agentId": agent_id }),
-    )
-    .await;
+    // Poll with deadline to handle async persistence race
+    let session = await_session_status(&mut rpc, 12, &ws_id, &agent_id, "error", 10).await;
     assert_eq!(
         session["session"]["status"], "error",
         "session status is error after exhaustion"
@@ -856,10 +931,8 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
         "agent.retry succeeded on error status"
     );
 
-    // Give the retry spawn a moment to start and complete
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
     // Wait for the turn to complete: expect agent:stream:chunk and agent:stream:end
+    // (no fixed sleep needed; event loop provides proper synchronization)
     let mut saw_chunk = false;
     let mut saw_end = false;
     for _ in 0..100 {
@@ -884,13 +957,9 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
     assert!(saw_end, "agent:stream:end emitted after retry recovery");
 
     // Verify final status is no longer error
-    let final_session = wss_rpc(
-        &mut rpc,
-        14,
-        "agent.getSession",
-        json!({ "workspaceId": ws_id, "agentId": agent_id }),
-    )
-    .await;
+    // Poll with deadline to handle async persistence race
+    let final_session =
+        await_session_status_not(&mut rpc, 14, &ws_id, &agent_id, "error", 10).await;
     assert_ne!(
         final_session["session"]["status"], "error",
         "session status recovered from error after agent.retry"
