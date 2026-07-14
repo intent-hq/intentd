@@ -22,7 +22,7 @@ use crate::model::{
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
     TaskRemoveAgentFromAllTasksResult, TaskUpdateNoteStatusResult, TaskUpdateResult,
     TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult,
-    WorkspaceEventSummary, WorkspacePurgeResult, WorkspaceTask, WorkspaceUpdate,
+    WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -336,20 +336,6 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::cleanup_workspace not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// Purge deleted workspaces and orphan on-disk directories (PROTOCOL §5.1).
-    /// Sweeps `<workspaces_root>/`: rows whose stored status is `Deleted` are
-    /// dropped alongside their directory (`removed`), and directories with no
-    /// matching row are removed too (`orphans`). Best-effort; individual
-    /// per-workspace failures are logged and skipped rather than aborting the
-    /// sweep.
-    fn purge_workspaces(&self) -> BoxFuture<'_, Result<WorkspacePurgeResult>> {
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::purge_workspaces not implemented".to_string(),
             ))
         })
     }

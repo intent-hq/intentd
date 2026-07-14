@@ -177,14 +177,6 @@ impl WorkspaceApi for FakeApi {
             Ok(())
         })
     }
-    fn purge_workspaces(&self) -> BoxFuture<'_, Result<intent_core::WorkspacePurgeResult>> {
-        Box::pin(async move {
-            Ok(intent_core::WorkspacePurgeResult {
-                removed: 3,
-                orphans: 1,
-            })
-        })
-    }
     fn find_repositories(&self, directory: String) -> BoxFuture<'_, Result<Vec<String>>> {
         Box::pin(async move {
             if directory == "fail" {
@@ -2112,15 +2104,6 @@ async fn workspace_cleanup_returns_success_true() {
     .await
     .unwrap();
     assert_eq!(v["result"]["success"], serde_json::json!(true));
-}
-
-#[tokio::test]
-async fn workspace_purge_returns_removed_and_orphans() {
-    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.purge","params":{}}"#)
-        .await
-        .unwrap();
-    assert_eq!(v["result"]["removed"], serde_json::json!(3));
-    assert_eq!(v["result"]["orphans"], serde_json::json!(1));
 }
 
 #[tokio::test]

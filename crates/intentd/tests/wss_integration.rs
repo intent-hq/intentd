@@ -2385,10 +2385,10 @@ async fn wss_repo_remove_round_trip() {
 
 /// End-to-end WSS coverage for the workspace lifecycle helpers added by the
 /// thin-FE remediation (PROTOCOL.md §5.1): `workspace.duplicate`,
-/// `workspace.restore`, `workspace.cleanup`, `workspace.purge`,
-/// `workspace.findRepositories`, and `workspace.initializeRepository`. Every
-/// method is driven over the real pinned-TLS WebSocket transport and its
-/// response envelope is asserted against the documented shape.
+/// `workspace.restore`, `workspace.cleanup`, `workspace.findRepositories`,
+/// and `workspace.initializeRepository`. Every method is driven over the
+/// real pinned-TLS WebSocket transport and its response envelope is asserted
+/// against the documented shape.
 #[tokio::test]
 async fn wss_workspace_lifecycle_helpers_round_trip() {
     let srv = start(WsOptions::default()).await;
@@ -2474,23 +2474,6 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
     .await;
     assert_eq!(cleanup_missing["error"]["code"], -32602);
     assert_eq!(cleanup_missing["error"]["message"], "Workspace not found");
-
-    // workspace.purge returns { removed, orphans } counters even when nothing
-    // is deleted; both counters are numbers.
-    let purge = wss_call(
-        srv.port,
-        srv.cfg.clone(),
-        r#"{"jsonrpc":"2.0","id":8,"method":"workspace.purge","params":{}}"#,
-    )
-    .await;
-    assert!(
-        purge["result"]["removed"].is_number(),
-        "removed is a number"
-    );
-    assert!(
-        purge["result"]["orphans"].is_number(),
-        "orphans is a number"
-    );
 
     // workspace.findRepositories returns { repositories: string[] }. Seed a
     // scratch dir with a fake `.git` folder so the scan produces a match.
