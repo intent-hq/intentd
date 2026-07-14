@@ -352,17 +352,20 @@ async fn process_cap_events_queued_resumed_evicted() {
     // Collect the eviction event with bounded wait (event emission is async).
     let mut evict_event = None;
     for _ in 0..50 {
-        let Ok(Some(batch)) = timeout(Duration::from_millis(100), sub.recv()).await else {
-            break;
-        };
-        for ev in batch {
-            if ev.event_type == AGENT_PROCESS_EVICTED && ev.data["agentId"] == a.0 {
-                evict_event = Some(ev);
-                break;
+        match timeout(Duration::from_millis(100), sub.recv()).await {
+            Ok(Some(batch)) => {
+                for ev in batch {
+                    if ev.event_type == AGENT_PROCESS_EVICTED && ev.data["agentId"] == a.0 {
+                        evict_event = Some(ev);
+                        break;
+                    }
+                }
+                if evict_event.is_some() {
+                    break;
+                }
             }
-        }
-        if evict_event.is_some() {
-            break;
+            Ok(None) => break,  // subscription closed
+            Err(_) => continue, // timeout, try again
         }
     }
     let ev = evict_event.expect("eviction event published");
@@ -431,17 +434,20 @@ async fn process_cap_events_queued_resumed_evicted() {
     // Collect queue event with bounded wait (event emission is async).
     let mut queue_event = None;
     for _ in 0..50 {
-        let Ok(Some(batch)) = timeout(Duration::from_millis(100), sub.recv()).await else {
-            break;
-        };
-        for ev in batch {
-            if ev.event_type == AGENT_PROCESS_QUEUED && ev.data["agentId"] == d.0 {
-                queue_event = Some(ev);
-                break;
+        match timeout(Duration::from_millis(100), sub.recv()).await {
+            Ok(Some(batch)) => {
+                for ev in batch {
+                    if ev.event_type == AGENT_PROCESS_QUEUED && ev.data["agentId"] == d.0 {
+                        queue_event = Some(ev);
+                        break;
+                    }
+                }
+                if queue_event.is_some() {
+                    break;
+                }
             }
-        }
-        if queue_event.is_some() {
-            break;
+            Ok(None) => break,  // subscription closed
+            Err(_) => continue, // timeout, try again
         }
     }
     let ev = queue_event.expect("queue event published");
@@ -463,17 +469,20 @@ async fn process_cap_events_queued_resumed_evicted() {
     // Collect resume event with bounded wait (event emission is async).
     let mut resume_event = None;
     for _ in 0..50 {
-        let Ok(Some(batch)) = timeout(Duration::from_millis(100), sub.recv()).await else {
-            break;
-        };
-        for ev in batch {
-            if ev.event_type == AGENT_PROCESS_RESUMED && ev.data["agentId"] == d.0 {
-                resume_event = Some(ev);
-                break;
+        match timeout(Duration::from_millis(100), sub.recv()).await {
+            Ok(Some(batch)) => {
+                for ev in batch {
+                    if ev.event_type == AGENT_PROCESS_RESUMED && ev.data["agentId"] == d.0 {
+                        resume_event = Some(ev);
+                        break;
+                    }
+                }
+                if resume_event.is_some() {
+                    break;
+                }
             }
-        }
-        if resume_event.is_some() {
-            break;
+            Ok(None) => break,  // subscription closed
+            Err(_) => continue, // timeout, try again
         }
     }
     let ev = resume_event.expect("resume event published");
