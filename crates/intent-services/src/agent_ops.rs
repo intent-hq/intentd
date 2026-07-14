@@ -2167,6 +2167,9 @@ impl Services {
             .unwrap_or_default()
             .to_string();
 
+        // Track effective isolation mode for the result
+        let mut effective_isolation: Option<&str> = None;
+
         // Provision sandbox if isolation=cow is requested (Task 3).
         // Check if isolation is "cow" (explicit or defaulted from workspace setting).
         let isolation = input.isolation.clone();
@@ -2203,6 +2206,9 @@ impl Services {
                                         .update_agent_session(&workspace_id, &session)
                                         .await;
 
+                                    // Track successful CoW provisioning
+                                    effective_isolation = Some("cow");
+
                                     // Emit sandbox:created event
                                     crate::publish_event(
                                         &self.event_bus,
@@ -2230,6 +2236,7 @@ impl Services {
                             }
                             Ok(ProvisionOutcome::Unsupported) => {
                                 // Fallback to shared mode (no action needed, session stays without sandbox fields)
+                                effective_isolation = Some("direct");
                                 tracing::debug!(
                                     workspace = %workspace_id,
                                     agent = %agent_id,
@@ -2237,6 +2244,7 @@ impl Services {
                                 );
                             }
                             Err(e) => {
+                                effective_isolation = Some("direct");
                                 tracing::warn!(
                                     workspace = %workspace_id,
                                     agent = %agent_id,
@@ -2328,7 +2336,16 @@ impl Services {
                 tracing::warn!(agent = %agent_id, error = %e, "delegate: failed to start child turn");
             }
         }
-        Ok(json!({ "ok": true, "agentId": agent_id, "name": name }))
+
+        // Include effective isolation in the result when isolation was requested
+        let mut result = json!({ "ok": true, "agentId": agent_id, "name": name });
+        if let Some(eff_iso) = effective_isolation {
+            result
+                .as_object_mut()
+                .unwrap()
+                .insert("effectiveIsolation".to_string(), json!(eff_iso));
+        }
+        Ok(result)
     }
 
     /// Auto-subscribe `parent_agent_id` to `child_agent_id`'s completion
