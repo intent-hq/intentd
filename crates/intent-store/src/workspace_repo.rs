@@ -128,30 +128,40 @@ impl Store {
     /// `deleted_workspace_id` (same transaction as the row delete) so
     /// `workspace.create` never recycles the id for a later workspace (FE
     /// `recentlyDeletedWorkspaces` parity, persisted across restarts).
+    ///
+    /// Uses whole-transaction retry to eliminate SQLITE_BUSY (code 5) failures
+    /// during lock upgrade under concurrent load (STAB-7).
     pub async fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
-        let mut tx = self
-            .pool()
-            .begin()
-            .await
-            .map_err(|e| Error::Internal(format!("delete workspace tx failed: {e}")))?;
-        let res = sqlx::query("DELETE FROM workspace WHERE id = ?")
-            .bind(&id.0)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Error::Internal(format!("delete workspace failed: {e}")))?;
-        if res.rows_affected() == 0 {
-            return Err(Error::NotFound(format!("workspace {id}")));
-        }
-        sqlx::query("INSERT OR REPLACE INTO deleted_workspace_id (id, deleted_at) VALUES (?, ?)")
+        let pool = self.pool();
+        let id = id.clone();
+
+        crate::with_write_txn_retry(|| async {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| Error::Internal(format!("delete workspace tx failed: {e}")))?;
+            let res = sqlx::query("DELETE FROM workspace WHERE id = ?")
+                .bind(&id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("delete workspace failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Err(Error::NotFound(format!("workspace {id}")));
+            }
+            sqlx::query(
+                "INSERT OR REPLACE INTO deleted_workspace_id (id, deleted_at) VALUES (?, ?)",
+            )
             .bind(&id.0)
             .bind(now_iso())
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("record deleted workspace id failed: {e}")))?;
-        tx.commit()
-            .await
-            .map_err(|e| Error::Internal(format!("delete workspace commit failed: {e}")))?;
-        Ok(())
+            tx.commit()
+                .await
+                .map_err(|e| Error::Internal(format!("delete workspace commit failed: {e}")))?;
+            Ok(())
+        })
+        .await
     }
 
     /// Whether a workspace id was ever used — a live row exists **or** a

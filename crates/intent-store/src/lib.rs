@@ -42,6 +42,50 @@ pub use note_version_repo::MAX_NOTE_VERSIONS;
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
 
+/// Retry helper for write transactions that may hit SQLITE_BUSY during lock upgrade
+/// (STAB-7). Executes the given async transaction closure up to MAX_ATTEMPTS times,
+/// with jittered exponential backoff between attempts. Returns the result on success
+/// or the last error after exhausting retries.
+///
+/// Use this for any write transaction that uses .begin() (DEFERRED mode) to eliminate
+/// the intermittent "database is locked" (code 5) failures that occur when multiple
+/// transactions try to upgrade from shared to exclusive lock simultaneously.
+async fn with_write_txn_retry<F, Fut, T>(f: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    const MAX_ATTEMPTS: u32 = 10;
+    const BASE_DELAY_MS: u64 = 50;
+
+    let mut last_error = None;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match f().await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                // Only retry on SQLITE_BUSY (code 5: database is locked)
+                let should_retry = matches!(&e, Error::Internal(msg) if msg.contains("code: 5"));
+
+                if !should_retry || attempt == MAX_ATTEMPTS - 1 {
+                    return Err(e);
+                }
+
+                last_error = Some(e);
+
+                // Exponential backoff with jitter: 50ms, 100ms, 200ms, 400ms, ...
+                let delay_ms = BASE_DELAY_MS * (1 << attempt);
+                let jitter_ms = (delay_ms / 4) as i64; // ±25% jitter
+                let jittered_delay = delay_ms as i64
+                    + (rand::random::<i64>() % (2 * jitter_ms + 1)) - jitter_ms;
+                tokio::time::sleep(Duration::from_millis(jittered_delay.max(0) as u64)).await;
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| Error::Internal("retry exhausted".to_string())))
+}
+
 #[cfg(test)]
 mod tests;
 

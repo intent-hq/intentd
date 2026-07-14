@@ -622,62 +622,82 @@ impl Store {
     /// edit-truncate transcript-mutation path (`agent.replaceMessages`,
     /// PROTOCOL §5.5). Callers are expected to reject busy sessions before
     /// invoking this (message-log mutations must not race an in-flight turn).
+    /// Uses whole-transaction retry to eliminate SQLITE_BUSY (code 5) failures
+    /// during lock upgrade under concurrent load (STAB-7).
     pub async fn replace_agent_messages(
         &self,
         agent_id: &AgentId,
         messages: &[ReplaceMessage<'_>],
     ) -> Result<Vec<AgentMessage>> {
-        let mut tx =
-            self.pool().begin().await.map_err(|e| {
+        let pool = self.pool();
+        let agent_id = agent_id.clone();
+        // Clone messages into owned data for retry closure
+        let owned_messages: Vec<(String, serde_json::Value, Option<serde_json::Value>, String)> =
+            messages
+                .iter()
+                .map(|m| {
+                    (
+                        m.role.to_string(),
+                        m.content.clone(),
+                        m.metadata.cloned(),
+                        m.created_at.to_string(),
+                    )
+                })
+                .collect();
+
+        crate::with_write_txn_retry(|| async {
+            let mut tx = pool.begin().await.map_err(|e| {
                 Error::Internal(format!("replace agent messages begin failed: {e}"))
             })?;
-        sqlx::query("DELETE FROM agent_message WHERE agent_id = ?")
-            .bind(&agent_id.0)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Error::Internal(format!("replace agent messages clear failed: {e}")))?;
-        let mut inserted = Vec::with_capacity(messages.len());
-        let insert_sql =
-            format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
-        for (idx, m) in messages.iter().enumerate() {
-            let seq = idx as i64;
-            let id = Uuid::now_v7().to_string();
-            let content_json = serde_json::to_string(&m.content).map_err(|e| {
-                Error::Internal(format!("encode replaced message content failed: {e}"))
-            })?;
-            let metadata_json = match m.metadata {
-                Some(md) => Some(serde_json::to_string(md).map_err(|e| {
-                    Error::Internal(format!("encode replaced message metadata failed: {e}"))
-                })?),
-                None => None,
-            };
-            sqlx::query(&insert_sql)
-                .bind(&id)
+            sqlx::query("DELETE FROM agent_message WHERE agent_id = ?")
                 .bind(&agent_id.0)
-                .bind(seq)
-                .bind(m.role)
-                .bind(&content_json)
-                .bind(metadata_json.as_deref())
-                .bind(m.created_at)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| {
-                    Error::Internal(format!("replace agent messages insert failed: {e}"))
+                .map_err(|e| Error::Internal(format!("replace agent messages clear failed: {e}")))?;
+            let mut inserted = Vec::with_capacity(owned_messages.len());
+            let insert_sql =
+                format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
+            for (idx, (role, content, metadata, created_at)) in owned_messages.iter().enumerate() {
+                let seq = idx as i64;
+                let id = Uuid::now_v7().to_string();
+                let content_json = serde_json::to_string(content).map_err(|e| {
+                    Error::Internal(format!("encode replaced message content failed: {e}"))
                 })?;
-            inserted.push(AgentMessage {
-                id,
-                agent_id: agent_id.clone(),
-                seq,
-                role: m.role.to_string(),
-                content: m.content.clone(),
-                metadata: m.metadata.cloned(),
-                created_at: m.created_at.to_string(),
-            });
-        }
-        tx.commit()
-            .await
-            .map_err(|e| Error::Internal(format!("replace agent messages commit failed: {e}")))?;
-        Ok(inserted)
+                let metadata_json = match metadata {
+                    Some(md) => Some(serde_json::to_string(md).map_err(|e| {
+                        Error::Internal(format!("encode replaced message metadata failed: {e}"))
+                    })?),
+                    None => None,
+                };
+                sqlx::query(&insert_sql)
+                    .bind(&id)
+                    .bind(&agent_id.0)
+                    .bind(seq)
+                    .bind(role)
+                    .bind(&content_json)
+                    .bind(metadata_json.as_deref())
+                    .bind(created_at)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("replace agent messages insert failed: {e}"))
+                    })?;
+                inserted.push(AgentMessage {
+                    id,
+                    agent_id: agent_id.clone(),
+                    seq,
+                    role: role.clone(),
+                    content: content.clone(),
+                    metadata: metadata.clone(),
+                    created_at: created_at.clone(),
+                });
+            }
+            tx.commit()
+                .await
+                .map_err(|e| Error::Internal(format!("replace agent messages commit failed: {e}")))?;
+            Ok(inserted)
+        })
+        .await
     }
 }
 
