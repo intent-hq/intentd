@@ -808,10 +808,13 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
             Some("agent:status-changed") => {
                 if frame["params"]["event"]["data"]["status"] == "error" {
                     saw_status_error = true;
-                    break; // Stop after seeing the error status persisted
                 }
             }
             _ => {}
+        }
+        // Only break after seeing all three terminal events to handle out-of-order delivery
+        if saw_failed && saw_end_from_exhaustion && saw_status_error {
+            break;
         }
     }
     assert!(saw_failed, "agent:failed emitted after exhaustion");
