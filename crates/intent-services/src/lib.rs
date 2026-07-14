@@ -4492,23 +4492,39 @@ impl WorkspaceApi for Services {
                 // when server.wsApi.enabled / server.discovery.enabled change.
                 if let Some(control) = self.server_control.get() {
                     if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
-                        // Rollback: restore old values for ALL settings in the batch
+                        // Rollback: restore old values for ALL settings in the batch.
+                        // Log rollback failures but don't let them mask the original hook error.
+                        let mut rollback_failed = false;
                         for (path, old_val, is_sensitive) in old_values {
-                            if is_sensitive {
+                            let rollback_result = if is_sensitive {
                                 // Sensitive setting: restore to secrets store or delete
                                 if let Some(val) = old_val {
-                                    let _ = self.secrets.store(&path, &val).await;
+                                    self.secrets.store(&path, &val).await
                                 } else {
-                                    let _ = self.secrets.delete(&path).await;
+                                    self.secrets.delete(&path).await
                                 }
                             } else {
                                 // Non-sensitive setting: restore to DB or delete
                                 if let Some(val) = old_val {
-                                    let _ = self.store.set_setting(&path, &val).await;
+                                    self.store.set_setting(&path, &val).await
                                 } else {
-                                    let _ = self.store.delete_setting(&path).await;
+                                    self.store.delete_setting(&path).await.map(|_| ())
                                 }
+                            };
+                            if let Err(rollback_err) = rollback_result {
+                                tracing::error!(
+                                    path = %path,
+                                    error = %rollback_err,
+                                    "settings.update rollback failed for key"
+                                );
+                                rollback_failed = true;
                             }
+                        }
+                        // Return an error that indicates incomplete rollback if any writes failed
+                        if rollback_failed {
+                            return Err(Error::Internal(format!(
+                                "settings.update hook failed ({e}), and rollback was incomplete (see logs)"
+                            )));
                         }
                         // Return the hook error to the caller
                         return Err(e);

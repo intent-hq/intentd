@@ -383,3 +383,123 @@ async fn single_key_failure_reverts() {
     shutdown_tx.send(()).ok();
     let _ = std::fs::remove_file(&socket_path);
 }
+
+/// Mixed batch with sensitive setting: hook failure reverts both sensitive and non-sensitive keys.
+#[tokio::test]
+async fn mixed_batch_with_sensitive_setting_full_rollback() {
+    let tmpdb = TempDb::new();
+    let store = Store::open(&tmpdb.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store)
+        .with_event_bus(bus.clone())
+        .with_secret_store(Arc::new(InMemorySecretStore::default()));
+
+    services.attach_server_control(Arc::new(FailingServerControl));
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+
+    let socket_path = std::env::temp_dir().join(format!("at-{}.sock", Uuid::new_v4().simple()));
+    let socket_path_clone = socket_path.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        serve_uds(api, bus, &socket_path_clone, None, async {
+            shutdown_rx.await.ok();
+        })
+        .await
+        .unwrap();
+    });
+
+    let stream = connect_retry(&socket_path).await;
+    let (r, mut w) = stream.into_split();
+    let mut reader = BufReader::new(r);
+
+    // Set baseline: linear.token (sensitive) + git.autoCommit (non-sensitive)
+    rpc(
+        &mut w,
+        &mut reader,
+        1,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "linear.token", "value": "baseline-token" },
+            { "path": "git.autoCommit", "value": true },
+        ] }),
+    )
+    .await;
+
+    // Verify baseline for git.autoCommit
+    let got = rpc(
+        &mut w,
+        &mut reader,
+        2,
+        "settings.get",
+        json!({ "path": "git.autoCommit" }),
+    )
+    .await;
+    assert_eq!(got["value"], true);
+
+    // Verify linear.token is redacted (sensitive setting)
+    let got = rpc(
+        &mut w,
+        &mut reader,
+        3,
+        "settings.get",
+        json!({ "path": "linear.token" }),
+    )
+    .await;
+    assert_eq!(
+        got["value"], "********",
+        "sensitive setting should be redacted"
+    );
+
+    // Attempt batch: linear.token=new-token + git.autoCommit=false + server.wsApi.enabled=true
+    // The server.wsApi.enabled hook will fail, so ALL keys should revert
+    let resp = call(
+        &mut w,
+        &mut reader,
+        4,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "linear.token", "value": "new-token" },
+            { "path": "git.autoCommit", "value": false },
+            { "path": "server.wsApi.enabled", "value": true },
+        ] }),
+    )
+    .await;
+
+    // Should return an error (hook failed)
+    assert!(
+        resp.get("error").is_some(),
+        "expected error from hook failure"
+    );
+
+    // Verify git.autoCommit reverted to baseline (true)
+    let got = rpc(
+        &mut w,
+        &mut reader,
+        5,
+        "settings.get",
+        json!({ "path": "git.autoCommit" }),
+    )
+    .await;
+    assert_eq!(
+        got["value"], true,
+        "git.autoCommit should revert to baseline"
+    );
+
+    // Verify linear.token still shows [redacted] (secret was restored, not deleted)
+    let got = rpc(
+        &mut w,
+        &mut reader,
+        6,
+        "settings.get",
+        json!({ "path": "linear.token" }),
+    )
+    .await;
+    assert_eq!(
+        got["value"], "********",
+        "linear.token should still be present (redacted) after rollback"
+    );
+
+    shutdown_tx.send(()).ok();
+    let _ = std::fs::remove_file(&socket_path);
+}
