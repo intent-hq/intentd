@@ -617,6 +617,16 @@ async fn git_get_config_over_wss() {
     .await;
     assert_eq!(config_resp["result"]["config"], json!(""));
 
+    // Non-repo workspace: remove .git file/directory → empty string.
+    let git_path = _wt.join(".git");
+    if git_path.is_file() {
+        std::fs::remove_file(&git_path).expect("remove .git file");
+    } else if git_path.is_dir() {
+        std::fs::remove_dir_all(&git_path).expect("remove .git dir");
+    }
+    let nonrepo_resp = wss_rpc(&mut ws, 8, "git.getConfig", json!({ "workspaceId": ws_id })).await;
+    assert_eq!(nonrepo_resp["result"]["config"], json!(""));
+
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }

@@ -9088,8 +9088,10 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             // `NotFound` if the workspace is absent (router maps to `-32602`).
-            // Remote workspaces and non-repositories return an empty string (same
-            // fallback as the FE's `readGitConfig`).
+            // Remote workspaces return an empty string. For local workspaces,
+            // attempts to read `.git/config` (resolving linked-worktree pointers),
+            // then walks parent directories to find a containing repo (nested-repo
+            // parity with FE). Returns empty string if no config found.
             let ws = store.get_workspace(&workspace_id).await?;
             if ws.is_remote {
                 return Ok(String::new());
@@ -9106,9 +9108,10 @@ impl WorkspaceApi for Services {
                 // Linked worktree: read the gitdir pointer file.
                 match tokio::fs::read_to_string(&git_path).await {
                     Ok(content) => {
-                        // Strip `gitdir: ` prefix and optional quotes, then trim whitespace.
-                        let gitdir = content
-                            .strip_prefix("gitdir: ")
+                        // Strip `gitdir:` prefix (tolerant of varied whitespace), quotes, and trim.
+                        let trimmed = content.trim();
+                        let gitdir = trimmed
+                            .strip_prefix("gitdir:")
                             .map(|s| s.trim())
                             .map(|s| {
                                 // If quoted, strip the quotes.
@@ -9118,7 +9121,7 @@ impl WorkspaceApi for Services {
                                     s
                                 }
                             })
-                            .unwrap_or_else(|| content.trim());
+                            .unwrap_or(trimmed);
                         // Resolve relative gitdir paths against the worktree directory.
                         let gitdir_path = if std::path::Path::new(gitdir).is_relative() {
                             path.join(gitdir)
@@ -9145,16 +9148,23 @@ impl WorkspaceApi for Services {
                 Ok(content) => Ok(content),
                 Err(_) => {
                     // If direct read fails, try parent directories (mirroring the FE
-                    // `readGitConfig` fallback logic for nested repos).
+                    // `readGitConfig` fallback logic for nested repos). Limit the walk
+                    // to prevent data exposure from climbing too far.
+                    const MAX_PARENT_LEVELS: usize = 5;
                     let mut current = path.as_path();
-                    while let Some(parent) = current.parent() {
-                        let parent_git_config = parent.join(".git").join("config");
-                        if let Ok(content) = tokio::fs::read_to_string(&parent_git_config).await {
-                            return Ok(content);
+                    for _ in 0..MAX_PARENT_LEVELS {
+                        if let Some(parent) = current.parent() {
+                            let parent_git_config = parent.join(".git").join("config");
+                            if let Ok(content) = tokio::fs::read_to_string(&parent_git_config).await
+                            {
+                                return Ok(content);
+                            }
+                            current = parent;
+                        } else {
+                            break;
                         }
-                        current = parent;
                     }
-                    // No config found anywhere in the parent chain.
+                    // No config found in the parent chain (or hit depth limit).
                     Ok(String::new())
                 }
             }

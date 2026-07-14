@@ -1978,9 +1978,12 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `git.getConfig`: read the raw `.git/config` file content from the
     /// workspace's repository (STAB-10 — retire FE filesystem reads). Returns
-    /// `{ config: String }` where `config` is the entire file content. Remote
-    /// workspaces and non-repositories return `{ config: "" }`. A missing
-    /// workspace is `-32602`.
+    /// `{ config: String }` where `config` is the entire file content.
+    /// For linked worktrees, resolves the `gitdir:` pointer and `commondir` to
+    /// read the main repo's config. If the worktree is not a repo, walks parent
+    /// directories to find a containing repo's config (nested-repo parity with
+    /// the FE). Remote workspaces and non-repositories return `{ config: "" }`.
+    /// A missing workspace is `-32602`.
     fn git_get_config(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<String>> {
         let _ = workspace_id;
         Box::pin(async {
