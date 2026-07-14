@@ -84,9 +84,13 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     .expect("serialize rpc");
     line.push('\n');
     write_half.write_all(line.as_bytes()).await.expect("write");
+    write_half.flush().await.expect("flush");
     let mut reader = tokio::io::BufReader::new(read_half);
     let mut response = String::new();
-    reader.read_line(&mut response).await.expect("read");
+    timeout(Duration::from_secs(5), reader.read_line(&mut response))
+        .await
+        .expect("read timeout")
+        .expect("read");
     serde_json::from_str(&response).expect("parse response")
 }
 
@@ -173,8 +177,8 @@ async fn disabling_listener_stops_discovery() {
         "settings.update should fail when trying to enable discovery without listener (invariant)"
     );
 
-    daemon.child.kill().expect("kill daemon");
-    daemon.child.wait().expect("wait daemon");
+    let _ = daemon.child.kill();
+    let _ = daemon.child.wait();
 }
 
 /// Regression: toggling discovery.enabled while the listener runs should work
@@ -251,8 +255,8 @@ async fn toggle_discovery_while_listener_runs() {
         "re-enable discovery should succeed (independent toggle)"
     );
 
-    daemon.child.kill().expect("kill daemon");
-    daemon.child.wait().expect("wait daemon");
+    let _ = daemon.child.kill();
+    let _ = daemon.child.wait();
 }
 
 /// Regression: batch ordering must enforce wsApi.enabled before discovery.enabled
@@ -299,6 +303,6 @@ async fn batch_ordering_enforces_listener_before_discovery() {
         "listener should be running after batch enable"
     );
 
-    daemon.child.kill().expect("kill daemon");
-    daemon.child.wait().expect("wait daemon");
+    let _ = daemon.child.kill();
+    let _ = daemon.child.wait();
 }

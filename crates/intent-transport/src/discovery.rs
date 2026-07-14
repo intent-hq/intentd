@@ -24,9 +24,10 @@
 //!
 //! 1. **Service contract**: Clients expect advertised services to be reachable.
 //! 2. **Settings ordering**: The batch-update system (§5.12) enforces that
-//!    `server.wsApi.enabled` runs before `server.discovery.enabled`, ensuring
-//!    the listener starts before discovery and stops after discovery.
-//! 3. **Runtime guards**: [`crate::lifecycle::WsInner::start_discovery`] returns
+//!    `server.wsApi.enabled` (priority 10) runs before `server.discovery.enabled`
+//!    (priority 11), ensuring the listener starts before discovery. On shutdown,
+//!    the listener's internal teardown unpublishes mDNS before stopping.
+//! 3. **Runtime guards**: [`crate::ws::WsInner::start_discovery`] returns
 //!    an error if the listener is not running.
 //! 4. **Secure mode requirement**: Discovery advertises the TLS fingerprint;
 //!    insecure mode has no fingerprint and forces `discovery_enabled = false`.
