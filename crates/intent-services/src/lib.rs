@@ -55,6 +55,8 @@ mod auto_commit;
 pub mod browser_ops;
 mod clone_ops;
 mod complete_ops;
+#[cfg(test)]
+mod completion_interception_tests;
 mod crdt_notes;
 mod drafts;
 mod enhance_ops;
