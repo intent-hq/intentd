@@ -295,7 +295,7 @@ fn create_snapshot_commit(repo: &git2::Repository, agent_id: &AgentId) -> Result
         .signature()
         .map_err(|e| Error::Internal(format!("get signature failed: {e}")))?;
 
-    let message = format!("Sandbox snapshot for agent {}", agent_id.0);
+    let message = format!("WIP snapshot for {}", agent_id.0);
     let parents: Vec<&git2::Commit> = parent.iter().collect();
 
     let oid = repo
@@ -405,6 +405,22 @@ mod tests {
         let (store, _db) = temp_store().await;
         let (_repo_dir_guard, repo_path) = temp_repo("source");
 
+        // Provision sandbox (both source and dest in std::env::temp_dir() ensures same volume)
+        let workspaces_root =
+            std::env::temp_dir().join(format!("intentd-test-{}", uuid::Uuid::new_v4()));
+
+        // Early probe check - skip test if CoW not available (e.g., tmpfs, non-APFS)
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!(
+                "Skipping test: CoW not supported between {:?} and {:?}",
+                repo_path, workspaces_root
+            );
+            let _ = fs::remove_dir_all(&workspaces_root);
+            return;
+        }
+
         // Add a test file to the source repo
         fs::write(repo_path.join("test.txt"), "hello").unwrap();
         let source_repo = git2::Repository::open(&repo_path).unwrap();
@@ -462,73 +478,85 @@ mod tests {
         };
         store.insert_agent_session(&agent).await.unwrap();
 
-        // Provision sandbox
-        let _workspaces_root_guard = tempfile::TempDir::new().unwrap();
+        // Provision sandbox (use workspaces_root in same TempDir to ensure same volume)
+        fs::create_dir_all(&workspaces_root).unwrap();
         let config = ProvisionConfig {
-            workspaces_root: _workspaces_root_guard.path().to_path_buf(),
+            workspaces_root: workspaces_root.clone(),
         };
-
         let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config)
             .await
             .unwrap();
 
-        // On APFS (macOS), this should be Supported; on other filesystems it may be Unsupported
-        match outcome {
-            ProvisionOutcome::Supported {
-                path,
-                branch,
-                base_commit_sha,
-                snapshot_commit_sha,
-            } => {
-                // Verify sandbox was created
-                assert!(path.exists());
-                assert!(path.join(".git").exists());
-                assert_eq!(branch, format!("sb/{}", agent_id.0));
+        // We probed upfront, so this MUST be Supported
+        let ProvisionOutcome::Supported {
+            path,
+            branch,
+            base_commit_sha,
+            snapshot_commit_sha,
+        } = outcome
+        else {
+            panic!("Expected Supported after probe confirmed CoW available");
+        };
 
-                // Verify the source repo was COMPLETELY UNTOUCHED
-                let source_head_after = source_repo.head().unwrap().target().unwrap().to_string();
-                assert_eq!(
-                    source_head_before, source_head_after,
-                    "HEAD must not change"
-                );
+        // Verify sandbox was created
+        assert!(path.exists());
+        assert!(path.join(".git").exists());
+        assert_eq!(branch, format!("sb/{}", agent_id.0));
 
-                let source_index_after = source_repo.index().unwrap();
-                assert_eq!(
-                    staged_count_before,
-                    source_index_after.len(),
-                    "Index must not change"
-                );
+        // Verify the source repo was COMPLETELY UNTOUCHED
+        let source_head_after = source_repo.head().unwrap().target().unwrap().to_string();
+        assert_eq!(
+            source_head_before, source_head_after,
+            "HEAD must not change"
+        );
 
-                let test_file_content_after =
-                    fs::read_to_string(repo_path.join("test.txt")).unwrap();
-                assert_eq!(
-                    test_file_content_before, test_file_content_after,
-                    "File content must be byte-identical"
-                );
+        let source_index_after = source_repo.index().unwrap();
+        assert_eq!(
+            staged_count_before,
+            source_index_after.len(),
+            "Index must not change"
+        );
 
-                // Verify base commit matches source HEAD
-                assert_eq!(base_commit_sha, source_head_before);
+        let test_file_content_after = fs::read_to_string(repo_path.join("test.txt")).unwrap();
+        assert_eq!(
+            test_file_content_before, test_file_content_after,
+            "File content must be byte-identical"
+        );
 
-                // Clean sandbox has no snapshot commit
-                assert_eq!(snapshot_commit_sha, None);
+        // Verify base commit matches source HEAD
+        assert_eq!(base_commit_sha, source_head_before);
 
-                // Verify sandbox record was persisted
-                let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap();
-                assert!(sandbox.is_some());
-            }
-            ProvisionOutcome::Unsupported => {
-                // On non-CoW filesystems, we fall back to shared mode
-                // Verify no sandbox record was created
-                let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap();
-                assert!(sandbox.is_none());
-            }
-        }
+        // Clean sandbox has no snapshot commit
+        assert_eq!(snapshot_commit_sha, None);
+
+        // Verify sandbox record was persisted
+        let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap();
+        assert!(sandbox.is_some());
+
+        // Clean up
+        let _ = fs::remove_dir_all(&workspaces_root);
     }
 
     #[tokio::test]
     async fn provision_dirty_state_creates_snapshot_commit() {
         let (store, _db) = temp_store().await;
         let (_repo_dir_guard, repo_path) = temp_repo("source-dirty");
+
+        // Provision sandbox (both source and dest in std::env::temp_dir() ensures same volume)
+        let workspaces_root =
+            std::env::temp_dir().join(format!("intentd-test-{}", uuid::Uuid::new_v4()));
+
+        // Early probe check - skip test if CoW not available
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!(
+                "Skipping test: CoW not supported between {:?} and {:?}",
+                repo_path, workspaces_root
+            );
+            let _ = fs::remove_dir_all(&workspaces_root);
+            return;
+        }
 
         // Add a committed file
         fs::write(repo_path.join("committed.txt"), "committed").unwrap();
@@ -593,74 +621,95 @@ mod tests {
         };
         store.insert_agent_session(&agent).await.unwrap();
 
-        let _workspaces_root_guard = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(&workspaces_root).unwrap();
         let config = ProvisionConfig {
-            workspaces_root: _workspaces_root_guard.path().to_path_buf(),
+            workspaces_root: workspaces_root.clone(),
         };
 
         let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config)
             .await
             .unwrap();
 
-        if let ProvisionOutcome::Supported {
+        // We probed upfront, so this MUST be Supported
+        let ProvisionOutcome::Supported {
             path,
             branch,
             base_commit_sha,
             snapshot_commit_sha,
         } = outcome
-        {
-            // Verify snapshot commit was created
-            let snapshot_sha =
-                snapshot_commit_sha.expect("Snapshot commit must exist for dirty state");
+        else {
+            panic!("Expected Supported after probe confirmed CoW available");
+        };
 
-            // Verify base SHA matches source HEAD
-            assert_eq!(base_commit_sha, base_sha, "Base SHA must match source HEAD");
+        // Verify snapshot commit was created
+        let snapshot_sha = snapshot_commit_sha.expect("Snapshot commit must exist for dirty state");
 
-            // Verify the sandbox contains the dirty file
-            assert!(path.join("dirty.txt").exists());
-            let content = fs::read_to_string(path.join("dirty.txt")).unwrap();
-            assert_eq!(content, "dirty WIP", "Sandbox must contain the dirty WIP");
+        // Verify base SHA matches source HEAD
+        assert_eq!(base_commit_sha, base_sha, "Base SHA must match source HEAD");
 
-            // Open sandbox repo and verify snapshot commit exists on the sandbox branch
-            let sandbox_repo = git2::Repository::open(&path).unwrap();
-            let snapshot_commit = sandbox_repo
-                .find_commit(git2::Oid::from_str(&snapshot_sha).unwrap())
-                .unwrap();
-            assert_eq!(
-                snapshot_commit.message().unwrap(),
-                format!("WIP snapshot for {}", agent_id.0),
-                "Snapshot commit message must match"
-            );
+        // Verify the sandbox contains the dirty file
+        assert!(path.join("dirty.txt").exists());
+        let content = fs::read_to_string(path.join("dirty.txt")).unwrap();
+        assert_eq!(content, "dirty WIP", "Sandbox must contain the dirty WIP");
 
-            // Verify snapshot commit is on the sandbox branch
-            let sb_branch_ref = sandbox_repo
-                .find_branch(&branch, git2::BranchType::Local)
-                .unwrap();
-            let sb_head = sb_branch_ref.get().target().unwrap().to_string();
-            assert_eq!(
-                sb_head, snapshot_sha,
-                "Sandbox branch must point to snapshot commit"
-            );
+        // Open sandbox repo and verify snapshot commit exists on the sandbox branch
+        let sandbox_repo = git2::Repository::open(&path).unwrap();
+        let snapshot_commit = sandbox_repo
+            .find_commit(git2::Oid::from_str(&snapshot_sha).unwrap())
+            .unwrap();
+        assert_eq!(
+            snapshot_commit.message().unwrap(),
+            format!("WIP snapshot for {}", agent_id.0),
+            "Snapshot commit message must match"
+        );
 
-            // Verify sandbox record has correct SHAs
-            let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap().unwrap();
-            assert_eq!(sandbox.base_commit_sha, base_sha);
-            assert_eq!(sandbox.snapshot_commit_sha, Some(snapshot_sha));
+        // Verify snapshot commit is on the sandbox branch
+        let sb_branch_ref = sandbox_repo
+            .find_branch(&branch, git2::BranchType::Local)
+            .unwrap();
+        let sb_head = sb_branch_ref.get().target().unwrap().to_string();
+        assert_eq!(
+            sb_head, snapshot_sha,
+            "Sandbox branch must point to snapshot commit"
+        );
 
-            // Verify the source repo still has dirty state (unchanged)
-            assert!(repo_path.join("dirty.txt").exists());
-            let statuses = source_repo.statuses(None).unwrap();
-            assert!(
-                !statuses.is_empty(),
-                "Source repo must still have dirty state"
-            );
-        }
+        // Verify sandbox record has correct SHAs
+        let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap().unwrap();
+        assert_eq!(sandbox.base_commit_sha, base_sha);
+        assert_eq!(sandbox.snapshot_commit_sha, Some(snapshot_sha));
+
+        // Verify the source repo still has dirty state (unchanged)
+        assert!(repo_path.join("dirty.txt").exists());
+        let statuses = source_repo.statuses(None).unwrap();
+        assert!(
+            !statuses.is_empty(),
+            "Source repo must still have dirty state"
+        );
+
+        // Clean up
+        let _ = fs::remove_dir_all(&workspaces_root);
     }
 
     #[tokio::test]
     async fn discard_sandbox_removes_directory_and_record() {
         let (store, _db) = temp_store().await;
         let (_repo_dir_guard, repo_path) = temp_repo("discard-test");
+
+        // Provision sandbox (both source and dest in std::env::temp_dir() ensures same volume)
+        let workspaces_root =
+            std::env::temp_dir().join(format!("intentd-test-{}", uuid::Uuid::new_v4()));
+
+        // Early probe check - skip test if CoW not available
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!(
+                "Skipping test: CoW not supported between {:?} and {:?}",
+                repo_path, workspaces_root
+            );
+            let _ = fs::remove_dir_all(&workspaces_root);
+            return;
+        }
 
         let ws = workspace_for_repo(&repo_path);
         store.insert_workspace(&ws).await.unwrap();
@@ -697,46 +746,52 @@ mod tests {
         };
         store.insert_agent_session(&agent).await.unwrap();
 
-        let _workspaces_root_guard = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(&workspaces_root).unwrap();
         let config = ProvisionConfig {
-            workspaces_root: _workspaces_root_guard.path().to_path_buf(),
+            workspaces_root: workspaces_root.clone(),
         };
 
         let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config)
             .await
             .unwrap();
 
-        if let ProvisionOutcome::Supported { path, .. } = outcome {
-            // Verify sandbox was created
-            assert!(path.exists(), "Sandbox directory must exist before discard");
-            assert!(
-                path.join(".git").exists(),
-                "Sandbox .git directory must exist"
-            );
+        // We probed upfront, so this MUST be Supported
+        let ProvisionOutcome::Supported { path, .. } = outcome else {
+            panic!("Expected Supported after probe confirmed CoW available");
+        };
 
-            // Verify sandbox record exists
-            let sandbox_before = store.get_sandbox(&ws.id, &agent_id).await.unwrap();
-            assert!(
-                sandbox_before.is_some(),
-                "Sandbox record must exist before discard"
-            );
+        // Verify sandbox was created
+        assert!(path.exists(), "Sandbox directory must exist before discard");
+        assert!(
+            path.join(".git").exists(),
+            "Sandbox .git directory must exist"
+        );
 
-            // Discard the sandbox
-            discard_sandbox(&store, &ws.id, &agent_id).await.unwrap();
+        // Verify sandbox record exists
+        let sandbox_before = store.get_sandbox(&ws.id, &agent_id).await.unwrap();
+        assert!(
+            sandbox_before.is_some(),
+            "Sandbox record must exist before discard"
+        );
 
-            // Verify directory was COMPLETELY removed
-            assert!(
-                !path.exists(),
-                "Sandbox directory must be completely removed after discard"
-            );
+        // Discard the sandbox
+        discard_sandbox(&store, &ws.id, &agent_id).await.unwrap();
 
-            // Verify record was deleted from the database
-            let sandbox_after = store.get_sandbox(&ws.id, &agent_id).await.unwrap();
-            assert!(
-                sandbox_after.is_none(),
-                "Sandbox record must be deleted from DB after discard"
-            );
-        }
+        // Verify directory was COMPLETELY removed
+        assert!(
+            !path.exists(),
+            "Sandbox directory must be completely removed after discard"
+        );
+
+        // Verify record was deleted from the database
+        let sandbox_after = store.get_sandbox(&ws.id, &agent_id).await.unwrap();
+        assert!(
+            sandbox_after.is_none(),
+            "Sandbox record must be deleted from DB after discard"
+        );
+
+        // Clean up
+        let _ = fs::remove_dir_all(&workspaces_root);
     }
 
     #[tokio::test]
