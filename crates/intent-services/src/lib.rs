@@ -9084,6 +9084,93 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn git_get_config(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<String>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // `NotFound` if the workspace is absent (router maps to `-32602`).
+            // Remote workspaces return an empty string. For local workspaces,
+            // attempts to read `.git/config` (resolving linked-worktree pointers),
+            // then walks parent directories to find a containing repo (nested-repo
+            // parity with FE). Returns empty string if no config found.
+            let ws = store.get_workspace(&workspace_id).await?;
+            if ws.is_remote {
+                return Ok(String::new());
+            }
+            let Some(path) = git_ops::worktree_path(&ws) else {
+                return Ok(String::new());
+            };
+            // Read `.git/config` from the worktree's git directory. For linked
+            // worktrees, `.git` is a file containing `gitdir: <path>`. Resolve the
+            // pointer, then look for `commondir` (which points to the main repo's
+            // `.git` if present). Fallback to parent-walk for nested repo parity.
+            let git_path = path.join(".git");
+            let config_path = if git_path.is_file() {
+                // Linked worktree: read the gitdir pointer file.
+                match tokio::fs::read_to_string(&git_path).await {
+                    Ok(content) => {
+                        // Strip `gitdir:` prefix (tolerant of varied whitespace), quotes, and trim.
+                        let trimmed = content.trim();
+                        let gitdir = trimmed
+                            .strip_prefix("gitdir:")
+                            .map(|s| s.trim())
+                            .map(|s| {
+                                // If quoted, strip the quotes.
+                                if s.starts_with('"') && s.ends_with('"') && s.len() > 1 {
+                                    &s[1..s.len() - 1]
+                                } else {
+                                    s
+                                }
+                            })
+                            .unwrap_or(trimmed);
+                        // Resolve relative gitdir paths against the worktree directory.
+                        let gitdir_path = if std::path::Path::new(gitdir).is_relative() {
+                            path.join(gitdir)
+                        } else {
+                            std::path::PathBuf::from(gitdir)
+                        };
+                        // Check for commondir (points to main repo .git for linked worktrees).
+                        let commondir_path = gitdir_path.join("commondir");
+                        if let Ok(commondir_content) =
+                            tokio::fs::read_to_string(&commondir_path).await
+                        {
+                            let commondir = commondir_content.trim();
+                            gitdir_path.join(commondir).join("config")
+                        } else {
+                            gitdir_path.join("config")
+                        }
+                    }
+                    Err(_) => git_path.join("config"),
+                }
+            } else {
+                git_path.join("config")
+            };
+            match tokio::fs::read_to_string(&config_path).await {
+                Ok(content) => Ok(content),
+                Err(_) => {
+                    // If direct read fails, try parent directories (mirroring the FE
+                    // `readGitConfig` fallback logic for nested repos). Limit the walk
+                    // to prevent data exposure from climbing too far.
+                    const MAX_PARENT_LEVELS: usize = 5;
+                    let mut current = path.as_path();
+                    for _ in 0..MAX_PARENT_LEVELS {
+                        if let Some(parent) = current.parent() {
+                            let parent_git_config = parent.join(".git").join("config");
+                            if let Ok(content) = tokio::fs::read_to_string(&parent_git_config).await
+                            {
+                                return Ok(content);
+                            }
+                            current = parent;
+                        } else {
+                            break;
+                        }
+                    }
+                    // No config found in the parent chain (or hit depth limit).
+                    Ok(String::new())
+                }
+            }
+        })
+    }
+
     fn git_stage(
         &self,
         workspace_id: WorkspaceId,

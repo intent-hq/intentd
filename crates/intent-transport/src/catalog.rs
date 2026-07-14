@@ -89,6 +89,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "git.discard",
     "git.fetch",
     "git.getBranches",
+    "git.getConfig",
     "git.getRemoteUrl",
     "git.numstat",
     "git.pull",

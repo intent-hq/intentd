@@ -1,5 +1,6 @@
 //! WSS end-to-end for the read-side `git.*` extensions added in
-//! PROTOCOL.md §5.6: `git.numstat`, `git.branchDiff`, and `git.getRemoteUrl`.
+//! PROTOCOL.md §5.6: `git.numstat`, `git.branchDiff`, `git.getRemoteUrl`,
+//! and `git.getConfig` (STAB-10a).
 //! Drives a real pinned-TLS WebSocket against a live `intentd serve --listen
 //! both` and asserts the response envelope shape from PROTOCOL.md §5 plus the
 //! `-32602` error envelope for the validation paths.
@@ -547,6 +548,84 @@ async fn git_get_remote_url_over_wss() {
     )
     .await;
     assert_eq!(resp["error"]["code"], json!(-32602));
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// `git.getConfig` — returns `{ config: String }` with the raw `.git/config`
+/// content for a git repository workspace, or empty string for remote/non-repo
+/// workspaces. Exercises the WSS envelope and validates error codes.
+#[tokio::test]
+async fn git_get_config_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("root-get-config");
+    let (daemon, port, cfg) = boot(&root).await;
+    let repo = make_source_repo(&daemon.scratch);
+    let mut ws = connect_ws(port, cfg).await;
+    let (ws_id, _wt) = create_workspace(&mut ws, &repo, "Git Read E2E — getConfig").await;
+
+    // Success: should return raw .git/config content.
+    let resp = wss_rpc(&mut ws, 3, "git.getConfig", json!({ "workspaceId": ws_id })).await;
+    let config = resp["result"]["config"].as_str().expect("config field");
+    assert!(
+        config.contains("[core]"),
+        "config has [core] section: {config}"
+    );
+
+    // Missing workspaceId → -32602 with "workspaceId is required".
+    let resp = wss_rpc(&mut ws, 4, "git.getConfig", json!({})).await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("workspaceId"),
+        "error mentions workspaceId: {:?}",
+        resp
+    );
+
+    // Non-existent workspace → -32602.
+    let resp = wss_rpc(
+        &mut ws,
+        5,
+        "git.getConfig",
+        json!({ "workspaceId": "nonexistent-ws-id" }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+
+    // Create a remote workspace (skipWorktree=true) → empty string.
+    let remote_resp = wss_rpc(
+        &mut ws,
+        6,
+        "workspace.create",
+        json!({ "title": "Remote test", "skipWorktree": true }),
+    )
+    .await;
+    let remote_id = remote_resp["result"]["workspace"]["id"]
+        .as_str()
+        .expect("remote workspace id");
+    let config_resp = wss_rpc(
+        &mut ws,
+        7,
+        "git.getConfig",
+        json!({ "workspaceId": remote_id }),
+    )
+    .await;
+    assert_eq!(config_resp["result"]["config"], json!(""));
+
+    // Non-repo workspace: remove .git file/directory → empty string.
+    let git_path = _wt.join(".git");
+    if git_path.is_file() {
+        std::fs::remove_file(&git_path).expect("remove .git file");
+    } else if git_path.is_dir() {
+        std::fs::remove_dir_all(&git_path).expect("remove .git dir");
+    }
+    let nonrepo_resp = wss_rpc(&mut ws, 8, "git.getConfig", json!({ "workspaceId": ws_id })).await;
+    assert_eq!(nonrepo_resp["result"]["config"], json!(""));
 
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);

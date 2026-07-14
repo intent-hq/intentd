@@ -162,3 +162,4 @@ The design lives in the monorepo under `docs/00_initial_porting/`:
 
 - [intent-hq/monorepo](https://github.com/intent-hq/monorepo) — engineering monorepo
   that mounts this repo at `packages/intentd` and holds the cross-cutting docs and tooling.
+
