@@ -2191,11 +2191,17 @@ impl Services {
                             }) => {
                                 // Update the session with sandbox metadata
                                 if let Ok(mut session) = self.store.get_agent_session(&aid).await {
-                                    session.sandbox_id =
-                                        Some(format!("sandbox-{}-{}", workspace_id.as_str(), aid.as_str()));
+                                    session.sandbox_id = Some(format!(
+                                        "sandbox-{}-{}",
+                                        workspace_id.as_str(),
+                                        aid.as_str()
+                                    ));
                                     session.sandbox_path = Some(path.to_string_lossy().to_string());
                                     session.sandbox_branch = Some(branch.clone());
-                                    let _ = self.store.update_agent_session(&workspace_id, &session).await;
+                                    let _ = self
+                                        .store
+                                        .update_agent_session(&workspace_id, &session)
+                                        .await;
 
                                     // Emit sandbox:created event
                                     crate::publish_event(
