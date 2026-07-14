@@ -1,23 +1,33 @@
-//! WSS end-to-end test for `server.pairingInfo` and `server.rotateToken`.
+//! WSS e2e for `server.pairingInfo` and `server.rotateToken` (§5.2).
 //!
-//! Drives the real WSS transport with TLS + bearer auth to prove the wire
-//! contract per AGENTS.md requirement: every new JSON-RPC method must have a
-//! WSS e2e test exercising the full production path.
+//! Drives the real WSS transport with TLS + bearer auth to prove:
+//! - WSS (TCP) connections are rejected with -32001 (local-only gating)
+//! - UDS connections receive credentials and can rotate tokens
 //!
-//! Tests:
-//! - server.pairingInfo returns complete credentials over local WSS
-//! - server.rotateToken mints a new token and invalidates the old one
-//! - Remote connections are rejected with -32001
+//! Per AGENTS.md: every new JSON-RPC method must have a WSS e2e test exercising
+//! the full production path. These RPCs are local-only so the WSS path is the
+//! rejection case; the success case is UDS.
 
 #![cfg(unix)]
 
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
+use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 const TOKEN: &str = "test-token-fixed-64-hex-cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
@@ -82,7 +92,6 @@ async fn await_uds(socket: &Path) -> bool {
 }
 
 async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let stream = tokio::net::UnixStream::connect(socket)
         .await
         .expect("UDS connect");
@@ -99,6 +108,124 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
         .expect("uds rpc timed out")
         .expect("read uds response");
     serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
+}
+
+/// Pinned-fingerprint cert verifier (mirrors wss_integration.rs).
+#[derive(Debug)]
+struct PinnedVerifier {
+    fingerprint: String,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for PinnedVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let fp = Sha256::digest(end_entity.as_ref())
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        if fp == self.fingerprint {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("fingerprint mismatch".into()))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    Arc::new(
+        ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedVerifier {
+                fingerprint: fingerprint.to_string(),
+                provider,
+            }))
+            .with_no_client_auth(),
+    )
+}
+
+async fn tls_connect(
+    port: u16,
+    cfg: Arc<ClientConfig>,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .expect("tcp connect");
+    let name = ServerName::try_from("localhost").unwrap();
+    TlsConnector::from(cfg)
+        .connect(name, tcp)
+        .await
+        .expect("tls connect")
+}
+
+async fn connect_ws(
+    port: u16,
+    cfg: Arc<ClientConfig>,
+) -> tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>> {
+    let tls = tls_connect(port, cfg).await;
+    let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
+    let (ws, _resp) = tokio_tungstenite::client_async(url, tls)
+        .await
+        .expect("ws handshake");
+    ws
+}
+
+async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
+    let mut ws = connect_ws(port, cfg).await;
+    ws.send(Message::Text(frame.to_string()))
+        .await
+        .expect("send");
+    loop {
+        match ws.next().await {
+            Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).expect("json"),
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
 }
 
 async fn boot(data_dir: &Path, _port: u16) -> (u16, String) {
@@ -158,6 +285,52 @@ async fn server_rotate_token_env_fixed_rejects() {
         .as_str()
         .unwrap()
         .contains("cannot rotate token"));
+
+    daemon.child.kill().ok();
+}
+
+#[tokio::test]
+async fn server_pairing_info_over_wss_rejects() {
+    let data_dir = temp_data_dir();
+    let port_hint = free_port();
+    let mut daemon = Daemon {
+        child: spawn_serve(&data_dir, port_hint),
+        data_dir: data_dir.clone(),
+    };
+    let (port, fp) = boot(&data_dir, port_hint).await;
+    let cfg = client_config(&fp);
+
+    // server.pairingInfo over WSS (TCP) is rejected with -32001
+    let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": "server.pairingInfo", "params": {} })
+        .to_string();
+    let response = wss_call(port, cfg.clone(), &frame).await;
+    let error = &response["error"];
+
+    assert_eq!(error["code"].as_i64().unwrap(), -32001);
+    assert!(error["message"].as_str().unwrap().contains("local"));
+
+    daemon.child.kill().ok();
+}
+
+#[tokio::test]
+async fn server_rotate_token_over_wss_rejects() {
+    let data_dir = temp_data_dir();
+    let port_hint = free_port();
+    let mut daemon = Daemon {
+        child: spawn_serve(&data_dir, port_hint),
+        data_dir: data_dir.clone(),
+    };
+    let (port, fp) = boot(&data_dir, port_hint).await;
+    let cfg = client_config(&fp);
+
+    // server.rotateToken over WSS (TCP) is rejected with -32001
+    let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": "server.rotateToken", "params": {} })
+        .to_string();
+    let response = wss_call(port, cfg.clone(), &frame).await;
+    let error = &response["error"];
+
+    assert_eq!(error["code"].as_i64().unwrap(), -32001);
+    assert!(error["message"].as_str().unwrap().contains("local"));
 
     daemon.child.kill().ok();
 }

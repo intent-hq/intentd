@@ -190,21 +190,26 @@ async fn handle_connection(
         }
         // A send failure means the writer/client is gone → end the connection.
         // UDS is the local control transport, so `is_local = true` (§12.3).
-        if !process_frame(
-            trimmed,
-            &api,
-            &bus,
-            &out_tx,
-            &mut subs,
-            &mut forwards,
-            &reverse,
-            control.as_ref(),
-            server_pairing_info.as_ref(),
-            &mut client_id,
-            true,
-        )
-        .await
-        {
+        // Wrap in connection context (is_tcp=false for UDS) so server.* RPCs can
+        // gate on real origin (§5.2).
+        let frame_ok = crate::context::with_connection_context(false, async {
+            process_frame(
+                trimmed,
+                &api,
+                &bus,
+                &out_tx,
+                &mut subs,
+                &mut forwards,
+                &reverse,
+                control.as_ref(),
+                server_pairing_info.as_ref(),
+                &mut client_id,
+                true,
+            )
+            .await
+        })
+        .await;
+        if !frame_ok {
             break Ok(());
         }
     };

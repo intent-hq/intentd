@@ -133,6 +133,9 @@ pub(crate) async fn process_frame(
         }
         if let Some(server_info) = server_pairing_info {
             if let Some(req) = crate::server::classify(&value) {
+                // server.* RPCs are local-only; gate on real connection origin (UDS vs TCP)
+                // not the locality flag. Task-local context set by transport (§5.2).
+                let is_local = !crate::context::is_tcp_connection();
                 return match crate::server::handle(req, server_info, is_local).await {
                     Some(frame) => out_tx.send(frame).await.is_ok(),
                     None => true,

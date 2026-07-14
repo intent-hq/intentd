@@ -555,7 +555,12 @@ impl WsInner {
                         // surface (those are served over the local UDS); pass `None`.
                         // `host.status` IS answered here, with the resolved WSS
                         // locality (remote unless overridden, §5.14).
-                        if !conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, None, self.server_pairing_info.as_ref(), &mut client_id, self.locality_is_local).await {
+                        // Wrap in connection context (is_tcp=true for WSS) so server.*
+                        // RPCs gate on real origin, not the locality flag (§5.2).
+                        let frame_ok = crate::context::with_connection_context(true, async {
+                            conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, None, self.server_pairing_info.as_ref(), &mut client_id, self.locality_is_local).await
+                        }).await;
+                        if !frame_ok {
                             break;
                         }
                     }

@@ -1,9 +1,11 @@
 //! Server pairing fast-path: `server.pairingInfo` + `server.rotateToken` (§5.2).
 //!
 //! These two methods expose pairing credentials (token + fingerprint + port + local IPs + hostname)
-//! and rotate the bearer token. They are LOCAL-ONLY: UDS and loopback connections only. Remote
-//! TCP connections get an auth error. This mirrors the `control::` fast-path pattern and sits
-//! one layer above the domain [`WorkspaceApi`] router, intercepted before JSON-RPC dispatch.
+//! and rotate the bearer token. They are LOCAL-ONLY: gated on the real connection origin (UDS vs TCP)
+//! via the task-local context set by the transport layer. WSS connections are ALWAYS remote (TCP),
+//! regardless of the `--mode local` locality flag. UDS connections are ALWAYS local. Remote callers
+//! receive a -32001 auth error. This mirrors the `control::` fast-path pattern and sits one layer
+//! above the domain [`WorkspaceApi`] router, intercepted before JSON-RPC dispatch.
 
 use std::future::Future;
 use std::pin::Pin;
