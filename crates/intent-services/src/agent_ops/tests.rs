@@ -1555,6 +1555,52 @@ async fn report_to_parent_cross_workspace_rejected_and_has_no_side_effects() {
 /// single parent wake is delivered by the child's terminal `agent:idle` via
 /// the still-armed completion watch, and the wake text carries the persisted
 /// completion report (Report:...).
+/// Test (a): double subscribe returns same ID, only one delivery
+#[tokio::test]
+async fn watch_completion_dedupe() {
+    let (_tmp, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    // First subscribe
+    let r1 = svc
+        .agent_watch_completion_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .unwrap();
+    let id1 = r1["subscriptionId"].as_str().unwrap();
+
+    // Second subscribe (should return same ID)
+    let r2 = svc
+        .agent_watch_completion_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .unwrap();
+    let id2 = r2["subscriptionId"].as_str().unwrap();
+
+    assert_eq!(
+        id1, id2,
+        "repeated subscribe must return same subscriptionId"
+    );
+
+    // Only one watch should exist
+    let watches = svc.list_watches_for_parent(&ws, &parent);
+    assert_eq!(watches.len(), 1, "only one watch should exist after dedupe");
+
+    // Deliver an idle event - parent should receive exactly ONE wake
+    let baseline = parent_message_count(&svc, &parent).await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "exactly one delivery even with dedupe"
+    );
+}
+
 #[tokio::test]
 async fn report_to_parent_metadata_only_no_immediate_wake_then_idle_delivers_one() {
     let (_t, svc, ws) = setup().await;

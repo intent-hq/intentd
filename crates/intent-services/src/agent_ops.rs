@@ -2376,6 +2376,7 @@ impl Services {
     /// (AS-5, the MCP `create_agent` front door): register a oneShot watch,
     /// mirroring the immediate-mode branch of `agent_delegate_op` above —
     /// including the deleted-parent guard (TS `selectIsAgentDeleted`).
+    /// Idempotent: reuses an existing watch when one already exists.
     pub(crate) async fn agent_watch_completion_op(
         &self,
         workspace_id: WorkspaceId,
@@ -2390,15 +2391,26 @@ impl Services {
         if parent_deleted {
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
-        let parent_name = parent_session.map(|s| s.name).unwrap_or_default();
-        let id = self.register_completion_watch(
-            &workspace_id,
-            parent_agent_id.clone(),
-            parent_name,
-            child_agent_id,
-            true,
-            None,
-        );
+        let parent_name = parent_session.as_ref().map(|s| s.name.clone());
+        // Dedupe: reuse an existing oneShot watch if present, otherwise create new.
+        let id = self
+            .find_and_refresh_ungrouped_watch(
+                &workspace_id,
+                &parent_agent_id,
+                &child_agent_id,
+                true,
+                parent_name.clone(),
+            )
+            .unwrap_or_else(|| {
+                self.register_completion_watch(
+                    &workspace_id,
+                    parent_agent_id.clone(),
+                    parent_name.unwrap_or_default(),
+                    child_agent_id,
+                    true,
+                    None,
+                )
+            });
         self.publish_subscriptions_changed(&workspace_id, &parent_agent_id)
             .await;
         Ok(json!({ "ok": true, "subscriptionId": id }))
@@ -2410,7 +2422,8 @@ impl Services {
     /// register a oneShot caller→target watch UNLESS the caller is a
     /// delegated background task session — those often send sibling
     /// coordination messages, and passively subscribing them creates noisy
-    /// wakeup cards unrelated to their own task.
+    /// wakeup cards unrelated to their own task. Idempotent: reuses an
+    /// existing watch when one already exists.
     pub(crate) async fn agent_watch_completion_for_sender_op(
         &self,
         workspace_id: WorkspaceId,
@@ -2425,15 +2438,26 @@ impl Services {
         if skip {
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
-        let caller_name = caller_session.map(|s| s.name).unwrap_or_default();
-        let id = self.register_completion_watch(
-            &workspace_id,
-            caller_agent_id.clone(),
-            caller_name,
-            target_agent_id,
-            true,
-            None,
-        );
+        let caller_name = caller_session.as_ref().map(|s| s.name.clone());
+        // Dedupe: reuse an existing oneShot watch if present, otherwise create new.
+        let id = self
+            .find_and_refresh_ungrouped_watch(
+                &workspace_id,
+                &caller_agent_id,
+                &target_agent_id,
+                true,
+                caller_name.clone(),
+            )
+            .unwrap_or_else(|| {
+                self.register_completion_watch(
+                    &workspace_id,
+                    caller_agent_id.clone(),
+                    caller_name.unwrap_or_default(),
+                    target_agent_id,
+                    true,
+                    None,
+                )
+            });
         self.publish_subscriptions_changed(&workspace_id, &caller_agent_id)
             .await;
         Ok(json!({ "ok": true, "subscriptionId": id }))

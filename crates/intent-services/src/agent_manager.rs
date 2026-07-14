@@ -1639,11 +1639,12 @@ impl AgentManager {
                 )
                 .await;
             // STAB-28: emit agent:idle after interrupt so completion watches fire.
-            // The aborted worker never reaches run_prompt_turn's idle-emit path, so
-            // we must emit here. Without this, a parent that re-messages via agent.send
-            // after the child settles registers a completion watch that never fires
-            // (no idle event → watch never delivered). Only emit when the agent has
-            // no queued ready-to-send messages (mirrors run_prompt_turn line 587).
+            // The aborted worker never reaches the worker-loop's idle-emit path
+            // (line ~2648), so we must emit here. Without this, a parent that
+            // re-messages via agent.send after the child settles registers a
+            // completion watch that never fires (no idle event → watch never
+            // delivered). Only emit when the agent has no queued ready-to-send
+            // messages (settlement coalescing: mirrors the worker-loop check).
             if !self.services.has_ready_to_send(agent_id) {
                 let mut data = json!({
                     "agentId": agent_id.0,
