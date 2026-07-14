@@ -20,7 +20,9 @@ use intent_core::{
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
-use intent_transport::{ensure_tls_certificate, serve_uds, TokenStore, WsApiServer, WsOptions};
+use intent_transport::{
+    ensure_tls_certificate, serve_uds, AsyncTokenStore, TokenStore, WsApiServer, WsOptions,
+};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
@@ -186,8 +188,9 @@ async fn start(opts: WsOptions) -> Server {
 async fn start_with_auggie(mut opts: WsOptions, auggie_bin: Option<std::path::PathBuf>) -> Server {
     let (api, bus, store, dir) = make_services(auggie_bin).await;
     let tls = ensure_tls_certificate(&dir).expect("cert");
-    let token_store = Arc::new(MemTokenStore::default());
-    token_store.store_token(TOKEN).unwrap();
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     if opts.base_port == WsOptions::default().base_port {
         opts.base_port = free_port();
     }
@@ -1158,8 +1161,9 @@ async fn bind_fails_fast_on_occupied_port() {
     let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, base)).unwrap();
     let (api, bus, _store, dir) = make_services(None).await;
     let tls = ensure_tls_certificate(&dir).expect("cert");
-    let token_store = Arc::new(MemTokenStore::default());
-    token_store.store_token(TOKEN).unwrap();
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     let mut opts = WsOptions {
         base_port: base,
         ..WsOptions::default()
