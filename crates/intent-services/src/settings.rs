@@ -1158,9 +1158,9 @@ pub async fn max_concurrent_agents(store: &Store) -> Option<usize> {
     match store.get_setting("agents.maxConcurrent").await {
         Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
             .ok()
-            .and_then(|v| v.as_u64()) // parse as u64 directly to avoid float saturation
-            .filter(|&n| n > 0 && n <= 200) // reject 0, negative, and unreasonably large values
-            .and_then(|n| usize::try_from(n).ok()),
+            .and_then(|v| v.as_f64()) // accept both integer and whole-valued float forms
+            .filter(|&n| n.is_finite() && n.fract() == 0.0 && n > 0.0 && n <= 200.0)
+            .and_then(|n| usize::try_from(n as u64).ok()),
         _ => None,
     }
 }
@@ -1676,6 +1676,13 @@ mod tests {
         // Positive integer → Some(cap).
         store
             .set_setting("agents.maxConcurrent", "12")
+            .await
+            .unwrap();
+        assert_eq!(max_concurrent_agents(&store).await, Some(12));
+
+        // Whole-valued float (e.g., 12.0 from some JSON serializers) → Some(cap).
+        store
+            .set_setting("agents.maxConcurrent", "12.0")
             .await
             .unwrap();
         assert_eq!(max_concurrent_agents(&store).await, Some(12));
