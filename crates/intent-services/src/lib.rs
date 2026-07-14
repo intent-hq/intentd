@@ -90,7 +90,7 @@ mod tests;
 
 pub use mcp_servers::McpHub;
 pub use sandbox_ops::ProvisionOutcome;
-pub use settings::{InMemorySecretStore, SecretStore};
+pub use settings::{max_concurrent_agents, InMemorySecretStore, SecretStore};
 pub use terminal_ops::PtyTerminalHost;
 
 /// Re-export the auggie discovery surface so the transport layer can reuse the

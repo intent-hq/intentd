@@ -1934,6 +1934,7 @@ dependencies = [
  "intent-sentry",
  "intent-sourcecontrol",
  "intent-store",
+ "libc",
  "nix 0.29.0",
  "notify",
  "serde",

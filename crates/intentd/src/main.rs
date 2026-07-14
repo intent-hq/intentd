@@ -11,8 +11,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use intent_core::{Config, ServerControl, WorkspaceApi};
 use intent_services::{
-    default_process_cap, AgentManager, BusEventSink, EventBus, FileWatcher, PermissionPolicy,
-    Services,
+    default_process_cap, max_concurrent_agents, AgentManager, BusEventSink, EventBus, FileWatcher,
+    PermissionPolicy, Services,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -408,6 +408,13 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     // per-connection `ReverseChannel` here; agent-initiated `browser.exec`
     // routes through the same registry via `Services::with_reverse_dispatch`.
     let reverse_registry = Arc::new(PrimaryReverseRegistry::new());
+    // Resolve the concurrent agent cap: positive stored value → explicit override;
+    // 0/unset/invalid → auto (RAM-based default_process_cap). The setting applies
+    // on daemon restart (§9.8 agents.maxConcurrent). Must read before the store
+    // is moved into `services`.
+    let process_cap = max_concurrent_agents(&store)
+        .await
+        .unwrap_or_else(default_process_cap);
     // The services surface publishes CRUD change events onto the same bus that
     // transport subscriptions read, so a mutation on one connection streams to
     // subscribers on another (§10).
@@ -435,7 +442,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
         AgentManager::new(
             services.clone(),
             Arc::new(BusEventSink::new(bus.clone())),
-            default_process_cap(),
+            process_cap,
         )
         .with_policy(permission_policy),
     );
