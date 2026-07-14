@@ -1662,7 +1662,6 @@ impl Services {
         content: String,
         message_id: Option<String>,
     ) -> Result<Value> {
-        let session = self.store.get_agent_session(&agent_id).await?;
         let message_id = message_id.unwrap_or_else(new_message_id);
         let blocks = user_content_blocks(&content);
         let created_at = now_iso();
@@ -1674,12 +1673,19 @@ impl Services {
             Ok(_) => {
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
-                if let Err(e) = self
-                    .store
-                    .refresh_agent_session_timestamp(&session.workspace_id, &agent_id, &created_at)
-                    .await
-                {
-                    tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+                // Fetch the session to get workspace_id; best-effort (logged on error).
+                if let Ok(session) = self.store.get_agent_session(&agent_id).await {
+                    if let Err(e) = self
+                        .store
+                        .refresh_agent_session_timestamp(
+                            &session.workspace_id,
+                            &agent_id,
+                            &created_at,
+                        )
+                        .await
+                    {
+                        tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+                    }
                 }
                 Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
             }
