@@ -790,7 +790,8 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
     let mut saw_failed = false;
     let mut saw_end_from_exhaustion = false;
     let mut saw_status_error = false;
-    for _ in 0..50 {
+    // Use a higher bound since continue skips unrelated agent events
+    for _ in 0..200 {
         let frame = wss_event(&mut sub, 30).await;
         // Filter by agent ID to avoid breaking on another agent's events
         let event_agent_id = frame["params"]["event"]["data"]["agentId"].as_str();
