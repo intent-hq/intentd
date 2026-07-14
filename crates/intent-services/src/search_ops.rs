@@ -23,11 +23,20 @@ pub(crate) const STREAM_BATCH_SIZE: usize = 10;
 
 /// Resolve a workspace's search root (its worktree path), or `None` when the
 /// workspace has no usable path (remote/non-repo) — callers return an empty
-/// result in that case.
+/// result in that case. When `caller_agent_id` is provided and the agent has a
+/// sandbox, the search root is the sandbox path (sandboxed agent containment).
 pub(crate) async fn search_root(
     store: &Store,
     workspace_id: &WorkspaceId,
+    caller_agent_id: Option<&intent_core::AgentId>,
 ) -> Result<Option<PathBuf>> {
+    if let Some(agent_id) = caller_agent_id {
+        if let Ok(session) = store.get_agent_session(agent_id).await {
+            if let Some(sandbox_path) = session.sandbox_path {
+                return Ok(Some(sandbox_path.into()));
+            }
+        }
+    }
     let ws = store.get_workspace(workspace_id).await?;
     Ok(crate::git_ops::worktree_path(&ws))
 }

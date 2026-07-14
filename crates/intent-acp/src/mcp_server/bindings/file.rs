@@ -28,13 +28,17 @@ pub(crate) const PRELUDE: &str = r#"
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&intent_core::AgentId>,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
+    let caller = caller_agent_id.cloned();
     match method {
         "read" => {
             let path = req_str(args, "path").map_err(|_| "path is required".to_string())?;
-            api.file_read(ws.clone(), path).await.map_err(map_err)
+            api.file_read(ws.clone(), path, caller)
+                .await
+                .map_err(map_err)
         }
         "write" => {
             let path =
@@ -44,29 +48,35 @@ pub(crate) async fn dispatch(
                 .and_then(Value::as_str)
                 .ok_or_else(|| "path and content are required".to_string())?
                 .to_string();
-            api.file_write(ws.clone(), path, content)
+            api.file_write(ws.clone(), path, content, caller)
                 .await
                 .map_err(map_err)
         }
         "list" => {
             // `path` defaults to `"."` (reference builder default).
             let path = opt_str(args, "path").unwrap_or_else(|| ".".to_string());
-            api.file_list(ws.clone(), path).await.map_err(map_err)
+            api.file_list(ws.clone(), path, caller)
+                .await
+                .map_err(map_err)
         }
         "delete" => {
             let path = req_str(args, "path").map_err(|_| "path is required".to_string())?;
-            api.file_delete(ws.clone(), path).await.map_err(map_err)
+            api.file_delete(ws.clone(), path, caller)
+                .await
+                .map_err(map_err)
         }
         "mkdir" => {
             let path = req_str(args, "path").map_err(|_| "path is required".to_string())?;
-            api.file_mkdir(ws.clone(), path).await.map_err(map_err)
+            api.file_mkdir(ws.clone(), path, caller)
+                .await
+                .map_err(map_err)
         }
         "rename" => {
             let old_path = req_str(args, "oldPath")
                 .map_err(|_| "Both oldPath and newPath are required".to_string())?;
             let new_path = req_str(args, "newPath")
                 .map_err(|_| "Both oldPath and newPath are required".to_string())?;
-            api.file_rename(ws.clone(), old_path, new_path)
+            api.file_rename(ws.clone(), old_path, new_path, caller)
                 .await
                 .map_err(map_err)
         }

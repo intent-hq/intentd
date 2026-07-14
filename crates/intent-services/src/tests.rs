@@ -9343,7 +9343,7 @@ mod file_ops_service {
         let svc = Services::new(store);
 
         let written = svc
-            .file_write(ws.clone(), "notes/x.txt".to_string(), "hi".to_string())
+            .file_write(ws.clone(), "notes/x.txt".to_string(), "hi".to_string(), None)
             .await
             .expect("write");
         assert_eq!(
@@ -9352,13 +9352,13 @@ mod file_ops_service {
         );
 
         let read = svc
-            .file_read(ws.clone(), "notes/x.txt".to_string())
+            .file_read(ws.clone(), "notes/x.txt".to_string(), None)
             .await
             .expect("read");
         assert_eq!(read, serde_json::Value::String("hi".to_string()));
 
         let listed = svc
-            .file_list(ws.clone(), "notes".to_string())
+            .file_list(ws.clone(), "notes".to_string(), None)
             .await
             .expect("list");
         assert_eq!(
@@ -9366,7 +9366,7 @@ mod file_ops_service {
             serde_json::json!([{ "name": "x.txt", "type": "file" }])
         );
 
-        let denied = svc.file_read(ws.clone(), "../escape".to_string()).await;
+        let denied = svc.file_read(ws.clone(), "../escape".to_string(), None).await;
         assert!(matches!(denied, Err(Error::Internal(_))));
 
         let _ = std::fs::remove_dir_all(&dir);

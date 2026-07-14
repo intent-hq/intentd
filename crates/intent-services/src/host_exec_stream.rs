@@ -259,7 +259,7 @@ pub async fn start_stream(
     // via a public helper so the two surfaces stay bit-identical).
     let cwd_resolved = match (common.cwd.as_deref(), common.workspace_id.as_deref()) {
         (Some(cwd), Some(ws_id)) => {
-            Some(host_exec::resolve_cwd_within_workspace(api, ws_id, cwd).await?)
+            Some(host_exec::resolve_cwd_within_workspace(api, ws_id, cwd, None).await?)
         }
         _ => None,
     };

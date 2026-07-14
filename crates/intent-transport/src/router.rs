@@ -2445,13 +2445,13 @@ async fn dispatch(
         "file.read" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
-            api.file_read(ws, path).await.map_err(domain_to_rpc)
+            api.file_read(ws, path, None).await.map_err(domain_to_rpc)
         }
         "file.write" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
             let content = require_str_param(params, "content")?;
-            api.file_write(ws, path, content)
+            api.file_write(ws, path, content, None)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -2459,7 +2459,7 @@ async fn dispatch(
             // `path` is optional, defaulting to "." (TS builder default).
             let ws = require_ws_note(params)?;
             let path = opt_str(params, "path").unwrap_or_else(|| ".".to_string());
-            api.file_list(ws, path).await.map_err(domain_to_rpc)
+            api.file_list(ws, path, None).await.map_err(domain_to_rpc)
         }
         "file.tree" => {
             // `path` is optional, defaulting to the workspace root ("."). The FE
@@ -2471,18 +2471,18 @@ async fn dispatch(
         "file.delete" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
-            api.file_delete(ws, path).await.map_err(domain_to_rpc)
+            api.file_delete(ws, path, None).await.map_err(domain_to_rpc)
         }
         "file.mkdir" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
-            api.file_mkdir(ws, path).await.map_err(domain_to_rpc)
+            api.file_mkdir(ws, path, None).await.map_err(domain_to_rpc)
         }
         "file.rename" => {
             let ws = require_ws_note(params)?;
             let old_path = require_str_param(params, "oldPath")?;
             let new_path = require_str_param(params, "newPath")?;
-            api.file_rename(ws, old_path, new_path)
+            api.file_rename(ws, old_path, new_path, None)
                 .await
                 .map_err(domain_to_rpc)
         }
