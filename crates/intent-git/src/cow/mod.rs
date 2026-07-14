@@ -164,6 +164,32 @@ mod tests {
     }
 
     #[test]
+    fn test_cow_probe_target_dir() {
+        // Test using target/test-cow-* paths to see if same-volume detection works
+        let workspace_root = std::env::current_dir().unwrap();
+        let src = workspace_root.join("target/test-cow-src-debug");
+        let dst = workspace_root.join("target/test-cow-dst-debug");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+
+        let result = cow_probe(&src, &dst);
+        eprintln!("cow_probe result for target dir paths: {:?}", result);
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dst);
+
+        assert!(result.is_ok());
+        // On APFS macOS, target/ paths should be Supported
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(CowSupport::Unsupported) = result {
+                eprintln!("WARNING: CoW unsupported for same-volume target/ paths - this may be a probe bug!");
+            }
+        }
+    }
+
+    #[test]
     fn test_cow_clone_basic() {
         let tmpdir = std::env::temp_dir();
         let src = tmpdir.join("cow_clone_src_test");

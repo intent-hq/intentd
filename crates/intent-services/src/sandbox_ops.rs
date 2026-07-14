@@ -311,6 +311,7 @@ mod tests {
     use intent_core::WorkspaceStatus;
     use intent_store::Store;
     use std::fs;
+    use std::path::Path;
 
     struct TempDb {
         path: PathBuf,
@@ -342,6 +343,29 @@ mod tests {
     fn temp_repo(name: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::TempDir::new().unwrap();
         let repo_path = dir.path().join(name);
+        init_test_repo(&repo_path);
+        (dir, repo_path)
+    }
+
+    /// Create a test repo under a specific parent directory (for same-volume CoW tests)
+    /// Uses workspace root's target dir, not crate's target dir, to ensure same volume.
+    fn temp_repo_in_target(name: &str) -> (PathBuf, PathBuf) {
+        // Navigate to workspace root (up from crates/intent-services)
+        let workspace_root = std::env::current_dir()
+            .unwrap()
+            .ancestors()
+            .nth(2) // packages/intentd
+            .unwrap()
+            .to_path_buf();
+        let test_root = workspace_root
+            .join("target")
+            .join(format!("test-sandbox-{}", uuid::Uuid::new_v4()));
+        let repo_path = test_root.join(name);
+        init_test_repo(&repo_path);
+        (test_root, repo_path)
+    }
+
+    fn init_test_repo(repo_path: &Path) {
         fs::create_dir_all(&repo_path).unwrap();
 
         // Initialize a git repository
@@ -356,8 +380,6 @@ mod tests {
         let tree = repo.find_tree(tree_id).unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
             .unwrap();
-
-        (dir, repo_path)
     }
 
     fn workspace_for_repo(repo_path: &PathBuf) -> Workspace {
@@ -403,13 +425,12 @@ mod tests {
     #[tokio::test]
     async fn provision_creates_sandbox_and_leaves_source_untouched() {
         let (store, _db) = temp_store().await;
-        let (_repo_dir_guard, repo_path) = temp_repo("source");
+        let (test_root, repo_path) = temp_repo_in_target("source");
 
-        // Provision sandbox (both source and dest in std::env::temp_dir() ensures same volume)
-        let workspaces_root =
-            std::env::temp_dir().join(format!("intentd-test-{}", uuid::Uuid::new_v4()));
+        // Use same test_root for workspaces to ensure same volume
+        let workspaces_root = test_root.join("workspaces");
 
-        // Early probe check - skip test if CoW not available (e.g., tmpfs, non-APFS)
+        // Early probe check - skip test if CoW not available (e.g., non-CoW filesystem)
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
         if probe == CowSupport::Unsupported {
@@ -417,7 +438,7 @@ mod tests {
                 "Skipping test: CoW not supported between {:?} and {:?}",
                 repo_path, workspaces_root
             );
-            let _ = fs::remove_dir_all(&workspaces_root);
+            let _ = fs::remove_dir_all(&test_root);
             return;
         }
 
@@ -534,17 +555,16 @@ mod tests {
         assert!(sandbox.is_some());
 
         // Clean up
-        let _ = fs::remove_dir_all(&workspaces_root);
+        let _ = fs::remove_dir_all(&test_root);
     }
 
     #[tokio::test]
     async fn provision_dirty_state_creates_snapshot_commit() {
         let (store, _db) = temp_store().await;
-        let (_repo_dir_guard, repo_path) = temp_repo("source-dirty");
+        let (test_root, repo_path) = temp_repo_in_target("source-dirty");
 
-        // Provision sandbox (both source and dest in std::env::temp_dir() ensures same volume)
-        let workspaces_root =
-            std::env::temp_dir().join(format!("intentd-test-{}", uuid::Uuid::new_v4()));
+        // Use same test_root for workspaces to ensure same volume
+        let workspaces_root = test_root.join("workspaces");
 
         // Early probe check - skip test if CoW not available
         fs::create_dir_all(&workspaces_root).unwrap();
@@ -554,7 +574,7 @@ mod tests {
                 "Skipping test: CoW not supported between {:?} and {:?}",
                 repo_path, workspaces_root
             );
-            let _ = fs::remove_dir_all(&workspaces_root);
+            let _ = fs::remove_dir_all(&test_root);
             return;
         }
 
@@ -687,17 +707,16 @@ mod tests {
         );
 
         // Clean up
-        let _ = fs::remove_dir_all(&workspaces_root);
+        let _ = fs::remove_dir_all(&test_root);
     }
 
     #[tokio::test]
     async fn discard_sandbox_removes_directory_and_record() {
         let (store, _db) = temp_store().await;
-        let (_repo_dir_guard, repo_path) = temp_repo("discard-test");
+        let (test_root, repo_path) = temp_repo_in_target("discard-test");
 
-        // Provision sandbox (both source and dest in std::env::temp_dir() ensures same volume)
-        let workspaces_root =
-            std::env::temp_dir().join(format!("intentd-test-{}", uuid::Uuid::new_v4()));
+        // Use same test_root for workspaces to ensure same volume
+        let workspaces_root = test_root.join("workspaces");
 
         // Early probe check - skip test if CoW not available
         fs::create_dir_all(&workspaces_root).unwrap();
@@ -707,7 +726,7 @@ mod tests {
                 "Skipping test: CoW not supported between {:?} and {:?}",
                 repo_path, workspaces_root
             );
-            let _ = fs::remove_dir_all(&workspaces_root);
+            let _ = fs::remove_dir_all(&test_root);
             return;
         }
 
@@ -791,7 +810,7 @@ mod tests {
         );
 
         // Clean up
-        let _ = fs::remove_dir_all(&workspaces_root);
+        let _ = fs::remove_dir_all(&test_root);
     }
 
     #[tokio::test]
@@ -909,13 +928,21 @@ mod tests {
         };
         store.insert_agent_session(&agent).await.unwrap();
 
-        // Use a cross-volume destination to force CoW to fail
-        // On most systems, /tmp is a different volume from the user's home directory
+        // Try to use a cross-volume destination
+        // On most systems, /tmp is a different volume, but on this APFS machine it's the same
         let cross_volume_root = std::env::temp_dir().join(format!(
             "intentd-cross-volume-test-{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&cross_volume_root).unwrap();
+
+        // Probe first to check if we actually have a cross-volume scenario
+        let probe = cow_probe(&repo_path, &cross_volume_root).unwrap();
+        if probe == CowSupport::Supported {
+            eprintln!("Skipping test: test environment has no cross-volume paths available");
+            let _ = fs::remove_dir_all(&cross_volume_root);
+            return;
+        }
 
         let config = ProvisionConfig {
             workspaces_root: cross_volume_root.clone(),
@@ -926,29 +953,26 @@ mod tests {
             .unwrap();
 
         // When CoW is not supported, we return Unsupported and copy ZERO bytes
-        match outcome {
-            ProvisionOutcome::Unsupported => {
-                // Verify no sandbox directory was created
-                let would_be_path = config
-                    .workspaces_root
-                    .join(ws.id.0.to_string())
-                    .join(agent_id.0.to_string());
-                assert!(
-                    !would_be_path.exists(),
-                    "No sandbox directory should exist when CoW is unsupported"
-                );
+        let ProvisionOutcome::Unsupported = outcome else {
+            panic!("Expected Unsupported outcome for cross-volume CoW attempt");
+        };
 
-                // Verify no sandbox record was created in the database
-                let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap();
-                assert!(
-                    sandbox.is_none(),
-                    "No sandbox record should exist when CoW is unsupported"
-                );
-            }
-            ProvisionOutcome::Supported { .. } => {
-                panic!("Expected Unsupported outcome for cross-volume CoW attempt")
-            }
-        }
+        // Verify no sandbox directory was created
+        let would_be_path = config
+            .workspaces_root
+            .join(ws.id.0.to_string())
+            .join(agent_id.0.to_string());
+        assert!(
+            !would_be_path.exists(),
+            "No sandbox directory should exist when CoW is unsupported"
+        );
+
+        // Verify no sandbox record was created in the database
+        let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap();
+        assert!(
+            sandbox.is_none(),
+            "No sandbox record should exist when CoW is unsupported"
+        );
 
         // Clean up
         let _ = fs::remove_dir_all(&cross_volume_root);
