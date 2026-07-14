@@ -9098,15 +9098,49 @@ impl WorkspaceApi for Services {
                 return Ok(String::new());
             };
             // Read `.git/config` from the worktree's git directory. For linked
-            // worktrees, `.git` is a file pointing to the worktree metadata, and
-            // the config is at the main repo's `.git/config`. Walk up from the
-            // worktree path to find the parent git root if needed.
-            let git_config_path = path.join(".git").join("config");
-            match tokio::fs::read_to_string(&git_config_path).await {
+            // worktrees, `.git` is a file containing `gitdir: <path>`. Resolve the
+            // pointer, then look for `commondir` (which points to the main repo's
+            // `.git` if present). Fallback to parent-walk for nested repo parity.
+            let git_path = path.join(".git");
+            let config_path = if git_path.is_file() {
+                // Linked worktree: read the gitdir pointer file.
+                match tokio::fs::read_to_string(&git_path).await {
+                    Ok(content) => {
+                        // Strip `gitdir: ` prefix and optional quotes, then trim whitespace.
+                        let gitdir = content
+                            .strip_prefix("gitdir: ")
+                            .map(|s| s.trim())
+                            .map(|s| {
+                                // If quoted, strip the quotes.
+                                if s.starts_with('"') && s.ends_with('"') && s.len() > 1 {
+                                    &s[1..s.len() - 1]
+                                } else {
+                                    s
+                                }
+                            })
+                            .unwrap_or_else(|| content.trim());
+                        let gitdir_path = std::path::PathBuf::from(gitdir);
+                        // Check for commondir (points to main repo .git for linked worktrees).
+                        let commondir_path = gitdir_path.join("commondir");
+                        if let Ok(commondir_content) =
+                            tokio::fs::read_to_string(&commondir_path).await
+                        {
+                            let commondir = commondir_content.trim();
+                            gitdir_path.join(commondir).join("config")
+                        } else {
+                            gitdir_path.join("config")
+                        }
+                    }
+                    Err(_) => git_path.join("config"),
+                }
+            } else {
+                git_path.join("config")
+            };
+            match tokio::fs::read_to_string(&config_path).await {
                 Ok(content) => Ok(content),
                 Err(_) => {
                     // If direct read fails, try parent directories (mirroring the FE
-                    // `readGitConfig` fallback logic).
+                    // `readGitConfig` fallback logic for nested repos).
                     let mut current = path.as_path();
                     while let Some(parent) = current.parent() {
                         let parent_git_config = parent.join(".git").join("config");

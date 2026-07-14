@@ -1344,8 +1344,8 @@ async fn dispatch(
             to_result_value(&status)
         }
         "git.getConfig" => {
-            let ws = require_workspace_id(params)?;
-            let config = api.git_get_config(ws).await.map_err(workspace_err)?;
+            let ws = require_ws_note(params)?;
+            let config = api.git_get_config(ws).await.map_err(domain_to_rpc)?;
             Ok(json!({ "config": config }))
         }
         "git.stage" => {
