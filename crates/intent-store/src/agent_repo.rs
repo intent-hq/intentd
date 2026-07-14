@@ -248,6 +248,51 @@ impl Store {
         Ok(())
     }
 
+    /// Refresh `updated_at` to the current timestamp whenever a message is
+    /// appended to an agent session (STAB-19 fix). The FE agent-card timestamp
+    /// is derived from `agent_session.updated_at`, so bumping it on every message
+    /// (both user and agent messages, including the dequeued-message path) ensures
+    /// the UI reflects real activity, not just status transitions. Scoped to
+    /// `workspace_id` (defense-in-depth guard — matches the pattern of
+    /// `set_agent_session_status` and `update_agent_session`). `NotFound` if
+    /// the session is absent or the workspace does not match.
+    pub async fn refresh_agent_session_timestamp(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        updated_at: &str,
+    ) -> Result<()> {
+        let rows =
+            sqlx::query("UPDATE agent_session SET updated_at=? WHERE id=? AND workspace_id=?")
+                .bind(updated_at)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .execute(self.pool())
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("refresh agent session timestamp failed: {e}"))
+                })?
+                .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(())
+    }
+
+    /// Reset all `is_active=1` rows to `is_active=0` unconditionally (Wave B
+    /// post-restart recovery). ACP sessions are process-local and cannot survive
+    /// a daemon restart, so any `is_active=1` flag after boot is stale. Called
+    /// early in startup (before listeners) to ensure no races with live turn
+    /// spawns. Returns the count of rows reset.
+    pub async fn reset_all_active_flags(&self) -> Result<usize> {
+        let rows = sqlx::query("UPDATE agent_session SET is_active=0 WHERE is_active=1")
+            .execute(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("reset active flags failed: {e}")))?
+            .rows_affected();
+        Ok(rows as usize)
+    }
+
     /// Set `acp_session_id` write-once (the provider `session:created` path).
     /// Scoped to `workspace_id` (defense-in-depth). Errors if it is already set
     /// to a different value (§9.5). `NotFound` if the session is absent or the
@@ -451,6 +496,26 @@ impl Store {
     /// `messageId` at turn start so streaming block ids `{messageId}:{index}`
     /// match the persisted blocks — CS-0 D1), allocating the next monotonic
     /// `seq` and returning the persisted [`AgentMessage`].
+    ///
+    /// ## Transaction boundary
+    ///
+    /// This operation executes TWO separate queries (SELECT next seq, INSERT
+    /// message) without an explicit transaction wrapper. Each query runs in
+    /// SQLite's autocommit mode as its own implicit transaction. The schema
+    /// enforces `UNIQUE(agent_id, seq)`, so concurrent appends racing on the
+    /// SELECT phase will cause one INSERT to fail with a constraint violation.
+    ///
+    /// **Crash safety**: Because `seq` is computed as `COALESCE(MAX(seq), -1) + 1`
+    /// rather than a persisted counter, a crash between SELECT and INSERT does
+    /// NOT create a durable gap — the next caller recomputes seq from the same
+    /// MAX. Only the INSERT commits data, so once INSERT completes the message
+    /// row is durable. No committed message can be lost. Assistant-message append
+    /// (the streaming path) is additionally protected by the AgentManager's
+    /// per-agent single-flight slot, serializing turns for one agent and
+    /// eliminating the seq-race window on that hot path. User-message appends
+    /// (sendMessage, forceMessage, wake delivery) can still race if fired
+    /// concurrently for one agent, but the UNIQUE constraint will reject
+    /// duplicates rather than silently corrupting the seq order.
     pub async fn append_agent_message_with_id(
         &self,
         agent_id: &AgentId,

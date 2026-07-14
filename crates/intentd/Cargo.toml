@@ -13,6 +13,9 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+directories = { workspace = true }
+sqlx = { workspace = true }
 
 intent-core = { path = "../intent-core" }
 intent-store = { path = "../intent-store" }

@@ -125,6 +125,14 @@ pub const LINE_ATTRIBUTION_UPDATED: &str = "line-attribution:updated";
 // Task events.
 pub const TASK_STATUS_CHANGED: &str = "task:status-changed";
 pub const TASK_READY_TASKS_CHANGED: &str = "task:ready-tasks-changed";
+// Task↔agent linkage events (new in intentd; PROTOCOL §5.4 / §6.5). Migrate
+// the renderer-only `taskAgentAssociations` slice into daemon-emitted events.
+// Self-sufficient payloads carry the full row so subscribers rebuild the
+// `byNoteId → byTaskKey → link` map without a follow-up `listAgentLinks`.
+// `task:agent-linked` → `{ workspaceId, noteId, taskKey, link: TaskAgentLink }`;
+// `task:agent-unlinked` → `{ workspaceId, noteId, taskKey }`.
+pub const TASK_AGENT_LINKED: &str = "task:agent-linked";
+pub const TASK_AGENT_UNLINKED: &str = "task:agent-unlinked";
 
 // Terminal events.
 pub const TERMINAL_COMMAND: &str = "terminal:command";
@@ -173,6 +181,11 @@ pub const WORKSPACE_ATTENTION_CHANGED: &str = "workspace:attention-changed";
 // The self-sufficient payload `{ workspaceId, tokenUsage: TokenUsage }` carries
 // the new snapshot so the FE re-renders without a follow-up `getTokenUsage`.
 pub const WORKSPACE_TOKEN_USAGE_CHANGED: &str = "workspace:tokenUsage-changed";
+// Chat context items changed for a workspace (new in intentd; PROTOCOL §5.1 /
+// §6.5). Emitted by `workspace.updateContext`; the self-sufficient payload
+// `{ workspaceId, items: ContextItem[] }` carries the new authoritative list
+// so subscribers refresh without a follow-up `workspace.getContext`.
+pub const WORKSPACE_CONTEXT_CHANGED: &str = "workspace:context-changed";
 
 // Spec / goal events.
 pub const SPEC_UPDATED: &str = "spec:updated";
@@ -309,6 +322,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     LINE_ATTRIBUTION_UPDATED,
     TASK_STATUS_CHANGED,
     TASK_READY_TASKS_CHANGED,
+    TASK_AGENT_LINKED,
+    TASK_AGENT_UNLINKED,
     TERMINAL_COMMAND,
     TERMINAL_DATA,
     TERMINAL_EXIT,
@@ -329,6 +344,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED,
     WORKSPACE_TOKEN_USAGE_CHANGED,
+    WORKSPACE_CONTEXT_CHANGED,
     SPEC_UPDATED,
     GOAL_UPDATED,
     COMMENT_ADDED,

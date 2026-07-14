@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -21,11 +21,16 @@ use intent_transport::{
     SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
+use sqlx::Row;
 
 mod client;
 mod import;
 mod service;
 use client::rpc_call;
+
+/// Global guard for the file log writer thread. Must be kept alive for the
+/// process lifetime to ensure file logging continues working.
+static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
 /// intentd — local-first JSON-RPC daemon for the Intent domain model.
 #[derive(Debug, Parser)]
@@ -130,6 +135,7 @@ enum ServiceAction {
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
+    install_panic_hook();
     match Cli::parse().command {
         Command::Serve {
             listen,
@@ -234,12 +240,119 @@ fn to_exit(result: anyhow::Result<()>) -> ExitCode {
 }
 
 fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+    // Resolve the log file path: INTENTD_DATA_DIR/intentd.log
+    let log_dir = match std::env::var_os("INTENTD_DATA_DIR") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            if let Some(proj) = directories::ProjectDirs::from("", "", "intentd") {
+                proj.data_dir().to_path_buf()
+            } else {
+                // Fallback to current directory if platform dirs unavailable
+                std::path::PathBuf::from(".")
+            }
+        }
+    };
+
+    // Create the data directory if it doesn't exist
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("WARN: failed to create log directory {:?}: {}", log_dir, e);
+    }
+
+    // Set up file appender with rotation: keep ~5 files, rotate daily
+    // Note: tracing-appender's max_log_files works with time-based rotation
+    // (DAILY/HOURLY/etc), not size-based rotation. We use daily rotation
+    // to prevent unbounded growth on long-running daemons.
+    let file_appender = match tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .max_log_files(5)
+        .filename_prefix("intentd")
+        .filename_suffix("log")
+        .build(log_dir)
+    {
+        Ok(appender) => Some(appender),
+        Err(e) => {
+            eprintln!(
+                "WARN: failed to create log file appender: {}, continuing with stderr-only logging",
+                e
+            );
+            None
+        }
+    };
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
+
+    // Set up dual output: stderr (for interactive use) and optionally file (for diagnostics)
+    let stderr_layer = fmt::layer().with_writer(std::io::stderr);
+
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr_layer);
+
+    if let Some(appender) = file_appender {
+        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+        let file_layer = fmt::layer().with_writer(non_blocking).with_ansi(false);
+        match subscriber.with(file_layer).try_init() {
+            Ok(_) => {
+                // Store the guard in a static to keep it alive for the process lifetime.
+                // Dropping it would stop the background file writer thread.
+                let _ = LOG_GUARD.set(guard);
+            }
+            Err(e) => eprintln!(
+                "WARN: failed to initialize tracing (already initialized?): {}",
+                e
+            ),
+        }
+    } else {
+        match subscriber.try_init() {
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "WARN: failed to initialize tracing (already initialized?): {}",
+                e
+            ),
+        }
+    }
+}
+
+/// Install a panic hook that logs the panic message and backtrace to the
+/// tracing log. This ensures panic details are written to the rotating log
+/// file (INTENTD_DATA_DIR/intentd.log) for post-mortem diagnosis of unexpected
+/// daemon deaths. Chains the default panic hook to preserve standard Rust
+/// panic formatting (thread name, etc.). The process will panic/unwind/abort
+/// according to Rust's standard behavior after both hooks run.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+
+        let location = panic_info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+
+        let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+
+        tracing::error!(
+            location = %location,
+            message = %message,
+            backtrace = %backtrace,
+            "PANIC: daemon panicked"
+        );
+
+        // Also write to stderr so it's visible in immediate context
+        eprintln!("PANIC at {}: {}", location, message);
+        eprintln!("Backtrace:\n{}", backtrace);
+
+        // Chain the default hook to preserve standard Rust panic formatting
+        default_hook(panic_info);
+    }));
 }
 
 fn resolve_config() -> anyhow::Result<Config> {
@@ -263,6 +376,11 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     let locality_override = parse_locality_mode(mode)?;
     let config = resolve_config()?;
     std::fs::create_dir_all(&config.data_dir)?;
+    // CoW isolation startup probe: probe the workspaces root once at daemon startup
+    // so the result is cached for future cow_probe calls. This runs before the
+    // store/services are initialized so the cache is ready when sandbox provisioning
+    // needs it. The probe result is also reported by `intentd doctor`.
+    probe_cow_at_startup(&config);
     // OS-level single-instance backstop (§5.6): hold an exclusive advisory lock
     // on `data_dir/intentd.lock` for the whole process. Acquired before the
     // socket/pidfile guard so the strongest, configuration-independent guard
@@ -329,6 +447,15 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
         process_cap = manager.registry().cap(),
         "agent manager ready"
     );
+    // Wave B: unconditionally reset all is_active=1 rows (ACP sessions cannot
+    // survive a daemon restart — they are process-local). Any is_active=1 flag
+    // after boot is stale. This runs BEFORE heal_stale_agent_sessions so the
+    // stale-status heal sees is_active=0 rows across the board.
+    match services.store().reset_all_active_flags().await {
+        Ok(0) => {}
+        Ok(reset) => tracing::warn!(reset, "reset stale is_active=1 flags on startup"),
+        Err(e) => tracing::warn!(error = %e, "is_active reset failed"),
+    }
     // Heal stale in-flight conversations from any prior crash BEFORE the chat
     // subscription path can observe them (iter#1c). Sessions left in an
     // active status (`Active`/`Processing`/`Waiting`) without a live worker
@@ -1509,6 +1636,9 @@ async fn cmd_doctor() -> ExitCode {
                     println!("[FAIL] migration status: {e}");
                 }
             }
+
+            // DB health checks (STAB-15 observability)
+            report_db_health(&store).await;
         }
         Err(e) => {
             ok = false;
@@ -1530,6 +1660,7 @@ async fn cmd_doctor() -> ExitCode {
     report_github_token();
     report_context_engine().await;
     report_host_capabilities();
+    report_cow_support(&config);
 
     if ok {
         ExitCode::SUCCESS
@@ -1635,6 +1766,59 @@ fn report_host_capabilities() {
     );
 }
 
+/// Probe CoW support for the workspaces root at daemon startup. This populates
+/// the cache so later cow_probe calls for the same volume pair are instant. Best-effort;
+/// failures are silent (the probe will be retried on demand if needed).
+fn probe_cow_at_startup(config: &Config) {
+    let workspaces_root = config.data_dir.join("workspaces");
+    if std::fs::create_dir_all(&workspaces_root).is_ok() {
+        // Probe and cache; ignore errors (doctor will report them if persistent)
+        let _ = intent_git::cow_probe(&workspaces_root, &workspaces_root);
+    }
+}
+
+/// CoW isolation support: probe the workspaces root for copy-on-write capability.
+/// Non-fatal — CoW isolation degrades gracefully when unsupported (shared mode).
+/// Uses the cached result if available (populated by probe_cow_at_startup).
+fn report_cow_support(config: &Config) {
+    let workspaces_root = config.data_dir.join("workspaces");
+    // Create workspaces dir if it doesn't exist (probe needs it)
+    if !workspaces_root.exists() {
+        if let Err(e) = std::fs::create_dir_all(&workspaces_root) {
+            println!("[--] CoW isolation: probe failed (cannot create workspaces dir: {e})");
+            return;
+        }
+    }
+
+    match intent_git::cow_probe(&workspaces_root, &workspaces_root) {
+        Ok(intent_git::CowSupport::Supported) => {
+            #[cfg(target_os = "macos")]
+            println!("[ok] CoW isolation: supported (apfs)");
+            #[cfg(target_os = "linux")]
+            println!("[ok] CoW isolation: supported (btrfs/xfs/bcachefs/zfs)");
+            #[cfg(target_os = "windows")]
+            println!("[ok] CoW isolation: supported (refs)");
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            println!("[ok] CoW isolation: supported");
+        }
+        Ok(intent_git::CowSupport::Unsupported) => {
+            #[cfg(target_os = "macos")]
+            println!("[--] CoW isolation: unsupported (not apfs or different volumes)");
+            #[cfg(target_os = "linux")]
+            println!(
+                "[--] CoW isolation: unsupported (not btrfs/xfs/bcachefs/zfs or different volumes)"
+            );
+            #[cfg(target_os = "windows")]
+            println!("[--] CoW isolation: unsupported (not ReFS or different volumes)");
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            println!("[--] CoW isolation: unsupported (platform not supported)");
+        }
+        Err(e) => {
+            println!("[--] CoW isolation: probe failed ({e})");
+        }
+    }
+}
+
 /// Doctor provider-discovery section (§6.9): print which configured ACP
 /// providers are installed (resolvable on `PATH`) and, best-effort, which are
 /// authenticated. Provider availability never fails `doctor` — a host with no
@@ -1690,6 +1874,91 @@ fn check_data_dir_writable(config: &Config) -> anyhow::Result<()> {
     std::fs::write(&probe, b"ok")?;
     std::fs::remove_file(&probe)?;
     Ok(())
+}
+
+/// Report database health metrics for diagnostics (STAB-15 observability).
+/// Runs PRAGMA integrity_check, PRAGMA wal_checkpoint(PASSIVE), and reports
+/// connection pool stats. Never fails the doctor check — all checks are
+/// informational.
+async fn report_db_health(store: &Store) {
+    println!("database health:");
+
+    // PRAGMA integrity_check: verify DB structural integrity
+    // Can return multiple rows if issues are found; treat anything other
+    // than a single "ok" row as a warning.
+    match sqlx::query("PRAGMA integrity_check")
+        .fetch_all(store.pool())
+        .await
+    {
+        Ok(rows) => {
+            if rows.len() == 1 {
+                match rows[0].try_get::<String, _>(0) {
+                    Ok(result) if result == "ok" => println!("  [ok] integrity_check: ok"),
+                    Ok(result) => println!("  [WARN] integrity_check: {}", result),
+                    Err(e) => println!("  [WARN] integrity_check: failed to decode result: {}", e),
+                }
+            } else {
+                println!("  [WARN] integrity_check: {} issues found", rows.len());
+                for row in rows {
+                    match row.try_get::<String, _>(0) {
+                        Ok(result) => println!("    - {}", result),
+                        Err(e) => println!("    - [decode error: {}]", e),
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            println!("  [WARN] integrity_check failed: {}", e);
+        }
+    }
+
+    // PRAGMA wal_checkpoint(PASSIVE): report checkpoint stats
+    // Returns (busy, log, checkpointed) — number of frames in WAL and how many
+    // were checkpointed. PASSIVE mode does not block writers. busy > 0 means the
+    // checkpoint couldn't complete.
+    match sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+        .fetch_one(store.pool())
+        .await
+    {
+        Ok(row) => {
+            let busy = row.try_get::<i64, _>(0);
+            let log = row.try_get::<i64, _>(1);
+            let checkpointed = row.try_get::<i64, _>(2);
+
+            match (busy, log, checkpointed) {
+                (Ok(busy), Ok(log), Ok(checkpointed)) => {
+                    if busy != 0 {
+                        println!(
+                            "  [WARN] wal_checkpoint(PASSIVE): busy={}, log={} frames, checkpointed={} frames (checkpoint incomplete)",
+                            busy, log, checkpointed
+                        );
+                    } else if checkpointed < log {
+                        println!(
+                            "  [WARN] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames (partial checkpoint)",
+                            log, checkpointed
+                        );
+                    } else {
+                        println!(
+                            "  [ok] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames",
+                            log, checkpointed
+                        );
+                    }
+                }
+                _ => {
+                    println!("  [WARN] wal_checkpoint(PASSIVE): failed to decode PRAGMA result");
+                }
+            }
+        }
+        Err(e) => {
+            println!("  [WARN] wal_checkpoint failed: {}", e);
+        }
+    }
+
+    // Connection pool stats: report size and idle connections
+    let pool = store.pool();
+    let size = pool.size();
+    let idle = pool.num_idle();
+    println!("  [ok] pool: size={}, idle={}", size, idle);
 }
 
 #[cfg(unix)]

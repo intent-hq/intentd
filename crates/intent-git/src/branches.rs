@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use git2::{BranchType, Repository, Status, StatusOptions};
-use intent_core::{GitBranchStatus, GitBranches, Result};
+use intent_core::{Error, GitBranchStatus, GitBranches, Result};
 
 use crate::map_git_err;
 use crate::status::current_branch;
@@ -129,6 +129,67 @@ pub fn delete_local_branch(repo_path: &Path, branch: &str) -> Result<()> {
         .find_branch(branch, BranchType::Local)
         .map_err(map_git_err)?;
     b.delete().map_err(map_git_err)
+}
+
+/// Create a new local branch pointing at `HEAD` and optionally check it out
+/// (`git branch <name>` / `git checkout -b <name>` parity). Errors when the
+/// branch already exists or `HEAD` is unborn. Ports
+/// `gitService.createBranch`.
+pub fn create_branch(repo_path: &Path, branch_name: &str, checkout: bool) -> Result<()> {
+    if branch_name.is_empty() {
+        return Err(Error::InvalidParams(
+            "branch name cannot be empty".to_string(),
+        ));
+    }
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let head = repo
+        .head()
+        .map_err(map_git_err)?
+        .peel_to_commit()
+        .map_err(map_git_err)?;
+    repo.branch(branch_name, &head, false)
+        .map_err(map_git_err)?;
+    if checkout {
+        let refname = format!("refs/heads/{branch_name}");
+        let obj = repo.revparse_single(&refname).map_err(map_git_err)?;
+        repo.checkout_tree(&obj, None).map_err(map_git_err)?;
+        repo.set_head(&refname).map_err(map_git_err)?;
+    }
+    Ok(())
+}
+
+/// Check out an existing local branch (`git checkout <name>` parity). Errors
+/// when the branch is missing. Ports `gitService.checkoutBranch`.
+pub fn checkout_branch(repo_path: &Path, branch_name: &str) -> Result<()> {
+    if branch_name.is_empty() {
+        return Err(Error::InvalidParams(
+            "branch name cannot be empty".to_string(),
+        ));
+    }
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let refname = format!("refs/heads/{branch_name}");
+    let obj = repo.revparse_single(&refname).map_err(map_git_err)?;
+    repo.checkout_tree(&obj, None).map_err(map_git_err)?;
+    repo.set_head(&refname).map_err(map_git_err)?;
+    Ok(())
+}
+
+/// Rename `old_name` → `new_name` (`git branch -m` parity). Errors when the
+/// old branch is missing or the new name is already in use. Ports
+/// `gitService.renameBranch`; the FE's format validation (`git
+/// check-ref-format`) and `-32602` wire-policy live in `intent-services`.
+pub fn rename_branch(repo_path: &Path, old_name: &str, new_name: &str) -> Result<()> {
+    if new_name.is_empty() {
+        return Err(Error::InvalidParams(
+            "new branch name cannot be empty".to_string(),
+        ));
+    }
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let mut b = repo
+        .find_branch(old_name, BranchType::Local)
+        .map_err(map_git_err)?;
+    b.rename(new_name, false).map_err(map_git_err)?;
+    Ok(())
 }
 
 /// All branch names occupied in the repo: local names plus the short names of
@@ -249,13 +310,13 @@ fn rank_default(name: &str, default_branch: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{commit_file, create_branch, init_repo};
+    use crate::testutil::{commit_file, create_branch as create_branch_util, init_repo};
 
     #[test]
     fn lists_local_branches_default_first() {
         let dir = init_repo("branches-local");
         commit_file(dir.path(), "a.txt", "x\n");
-        create_branch(dir.path(), "feature");
+        create_branch_util(dir.path(), "feature");
         let result = get_branches(dir.path(), false).unwrap();
         assert!(result.remote_branches.is_empty());
         assert!(result.branches.contains(&"feature".to_string()));
@@ -271,8 +332,8 @@ mod tests {
         let dir = init_repo("branches-current");
         commit_file(dir.path(), "a.txt", "x\n");
         // Create two extra branches; checkout one so it becomes current.
-        create_branch(dir.path(), "aaa-other");
-        create_branch(dir.path(), "zzz-current");
+        create_branch_util(dir.path(), "aaa-other");
+        create_branch_util(dir.path(), "zzz-current");
         crate::testutil::checkout_branch(dir.path(), "zzz-current");
         let result = get_branches(dir.path(), false).unwrap();
         assert_eq!(result.current_branch, "zzz-current");
@@ -331,7 +392,7 @@ mod tests {
     fn branch_status_is_current_branch_false_for_other_branch() {
         let dir = init_repo("branch-status-other");
         commit_file(dir.path(), "a.txt", "x\n");
-        create_branch(dir.path(), "feature");
+        create_branch_util(dir.path(), "feature");
         let result = branch_status(dir.path(), "feature").unwrap();
         assert_eq!(result.branch, "feature");
         assert!(!result.is_current_branch);
@@ -365,12 +426,12 @@ mod tests {
     fn unique_branch_name_suffixes_on_local_collision() {
         let dir = init_repo("unique-local");
         commit_file(dir.path(), "a.txt", "x\n");
-        create_branch(dir.path(), "auth-fix");
+        create_branch_util(dir.path(), "auth-fix");
         assert_eq!(
             ensure_unique_branch_name(dir.path(), "auth-fix").unwrap(),
             "auth-fix-2"
         );
-        create_branch(dir.path(), "auth-fix-2");
+        create_branch_util(dir.path(), "auth-fix-2");
         assert_eq!(
             ensure_unique_branch_name(dir.path(), "auth-fix").unwrap(),
             "auth-fix-3"
@@ -397,5 +458,71 @@ mod tests {
             ensure_unique_branch_name(dir.path(), "HEAD").unwrap(),
             "HEAD"
         );
+    }
+
+    #[test]
+    fn create_branch_without_checkout_leaves_head_alone() {
+        let dir = init_repo("create-branch-no-checkout");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let before = current_branch(&repo);
+        create_branch(dir.path(), "feature", false).unwrap();
+        let after = current_branch(&repo);
+        assert_eq!(before, after);
+        assert!(repo.find_branch("feature", BranchType::Local).is_ok());
+    }
+
+    #[test]
+    fn create_branch_with_checkout_switches_head() {
+        let dir = init_repo("create-branch-checkout");
+        commit_file(dir.path(), "a.txt", "x\n");
+        create_branch(dir.path(), "feature", true).unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(current_branch(&repo), "feature");
+    }
+
+    #[test]
+    fn create_branch_duplicate_is_error() {
+        let dir = init_repo("create-branch-dup");
+        commit_file(dir.path(), "a.txt", "x\n");
+        create_branch(dir.path(), "feature", false).unwrap();
+        assert!(create_branch(dir.path(), "feature", false).is_err());
+    }
+
+    #[test]
+    fn checkout_branch_switches_head() {
+        let dir = init_repo("checkout-branch");
+        commit_file(dir.path(), "a.txt", "x\n");
+        create_branch(dir.path(), "feature", false).unwrap();
+        checkout_branch(dir.path(), "feature").unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(current_branch(&repo), "feature");
+    }
+
+    #[test]
+    fn checkout_branch_missing_is_error() {
+        let dir = init_repo("checkout-missing");
+        commit_file(dir.path(), "a.txt", "x\n");
+        assert!(checkout_branch(dir.path(), "does-not-exist").is_err());
+    }
+
+    #[test]
+    fn rename_branch_swaps_the_name() {
+        let dir = init_repo("rename-branch");
+        commit_file(dir.path(), "a.txt", "x\n");
+        create_branch(dir.path(), "old", false).unwrap();
+        rename_branch(dir.path(), "old", "new").unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        assert!(repo.find_branch("old", BranchType::Local).is_err());
+        assert!(repo.find_branch("new", BranchType::Local).is_ok());
+    }
+
+    #[test]
+    fn rename_branch_to_existing_name_is_error() {
+        let dir = init_repo("rename-collide");
+        commit_file(dir.path(), "a.txt", "x\n");
+        create_branch(dir.path(), "one", false).unwrap();
+        create_branch(dir.path(), "two", false).unwrap();
+        assert!(rename_branch(dir.path(), "one", "two").is_err());
     }
 }

@@ -1373,6 +1373,15 @@ impl Services {
                 &created_at,
             )
             .await?;
+        // Refresh agent_session.updated_at so the FE agent-card timestamp
+        // reflects message activity, not just status transitions (STAB-19).
+        if let Err(e) = self
+            .store
+            .refresh_agent_session_timestamp(&session.workspace_id, &agent_id, &created_at)
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+        }
         self.publish_agent_mutation_event(
             &session.workspace_id,
             &agent_id,
@@ -1655,12 +1664,31 @@ impl Services {
     ) -> Result<Value> {
         let message_id = message_id.unwrap_or_else(new_message_id);
         let blocks = user_content_blocks(&content);
+        let created_at = now_iso();
         match self
             .store
-            .append_agent_message(&agent_id, "user", &blocks, &now_iso())
+            .append_agent_message(&agent_id, "user", &blocks, &created_at)
             .await
         {
-            Ok(_) => Ok(json!({ "success": true, "queued": false, "messageId": message_id })),
+            Ok(_) => {
+                // Refresh agent_session.updated_at so the FE agent-card timestamp
+                // reflects message activity, not just status transitions (STAB-19).
+                // Fetch the session to get workspace_id; best-effort (logged on error).
+                if let Ok(session) = self.store.get_agent_session(&agent_id).await {
+                    if let Err(e) = self
+                        .store
+                        .refresh_agent_session_timestamp(
+                            &session.workspace_id,
+                            &agent_id,
+                            &created_at,
+                        )
+                        .await
+                    {
+                        tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+                    }
+                }
+                Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+            }
             Err(_) => {
                 let (queued, position) = self.enqueue_message(&agent_id, content, None, None);
                 let result = json!({
@@ -1682,10 +1710,21 @@ impl Services {
         message_id: String,
         content: String,
     ) -> Result<Value> {
+        let session = self.store.get_agent_session(&agent_id).await?;
         let blocks = user_content_blocks(&content);
+        let created_at = now_iso();
         self.store
-            .append_agent_message(&agent_id, "user", &blocks, &now_iso())
+            .append_agent_message(&agent_id, "user", &blocks, &created_at)
             .await?;
+        // Refresh agent_session.updated_at so the FE agent-card timestamp
+        // reflects message activity, not just status transitions (STAB-19).
+        if let Err(e) = self
+            .store
+            .refresh_agent_session_timestamp(&session.workspace_id, &agent_id, &created_at)
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+        }
         Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
     }
 
@@ -2919,6 +2958,22 @@ impl Services {
                 .get("queued")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            // Wave B: when the wake message was directly delivered (not queued),
+            // force a queue drain so any previously-queued normal-priority messages
+            // send immediately without waiting for an interrupt-priority nudge.
+            // Post-restart recovery: a woken agent must resume pending work.
+            if !queued {
+                if let Some(mgr) = self.agent_manager() {
+                    tokio::spawn({
+                        let mgr = mgr.clone();
+                        let agent_id = agent_id.clone();
+                        let workspace_id = workspace_id.clone();
+                        async move {
+                            mgr.try_drain_queue(agent_id, workspace_id).await;
+                        }
+                    });
+                }
+            }
             let action = if queued {
                 "message_queued_to_active_agent"
             } else {
@@ -3202,7 +3257,7 @@ impl Services {
         };
         let Some(manager) = self.agent_manager() else {
             return self
-                .deliver_wake_message_store_only(agent_id, content, build_block)
+                .deliver_wake_message_store_only(workspace_id, agent_id, content, build_block)
                 .await;
         };
         // Runtime path (DELIV-1): two-step claim/persist/spawn so the
@@ -3229,9 +3284,10 @@ impl Services {
         }
         let message_id = new_message_id();
         let blocks = json!([build_block()]);
+        let created_at = now_iso();
         if self
             .store
-            .append_agent_message(agent_id, "user", &blocks, &now_iso())
+            .append_agent_message(agent_id, "user", &blocks, &created_at)
             .await
             .is_err()
         {
@@ -3248,6 +3304,15 @@ impl Services {
                 "queuedMessage": queued.to_value(position),
             }));
         }
+        // Refresh agent_session.updated_at so the FE agent-card timestamp
+        // reflects message activity, not just status transitions (STAB-19).
+        if let Err(e) = self
+            .store
+            .refresh_agent_session_timestamp(workspace_id, agent_id, &created_at)
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+        }
         manager.clone().finish_prepersisted_turn_spawn(
             agent_id.clone(),
             workspace_id.clone(),
@@ -3262,6 +3327,7 @@ impl Services {
     /// store failure fall back to an in-memory enqueue with `queued: true`.
     async fn deliver_wake_message_store_only<F>(
         &self,
+        workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         content: &str,
         build_block: F,
@@ -3271,12 +3337,24 @@ impl Services {
     {
         let message_id = new_message_id();
         let blocks = json!([build_block()]);
+        let created_at = now_iso();
         match self
             .store
-            .append_agent_message(agent_id, "user", &blocks, &now_iso())
+            .append_agent_message(agent_id, "user", &blocks, &created_at)
             .await
         {
-            Ok(_) => Ok(json!({ "success": true, "queued": false, "messageId": message_id })),
+            Ok(_) => {
+                // Refresh agent_session.updated_at so the FE agent-card timestamp
+                // reflects message activity, not just status transitions (STAB-19).
+                if let Err(e) = self
+                    .store
+                    .refresh_agent_session_timestamp(workspace_id, agent_id, &created_at)
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+                }
+                Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+            }
             Err(_) => {
                 let (queued, position) =
                     self.enqueue_message(agent_id, content.to_string(), None, None);
