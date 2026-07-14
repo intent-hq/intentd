@@ -784,23 +784,47 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // Wait for agent:failed terminal event AND the subsequent agent:stream:end
+    // Wait for agent:failed terminal event, agent:stream:end, AND agent:status-changed
+    // (the status-changed event is published AFTER the status is persisted, so
+    // waiting for it ensures the status write is visible to subsequent reads)
     let mut saw_failed = false;
     let mut saw_end_from_exhaustion = false;
-    for _ in 0..50 {
+    let mut saw_status_error = false;
+    // Use a higher bound since continue skips unrelated agent events
+    for _ in 0..200 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:failed" {
-            saw_failed = true;
+        // Filter by agent ID to avoid breaking on another agent's events
+        let event_agent_id = frame["params"]["event"]["data"]["agentId"].as_str();
+        if event_agent_id != Some(agent_id.as_str()) {
+            continue;
         }
-        if frame["params"]["event"]["type"] == "agent:stream:end" {
-            saw_end_from_exhaustion = true;
-            break; // Stop after consuming the exhaustion's stream:end
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:failed") => {
+                saw_failed = true;
+            }
+            Some("agent:stream:end") => {
+                saw_end_from_exhaustion = true;
+            }
+            Some("agent:status-changed") => {
+                if frame["params"]["event"]["data"]["status"] == "error" {
+                    saw_status_error = true;
+                }
+            }
+            _ => {}
+        }
+        // Only break after seeing all three terminal events to handle out-of-order delivery
+        if saw_failed && saw_end_from_exhaustion && saw_status_error {
+            break;
         }
     }
     assert!(saw_failed, "agent:failed emitted after exhaustion");
     assert!(
         saw_end_from_exhaustion,
         "agent:stream:end emitted after exhaustion"
+    );
+    assert!(
+        saw_status_error,
+        "agent:status-changed with status=error emitted after exhaustion"
     );
 
     // Assert persisted error status via agent.getSession
