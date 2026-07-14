@@ -405,7 +405,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     // toggle the listener on/off. The CLI --listen flag + env (INTENTD_TCP_PORT,
     // INTENTD_DISCOVERY, --insecure) override persisted settings, logged when they
     // win. TLS and bearer auth are auto-on for TCP (§5.2/§5.3) unless --insecure.
-    let (ws_server, ws_port, ws_runtime) = if serve_tcp_enabled {
+    let (ws_server, _ws_port, ws_runtime) = if serve_tcp_enabled {
         let mut ws_options = ws_options_from_env();
         ws_options.locality_override = locality_override;
 
@@ -437,6 +437,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             state: tokio::sync::Mutex::new(WsRuntimeState {
                 ws_server: None,
                 discovery: None,
+                port: None,
             }),
         });
 
@@ -445,7 +446,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             WsApiServer::new_insecure_with_reverse(
                 api.clone(),
                 bus.clone(),
-                ws_options,
+                ws_options.clone(),
                 reverse_registry.clone(),
             )
         } else {
@@ -454,7 +455,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
                 bus.clone(),
                 tls_cert.as_ref().unwrap(),
                 token_store.unwrap(),
-                ws_options,
+                ws_options.clone(),
                 reverse_registry.clone(),
             )
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
@@ -465,8 +466,32 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             None => tracing::info!(port, "intentd WS listening (insecure, no TLS)"),
         }
 
-        // Store the server in runtime state
-        runtime.state.lock().await.ws_server = Some(server.clone());
+        // Start mDNS discovery if enabled
+        let discovery = if ws_options.discovery_enabled {
+            server.fingerprint().and_then(|fp| {
+                let is_local = ws_options.locality_override.unwrap_or(false);
+                match Discovery::start(port, fp, is_local) {
+                    Ok(d) => {
+                        tracing::info!("mDNS discovery started");
+                        Some(d)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "failed to start mDNS");
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
+
+        // Store the server and discovery in runtime state
+        {
+            let mut state = runtime.state.lock().await;
+            state.ws_server = Some(server.clone());
+            state.discovery = discovery;
+            state.port = Some(port);
+        }
 
         (Some(server), Some(port), Some(runtime))
     } else {
@@ -482,11 +507,6 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
         listen_mode: listen.to_string(),
         uds: serve_uds_enabled,
         tcp: serve_tcp_enabled,
-        port: ws_port,
-        fingerprint: ws_server
-            .as_ref()
-            .and_then(|s| s.fingerprint().map(str::to_string)),
-        ws_server: ws_server.clone(),
         manager: manager.clone(),
         shutdown: shutdown_notify.clone(),
         ws_runtime,
@@ -560,9 +580,6 @@ struct DaemonControl {
     listen_mode: String,
     uds: bool,
     tcp: bool,
-    port: Option<u16>,
-    fingerprint: Option<String>,
-    ws_server: Option<WsApiServer>,
     manager: Arc<AgentManager>,
     shutdown: Arc<tokio::sync::Notify>,
     /// Runtime state for settings-driven listener control (§5.12). Holds the
@@ -589,22 +606,42 @@ struct WsRuntimeControl {
 struct WsRuntimeState {
     ws_server: Option<WsApiServer>,
     discovery: Option<Discovery>,
+    /// Cached port for sync system.status access
+    port: Option<u16>,
 }
 
 impl SystemControl for DaemonControl {
     fn status(&self) -> SystemStatus {
+        // Read live port/fingerprint/client count from runtime state (§5.12 fix).
+        // Use try_lock to avoid blocking; if locked, report as unavailable.
+        let (port, fingerprint, clients) = if let Some(ref runtime) = self.ws_runtime {
+            if let Ok(state) = runtime.state.try_lock() {
+                let port = state.port;
+                let fingerprint = state
+                    .ws_server
+                    .as_ref()
+                    .and_then(|s| s.fingerprint().map(str::to_string));
+                let clients = state
+                    .ws_server
+                    .as_ref()
+                    .map(|s| s.client_count())
+                    .unwrap_or(0);
+                (port, fingerprint, clients)
+            } else {
+                (None, None, 0)
+            }
+        } else {
+            (None, None, 0)
+        };
+
         SystemStatus {
             listen_mode: self.listen_mode.clone(),
             uds: self.uds,
             tcp: self.tcp,
-            port: self.port,
-            clients: self
-                .ws_server
-                .as_ref()
-                .map(|s| s.client_count())
-                .unwrap_or(0),
+            port,
+            clients,
             agents: self.manager.registry().size(),
-            fingerprint: self.fingerprint.clone(),
+            fingerprint,
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             has_display: detect_has_display(),
@@ -630,10 +667,14 @@ impl intent_core::ServerControl for DaemonControl {
                 )
             })?;
 
-            let mut state = runtime.state.lock().await;
+            // Check if already running (don't hold lock across await)
+            let existing_server = {
+                let state = runtime.state.lock().await;
+                state.ws_server.clone()
+            };
 
             // If already started, return the current port (idempotent)
-            if let Some(ref server) = state.ws_server {
+            if let Some(ref server) = existing_server {
                 if let Some(port) = server.bound_port().await {
                     return Ok(port);
                 }
@@ -690,8 +731,13 @@ impl intent_core::ServerControl for DaemonControl {
                 None
             };
 
-            state.ws_server = Some(server);
-            state.discovery = discovery;
+            // Store server + discovery + port (acquire lock only after all awaits done)
+            {
+                let mut state = runtime.state.lock().await;
+                state.ws_server = Some(server);
+                state.discovery = discovery;
+                state.port = Some(port);
+            }
 
             Ok(port)
         })
@@ -702,16 +748,21 @@ impl intent_core::ServerControl for DaemonControl {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             if let Some(runtime) = &self.ws_runtime {
-                let mut state = runtime.state.lock().await;
+                // Extract server + discovery without holding lock across await
+                let (server, discovery) = {
+                    let mut state = runtime.state.lock().await;
+                    state.port = None;
+                    (state.ws_server.take(), state.discovery.take())
+                };
 
-                // Stop mDNS first
-                if let Some(discovery) = state.discovery.take() {
-                    discovery.stop();
+                // Stop mDNS first (synchronous)
+                if let Some(d) = discovery {
+                    d.stop();
                 }
 
-                // Stop the WS server
-                if let Some(server) = state.ws_server.take() {
-                    server.stop().await;
+                // Stop the WS server (async)
+                if let Some(s) = server {
+                    s.stop().await;
                 }
             }
         })
@@ -722,9 +773,13 @@ impl intent_core::ServerControl for DaemonControl {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u16>> + Send + '_>> {
         Box::pin(async move {
             if let Some(runtime) = &self.ws_runtime {
-                let state = runtime.state.lock().await;
-                if let Some(ref server) = state.ws_server {
-                    server.bound_port().await
+                // Extract server without holding lock across await
+                let server = {
+                    let state = runtime.state.lock().await;
+                    state.ws_server.clone()
+                };
+                if let Some(ref s) = server {
+                    s.bound_port().await
                 } else {
                     None
                 }
@@ -735,8 +790,10 @@ impl intent_core::ServerControl for DaemonControl {
     }
 
     fn is_tcp_connection(&self) -> bool {
-        // TODO: This needs context about the current connection
-        // For now, always allow (UDS safety check deferred)
+        // TODO: Connection context detection not implemented yet.
+        // Returning false (treat all as UDS) allows all stop requests.
+        // When implemented, return true for TCP connections to block
+        // self-terminating calls per ServerControl contract.
         false
     }
 }
