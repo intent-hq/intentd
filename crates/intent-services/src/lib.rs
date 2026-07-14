@@ -9084,6 +9084,44 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn git_get_config(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<String>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // `NotFound` if the workspace is absent (router maps to `-32602`).
+            // Remote workspaces and non-repositories return an empty string (same
+            // fallback as the FE's `readGitConfig`).
+            let ws = store.get_workspace(&workspace_id).await?;
+            if ws.is_remote {
+                return Ok(String::new());
+            }
+            let Some(path) = git_ops::worktree_path(&ws) else {
+                return Ok(String::new());
+            };
+            // Read `.git/config` from the worktree's git directory. For linked
+            // worktrees, `.git` is a file pointing to the worktree metadata, and
+            // the config is at the main repo's `.git/config`. Walk up from the
+            // worktree path to find the parent git root if needed.
+            let git_config_path = path.join(".git").join("config");
+            match tokio::fs::read_to_string(&git_config_path).await {
+                Ok(content) => Ok(content),
+                Err(_) => {
+                    // If direct read fails, try parent directories (mirroring the FE
+                    // `readGitConfig` fallback logic).
+                    let mut current = path.as_path();
+                    while let Some(parent) = current.parent() {
+                        let parent_git_config = parent.join(".git").join("config");
+                        if let Ok(content) = tokio::fs::read_to_string(&parent_git_config).await {
+                            return Ok(content);
+                        }
+                        current = parent;
+                    }
+                    // No config found anywhere in the parent chain.
+                    Ok(String::new())
+                }
+            }
+        })
+    }
+
     fn git_stage(
         &self,
         workspace_id: WorkspaceId,

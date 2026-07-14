@@ -1976,6 +1976,20 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `git.getConfig`: read the raw `.git/config` file content from the
+    /// workspace's repository (STAB-10 — retire FE filesystem reads). Returns
+    /// `{ config: String }` where `config` is the entire file content. Remote
+    /// workspaces and non-repositories return `{ config: "" }`. A missing
+    /// workspace is `-32602`.
+    fn git_get_config(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<String>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_get_config not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `git.stage`: stage `paths` (CSV string or array). `.`/`*`/`--all` are
     /// rejected (`-32603`); returns the validated path list (PROTOCOL §5.6).
     fn git_stage(
