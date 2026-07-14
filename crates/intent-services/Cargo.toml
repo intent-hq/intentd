@@ -19,6 +19,7 @@ intent-providers = { path = "../intent-providers" }
 intent-pty = { path = "../intent-pty" }
 intent-search = { path = "../intent-search" }
 base64 = { workspace = true }
+git2 = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
@@ -34,6 +35,7 @@ tokio = { workspace = true, features = ["test-util"] }
 uuid = { workspace = true }
 async-trait = "0.1"
 git2.workspace = true
+tempfile = "3"
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process"] }
