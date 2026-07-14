@@ -76,6 +76,7 @@ mod note_ops;
 mod pagination;
 mod pr_ops;
 mod primitive_ops;
+mod sandbox_ops;
 mod script_ops;
 mod search_ops;
 mod sentry_ops;
@@ -87,6 +88,7 @@ pub mod tool_block;
 mod tests;
 
 pub use mcp_servers::McpHub;
+pub use sandbox_ops::ProvisionOutcome;
 pub use settings::{InMemorySecretStore, SecretStore};
 pub use terminal_ops::PtyTerminalHost;
 
@@ -12294,6 +12296,39 @@ impl WorkspaceApi for Services {
                     })?;
             browser_ops::shape_result(response).map_err(|e| Error::Internal(e.message))
         })
+    }
+}
+
+/// Sandbox provisioning and lifecycle for CoW agent isolation (direct-mode workspaces).
+impl Services {
+    /// Provision a sandbox for an agent in a direct-mode workspace.
+    /// Returns `ProvisionOutcome::Supported` if CoW is available, or `Unsupported` for fallback.
+    pub async fn provision_sandbox(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) -> Result<sandbox_ops::ProvisionOutcome> {
+        let config = sandbox_ops::ProvisionConfig {
+            workspaces_root: self
+                .workspaces_root
+                .clone()
+                .ok_or_else(|| Error::Internal("workspaces_root not configured".to_string()))?,
+        };
+        sandbox_ops::provision_sandbox(&self.store, workspace_id, agent_id, &config).await
+    }
+
+    /// Discard a sandbox: remove the directory and database record.
+    pub async fn discard_sandbox(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) -> Result<()> {
+        sandbox_ops::discard_sandbox(&self.store, workspace_id, agent_id).await
+    }
+
+    /// Garbage-collect orphaned sandboxes (startup GC).
+    pub async fn gc_orphaned_sandboxes(&self) -> Result<()> {
+        sandbox_ops::gc_orphaned_sandboxes(&self.store).await
     }
 }
 

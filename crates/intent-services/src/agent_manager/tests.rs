@@ -1255,12 +1255,14 @@ async fn build_turn_prompt_skips_naming_instruction_after_first_turn() {
     assert_eq!(text, "follow-up");
 }
 
-/// The keep-alive interrupt path emits ONLY the terminal `agent:stream:end` and
-/// deliberately NOT `agent:idle`: an interrupted agent is about to resume, so
-/// waking parents on idle would be premature (mirrors the TS interrupt
-/// suppression in `emitAgentIdleEvent`).
+/// STAB-28: The keep-alive interrupt path emits `agent:stream:end` and NOW
+/// ALSO emits `agent:idle` when the agent has no queued ready-to-send messages.
+/// This fixes the bug where a parent that re-messages via agent.send after a
+/// child settles registers a completion watch that never fires (the aborted
+/// worker never reaches run_prompt_turn's idle-emit path). When the agent DOES
+/// have queued messages, idle is suppressed (the agent will resume immediately).
 #[tokio::test]
-async fn interrupt_emits_terminal_stream_end_but_no_idle() {
+async fn interrupt_emits_terminal_stream_end_and_idle_when_no_queue() {
     let (_tmp, mgr, bus) = manager_with_bus().await;
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int"));
     seed_agent(&mgr, &ws, &id).await;
@@ -1289,8 +1291,53 @@ async fn interrupt_emits_terminal_stream_end_but_no_idle() {
         "interrupt emits the terminal stream:end (got {types:?})"
     );
     assert!(
+        types.contains(&"agent:idle"),
+        "STAB-28: interrupt NOW emits agent:idle when queue is empty (got {types:?})"
+    );
+}
+
+/// STAB-28 suppression case: interrupt must NOT emit agent:idle when the agent
+/// has queued ready-to-send messages — the agent will resume immediately, so
+/// waking parents on idle would be premature. This regression guard ensures the
+/// gating logic stays correct (the empty-queue case is exercised above).
+#[tokio::test]
+async fn interrupt_suppresses_idle_when_queue_has_ready_to_send() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-int")
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    // Queue a ready-to-send message via agent_queue_message_op (mirroring
+    // agent.queueMessage over the wire). New messages are always editing=false
+    // so they're immediately ready to send.
+    let _ = mgr
+        .services
+        .agent_queue_message_op(id.clone(), "follow-up".into(), None, None)
+        .await
+        .expect("queue");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    assert!(mgr.interrupt(&id).await, "interrupt finds the live agent");
+
+    // Drain the published events within a bounded window.
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"agent:stream:end"),
+        "interrupt still emits the terminal stream:end (got {types:?})"
+    );
+    assert!(
         !types.contains(&"agent:idle"),
-        "interrupt suppresses agent:idle (got {types:?})"
+        "STAB-28: interrupt suppresses agent:idle when queue has ready-to-send (got {types:?})"
     );
 }
 

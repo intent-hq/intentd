@@ -12,8 +12,12 @@ const COPYFILE_CLONE: u32 = 1 << 24;
 const COPYFILE_RECURSIVE: u32 = 1 << 15;
 
 // getattrlist volume capability constants
+// TODO: Re-enable fast path once f_fsid comparison is fixed for APFS
+#[allow(dead_code)]
 const ATTR_VOL_INFO: u32 = 0x80000000;
+#[allow(dead_code)]
 const ATTR_VOL_CAPABILITIES: u32 = 1 << 17;
+#[allow(dead_code)]
 const VOL_CAP_INT_CLONE: u64 = 1 << 25;
 
 extern "C" {
@@ -24,6 +28,7 @@ extern "C" {
         flags: u32,
     ) -> libc::c_int;
 
+    #[allow(dead_code)]
     fn getattrlist(
         path: *const libc::c_char,
         attrlist: *const AttrList,
@@ -36,6 +41,7 @@ extern "C" {
 }
 
 #[repr(C)]
+#[allow(dead_code)]
 struct AttrList {
     bitmapcount: libc::c_ushort,
     reserved: libc::c_ushort,
@@ -47,12 +53,14 @@ struct AttrList {
 }
 
 #[repr(C)]
+#[allow(dead_code)]
 struct VolCapabilities {
     capabilities: [u32; 4],
     valid: [u32; 4],
 }
 
 #[repr(C)]
+#[allow(dead_code)]
 struct AttrBuf {
     length: u32,
     caps: VolCapabilities,
@@ -81,6 +89,8 @@ struct StatFs {
 
 /// Fast path: check volume capability flags. Returns `Some(Supported/Unsupported)`
 /// if conclusive, `None` if the live probe is needed.
+/// TODO: Re-enable once f_fsid comparison is fixed for APFS
+#[allow(dead_code)]
 fn check_volume_caps(src_dir: &Path, dst_dir: &Path) -> Option<CowSupport> {
     let src_caps = has_clone_capability(src_dir)?;
     let dst_caps = has_clone_capability(dst_dir)?;
@@ -97,6 +107,7 @@ fn check_volume_caps(src_dir: &Path, dst_dir: &Path) -> Option<CowSupport> {
     None // Live probe needed
 }
 
+#[allow(dead_code)]
 fn has_clone_capability(path: &Path) -> Option<bool> {
     let path_cstr = CString::new(path.as_os_str().as_bytes()).ok()?;
 
@@ -129,6 +140,7 @@ fn has_clone_capability(path: &Path) -> Option<bool> {
     Some((attrbuf.caps.capabilities[3] & (VOL_CAP_INT_CLONE as u32)) != 0)
 }
 
+#[allow(dead_code)]
 fn same_volume(src: &Path, dst: &Path) -> bool {
     let src_cstr = CString::new(src.as_os_str().as_bytes()).ok();
     let dst_cstr = CString::new(dst.as_os_str().as_bytes()).ok();
@@ -169,10 +181,10 @@ fn get_volume_id(path: &Path) -> Option<u64> {
 }
 
 pub fn probe(src_dir: &Path, dst_dir: &Path) -> Result<CowSupport> {
-    // Try fast path first
-    if let Some(result) = check_volume_caps(src_dir, dst_dir) {
-        return Ok(result);
-    }
+    // SKIP fast path for now - it has false negatives with f_fsid comparison on APFS
+    // if let Some(result) = check_volume_caps(src_dir, dst_dir) {
+    //     return Ok(result);
+    // }
 
     // Live probe: create a temp file and try to clone it
     let temp_src = src_dir.join(".cow_probe_temp");

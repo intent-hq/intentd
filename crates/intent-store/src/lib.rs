@@ -26,6 +26,7 @@ mod metrics_repo;
 mod note_line_attribution_repo;
 mod note_repo;
 mod note_version_repo;
+mod sandbox_repo;
 mod script_repo;
 mod settings_repo;
 mod task_agent_link_repo;
@@ -38,6 +39,7 @@ pub use diffs_repo::{DiffRow, NewDiff};
 pub use event_repo::{EventQuery, NewEvent};
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
 pub use note_version_repo::MAX_NOTE_VERSIONS;
+pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
 
 #[cfg(test)]

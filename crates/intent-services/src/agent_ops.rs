@@ -46,6 +46,9 @@ use crate::Services;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod tests_stab28;
+
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
 ///
 /// `editing` marks the entry as "under edit" — excluded from the **ready-to-send**
