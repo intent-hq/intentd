@@ -194,14 +194,49 @@ async function handlePrompt(id, params) {
   result(id, { stopReason: 'end_turn' });
 }
 
+// Attempt-counting for deterministic failure modes. Reads/writes a counter file
+// whose path is passed via MOCK_AGENT_ATTEMPT_FILE env var. Returns the current
+// attempt number (1-based) and increments the file for the next spawn.
+function getAndIncrementAttempt() {
+  const path = process.env.MOCK_AGENT_ATTEMPT_FILE;
+  if (!path) return 1;
+  let count = 1;
+  try {
+    if (fs.existsSync(path)) {
+      count = parseInt(fs.readFileSync(path, 'utf8'), 10) || 1;
+    }
+  } catch {}
+  try {
+    fs.writeFileSync(path, String(count + 1), 'utf8');
+  } catch {}
+  return count;
+}
+
 async function dispatch(msg) {
+  let behavior = {};
+  try {
+    behavior = JSON.parse(process.env.MOCK_AGENT_BEHAVIOR || '{}');
+  } catch {
+    behavior = {};
+  }
+
   switch (msg.method) {
     case 'initialize':
       return result(msg.id, { protocolVersion: 1, agentCapabilities: { loadSession: false } });
     case 'authenticate':
       return result(msg.id, {});
-    case 'session/new':
+    case 'session/new': {
+      // Deterministic failure mode: ignore session/new for the first N attempts
+      if (typeof behavior.ignoreSessionNewAttempts === 'number' && behavior.ignoreSessionNewAttempts > 0) {
+        const attempt = getAndIncrementAttempt();
+        if (attempt <= behavior.ignoreSessionNewAttempts) {
+          log(`ignoring session/new (attempt ${attempt}/${behavior.ignoreSessionNewAttempts})`);
+          // Stall without responding (timeout will trigger)
+          return;
+        }
+      }
       return result(msg.id, { sessionId: SESSION_ID });
+    }
     case 'session/load':
       return send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'no load' } });
     case 'session/prompt':
@@ -217,6 +252,20 @@ async function dispatch(msg) {
     default:
       if (msg.id !== undefined)
         send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: `no ${msg.method}` } });
+  }
+}
+
+// Deterministic failure mode: exit immediately on launch for the first N spawns.
+// This triggers "agent stdout closed" handshake failure during initialize.
+let exitBehavior = {};
+try {
+  exitBehavior = JSON.parse(process.env.MOCK_AGENT_BEHAVIOR || '{}');
+} catch {}
+if (typeof exitBehavior.exitImmediatelyAttempts === 'number' && exitBehavior.exitImmediatelyAttempts > 0) {
+  const attempt = getAndIncrementAttempt();
+  if (attempt <= exitBehavior.exitImmediatelyAttempts) {
+    log(`exiting immediately (attempt ${attempt}/${exitBehavior.exitImmediatelyAttempts})`);
+    process.exit(1);
   }
 }
 
