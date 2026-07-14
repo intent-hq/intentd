@@ -153,12 +153,16 @@ pub(crate) async fn process_frame(
             let bus = bus.clone();
             let out = out_tx.clone();
             let reverse = reverse.clone();
+            let is_tcp = crate::context::is_tcp_connection();
             tokio::spawn(async move {
-                if let Some(frame) =
-                    host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse).await
-                {
-                    let _ = out.send(frame).await;
-                }
+                crate::context::with_connection_context(is_tcp, async {
+                    if let Some(frame) =
+                        host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse).await
+                    {
+                        let _ = out.send(frame).await;
+                    }
+                })
+                .await
             });
             return true;
         }
@@ -169,10 +173,14 @@ pub(crate) async fn process_frame(
             // the reverse timeout.
             let out = out_tx.clone();
             let reverse = reverse.clone();
+            let is_tcp = crate::context::is_tcp_connection();
             tokio::spawn(async move {
-                if let Some(frame) = browser::handle(req, &reverse).await {
-                    let _ = out.send(frame).await;
-                }
+                crate::context::with_connection_context(is_tcp, async {
+                    if let Some(frame) = browser::handle(req, &reverse).await {
+                        let _ = out.send(frame).await;
+                    }
+                })
+                .await
             });
             return true;
         }
