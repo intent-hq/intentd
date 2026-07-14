@@ -11,6 +11,7 @@
 use serde_json::{json, Value};
 
 use crate::events::success_frame;
+use crate::protocol::PROTOCOL_VERSION;
 
 /// A point-in-time snapshot of daemon state for `system.status` (§5.7, §12.3).
 /// `locality` is derived per-connection (UDS ⇒ `local`, WSS ⇒ `remote`) and so
@@ -109,6 +110,7 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         "clients": status.clients,
         "agents": status.agents,
         "fingerprint": status.fingerprint,
+        "protocolVersion": PROTOCOL_VERSION,
         "host": {
             "os": status.os,
             "arch": status.arch,

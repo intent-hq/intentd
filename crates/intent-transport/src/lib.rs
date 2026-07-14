@@ -13,6 +13,9 @@ pub use auth::{
     is_auth_enabled, is_discovery_enabled, validate_token, AsyncTokenStore, FileTokenStore,
     TokenStore,
 };
+pub use catalog::{
+    FASTPATH_METHODS, METHOD_ALIASES, NOTIFICATIONS, REVERSE_METHODS, ROUTER_METHODS,
+};
 pub use context::{is_tcp_connection, with_connection_context};
 pub use control::{SystemControl, SystemStatus};
 pub use discovery::{detect_display_server, detect_has_display, Discovery, SERVICE_TYPE};
@@ -22,6 +25,7 @@ pub use host::{
     OsEditorLauncher, OsOpener, PickApplicationError, ResolvedEditor,
 };
 pub use listener::{serve_uds, serve_uds_with_reverse};
+pub use protocol::PROTOCOL_VERSION;
 pub use reverse::{
     PrimaryReverseGuard, PrimaryReverseRegistry, ReverseChannel, ReverseError,
     DEFAULT_REVERSE_TIMEOUT,
@@ -33,6 +37,7 @@ pub use ws::{WsApiServer, WsOptions};
 
 pub mod auth;
 pub(crate) mod browser;
+pub mod catalog;
 mod client;
 mod conn;
 pub mod context;
@@ -45,6 +50,7 @@ pub mod host;
 mod host_ops;
 pub mod lifecycle;
 pub mod listener;
+mod protocol;
 pub mod reverse;
 pub mod router;
 pub mod server;

@@ -51,6 +51,7 @@ async fn mints_client_id_when_omitted() {
     let server = &resp["result"]["server"];
     assert_eq!(server["locality"], json!("local"));
     assert_eq!(server["version"], json!(env!("CARGO_PKG_VERSION")));
+    assert_eq!(server["protocolVersion"], json!("2.0"));
     assert!(
         server["osArch"].as_str().unwrap().contains('/'),
         "osArch is os/arch"
