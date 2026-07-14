@@ -168,8 +168,10 @@ pub async fn prompt(
 
     // Use a very large fallback timeout (24h) to catch agent-died-without-
     // closing-stdout edge cases, but the idle timeout below provides the real
-    // bound. The large timeout ensures request_timeout cleans up its pending
-    // entry eventually even if we return early on idle timeout.
+    // bound. NOTE: returning early on idle timeout (below) drops req_fut before
+    // it reaches request_timeout's cleanup branch, so the pending-map entry
+    // leaks until the fallback expires or the agent closes stdout. This is a
+    // known limitation; fixing it requires Connection to expose a cancel(id) API.
     let fallback_timeout = Duration::from_secs(24 * 60 * 60);
     let req_fut = conn.request_timeout("session/prompt", params, fallback_timeout);
     tokio::pin!(req_fut);
@@ -185,12 +187,8 @@ pub async fn prompt(
             _ = tokio::time::sleep(poll_interval) => {
                 let idle = Duration::from_millis(activity.idle_ms());
                 if idle >= idle_window {
-                    // Dropping req_fut here leaves its pending-map entry until
-                    // the fallback timeout (24h) or agent-stdout-close, but
-                    // that's acceptable: one leaked entry per idle-timed-out
-                    // turn, cleaned within 24h. The alternative (manual request
-                    // ID tracking + pending.remove) couples this to Connection
-                    // internals. Future: expose a cancel(id) helper on Connection.
+                    // Return early without cleaning pending-map entry (see
+                    // fallback_timeout comment above for the leak rationale).
                     return Err(AcpError::Timeout(format!(
                         "session/prompt idle timeout ({idle_window:?} of silence)"
                     )));

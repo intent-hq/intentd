@@ -1,8 +1,8 @@
 //! Unit tests for `ActivityTracker` (STAB-33).
 //!
 //! These tests verify the timestamp-tracking mechanism that supports the
-//! activity-based idle timeout. They do NOT test `session::prompt` timeout
-//! behavior (that's covered by integration tests with the mock ACP agent).
+//! activity-based idle timeout. Full integration test coverage (asserting that
+//! `session::prompt` actually times out after the idle window) is deferred.
 
 use std::time::Duration;
 use tokio::time::sleep;
