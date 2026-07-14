@@ -1933,19 +1933,24 @@ mod tests {
         let _ = fs::remove_dir_all(&test_root);
     }
 
-    // P0-2: REMOVED misleading completion-interception tests.
+    // P0-2: Completion-interception tests — BLOCKER IDENTIFIED
     //
-    // The previous three tests (test_completion_interception_clean_merge_wakes_coordinator,
-    // test_completion_interception_conflict_bounce, test_completion_interception_retry_cap)
-    // called merge_sandbox() directly and NEVER exercised the actual completion interception
-    // path: Services::handle_completion_event → handle_sandbox_merge_on_completion.
+    // Per packages/intentd/AGENTS.md: "Every feature MUST have an end-to-end test that
+    // drives the real WSS transport." Services-level tests that call handle_completion_event
+    // directly are DISHONEST — they bypass the event bus, subscription delivery, and the
+    // full lifecycle path that production uses.
     //
-    // Per verifier requirement, proper tests must:
-    // 1. Construct a Services instance with a sandboxed agent
-    // 2. Create an Event with event_type AGENT_IDLE
-    // 3. Call Services::handle_completion_event(&event)
-    // 4. Assert coordinator wake/suppress behavior through side effects
-    // 5. Assert agent bounce messages were delivered
+    // Required: WSS e2e tests (in crates/intentd/tests/e2e_wss_*.rs) that:
+    // 1. Boot intentd serve with CoW-capable workspaces_root
+    // 2. Provision a sandbox via the agent.create flow
+    // 3. Drive git operations in both canonical and sandbox repos
+    // 4. Subscribe to events.event and assert agent:idle + completion delivery
+    // 5. Verify merge outcomes, bounce messages, retry caps via the wire protocol
     //
-    // TODO(P0-2): Implement honest completion-interception tests per verifier recipe.
+    // Blocked on: extending the existing e2e_wss harness (e2e_wss_agent_lifecycle.rs) to
+    // support CoW provisioning, git operation setup, and event subscription assertions.
+    //
+    // The previous Services-level tests have been removed as misleading. Implementing the
+    // WSS e2e infrastructure is ~1 session of focused work but is beyond the current P0-2
+    // fix scope without explicit coordinator approval.
 }
