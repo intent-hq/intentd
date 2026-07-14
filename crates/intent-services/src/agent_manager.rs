@@ -556,6 +556,12 @@ impl ProcessRegistry {
                 }
                 Action::Wait(rx) => {
                     let _ = rx.await;
+                    // Resume path: when woken from the queue, a slot is now available
+                    // (either a process was deregistered or became idle). Return
+                    // immediately rather than looping to re-evaluate — looping would
+                    // race with the idle-marking process and could evict the very
+                    // process that freed the slot, emitting a spurious eviction event.
+                    return;
                 }
             }
         }
