@@ -256,7 +256,9 @@ fn init_tracing() {
     };
 
     // Create the data directory if it doesn't exist
-    let _ = std::fs::create_dir_all(&log_dir);
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("WARN: failed to create log directory {:?}: {}", log_dir, e);
+    }
 
     // Set up file appender with rotation: keep ~5 files, rotate daily
     // Note: tracing-appender's max_log_files works with time-based rotation
@@ -1619,17 +1621,18 @@ async fn report_db_health(store: &Store) {
     {
         Ok(rows) => {
             if rows.len() == 1 {
-                let result: String = rows[0].get(0);
-                if result == "ok" {
-                    println!("  [ok] integrity_check: ok");
-                } else {
-                    println!("  [WARN] integrity_check: {}", result);
+                match rows[0].try_get::<String, _>(0) {
+                    Ok(result) if result == "ok" => println!("  [ok] integrity_check: ok"),
+                    Ok(result) => println!("  [WARN] integrity_check: {}", result),
+                    Err(e) => println!("  [WARN] integrity_check: failed to decode result: {}", e),
                 }
             } else {
                 println!("  [WARN] integrity_check: {} issues found", rows.len());
                 for row in rows {
-                    let result: String = row.get(0);
-                    println!("    - {}", result);
+                    match row.try_get::<String, _>(0) {
+                        Ok(result) => println!("    - {}", result),
+                        Err(e) => println!("    - [decode error: {}]", e),
+                    }
                 }
             }
         }
@@ -1647,24 +1650,32 @@ async fn report_db_health(store: &Store) {
         .await
     {
         Ok(row) => {
-            let busy: i64 = row.get(0);
-            let log: i64 = row.get(1);
-            let checkpointed: i64 = row.get(2);
-            if busy != 0 {
-                println!(
-                    "  [WARN] wal_checkpoint(PASSIVE): busy={}, log={} frames, checkpointed={} frames (checkpoint incomplete)",
-                    busy, log, checkpointed
-                );
-            } else if checkpointed < log {
-                println!(
-                    "  [WARN] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames (partial checkpoint)",
-                    log, checkpointed
-                );
-            } else {
-                println!(
-                    "  [ok] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames",
-                    log, checkpointed
-                );
+            let busy = row.try_get::<i64, _>(0);
+            let log = row.try_get::<i64, _>(1);
+            let checkpointed = row.try_get::<i64, _>(2);
+
+            match (busy, log, checkpointed) {
+                (Ok(busy), Ok(log), Ok(checkpointed)) => {
+                    if busy != 0 {
+                        println!(
+                            "  [WARN] wal_checkpoint(PASSIVE): busy={}, log={} frames, checkpointed={} frames (checkpoint incomplete)",
+                            busy, log, checkpointed
+                        );
+                    } else if checkpointed < log {
+                        println!(
+                            "  [WARN] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames (partial checkpoint)",
+                            log, checkpointed
+                        );
+                    } else {
+                        println!(
+                            "  [ok] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames",
+                            log, checkpointed
+                        );
+                    }
+                }
+                _ => {
+                    println!("  [WARN] wal_checkpoint(PASSIVE): failed to decode PRAGMA result");
+                }
             }
         }
         Err(e) => {

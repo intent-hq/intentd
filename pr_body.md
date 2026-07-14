@@ -9,24 +9,30 @@ Implements three observability features to make the next unexplained daemon deat
 ## Changes
 
 ### File Logging
-- Uses tracing-appender::rolling with rotation
+- Uses tracing-appender::rolling with **daily rotation** (time-based, not size-based)
 - Logs to INTENTD_DATA_DIR/intentd.log
-- Keeps ~5 files, ~10MB each
+- Keeps 5 most recent files (hardcoded `max_log_files(5)`)
 - INFO default, RUST_LOG override respected
 - Dual output: stderr (interactive) + file (diagnostics)
+- Degrades gracefully: if file appender fails, continues with stderr-only logging
+- WorkerGuard stored in static to keep background writer thread alive for process lifetime
 
 ### Panic Hook
 - Installed via std::panic::set_hook
 - Captures full backtrace using std::backtrace::Backtrace::force_capture()
 - Logs to tracing (which writes to file) with location, message, and backtrace
 - Also writes to stderr for immediate visibility
+- Chains default panic hook to preserve standard Rust panic formatting (thread name, etc.)
+- Process panics/unwinds/aborts according to Rust's standard behavior after both hooks run
 
 ### DB Health Section
 - Added report_db_health() function called from cmd_doctor()
-- Runs PRAGMA integrity_check
+- Runs PRAGMA integrity_check (reports all issues, not just the first)
 - Runs PRAGMA wal_checkpoint(PASSIVE) and reports frame counts
+  - Marks as [WARN] when busy != 0 (checkpoint incomplete) or checkpointed < log (partial checkpoint)
 - Reports connection pool stats (size, idle connections)
 - All checks informational, never fail doctor
+- Uses `try_get` instead of `get` to avoid panics on unexpected PRAGMA results
 
 ## Verification
 
