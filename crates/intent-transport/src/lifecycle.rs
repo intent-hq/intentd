@@ -216,12 +216,13 @@ impl WsInner {
             Error::Internal("cannot start discovery in insecure mode (no fingerprint)".to_string())
         })?;
 
-        // Start discovery
-        let discovery = advertise_if_enabled(true, port, fingerprint, self.locality_is_local);
+        // Start discovery - advertise_if_enabled returns None on failure
+        let discovery = advertise_if_enabled(true, port, fingerprint, self.locality_is_local)
+            .ok_or_else(|| Error::Internal("failed to start mDNS discovery".to_string()))?;
 
         // Store the discovery handle
         if let Some(ref mut running) = st.running {
-            running.discovery = discovery;
+            running.discovery = Some(discovery);
         }
 
         Ok(())

@@ -3505,8 +3505,8 @@ impl Services {
         control: &Arc<dyn intent_core::ServerControl>,
     ) {
         for change in applied {
-            if let Some(key) = change.get("key").and_then(|v| v.as_str()) {
-                match key {
+            if let Some(path) = change.get("path").and_then(|v| v.as_str()) {
+                match path {
                     "server.wsApi.enabled" => {
                         if let Some(enabled) = change.get("value").and_then(|v| v.as_bool()) {
                             if enabled {
