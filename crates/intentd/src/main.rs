@@ -568,7 +568,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
         });
 
         // Start the listener immediately (CLI --listen wins over settings)
-        let server = if insecure {
+        let mut server = if insecure {
             WsApiServer::new_insecure_with_reverse(
                 api.clone(),
                 bus.clone(),
@@ -580,12 +580,23 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
                 api.clone(),
                 bus.clone(),
                 tls_cert.as_ref().unwrap(),
-                token_store.unwrap(),
+                token_store.clone().unwrap(),
                 ws_options.clone(),
                 reverse_registry.clone(),
             )
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
         };
+
+        // Install pairing info provider on the server (§5.2) if in secure mode
+        if !insecure {
+            let pairing_provider = Arc::new(DaemonPairingInfo {
+                data_dir: config.data_dir.clone(),
+                token_store: AsyncTokenStore::new(resolve_token_store()),
+                ws_runtime: Some(runtime.clone()),
+            });
+            server.install_pairing_info(pairing_provider);
+        }
+
         let port = server.start().await?;
         match server.fingerprint() {
             Some(fp) => tracing::info!(port, fingerprint = %fp, "intentd WSS listening"),
@@ -618,13 +629,26 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
         tcp: serve_tcp_enabled,
         manager: manager.clone(),
         shutdown: shutdown_notify.clone(),
-        ws_runtime,
+        ws_runtime: ws_runtime.clone(),
     });
 
     // Wire ServerControl to Services for settings-driven runtime control (§5.12).
     // The control is attached after the api Arc is built via the `OnceLock` seam.
     let server_control: Arc<dyn intent_core::ServerControl> = control.clone();
     services.attach_server_control(server_control);
+
+    // Build pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
+    // Only built when there's a token store (secure mode); `None` in insecure mode.
+    // Available to UDS clients even when TCP is disabled (they can still call the RPCs).
+    let pairing_info: Option<Arc<dyn intent_transport::ServerPairingInfo>> = if insecure {
+        None
+    } else {
+        Some(Arc::new(DaemonPairingInfo {
+            data_dir: config.data_dir.clone(),
+            token_store: AsyncTokenStore::new(resolve_token_store()),
+            ws_runtime: ws_runtime.clone(),
+        }))
+    };
 
     let shutdown = {
         let notify = shutdown_notify.clone();
@@ -644,6 +668,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             bus,
             &config.socket_path,
             Some(system_control),
+            pairing_info,
             reverse_registry.clone(),
             shutdown,
         )
@@ -717,6 +742,45 @@ struct WsRuntimeState {
     ws_server: Option<WsApiServer>,
     /// Cached port for sync system.status access
     port: Option<u16>,
+}
+
+/// Pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
+/// Implemented by the daemon composition root and wired to UDS and WSS listeners.
+struct DaemonPairingInfo {
+    data_dir: PathBuf,
+    token_store: AsyncTokenStore,
+    /// Runtime control reference to read the current bound port. `None` when the
+    /// daemon was started with --listen uds (no TCP listener capability).
+    ws_runtime: Option<Arc<WsRuntimeControl>>,
+}
+
+impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
+    fn pairing_snapshot(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = intent_transport::PairingSnapshot> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let port = if let Some(ref runtime) = self.ws_runtime {
+                if let Ok(state) = runtime.state.try_lock() {
+                    state.port
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            intent_transport::PairingSnapshot { port }
+        })
+    }
+
+    fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
+    fn token_store(&self) -> &AsyncTokenStore {
+        &self.token_store
+    }
 }
 
 impl SystemControl for DaemonControl {

@@ -135,6 +135,9 @@ pub(crate) struct WsInner {
     /// reverse RPCs still surface `NoClient` when the composition root did not
     /// share a registry across listeners).
     pub reverse_registry: Arc<PrimaryReverseRegistry>,
+    /// Server pairing info provider for `server.pairingInfo` / `server.rotateToken`
+    /// fast-path (§5.2). `None` means the methods are unavailable on this listener.
+    pub server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -177,6 +180,7 @@ impl WsApiServer {
             external_stop_generation: AtomicU64::new(0),
             state: tokio::sync::Mutex::new(StartState::default()),
             reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
+            server_pairing_info: None,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -208,6 +212,7 @@ impl WsApiServer {
             external_stop_generation: AtomicU64::new(0),
             state: tokio::sync::Mutex::new(StartState::default()),
             reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
+            server_pairing_info: None,
         };
         Self {
             inner: Arc::new(inner),
@@ -255,6 +260,17 @@ impl WsApiServer {
         let inner = Arc::get_mut(&mut server.inner)
             .expect("WsApiServer inner not yet shared before install_registry");
         inner.reverse_registry = reverse_registry;
+    }
+
+    /// Install server pairing info provider on the inner state. Uses the same
+    /// `Arc::get_mut` pattern as `install_registry`. Called from composition root.
+    pub fn install_pairing_info(
+        &mut self,
+        server_pairing_info: Arc<dyn crate::server::ServerPairingInfo>,
+    ) {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("WsApiServer inner not yet shared before install_pairing_info");
+        inner.server_pairing_info = Some(server_pairing_info);
     }
 
     /// Start the listener, returning the bound port (single-flight).
@@ -539,7 +555,7 @@ impl WsInner {
                         // surface (those are served over the local UDS); pass `None`.
                         // `host.status` IS answered here, with the resolved WSS
                         // locality (remote unless overridden, §5.14).
-                        if !conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, None, &mut client_id, self.locality_is_local).await {
+                        if !conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, None, self.server_pairing_info.as_ref(), &mut client_id, self.locality_is_local).await {
                             break;
                         }
                     }

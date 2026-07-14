@@ -112,6 +112,7 @@ pub(crate) async fn process_frame(
     forwards: &mut ForwardRegistry,
     reverse: &ReverseChannel,
     control: Option<&Arc<dyn SystemControl>>,
+    server_pairing_info: Option<&Arc<dyn crate::server::ServerPairingInfo>>,
     client_id: &mut Option<ClientId>,
     is_local: bool,
 ) -> bool {
@@ -125,6 +126,14 @@ pub(crate) async fn process_frame(
         if let Some(control) = control {
             if let Some(req) = control::classify(&value) {
                 return match control::handle(req, control.as_ref(), is_local) {
+                    Some(frame) => out_tx.send(frame).await.is_ok(),
+                    None => true,
+                };
+            }
+        }
+        if let Some(server_info) = server_pairing_info {
+            if let Some(req) = crate::server::classify(&value) {
+                return match crate::server::handle(req, server_info, is_local).await {
                     Some(frame) => out_tx.send(frame).await.is_ok(),
                     None => true,
                 };

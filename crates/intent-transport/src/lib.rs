@@ -27,6 +27,7 @@ pub use reverse::{
     DEFAULT_REVERSE_TIMEOUT,
 };
 pub use router::handle_message;
+pub use server::{PairingSnapshot, ServerPairingInfo};
 pub use tls::{cert_fingerprint, ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
 pub use ws::{WsApiServer, WsOptions};
 
@@ -46,6 +47,7 @@ pub mod lifecycle;
 pub mod listener;
 pub mod reverse;
 pub mod router;
+pub mod server;
 mod subscriptions;
 pub mod tls;
 pub mod ws;

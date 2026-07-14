@@ -1,0 +1,174 @@
+//! Server pairing fast-path: `server.pairingInfo` + `server.rotateToken` (§5.2).
+//!
+//! These two methods expose pairing credentials (token + fingerprint + port + local IPs + hostname)
+//! and rotate the bearer token. They are LOCAL-ONLY: UDS and loopback connections only. Remote
+//! TCP connections get an auth error. This mirrors the `control::` fast-path pattern and sits
+//! one layer above the domain [`WorkspaceApi`] router, intercepted before JSON-RPC dispatch.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use serde_json::{json, Value};
+
+use crate::events::{error_frame, success_frame};
+use intent_core::{Error, Result};
+
+/// Pairing information provider: implemented by the composition root (`intentd`).
+/// Provides access to token store, data dir, and port snapshot for pairing RPCs.
+pub trait ServerPairingInfo: Send + Sync {
+    /// Get the current bound WSS port, or `None` if the listener is stopped.
+    fn pairing_snapshot(&self) -> Pin<Box<dyn Future<Output = PairingSnapshot> + Send + '_>>;
+    /// Data directory for TLS cert access.
+    fn data_dir(&self) -> &std::path::Path;
+    /// Token store for get/generate operations.
+    fn token_store(&self) -> &crate::AsyncTokenStore;
+}
+
+/// Point-in-time snapshot of pairing-relevant server state.
+#[derive(Debug, Clone)]
+pub struct PairingSnapshot {
+    /// The bound WSS port, when the TCP listener is running.
+    pub port: Option<u16>,
+}
+
+/// The two server methods, once classified.
+#[derive(Debug)]
+pub(crate) enum ServerMethod {
+    PairingInfo,
+    RotateToken,
+}
+
+/// A classified `server.*` request awaiting handling by the connection task.
+pub(crate) struct ServerRequest {
+    pub method: ServerMethod,
+    pub id_present: bool,
+    pub id_echo: Value,
+}
+
+/// Classify a parsed frame as a `server.pairingInfo` / `server.rotateToken` request, or
+/// `None` to fall through to the JSON-RPC dispatcher. Mirrors `control::classify`.
+pub(crate) fn classify(value: &Value) -> Option<ServerRequest> {
+    let obj = value.as_object()?;
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return None;
+    }
+    let method = obj.get("method").and_then(Value::as_str)?;
+    let id_member = obj.get("id");
+    if let Some(v) = id_member {
+        if !v.is_null() && !v.is_string() && !v.is_number() {
+            return None;
+        }
+    }
+    let method = match method {
+        "server.pairingInfo" => ServerMethod::PairingInfo,
+        "server.rotateToken" => ServerMethod::RotateToken,
+        _ => return None,
+    };
+    Some(ServerRequest {
+        method,
+        id_present: id_member.is_some(),
+        id_echo: id_member.cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// Handle a classified `server.*` request: build the response frame (or `None`
+/// for a notification). LOCAL-ONLY: remote connections get an auth error.
+pub(crate) async fn handle(
+    req: ServerRequest,
+    provider: &Arc<dyn ServerPairingInfo>,
+    is_local: bool,
+) -> Option<String> {
+    if !is_local {
+        // Remote connections are not allowed to access pairing info or rotate tokens.
+        if !req.id_present {
+            return None;
+        }
+        return Some(error_frame(
+            req.id_echo,
+            -32001,
+            "server.* methods are local-only",
+        ));
+    }
+
+    let result: std::result::Result<Value, (i32, String)> = match req.method {
+        ServerMethod::PairingInfo => pairing_info_json(provider.as_ref())
+            .await
+            .map_err(|e| (e.code(), e.to_string())),
+        ServerMethod::RotateToken => rotate_token_json(provider.as_ref())
+            .await
+            .map_err(|e| (e.code(), e.to_string())),
+    };
+
+    if !req.id_present {
+        return None;
+    }
+    match result {
+        Ok(v) => Some(success_frame(req.id_echo, v)),
+        Err((code, msg)) => Some(error_frame(req.id_echo, code, &msg)),
+    }
+}
+
+/// Build the `server.pairingInfo` result JSON.
+async fn pairing_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
+    let snapshot = provider.pairing_snapshot().await;
+    let token = crate::get_or_create_token(provider.token_store()).await?;
+    let cert = crate::ensure_tls_certificate(provider.data_dir())?;
+    let local_ips = collect_local_ips();
+    let hostname = crate::discovery::local_hostname();
+
+    Ok(json!({
+        "token": token,
+        "certFingerprint": cert.fingerprint256,
+        "port": snapshot.port,
+        "path": "/ws",
+        "localIps": local_ips,
+        "hostname": hostname,
+    }))
+}
+
+/// Build the `server.rotateToken` result JSON. Returns an error when INTENTD_AUTH_TOKEN is set.
+async fn rotate_token_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
+    // Check if INTENTD_AUTH_TOKEN is set (token is fixed by env).
+    if std::env::var("INTENTD_AUTH_TOKEN")
+        .map(|t| !t.is_empty())
+        .unwrap_or(false)
+    {
+        return Err(Error::InvalidParams(
+            "cannot rotate token: INTENTD_AUTH_TOKEN is set (token is fixed by env)".to_string(),
+        ));
+    }
+
+    crate::generate_token(provider.token_store()).await?;
+    pairing_info_json(provider).await
+}
+
+/// Collect local IP addresses (non-loopback IPv4) for pairing. Mirrors the logic
+/// from `tls::collect_san` but returns only the local IPs (no localhost/loopback).
+fn collect_local_ips() -> Vec<String> {
+    let mut ips = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            // Skip virtual/container interfaces (same prefixes as tls::collect_san).
+            if ["docker", "veth", "br-", "vboxnet", "vmnet"]
+                .iter()
+                .any(|p| iface.name.starts_with(p))
+            {
+                continue;
+            }
+            if iface.is_loopback() {
+                continue;
+            }
+            if let std::net::IpAddr::V4(v4) = iface.ip() {
+                let addr = v4.to_string();
+                if !ips.contains(&addr) {
+                    ips.push(addr);
+                }
+            }
+        }
+    }
+    ips
+}
+
+#[cfg(test)]
+mod tests;
