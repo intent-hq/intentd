@@ -447,6 +447,15 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
         process_cap = manager.registry().cap(),
         "agent manager ready"
     );
+    // Wave B: unconditionally reset all is_active=1 rows (ACP sessions cannot
+    // survive a daemon restart — they are process-local). Any is_active=1 flag
+    // after boot is stale. This runs BEFORE heal_stale_agent_sessions so the
+    // stale-status heal sees is_active=0 rows across the board.
+    match services.store().reset_all_active_flags().await {
+        Ok(0) => {}
+        Ok(reset) => tracing::warn!(reset, "reset stale is_active=1 flags on startup"),
+        Err(e) => tracing::warn!(error = %e, "is_active reset failed"),
+    }
     // Heal stale in-flight conversations from any prior crash BEFORE the chat
     // subscription path can observe them (iter#1c). Sessions left in an
     // active status (`Active`/`Processing`/`Waiting`) without a live worker

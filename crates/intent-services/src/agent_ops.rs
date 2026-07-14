@@ -2958,6 +2958,22 @@ impl Services {
                 .get("queued")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            // Wave B: when the wake message was directly delivered (not queued),
+            // force a queue drain so any previously-queued normal-priority messages
+            // send immediately without waiting for an interrupt-priority nudge.
+            // Post-restart recovery: a woken agent must resume pending work.
+            if !queued {
+                if let Some(mgr) = self.agent_manager() {
+                    tokio::spawn({
+                        let mgr = mgr.clone();
+                        let agent_id = agent_id.clone();
+                        let workspace_id = workspace_id.clone();
+                        async move {
+                            mgr.try_drain_queue(agent_id, workspace_id).await;
+                        }
+                    });
+                }
+            }
             let action = if queued {
                 "message_queued_to_active_agent"
             } else {
