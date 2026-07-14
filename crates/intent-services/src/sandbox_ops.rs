@@ -1524,7 +1524,7 @@ mod tests {
             index.write().unwrap();
             let tree_oid = index.write_tree().unwrap();
             let tree = sandbox_repo.find_tree(tree_oid).unwrap();
-            let sig = sandbox_repo.signature().unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
             let parent = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
             sandbox_repo
                 .commit(Some("HEAD"), &sig, &sig, "Sandbox work", &tree, &[&parent])
