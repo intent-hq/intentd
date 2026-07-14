@@ -357,3 +357,240 @@ async fn runtime_ws_listener_toggle_over_wss() {
         "subscriptionId should be returned after re-enable"
     );
 }
+
+/// Batch hook ordering: settings.update with {wsApi.enabled=true, discovery.enabled=true}
+/// in a single batch must apply hooks in deterministic, dependency-aware order.
+/// server.wsApi.enabled (priority 10) applies before server.discovery.enabled (priority 11)
+/// because mDNS discovery depends on the WSS listener being active.
+/// Key test: a batch with both wsApi.enabled and discovery.enabled succeeds (no
+/// "WSS listener not started" error from non-deterministic map iteration order).
+#[tokio::test]
+async fn batch_hook_ordering_enable_both_services() {
+    let data_dir = temp_data_dir();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    // Disable both listener and discovery
+    let disable_all = uds_rpc(
+        &socket,
+        1,
+        "settings.update",
+        json!({
+            "changes": [
+                { "path": "server.wsApi.enabled", "value": false },
+                { "path": "server.discovery.enabled", "value": false }
+            ]
+        }),
+    )
+    .await;
+    assert!(
+        disable_all.get("error").is_none(),
+        "disable all should succeed: {disable_all}"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Batch update: enable both in arbitrary input order (wsApi.enabled first in the array).
+    // The ordering rule ensures deterministic application: wsApi.enabled (priority 10) applies
+    // before discovery.enabled (priority 11), so the listener starts before mDNS discovery.
+    let batch_enable = uds_rpc(
+        &socket,
+        2,
+        "settings.update",
+        json!({
+            "changes": [
+                { "path": "server.wsApi.enabled", "value": true },
+                { "path": "server.discovery.enabled", "value": true }
+            ]
+        }),
+    )
+    .await;
+    assert!(
+        batch_enable.get("error").is_none(),
+        "batch enable both should succeed: {batch_enable}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify system.status shows both services enabled
+    let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
+    assert!(
+        status["result"]["port"].as_u64().is_some(),
+        "WSS listener should be enabled"
+    );
+
+    // Connect over WSS to verify the listener is functional
+    let port = status["result"]["port"].as_u64().unwrap() as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    let ping_resp = wss_rpc(
+        &mut ws,
+        10,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        ping_resp.get("error").is_none(),
+        "events.subscribe over WSS should work: {ping_resp}"
+    );
+}
+
+/// Batch hook ordering: disable case. A batch with {wsApi.enabled=false, discovery.enabled=false}
+/// should stop both services. This tests the ordering is stable for the disable direction:
+/// wsApi.enabled (priority 10) applies before discovery.enabled (priority 11).
+#[tokio::test]
+async fn batch_hook_ordering_disable_both() {
+    let data_dir = temp_data_dir();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    // Verify initial listener is running
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let initial_port = status["result"]["port"]
+        .as_u64()
+        .expect("port should be set at boot") as u16;
+
+    // Batch update: disable both wsApi and discovery in a SINGLE batch, in reverse
+    // lexicographic input order (wsApi.enabled appears before discovery.enabled in the array).
+    // The ordering rule ensures deterministic application: wsApi.enabled (priority 10) applies
+    // before discovery.enabled (priority 11). Note: stopping the WSS listener internally
+    // unpublishes mDNS first, so the subsequent discovery.enabled=false hook is a no-op.
+    let batch_disable = uds_rpc(
+        &socket,
+        2,
+        "settings.update",
+        json!({
+            "changes": [
+                { "path": "server.wsApi.enabled", "value": false },
+                { "path": "server.discovery.enabled", "value": false }
+            ]
+        }),
+    )
+    .await;
+    assert!(
+        batch_disable.get("error").is_none(),
+        "batch disable both should succeed: {batch_disable}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify system.status shows no listener
+    let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
+    assert!(
+        status["result"]["port"].is_null(),
+        "port should be null after batch disable"
+    );
+
+    // Verify new WSS connections are refused at the initial port
+    let connect_result = timeout(
+        Duration::from_secs(2),
+        TcpStream::connect((Ipv4Addr::LOCALHOST, initial_port)),
+    )
+    .await;
+    assert!(
+        connect_result.is_err() || connect_result.unwrap().is_err(),
+        "TCP connection should fail after listener is stopped"
+    );
+}
+
+/// Batch hook ordering: reverse input order test. A batch with changes in non-lexicographic
+/// input order should still apply hooks deterministically. This test provides
+/// {wsApi.enabled=true, discovery.enabled=true} with discovery.enabled FIRST in the input array,
+/// proving the sort happens before application (not dependent on input order).
+#[tokio::test]
+async fn batch_hook_ordering_reverse_input_order() {
+    let data_dir = temp_data_dir();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    // Disable both listener and discovery
+    let disable_all = uds_rpc(
+        &socket,
+        1,
+        "settings.update",
+        json!({
+            "changes": [
+                { "path": "server.wsApi.enabled", "value": false },
+                { "path": "server.discovery.enabled", "value": false }
+            ]
+        }),
+    )
+    .await;
+    assert!(
+        disable_all.get("error").is_none(),
+        "disable all should succeed: {disable_all}"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Batch update: provide changes in REVERSE dependency order (discovery.enabled before wsApi.enabled).
+    // The hook ordering ensures they still apply in deterministic, dependency-aware order:
+    // wsApi.enabled (priority 10) before discovery.enabled (priority 11), regardless of input order.
+    let batch_reverse = uds_rpc(
+        &socket,
+        2,
+        "settings.update",
+        json!({
+            "changes": [
+                { "path": "server.discovery.enabled", "value": true },
+                { "path": "server.wsApi.enabled", "value": true }
+            ]
+        }),
+    )
+    .await;
+    assert!(
+        batch_reverse.get("error").is_none(),
+        "batch reverse order should succeed: {batch_reverse}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify system.status shows the listener is enabled
+    let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
+    let port = status["result"]["port"]
+        .as_u64()
+        .expect("port should be set after batch enable") as u16;
+
+    // Connect over WSS to verify the listener is functional
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    let ping_resp = wss_rpc(
+        &mut ws,
+        10,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        ping_resp.get("error").is_none(),
+        "events.subscribe over WSS after reverse-order batch should work: {ping_resp}"
+    );
+}

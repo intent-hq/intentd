@@ -4334,12 +4334,48 @@ impl Services {
     /// `server.wsApi.enabled` / `server.discovery.enabled` changes (§5.12).
     /// Returns an error if the operation fails (e.g., TCP client trying to disable
     /// the WSS listener, or listener start failure), allowing the caller to rollback.
+    ///
+    /// **Ordering rule**: Hooks are applied in dependency-aware, deterministic order:
+    /// - Value-setting keys (future: server.wsApi.port, server.locality, server.discovery.*
+    ///   config values) apply FIRST (priority 0).
+    /// - server.wsApi.enabled applies SECOND (priority 10) — starts/stops the WSS listener.
+    /// - server.discovery.enabled applies THIRD (priority 11) — starts/stops mDNS, which
+    ///   depends on the WSS listener being active.
+    /// - Within the same priority tier, keys are processed in lexicographic order.
+    /// - Single-key updates have zero behavior change.
+    /// - This ensures batches like {server.wsApi.enabled=true, server.discovery.enabled=true}
+    ///   start the listener before attempting discovery, and future batches like
+    ///   {server.wsApi.port=NEW, server.wsApi.enabled=true} will start the listener on the
+    ///   NEW port, not the old one.
     async fn apply_server_setting_hooks(
         &self,
         applied: &[serde_json::Value],
         control: &Arc<dyn intent_core::ServerControl>,
     ) -> Result<()> {
-        for change in applied {
+        /// Priority for hook application order: lower values apply first.
+        fn hook_priority(path: &str) -> u8 {
+            match path {
+                // WSS listener must start before discovery (discovery depends on listener)
+                "server.wsApi.enabled" => 10,
+                // Discovery enabled applies after listener is up
+                "server.discovery.enabled" => 11,
+                // Value-setting keys (port, locality, discovery config) apply first
+                _ if path.starts_with("server.") => 0,
+                // Non-server keys (no hooks, sorted lexicographically within this tier)
+                _ => 255,
+            }
+        }
+
+        // Sort changes by (priority, path) to ensure deterministic, dependency-aware order.
+        // Use stable sort so duplicate paths maintain their input order (tie-breaker).
+        let mut sorted_changes: Vec<&serde_json::Value> = applied.iter().collect();
+        sorted_changes.sort_by(|a, b| {
+            let path_a = a.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path_b = b.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            (hook_priority(path_a), path_a).cmp(&(hook_priority(path_b), path_b))
+        });
+
+        for change in sorted_changes {
             if let Some(path) = change.get("path").and_then(|v| v.as_str()) {
                 match path {
                     "server.wsApi.enabled" => {
