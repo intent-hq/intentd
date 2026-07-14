@@ -9536,6 +9536,93 @@ mod file_ops_service {
         // Clean up
         let _ = fs::remove_dir_all(&test_root);
     }
+
+    /// Wire-contract test: agent.delegate returns effectiveIsolation field when
+    /// isolation is requested, reporting "cow" on successful provisioning or "direct"
+    /// on unsupported fallback.
+    #[tokio::test]
+    async fn delegate_returns_effective_isolation_in_result() {
+        use intent_core::AgentDelegateInput;
+        use intent_git::{cow_probe, CowSupport};
+        use std::fs;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+
+        // Set up test directories under target/ (same volume for CoW support)
+        let workspace_root = std::env::current_dir()
+            .unwrap()
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .to_path_buf();
+        let test_root = workspace_root
+            .join("target")
+            .join(format!("test-delegate-iso-{}", uuid::Uuid::new_v4()));
+        let user_dir = test_root.join("user-workspace");
+        let workspaces_root = test_root.join("workspaces");
+
+        // Initialize a git repo
+        fs::create_dir_all(&user_dir).unwrap();
+        let repo = git2::Repository::init(&user_dir).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
+            .unwrap();
+
+        // Create workspace
+        let mut ws = workspace(&ws_id);
+        ws.repository_path = Some(user_dir.to_string_lossy().to_string());
+        ws.skip_worktree = true;
+        store.insert_workspace(&ws).await.expect("insert ws");
+
+        // Probe CoW support to determine expected outcome
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&user_dir, &workspaces_root).unwrap();
+        let expected_isolation = match probe {
+            CowSupport::Supported => "cow",
+            CowSupport::Unsupported => "direct",
+        };
+
+        // Create services with workspaces_root configured
+        let mut svc = Services::new(store.clone());
+        svc.workspaces_root = Some(workspaces_root);
+
+        // Delegate with isolation=cow
+        let delegate_input = AgentDelegateInput {
+            task_text: Some("test task".to_string()),
+            agent_instructions: Some("test instructions".to_string()),
+            isolation: Some("cow".to_string()),
+            ..Default::default()
+        };
+        let result = svc
+            .agent_delegate_op(ws_id.clone(), delegate_input, None)
+            .await
+            .expect("delegate");
+
+        // Assert effectiveIsolation field is present and correct
+        let effective_iso = result
+            .get("effectiveIsolation")
+            .expect("effectiveIsolation field must be present when isolation is requested");
+        assert_eq!(
+            effective_iso.as_str().unwrap(),
+            expected_isolation,
+            "effectiveIsolation must report actual provisioning outcome"
+        );
+
+        // Also verify agentId and name are present (baseline delegate result shape)
+        assert!(result.get("ok").unwrap().as_bool().unwrap());
+        assert!(result.get("agentId").is_some());
+        assert!(result.get("name").is_some());
+
+        // Clean up
+        let _ = fs::remove_dir_all(&test_root);
+    }
 }
 
 mod primitive_ops_service {
