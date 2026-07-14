@@ -2020,6 +2020,19 @@ impl AgentManager {
             .await
     }
 
+    /// Tear down only the agent's child process + handle, without touching the
+    /// worker or busy flag. Safe to call from within the worker itself (e.g.,
+    /// retry loop). Use `stop()` for full teardown from external callers.
+    async fn kill_child_only(&self, agent_id: &AgentId) {
+        let handle = self.handles.lock().unwrap().remove(agent_id);
+        if let Some(mut handle) = handle {
+            if let Some(child) = handle._child.take() {
+                kill_child_tree(child).await;
+            }
+        }
+        self.registry.deregister(agent_id);
+    }
+
     /// Build the kill callback for `agent_id`: removing the handle signals the
     /// child's whole process group (SIGTERM→SIGKILL) and aborts its request
     /// loop, so no orphaned grandchildren linger.
@@ -2467,8 +2480,34 @@ async fn persist_user(mgr: &AgentManager, agent_id: &AgentId, content: &str) {
 
 /// Max number of spawn attempts (includes the initial attempt).
 const MAX_SPAWN_ATTEMPTS: u32 = 3;
-/// Backoff delays between retry attempts (in seconds).
-const RETRY_BACKOFF_MS: &[u64] = &[2000, 5000];
+/// Default backoff delays between retry attempts (in milliseconds).
+const DEFAULT_RETRY_BACKOFF_MS: &[u64] = &[2000, 5000];
+
+/// Get retry backoff delays, overridable via INTENTD_SPAWN_RETRY_BACKOFF_MS
+/// for test-only fast retries (comma-separated milliseconds, e.g. "100,200").
+fn retry_backoff_ms() -> Vec<u64> {
+    if let Ok(val) = std::env::var("INTENTD_SPAWN_RETRY_BACKOFF_MS") {
+        let mut delays = Vec::new();
+        for part in val.split(',') {
+            if let Ok(ms) = part.trim().parse::<u64>() {
+                delays.push(ms);
+            } else {
+                // Invalid format, fall back to default
+                eprintln!("[retry_backoff_ms] invalid format, using default");
+                return DEFAULT_RETRY_BACKOFF_MS.to_vec();
+            }
+        }
+        if !delays.is_empty() {
+            eprintln!("[retry_backoff_ms] using override: {:?}", delays);
+            return delays;
+        }
+    }
+    eprintln!(
+        "[retry_backoff_ms] using default: {:?}",
+        DEFAULT_RETRY_BACKOFF_MS
+    );
+    DEFAULT_RETRY_BACKOFF_MS.to_vec()
+}
 
 /// Classify whether an error from `ensure_started` is retryable. Retryable
 /// errors include session/new or session/load timeouts, handshake failures
@@ -2531,7 +2570,8 @@ async fn retry_spawn(
                 }
 
                 // Tear down the failed child so the next attempt spawns fresh
-                mgr.stop(agent_id).await;
+                // (narrower than full stop() — only kills child/handle, no worker/busy-flag touch)
+                mgr.kill_child_only(agent_id).await;
 
                 // Publish retry status hint
                 let retry_num = attempt;
@@ -2550,7 +2590,8 @@ async fn retry_spawn(
                     .await;
 
                 // Backoff before retry
-                if let Some(&delay_ms) = RETRY_BACKOFF_MS.get((attempt - 1) as usize) {
+                let backoff = retry_backoff_ms();
+                if let Some(&delay_ms) = backoff.get((attempt - 1) as usize) {
                     tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                 }
             }
