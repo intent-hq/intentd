@@ -3499,32 +3499,38 @@ impl Services {
 
     /// Apply server runtime control hooks after `settings.update` persists
     /// `server.wsApi.enabled` / `server.discovery.enabled` changes (§5.12).
+    /// Returns an error if the operation fails (e.g., TCP client trying to disable
+    /// the WSS listener, or listener start failure), allowing the caller to rollback.
     async fn apply_server_setting_hooks(
         &self,
         applied: &[serde_json::Value],
         control: &Arc<dyn intent_core::ServerControl>,
-    ) {
+    ) -> Result<()> {
         for change in applied {
             if let Some(path) = change.get("path").and_then(|v| v.as_str()) {
                 match path {
                     "server.wsApi.enabled" => {
                         if let Some(enabled) = change.get("value").and_then(|v| v.as_bool()) {
                             if enabled {
-                                match control.start_ws_listener().await {
-                                    Ok(port) => {
-                                        tracing::info!(
-                                            port,
-                                            "server.wsApi.enabled → true: started WSS listener"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            error = ?e,
-                                            "server.wsApi.enabled → true: failed to start WSS listener"
-                                        );
-                                    }
-                                }
+                                // Attempt to start the listener
+                                let port = control.start_ws_listener().await.map_err(|e| {
+                                    tracing::error!(
+                                        error = ?e,
+                                        "server.wsApi.enabled → true: failed to start WSS listener"
+                                    );
+                                    Error::Internal(format!("failed to start WSS listener: {}", e))
+                                })?;
+                                tracing::info!(
+                                    port,
+                                    "server.wsApi.enabled → true: started WSS listener"
+                                );
                             } else {
+                                // Guard: refuse to stop the listener from a TCP connection
+                                if control.is_tcp_connection() {
+                                    return Err(Error::InvalidParams(
+                                        "cannot disable server.wsApi.enabled from a TCP connection (would self-terminate)".to_string()
+                                    ));
+                                }
                                 control.stop_ws_listener().await;
                                 tracing::info!(
                                     "server.wsApi.enabled → false: stopped WSS listener"
@@ -3535,19 +3541,19 @@ impl Services {
                     "server.discovery.enabled" => {
                         if let Some(enabled) = change.get("value").and_then(|v| v.as_bool()) {
                             if enabled {
-                                match control.start_discovery().await {
-                                    Ok(()) => {
-                                        tracing::info!(
-                                            "server.discovery.enabled → true: started mDNS discovery"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            error = ?e,
-                                            "server.discovery.enabled → true: failed to start mDNS discovery"
-                                        );
-                                    }
-                                }
+                                control.start_discovery().await.map_err(|e| {
+                                    tracing::error!(
+                                        error = ?e,
+                                        "server.discovery.enabled → true: failed to start mDNS discovery"
+                                    );
+                                    Error::Internal(format!(
+                                        "failed to start mDNS discovery: {}",
+                                        e
+                                    ))
+                                })?;
+                                tracing::info!(
+                                    "server.discovery.enabled → true: started mDNS discovery"
+                                );
                             } else {
                                 control.stop_discovery().await;
                                 tracing::info!(
@@ -3560,6 +3566,7 @@ impl Services {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -3577,12 +3584,45 @@ impl WorkspaceApi for Services {
         changes: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            // Capture old values for server.* settings so we can rollback on hook failure
+            let old_values = if let Some(entries) = changes.as_array() {
+                let mut old = Vec::new();
+                for entry in entries {
+                    if let Some(path) = entry.get("path").and_then(|v| v.as_str()) {
+                        if path.starts_with("server.") {
+                            if let Ok(Some(raw)) = self.store.get_setting(path).await {
+                                old.push((path.to_string(), raw));
+                            } else {
+                                // No prior value; mark for deletion on rollback
+                                old.push((path.to_string(), String::new()));
+                            }
+                        }
+                    }
+                }
+                old
+            } else {
+                Vec::new()
+            };
+
             let applied = self.settings_service().update(&changes).await?;
             if !applied.is_empty() {
                 // Apply server runtime hooks (§5.12): start/stop WSS listener + mDNS
                 // when server.wsApi.enabled / server.discovery.enabled change.
                 if let Some(control) = self.server_control.get() {
-                    self.apply_server_setting_hooks(&applied, control).await;
+                    if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
+                        // Rollback: restore old values for server.* settings
+                        for (path, old_raw) in old_values {
+                            if old_raw.is_empty() {
+                                // Was not set before; delete it
+                                let _ = self.store.delete_setting(&path).await;
+                            } else {
+                                // Restore old value
+                                let _ = self.store.set_setting(&path, &old_raw).await;
+                            }
+                        }
+                        // Return the hook error to the caller
+                        return Err(e);
+                    }
                 }
                 publish_event(&self.event_bus, settings_changed_event(applied.clone())).await;
             }

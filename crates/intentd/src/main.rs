@@ -752,11 +752,10 @@ impl intent_core::ServerControl for DaemonControl {
     }
 
     fn is_tcp_connection(&self) -> bool {
-        // TODO: Connection context detection not implemented yet.
-        // Returning false (treat all as UDS) allows all stop requests.
-        // When implemented, return true for TCP connections to block
-        // self-terminating calls per ServerControl contract.
-        false
+        // Read from task-local connection context set by the transport layer.
+        // Returns true for TCP (WSS) connections, false for UDS or when called
+        // outside a request context.
+        intent_transport::is_tcp_connection()
     }
 
     fn start_discovery(
