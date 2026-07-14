@@ -398,6 +398,7 @@ pub async fn merge_sandbox(
                         .map_err(|e| {
                             Error::Internal(format!("reset after conflict failed: {e}"))
                         })?;
+                    canonical_repo.cleanup_state().ok();
 
                     return Ok(MergeOutcome::Conflict {
                         conflicting_paths,
@@ -424,6 +425,7 @@ pub async fn merge_sandbox(
                         &[&current_commit],
                     )
                     .map_err(|e| Error::Internal(format!("commit cherry-pick failed: {e}")))?;
+                canonical_repo.cleanup_state().ok();
 
                 current_oid = new_oid;
             }
@@ -434,6 +436,7 @@ pub async fn merge_sandbox(
                     git2::ResetType::Hard,
                     None,
                 );
+                canonical_repo.cleanup_state().ok();
                 return Err(Error::Internal(format!("cherrypick failed: {e}")));
             }
         }
@@ -1499,7 +1502,6 @@ mod tests {
     async fn test_sandbox_merge_dirty_overlap_blocked() {
         let (store, _db) = temp_store().await;
         let (test_root, canonical_path) = temp_repo_in_target("canonical");
-        let (_, sandbox_path) = temp_repo_in_target("sandbox");
 
         // Create workspace
         let ws = workspace_for_repo(&canonical_path);
@@ -1507,6 +1509,11 @@ mod tests {
 
         let agent_id = AgentId(uuid::Uuid::new_v4().to_string());
         create_test_agent(&store, &ws.id, &agent_id).await;
+
+        // Clone canonical to sandbox (so they share commit history)
+        let sandbox_path = test_root.join("sandbox");
+        git2::Repository::clone(canonical_path.to_str().unwrap(), &sandbox_path).unwrap();
+
         let base_sha = {
             let canonical_repo = git2::Repository::open(&canonical_path).unwrap();
             let head_ref = canonical_repo.head().unwrap();
