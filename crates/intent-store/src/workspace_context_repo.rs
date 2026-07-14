@@ -34,40 +34,51 @@ impl Store {
     /// caller-supplied ordering (assigning `ordinal` positionally).
     /// Returns the persisted list read back from the store so callers can
     /// forward it verbatim to `workspace:context-changed` subscribers.
+    ///
+    /// Uses whole-transaction retry to eliminate SQLITE_BUSY (code 5) failures
+    /// during lock upgrade under concurrent load (STAB-7).
     pub async fn replace_workspace_context_items(
         &self,
         workspace_id: &WorkspaceId,
         items: &[ContextItem],
     ) -> Result<Vec<ContextItem>> {
-        let mut tx = self
-            .pool()
-            .begin()
-            .await
-            .map_err(|e| Error::Internal(format!("replace context tx failed: {e}")))?;
-        sqlx::query("DELETE FROM workspace_context_item WHERE workspace_id = ?")
-            .bind(&workspace_id.0)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Error::Internal(format!("clear workspace context failed: {e}")))?;
-        for (idx, item) in items.iter().enumerate() {
-            let payload = serde_json::to_string(item)
-                .map_err(|e| Error::Internal(format!("encode context item failed: {e}")))?;
-            sqlx::query(
-                "INSERT INTO workspace_context_item \
-                 (workspace_id, id, ordinal, payload) VALUES (?, ?, ?, ?)",
-            )
-            .bind(&workspace_id.0)
-            .bind(&item.id)
-            .bind(idx as i64)
-            .bind(payload)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Error::Internal(format!("insert context item failed: {e}")))?;
-        }
-        tx.commit()
-            .await
-            .map_err(|e| Error::Internal(format!("replace context commit failed: {e}")))?;
-        self.list_workspace_context_items(workspace_id).await
+        let pool = self.pool();
+        let workspace_id = workspace_id.clone();
+        let items = items.to_vec();
+
+        crate::with_write_txn_retry(|| async {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| Error::Internal(format!("replace context tx failed: {e}")))?;
+            sqlx::query("DELETE FROM workspace_context_item WHERE workspace_id = ?")
+                .bind(&workspace_id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("clear workspace context failed: {e}")))?;
+            for (idx, item) in items.iter().enumerate() {
+                let payload = serde_json::to_string(item)
+                    .map_err(|e| Error::Internal(format!("encode context item failed: {e}")))?;
+                sqlx::query(
+                    "INSERT INTO workspace_context_item \
+                     (workspace_id, id, ordinal, payload) VALUES (?, ?, ?, ?)",
+                )
+                .bind(&workspace_id.0)
+                .bind(&item.id)
+                .bind(idx as i64)
+                .bind(payload)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("insert context item failed: {e}")))?;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| Error::Internal(format!("replace context commit failed: {e}")))?;
+            Ok(())
+        })
+        .await?;
+
+        self.list_workspace_context_items(&workspace_id).await
     }
 }
 
