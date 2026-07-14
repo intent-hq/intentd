@@ -83,7 +83,9 @@ async fn await_uds(socket: &Path) -> bool {
 
 async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    let stream = tokio::net::UnixStream::connect(socket).await.expect("UDS connect");
+    let stream = tokio::net::UnixStream::connect(socket)
+        .await
+        .expect("UDS connect");
     let (read_half, mut write_half) = stream.into_split();
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     let mut line = frame.to_string();
@@ -110,8 +112,6 @@ async fn boot(data_dir: &Path, _port: u16) -> (u16, String) {
         .to_string();
     (actual_port, fingerprint)
 }
-
-
 
 #[tokio::test]
 async fn server_pairing_info_over_uds() {

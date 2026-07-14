@@ -34,7 +34,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role};
 use tokio_tungstenite::WebSocketStream;
 
-use crate::auth::{extract_token, is_allowed_origin, validate_token, AsyncTokenStore, TokenStore};
+use crate::auth::{extract_token, is_allowed_origin, validate_token, AsyncTokenStore};
 use crate::conn::{self, ConnSubs, OUTBOUND_CAPACITY};
 use crate::forward::ForwardRegistry;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
@@ -155,7 +155,7 @@ impl WsApiServer {
         api: Arc<dyn WorkspaceApi>,
         bus: EventBus,
         tls: &TlsCertificate,
-        token_store: Arc<dyn TokenStore>,
+        token_store: Arc<AsyncTokenStore>,
         options: WsOptions,
     ) -> Result<Self> {
         let acceptor = build_acceptor(tls)?;
@@ -163,7 +163,7 @@ impl WsApiServer {
             api,
             bus,
             acceptor: Some(acceptor),
-            token_store: Some(AsyncTokenStore::new(token_store)),
+            token_store: Some((*token_store).clone()),
             enabled: options.enabled,
             auth_enabled: options.auth_enabled,
             discovery_enabled: options.discovery_enabled,
@@ -228,7 +228,7 @@ impl WsApiServer {
         api: Arc<dyn WorkspaceApi>,
         bus: EventBus,
         tls: &TlsCertificate,
-        token_store: Arc<dyn TokenStore>,
+        token_store: Arc<AsyncTokenStore>,
         options: WsOptions,
         reverse_registry: Arc<PrimaryReverseRegistry>,
     ) -> Result<Self> {

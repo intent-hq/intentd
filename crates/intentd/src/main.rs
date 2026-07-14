@@ -546,11 +546,11 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
         } else {
             let tls = ensure_tls_certificate(&config.data_dir)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            let token_store = resolve_token_store();
-            get_or_create_token(&AsyncTokenStore::new(token_store.clone()))
+            let async_token_store = Arc::new(AsyncTokenStore::new(resolve_token_store()));
+            get_or_create_token(&async_token_store)
                 .await
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            (Some(tls), Some(token_store))
+            (Some(tls), Some(async_token_store))
         };
 
         // Build runtime control struct
@@ -591,7 +591,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
         if !insecure {
             let pairing_provider = Arc::new(DaemonPairingInfo {
                 data_dir: config.data_dir.clone(),
-                token_store: AsyncTokenStore::new(resolve_token_store()),
+                token_store: token_store.clone().unwrap(),
                 ws_runtime: Some(runtime.clone()),
             });
             server.install_pairing_info(pairing_provider);
@@ -643,9 +643,15 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     let pairing_info: Option<Arc<dyn intent_transport::ServerPairingInfo>> = if insecure {
         None
     } else {
+        // Share the same AsyncTokenStore instance as the WSS listener (if enabled)
+        // so rotations propagate to the live auth layer.
+        let token_store = match ws_runtime.as_ref() {
+            Some(rt) => rt.token_store.clone().expect("secure mode token_store"),
+            None => Arc::new(AsyncTokenStore::new(resolve_token_store())),
+        };
         Some(Arc::new(DaemonPairingInfo {
             data_dir: config.data_dir.clone(),
-            token_store: AsyncTokenStore::new(resolve_token_store()),
+            token_store,
             ws_runtime: ws_runtime.clone(),
         }))
     };
@@ -731,7 +737,7 @@ struct WsRuntimeControl {
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
     tls_cert: Option<intent_transport::TlsCertificate>,
-    token_store: Option<Arc<dyn TokenStore>>,
+    token_store: Option<Arc<AsyncTokenStore>>,
     ws_options: WsOptions,
     reverse_registry: Arc<PrimaryReverseRegistry>,
     /// Mutable runtime state: the live WsApiServer (when started) plus mDNS.
@@ -748,7 +754,7 @@ struct WsRuntimeState {
 /// Implemented by the daemon composition root and wired to UDS and WSS listeners.
 struct DaemonPairingInfo {
     data_dir: PathBuf,
-    token_store: AsyncTokenStore,
+    token_store: Arc<AsyncTokenStore>,
     /// Runtime control reference to read the current bound port. `None` when the
     /// daemon was started with --listen uds (no TCP listener capability).
     ws_runtime: Option<Arc<WsRuntimeControl>>,
@@ -762,11 +768,8 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
     > {
         Box::pin(async move {
             let port = if let Some(ref runtime) = self.ws_runtime {
-                if let Ok(state) = runtime.state.try_lock() {
-                    state.port
-                } else {
-                    None
-                }
+                let state = runtime.state.lock().await;
+                state.port
             } else {
                 None
             };
