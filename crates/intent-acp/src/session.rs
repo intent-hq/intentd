@@ -25,7 +25,9 @@
 //! prompt turn so the fresh session has context.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::{
     CancelNotification, LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse,
@@ -56,9 +58,61 @@ fn session_setup_timeout() -> Duration {
     }
     Duration::from_secs(60)
 }
-/// Timeout for a full prompt turn. A turn can run for minutes, so this is large;
-/// real cancellation flows through `session/cancel`, not the timeout.
-const PROMPT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// Idle timeout for a prompt turn: the turn times out only after this period
+/// of silence (no `session/update` traffic). Actively-streaming turns reset
+/// the timer on every update and never time out. Overridable via
+/// `INTENTD_PROMPT_IDLE_TIMEOUT_MS`.
+fn prompt_idle_timeout() -> Duration {
+    if let Ok(val) = std::env::var("INTENTD_PROMPT_IDLE_TIMEOUT_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return Duration::from_millis(ms);
+        }
+    }
+    Duration::from_secs(15 * 60)
+}
+
+/// Shared last-activity timestamp for idle-timeout tracking. The caller updates
+/// this on every `session/update` notification; the prompt logic polls it to
+/// enforce the idle window.
+#[derive(Clone)]
+pub struct ActivityTracker {
+    /// Elapsed milliseconds since an arbitrary epoch (e.g. `Instant::now()`),
+    /// atomically updated on each activity.
+    last_active_ms: Arc<AtomicU64>,
+}
+
+impl ActivityTracker {
+    /// Create a new tracker initialized to "now".
+    pub fn new() -> Self {
+        Self {
+            last_active_ms: Arc::new(AtomicU64::new(elapsed_ms())),
+        }
+    }
+
+    /// Record activity now.
+    pub fn touch(&self) {
+        self.last_active_ms.store(elapsed_ms(), Ordering::SeqCst);
+    }
+
+    /// Milliseconds since the last activity.
+    pub fn idle_ms(&self) -> u64 {
+        elapsed_ms().saturating_sub(self.last_active_ms.load(Ordering::SeqCst))
+    }
+}
+
+impl Default for ActivityTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Milliseconds elapsed since an arbitrary epoch (monotonic).
+fn elapsed_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    start.elapsed().as_millis() as u64
+}
 
 /// `session/new` with `{ cwd, mcpServers }` → the agent's session id and initial
 /// state. The caller persists `response.session_id` as `AgentSession.acpSessionId`
@@ -97,19 +151,47 @@ pub async fn load_session(
 
 /// `session/prompt` with the user content blocks → drives a turn; the agent
 /// streams `session/update`s then returns a [`StopReason`] (§6.5).
+///
+/// Uses an activity-based idle timeout: the turn times out only after a
+/// sustained period of silence (no `session/update` traffic). The caller must
+/// update `activity` on every incoming notification; the prompt loop polls it
+/// to enforce the idle window. Actively-streaming turns never time out.
 pub async fn prompt(
     conn: &Connection,
     session_id: &str,
     prompt: Vec<ContentBlock>,
+    activity: &ActivityTracker,
 ) -> AcpResult<StopReason> {
     let request = PromptRequest::new(SessionId::new(session_id), prompt);
     let params = serde_json::to_value(&request)?;
-    let result = conn
-        .request_timeout("session/prompt", params, PROMPT_TIMEOUT)
-        .await?;
-    let response: PromptResponse = serde_json::from_value(result)
-        .map_err(|e| AcpError::Protocol(format!("invalid session/prompt response: {e}")))?;
-    Ok(response.stop_reason)
+    let idle_window = prompt_idle_timeout();
+
+    // Wrap the request/response with an idle-aware timeout: poll every second
+    // to check whether the idle window has elapsed since the last activity.
+    // Use a very large request timeout (24 hours) since the idle timeout
+    // provides the real bound.
+    let fallback_timeout = Duration::from_secs(24 * 60 * 60);
+    let req_fut = conn.request_timeout("session/prompt", params, fallback_timeout);
+    tokio::pin!(req_fut);
+    let poll_interval = Duration::from_secs(1);
+    loop {
+        tokio::select! {
+            res = &mut req_fut => {
+                let result = res?;
+                let response: PromptResponse = serde_json::from_value(result)
+                    .map_err(|e| AcpError::Protocol(format!("invalid session/prompt response: {e}")))?;
+                return Ok(response.stop_reason);
+            }
+            _ = tokio::time::sleep(poll_interval) => {
+                let idle = Duration::from_millis(activity.idle_ms());
+                if idle >= idle_window {
+                    return Err(AcpError::Timeout(format!(
+                        "session/prompt idle timeout ({idle_window:?} of silence)"
+                    )));
+                }
+            }
+        }
+    }
 }
 
 /// `session/cancel` to interrupt the current turn (fire-and-forget notification;
