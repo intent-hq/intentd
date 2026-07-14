@@ -505,16 +505,17 @@ impl Store {
     /// enforces `UNIQUE(agent_id, seq)`, so concurrent appends racing on the
     /// SELECT phase will cause one INSERT to fail with a constraint violation.
     ///
-    /// **Crash safety**: A crash between SELECT and INSERT leaves a seq gap
-    /// (the next caller sees a higher seq) but does NOT lose any committed
-    /// message — only the INSERT commits data. Once INSERT completes, the
-    /// message row is durable. Assistant-message append (the streaming path)
-    /// is additionally protected by the AgentManager's per-agent single-flight
-    /// slot, serializing turns for one agent and eliminating the seq-race
-    /// window on that hot path. User-message appends (sendMessage, forceMessage,
-    /// wake delivery) can still race if fired concurrently for one agent, but
-    /// the UNIQUE constraint will reject duplicates rather than silently
-    /// corrupting the seq order.
+    /// **Crash safety**: Because `seq` is computed as `COALESCE(MAX(seq), -1) + 1`
+    /// rather than a persisted counter, a crash between SELECT and INSERT does
+    /// NOT create a durable gap — the next caller recomputes seq from the same
+    /// MAX. Only the INSERT commits data, so once INSERT completes the message
+    /// row is durable. No committed message can be lost. Assistant-message append
+    /// (the streaming path) is additionally protected by the AgentManager's
+    /// per-agent single-flight slot, serializing turns for one agent and
+    /// eliminating the seq-race window on that hot path. User-message appends
+    /// (sendMessage, forceMessage, wake delivery) can still race if fired
+    /// concurrently for one agent, but the UNIQUE constraint will reject
+    /// duplicates rather than silently corrupting the seq order.
     pub async fn append_agent_message_with_id(
         &self,
         agent_id: &AgentId,

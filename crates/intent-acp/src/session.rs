@@ -14,14 +14,15 @@
 //!
 //! ACP session ids are **process-local** — they exist only for the lifetime of
 //! the provider child process. When the daemon restarts (or the provider crashes),
-//! stored session ids become stale. Post-restart `session/load` reliably fails
-//! with `-32602` `invalid_request` because the provider has no record of the stale
-//! id. This is a **design limitation** of process-local session state, not a bug.
-//! The daemon implements a recreate+resend fallback (see
-//! `AgentManager::start_session`): when `session/load` fails (or the agent lacks
-//! `loadSession` capability), the daemon creates a fresh session via `session/new`
-//! (CAS-replacing the stale id) and prepends the prior conversation history as
-//! `<supervisor>` XML on the next prompt turn so the fresh session has context.
+//! stored session ids become stale. For providers that do not persist session state
+//! across restarts, post-restart `session/load` will fail (typically `-32602`
+//! invalid params) because the provider has no record of the stale id. This is a
+//! limitation of process-local session state in such providers, not a bug. The
+//! daemon implements a recreate+resend fallback (see `AgentManager::start_session`):
+//! when `session/load` fails (or the agent lacks `loadSession` capability), the
+//! daemon creates a fresh session via `session/new` (CAS-replacing the stale id)
+//! and prepends the prior conversation history as `<supervisor>` XML on the next
+//! prompt turn so the fresh session has context.
 
 use std::path::PathBuf;
 use std::time::Duration;
