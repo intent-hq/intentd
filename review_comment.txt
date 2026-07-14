@@ -1,8 +1,0 @@
-Added WSS e2e test `dequeued_message_publishes_agent_message_event_over_wss` in commit 91e12e6.
-
-The test:
-1. Starts an agent with a slow first turn (2s delay) to keep it busy
-2. Sends a second message while the agent is processing, causing it to queue
-3. Subscribes to `agent:*` events and verifies that when the queue drains, an `agent:message` event is published for the dequeued user message
-
-This ensures the STAB-4 fix (publishing events from `persist_user` during queue drain) cannot regress without the test catching it.
