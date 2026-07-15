@@ -10,7 +10,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use intent_core::{now_iso, AgentId, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus};
+use intent_core::{
+    now_iso, AgentId, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
+    WorkspaceStatus,
+};
 use intent_services::{EventBus, Services};
 use intent_store::Store;
 use serde_json::json;
@@ -57,8 +60,12 @@ fn workspace(id: &WorkspaceId, path: PathBuf) -> Workspace {
 }
 
 async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
-    let db = std::env::temp_dir().join(format!("intentd-e2e-agent-queue-{}.db", uuid::Uuid::new_v4()));
-    let ws_root = std::env::temp_dir().join(format!("itd-e2e-agent-queue-ws-{}", uuid::Uuid::new_v4()));
+    let db = std::env::temp_dir().join(format!(
+        "intentd-e2e-agent-queue-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let ws_root =
+        std::env::temp_dir().join(format!("itd-e2e-agent-queue-ws-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&ws_root).expect("create ws root");
 
     let store = Store::open(&db).await.expect("open store");
@@ -82,7 +89,16 @@ async fn agent_queue_add_get_remove_lifecycle() {
 
     // Create agent
     let agent_val = services
-        .agent_create(ws.clone(), Some("QueueTest".into()), None, None, None, None, None, Default::default())
+        .agent_create(
+            ws.clone(),
+            Some("QueueTest".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+        )
         .await
         .expect("create agent");
     let agent_id = AgentId::from(agent_val["agent"]["id"].as_str().unwrap());
@@ -141,7 +157,16 @@ async fn agent_conversation_and_summary() {
 
     // Create agent
     let agent_val = services
-        .agent_create(ws.clone(), Some("ConvTest".into()), None, None, None, None, None, Default::default())
+        .agent_create(
+            ws.clone(),
+            Some("ConvTest".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+        )
         .await
         .expect("create agent");
     let agent_id = AgentId::from(agent_val["agent"]["id"].as_str().unwrap());
@@ -150,7 +175,8 @@ async fn agent_conversation_and_summary() {
     let blocks = json!([
         { "type": "text", "text": "Hello, I completed the task" }
     ]);
-    services.store()
+    services
+        .store()
         .append_agent_message(&agent_id, "assistant", &blocks, &now_iso())
         .await
         .expect("append message");
@@ -193,7 +219,16 @@ async fn agent_diagnostics_baseline() {
 
     // Create an agent
     let agent_val = services
-        .agent_create(ws.clone(), Some("DiagTest".into()), None, None, None, None, None, Default::default())
+        .agent_create(
+            ws.clone(),
+            Some("DiagTest".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+        )
         .await
         .expect("create agent");
     let agent_id = AgentId::from(agent_val["agent"]["id"].as_str().unwrap());
