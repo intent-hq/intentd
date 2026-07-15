@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Combined coverage script
 # Measures line coverage from ALL workspace tests (unit + integration + e2e)
-# auggie_context_e2e test is env-gated (INTENTD_AUGGIE_E2E) and self-skips when the env var is unset
+# Excludes auggie_context_e2e (requires real auggie binary)
 
 cd "$(dirname "$0")/.."
 
@@ -40,7 +40,7 @@ if [ "${GENERATE_LCOV:-}" = "1" ]; then
     cargo llvm-cov report --lcov --output-path lcov.info
 fi
 
-# If a numeric floor is provided as first argument, enforce it
+# If --fail-under-lines is provided as first argument, enforce the floor
 if [ $# -gt 0 ]; then
     FLOOR="$1"
     echo ""

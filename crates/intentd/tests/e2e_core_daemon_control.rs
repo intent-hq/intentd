@@ -1,16 +1,23 @@
-//! E2E tests exercising intentd binary control paths (main.rs).
+//! E2E tests exercising intent-core config and intent-transport auth paths.
 //!
-//! Drives CLI subcommands (status, token, service) to exercise the binary crate's
-//! control logic and increase coverage of service.rs, main.rs paths.
+//! Tests token generation/rotation and config resolution WITHOUT spawning a daemon.
 
 use intent_core::Config;
 use intent_transport::{generate_token, get_or_create_token, AsyncTokenStore, FileTokenStore};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-/// Verify token generation and persistence (token subcommand path).
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Verify token generation and persistence via AsyncTokenStore.
 #[tokio::test]
 async fn token_generation_and_persistence() {
-    // Use default FileTokenStore (delegates to FileSecretStore)
+    let tmp_dir = std::env::temp_dir().join(format!("intentd-token-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+    let secrets_file = tmp_dir.join("secrets.json");
+
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("INTENTD_SECRETS_FILE", &secrets_file);
+
     let store_async = AsyncTokenStore::new(Arc::new(FileTokenStore::default()));
 
     // Generate a fresh token
@@ -27,11 +34,22 @@ async fn token_generation_and_persistence() {
         .await
         .expect("get_or_create");
     assert_eq!(token2, token1, "get_or_create returns existing token");
+
+    std::env::remove_var("INTENTD_SECRETS_FILE");
+    drop(_guard);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
 /// Verify token rotation (generate new, replace old).
 #[tokio::test]
 async fn token_rotation_replaces_old() {
+    let tmp_dir = std::env::temp_dir().join(format!("intentd-token-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+    let secrets_file = tmp_dir.join("secrets.json");
+
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("INTENTD_SECRETS_FILE", &secrets_file);
+
     let store_async = AsyncTokenStore::new(Arc::new(FileTokenStore::default()));
 
     // Create initial token
@@ -46,12 +64,18 @@ async fn token_rotation_replaces_old() {
     // Verify new token persisted
     let loaded = store_async.load_token().await;
     assert_eq!(loaded, Some(token2));
+
+    std::env::remove_var("INTENTD_SECRETS_FILE");
+    drop(_guard);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// Verify Config paths include socket, db, pid.
+/// Verify Config::resolve correctly sets daemon paths.
 #[tokio::test]
 async fn config_paths_include_daemon_files() {
     let tmp_dir = std::env::temp_dir().join(format!("intentd-cfg-{}", uuid::Uuid::new_v4()));
+
+    let _guard = ENV_LOCK.lock().unwrap();
     std::env::set_var("INTENTD_DATA_DIR", &tmp_dir);
 
     let config = Config::resolve().expect("resolve config");
@@ -62,6 +86,5 @@ async fn config_paths_include_daemon_files() {
     assert_eq!(config.socket_path, tmp_dir.join("intentd.sock"));
     assert_eq!(config.pid_path, tmp_dir.join("intentd.pid"));
 
-    // Clean up
     std::env::remove_var("INTENTD_DATA_DIR");
 }

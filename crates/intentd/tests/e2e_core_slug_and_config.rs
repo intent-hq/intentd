@@ -1,11 +1,14 @@
 //! E2E tests exercising intent-core slug generation and config paths.
 //!
-//! Drives slug extraction and generation through real workspace creation flows,
-//! and config parsing through daemon initialization.
+//! Calls Services directly to exercise slug generation (extract_local_slug,
+//! generate_workspace_slug) and config parsing WITHOUT spawning a daemon.
 
 use intent_core::{Config, WorkspaceApi, WorkspaceCreate, WorkspaceCreateInitialAgent};
 use intent_services::Services;
 use intent_store::Store;
+use std::sync::Mutex;
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Create a workspace with an initial-agent prompt and verify that the workspace
 /// ID is derived from the prompt via `extract_local_slug` ("fix auth" → "auth-fix").
@@ -88,11 +91,11 @@ async fn workspace_id_random_slug_when_no_prompt() {
 /// Verify Config::resolve parses env vars and fills defaults.
 #[tokio::test]
 async fn config_resolve_fills_defaults() {
-    // Set a custom data dir to avoid interfering with real daemon
     let tmp_dir = std::env::temp_dir().join(format!("intentd-cfg-{}", uuid::Uuid::new_v4()));
+
+    let _guard = ENV_LOCK.lock().unwrap();
     std::env::set_var("INTENTD_DATA_DIR", &tmp_dir);
 
-    // Load and verify defaults are filled
     let config = Config::resolve().expect("resolve config");
     assert_eq!(config.data_dir, tmp_dir);
     assert!(config.db_path.to_string_lossy().contains("intentd.db"));
@@ -100,10 +103,10 @@ async fn config_resolve_fills_defaults() {
         .socket_path
         .to_string_lossy()
         .contains("intentd.sock"));
-    assert_eq!(config.idle_reap_minutes, 30); // DEFAULT_IDLE_REAP_MINUTES
+    assert_eq!(config.idle_reap_minutes, 30);
 
-    // Clean up
     std::env::remove_var("INTENTD_DATA_DIR");
+    drop(_guard);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
@@ -113,7 +116,6 @@ async fn config_resolve_reads_idle_reap_from_file() {
     let tmp_dir = std::env::temp_dir().join(format!("intentd-cfg-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
 
-    // Config file with custom idle_reap_minutes
     let cfg_path = tmp_dir.join("config.toml");
     std::fs::write(
         &cfg_path,
@@ -124,15 +126,15 @@ idleReapMinutes = 50
     )
     .expect("write config");
 
+    let _guard = ENV_LOCK.lock().unwrap();
     std::env::set_var("INTENTD_DATA_DIR", &tmp_dir);
     std::env::set_var("INTENTD_CONFIG", &cfg_path);
 
-    // Load and verify custom value is read
     let config = Config::resolve().expect("resolve config");
     assert_eq!(config.idle_reap_minutes, 50);
 
-    // Clean up
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
+    drop(_guard);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
