@@ -1252,17 +1252,16 @@ impl<'a> SettingsService<'a> {
         // Drive every load future concurrently on the current task: a single
         // stalled account never blocks the others because `join_all_pinned`
         // polls every future on each wake-up. Best-effort: errors treated as absent.
-        let futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send>>> =
-            sensitive
-                .iter()
-                .map(|path| {
-                    let fut = self.secrets.load(path);
-                    Box::pin(fut)
-                        as std::pin::Pin<
-                            Box<dyn std::future::Future<Output = Result<Option<String>>> + Send>,
-                        >
-                })
-                .collect();
+        type LoadFuture<'a> = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>,
+        >;
+        let futs: Vec<LoadFuture<'_>> = sensitive
+            .iter()
+            .map(|path| {
+                let fut = self.secrets.load(path);
+                Box::pin(fut) as LoadFuture<'_>
+            })
+            .collect();
         let results = join_all_pinned(futs).await;
         let mut presence: HashMap<&'static str, bool> = HashMap::with_capacity(sensitive.len());
         for (path, result) in sensitive.into_iter().zip(results) {
