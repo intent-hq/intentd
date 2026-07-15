@@ -5464,7 +5464,7 @@ impl WorkspaceApi for Services {
 
     fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.list(&workspace_id) })
+        Box::pin(async move { mgr.list(&workspace_id).await })
     }
 
     fn script_create(
@@ -5735,7 +5735,22 @@ impl WorkspaceApi for Services {
                                 .and_then(|a| a.prompt.as_deref())
                                 .and_then(intent_core::slug::extract_local_slug)
                                 .unwrap_or_else(intent_core::slug::generate_workspace_slug);
-                            let prefix = settings::branch_prefix(&store).await;
+                            // Branch prefix fallback: repo config > global setting
+                            // (FE parity: workspace.service.ts L1215-1219).
+                            let prefix = if let Some(repo_path) = input
+                                .repository_path
+                                .as_deref()
+                                .filter(|p| !p.is_empty())
+                                .map(PathBuf::from)
+                            {
+                                let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                                match repo_config.branch_prefix.filter(|p| !p.is_empty()) {
+                                    Some(p) => p,
+                                    None => settings::branch_prefix(&store).await,
+                                }
+                            } else {
+                                settings::branch_prefix(&store).await
+                            };
                             let desired = format!("{prefix}{slug}");
                             let git_repo = input
                                 .repository_path
@@ -5778,6 +5793,26 @@ impl WorkspaceApi for Services {
                         .title
                         .map(|t| t.trim().to_string())
                         .unwrap_or_default();
+                    // Setup script fallback: request > repo config > none
+                    // (FE parity: workspace.service.ts L1788-1791).
+                    let setup_script = match input.setup_script.clone().filter(|s| !s.is_empty()) {
+                        Some(explicit) => Some(setup_scripts::user_script(explicit)),
+                        None => {
+                            if let Some(repo_path) = input
+                                .repository_path
+                                .as_deref()
+                                .filter(|p| !p.is_empty())
+                                .map(PathBuf::from)
+                            {
+                                let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                                repo_config.setup_script
+                                    .filter(|s| !s.is_empty())
+                                    .map(setup_scripts::user_script)
+                            } else {
+                                None
+                            }
+                        }
+                    };
                     let mut ws = Workspace {
                         id,
                         title,
@@ -5807,7 +5842,7 @@ impl WorkspaceApi for Services {
                         worktree_path: input.worktree_path,
                         scope: input.scope,
                         skip_worktree: input.skip_worktree.unwrap_or(false),
-                        setup_script: input.setup_script.map(setup_scripts::user_script),
+                        setup_script,
                         is_remote: input.is_remote.unwrap_or(false),
                         default_model: input.default_model,
                         pr_number: None,

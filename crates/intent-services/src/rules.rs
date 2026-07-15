@@ -369,6 +369,23 @@ pub(crate) async fn assemble_system_prompt(
             }
         }
     }
+    // Repo config instructions (FE parity: instruction-service.ts L1019-1022):
+    // append repo-level instructions from `.intent/config.json` when present.
+    if let Some(ws) = workspace {
+        if let Some(repo_path) = ws
+            .repository_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+        {
+            let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+            if let Some(instructions) = repo_config.instructions {
+                if !instructions.trim().is_empty() {
+                    parts.push(format!("## User Rules & Guidelines\n\nThe following rules and guidelines have been configured for this project. Please follow these conventions and best practices:\n\n```\n{}\n```\n\nThese rules are loaded from: {}/.intent/config.json", instructions, repo_path.display()));
+                }
+            }
+        }
+    }
     // Mode-dependent isolation hints (Task 6): inject context about CoW
     // sandboxing for implementors and parallel delegation safety for coordinators
     // when appropriate, before the specialist role section so the specialist

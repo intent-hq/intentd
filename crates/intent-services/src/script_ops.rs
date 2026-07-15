@@ -172,16 +172,101 @@ impl ScriptManager {
     }
 
     /// `script.list`: the workspace's scripts with merged runtime state.
-    pub(crate) fn list(&self, workspace_id: &WorkspaceId) -> Result<Value> {
-        let guard = self.scripts.lock().unwrap();
-        let mut scripts: Vec<(String, Value)> = guard
-            .iter()
-            .filter(|((ws, _), _)| ws == workspace_id)
-            .map(|(_, m)| (m.def.created_at.clone(), with_runtime(&m.def, &m.state)))
-            .collect();
-        scripts.sort_by(|a, b| a.0.cmp(&b.0));
-        let scripts: Vec<Value> = scripts.into_iter().map(|(_, v)| v).collect();
-        Ok(json!({ "scripts": scripts }))
+    /// When empty, bootstrap from repo config `scripts[]` (FE parity:
+    /// scripts.ipc.ts L291-320).
+    pub(crate) async fn list(&self, workspace_id: &WorkspaceId) -> Result<Value> {
+        let is_empty = {
+            let guard = self.scripts.lock().unwrap();
+            let mut scripts: Vec<(String, Value)> = guard
+                .iter()
+                .filter(|((ws, _), _)| ws == workspace_id)
+                .map(|(_, m)| (m.def.created_at.clone(), with_runtime(&m.def, &m.state)))
+                .collect();
+            scripts.sort_by(|a, b| a.0.cmp(&b.0));
+            let scripts: Vec<Value> = scripts.into_iter().map(|(_, v)| v).collect();
+            let is_empty = scripts.is_empty();
+            if !is_empty {
+                return Ok(json!({ "scripts": scripts }));
+            }
+            is_empty
+        }; // guard dropped here
+
+        // Bootstrap from repo config if workspace has no scripts
+        if is_empty {
+            if let Ok(ws) = self.store.get_workspace(workspace_id).await {
+                if let Some(repo_path) = ws
+                    .repository_path
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .map(PathBuf::from)
+                {
+                    let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                    if let Some(repo_scripts) = repo_config.scripts {
+                        // Convert RepoScript -> Script definitions and persist them
+                        let now = now_iso();
+                        for repo_script in repo_scripts {
+                            let script_id = uuid::Uuid::new_v4().to_string();
+                            let script = Script {
+                                id: script_id.clone(),
+                                workspace_id: workspace_id.to_string(),
+                                name: repo_script.name,
+                                command: repo_script.command,
+                                cwd: repo_script.cwd,
+                                env: repo_script.env,
+                                mode: match repo_script.mode {
+                                    intent_core::RepoScriptMode::Service => ScriptMode::Service,
+                                    intent_core::RepoScriptMode::Command => ScriptMode::Command,
+                                },
+                                category: repo_script.category.map(|c| {
+                                    match c {
+                                        intent_core::RepoScriptCategory::Dev => "dev",
+                                        intent_core::RepoScriptCategory::Test => "test",
+                                        intent_core::RepoScriptCategory::Build => "build",
+                                        intent_core::RepoScriptCategory::Lint => "lint",
+                                        intent_core::RepoScriptCategory::Typecheck => "typecheck",
+                                        intent_core::RepoScriptCategory::Format => "format",
+                                        intent_core::RepoScriptCategory::Storybook => "storybook",
+                                        intent_core::RepoScriptCategory::Other => "other",
+                                    }
+                                    .to_string()
+                                }),
+                                source: "user".to_string(),
+                                auto_start: repo_script.auto_start,
+                                created_at: now.clone(),
+                                updated_at: None,
+                            };
+                            // Persist and register
+                            self.store.upsert_script(&script).await?;
+                            self.scripts.lock().unwrap().insert(
+                                (workspace_id.clone(), script_id),
+                                ManagedScript {
+                                    def: script,
+                                    state: ScriptRuntimeState::default(),
+                                    pty_id: None,
+                                    stopped_by_user: false,
+                                    supervisor: None,
+                                },
+                            );
+                        }
+                        // Re-read scripts after bootstrapping
+                        let guard = self.scripts.lock().unwrap();
+                        let mut scripts: Vec<(String, Value)> = guard
+                            .iter()
+                            .filter(|((ws, _), _)| ws == workspace_id)
+                            .map(|(_, m)| {
+                                (m.def.created_at.clone(), with_runtime(&m.def, &m.state))
+                            })
+                            .collect();
+                        scripts.sort_by(|a, b| a.0.cmp(&b.0));
+                        let scripts: Vec<Value> = scripts.into_iter().map(|(_, v)| v).collect();
+                        return Ok(json!({ "scripts": scripts }));
+                    }
+                }
+            }
+        }
+
+        // If we get here, workspace was empty and no repo config scripts found
+        Ok(json!({ "scripts": [] }))
     }
 
     /// `script.remove`: stop (if running), forget, and unpersist a script.
