@@ -1,9 +1,8 @@
 //! E2E coverage for agent.queueMessage / agent.getQueue / agent.removeQueuedMessage
 //! (intent-services agent_ops.rs coverage boost).
 //!
-//! Drives the full agent queue lifecycle over the WSS transport using the existing
-//! e2e harness infrastructure. Asserts on backend state changes and JSON-RPC error
-//! codes per PR #179 quality bar.
+//! Tests call intent_services::Services directly (not via WSS transport) for hermetic
+//! in-process coverage. Asserts on backend state changes.
 
 #![cfg(unix)]
 
@@ -17,6 +16,13 @@ use intent_core::{
 use intent_services::{EventBus, Services};
 use intent_store::Store;
 use serde_json::json;
+
+/// Clean up SQLite database including -wal and -shm sidecars.
+fn cleanup_db(db: &PathBuf) {
+    std::fs::remove_file(db).ok();
+    std::fs::remove_file(db.with_extension("db-wal")).ok();
+    std::fs::remove_file(db.with_extension("db-shm")).ok();
+}
 
 fn workspace(id: &WorkspaceId, path: PathBuf) -> Workspace {
     let ts = now_iso();
@@ -147,7 +153,7 @@ async fn agent_queue_add_get_remove_lifecycle() {
     assert_eq!(removed2["success"], true);
 
     // Cleanup
-    std::fs::remove_file(&db).ok();
+    cleanup_db(&db);
     std::fs::remove_dir_all(&ws_root).ok();
 }
 
@@ -200,7 +206,7 @@ async fn agent_conversation_and_summary() {
     assert_eq!(summary["messageCount"], 1);
 
     // Cleanup
-    std::fs::remove_file(&db).ok();
+    cleanup_db(&db);
     std::fs::remove_dir_all(&ws_root).ok();
 }
 
@@ -242,6 +248,6 @@ async fn agent_diagnostics_baseline() {
     assert!(diag2["diagnostics"]["agents"].is_array());
 
     // Cleanup
-    std::fs::remove_file(&db).ok();
+    cleanup_db(&db);
     std::fs::remove_dir_all(&ws_root).ok();
 }

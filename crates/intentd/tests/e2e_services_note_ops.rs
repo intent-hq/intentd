@@ -1,6 +1,7 @@
 //! E2E coverage for note.* operations (intent-services note_ops.rs coverage boost).
 //!
-//! Tests note.add, note.edit, note.editLines, note.listTasks paths.
+//! Tests call intent_services::Services directly (not via WSS transport) for hermetic
+//! in-process coverage. Tests note.add, note.edit, note.editLines, note.listTasks paths.
 
 #![cfg(unix)]
 
@@ -8,12 +9,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use intent_core::{
-    now_iso, ContentType, Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput,
-    NoteId, NoteMetadata, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, Workspace,
+    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
+
+/// Clean up SQLite database including -wal and -shm sidecars.
+fn cleanup_db(db: &PathBuf) {
+    std::fs::remove_file(db).ok();
+    std::fs::remove_file(db.with_extension("db-wal")).ok();
+    std::fs::remove_file(db.with_extension("db-shm")).ok();
+}
 
 fn workspace(id: &WorkspaceId, path: PathBuf) -> Workspace {
     let ts = now_iso();
@@ -125,26 +132,25 @@ async fn note_add_edit_edit_lines() {
         .expect("edit note");
     assert!(edit_result.match_position >= 0);
 
-    // Test note.editLines
+    // Test note.editLines - always invoke it
     let note_after_edit = services
         .get_note(ws.clone(), note_id.clone())
         .await
         .expect("get note");
-    let lines: Vec<&str> = note_after_edit.content.lines().collect();
-    if lines.len() > 0 {
-        let edit_lines_input = NoteEditLinesInput {
-            start: 1,
-            end: 1,
-            content: "Line replaced".to_string(),
-        };
-        let _edit_lines_result = services
-            .edit_note_lines(ws.clone(), note_id.clone(), edit_lines_input, None)
-            .await
-            .expect("edit note lines");
-    }
+    assert!(!note_after_edit.content.is_empty(), "note content must be non-empty");
+    let edit_lines_input = NoteEditLinesInput {
+        start: 1,
+        end: 1,
+        content: "Line replaced".to_string(),
+    };
+    let edit_lines_result = services
+        .edit_note_lines(ws.clone(), note_id.clone(), edit_lines_input, None)
+        .await
+        .expect("edit note lines");
+    assert_eq!(edit_lines_result.note_id, note_id);
 
     // Cleanup
-    std::fs::remove_file(&db).ok();
+    cleanup_db(&db);
     std::fs::remove_dir_all(&ws_root).ok();
 }
 
@@ -180,7 +186,7 @@ async fn note_list_tasks() {
     assert_eq!(tasks[2].status, "todo");
 
     // Cleanup
-    std::fs::remove_file(&db).ok();
+    cleanup_db(&db);
     std::fs::remove_dir_all(&ws_root).ok();
 }
 
@@ -226,6 +232,6 @@ async fn note_update_metadata() {
     assert_eq!(updated_note.content, "Content"); // Content unchanged
 
     // Cleanup
-    std::fs::remove_file(&db).ok();
+    cleanup_db(&db);
     std::fs::remove_dir_all(&ws_root).ok();
 }
