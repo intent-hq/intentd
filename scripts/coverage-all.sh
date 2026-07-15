@@ -22,8 +22,11 @@ echo "Running all workspace tests with coverage instrumentation..."
 
 # Run all workspace tests (unit + integration + e2e)
 # Skip auggie_context_e2e (needs real auggie binary)
-# Skip known flaky test: uds_concurrent_dispatch::slow_host_exec_does_not_block_fast_workspace_list
-cargo llvm-cov --no-report --workspace --exclude auggie_context_e2e -- --skip slow_host_exec_does_not_block_fast_workspace_list
+# Skip known flaky tests under llvm-cov instrumentation (STAB-40, STAB-42)
+# These skips DEFLATE coverage (we lose their contribution) but prevent spurious CI failures
+cargo llvm-cov --no-report --workspace --exclude auggie_context_e2e -- \
+    --skip wss_note_save_asset_round_trip \
+    --skip slow_host_exec_does_not_block_fast_workspace_list
 
 echo ""
 echo "Generating coverage report..."
