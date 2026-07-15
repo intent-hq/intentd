@@ -602,3 +602,104 @@ fn list_installed_editors_with_windows_uses_binary_resolver() {
     // Windows-only editors are visible on Windows.
     assert!(editors.iter().any(|e| e["id"] == "powershell"));
 }
+
+/// Regression test: run_version_with() enriches PATH with binary's parent dir,
+/// enabling scripts that invoke co-located dependencies via PATH lookup to succeed.
+///
+/// Mirrors the real nvm layout where 'node' is co-located with npm-installed
+/// binaries like 'auggie'. A fake script invokes a co-located fake 'node' via
+/// the shell PATH. The minimal PATH does NOT include the script directory, so
+/// without parent-dir enrichment the node lookup fails.
+#[cfg(unix)]
+#[test]
+fn run_version_enriches_path_with_binary_parent_dir_for_env_shebangs() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = unique_temp_dir("run-version-env-shebang");
+
+    // Create fake 'node' interpreter that responds to --version
+    let fake_node = dir.join("node");
+    std::fs::write(&fake_node, "#!/bin/sh\necho \"fake-auggie 2.0.0\"\n").unwrap();
+    std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Create fake 'auggie' script that invokes co-located 'node' via PATH lookup
+    // This mirrors real npm-installed binaries that have #!/usr/bin/env node shebangs
+    let fake_auggie = dir.join("auggie");
+    std::fs::write(
+        &fake_auggie,
+        "#!/bin/sh\n# Simulate #!/usr/bin/env node shebang behavior\nif [ \"$1\" = \"--version\" ]; then\n  exec node\nfi\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_auggie, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Build enriched PATH with parent dir prepended (the fix)
+    let enriched_path = super::build_enriched_path_for_binary(&fake_auggie);
+
+    // Probe should succeed with enriched PATH (node resolves via parent dir)
+    let version = super::run_version_with(&fake_auggie, &enriched_path);
+    assert!(
+        version.is_some(),
+        "run_version_with enriched PATH should succeed when node is co-located; enriched_path={}",
+        enriched_path.to_string_lossy()
+    );
+    assert_eq!(version.unwrap(), "fake-auggie 2.0.0");
+
+    // Prove regression coverage: probe FAILS with minimal PATH that lacks the script dir
+    let minimal_path = std::ffi::OsString::from("/usr/bin:/bin");
+    let version_minimal = super::run_version_with(&fake_auggie, &minimal_path);
+    assert!(
+        version_minimal.is_none(),
+        "run_version_with minimal PATH should fail when node is NOT on PATH (proves fix is needed)"
+    );
+}
+
+/// Test that enhanced_path() includes enriched directories in correct precedence.
+#[test]
+fn enhanced_path_includes_enriched_dirs_with_correct_precedence() {
+    use intent_core::path_utils;
+    use intent_providers::args::enhanced_path;
+
+    let fake_provider_bin = std::path::PathBuf::from("/fake/provider/bin/auggie");
+    let path = enhanced_path(Some(&fake_provider_bin));
+
+    // Split path and check precedence
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let parts: Vec<&str> = path.split(sep).collect();
+
+    // 1. Provider binary's parent dir should be first
+    assert!(
+        parts
+            .first()
+            .map(|p| p.contains("/fake/provider/bin"))
+            .unwrap_or(false),
+        "Provider binary parent dir should be first in PATH"
+    );
+
+    // 2. Should include ~/.augment/bin early
+    let has_augment_bin = parts.iter().any(|p| p.contains(".augment/bin"));
+    assert!(has_augment_bin, "PATH should include ~/.augment/bin");
+
+    // 3. Should include at least some enhanced dirs (can't test all as they're system-dependent)
+    // Just verify path is longer than minimal (more than just provider + augment)
+    assert!(
+        parts.len() >= 3,
+        "Enhanced path should include multiple directories, got {} parts",
+        parts.len()
+    );
+
+    // 4. Verify deduplication: get enriched dirs and check no directory appears twice
+    let enriched_dirs = path_utils::enhanced_path_dirs();
+    let dir_strings: Vec<String> = enriched_dirs
+        .iter()
+        .map(|d| d.to_string_lossy().to_string())
+        .collect();
+    let unique_count = dir_strings
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert_eq!(
+        dir_strings.len(),
+        unique_count,
+        "enhanced_path_dirs should not contain duplicates"
+    );
+}

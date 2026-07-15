@@ -164,21 +164,20 @@ fn binary_filename(name: &str) -> String {
 /// Run `<path> --version` (5s timeout) and return the first trimmed non-empty
 /// line of stdout, or `None` on failure.
 ///
-/// Enriches the PATH environment variable to include:
-/// 1. The binary's parent directory (for co-located dependencies like node)
-/// 2. Enhanced path directories (node, nvm, homebrew, volta, asdf, etc.)
-/// 3. The inherited PATH
-///
-/// This ensures that scripts with `#!/usr/bin/env node` shebangs can find
-/// their interpreter even when running in packaged app environments with
-/// minimal inherited PATH.
+/// Enriches the PATH environment variable to include the binary's parent
+/// directory plus enhanced path directories, ensuring scripts with shebangs
+/// like `#!/usr/bin/env node` can resolve their interpreter.
 fn run_version(path: &Path) -> Option<String> {
-    // Build enriched PATH: binary's parent dir + enhanced dirs + inherited PATH
     let enriched_path = build_enriched_path_for_binary(path);
+    run_version_with(path, &enriched_path)
+}
 
+/// Run `<path> --version` with an explicit PATH environment variable.
+/// Exposed for testing — production code should use `run_version()`.
+fn run_version_with(path: &Path, path_env: &OsString) -> Option<String> {
     let mut child = Command::new(path)
         .arg("--version")
-        .env("PATH", enriched_path)
+        .env("PATH", path_env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

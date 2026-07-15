@@ -1987,6 +1987,7 @@ dependencies = [
  "httparse",
  "if-addrs 0.15.0",
  "intent-core",
+ "intent-providers",
  "intent-services",
  "mdns-sd",
  "rcgen",
