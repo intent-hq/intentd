@@ -34,19 +34,6 @@ use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-struct Daemon {
-    child: Child,
-    data_dir: PathBuf,
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
-    }
-}
-
 fn free_port() -> u16 {
     StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .unwrap()
@@ -60,20 +47,6 @@ fn temp_data_dir() -> PathBuf {
     let dir = PathBuf::from("/tmp").join(format!("itd-wss-interrupted-{}", &id[..8]));
     std::fs::create_dir_all(&dir).expect("mkdir data dir");
     dir
-}
-
-fn spawn_serve(data_dir: &Path, listen: &str) -> Child {
-    let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
-        .arg("--listen")
-        .arg(listen)
-        .env("INTENTD_DATA_DIR", data_dir)
-        .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -239,11 +212,24 @@ where
 async fn interrupted_agents_persisted_across_restart() {
     let data_dir = temp_data_dir();
     let port = free_port();
-    let listen = format!("tcp:{port}");
+    let port_s = port.to_string();
+    let listen = "both";
     let socket = data_dir.join("intentd.sock");
 
     // Phase 1: Boot daemon, create a workspace, create an agent session with Active status.
-    let mut daemon = spawn_serve(&data_dir, &listen);
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("serve")
+        .arg("--listen")
+        .arg(listen)
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_TCP_PORT", &port_s)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
+        ))
+        .spawn()
+        .expect("spawn intentd serve");
     if !await_uds(&socket).await {
         let log_path = data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
@@ -300,7 +286,10 @@ async fn interrupted_agents_persisted_across_restart() {
             sandbox_path: None,
             sandbox_branch: None,
         };
-        store.insert_agent_session(&session).await.expect("insert agent");
+        store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert agent");
     }
 
     // Kill daemon to simulate restart.
@@ -308,15 +297,30 @@ async fn interrupted_agents_persisted_across_restart() {
     daemon.wait().expect("wait daemon");
 
     // Phase 2: Restart daemon — heal sweep should insert interrupted_agent row.
-    daemon = spawn_serve(&data_dir, &listen);
+    daemon = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("serve")
+        .arg("--listen")
+        .arg(listen)
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_TCP_PORT", &port_s)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
+        ))
+        .spawn()
+        .expect("spawn intentd serve 2");
     assert!(await_uds(&socket).await, "daemon did not restart");
 
     // Fetch fingerprint for TLS cert pinning.
-    let fp_result = uds_rpc(&socket, 1, "host.fingerprint", json!({})).await;
-    let fp = fp_result["fingerprint"].as_str().expect("fingerprint");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
 
     // Open WSS connection.
-    let cfg = client_config(fp);
+    let cfg = client_config(&fp);
     let mut ws = connect_ws(port, cfg).await;
 
     // Phase 3: Call agent.listInterrupted over WSS.
@@ -328,7 +332,10 @@ async fn interrupted_agents_persisted_across_restart() {
     let interrupted = &agents[0];
     assert_eq!(interrupted["agentId"].as_str(), Some(agent_id.as_str()));
     assert_eq!(interrupted["workspaceId"].as_str(), Some(ws_id));
-    assert_eq!(interrupted["workspaceName"].as_str(), Some("WSS-INTERRUPTED"));
+    assert_eq!(
+        interrupted["workspaceName"].as_str(),
+        Some("WSS-INTERRUPTED")
+    );
     assert_eq!(interrupted["agentName"].as_str(), Some("Interrupted Agent"));
     assert_eq!(interrupted["prevStatus"].as_str(), Some("active"));
     assert!(interrupted["interruptedAt"].is_string());
@@ -336,12 +343,27 @@ async fn interrupted_agents_persisted_across_restart() {
     // Phase 4: Restart again — idempotent insert should not duplicate.
     daemon.kill().expect("kill daemon 2");
     daemon.wait().expect("wait daemon 2");
-    daemon = spawn_serve(&data_dir, &listen);
+    daemon = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("serve")
+        .arg("--listen")
+        .arg(listen)
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_TCP_PORT", &port_s)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
+        ))
+        .spawn()
+        .expect("spawn intentd serve 3");
     assert!(await_uds(&socket).await, "daemon did not restart 2");
 
-    let fp_result = uds_rpc(&socket, 3, "host.fingerprint", json!({})).await;
-    let fp = fp_result["fingerprint"].as_str().expect("fingerprint 2");
-    let cfg = client_config(fp);
+    let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint 2")
+        .to_string();
+    let cfg = client_config(&fp);
     let mut ws = connect_ws(port, cfg).await;
 
     let result = wss_rpc(&mut ws, 4, "agent.listInterrupted", json!({})).await;
