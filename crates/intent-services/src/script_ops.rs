@@ -175,24 +175,23 @@ impl ScriptManager {
     /// When empty, bootstrap from repo config `scripts[]` (FE parity:
     /// scripts.ipc.ts L291-320).
     pub(crate) async fn list(&self, workspace_id: &WorkspaceId) -> Result<Value> {
-        let is_empty = {
+        // First check: read existing scripts
+        {
             let guard = self.scripts.lock().unwrap();
             let mut scripts: Vec<(String, Value)> = guard
                 .iter()
                 .filter(|((ws, _), _)| ws == workspace_id)
                 .map(|(_, m)| (m.def.created_at.clone(), with_runtime(&m.def, &m.state)))
                 .collect();
-            scripts.sort_by(|a, b| a.0.cmp(&b.0));
-            let scripts: Vec<Value> = scripts.into_iter().map(|(_, v)| v).collect();
-            let is_empty = scripts.is_empty();
-            if !is_empty {
+            if !scripts.is_empty() {
+                scripts.sort_by(|a, b| a.0.cmp(&b.0));
+                let scripts: Vec<Value> = scripts.into_iter().map(|(_, v)| v).collect();
                 return Ok(json!({ "scripts": scripts }));
             }
-            is_empty
-        }; // guard dropped here
+        } // guard dropped here
 
-        // Bootstrap from repo config if workspace has no scripts
-        if is_empty {
+        // Bootstrap from repo config if workspace has no scripts (double-check inside lock below)
+        {
             if let Ok(ws) = self.store.get_workspace(workspace_id).await {
                 if let Some(repo_path) = ws
                     .repository_path
@@ -202,6 +201,26 @@ impl ScriptManager {
                 {
                     let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
                     if let Some(repo_scripts) = repo_config.scripts {
+                        // Double-check emptiness before bootstrapping to avoid race condition
+                        // where multiple concurrent calls could each bootstrap duplicate scripts
+                        let needs_bootstrap = {
+                            let guard = self.scripts.lock().unwrap();
+                            !guard.iter().any(|((ws, _), _)| ws == workspace_id)
+                        };
+                        if !needs_bootstrap {
+                            // Another thread bootstrapped while we were reading repo config
+                            let guard = self.scripts.lock().unwrap();
+                            let mut scripts: Vec<(String, Value)> = guard
+                                .iter()
+                                .filter(|((ws, _), _)| ws == workspace_id)
+                                .map(|(_, m)| {
+                                    (m.def.created_at.clone(), with_runtime(&m.def, &m.state))
+                                })
+                                .collect();
+                            scripts.sort_by(|a, b| a.0.cmp(&b.0));
+                            let scripts: Vec<Value> = scripts.into_iter().map(|(_, v)| v).collect();
+                            return Ok(json!({ "scripts": scripts }));
+                        }
                         // Convert RepoScript -> Script definitions and persist them
                         let now = now_iso();
                         for repo_script in repo_scripts {

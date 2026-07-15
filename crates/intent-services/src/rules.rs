@@ -381,7 +381,8 @@ pub(crate) async fn assemble_system_prompt(
             let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
             if let Some(instructions) = repo_config.instructions {
                 if !instructions.trim().is_empty() {
-                    parts.push(format!("## User Rules & Guidelines\n\nThe following rules and guidelines have been configured for this project. Please follow these conventions and best practices:\n\n```\n{}\n```\n\nThese rules are loaded from: {}/.intent/config.json", instructions, repo_path.display()));
+                    let source = format!("{}/.intent/config.json", repo_path.display());
+                    parts.push(format_user_rules_for_context(&instructions, &source));
                 }
             }
         }

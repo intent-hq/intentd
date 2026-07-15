@@ -96,22 +96,22 @@ fn create_test_repo_with_config(config: &str) -> TempRepo {
     let repo_path = std::env::temp_dir().join(format!("repo-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&repo_path).unwrap();
 
-    // Initialize a git repo
+    // Initialize a git repo with explicit default branch
     std::process::Command::new("git")
-        .args(["init"])
+        .args(["init", "--initial-branch=main"])
         .current_dir(&repo_path)
         .output()
-        .unwrap();
+        .expect("git init failed");
     std::process::Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(&repo_path)
         .output()
-        .unwrap();
+        .expect("git config user.email failed");
     std::process::Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(&repo_path)
         .output()
-        .unwrap();
+        .expect("git config user.name failed");
 
     // Create .intent/config.json
     let intent_dir = repo_path.join(".intent");
@@ -400,11 +400,10 @@ async fn test_repo_instructions_in_system_prompt() {
 
     let _stream = connect_retry(&socket_path).await;
 
-    // Task 3 DoD point (d): repo instructions are integrated into rules.rs (lines 372-388).
+    // Task 3 DoD point (d): repo instructions are integrated into rules.rs system prompt assembly.
     // The full flow (agent system prompt assembly → agent.readConversation) can't be tested
-    // without agent.readConversation RPC (out of scope). The repo_config.get RPC (Task 2)
-    // isn't wired yet either. Instead, we verify that the repo config file parsing works
-    // by directly calling the same function rules.rs uses: read_repo_config.
+    // without agent.readConversation RPC (out of scope for this PR). We verify that the repo
+    // config file parsing works by directly calling the same function rules.rs uses: read_repo_config.
     let repo =
         create_test_repo_with_config(r#"{"instructions": "Always use TypeScript for new files"}"#);
     let repo_path_buf = repo.0.clone();
