@@ -335,8 +335,8 @@ fn resolve_binary_path_searches_enriched_tool_dirs() {
 
     let test_bin_name = format!("test-enriched-binary-{pid}-{nanos}");
     let bin = local_bin.join(&test_bin_name);
-    std::fs::write(&bin, "#!/bin/sh\nexit 0\n").ok();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     // Temporarily override HOME to point to our test directory
     let original_home = std::env::var("HOME").ok();

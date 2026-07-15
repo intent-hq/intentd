@@ -65,7 +65,10 @@ fn capture_login_shell_path_with(shell: Option<&str>) -> Vec<PathBuf> {
                     return Vec::new();
                 }
                 let path_str = String::from_utf8_lossy(&output);
-                return std::env::split_paths(&path_str.as_ref()).collect::<Vec<_>>();
+                // Filter to absolute paths only to avoid unsafe relative entries like "." or "bin"
+                return std::env::split_paths(&path_str.as_ref())
+                    .filter(|p| p.is_absolute())
+                    .collect::<Vec<_>>();
             }
             Ok(None) => {
                 // Still running
