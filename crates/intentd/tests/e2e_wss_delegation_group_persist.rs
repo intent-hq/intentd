@@ -557,6 +557,8 @@ async fn delegation_group_persists_across_restart() {
     )
     .await;
     let messages = conv["messages"].as_array().expect("messages array");
+
+    // Debug: Count and show wake messages
     let texts: Vec<String> = messages
         .iter()
         .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
@@ -565,12 +567,23 @@ async fn delegation_group_persists_across_restart() {
         .iter()
         .filter(|t| t.contains("[WORKSPACE EVENTS]"))
         .collect();
+
     if wakes.len() != 1 {
-        eprintln!("\nGot {} wakes:", wakes.len());
-        for (i, w) in wakes.iter().enumerate() {
-            eprintln!("Wake {}: {}", i + 1, w);
+        eprintln!("\n===  GOT {} WAKES ===", wakes.len());
+        for (i, wake) in wakes.iter().enumerate() {
+            let has_both = wake.contains(CHILD1_REPORT) && wake.contains(CHILD2_REPORT);
+            let aggregated = wake.contains("All 2 delegated");
+            eprintln!("Wake {}: aggregated={}, has_both={}", i+1, aggregated, has_both);
+        }
+        // Show full messages for context
+        eprintln!("\n=== FULL PARENT CONVERSATION ===");
+        for (i, msg) in messages.iter().enumerate() {
+            eprintln!("Msg {}: role={}, events={}",
+                i, msg["role"].as_str().unwrap_or("?"),
+                texts[i].contains("[WORKSPACE EVENTS]"));
         }
     }
+
     assert_eq!(wakes.len(), 1, "exactly one wake message");
     let wake = wakes[0];
     assert!(

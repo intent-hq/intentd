@@ -647,24 +647,38 @@ impl Services {
     }
 
     /// Rehydrate undelivered delegation groups on resume (AS-2 rehydration).
+    /// Idempotent: skips groups already present in memory (by group_id).
     pub(crate) async fn rehydrate_delegation_groups(
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<usize> {
         let persisted = self.store.list_undelivered_groups(workspace_id).await?;
-        let count = persisted.len();
         let mut guard = self
             .agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned");
         let entry = guard.entry(workspace_id.clone()).or_default();
+        let mut loaded = 0;
+        eprintln!("[REHYDRATE] Found {} persisted groups, {} already in memory", persisted.len(), entry.delegation_groups.len());
         for p in persisted {
+            // Skip if this group is already in memory (idempotent rehydration).
+            if entry
+                .delegation_groups
+                .iter()
+                .any(|g| g.group_id == p.group_id)
+            {
+                eprintln!("[REHYDRATE] Skipping duplicate group {}", p.group_id);
+                continue;
+            }
+            eprintln!("[REHYDRATE] Loading group {} (sealed={}, expected={}, completed={})",
+                p.group_id, p.sealed, p.expected_agent_ids.len(), p.completed_agent_ids.len());
             // Groups are sealed on rehydration (original parent turn is gone).
             let mut group = persisted_to_delegation_group(&p)?;
             group.sealed = true;
             entry.delegation_groups.push(group);
+            loaded += 1;
         }
-        Ok(count)
+        Ok(loaded)
     }
 }
 
