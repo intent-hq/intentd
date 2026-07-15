@@ -252,7 +252,7 @@ async fn dispatch(
             let id = require_workspace_id(params)?;
             let config_value = params
                 .get("config")
-                .ok_or_else(|| rpc(INVALID_PARAMS, "config required"))?
+                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: config"))?
                 .clone();
             let config: intent_core::RepoConfig = serde_json::from_value(config_value)
                 .map_err(|e| rpc(INVALID_PARAMS, format!("invalid config: {e}")))?;

@@ -4546,7 +4546,7 @@ async fn repo_config_save_missing_config() {
     .await
     .unwrap();
     assert_eq!(err_code(&v), -32602);
-    assert_eq!(v["error"]["message"], "config required");
+    assert_eq!(v["error"]["message"], "Missing required parameter: config");
 }
 
 #[tokio::test]

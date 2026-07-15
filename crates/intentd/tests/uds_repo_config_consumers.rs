@@ -131,16 +131,18 @@ fn create_test_repo_with_config(config: &str) -> TempRepo {
 
     // Create an initial commit so the repo has a main branch
     std::fs::write(repo_path.join("README.md"), "test").unwrap();
-    std::process::Command::new("git")
+    let status = std::process::Command::new("git")
         .args(["add", "."])
         .current_dir(&repo_path)
         .output()
-        .unwrap();
-    std::process::Command::new("git")
+        .expect("git add spawn failed");
+    assert!(status.status.success(), "git add command failed");
+    let status = std::process::Command::new("git")
         .args(["commit", "-m", "Initial commit"])
         .current_dir(&repo_path)
         .output()
-        .unwrap();
+        .expect("git commit spawn failed");
+    assert!(status.status.success(), "git commit command failed");
 
     TempRepo(repo_path)
 }

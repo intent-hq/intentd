@@ -11,7 +11,7 @@ mod tests;
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
-/// These are the 254 methods routed through the main dispatch match in
+/// These are the 257 methods routed through the main dispatch match in
 /// `router.rs`. Every method here is guaranteed to return `-32601 Method not
 /// found` when the method name is unknown, or a domain error code (never
 /// `-32601`) when the method is recognized but fails for other reasons.

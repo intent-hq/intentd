@@ -103,7 +103,7 @@ pub async fn write_repo_config(repo_path: &Path, config: RepoConfig) -> Result<(
             .map_err(|e| {
                 intent_core::Error::Internal(format!("Failed to write .intent/.gitignore: {}", e))
             })?;
-        tracing::info!("Created .intent/.gitignore at {:?}", repo_path);
+        tracing::info!("Created .intent/.gitignore at {:?}", gitignore_path);
     }
 
     // Read existing config to preserve unknown keys
@@ -125,7 +125,7 @@ pub async fn write_repo_config(repo_path: &Path, config: RepoConfig) -> Result<(
         .await
         .map_err(|e| intent_core::Error::Internal(format!("Failed to write repo config: {}", e)))?;
 
-    tracing::info!("Wrote repo config at {:?}", repo_path);
+    tracing::info!("Wrote repo config at {:?}", config_path);
     Ok(())
 }
 
@@ -145,7 +145,7 @@ pub async fn ensure_intent_dir(repo_path: &Path) -> Result<()> {
             .map_err(|e| {
                 intent_core::Error::Internal(format!("Failed to write .intent/.gitignore: {}", e))
             })?;
-        tracing::info!("Initialized .intent directory at {:?}", repo_path);
+        tracing::info!("Initialized .intent directory at {:?}", gitignore_path);
     }
 
     Ok(())

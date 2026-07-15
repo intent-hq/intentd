@@ -254,32 +254,37 @@ async fn repo_config_wss_e2e() {
     // Create a temporary git repo
     let repo_path = std::env::temp_dir().join(format!("repo-cfg-wss-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&repo_path).expect("create temp repo dir");
-    std::process::Command::new("git")
+    let status = std::process::Command::new("git")
         .args(["init", "--initial-branch=main"])
         .current_dir(&repo_path)
         .status()
-        .expect("git init");
-    std::process::Command::new("git")
+        .expect("git init spawn");
+    assert!(status.success(), "git init failed");
+    let status = std::process::Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(&repo_path)
         .status()
-        .expect("git config email");
-    std::process::Command::new("git")
+        .expect("git config email spawn");
+    assert!(status.success(), "git config email failed");
+    let status = std::process::Command::new("git")
         .args(["config", "user.name", "Test"])
         .current_dir(&repo_path)
         .status()
-        .expect("git config name");
+        .expect("git config name spawn");
+    assert!(status.success(), "git config name failed");
     std::fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
-    std::process::Command::new("git")
+    let status = std::process::Command::new("git")
         .args(["add", "."])
         .current_dir(&repo_path)
         .status()
-        .expect("git add");
-    std::process::Command::new("git")
+        .expect("git add spawn");
+    assert!(status.success(), "git add failed");
+    let status = std::process::Command::new("git")
         .args(["commit", "-m", "initial commit"])
         .current_dir(&repo_path)
         .status()
-        .expect("git commit");
+        .expect("git commit spawn");
+    assert!(status.success(), "git commit failed");
 
     // Create a test workspace with the git repo via UDS
     let create_resp = uds_rpc(
