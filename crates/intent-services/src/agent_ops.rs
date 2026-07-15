@@ -3839,3 +3839,153 @@ fn validate_message_role(role: &str) -> Result<()> {
         ))),
     }
 }
+
+impl Services {
+    /// Resume an interrupted agent (INT-41 phase 2): mark row `resumed`, re-register
+    /// parent completion watch when the agent was delegated, then deliver a
+    /// continuation message via `agent.sendMessage`. Delivery failures leave the
+    /// row pending so the caller can retry.
+    pub(crate) async fn resume_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
+        // Verify the agent is in pending interrupted state
+        let rows = self.store.list_interrupted_agents().await?;
+        let interrupted = rows
+            .iter()
+            .find(|ia| ia.agent_id == *agent_id)
+            .ok_or_else(|| {
+                Error::InvalidParams(format!(
+                    "Agent {agent_id} is not in pending interrupted state"
+                ))
+            })?;
+
+        let workspace_id = interrupted.workspace_id.clone();
+
+        // Load the session to check for delegation metadata
+        let session = self.store.get_agent_session(agent_id).await?;
+
+        // Re-register parent completion watch if the agent was delegated
+        if let Some(parent_id) = &session.parent_agent_id {
+            // Extract createdByAgentId from metadata if present
+            let created_by = session
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("createdByAgentId"))
+                .and_then(|v| v.as_str())
+                .map(AgentId::from);
+
+            if let Some(parent) = created_by.or_else(|| Some(parent_id.clone())) {
+                // Fetch parent session for name
+                let parent_name = self
+                    .store
+                    .get_agent_session(&parent)
+                    .await
+                    .ok()
+                    .map(|s| s.name)
+                    .unwrap_or_default();
+
+                // Register completion watch (dedupe via find_and_refresh_ungrouped_watch)
+                let _sub_id = self
+                    .find_and_refresh_ungrouped_watch(
+                        &workspace_id,
+                        &parent,
+                        agent_id,
+                        true,
+                        Some(parent_name.clone()),
+                    )
+                    .unwrap_or_else(|| {
+                        self.register_completion_watch(
+                            &workspace_id,
+                            parent,
+                            parent_name,
+                            agent_id.clone(),
+                            true,
+                            None,
+                        )
+                    });
+            }
+        }
+
+        // Deliver continuation message
+        let continuation =
+            "intentd restarted while you were working. Review your last steps and continue the task.";
+
+        // Use the agent_send_message machinery to deliver the message
+        // (lazily respawns provider and resumes via ACP session/load)
+        let result = self
+            .agent_send_message(
+                workspace_id.clone(),
+                agent_id.clone(),
+                continuation.to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        // If delivery succeeded, mark the row resolved
+        if result.is_ok() {
+            self.store
+                .set_interrupted_resolution(agent_id, "resumed", &now_iso())
+                .await?;
+        } else {
+            // Delivery failed → leave row pending, return error
+            return Err(Error::Internal(format!(
+                "Failed to deliver continuation message to {agent_id}: {:?}",
+                result.err()
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Abandon an interrupted agent (INT-41 phase 2): mark row `abandoned`, append
+    /// a system interruption message to the log, emit chat/agent events for live UIs.
+    pub(crate) async fn abandon_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
+        // Verify the agent is in pending interrupted state
+        let rows = self.store.list_interrupted_agents().await?;
+        let interrupted = rows
+            .iter()
+            .find(|ia| ia.agent_id == *agent_id)
+            .ok_or_else(|| {
+                Error::InvalidParams(format!(
+                    "Agent {agent_id} is not in pending interrupted state"
+                ))
+            })?;
+
+        let workspace_id = interrupted.workspace_id.clone();
+
+        // Build the system interruption message
+        let text = "This conversation was interrupted because intentd restarted. The agent's in-flight work was terminated.";
+        let content = json!([{
+            "type": "text",
+            "text": text,
+            "meta": { "kind": "interruption" }
+        }]);
+
+        // Append the system message
+        let message = self
+            .store
+            .append_agent_message(agent_id, "system", &content, &now_iso())
+            .await?;
+
+        // Mark the interrupted_agent row as resolved
+        self.store
+            .set_interrupted_resolution(agent_id, "abandoned", &now_iso())
+            .await?;
+
+        // Emit agent:message event so live UIs see the new message
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            agent_id,
+            AGENT_MESSAGE,
+            json!({ "agentId": agent_id.0, "messageId": message.id, "role": "system" }),
+        )
+        .await;
+
+        Ok(())
+    }
+}

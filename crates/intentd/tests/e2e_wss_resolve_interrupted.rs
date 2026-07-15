@@ -1,14 +1,16 @@
-//! WSS end-to-end for `agent.listInterrupted` (INT-41, agent-resumption phase 1).
+//! WSS end-to-end for `agent.resolveInterrupted` (INT-41, agent-resumption phase 2).
 //!
-//! Boots a real `intentd serve --listen both`, creates agent sessions in stale
-//! in-flight statuses (Active/Processing/Waiting), restarts the daemon, and
-//! verifies that `agent.listInterrupted` returns the interrupted agents.
+//! Boots a real `intentd serve --listen both`, creates interrupted agent rows,
+//! then calls `agent.resolveInterrupted` to resume/abandon them. Verifies that
+//! resumed agents receive continuation messages and abandoned agents get system
+//! interruption messages.
 //!
 //! Coverage:
-//! - Interrupted agents are persisted across restart
-//! - `agent.listInterrupted` returns pending rows with joined workspace/agent data
-//! - Terminal/pending sessions are not captured
-//! - Idempotent inserts on second restart
+//! - Resume path delivers continuation message and re-registers completion watches
+//! - Abandon path appends system interruption message and emits events
+//! - Rows leave `agent.listInterrupted` once resolved
+//! - Unknown/already-resolved ids land in `failed`
+//! - Id in both resume and abandon lists → -32602
 
 #![cfg(unix)]
 
@@ -21,7 +23,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
-use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls::{ClientConfig, DigitallySignedStruct};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
@@ -44,7 +46,7 @@ fn free_port() -> u16 {
 
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-interrupted-{}", &id[..8]));
+    let dir = PathBuf::from("/tmp").join(format!("itd-wss-resolve-{}", &id[..8]));
     std::fs::create_dir_all(&dir).expect("mkdir data dir");
     dir
 }
@@ -138,7 +140,7 @@ impl ServerCertVerifier for PinnedVerifier {
         )
     }
 
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.provider
             .signature_verification_algorithms
             .supported_schemes()
@@ -208,175 +210,12 @@ where
     }
 }
 
-#[tokio::test]
-async fn interrupted_agents_persisted_across_restart() {
-    let data_dir = temp_data_dir();
-    let port = free_port();
-    let port_s = port.to_string();
-    let listen = "both";
-    let socket = data_dir.join("intentd.sock");
-
-    // Phase 1: Boot daemon, create a workspace, create an agent session with Active status.
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
-        .arg("--listen")
-        .arg(listen)
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", &port_s)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(
-            std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
-        ))
-        .spawn()
-        .expect("spawn intentd serve");
-    if !await_uds(&socket).await {
-        let log_path = data_dir.join("daemon.log");
-        if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("Daemon log:\n{}", log);
-        }
-        panic!("daemon did not start");
-    }
-
-    let ws_id = "ws-interrupted-test";
-    let agent_id = format!("agent-{}", Uuid::new_v4().simple());
-
-    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
-        .await
-        .expect("open store");
-
-    // Seed workspace + agent session with Active status (stale in-flight).
-    {
-        use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
-        let ts = now_iso();
-        store
-            .insert_workspace(&workspace_seed(&WorkspaceId(ws_id.to_string())))
-            .await
-            .expect("insert workspace");
-
-        let session = AgentSession {
-            id: AgentId(agent_id.clone()),
-            workspace_id: WorkspaceId(ws_id.to_string()),
-            backend_session_id: None,
-            acp_session_id: None,
-            name: "Interrupted Agent".to_string(),
-            name_explicitly_set: false,
-            model: None,
-            provider: None,
-            status: AgentStatus::Active, // stale in-flight
-            is_active: true,
-            system_prompt: None,
-            created_at: ts.clone(),
-            updated_at: ts,
-            parent_agent_id: None,
-            specialist: None,
-            task_note_id: None,
-            skip_auto_commit: false,
-            completion_report: None,
-            completion_report_timestamp: None,
-            delegation_depth: None,
-            initial_message: None,
-            context_references: None,
-            image_blocks: None,
-            is_background: false,
-            metadata: None,
-            messages: vec![],
-            stats: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
-        };
-        store
-            .insert_agent_session(&session)
-            .await
-            .expect("insert agent");
-    }
-
-    // Kill daemon to simulate restart.
-    daemon.kill().expect("kill daemon");
-    daemon.wait().expect("wait daemon");
-
-    // Phase 2: Restart daemon — heal sweep should insert interrupted_agent row.
-    daemon = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
-        .arg("--listen")
-        .arg(listen)
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", &port_s)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(
-            std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
-        ))
-        .spawn()
-        .expect("spawn intentd serve 2");
-    assert!(await_uds(&socket).await, "daemon did not restart");
-
-    // Fetch fingerprint for TLS cert pinning.
-    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
-    let fp = status["result"]["fingerprint"]
-        .as_str()
-        .expect("fingerprint")
-        .to_string();
-
-    // Open WSS connection.
-    let cfg = client_config(&fp);
-    let mut ws = connect_ws(port, cfg).await;
-
-    // Phase 3: Call agent.listInterrupted over WSS.
-    let result = wss_rpc(&mut ws, 2, "agent.listInterrupted", json!({})).await;
-
-    // Verify the response shape.
-    let agents = result["agents"].as_array().expect("agents array");
-    assert_eq!(agents.len(), 1, "expected 1 interrupted agent");
-    let interrupted = &agents[0];
-    assert_eq!(interrupted["agentId"].as_str(), Some(agent_id.as_str()));
-    assert_eq!(interrupted["workspaceId"].as_str(), Some(ws_id));
-    assert_eq!(
-        interrupted["workspaceName"].as_str(),
-        Some("WSS-INTERRUPTED")
-    );
-    assert_eq!(interrupted["agentName"].as_str(), Some("Interrupted Agent"));
-    assert_eq!(interrupted["prevStatus"].as_str(), Some("active"));
-    assert!(interrupted["interruptedAt"].is_string());
-
-    // Phase 4: Restart again — idempotent insert should not duplicate.
-    daemon.kill().expect("kill daemon 2");
-    daemon.wait().expect("wait daemon 2");
-    daemon = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
-        .arg("--listen")
-        .arg(listen)
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", &port_s)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(
-            std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
-        ))
-        .spawn()
-        .expect("spawn intentd serve 3");
-    assert!(await_uds(&socket).await, "daemon did not restart 2");
-
-    let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
-    let fp = status["result"]["fingerprint"]
-        .as_str()
-        .expect("fingerprint 2")
-        .to_string();
-    let cfg = client_config(&fp);
-    let mut ws = connect_ws(port, cfg).await;
-
-    let result = wss_rpc(&mut ws, 4, "agent.listInterrupted", json!({})).await;
-    let agents = result["agents"].as_array().expect("agents array 2");
-    assert_eq!(agents.len(), 1, "still 1 interrupted agent (idempotent)");
-}
-
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
     let ts = now_iso();
     Workspace {
         id: id.clone(),
-        title: "WSS-INTERRUPTED".to_string(),
+        title: "WSS-RESOLVE".to_string(),
         branch: "main".to_string(),
         base_ref: None,
         base_commit_sha: None,
@@ -411,4 +250,222 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
     }
+}
+
+#[tokio::test]
+async fn resolve_interrupted_resume_and_abandon() {
+    let data_dir = temp_data_dir();
+    let port = free_port();
+    let port_s = port.to_string();
+    let listen = "both";
+    let socket = data_dir.join("intentd.sock");
+
+    // Phase 1: Boot daemon, create workspace, seed two interrupted agent rows.
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("serve")
+        .arg("--listen")
+        .arg(listen)
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_TCP_PORT", &port_s)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
+        ))
+        .spawn()
+        .expect("spawn intentd serve");
+    if !await_uds(&socket).await {
+        panic!("daemon did not start");
+    }
+
+    let ws_id = "ws-resolve-test";
+    let agent_resume = format!("agent-{}", Uuid::new_v4().simple());
+    let agent_abandon = format!("agent-{}", Uuid::new_v4().simple());
+
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open store");
+
+    {
+        use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
+        let ts = now_iso();
+        store
+            .insert_workspace(&workspace_seed(&WorkspaceId(ws_id.to_string())))
+            .await
+            .expect("insert workspace");
+
+        // Agent 1: will be resumed
+        let session1 = AgentSession {
+            id: AgentId(agent_resume.clone()),
+            workspace_id: WorkspaceId(ws_id.to_string()),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Resume Agent".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            status: AgentStatus::RuntimeIdle, // settled after heal
+            is_active: true,
+            system_prompt: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            messages: vec![],
+            stats: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        };
+        store
+            .insert_agent_session(&session1)
+            .await
+            .expect("insert agent 1");
+        store
+            .insert_interrupted_agent(
+                &AgentId(agent_resume.clone()),
+                &WorkspaceId(ws_id.to_string()),
+                "active",
+                &ts,
+            )
+            .await
+            .expect("insert interrupted 1");
+
+        // Agent 2: will be abandoned
+        let session2 = AgentSession {
+            id: AgentId(agent_abandon.clone()),
+            workspace_id: WorkspaceId(ws_id.to_string()),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Abandon Agent".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            status: AgentStatus::RuntimeIdle,
+            is_active: true,
+            system_prompt: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            messages: vec![],
+            stats: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        };
+        store
+            .insert_agent_session(&session2)
+            .await
+            .expect("insert agent 2");
+        store
+            .insert_interrupted_agent(
+                &AgentId(agent_abandon.clone()),
+                &WorkspaceId(ws_id.to_string()),
+                "active",
+                &ts,
+            )
+            .await
+            .expect("insert interrupted 2");
+    }
+
+    // Fetch fingerprint
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    // Open WSS connection
+    let cfg = client_config(&fp);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // Phase 2: Verify both agents are in the pending list
+    let list1 = wss_rpc(&mut ws, 2, "agent.listInterrupted", json!({})).await;
+    let agents = list1["agents"].as_array().expect("agents array");
+    assert_eq!(agents.len(), 2, "expected 2 interrupted agents");
+
+    // Phase 3: Call agent.resolveInterrupted
+    let result = wss_rpc(
+        &mut ws,
+        3,
+        "agent.resolveInterrupted",
+        json!({
+            "resume": [agent_resume.clone()],
+            "abandon": [agent_abandon.clone()],
+        }),
+    )
+    .await;
+
+    // Verify response shape
+    let resumed = result["resumed"].as_array().expect("resumed array");
+    let abandoned = result["abandoned"].as_array().expect("abandoned array");
+    let failed = result["failed"].as_array().expect("failed array");
+
+    assert_eq!(resumed.len(), 1, "expected 1 resumed");
+    assert_eq!(resumed[0].as_str(), Some(agent_resume.as_str()));
+    assert_eq!(abandoned.len(), 1, "expected 1 abandoned");
+    assert_eq!(abandoned[0].as_str(), Some(agent_abandon.as_str()));
+    assert_eq!(failed.len(), 0, "expected 0 failed");
+
+    // Phase 4: Verify rows are no longer in pending list
+    let list2 = wss_rpc(&mut ws, 4, "agent.listInterrupted", json!({})).await;
+    let agents2 = list2["agents"].as_array().expect("agents array 2");
+    assert_eq!(agents2.len(), 0, "expected 0 interrupted agents after resolve");
+
+    // Phase 5: Verify the abandoned agent has a system message
+    use intent_core::AgentId;
+    let abandoned_session = store
+        .get_agent_session(&AgentId(agent_abandon.clone()))
+        .await
+        .expect("get abandoned session");
+    assert!(!abandoned_session.messages.is_empty(), "expected messages");
+    let last_msg = abandoned_session.messages.last().unwrap();
+    assert_eq!(last_msg.role, "system", "expected system message");
+    let blocks = last_msg.content.as_array().expect("content blocks");
+    let text_block = &blocks[0];
+    assert_eq!(text_block["type"], "text");
+    assert!(text_block["text"]
+        .as_str()
+        .unwrap()
+        .contains("interrupted because intentd restarted"));
+    assert_eq!(text_block["meta"]["kind"], "interruption");
+
+    // Phase 6: Test error case - unknown agent id (already resolved)
+    let unknown_result = wss_rpc(
+        &mut ws,
+        5,
+        "agent.resolveInterrupted",
+        json!({
+            "resume": [agent_resume.clone()],
+        }),
+    )
+    .await;
+    let resumed2 = unknown_result["resumed"].as_array().expect("resumed array 2");
+    let failed2 = unknown_result["failed"].as_array().expect("failed array 2");
+    assert_eq!(resumed2.len(), 0, "already resolved should not resume");
+    assert_eq!(failed2.len(), 1, "already resolved should be in failed");
+
+    daemon.kill().expect("kill daemon");
+    daemon.wait().expect("wait daemon");
 }

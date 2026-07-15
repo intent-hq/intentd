@@ -11047,6 +11047,61 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_resolve_interrupted(
+        &self,
+        resume: Option<Vec<String>>,
+        abandon: Option<Vec<String>>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            use serde_json::json;
+            let resume_ids = resume.unwrap_or_default();
+            let abandon_ids = abandon.unwrap_or_default();
+
+            // Check for ids in both lists → -32602
+            for id in &resume_ids {
+                if abandon_ids.contains(id) {
+                    return Err(Error::InvalidParams(format!(
+                        "Agent id {id} appears in both resume and abandon"
+                    )));
+                }
+            }
+
+            let mut resumed = Vec::new();
+            let mut abandoned = Vec::new();
+            let mut failed = Vec::new();
+
+            // Resume path
+            for agent_id_str in resume_ids {
+                let agent_id = AgentId::from(agent_id_str.as_str());
+                match self.resume_interrupted_agent(&agent_id).await {
+                    Ok(()) => resumed.push(agent_id_str),
+                    Err(e) => failed.push(json!({
+                        "agentId": agent_id_str,
+                        "error": e.to_string(),
+                    })),
+                }
+            }
+
+            // Abandon path
+            for agent_id_str in abandon_ids {
+                let agent_id = AgentId::from(agent_id_str.as_str());
+                match self.abandon_interrupted_agent(&agent_id).await {
+                    Ok(()) => abandoned.push(agent_id_str),
+                    Err(e) => failed.push(json!({
+                        "agentId": agent_id_str,
+                        "error": e.to_string(),
+                    })),
+                }
+            }
+
+            Ok(json!({
+                "resumed": resumed,
+                "abandoned": abandoned,
+                "failed": failed,
+            }))
+        })
+    }
+
     fn agent_diagnostics(
         &self,
         workspace_id: WorkspaceId,

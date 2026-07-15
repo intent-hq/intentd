@@ -41,6 +41,8 @@ pub const ROUTER_METHODS: &[&str] = &[
     "agent.rename",
     "agent.replaceMessages",
     "agent.reportToParent",
+    "agent.resolveInterrupted",
+    "agent.reportToParent",
     "agent.respondPermission",
     "agent.retry",
     "agent.sendMessage",
