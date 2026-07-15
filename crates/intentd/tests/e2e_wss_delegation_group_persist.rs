@@ -397,18 +397,24 @@ async fn delegation_group_persists_across_restart() {
     ];
 
     // Phase 1: Boot, create parent, delegate both children
+    eprintln!("[TEST] booting daemon");
     let mut daemon = boot_daemon(&data_dir, port, &env);
+    eprintln!("[TEST] waiting for UDS");
     assert!(await_uds(&socket).await, "daemon start");
 
+    eprintln!("[TEST] getting fingerprint");
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .unwrap()
         .to_string();
+    eprintln!("[TEST] fingerprint: {}", fp);
     let cfg = client_config(&fp);
 
     // Subscribe BEFORE creating the parent so we don't miss events
+    eprintln!("[TEST] connecting subscription websocket");
     let mut sub = connect_ws(port, cfg.clone()).await;
+    eprintln!("[TEST] subscribing to events");
     wss_rpc(
         &mut sub,
         1,
@@ -416,8 +422,11 @@ async fn delegation_group_persists_across_restart() {
         json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
     )
     .await;
+    eprintln!("[TEST] subscription successful");
 
+    eprintln!("[TEST] connecting RPC websocket");
     let mut rpc = connect_ws(port, cfg.clone()).await;
+    eprintln!("[TEST] RPC websocket connected");
     let parent = wss_rpc(
         &mut rpc,
         10,
@@ -436,17 +445,22 @@ async fn delegation_group_persists_across_restart() {
     .await;
 
     // Wait for parent to idle after delegating
+    eprintln!("[TEST] waiting for parent idle after delegation");
     let mut parent_idle = false;
-    for _ in 0..200 {
+    let mut received_events = Vec::new();
+    for i in 0..200 {
         let frame = wss_event(&mut sub, 60).await;
         let ev = &frame["params"]["event"];
+        let ev_type = ev["type"].as_str().unwrap_or("UNKNOWN");
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+        received_events.push(format!("{}:{}", ev_type, ev_agent));
+        eprintln!("[TEST] event {}: {} agent={}", i, ev_type, ev_agent);
         if ev["type"] == "agent:idle" && ev_agent == parent_id {
             parent_idle = true;
             break;
         }
     }
-    assert!(parent_idle, "parent went idle after delegating");
+    assert!(parent_idle, "parent went idle after delegating. Received events: {:?}", received_events);
 
     // Get child IDs from parent's waitingForAgentIds (more reliable than event capture)
     let lite = wss_rpc(&mut rpc, 12, "agent.get", json!({ "agentId": &parent_id })).await;
