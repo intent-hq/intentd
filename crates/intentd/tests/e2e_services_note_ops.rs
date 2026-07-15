@@ -137,7 +137,10 @@ async fn note_add_edit_edit_lines() {
         .get_note(ws.clone(), note_id.clone())
         .await
         .expect("get note");
-    assert!(!note_after_edit.content.is_empty(), "note content must be non-empty");
+    assert!(
+        !note_after_edit.content.is_empty(),
+        "note content must be non-empty"
+    );
     let edit_lines_input = NoteEditLinesInput {
         start: 1,
         end: 1,
@@ -219,7 +222,7 @@ async fn note_update_metadata() {
         .await
         .expect("update metadata");
 
-    assert_eq!(update_result.ok, true);
+    assert!(update_result.ok);
     assert_eq!(update_result.note_id, note.id);
 
     // Verify the changes

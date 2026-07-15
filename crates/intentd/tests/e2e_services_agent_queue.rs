@@ -194,7 +194,7 @@ async fn agent_conversation_and_summary() {
         .expect("get conversation");
     assert!(conversation["messages"].is_array());
     let messages = conversation["messages"].as_array().unwrap();
-    assert!(messages.len() > 0);
+    assert!(!messages.is_empty());
 
     // Get summary
     let summary = services
