@@ -3,7 +3,7 @@ set -euo pipefail
 
 # E2E coverage script
 # Measures line coverage from ALL daemon-level integration tests in crates/intentd/tests/
-# Excludes auggie_context_e2e (requires real auggie binary)
+# Explicitly skips auggie_context_e2e in the loop below (requires real auggie binary)
 
 cd "$(dirname "$0")/.."
 
@@ -39,6 +39,8 @@ for test_file in "${test_files[@]}"; do
     echo "Running test: $test_name"
     # Skip known flaky tests under llvm-cov instrumentation (STAB-40, STAB-42)
     # These skips DEFLATE coverage (we lose their contribution) but prevent spurious CI failures
+    # Note: capture_login_shell_path_with_fake_shell (STAB-43) is an intent-core unit test,
+    # not an intentd integration test, so it's skipped in coverage-all.sh but not here
     cargo llvm-cov --no-report -p intentd --test "$test_name" -- \
         --skip wss_note_save_asset_round_trip \
         --skip slow_host_exec_does_not_block_fast_workspace_list
@@ -56,7 +58,7 @@ if [ "${GENERATE_LCOV:-}" = "1" ]; then
     cargo llvm-cov report --lcov --output-path lcov.info
 fi
 
-# If --fail-under-lines is provided as first argument, enforce the floor
+# If a numeric floor is provided as first argument, enforce it
 if [ $# -gt 0 ]; then
     FLOOR="$1"
     echo ""

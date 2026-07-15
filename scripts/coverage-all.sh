@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Combined coverage script
 # Measures line coverage from ALL workspace tests (unit + integration + e2e)
-# Excludes auggie_context_e2e (requires real auggie binary)
+# auggie_context_e2e test is env-gated (INTENTD_AUGGIE_E2E) and self-skips when the env var is unset
 
 cd "$(dirname "$0")/.."
 
@@ -22,11 +22,12 @@ echo "Running all workspace tests with coverage instrumentation..."
 
 # Run all workspace tests (unit + integration + e2e)
 # auggie_context_e2e test is env-gated (INTENTD_AUGGIE_E2E) and skips cleanly in CI
-# Skip known flaky tests under llvm-cov instrumentation (STAB-40, STAB-42)
+# Skip known flaky tests under llvm-cov instrumentation (STAB-40, STAB-42, STAB-43)
 # These skips DEFLATE coverage (we lose their contribution) but prevent spurious CI failures
 cargo llvm-cov --no-report --workspace -- \
     --skip wss_note_save_asset_round_trip \
-    --skip slow_host_exec_does_not_block_fast_workspace_list
+    --skip slow_host_exec_does_not_block_fast_workspace_list \
+    --skip capture_login_shell_path_with_fake_shell
 
 echo ""
 echo "Generating coverage report..."
@@ -40,7 +41,7 @@ if [ "${GENERATE_LCOV:-}" = "1" ]; then
     cargo llvm-cov report --lcov --output-path lcov.info
 fi
 
-# If --fail-under-lines is provided as first argument, enforce the floor
+# If a numeric floor is provided as first argument, enforce it
 if [ $# -gt 0 ]; then
     FLOOR="$1"
     echo ""
