@@ -1,26 +1,23 @@
-//! WSS end-to-end for delegation-group persistence and rehydration across restart.
+//! WSS end-to-end for delegation-group persistence and aggregated wake across restart.
 //!
-//! Boots a real `intentd serve --listen both`, seeds a delegation_group row (with
-//! one pre-restart completion) and two child agent sessions, kills the daemon,
-//! restarts it, resumes an interrupted child via `agent.resolveInterrupted` (which
-//! triggers rehydration), and verifies via `agent.diagnostics` (over WSS) that the
-//! group was correctly loaded into memory with sealed=true, both children expected,
-//! and the pre-restart completion preserved. Also verifies the group row persists
-//! in the database until actual delivery (which requires real agent completions
-//! and is tested separately in unit tests).
+//! Creates a parent that delegates two children with `waitMode: 'after_all'`, allows
+//! child1 to complete, kills the daemon mid-flight, restarts, resumes child2, allows
+//! child2 to complete post-restart, and verifies the parent receives exactly ONE
+//! aggregated wake over WSS with both children's summaries.
 //!
 //! Coverage:
 //! - Delegation groups persist to SQLite (write-through)
 //! - Groups rehydrate on `agent.resolveInterrupted` with sealed=true
-//! - Pre-restart completions and expected_agent_ids survive restart
-//! - Rehydrated state is observable via WSS (`agent.diagnostics`)
-//! - Group rows remain until delivery (no premature deletion)
+//! - Pre-restart completions survive restart
+//! - Aggregated wake fires exactly once with both summaries
+//! - Wake observable via WSS (stream lifecycle keyed by parent)
+//! - Group row deleted after delivery
 
 #![cfg(unix)]
 
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +27,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
@@ -39,6 +37,8 @@ use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
+const CHILD1_REPORT: &str = "CHILD1_DONE_PRE_RESTART";
+const CHILD2_REPORT: &str = "CHILD2_DONE_POST_RESTART";
 
 fn free_port() -> u16 {
     StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -46,13 +46,6 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
-}
-
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-delgrp-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -100,10 +93,9 @@ impl ServerCertVerifier for PinnedVerifier {
         end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
+        _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        use sha2::{Digest, Sha256};
         let fp = Sha256::digest(end_entity.as_ref())
             .iter()
             .map(|b| format!("{b:02X}"))
@@ -115,7 +107,6 @@ impl ServerCertVerifier for PinnedVerifier {
             Err(rustls::Error::General("fingerprint mismatch".into()))
         }
     }
-
     fn verify_tls12_signature(
         &self,
         message: &[u8],
@@ -129,7 +120,6 @@ impl ServerCertVerifier for PinnedVerifier {
             &self.provider.signature_verification_algorithms,
         )
     }
-
     fn verify_tls13_signature(
         &self,
         message: &[u8],
@@ -143,7 +133,6 @@ impl ServerCertVerifier for PinnedVerifier {
             &self.provider.signature_verification_algorithms,
         )
     }
-
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.provider
             .signature_verification_algorithms
@@ -214,12 +203,56 @@ where
     }
 }
 
+async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let next = timeout(Duration::from_secs(secs), ws.next())
+            .await
+            .expect("wss event timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "events.event" {
+                    return v;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+fn temp_data_dir() -> PathBuf {
+    let id = Uuid::new_v4().simple().to_string();
+    let dir = PathBuf::from("/tmp").join(format!("itd-delgrp-{}", &id[..8]));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    dir
+}
+
+async fn seed_workspace_only(data_dir: &Path) -> String {
+    use intent_core::WorkspaceId;
+    use intent_store::Store;
+    let db_path = data_dir.join("intentd.db");
+    let store = Store::open(&db_path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace_seed(&ws))
+        .await
+        .expect("insert ws");
+    ws.0
+}
+
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
     let ts = now_iso();
     Workspace {
         id: id.clone(),
-        title: "WSS-DELGRP".to_string(),
+        title: "DELGRP-E2E".to_string(),
         branch: "main".to_string(),
         base_ref: None,
         base_commit_sha: None,
@@ -256,272 +289,181 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
-fn boot_daemon(data_dir: &Path, port: u16) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+fn boot_daemon(data_dir: &PathBuf, port: u16, env: &[(&str, &str)]) -> std::process::Child {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd.arg("serve")
         .arg("--listen")
         .arg("both")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", &port.to_string())
-        .env("INTENTD_ACP_PROVIDER", "mock")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
-        ))
-        .spawn()
-        .expect("spawn intentd serve")
+        ));
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.spawn().expect("spawn intentd serve")
 }
 
 #[tokio::test]
 async fn delegation_group_persists_across_restart() {
     let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
     let port = free_port();
     let socket = data_dir.join("intentd.sock");
 
-    // Phase 1: Boot daemon, create workspace, parent, and two after_all children
-    let mut daemon = boot_daemon(&data_dir, port);
-    if !await_uds(&socket).await {
-        panic!("daemon did not start");
-    }
+    // Mock ACP behavior: children report after delay (to ensure parent seals group first)
+    let report1_js = format!(
+        "return await ws.agent.reportToParent({});",
+        json!(CHILD1_REPORT)
+    );
+    let report2_js = format!(
+        "return await ws.agent.reportToParent({});",
+        json!(CHILD2_REPORT)
+    );
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": "CHILD1",
+                "delayMs": 2000,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": report1_js, "summary": "child1 report" }
+                },
+                "response": "child1 done"
+            },
+            {
+                "ifPromptContains": "CHILD2",
+                "delayMs": 2000,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": report2_js, "summary": "child2 report" }
+                },
+                "response": "child2 done"
+            },
+            {
+                "ifPromptContains": "[WORKSPACE EVENTS]",
+                "response": "parent ack"
+            },
+            {
+                "ifPromptContains": "PARENT_GO",
+                "toolCalls": [
+                    {
+                        "name": "workspace_api",
+                        "arguments": {
+                            "code": "return await ws.agent.delegate({ agentInstructions: 'CHILD1', waitMode: 'after_all', model: 'mock:default' });",
+                            "summary": "delegate child1"
+                        }
+                    },
+                    {
+                        "name": "workspace_api",
+                        "arguments": {
+                            "code": "return await ws.agent.delegate({ agentInstructions: 'CHILD2', waitMode: 'after_all', model: 'mock:default' });",
+                            "summary": "delegate child2"
+                        }
+                    }
+                ],
+                "response": "delegated both"
+            }
+        ]
+    }).to_string();
 
-    let ws_id = "ws-delgrp-test";
-    let parent_id = format!("agent-{}", Uuid::new_v4().simple());
-    let child1_id = format!("agent-{}", Uuid::new_v4().simple());
-    let child2_id = format!("agent-{}", Uuid::new_v4().simple());
+    let mock_script = data_dir.join("mock-acp.mjs");
+    let script_src = include_str!("fixtures/mock-acp-agent.mjs");
+    std::fs::write(&mock_script, script_src).expect("write mock script");
 
-    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
-        .await
-        .expect("open store");
+    let env = [
+        ("INTENTD_ACP_PROVIDER", "mock"),
+        ("MOCK_AGENT_SCRIPT_PATH", mock_script.to_str().unwrap()),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
 
-    {
-        use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
-        let ts = now_iso();
-        store
-            .insert_workspace(&workspace_seed(&WorkspaceId(ws_id.to_string())))
-            .await
-            .expect("insert workspace");
+    // Phase 1: Boot, create parent, delegate both children
+    let mut daemon = boot_daemon(&data_dir, port, &env);
+    assert!(await_uds(&socket).await, "daemon start");
 
-        // Parent agent
-        let parent_session = AgentSession {
-            id: AgentId(parent_id.clone()),
-            workspace_id: WorkspaceId(ws_id.to_string()),
-            backend_session_id: None,
-            acp_session_id: None,
-            name: "Parent".to_string(),
-            name_explicitly_set: false,
-            model: None,
-            provider: None,
-            status: AgentStatus::RuntimeIdle,
-            is_active: true,
-            system_prompt: None,
-            created_at: ts.clone(),
-            updated_at: ts.clone(),
-            parent_agent_id: None,
-            specialist: None,
-            task_note_id: None,
-            skip_auto_commit: false,
-            completion_report: None,
-            completion_report_timestamp: None,
-            delegation_depth: Some(0),
-            initial_message: None,
-            context_references: None,
-            image_blocks: None,
-            is_background: false,
-            metadata: None,
-            messages: vec![],
-            stats: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
-        };
-        store
-            .insert_agent_session(&parent_session)
-            .await
-            .expect("insert parent");
-
-        // Child 1 (will complete before restart)
-        let child1_session = AgentSession {
-            id: AgentId(child1_id.clone()),
-            workspace_id: WorkspaceId(ws_id.to_string()),
-            backend_session_id: None,
-            acp_session_id: None,
-            name: "Child1".to_string(),
-            name_explicitly_set: false,
-            model: None,
-            provider: None,
-            status: AgentStatus::RuntimeIdle,
-            is_active: true,
-            system_prompt: None,
-            created_at: ts.clone(),
-            updated_at: ts.clone(),
-            parent_agent_id: Some(AgentId(parent_id.clone())),
-            specialist: None,
-            task_note_id: None,
-            skip_auto_commit: false,
-            completion_report: None,
-            completion_report_timestamp: None,
-            delegation_depth: Some(1),
-            initial_message: None,
-            context_references: None,
-            image_blocks: None,
-            is_background: false,
-            metadata: Some(json!({ "createdByAgentId": parent_id.clone() })),
-            messages: vec![],
-            stats: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
-        };
-        store
-            .insert_agent_session(&child1_session)
-            .await
-            .expect("insert child1");
-
-        // Child 2 (will be interrupted and resumed)
-        let child2_session = AgentSession {
-            id: AgentId(child2_id.clone()),
-            workspace_id: WorkspaceId(ws_id.to_string()),
-            backend_session_id: None,
-            acp_session_id: None,
-            name: "Child2".to_string(),
-            name_explicitly_set: false,
-            model: None,
-            provider: None,
-            status: AgentStatus::Active, // interrupted mid-flight
-            is_active: true,
-            system_prompt: None,
-            created_at: ts.clone(),
-            updated_at: ts.clone(),
-            parent_agent_id: Some(AgentId(parent_id.clone())),
-            specialist: None,
-            task_note_id: None,
-            skip_auto_commit: false,
-            completion_report: None,
-            completion_report_timestamp: None,
-            delegation_depth: Some(1),
-            initial_message: None,
-            context_references: None,
-            image_blocks: None,
-            is_background: false,
-            metadata: Some(json!({ "createdByAgentId": parent_id.clone() })),
-            messages: vec![],
-            stats: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
-        };
-        store
-            .insert_agent_session(&child2_session)
-            .await
-            .expect("insert child2");
-    }
-
-    // Fetch fingerprint
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
-        .expect("fingerprint")
+        .unwrap()
         .to_string();
-
-    // Open WSS connection
     let cfg = client_config(&fp);
-    let mut ws = connect_ws(port, cfg.clone()).await;
 
-    // Subscribe to events to catch the aggregated wake
-    let _sub = wss_rpc(
-        &mut ws,
-        2,
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
         "events.subscribe",
-        json!({
-            "eventTypes": ["agent:*"],
-            "workspaceId": ws_id,
-        }),
+        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
     )
     .await;
 
-    // Phase 2: Seed the delegation group and child1 completion via direct store access
-    // (simulating the state that would exist if the parent had delegated with after_all)
-    {
-        use intent_core::{now_iso, ActorType, AgentId, Event, EventActor, WorkspaceId};
-        use intent_store::PersistedDelegationGroup;
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let parent = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "Parent", "model": "mock:default" }),
+    )
+    .await;
+    let parent_id = parent["agent"]["id"].as_str().unwrap().to_string();
+    wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &parent_id, "content": "PARENT_GO" }),
+    )
+    .await;
 
-        let group_id = Uuid::new_v4().to_string();
-        let ts = now_iso();
-
-        // Build pre-restart child1 completion event
-        let child1_event_json = serde_json::to_string(&Event {
-            id: format!("evt-{}", Uuid::new_v4().simple()),
-            workspace_id: WorkspaceId(ws_id.to_string()),
-            timestamp: ts.clone(),
-            event_type: "agent:idle".to_string(),
-            actor: EventActor {
-                actor_type: ActorType::Agent,
-                id: Some(child1_id.clone()),
-                name: Some("Child1".to_string()),
-                ..Default::default()
-            },
-            session_id: Some(child1_id.clone()),
-            correlation_id: None,
-            parent_event_id: None,
-            metadata: None,
-            data: json!({ "agentId": child1_id.clone(), "status": "idle" }),
-        })
-        .unwrap();
-
-        // Persist delegation group with child1 completed, child2 expected but not completed
-        let group = PersistedDelegationGroup {
-            group_id: group_id.clone(),
-            workspace_id: WorkspaceId(ws_id.to_string()),
-            parent_agent_id: AgentId(parent_id.clone()),
-            await_mode: "after_all".to_string(),
-            expected_agent_ids: vec![AgentId(child1_id.clone()), AgentId(child2_id.clone())],
-            completed_agent_ids: vec![AgentId(child1_id.clone())],
-            deleted_agent_ids: vec![],
-            sealed: false, // Not yet sealed (parent turn not done)
-            delivered: false,
-            event_summaries: vec![format!("Child1 completed pre-restart")],
-            raw_events_json: vec![child1_event_json],
-            created_at: ts.clone(),
-            updated_at: ts.clone(),
-        };
-        store
-            .upsert_delegation_group(&group)
-            .await
-            .expect("upsert group");
-
-        // Mark child1 as idle (completed)
-        store
-            .set_agent_session_status(
-                &WorkspaceId(ws_id.to_string()),
-                &AgentId(child1_id.clone()),
-                intent_core::AgentStatus::RuntimeIdle,
-                true,
-                &ts,
-            )
-            .await
-            .expect("update child1 status");
+    // Wait for parent to idle after delegating
+    let mut parent_idle = false;
+    let mut child1_id: Option<String> = None;
+    let mut child2_id: Option<String> = None;
+    for _ in 0..100 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:created" {
+            let agent_id = ev["data"]["agentId"].as_str().unwrap().to_string();
+            if child1_id.is_none() {
+                child1_id = Some(agent_id);
+            } else if child2_id.is_none() {
+                child2_id = Some(agent_id);
+            }
+        }
+        if ev["type"] == "agent:idle" && ev["data"]["agentId"] == parent_id {
+            parent_idle = true;
+            break;
+        }
     }
+    assert!(parent_idle, "parent went idle after delegating");
+    let child1_id = child1_id.expect("child1 created");
+    let child2_id = child2_id.expect("child2 created");
 
-    // Verify delegation_group row exists
-    let groups = store
-        .list_undelivered_groups(&intent_core::WorkspaceId(ws_id.to_string()))
-        .await
-        .expect("list groups");
-    assert_eq!(
-        groups.len(),
-        1,
-        "expected 1 undelivered group before restart"
-    );
-    assert_eq!(groups[0].expected_agent_ids.len(), 2);
-    assert_eq!(groups[0].completed_agent_ids.len(), 1);
+    // Wait for child1 to complete (idle)
+    let mut child1_idle = false;
+    for _ in 0..100 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:idle"
+            && frame["params"]["event"]["data"]["agentId"] == child1_id
+        {
+            child1_idle = true;
+            break;
+        }
+    }
+    assert!(child1_idle, "child1 went idle");
 
-    // Phase 3: Kill daemon (simulating restart mid-flight)
+    // Kill daemon before child2 completes
     daemon.kill().expect("kill daemon");
     daemon.wait().expect("wait daemon");
-    drop(ws);
+    drop(sub);
+    drop(rpc);
 
-    // Insert interrupted_agent row for child2 (simulating what heal would do)
+    // Insert interrupted_agent row for child2
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open store");
     {
         use intent_core::{now_iso, AgentId, WorkspaceId};
         store
@@ -533,114 +475,111 @@ async fn delegation_group_persists_across_restart() {
             )
             .await
             .expect("insert interrupted child2");
-
-        // Heal would set child2 to idle
-        store
-            .set_agent_session_status(
-                &WorkspaceId(ws_id.to_string()),
-                &AgentId(child2_id.clone()),
-                intent_core::AgentStatus::RuntimeIdle,
-                true,
-                &now_iso(),
-            )
-            .await
-            .expect("update child2 status to idle");
     }
 
-    // Phase 4: Restart daemon
+    // Restart daemon
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let mut daemon2 = boot_daemon(&data_dir, port);
-    if !await_uds(&socket).await {
-        panic!("daemon did not restart");
-    }
-
-    // Verify group still exists after restart
-    let groups_after = store
-        .list_undelivered_groups(&intent_core::WorkspaceId(ws_id.to_string()))
-        .await
-        .expect("list groups after restart");
-    assert_eq!(
-        groups_after.len(),
-        1,
-        "expected 1 undelivered group after restart"
-    );
+    let mut daemon2 = boot_daemon(&data_dir, port, &env);
+    assert!(await_uds(&socket).await, "daemon restart");
 
     // Reconnect WSS
-    let mut ws2 = connect_ws(port, cfg).await;
+    let status2 = uds_rpc(&socket, 20, "system.status", json!({})).await;
+    let fp2 = status2["result"]["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let cfg2 = client_config(&fp2);
 
-    // Resubscribe to events
-    let _sub2 = wss_rpc(
-        &mut ws2,
-        10,
+    let mut sub2 = connect_ws(port, cfg2.clone()).await;
+    wss_rpc(
+        &mut sub2,
+        21,
         "events.subscribe",
-        json!({
-            "eventTypes": ["agent:*"],
-            "workspaceId": ws_id,
-        }),
+        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
     )
     .await;
 
-    // Phase 5: Resume child2 via agent.resolveInterrupted
-    let resume_result = wss_rpc(
-        &mut ws2,
-        11,
+    let mut rpc2 = connect_ws(port, cfg2).await;
+
+    // Resume child2
+    wss_rpc(
+        &mut rpc2,
+        30,
         "agent.resolveInterrupted",
-        json!({
-            "resume": [child2_id.clone()],
-        }),
+        json!({ "resume": [child2_id.clone()] }),
     )
     .await;
 
-    let resumed = resume_result["resumed"].as_array().expect("resumed array");
-    assert_eq!(resumed.len(), 1, "expected 1 resumed");
-    assert_eq!(resumed[0].as_str(), Some(child2_id.as_str()));
+    // Wait for child2 to complete
+    let mut child2_idle = false;
+    for _ in 0..100 {
+        let frame = wss_event(&mut sub2, 30).await;
+        if frame["params"]["event"]["type"] == "agent:idle"
+            && frame["params"]["event"]["data"]["agentId"] == child2_id
+        {
+            child2_idle = true;
+            break;
+        }
+    }
+    assert!(child2_idle, "child2 went idle post-restart");
 
-    // Phase 6: Verify the group was rehydrated with correct state
-    // Use agent.diagnostics to inspect the in-memory state via WSS
-    let diag = wss_rpc(
-        &mut ws2,
-        12,
-        "agent.diagnostics",
-        json!({
-            "workspaceId": ws_id,
-        }),
+    // Observe the aggregated wake: parent receives stream events
+    let mut wake_chunks = 0u32;
+    let mut wake_ends = 0u32;
+    let mut parent_idle_again = false;
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub2, 60).await;
+        let ev = &frame["params"]["event"];
+        let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+        if ev_agent != parent_id {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:stream:chunk") => wake_chunks += 1,
+            Some("agent:stream:end") => wake_ends += 1,
+            Some("agent:idle") => parent_idle_again = true,
+            _ => {}
+        }
+        if parent_idle_again && wake_ends >= 1 {
+            break;
+        }
+    }
+    assert!(wake_chunks >= 1, "wake turn streamed ≥1 chunk");
+    assert_eq!(wake_ends, 1, "exactly one wake stream:end");
+    assert!(parent_idle_again, "parent idled after wake");
+
+    // Verify parent transcript has ONE wake with both reports
+    let conv = wss_rpc(
+        &mut rpc2,
+        40,
+        "agent.getConversation",
+        json!({ "agentId": parent_id }),
     )
     .await;
-
-    assert_eq!(diag["ok"], true);
-    let diagnostics = &diag["diagnostics"];
-    let delegation_groups = diagnostics["delegationGroups"]
-        .as_array()
-        .expect("delegationGroups array");
-    assert_eq!(delegation_groups.len(), 1, "expected 1 rehydrated group");
-    let group = &delegation_groups[0];
-    assert_eq!(group["parentAgentId"], parent_id);
-    // Note: sealed field is not exposed in the JSON wire shape
-    assert_eq!(group["delivered"], false);
-    assert_eq!(
-        group["expectedAgentIds"].as_array().unwrap().len(),
-        2,
-        "expected 2 children"
+    let messages = conv["messages"].as_array().expect("messages array");
+    let texts: Vec<String> = messages
+        .iter()
+        .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
+        .collect();
+    let wakes: Vec<&String> = texts
+        .iter()
+        .filter(|t| t.contains("[WORKSPACE EVENTS]"))
+        .collect();
+    assert_eq!(wakes.len(), 1, "exactly one wake message");
+    let wake = wakes[0];
+    assert!(
+        wake.contains("All 2 delegated child agent(s) settled"),
+        "wake header"
     );
-    assert_eq!(
-        group["completedAgentIds"].as_array().unwrap().len(),
-        1,
-        "expected 1 pre-restart completion"
-    );
+    assert!(wake.contains(CHILD1_REPORT), "wake has child1 report");
+    assert!(wake.contains(CHILD2_REPORT), "wake has child2 report");
 
-    // Phase 7: Verify group persistence integrity - final cleanup
-    // The group should still exist in the database (undelivered)
+    // Verify delegation_group row deleted after delivery
     let final_groups = store
         .list_undelivered_groups(&intent_core::WorkspaceId(ws_id.to_string()))
         .await
-        .expect("list groups after resume");
-    assert_eq!(
-        final_groups.len(),
-        1,
-        "expected delegation_group row to persist until delivery"
-    );
-    assert_eq!(final_groups[0].completed_agent_ids.len(), 1);
-    assert_eq!(final_groups[0].expected_agent_ids.len(), 2);
+        .expect("list groups after delivery");
+    assert_eq!(final_groups.len(), 0, "group deleted after delivery");
 
     daemon2.kill().expect("kill daemon2");
     daemon2.wait().expect("wait daemon2");
