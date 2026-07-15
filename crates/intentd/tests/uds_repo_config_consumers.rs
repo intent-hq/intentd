@@ -109,14 +109,20 @@ fn create_test_repo_with_config(config: &str) -> TempRepo {
         .current_dir(&repo_path)
         .output()
         .expect("git config user.email spawn failed");
-    assert!(status.status.success(), "git config user.email command failed");
+    assert!(
+        status.status.success(),
+        "git config user.email command failed"
+    );
 
     let status = std::process::Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(&repo_path)
         .output()
         .expect("git config user.name spawn failed");
-    assert!(status.status.success(), "git config user.name command failed");
+    assert!(
+        status.status.success(),
+        "git config user.name command failed"
+    );
 
     // Create .intent/config.json
     let intent_dir = repo_path.join(".intent");
