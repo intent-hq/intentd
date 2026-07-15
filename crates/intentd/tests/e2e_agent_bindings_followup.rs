@@ -98,10 +98,13 @@ async fn agent_subscribe_creates_event_subscription() {
         .await
         .expect("subscribe");
 
-    // Assert concrete contract: subscription created
+    // Assert concrete contract: subscription created with both subscriptionId and eventTypes
     assert!(result["subscriptionId"].is_string());
     let sub_id = result["subscriptionId"].as_str().unwrap().to_string();
     assert!(!sub_id.is_empty());
+    assert!(result["eventTypes"].is_array());
+    assert_eq!(result["eventTypes"].as_array().unwrap().len(), 1);
+    assert_eq!(result["eventTypes"][0].as_str().unwrap(), "agent:*");
 
     // Verify subscription works by unsubscribing
     let unsub_result = services
@@ -140,7 +143,8 @@ async fn agent_diagnostics_returns_workspace_snapshot() {
         .await
         .expect("diagnostics");
 
-    // Assert concrete contract: diagnostics shape
+    // Assert concrete contract: full shape { ok, diagnostics, text }
+    assert_eq!(result["ok"].as_bool().unwrap(), true);
     assert!(result["diagnostics"].is_object());
     assert!(result["text"].is_string());
     assert!(!result["text"].as_str().unwrap().is_empty());
