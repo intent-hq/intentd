@@ -60,6 +60,27 @@ fn free_port() -> u16 {
         .port()
 }
 
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std::process::Child {
+    let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    let secrets_file = data_dir.join("secrets.json");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd.arg("serve")
+        .arg("--listen")
+        .arg(listen)
+        .env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_SECRETS_FILE", &secrets_file)
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(log));
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.spawn().expect("spawn intentd serve")
+}
+
 async fn await_uds(socket: &Path) -> bool {
     timeout(Duration::from_secs(10), async {
         loop {
@@ -315,24 +336,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
-fn boot_daemon(data_dir: &PathBuf, env: &[(&str, &str)]) -> Daemon {
-    let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .arg("--listen")
-        .arg("both")
-        .env("INTENTD_DATA_DIR", data_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log));
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    let child = cmd.spawn().expect("spawn intentd serve");
-    Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    }
-}
+
 
 #[tokio::test]
 async fn delegation_group_persists_across_restart() {
@@ -348,19 +352,20 @@ async fn delegation_group_persists_across_restart() {
     eprintln!("CHECKPOINT 2: data_dir created");
     let ws_id = seed_workspace_only(&data_dir).await;
     eprintln!("CHECKPOINT 3: workspace seeded");
-    let port = free_port();
-    eprintln!("CHECKPOINT 4: port allocated");
     let socket = data_dir.join("intentd.sock");
-    eprintln!("CHECKPOINT 5: socket path set");
+    eprintln!("CHECKPOINT 4: socket path set");
 
-    // Mock ACP behavior: children report after delay (to ensure parent seals group first)
-    let report1_js = format!(
-        "return await ws.agent.reportToParent({});",
-        json!(CHILD1_REPORT)
+    // Mock ACP behavior - verbatim copy from reference test adapted for this scenario
+    const PARENT_GO: &str = "DELGRP_PARENT_GO";
+    let report1_js = format!("return await ws.agent.reportToParent({});", json!(CHILD1_REPORT));
+    let report2_js = format!("return await ws.agent.reportToParent({});", json!(CHILD2_REPORT));
+    let delegate1_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
+        json!("CHILD1"),
     );
-    let report2_js = format!(
-        "return await ws.agent.reportToParent({});",
-        json!(CHILD2_REPORT)
+    let delegate2_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
+        json!("CHILD2"),
     );
     let behavior = json!({
         "rules": [
@@ -369,75 +374,73 @@ async fn delegation_group_persists_across_restart() {
                 "delayMs": 8000,
                 "toolCall": {
                     "name": "workspace_api",
-                    "arguments": { "code": report1_js, "summary": "child1 report" }
+                    "arguments": { "code": report1_js, "summary": "child1 reportToParent" }
                 },
-                "response": "child1 done"
+                "response": "child1 done",
             },
             {
                 "ifPromptContains": "CHILD2",
                 "delayMs": 8000,
                 "toolCall": {
                     "name": "workspace_api",
-                    "arguments": { "code": report2_js, "summary": "child2 report" }
+                    "arguments": { "code": report2_js, "summary": "child2 reportToParent" }
                 },
-                "response": "child2 done"
+                "response": "child2 done",
             },
             {
                 "ifPromptContains": "[WORKSPACE EVENTS]",
-                "response": "parent ack"
+                "response": "parent acknowledged the aggregated wake",
             },
             {
-                "ifPromptContains": "PARENT_GO",
+                "ifPromptContains": PARENT_GO,
                 "toolCalls": [
                     {
                         "name": "workspace_api",
-                        "arguments": {
-                            "code": "return await ws.agent.delegate({ agentInstructions: 'CHILD1', waitMode: 'after_all', model: 'mock:default' });",
-                            "summary": "delegate child1"
-                        }
+                        "arguments": { "code": delegate1_js, "summary": "delegate child1 after_all" }
                     },
                     {
                         "name": "workspace_api",
-                        "arguments": {
-                            "code": "return await ws.agent.delegate({ agentInstructions: 'CHILD2', waitMode: 'after_all', model: 'mock:default' });",
-                            "summary": "delegate child2"
-                        }
-                    }
+                        "arguments": { "code": delegate2_js, "summary": "delegate child2 after_all" }
+                    },
                 ],
-                "response": "delegated both"
-            }
-        ]
-    }).to_string();
+                "response": "parent delegated two after_all children",
+            },
+        ],
+    })
+    .to_string();
 
-    let port_s = port.to_string();
     let env = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
         ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
 
     // Phase 1: Boot, create parent, delegate both children
-    eprintln!("CHECKPOINT 6: booting daemon");
-    let _daemon = boot_daemon(&data_dir, &env);
-    eprintln!("CHECKPOINT 7: daemon spawned, waiting for UDS");
+    eprintln!("CHECKPOINT 5: booting daemon");
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    eprintln!("CHECKPOINT 6: daemon spawned, waiting for UDS");
     assert!(await_uds(&socket).await, "daemon start");
-    eprintln!("CHECKPOINT 8: UDS ready");
+    eprintln!("CHECKPOINT 7: UDS ready");
 
-    eprintln!("CHECKPOINT 9: fetching fingerprint");
+    eprintln!("CHECKPOINT 8: fetching port and fingerprint");
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
-    eprintln!("CHECKPOINT 10: got status response");
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    eprintln!("CHECKPOINT 9: got port={}", port);
     let fp = status["result"]["fingerprint"]
         .as_str()
         .unwrap()
         .to_string();
-    eprintln!("CHECKPOINT 11: fingerprint extracted: {}", fp);
+    eprintln!("CHECKPOINT 10: fingerprint extracted: {}", fp);
     let cfg = client_config(&fp);
 
     // Subscribe BEFORE creating the parent so we don't miss events
-    eprintln!("CHECKPOINT 12: connecting subscription WSS");
+    eprintln!("CHECKPOINT 11: connecting subscription WSS");
     let mut sub = connect_ws(port, cfg.clone()).await;
-    eprintln!("CHECKPOINT 13: subscription WSS connected, subscribing");
+    eprintln!("CHECKPOINT 12: subscription WSS connected, subscribing");
     wss_rpc(
         &mut sub,
         1,
@@ -445,27 +448,27 @@ async fn delegation_group_persists_across_restart() {
         json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
     )
     .await;
-    eprintln!("CHECKPOINT 14: subscription successful");
+    eprintln!("CHECKPOINT 13: subscription successful");
 
-    eprintln!("CHECKPOINT 15: connecting RPC WSS");
+    eprintln!("CHECKPOINT 14: connecting RPC WSS");
     let mut rpc = connect_ws(port, cfg.clone()).await;
-    eprintln!("CHECKPOINT 16: RPC WSS connected, creating parent");
+    eprintln!("CHECKPOINT 15: RPC WSS connected, creating parent");
     let parent = wss_rpc(
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
     )
     .await;
-    eprintln!("CHECKPOINT 17: parent created");
+    eprintln!("CHECKPOINT 16: parent created");
     let parent_id = parent["agent"]["id"].as_str().unwrap().to_string();
-    eprintln!("CHECKPOINT 18: parent_id extracted: {}", parent_id);
+    eprintln!("CHECKPOINT 17: parent_id extracted: {}", parent_id);
 
     wss_rpc(
         &mut rpc,
         11,
         "agent.sendMessage",
-        json!({ "workspaceId": &ws_id, "agentId": &parent_id, "content": "PARENT_GO" }),
+        json!({ "workspaceId": ws_id, "agentId": parent_id, "content": PARENT_GO }),
     )
     .await;
 
@@ -528,18 +531,23 @@ async fn delegation_group_persists_across_restart() {
 
     // Restart daemon
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let _daemon2 = boot_daemon(&data_dir, &env);
+    let child2 = spawn_serve(&data_dir, "both", &env);
+    let _daemon2 = Daemon {
+        child: child2,
+        data_dir: data_dir.clone(),
+    };
     assert!(await_uds(&socket).await, "daemon restart");
 
-    // Reconnect WSS
+    // Reconnect WSS — daemon2 gets new port
     let status2 = uds_rpc(&socket, 20, "system.status", json!({})).await;
+    let port2 = status2["result"]["port"].as_u64().expect("port2") as u16;
     let fp2 = status2["result"]["fingerprint"]
         .as_str()
         .unwrap()
         .to_string();
     let cfg2 = client_config(&fp2);
 
-    let mut sub2 = connect_ws(port, cfg2.clone()).await;
+    let mut sub2 = connect_ws(port2, cfg2.clone()).await;
     wss_rpc(
         &mut sub2,
         21,
@@ -548,7 +556,7 @@ async fn delegation_group_persists_across_restart() {
     )
     .await;
 
-    let mut rpc2 = connect_ws(port, cfg2).await;
+    let mut rpc2 = connect_ws(port2, cfg2).await;
 
     // Resume child2
     wss_rpc(
