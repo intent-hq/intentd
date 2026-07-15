@@ -34,6 +34,8 @@ fn spawn_daemon(data_dir: &PathBuf) -> Child {
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        .env_remove("INTENTD_TCP_PORT")
+        .env_remove("INTENTD_AUTH_TOKEN")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .spawn()
@@ -60,9 +62,6 @@ async fn doctor_checks_data_dir_and_migrations() {
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     let socket = data_dir.join("intentd.sock");
 
-    // Ensure INTENTD_TCP_PORT is not inherited from parent environment
-    std::env::remove_var("INTENTD_TCP_PORT");
-
     let child = spawn_daemon(&data_dir);
     let _daemon = Daemon {
         child,
@@ -74,6 +73,7 @@ async fn doctor_checks_data_dir_and_migrations() {
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("doctor")
         .env("INTENTD_DATA_DIR", &data_dir)
+        .env_remove("INTENTD_TCP_PORT")
         .output()
         .expect("run intentd doctor");
 
@@ -170,14 +170,12 @@ async fn token_generates_and_prints_token_and_fingerprint() {
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     let secrets_file = data_dir.join("secrets.json");
 
-    // Ensure INTENTD_AUTH_TOKEN is not inherited from parent environment
-    std::env::remove_var("INTENTD_AUTH_TOKEN");
-
     // Run `intentd token` (no rotation)
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("token")
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
+        .env_remove("INTENTD_AUTH_TOKEN")
         .output()
         .expect("run intentd token");
 
@@ -207,14 +205,12 @@ async fn token_rotate_flag_generates_new_token() {
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     let secrets_file = data_dir.join("secrets.json");
 
-    // Ensure INTENTD_AUTH_TOKEN is not inherited from parent environment
-    std::env::remove_var("INTENTD_AUTH_TOKEN");
-
     // First token
     let output1 = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("token")
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
+        .env_remove("INTENTD_AUTH_TOKEN")
         .output()
         .expect("run intentd token");
 
@@ -232,6 +228,7 @@ async fn token_rotate_flag_generates_new_token() {
         .arg("--rotate")
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
+        .env_remove("INTENTD_AUTH_TOKEN")
         .output()
         .expect("run intentd token --rotate");
 
