@@ -11,7 +11,9 @@ echo "Installing cargo-llvm-cov and llvm-tools..."
 if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
     cargo install cargo-llvm-cov --locked
 fi
-rustup component add llvm-tools-preview
+if ! rustup component list --installed | grep -q llvm-tools; then
+    rustup component add llvm-tools-preview
+fi
 
 echo "Cleaning coverage data..."
 cargo llvm-cov clean --workspace
@@ -20,7 +22,15 @@ echo "Running e2e tests with coverage instrumentation..."
 
 # Enumerate all test targets dynamically from crates/intentd/tests/*.rs
 # Skip auggie_context_e2e (needs real auggie binary)
-for test_file in crates/intentd/tests/*.rs; do
+# Guard against empty glob with nullglob
+shopt -s nullglob
+test_files=(crates/intentd/tests/*.rs)
+if [ ${#test_files[@]} -eq 0 ]; then
+    echo "Error: No test files found in crates/intentd/tests/" >&2
+    exit 1
+fi
+
+for test_file in "${test_files[@]}"; do
     test_name=$(basename "$test_file" .rs)
     if [ "$test_name" = "auggie_context_e2e" ]; then
         echo "Skipping $test_name (requires auggie binary)"
