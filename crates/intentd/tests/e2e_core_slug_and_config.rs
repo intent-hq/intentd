@@ -96,9 +96,11 @@ async fn workspace_id_random_slug_when_no_prompt() {
 #[tokio::test]
 async fn config_resolve_fills_defaults() {
     let tmp_dir = std::env::temp_dir().join(format!("intentd-cfg-{}", uuid::Uuid::new_v4()));
+    let tmp_cfg = tmp_dir.join("nonexistent-config.toml");
 
     let _guard = ENV_LOCK.lock().unwrap();
     std::env::set_var("INTENTD_DATA_DIR", &tmp_dir);
+    std::env::set_var("INTENTD_CONFIG", &tmp_cfg);
 
     let config = Config::resolve().expect("resolve config");
     assert_eq!(config.data_dir, tmp_dir);
@@ -110,6 +112,7 @@ async fn config_resolve_fills_defaults() {
     assert_eq!(config.idle_reap_minutes, 30);
 
     std::env::remove_var("INTENTD_DATA_DIR");
+    std::env::remove_var("INTENTD_CONFIG");
     drop(_guard);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

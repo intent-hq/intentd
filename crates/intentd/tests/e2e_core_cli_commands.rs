@@ -60,6 +60,9 @@ async fn doctor_checks_data_dir_and_migrations() {
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     let socket = data_dir.join("intentd.sock");
 
+    // Ensure INTENTD_TCP_PORT is not inherited from parent environment
+    std::env::remove_var("INTENTD_TCP_PORT");
+
     let child = spawn_daemon(&data_dir);
     let _daemon = Daemon {
         child,
@@ -167,6 +170,9 @@ async fn token_generates_and_prints_token_and_fingerprint() {
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     let secrets_file = data_dir.join("secrets.json");
 
+    // Ensure INTENTD_AUTH_TOKEN is not inherited from parent environment
+    std::env::remove_var("INTENTD_AUTH_TOKEN");
+
     // Run `intentd token` (no rotation)
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("token")
@@ -200,6 +206,9 @@ async fn token_rotate_flag_generates_new_token() {
     let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     let secrets_file = data_dir.join("secrets.json");
+
+    // Ensure INTENTD_AUTH_TOKEN is not inherited from parent environment
+    std::env::remove_var("INTENTD_AUTH_TOKEN");
 
     // First token
     let output1 = Command::new(env!("CARGO_BIN_EXE_intentd"))
