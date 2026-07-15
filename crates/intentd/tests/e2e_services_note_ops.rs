@@ -1,7 +1,8 @@
 //! E2E coverage for note.* operations (intent-services note_ops.rs coverage boost).
 //!
 //! Tests call intent_services::Services directly (not via WSS transport) for hermetic
-//! in-process coverage. Tests note.add, note.edit, note.editLines, note.listTasks paths.
+//! in-process coverage. Tests note.add, note.edit, note.editLines, note.updateMetadata,
+//! note.listTasks paths.
 
 #![cfg(unix)]
 

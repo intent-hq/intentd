@@ -1,4 +1,5 @@
-//! E2E coverage for agent.queueMessage / agent.getQueue / agent.removeQueuedMessage
+//! E2E coverage for agent.queueMessage / agent.getQueue / agent.removeQueuedMessage /
+//! agent.readConversation / agent.summary / agent.diagnostics
 //! (intent-services agent_ops.rs coverage boost).
 //!
 //! Tests call intent_services::Services directly (not via WSS transport) for hermetic
@@ -201,9 +202,9 @@ async fn agent_conversation_and_summary() {
         .agent_summary(ws.clone(), agent_id.clone())
         .await
         .expect("get summary");
-    assert_eq!(summary["agentId"], agent_id.to_string());
-    assert_eq!(summary["agentName"], "ConvTest");
-    assert_eq!(summary["messageCount"], 1);
+    assert_eq!(summary["agentId"].as_str().unwrap(), agent_id.to_string());
+    assert_eq!(summary["agentName"].as_str().unwrap(), "ConvTest");
+    assert_eq!(summary["messageCount"].as_i64().unwrap(), 1);
 
     // Cleanup
     cleanup_db(&db);
