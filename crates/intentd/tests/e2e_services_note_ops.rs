@@ -131,6 +131,9 @@ async fn note_add_edit_edit_lines() {
         .await
         .expect("edit note");
     assert!(edit_result.match_position >= 0);
+    // Verify the edit actually occurred
+    assert!(!edit_result.new_content.contains("Initial"));
+    assert!(edit_result.new_content.contains("Modified"));
 
     // Test note.editLines - always invoke it
     let note_after_edit = services
@@ -151,6 +154,12 @@ async fn note_add_edit_edit_lines() {
         .await
         .expect("edit note lines");
     assert_eq!(edit_lines_result.note_id, note_id);
+    // Verify the line edit actually occurred in the content
+    let note_after_line_edit = services
+        .get_note(ws.clone(), note_id.clone())
+        .await
+        .expect("get note after line edit");
+    assert!(note_after_line_edit.content.contains("Line replaced"));
 
     // Cleanup
     cleanup_db(&db);

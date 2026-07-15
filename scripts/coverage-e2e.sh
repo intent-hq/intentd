@@ -3,7 +3,7 @@ set -euo pipefail
 
 # E2E coverage script
 # Measures line coverage from ALL daemon-level integration tests in crates/intentd/tests/
-# auggie_context_e2e test is env-gated (INTENTD_AUGGIE_E2E) and self-skips when the env var is unset
+# Explicitly skips auggie_context_e2e in the loop below (requires real auggie binary)
 
 cd "$(dirname "$0")/.."
 
@@ -37,12 +37,13 @@ for test_file in "${test_files[@]}"; do
         continue
     fi
     echo "Running test: $test_name"
-    # Skip known flaky tests under llvm-cov instrumentation (STAB-40, STAB-42, STAB-43)
+    # Skip known flaky tests under llvm-cov instrumentation (STAB-40, STAB-42)
     # These skips DEFLATE coverage (we lose their contribution) but prevent spurious CI failures
+    # Note: capture_login_shell_path_with_fake_shell (STAB-43) is an intent-core unit test,
+    # not an intentd integration test, so it's skipped in coverage-all.sh but not here
     cargo llvm-cov --no-report -p intentd --test "$test_name" -- \
         --skip wss_note_save_asset_round_trip \
-        --skip slow_host_exec_does_not_block_fast_workspace_list \
-        --skip capture_login_shell_path_with_fake_shell
+        --skip slow_host_exec_does_not_block_fast_workspace_list
 done
 
 echo ""
