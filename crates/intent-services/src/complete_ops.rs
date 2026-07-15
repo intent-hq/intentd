@@ -251,7 +251,7 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string()
-                .contains("configured auggie path does not exist"),
+                .contains("configured auggie path is not a valid file"),
             "got {err:?}"
         );
 
