@@ -124,19 +124,19 @@ pub fn find_provider_binary(
     command: &str,
     explicit_path: Option<&str>,
 ) -> Option<PathBuf> {
-    // 1. Explicit setting wins (must be executable)
+    // 1. Explicit setting wins (must be executable and absolute)
     if let Some(path) = explicit_path {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
             let pb = PathBuf::from(trimmed);
-            if is_executable_file(&pb) {
+            if pb.is_absolute() && is_executable_file(&pb) {
                 return Some(pb);
             }
-            // Warn when explicit setting points to missing/non-executable file
+            // Warn when explicit setting points to missing/non-executable/relative file
             tracing::warn!(
                 provider_id = provider_id,
                 configured_path = trimmed,
-                "providers.paths[\"{}\"] points to non-existent or non-executable file; falling back to managed bin / PATH scan",
+                "providers.paths[\"{}\"] must be absolute and executable; falling back to managed bin / PATH scan",
                 provider_id
             );
         }
@@ -338,11 +338,9 @@ mod find_provider_binary_tests {
 
     #[cfg(unix)]
     #[test]
-    fn find_provider_binary_checks_managed_bin_second() {
-        // This test requires actually creating ~/.augment/bin which we can't do
-        // in a unit test, so we just verify the function doesn't crash
+    fn find_provider_binary_returns_none_when_no_candidates_found() {
+        // Verify function returns None when binary is not in any of the search locations
         let result = find_provider_binary("test", "unlikely-name-12345", None);
-        // Should return None since we didn't create the file
         assert_eq!(result, None);
     }
 
