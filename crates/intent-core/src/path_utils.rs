@@ -21,7 +21,9 @@ fn home_dir() -> Option<PathBuf> {
 static LOGIN_SHELL_DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
 /// Sentinels for extracting PATH from potentially noisy shell output.
+#[cfg(unix)]
 const PATH_START_SENTINEL: &str = "__INTENT_PATH_S__";
+#[cfg(unix)]
 const PATH_END_SENTINEL: &str = "__INTENT_PATH_E__";
 
 /// Capture PATH from the user's login shell (unix only, cached, short timeout).
