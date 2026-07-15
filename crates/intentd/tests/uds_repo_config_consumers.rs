@@ -97,21 +97,26 @@ fn create_test_repo_with_config(config: &str) -> TempRepo {
     std::fs::create_dir_all(&repo_path).unwrap();
 
     // Initialize a git repo with explicit default branch
-    std::process::Command::new("git")
+    let status = std::process::Command::new("git")
         .args(["init", "--initial-branch=main"])
         .current_dir(&repo_path)
         .output()
-        .expect("git init failed");
-    std::process::Command::new("git")
+        .expect("git init spawn failed");
+    assert!(status.status.success(), "git init command failed");
+
+    let status = std::process::Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(&repo_path)
         .output()
-        .expect("git config user.email failed");
-    std::process::Command::new("git")
+        .expect("git config user.email spawn failed");
+    assert!(status.status.success(), "git config user.email command failed");
+
+    let status = std::process::Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(&repo_path)
         .output()
-        .expect("git config user.name failed");
+        .expect("git config user.name spawn failed");
+    assert!(status.status.success(), "git config user.name command failed");
 
     // Create .intent/config.json
     let intent_dir = repo_path.join(".intent");

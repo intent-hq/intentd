@@ -201,8 +201,7 @@ impl ScriptManager {
                 {
                     let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
                     if let Some(repo_scripts) = repo_config.scripts {
-                        // Double-check emptiness before bootstrapping to avoid race condition
-                        // where multiple concurrent calls could each bootstrap duplicate scripts
+                        // Double-check before bootstrap to reduce (not eliminate) race window
                         let needs_bootstrap = {
                             let guard = self.scripts.lock().unwrap();
                             !guard.iter().any(|((ws, _), _)| ws == workspace_id)
@@ -221,7 +220,12 @@ impl ScriptManager {
                             let scripts: Vec<Value> = scripts.into_iter().map(|(_, v)| v).collect();
                             return Ok(json!({ "scripts": scripts }));
                         }
-                        // Convert RepoScript -> Script definitions and persist them
+                        // Known limitation: concurrent callers can still both pass the check above and
+                        // proceed to bootstrap, creating duplicate script rows + in-memory entries.
+                        // Proper fix requires either: (a) async Mutex to hold lock across .await,
+                        // (b) separate "bootstrap in progress" flag tracked in a side map, or
+                        // (c) rework to generate + persist all scripts before acquiring registry lock.
+                        // Practical impact: low (bootstrap is rare, happens only on first script.list call).
                         let now = now_iso();
                         for repo_script in repo_scripts {
                             let script_id = uuid::Uuid::new_v4().to_string();
