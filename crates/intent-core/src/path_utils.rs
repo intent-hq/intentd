@@ -54,6 +54,7 @@ fn capture_login_shell_path_with(shell: Option<&str>) -> Vec<PathBuf> {
 #[cfg(unix)]
 fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<Vec<PathBuf>> {
     use std::io::Read;
+    use std::sync::{Arc, Mutex};
 
     // Build command with sentinel-wrapped printf
     let cmd = format!(
@@ -71,56 +72,72 @@ fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<Vec<PathBuf>> {
         .spawn()
         .ok()?;
 
+    // Drain stdout concurrently to avoid pipe-buffer deadlock when rc files print >64KB of noise
+    let stdout = child.stdout.take()?;
+    let output_buffer = Arc::new(Mutex::new(Vec::new()));
+    let output_clone = output_buffer.clone();
+    let reader_thread = std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let mut out = output_clone.lock().unwrap();
+        *out = buf;
+    });
+
     // Poll for completion with 5s timeout (interactive shells with nvm can take ~1.9s)
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
+    let exit_status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                // Process exited - read stdout directly (can't use wait_with_output after try_wait succeeds)
-                if !status.success() {
-                    return None;
-                }
-                let mut stdout = child.stdout.take()?;
-                let mut output = Vec::new();
-                if stdout.read_to_end(&mut output).is_err() {
-                    return None;
-                }
-                let output_str = String::from_utf8_lossy(&output);
-
-                // Extract PATH between sentinels (last occurrence wins if sentinels appear multiple times)
-                let path_str = extract_path_from_sentinels(&output_str)?;
-
-                // Filter to absolute paths only to avoid unsafe relative entries like "." or "bin"
-                return Some(
-                    std::env::split_paths(path_str)
-                        .filter(|p| p.is_absolute())
-                        .collect::<Vec<_>>(),
-                );
-            }
+            Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 // Still running
                 if std::time::Instant::now() >= deadline {
                     // Timeout - kill and return None
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    break None;
                 }
                 // Sleep a bit before polling again
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(_) => return None,
+            Err(_) => break None,
         }
+    };
+
+    // Wait for reader thread to finish
+    let _ = reader_thread.join();
+
+    // Check exit status
+    let status = exit_status?;
+    if !status.success() {
+        return None;
     }
+
+    // Extract output from buffer
+    let output = output_buffer.lock().unwrap();
+    let output_str = String::from_utf8_lossy(&output);
+
+    // Extract PATH between sentinels (last complete pair wins if sentinels appear multiple times)
+    let path_str = extract_path_from_sentinels(&output_str)?;
+
+    // Filter to absolute paths only to avoid unsafe relative entries like "." or "bin"
+    Some(
+        std::env::split_paths(path_str)
+            .filter(|p| p.is_absolute())
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Extract PATH value from between sentinels in shell output.
 /// Returns Some(path_str) if both sentinels found, None otherwise.
-/// If sentinels appear multiple times, uses the last occurrence.
+/// If sentinels appear multiple times, uses the last complete pair (last END, then last START before it).
 #[cfg(unix)]
 fn extract_path_from_sentinels(output: &str) -> Option<&str> {
-    let start_idx = output.rfind(PATH_START_SENTINEL)? + PATH_START_SENTINEL.len();
-    let end_idx = output[start_idx..].find(PATH_END_SENTINEL)?;
-    Some(&output[start_idx..start_idx + end_idx])
+    // Find the last END sentinel
+    let end_idx = output.rfind(PATH_END_SENTINEL)?;
+    // Find the last START sentinel before that END
+    let start_pos = output[..end_idx].rfind(PATH_START_SENTINEL)? + PATH_START_SENTINEL.len();
+    Some(&output[start_pos..end_idx])
 }
 
 #[cfg(not(unix))]
@@ -489,5 +506,82 @@ mod tests {
         assert_eq!(dirs.len(), 2, "Should use last sentinel occurrence");
         assert_eq!(dirs[0], PathBuf::from("/last/bin"));
         assert_eq!(dirs[1], PathBuf::from("/final/bin"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_path_handles_trailing_incomplete_sentinel() {
+        // Test that a trailing incomplete start sentinel after a complete pair is handled correctly
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fake_shell = temp_dir.join(format!("fake_shell_trailing_{pid}_{nanos}.sh"));
+
+        // Script outputs a complete pair followed by a bare start sentinel
+        fs::write(
+            &fake_shell,
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/valid/bin__INTENT_PATH_E__'\n  printf '__INTENT_PATH_S__'\nfi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
+        fs::remove_file(&fake_shell).ok();
+
+        assert_eq!(
+            dirs.len(),
+            1,
+            "Should extract from the complete pair, ignoring trailing bare start"
+        );
+        assert_eq!(dirs[0], PathBuf::from("/valid/bin"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_path_handles_large_output_without_deadlock() {
+        // Test that output >64KB doesn't cause pipe-buffer deadlock
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fake_shell = temp_dir.join(format!("fake_shell_large_{pid}_{nanos}.sh"));
+
+        // Script prints >64KB of noise before the sentinel pair
+        // 70,000 'X' characters = 70KB, well over typical pipe buffer size
+        let noise = "X".repeat(70_000);
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '{}'\n  printf '__INTENT_PATH_S__/large/bin__INTENT_PATH_E__'\nfi\n",
+            noise
+        );
+        fs::write(&fake_shell, script).unwrap();
+        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let start = std::time::Instant::now();
+        let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
+        let elapsed = start.elapsed();
+        fs::remove_file(&fake_shell).ok();
+
+        assert_eq!(
+            dirs.len(),
+            1,
+            "Should extract PATH even with >64KB of noise"
+        );
+        assert_eq!(dirs[0], PathBuf::from("/large/bin"));
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "Should complete well within timeout (no deadlock), took {:?}",
+            elapsed
+        );
     }
 }
