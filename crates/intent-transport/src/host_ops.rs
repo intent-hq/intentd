@@ -26,10 +26,13 @@
 //! `auggie-path.ts`. The pure operations accept injected resolvers / a `home`
 //! root so they unit-test cleanly with a temp directory.
 
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use intent_core::path_utils;
 use serde_json::{json, Map, Value};
 
 /// Resolves a binary by name to an absolute path on the daemon host. Injected
@@ -160,9 +163,21 @@ fn binary_filename(name: &str) -> String {
 
 /// Run `<path> --version` (5s timeout) and return the first trimmed non-empty
 /// line of stdout, or `None` on failure.
+///
+/// Enriches the PATH environment variable to include the binary's parent
+/// directory plus enhanced path directories, ensuring scripts with shebangs
+/// like `#!/usr/bin/env node` can resolve their interpreter.
 fn run_version(path: &Path) -> Option<String> {
+    let enriched_path = build_enriched_path_for_binary(path);
+    run_version_with(path, &enriched_path)
+}
+
+/// Run `<path> --version` with an explicit PATH environment variable.
+/// Exposed for testing — production code should use `run_version()`.
+fn run_version_with(path: &Path, path_env: &OsString) -> Option<String> {
     let mut child = Command::new(path)
         .arg("--version")
+        .env("PATH", path_env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -191,6 +206,37 @@ fn run_version(path: &Path) -> Option<String> {
         .map(str::trim)
         .find(|s| !s.is_empty())
         .map(String::from)
+}
+
+/// Build an enriched PATH for executing a binary, with correct precedence:
+/// 1. Binary's parent directory (for co-located dependencies like node in nvm)
+/// 2. Enriched tool directories (node, nvm, homebrew, volta, asdf, etc.)
+/// 3. Inherited PATH (fallback)
+fn build_enriched_path_for_binary(binary_path: &Path) -> OsString {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+
+    // 1. Binary's parent directory (highest priority for co-located dependencies)
+    if binary_path.is_absolute() {
+        if let Some(parent) = binary_path.parent() {
+            path_utils::push_dir(&mut dirs, &mut seen, parent.to_path_buf());
+        }
+    }
+
+    // 2. Enriched tool directories (node, nvm, homebrew, volta, asdf, etc.)
+    for dir in path_utils::enriched_tool_dirs() {
+        path_utils::push_dir(&mut dirs, &mut seen, dir);
+    }
+
+    // 3. Inherited PATH (lowest priority)
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            path_utils::push_dir(&mut dirs, &mut seen, dir);
+        }
+    }
+
+    // Join paths, fall back to inherited PATH if joining fails
+    std::env::join_paths(&dirs).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
 }
 
 /// Build the `host.checkGit` result. `available:false` (never an RPC error)

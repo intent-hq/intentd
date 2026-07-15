@@ -11,6 +11,7 @@ pub mod error;
 pub mod events;
 pub mod ids;
 pub mod model;
+pub mod path_utils;
 pub mod secrets;
 pub mod server_control;
 pub mod slug;

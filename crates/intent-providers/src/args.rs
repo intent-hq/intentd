@@ -5,10 +5,11 @@
 //! the per-provider flag appends from `acp-provider.ts`, `buildProviderEnv`
 //! (`provider-config.ts`), and `getAuggieExecPATH` (`execute-auggie-command.ts`).
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::config::ProviderConfig;
+use intent_core::path_utils;
 
 /// Sentinel model id meaning "let the provider pick" — never passed as a real
 /// model flag value (matches the TS `'default'` guard).
@@ -202,36 +203,40 @@ const PATH_SEP: char = if cfg!(windows) { ';' } else { ':' };
 /// `node`. Entries are de-duplicated while preserving order. Port of the
 /// `getAuggieExecPATH` behavior (generalized across providers).
 pub fn enhanced_path(provider_binary: Option<&Path>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let push = |p: String, parts: &mut Vec<String>| {
-        if !p.is_empty() && !parts.contains(&p) {
-            parts.push(p);
-        }
-    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
 
+    // 1. Provider binary directory (highest priority for co-located dependencies like node)
     if let Some(bin) = provider_binary {
         if bin.is_absolute() {
             if let Some(parent) = bin.parent() {
-                push(parent.to_string_lossy().into_owned(), &mut parts);
+                path_utils::push_dir(&mut dirs, &mut seen, parent.to_path_buf());
             }
         }
     }
 
+    // 2. ~/.augment/bin (managed binaries)
     if let Some(home) = home_dir() {
-        let augment_bin = home.join(".augment").join("bin");
-        push(augment_bin.to_string_lossy().into_owned(), &mut parts);
+        path_utils::push_dir(&mut dirs, &mut seen, home.join(".augment").join("bin"));
     }
 
-    if let Some(current) = std::env::var_os("PATH") {
-        for entry in current.to_string_lossy().split(PATH_SEP) {
-            let trimmed = entry.trim();
-            if !trimmed.is_empty() {
-                push(trimmed.to_string(), &mut parts);
-            }
+    // 3. Enriched tool directories (node, nvm, homebrew, volta, asdf, etc.)
+    for dir in path_utils::enriched_tool_dirs() {
+        path_utils::push_dir(&mut dirs, &mut seen, dir);
+    }
+
+    // 4. Inherited PATH (lowest priority)
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            path_utils::push_dir(&mut dirs, &mut seen, dir);
         }
     }
 
-    parts.join(&PATH_SEP.to_string())
+    // Join with platform-specific separator
+    dirs.iter()
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(&PATH_SEP.to_string())
 }
 
 /// Resolve the user's home directory from environment, cross-platform.

@@ -12,6 +12,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
+use intent_core::path_utils;
 
 /// Candidate auggie file names for the current platform (npm installs leave a
 /// `.cmd`/`.bat` shim on Windows; the Intent-managed binary is `auggie.exe`).
@@ -25,15 +26,6 @@ fn candidate_names() -> &'static [&'static str] {
 
 fn home_dir() -> Option<PathBuf> {
     BaseDirs::new().map(|b| b.home_dir().to_path_buf())
-}
-
-fn push_dir(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, dir: PathBuf) {
-    if dir.as_os_str().is_empty() {
-        return;
-    }
-    if seen.insert(dir.clone()) {
-        dirs.push(dir);
-    }
 }
 
 /// The Intent-managed binary path (`~/.augment/bin/auggie[.exe]`), highest
@@ -50,61 +42,10 @@ pub fn managed_binary_path() -> Option<PathBuf> {
 /// Build the ordered, de-duplicated list of directories to search (port of
 /// `getEnhancedPath`): the current PATH first, then common node/npm locations,
 /// then each nvm-managed node version's `bin`.
+///
+/// Re-exported from `intent_core::path_utils` for backward compatibility.
 pub fn enhanced_path_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            push_dir(&mut dirs, &mut seen, dir);
-        }
-    }
-
-    let home = home_dir();
-
-    if cfg!(windows) {
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            push_dir(&mut dirs, &mut seen, PathBuf::from(&appdata).join("npm"));
-        }
-        if let Some(home) = &home {
-            push_dir(&mut dirs, &mut seen, home.join(".npm-global"));
-        }
-    } else {
-        for p in [
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin",
-            "/usr/sbin",
-            "/sbin",
-            "/opt/homebrew/bin",
-            "/opt/homebrew/sbin",
-            "/usr/local/opt/node/bin",
-        ] {
-            push_dir(&mut dirs, &mut seen, PathBuf::from(p));
-        }
-        if let Some(home) = &home {
-            for sub in [
-                [".npm-global", "bin"],
-                [".npm-packages", "bin"],
-                [".local", "bin"],
-                [".volta", "bin"],
-            ] {
-                push_dir(&mut dirs, &mut seen, home.join(sub[0]).join(sub[1]));
-            }
-            push_dir(&mut dirs, &mut seen, home.join(".asdf").join("shims"));
-        }
-    }
-
-    if let Some(home) = &home {
-        let nvm_dir = home.join(".nvm").join("versions").join("node");
-        if let Ok(entries) = std::fs::read_dir(&nvm_dir) {
-            for entry in entries.flatten() {
-                push_dir(&mut dirs, &mut seen, entry.path().join("bin"));
-            }
-        }
-    }
-
-    dirs
+    path_utils::enhanced_path_dirs()
 }
 
 /// The enhanced PATH joined into a single `OsString` (for a child's `PATH` env).
@@ -164,11 +105,11 @@ pub fn exec_path(auggie_path: &Path) -> OsString {
     let mut seen: HashSet<PathBuf> = HashSet::new();
     if auggie_path.is_absolute() {
         if let Some(parent) = auggie_path.parent() {
-            push_dir(&mut dirs, &mut seen, parent.to_path_buf());
+            path_utils::push_dir(&mut dirs, &mut seen, parent.to_path_buf());
         }
     }
     for dir in enhanced_path_dirs() {
-        push_dir(&mut dirs, &mut seen, dir);
+        path_utils::push_dir(&mut dirs, &mut seen, dir);
     }
     std::env::join_paths(dirs).unwrap_or_default()
 }
