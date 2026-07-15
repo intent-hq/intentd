@@ -1,7 +1,8 @@
 //! E2E coverage follow-up for agent_ops.rs reachable operations.
 //!
 //! Exercises agent_send_message, agent_send_to_task, agent_wake_or_create,
-//! agent_cancel_subscriptions via in-process Services calls. Hermetic tests asserting BE state changes.
+//! agent_cancel_subscriptions, agent_get_subscriptions, and agent_delegate via in-process
+//! Services calls. Hermetic tests asserting BE state changes.
 
 #![cfg(unix)]
 
@@ -14,6 +15,7 @@ use intent_core::{
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
+use serde_json::json;
 
 fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
     let ts = now_iso();
@@ -123,19 +125,8 @@ async fn agent_send_message_queues_for_idle_agent() {
         .expect("agent send message");
     assert_eq!(result["success"], true);
 
-    // Message was queued (agent idle, no manager attached)
-    if result["queued"] == true {
-        let queue = services
-            .agent_get_queue(target_id.clone(), Some(ws.clone()))
-            .await
-            .expect("get queue");
-        let messages = queue["queue"].as_array().unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(
-            messages[0]["content"].as_str().unwrap(),
-            "Hello from sender"
-        );
-    }
+    // Store-only path (no manager) returns { success: true, queued: false }
+    assert_eq!(result["queued"], false);
 
     drop(services);
     cleanup_db(&db);
@@ -206,13 +197,10 @@ async fn agent_send_to_task_delivers_to_assigned_agent() {
         .await
         .expect("send to task");
 
-    // Result should indicate success (may have ok or success field)
-    assert!(result.get("ok").is_some() || result.get("success").is_some());
-
-    // If message was delivered (not queued), it went directly to the agent
-    // If no manager, it might be persisted directly without queueing
-    // In either case, the agent_id should be in the result
-    assert!(result.get("agentId").is_some() || result.get("delivered").is_some());
+    // Stable shape: { ok: true, agentId, result: { success, queued, ... } }
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["agentId"], json!(assigned_id.0));
+    assert_eq!(result["result"]["success"], true);
 
     drop(services);
     cleanup_db(&db);
@@ -396,12 +384,10 @@ async fn agent_delegate_creates_new_agent_for_task() {
         .await
         .expect("delegate");
 
-    assert!(result.get("ok").is_some() || result.get("success").is_some());
-
-    // Verify agent was created
-    if let Some(agent_id) = result.get("agentId").and_then(|v| v.as_str()) {
-        assert!(!agent_id.is_empty());
-    }
+    // Stable shape: { ok: true, agentId, name }
+    assert_eq!(result["ok"], true);
+    assert!(result["agentId"].is_string());
+    assert!(result["name"].is_string());
 
     drop(services);
     cleanup_db(&db);
