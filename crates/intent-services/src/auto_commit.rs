@@ -83,9 +83,7 @@ fn build_message_prompt(
     agent_name: &str,
 ) -> String {
     let mut parts = Vec::new();
-    parts.push(format!(
-        "# Uncommitted Changes\n\n```diff\n{diff_text}\n```"
-    ));
+    parts.push(format!("# Uncommitted Changes\n\n```\n{diff_text}\n```"));
     if !recent_commits.is_empty() {
         parts.push(format!(
             "\n# Recent Commit Messages (for style reference)\n\n{}",
@@ -192,20 +190,24 @@ impl Services {
         }
 
         // Resolve worktree path for generation + fallback.
-        let worktree_path = match self
-            .store()
-            .get_workspace(&session.workspace_id)
-            .await
-            .ok()
-            .and_then(|ws| ws.worktree_path)
-            .map(PathBuf::from)
-        {
-            Some(p) => p,
-            None => {
-                tracing::debug!(
+        let worktree_path = match self.store().get_workspace(&session.workspace_id).await {
+            Ok(ws) => match ws.worktree_path.map(PathBuf::from) {
+                Some(p) => p,
+                None => {
+                    tracing::debug!(
+                        agent = %agent_id.0,
+                        workspace = %session.workspace_id.0,
+                        "auto-commit skipped: no worktree path"
+                    );
+                    return;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
                     agent = %agent_id.0,
                     workspace = %session.workspace_id.0,
-                    "auto-commit skipped: no worktree path"
+                    error = %e,
+                    "auto-commit failed: could not load workspace"
                 );
                 return;
             }
@@ -351,7 +353,12 @@ impl Services {
                     .ok()
                     .map(|content| {
                         if content.len() > AGENTS_MD_CAP_BYTES {
-                            format!("{}... (truncated)", &content[..AGENTS_MD_CAP_BYTES])
+                            // UTF-8 safe truncation: find last char boundary within cap
+                            let mut end = AGENTS_MD_CAP_BYTES.min(content.len());
+                            while end > 0 && !content.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            format!("{}... (truncated)", &content[..end])
                         } else {
                             content
                         }

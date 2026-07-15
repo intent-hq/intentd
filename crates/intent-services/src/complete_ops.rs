@@ -60,11 +60,11 @@ impl Services {
                             let trimmed = s.trim();
                             if !trimmed.is_empty() {
                                 let p = PathBuf::from(trimmed);
-                                if p.is_file() || p.is_symlink() {
+                                if p.is_file() {
                                     p
                                 } else {
-                                    return Err(Error::Internal(format!(
-                                        "configured auggie path does not exist: {}",
+                                    return Err(Error::InvalidParams(format!(
+                                        "configured auggie path is not a valid file: {}",
                                         trimmed
                                     )));
                                 }
@@ -75,14 +75,18 @@ impl Services {
                                 })?
                             }
                         } else {
-                            // Non-string value → fall through to discovery
-                            intent_context::discovery::find_auggie().ok_or_else(|| {
-                                Error::Internal("auggie CLI not found".to_string())
-                            })?
+                            // Non-string value → invalid configuration
+                            return Err(Error::InvalidParams(
+                                "context.auggiePath must be a string".to_string(),
+                            ));
                         }
                     }
-                    _ => {
-                        // Setting not found or DB error → fall through to discovery
+                    Err(e) => {
+                        // DB error → surface it
+                        return Err(e);
+                    }
+                    Ok(None) => {
+                        // Setting not found → fall through to discovery
                         intent_context::discovery::find_auggie()
                             .ok_or_else(|| Error::Internal("auggie CLI not found".to_string()))?
                     }

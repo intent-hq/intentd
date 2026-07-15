@@ -509,13 +509,10 @@ async fn auto_commit_uses_generated_message_over_wss() {
         serde_json::to_string_pretty(&agent_list).unwrap()
     );
 
-    // Give the auto-commit loop time to process the idle event
-    tokio::time::sleep(Duration::from_millis(3000)).await;
+    // Give auto-commit time to process the idle event and commit
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Give auto-commit a moment to run (it's async after the idle event).
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Check if the file was written by the agent
+    // Check git status after auto-commit
     let status = wss_rpc(&mut rpc, 16, "git.status", json!({ "workspaceId": ws_id })).await;
     eprintln!(
         "git.status after idle: {}",
@@ -667,7 +664,9 @@ async fn auto_commit_falls_back_when_auggie_missing() {
 
     // Wait for agent:idle event.
     wss_event(&mut sub, 60).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Give auto-commit time to process the idle event and commit
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Assert the commit used the fallback subject (task title).
     let commits = wss_rpc(
