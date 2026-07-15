@@ -35,7 +35,7 @@ mod workspace_context_repo;
 mod workspace_repo;
 mod workspace_ui_context_repo;
 
-pub use agent_repo::ReplaceMessage;
+pub use agent_repo::{InterruptedAgent, ReplaceMessage};
 pub use diffs_repo::{DiffRow, NewDiff};
 pub use event_repo::{EventQuery, NewEvent};
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};

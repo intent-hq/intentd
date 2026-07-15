@@ -755,11 +755,24 @@ impl Services {
     pub async fn heal_stale_agent_sessions(&self) -> Result<usize> {
         let sessions = self.store.list_all_agent_sessions().await?;
         let mut healed = 0usize;
+        let now = now_iso();
         for session in sessions {
             if !is_stale_in_flight_status(session.status) {
                 continue;
             }
             let prev = session.status;
+            // Serialize the status via serde to match the DB form (e.g., "active", "Waiting").
+            let prev_str = serde_json::to_string(&prev)
+                .unwrap_or_else(|_| "\"unknown\"".to_string())
+                .trim_matches('"')
+                .to_string();
+
+            // Insert interrupted_agent row (idempotent: second restart is a no-op).
+            let _ = self
+                .store
+                .insert_interrupted_agent(&session.id, &session.workspace_id, &prev_str, &now)
+                .await;
+
             // Narrow write: `set_agent_session_status` persists only
             // (status, is_active, updated_at) without loading the full
             // message log, keeping the startup sweep O(rows). The write-once
@@ -771,7 +784,7 @@ impl Services {
                     &session.id,
                     intent_core::AgentStatus::RuntimeIdle,
                     false,
-                    &now_iso(),
+                    &now,
                 )
                 .await?;
             healed += 1;
@@ -11011,6 +11024,26 @@ impl WorkspaceApi for Services {
                 target_agent_id,
             )
             .await
+        })
+    }
+
+    fn agent_list_interrupted(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            let rows = self.store.list_interrupted_agents().await?;
+            let agents: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|ia| {
+                    serde_json::json!({
+                        "agentId": ia.agent_id.0,
+                        "workspaceId": ia.workspace_id.0,
+                        "workspaceName": ia.workspace_name.unwrap_or_default(),
+                        "agentName": ia.agent_name.unwrap_or_default(),
+                        "prevStatus": ia.prev_status,
+                        "interruptedAt": ia.interrupted_at,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "agents": agents }))
         })
     }
 

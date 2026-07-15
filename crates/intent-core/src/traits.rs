@@ -1649,6 +1649,18 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.listInterrupted`: list pending interrupted agents (INT-41,
+    /// agent-resumption phase 1). Returns joined data: agent ID, workspace info,
+    /// agent name, prev status, interrupted timestamp. Sessions deleted since
+    /// interruption are excluded. (PROTOCOL §5.5).
+    fn agent_list_interrupted(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_list_interrupted not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.reportToParent`: child→parent report; `-32603` when the caller is
     /// not a delegated agent (PROTOCOL §5.5).
     ///

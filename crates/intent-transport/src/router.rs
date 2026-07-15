@@ -1343,6 +1343,11 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.listInterrupted" => {
+            // No required params; returns pending interrupted agents across all workspaces.
+            let result = api.agent_list_interrupted().await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.subscribe" => {
             let ws = require_ws_note(params)?;
             require_present(params, "eventTypes")?;

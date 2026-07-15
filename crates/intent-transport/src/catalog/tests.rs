@@ -123,7 +123,7 @@ const EXPECTED_TOTAL_METHODS: usize = 287;
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 257;
+const EXPECTED_ROUTER_METHODS: usize = 258;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 28;
