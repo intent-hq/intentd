@@ -25,6 +25,11 @@ const SESSION_ID = 'mock-session-1';
 let promptCount = 0;
 const pendingPromptIds = [];
 
+// Agent→client request correlation: track outgoing request IDs separately from
+// incoming prompt IDs. The daemon responds to each client call with a matching id.
+let nextClientCallId = 1;
+const pendingClientCalls = new Map();
+
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n');
 }
@@ -95,6 +100,48 @@ function callWorkspaceTool(toolCall) {
       resolve(resp.result);
     })().catch(reject);
   });
+}
+
+// Issue an agent→client request (fs/*, terminal/*, session/request_permission).
+// Returns a promise that resolves with the response result or rejects with an error.
+// The correlation is via the JSON-RPC id we assign (nextClientCallId).
+// Includes a 30-second timeout to prevent hanging on non-replying daemon.
+function callClientService(method, params, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const id = nextClientCallId++;
+    const timeout = setTimeout(() => {
+      pendingClientCalls.delete(id);
+      reject(new Error(`client call timeout after ${timeoutMs}ms: ${method}`));
+    }, timeoutMs);
+    pendingClientCalls.set(id, {
+      resolve: (result) => {
+        clearTimeout(timeout);
+        resolve(result);
+      },
+      reject: (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      },
+    });
+    send({ jsonrpc: '2.0', id, method, params });
+  });
+}
+
+// Structural subset match: every key in `expected` must exist in `actual` with
+// the same value (recursively for objects). Ignores extra keys in `actual`.
+function structuralSubsetMatch(expected, actual) {
+  if (expected === actual) return true;
+  if (typeof expected !== 'object' || expected === null) return false;
+  if (typeof actual !== 'object' || actual === null) return false;
+  for (const key in expected) {
+    if (!(key in actual)) return false;
+    if (typeof expected[key] === 'object' && expected[key] !== null) {
+      if (!structuralSubsetMatch(expected[key], actual[key])) return false;
+    } else if (expected[key] !== actual[key]) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function extractPromptText(params) {
@@ -174,6 +221,47 @@ async function handlePrompt(id, params) {
     } catch (err) {
       log(`tool call failed: ${err.message}`);
       return result(id, { stopReason: 'refusal' });
+    }
+  }
+  // Client calls: agent→client requests (fs/*, terminal/*, session/request_permission).
+  // Each entry in active.clientCalls is { method, params, assertResult?, assertError? }.
+  // We issue the call, await the daemon's response, and optionally assert on it.
+  const clientCalls = Array.isArray(active.clientCalls) ? active.clientCalls : [];
+  for (const call of clientCalls) {
+    try {
+      const resp = await callClientService(call.method, call.params);
+      log(`client call ok: ${call.method} → ${JSON.stringify(resp).slice(0, 120)}`);
+      // If assertError was set, the call should have failed but succeeded instead
+      if (call.assertError !== undefined) {
+        log(`assertion failed: expected error but got success for ${call.method}`);
+        return result(id, { stopReason: 'refusal' });
+      }
+      // Optional assertion on the result (structural subset match)
+      if (call.assertResult !== undefined) {
+        if (!structuralSubsetMatch(call.assertResult, resp)) {
+          log(`assertion failed: expected subset ${JSON.stringify(call.assertResult)}, got ${JSON.stringify(resp)}`);
+          return result(id, { stopReason: 'refusal' });
+        }
+      }
+    } catch (err) {
+      log(`client call failed: ${call.method} → ${err.message}`);
+      // If the call defines assertError, verify it matches the expected error structure
+      if (call.assertError !== undefined) {
+        const errorData = err.errorData || {}; // JSON-RPC error from daemon
+        const expectedCode = call.assertError.code;
+        const expectedMessage = call.assertError.message;
+        if (expectedCode !== undefined && errorData.code !== expectedCode) {
+          log(`error code mismatch: expected ${expectedCode}, got ${errorData.code}`);
+          return result(id, { stopReason: 'refusal' });
+        }
+        if (expectedMessage !== undefined && !String(errorData.message || '').includes(expectedMessage)) {
+          log(`error message mismatch: expected substring "${expectedMessage}", got "${errorData.message}"`);
+          return result(id, { stopReason: 'refusal' });
+        }
+        log(`client call error matched expectation: code=${errorData.code}`);
+      } else {
+        return result(id, { stopReason: 'refusal' });
+      }
     }
   }
   const base = active.response || behavior.response || 'Mock agent completed.';
@@ -273,8 +361,37 @@ const rl = readline.createInterface({ input: process.stdin, terminal: false });
 rl.on('line', async (line) => {
   const trimmed = line.trim();
   if (!trimmed) return;
+  let msg;
   try {
-    await dispatch(JSON.parse(trimmed));
+    msg = JSON.parse(trimmed);
+  } catch (err) {
+    log(`parse error: ${err.message}`);
+    return;
+  }
+  // If this is a response to a client call we issued (has an id and either result or error),
+  // resolve or reject the pending promise. Otherwise dispatch it as a daemon→agent request.
+  // JSON-RPC responses have no 'method' field.
+  if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined) && msg.method === undefined) {
+    const pending = pendingClientCalls.get(msg.id);
+    if (pending) {
+      pendingClientCalls.delete(msg.id);
+      if (msg.error) {
+        const err = new Error(`JSON-RPC error ${msg.error.code}: ${msg.error.message}`);
+        err.errorData = msg.error; // Attach full error object for assertions
+        pending.reject(err);
+      } else {
+        pending.resolve(msg.result);
+      }
+      return;
+    }
+    // Unknown/expired id (e.g., after timeout cleanup) - drop the response instead of
+    // dispatching it (responses have no 'method', so dispatch would fail/misbehave).
+    log(`dropping response for unknown/expired id ${msg.id}`);
+    return;
+  }
+  // Not a client-call response; dispatch it
+  try {
+    await dispatch(msg);
   } catch (err) {
     log(`dispatch error: ${err.message}`);
   }
