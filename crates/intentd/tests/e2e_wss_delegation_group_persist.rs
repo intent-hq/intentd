@@ -315,18 +315,15 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
-fn boot_daemon(data_dir: &PathBuf, port: u16, env: &[(&str, &str)]) -> Daemon {
+fn boot_daemon(data_dir: &PathBuf, env: &[(&str, &str)]) -> Daemon {
+    let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
         .arg("--listen")
         .arg("both")
         .env("INTENTD_DATA_DIR", data_dir)
-        .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", &port.to_string())
         .stdout(Stdio::null())
-        .stderr(Stdio::from(
-            std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
-        ));
+        .stderr(Stdio::from(log));
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -339,14 +336,22 @@ fn boot_daemon(data_dir: &PathBuf, port: u16, env: &[(&str, &str)]) -> Daemon {
 
 #[tokio::test]
 async fn delegation_group_persists_across_restart() {
+    eprintln!("CHECKPOINT 0: test function entered");
     let Some(script) = gate("WSS delegation-group persist E2E") else {
+        eprintln!("CHECKPOINT 0.5: gate returned None, skipping");
         return;
     };
+    eprintln!("CHECKPOINT 0.9: gate returned script: {}", script);
 
+    eprintln!("CHECKPOINT 1: test start");
     let data_dir = temp_data_dir();
+    eprintln!("CHECKPOINT 2: data_dir created");
     let ws_id = seed_workspace_only(&data_dir).await;
+    eprintln!("CHECKPOINT 3: workspace seeded");
     let port = free_port();
+    eprintln!("CHECKPOINT 4: port allocated");
     let socket = data_dir.join("intentd.sock");
+    eprintln!("CHECKPOINT 5: socket path set");
 
     // Mock ACP behavior: children report after delay (to ensure parent seals group first)
     let report1_js = format!(
@@ -404,24 +409,35 @@ async fn delegation_group_persists_across_restart() {
         ]
     }).to_string();
 
+    let port_s = port.to_string();
     let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
         ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
 
     // Phase 1: Boot, create parent, delegate both children
-    let _daemon = boot_daemon(&data_dir, port, &env);
+    eprintln!("CHECKPOINT 6: booting daemon");
+    let _daemon = boot_daemon(&data_dir, &env);
+    eprintln!("CHECKPOINT 7: daemon spawned, waiting for UDS");
     assert!(await_uds(&socket).await, "daemon start");
+    eprintln!("CHECKPOINT 8: UDS ready");
 
+    eprintln!("CHECKPOINT 9: fetching fingerprint");
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    eprintln!("CHECKPOINT 10: got status response");
     let fp = status["result"]["fingerprint"]
         .as_str()
         .unwrap()
         .to_string();
+    eprintln!("CHECKPOINT 11: fingerprint extracted: {}", fp);
     let cfg = client_config(&fp);
 
     // Subscribe BEFORE creating the parent so we don't miss events
+    eprintln!("CHECKPOINT 12: connecting subscription WSS");
     let mut sub = connect_ws(port, cfg.clone()).await;
+    eprintln!("CHECKPOINT 13: subscription WSS connected, subscribing");
     wss_rpc(
         &mut sub,
         1,
@@ -429,8 +445,11 @@ async fn delegation_group_persists_across_restart() {
         json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
     )
     .await;
+    eprintln!("CHECKPOINT 14: subscription successful");
 
+    eprintln!("CHECKPOINT 15: connecting RPC WSS");
     let mut rpc = connect_ws(port, cfg.clone()).await;
+    eprintln!("CHECKPOINT 16: RPC WSS connected, creating parent");
     let parent = wss_rpc(
         &mut rpc,
         10,
@@ -438,7 +457,9 @@ async fn delegation_group_persists_across_restart() {
         json!({ "workspaceId": &ws_id, "name": "Parent", "model": "mock:default" }),
     )
     .await;
+    eprintln!("CHECKPOINT 17: parent created");
     let parent_id = parent["agent"]["id"].as_str().unwrap().to_string();
+    eprintln!("CHECKPOINT 18: parent_id extracted: {}", parent_id);
 
     wss_rpc(
         &mut rpc,
@@ -507,7 +528,7 @@ async fn delegation_group_persists_across_restart() {
 
     // Restart daemon
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let _daemon2 = boot_daemon(&data_dir, port, &env);
+    let _daemon2 = boot_daemon(&data_dir, &env);
     assert!(await_uds(&socket).await, "daemon restart");
 
     // Reconnect WSS
