@@ -77,6 +77,7 @@ mod note_ops;
 mod pagination;
 mod pr_ops;
 mod primitive_ops;
+pub mod repo_config;
 mod sandbox_ops;
 mod script_ops;
 mod search_ops;
@@ -5481,7 +5482,7 @@ impl WorkspaceApi for Services {
 
     fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.list(&workspace_id) })
+        Box::pin(async move { mgr.list(&workspace_id).await })
     }
 
     fn script_create(
@@ -5752,7 +5753,22 @@ impl WorkspaceApi for Services {
                                 .and_then(|a| a.prompt.as_deref())
                                 .and_then(intent_core::slug::extract_local_slug)
                                 .unwrap_or_else(intent_core::slug::generate_workspace_slug);
-                            let prefix = settings::branch_prefix(&store).await;
+                            // Branch prefix fallback: repo config > global setting
+                            // (FE parity: workspace.service.ts L1215-1219).
+                            let prefix = if let Some(repo_path) = input
+                                .repository_path
+                                .as_deref()
+                                .filter(|p| !p.is_empty())
+                                .map(PathBuf::from)
+                            {
+                                let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                                match repo_config.branch_prefix.filter(|p| !p.is_empty()) {
+                                    Some(p) => p,
+                                    None => settings::branch_prefix(&store).await,
+                                }
+                            } else {
+                                settings::branch_prefix(&store).await
+                            };
                             let desired = format!("{prefix}{slug}");
                             let git_repo = input
                                 .repository_path
@@ -5795,6 +5811,26 @@ impl WorkspaceApi for Services {
                         .title
                         .map(|t| t.trim().to_string())
                         .unwrap_or_default();
+                    // Setup script fallback: request > repo config > none
+                    // (FE parity: workspace.service.ts L1788-1791).
+                    let setup_script = match input.setup_script.clone().filter(|s| !s.is_empty()) {
+                        Some(explicit) => Some(setup_scripts::user_script(explicit)),
+                        None => {
+                            if let Some(repo_path) = input
+                                .repository_path
+                                .as_deref()
+                                .filter(|p| !p.is_empty())
+                                .map(PathBuf::from)
+                            {
+                                let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                                repo_config.setup_script
+                                    .filter(|s| !s.is_empty())
+                                    .map(setup_scripts::user_script)
+                            } else {
+                                None
+                            }
+                        }
+                    };
                     let mut ws = Workspace {
                         id,
                         title,
@@ -5824,7 +5860,7 @@ impl WorkspaceApi for Services {
                         worktree_path: input.worktree_path,
                         scope: input.scope,
                         skip_worktree: input.skip_worktree.unwrap_or(false),
-                        setup_script: input.setup_script.map(setup_scripts::user_script),
+                        setup_script,
                         is_remote: input.is_remote.unwrap_or(false),
                         default_model: input.default_model,
                         pr_number: None,
@@ -7028,6 +7064,60 @@ impl WorkspaceApi for Services {
             let ws = store.get_workspace(&id).await?;
             let project_type = git_ops::worktree_path(&ws).and_then(|p| setup_scripts::detect(&p));
             Ok(setup_scripts::generate(project_type))
+        })
+    }
+
+    fn get_repo_config(&self, id: WorkspaceId) -> BoxFuture<'_, Result<intent_core::RepoConfig>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let ws = store.get_workspace(&id).await?;
+            let Some(repo_path) = git_ops::worktree_path(&ws) else {
+                // No repo path → return empty config (tolerant, FE parity)
+                return Ok(intent_core::RepoConfig::default());
+            };
+            Ok(repo_config::read_repo_config(&repo_path).await)
+        })
+    }
+
+    fn save_repo_config(
+        &self,
+        id: WorkspaceId,
+        config: intent_core::RepoConfig,
+    ) -> BoxFuture<'_, Result<intent_core::RepoConfig>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let ws = store.get_workspace(&id).await?;
+            let Some(repo_path) = git_ops::worktree_path(&ws) else {
+                return Err(Error::Internal(
+                    "Cannot save repo config: workspace has no repository path".to_string(),
+                ));
+            };
+            repo_config::write_repo_config(&repo_path, config.clone()).await?;
+            Ok(config)
+        })
+    }
+
+    fn has_repo_config(&self, id: WorkspaceId) -> BoxFuture<'_, Result<bool>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let ws = store.get_workspace(&id).await?;
+            let Some(repo_path) = git_ops::worktree_path(&ws) else {
+                return Ok(false);
+            };
+            Ok(repo_config::has_repo_config(&repo_path))
+        })
+    }
+
+    fn ensure_repo_intent_dir(&self, id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let ws = store.get_workspace(&id).await?;
+            let Some(repo_path) = git_ops::worktree_path(&ws) else {
+                return Err(Error::Internal(
+                    "Cannot ensure .intent directory: workspace has no repository path".to_string(),
+                ));
+            };
+            repo_config::ensure_intent_dir(&repo_path).await
         })
     }
 

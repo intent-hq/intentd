@@ -369,6 +369,19 @@ pub(crate) async fn assemble_system_prompt(
             }
         }
     }
+    // Repo config instructions (FE parity: instruction-service.ts L1019-1022):
+    // append repo-level instructions from `.intent/config.json` when present.
+    if let Some(ws) = workspace {
+        if let Some(repo_path) = crate::git_ops::worktree_path(ws) {
+            let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+            if let Some(instructions) = repo_config.instructions {
+                if !instructions.trim().is_empty() {
+                    let source = format!("{}/.intent/config.json", repo_path.display());
+                    parts.push(format_user_rules_for_context(&instructions, &source));
+                }
+            }
+        }
+    }
     // Mode-dependent isolation hints (Task 6): inject context about CoW
     // sandboxing for implementors and parallel delegation safety for coordinators
     // when appropriate, before the specialist role section so the specialist

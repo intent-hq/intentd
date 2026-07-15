@@ -17,8 +17,8 @@ use crate::model::{
     Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
     NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
-    NoteVersionSummary, ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
-    SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
+    NoteVersionSummary, ProjectType, ReadAssetResult, RepoConfig, SaveAssetResult,
+    ScriptCreateParams, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
     TaskRemoveAgentFromAllTasksResult, TaskUpdateNoteStatusResult, TaskUpdateResult,
     TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult,
@@ -202,6 +202,60 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::generate_setup_script not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Read the repo config from `.intent/config.json` keyed on `workspaceId`.
+    /// The server resolves the repository path from the workspace's worktree/repository
+    /// fields (same resolution as `detectProjectType`). Returns an empty config when
+    /// the file doesn't exist or is invalid (tolerant, never errors). `NotFound` if
+    /// the workspace is absent (router maps to `-32602`).
+    fn get_repo_config(&self, id: WorkspaceId) -> BoxFuture<'_, Result<RepoConfig>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::get_repo_config not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Write the repo config to `.intent/config.json` keyed on `workspaceId`.
+    /// Creates the `.intent/` directory and `.gitignore` if they don't exist.
+    /// Never overwrites an existing `.gitignore`. Unknown keys are preserved on
+    /// round-trip. `NotFound` if the workspace is absent.
+    fn save_repo_config(
+        &self,
+        id: WorkspaceId,
+        config: RepoConfig,
+    ) -> BoxFuture<'_, Result<RepoConfig>> {
+        let _ = (id, config);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::save_repo_config not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Check if a workspace has an `.intent/config.json` file.
+    /// `NotFound` if the workspace is absent (router maps to `-32602`).
+    fn has_repo_config(&self, id: WorkspaceId) -> BoxFuture<'_, Result<bool>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::has_repo_config not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Ensure the `.intent/` directory exists with a proper `.gitignore`.
+    /// Call this when initializing a workspace from a repo that doesn't have one yet.
+    /// `NotFound` if the workspace is absent (router maps to `-32602`).
+    fn ensure_repo_intent_dir(&self, id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::ensure_repo_intent_dir not implemented".to_string(),
             ))
         })
     }

@@ -313,6 +313,87 @@ pub struct SetupScript {
     pub generated_by: Option<SetupScriptGeneratedBy>,
 }
 
+/// Script mode for repo scripts (service = long-running, command = run-once).
+/// Matches `RepoScript.mode` in `cloudlands-fe/src/shared/types/repo-config.types.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoScriptMode {
+    Service,
+    Command,
+}
+
+/// Script category for repo scripts. Matches `RepoScript.category` in
+/// `cloudlands-fe/src/shared/types/repo-config.types.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoScriptCategory {
+    Dev,
+    Build,
+    Test,
+    Lint,
+    Typecheck,
+    Format,
+    Storybook,
+    Other,
+}
+
+/// Per-repository script definition (FE-parity with `RepoScript` in
+/// `cloudlands-fe/src/shared/types/repo-config.types.ts`). Part of the
+/// committable `.intent/config.json` file. Scripts can be seeded into
+/// workspace script storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoScript {
+    pub name: String,
+    pub command: String,
+    pub mode: RepoScriptMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<RepoScriptCategory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_start: Option<bool>,
+}
+
+/// Per-repository configuration stored in `.intent/config.json` in a repo root.
+/// FE-parity with `RepoConfig` in `cloudlands-fe/src/shared/types/repo-config.types.ts`.
+/// All fields are optional; missing fields fall back to global app settings or none.
+/// Unknown JSON keys are preserved on read→write round-trip.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RepoConfig {
+    /// Branch prefix for new workspaces created from this repo (e.g. "feature/").
+    /// Overrides the global branch prefix setting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_prefix: Option<String>,
+
+    /// Default setup script to run after creating a git worktree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_script: Option<String>,
+
+    /// General instructions for AI agents working in this repo, appended to system prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+
+    /// Script to run the project in development mode (for agents to start dev servers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_script: Option<String>,
+
+    /// Script to run when archiving/cleaning up a workspace (runs before worktree removal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_script: Option<String>,
+
+    /// Shared script definitions for this repo (bootstrap workspace scripts from config).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scripts: Option<Vec<RepoScript>>,
+
+    /// Unknown/extra keys preserved on round-trip to avoid dropping fields other tools add.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
 /// One chat-context attachment for a workspace (PROTOCOL §5.1 —
 /// `workspace.getContext` / `updateContext`). The daemon treats the item as an
 /// opaque JSON blob authored by the FE (`ContextItem` union in
@@ -2881,6 +2962,122 @@ mod tests {
         assert_eq!(v["updatedAt"], 0);
         let back: SetupScript = serde_json::from_value(v).unwrap();
         assert_eq!(back, bare);
+    }
+
+    /// `RepoScript` serializes with camelCase keys (`autoStart` not `auto_start`),
+    /// lowercase mode/category enum values, and omits optional fields when absent.
+    #[test]
+    fn repo_script_wire_shape() {
+        use std::collections::BTreeMap;
+
+        let s = RepoScript {
+            name: "dev".to_string(),
+            command: "pnpm dev".to_string(),
+            mode: RepoScriptMode::Service,
+            category: Some(RepoScriptCategory::Dev),
+            cwd: Some("frontend".to_string()),
+            env: {
+                let mut m = BTreeMap::new();
+                m.insert("PORT".to_string(), "3000".to_string());
+                Some(m)
+            },
+            auto_start: Some(true),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["name"], "dev");
+        assert_eq!(v["command"], "pnpm dev");
+        assert_eq!(v["mode"], "service");
+        assert_eq!(v["category"], "dev");
+        assert_eq!(v["cwd"], "frontend");
+        assert_eq!(v["env"]["PORT"], "3000");
+        assert_eq!(v["autoStart"], true);
+        let back: RepoScript = serde_json::from_value(v).unwrap();
+        assert_eq!(back, s);
+
+        // Optional fields omitted (not null) when absent.
+        let bare = RepoScript {
+            name: "test".to_string(),
+            command: "cargo test".to_string(),
+            mode: RepoScriptMode::Command,
+            category: None,
+            cwd: None,
+            env: None,
+            auto_start: None,
+        };
+        let v = serde_json::to_value(&bare).unwrap();
+        assert_eq!(v.get("category"), None);
+        assert_eq!(v.get("cwd"), None);
+        assert_eq!(v.get("env"), None);
+        assert_eq!(v.get("autoStart"), None);
+        let back: RepoScript = serde_json::from_value(v).unwrap();
+        assert_eq!(back, bare);
+    }
+
+    /// `RepoConfig` serializes with camelCase keys (`branchPrefix`, `setupScript`, etc.),
+    /// omits optional fields when absent, and preserves unknown keys via `extra`.
+    #[test]
+    fn repo_config_wire_shape() {
+        use std::collections::BTreeMap;
+
+        let cfg = RepoConfig {
+            branch_prefix: Some("feature/".to_string()),
+            setup_script: Some("npm install".to_string()),
+            instructions: Some("Use TypeScript strict mode".to_string()),
+            run_script: Some("npm run dev".to_string()),
+            archive_script: Some("docker compose down".to_string()),
+            scripts: Some(vec![RepoScript {
+                name: "build".to_string(),
+                command: "npm run build".to_string(),
+                mode: RepoScriptMode::Command,
+                category: Some(RepoScriptCategory::Build),
+                cwd: None,
+                env: None,
+                auto_start: None,
+            }]),
+            extra: {
+                let mut m = BTreeMap::new();
+                m.insert("customKey".to_string(), serde_json::json!("customValue"));
+                m
+            },
+        };
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(v["branchPrefix"], "feature/");
+        assert_eq!(v["setupScript"], "npm install");
+        assert_eq!(v["instructions"], "Use TypeScript strict mode");
+        assert_eq!(v["runScript"], "npm run dev");
+        assert_eq!(v["archiveScript"], "docker compose down");
+        assert_eq!(v["scripts"][0]["name"], "build");
+        assert_eq!(v["scripts"][0]["mode"], "command");
+        assert_eq!(v["customKey"], "customValue");
+        let back: RepoConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(back, cfg);
+
+        // Optional fields omitted (not null) when absent; extra preserves unknown keys.
+        let bare = RepoConfig::default();
+        let v = serde_json::to_value(&bare).unwrap();
+        assert_eq!(v.get("branchPrefix"), None);
+        assert_eq!(v.get("setupScript"), None);
+        assert_eq!(v.get("instructions"), None);
+        assert_eq!(v.get("runScript"), None);
+        assert_eq!(v.get("archiveScript"), None);
+        assert_eq!(v.get("scripts"), None);
+        let back: RepoConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(back, bare);
+
+        // Unknown keys in JSON are preserved in `extra` on round-trip.
+        let json = serde_json::json!({
+            "branchPrefix": "bugfix/",
+            "unknownField": "some-value",
+            "anotherUnknown": 42
+        });
+        let parsed: RepoConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.branch_prefix.as_deref(), Some("bugfix/"));
+        assert_eq!(parsed.extra.get("unknownField").unwrap(), "some-value");
+        assert_eq!(parsed.extra.get("anotherUnknown").unwrap(), 42);
+        let v = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(v["branchPrefix"], "bugfix/");
+        assert_eq!(v["unknownField"], "some-value");
+        assert_eq!(v["anotherUnknown"], 42);
     }
 
     /// `WorkspaceAgentInfo` omits the optional `specialist`/`lastActivity` keys
