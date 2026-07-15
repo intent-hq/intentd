@@ -426,10 +426,13 @@ async fn delegation_group_persists_across_restart() {
         let ev = &frame["params"]["event"];
         if ev["type"] == "agent:created" {
             let agent_id = ev["data"]["agentId"].as_str().unwrap().to_string();
-            if child1_id.is_none() {
-                child1_id = Some(agent_id);
-            } else if child2_id.is_none() {
-                child2_id = Some(agent_id);
+            // Skip the parent itself
+            if agent_id != parent_id {
+                if child1_id.is_none() {
+                    child1_id = Some(agent_id);
+                } else if child2_id.is_none() {
+                    child2_id = Some(agent_id);
+                }
             }
         }
         if ev["type"] == "agent:idle" && ev["data"]["agentId"] == parent_id {
@@ -567,22 +570,6 @@ async fn delegation_group_persists_across_restart() {
         .iter()
         .filter(|t| t.contains("[WORKSPACE EVENTS]"))
         .collect();
-
-    if wakes.len() != 1 {
-        eprintln!("\n===  GOT {} WAKES ===", wakes.len());
-        for (i, wake) in wakes.iter().enumerate() {
-            let has_both = wake.contains(CHILD1_REPORT) && wake.contains(CHILD2_REPORT);
-            let aggregated = wake.contains("All 2 delegated");
-            eprintln!("Wake {}: aggregated={}, has_both={}", i+1, aggregated, has_both);
-        }
-        // Show full messages for context
-        eprintln!("\n=== FULL PARENT CONVERSATION ===");
-        for (i, msg) in messages.iter().enumerate() {
-            eprintln!("Msg {}: role={}, events={}",
-                i, msg["role"].as_str().unwrap_or("?"),
-                texts[i].contains("[WORKSPACE EVENTS]"));
-        }
-    }
 
     assert_eq!(wakes.len(), 1, "exactly one wake message");
     let wake = wakes[0];
