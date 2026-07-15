@@ -259,6 +259,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "workspace.getContext",
     "workspace.getSetupScript",
     "workspace.getTokenUsage",
+    "workspace.getUiContext",
     "workspace.initializeRepository",
     "workspace.list",
     "workspace.markSeen",
@@ -267,6 +268,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "workspace.unarchive",
     "workspace.update",
     "workspace.updateContext",
+    "workspace.updateUiContext",
 ];
 
 /// Method aliases (wire-accepted → canonical).
