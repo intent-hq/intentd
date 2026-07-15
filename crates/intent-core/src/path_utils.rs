@@ -25,6 +25,8 @@ static LOGIN_SHELL_DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 /// Exposed for testing via an injectable shell path.
 #[cfg(unix)]
 fn capture_login_shell_path_with(shell: Option<&str>) -> Vec<PathBuf> {
+    use std::io::Read;
+
     let shell = match shell {
         Some(s) => s.to_string(),
         None => match std::env::var("SHELL") {
@@ -50,14 +52,20 @@ fn capture_login_shell_path_with(shell: Option<&str>) -> Vec<PathBuf> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Process exited
-                return match child.wait_with_output() {
-                    Ok(out) if status.success() => {
-                        let path_str = String::from_utf8_lossy(&out.stdout);
-                        std::env::split_paths(&path_str.as_ref()).collect::<Vec<_>>()
-                    }
-                    _ => Vec::new(),
+                // Process exited - read stdout directly (can't use wait_with_output after try_wait succeeds)
+                if !status.success() {
+                    return Vec::new();
+                }
+                let mut stdout = match child.stdout.take() {
+                    Some(s) => s,
+                    None => return Vec::new(),
                 };
+                let mut output = Vec::new();
+                if stdout.read_to_end(&mut output).is_err() {
+                    return Vec::new();
+                }
+                let path_str = String::from_utf8_lossy(&output);
+                return std::env::split_paths(&path_str.as_ref()).collect::<Vec<_>>();
             }
             Ok(None) => {
                 // Still running
@@ -134,6 +142,15 @@ pub fn enhanced_path_dirs() -> Vec<PathBuf> {
 /// provider-binary dir and ~/.augment/bin, then these enriched dirs, then
 /// inherited PATH last).
 pub fn enriched_tool_dirs() -> Vec<PathBuf> {
+    enriched_tool_dirs_with(login_shell_dirs)
+}
+
+/// Injectable variant for testing - accepts a function that returns login-shell dirs.
+/// This allows tests to avoid spawning the real shell.
+fn enriched_tool_dirs_with<F>(login_dirs_fn: F) -> Vec<PathBuf>
+where
+    F: FnOnce() -> &'static [PathBuf],
+{
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
@@ -186,7 +203,7 @@ pub fn enriched_tool_dirs() -> Vec<PathBuf> {
     }
 
     // Add login-shell PATH directories (unix only, cached, silent degradation)
-    for dir in login_shell_dirs() {
+    for dir in login_dirs_fn() {
         push_dir(&mut dirs, &mut seen, dir.clone());
     }
 
@@ -281,10 +298,11 @@ mod tests {
 
     #[test]
     fn enriched_tool_dirs_includes_login_shell_dirs() {
-        // This test verifies that enriched_tool_dirs includes login-shell dirs
-        // (even if empty on non-unix or when shell fails)
-        let dirs = enriched_tool_dirs();
-        // Should at least include the hardcoded dirs
+        // Use the injectable variant with a fake empty login-shell dirs function
+        // to avoid spawning the real shell in tests
+        static EMPTY_DIRS: [PathBuf; 0] = [];
+        let dirs = enriched_tool_dirs_with(|| &EMPTY_DIRS);
+        // Should at least include the hardcoded dirs (even with empty login-shell dirs)
         assert!(!dirs.is_empty());
     }
 }
