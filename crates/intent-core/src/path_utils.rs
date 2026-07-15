@@ -7,11 +7,94 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use directories::BaseDirs;
 
 fn home_dir() -> Option<PathBuf> {
     BaseDirs::new().map(|b| b.home_dir().to_path_buf())
+}
+
+/// Cached login-shell PATH directories. Runs at most once, with a 2s timeout.
+static LOGIN_SHELL_DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+
+/// Capture PATH from the user's login shell (unix only, cached, short timeout).
+/// On failure (timeout, spawn error, no $SHELL, non-unix), returns an empty vec.
+/// Exposed for testing via an injectable shell path.
+#[cfg(unix)]
+fn capture_login_shell_path_with(shell: Option<&str>) -> Vec<PathBuf> {
+    use std::io::Read;
+
+    let shell = match shell {
+        Some(s) => s.to_string(),
+        None => match std::env::var("SHELL") {
+            Ok(s) if !s.is_empty() => s,
+            _ => return Vec::new(),
+        },
+    };
+
+    // Run shell -lc 'printf %s "$PATH"' with 2s timeout
+    let mut child = match Command::new(&shell)
+        .args(["-lc", r#"printf %s "$PATH""#])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    // Poll for completion with 2s timeout
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Process exited - read stdout directly (can't use wait_with_output after try_wait succeeds)
+                if !status.success() {
+                    return Vec::new();
+                }
+                let mut stdout = match child.stdout.take() {
+                    Some(s) => s,
+                    None => return Vec::new(),
+                };
+                let mut output = Vec::new();
+                if stdout.read_to_end(&mut output).is_err() {
+                    return Vec::new();
+                }
+                let path_str = String::from_utf8_lossy(&output);
+                // Filter to absolute paths only to avoid unsafe relative entries like "." or "bin"
+                return std::env::split_paths(&path_str.as_ref())
+                    .filter(|p| p.is_absolute())
+                    .collect::<Vec<_>>();
+            }
+            Ok(None) => {
+                // Still running
+                if std::time::Instant::now() >= deadline {
+                    // Timeout - kill and return empty
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Vec::new();
+                }
+                // Sleep a bit before polling again
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return Vec::new(),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn capture_login_shell_path_with(_shell: Option<&str>) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Returns cached login-shell PATH directories (unix only).
+/// Runs the shell at most once, with a 2s timeout, and degrades silently on failure.
+pub(crate) fn login_shell_dirs() -> &'static [PathBuf] {
+    LOGIN_SHELL_DIRS.get_or_init(|| capture_login_shell_path_with(None))
 }
 
 /// Helper to push a directory to the list if it's not empty and not already seen.
@@ -62,6 +145,15 @@ pub fn enhanced_path_dirs() -> Vec<PathBuf> {
 /// provider-binary dir and ~/.augment/bin, then these enriched dirs, then
 /// inherited PATH last).
 pub fn enriched_tool_dirs() -> Vec<PathBuf> {
+    enriched_tool_dirs_with(login_shell_dirs)
+}
+
+/// Injectable variant for testing - accepts a function that returns login-shell dirs.
+/// This allows tests to avoid spawning the real shell.
+fn enriched_tool_dirs_with<F>(login_dirs_fn: F) -> Vec<PathBuf>
+where
+    F: FnOnce() -> &'static [PathBuf],
+{
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
@@ -113,6 +205,11 @@ pub fn enriched_tool_dirs() -> Vec<PathBuf> {
         }
     }
 
+    // Add login-shell PATH directories (unix only, cached, silent degradation)
+    for dir in login_dirs_fn() {
+        push_dir(&mut dirs, &mut seen, dir.clone());
+    }
+
     dirs
 }
 
@@ -157,5 +254,76 @@ mod tests {
             has_usr_bin || has_bin,
             "Should include common Unix bin directories"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_path_with_fake_shell() {
+        // Create a fake shell script that outputs a known PATH
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fake_shell = temp_dir.join(format!("fake_shell_test_{pid}_{nanos}.sh"));
+        fs::write(
+            &fake_shell,
+            "#!/bin/sh\nif [ \"$1\" = \"-lc\" ]; then\n  printf '/custom/bin:/other/bin'\nfi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
+        fs::remove_file(&fake_shell).ok();
+
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0], PathBuf::from("/custom/bin"));
+        assert_eq!(dirs[1], PathBuf::from("/other/bin"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_path_with_invalid_shell_degrades_silently() {
+        let dirs = capture_login_shell_path_with(Some("/nonexistent/shell"));
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_path_with_empty_shell_string_degrades_silently() {
+        let dirs = capture_login_shell_path_with(Some(""));
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
+    fn enriched_tool_dirs_includes_login_shell_dirs() {
+        use std::sync::LazyLock;
+
+        // Use the injectable variant with known fake login-shell dirs
+        // to verify that login-shell dirs are actually included
+        static FAKE_LOGIN_DIRS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
+            vec![
+                PathBuf::from("/fake/login/bin"),
+                PathBuf::from("/another/fake/bin"),
+            ]
+        });
+
+        let dirs = enriched_tool_dirs_with(|| &FAKE_LOGIN_DIRS);
+
+        // Verify the fake login-shell dirs actually appear in the result
+        assert!(
+            dirs.contains(&PathBuf::from("/fake/login/bin")),
+            "Login-shell dir /fake/login/bin should be included"
+        );
+        assert!(
+            dirs.contains(&PathBuf::from("/another/fake/bin")),
+            "Login-shell dir /another/fake/bin should be included"
+        );
+        // Should also include the hardcoded dirs
+        assert!(!dirs.is_empty());
     }
 }

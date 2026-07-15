@@ -1068,3 +1068,86 @@ async fn host_exec_stream_acp_handshake_probe_over_wss() {
     );
     assert_eq!(data["ok"], false, "reaped child is not `ok`: {exit}");
 }
+
+/// Verify host.findBinary resolves binaries from login-shell PATH enrichment
+/// when the daemon runs with minimal PATH. Spawns intentd with a controlled
+/// minimal PATH and a fake $SHELL that outputs a PATH containing a temp dir
+/// holding a unique binary; asserts host.findBinary resolves that binary.
+#[tokio::test]
+async fn host_find_binary_uses_login_shell_path() {
+    let data_dir = temp_data_dir();
+
+    // Create a unique temp dir with a fake binary
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let fake_bin_dir = data_dir.join(format!("fake_login_bin_{pid}_{nanos}"));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+
+    let bin_name = format!("test-login-bin-{pid}-{nanos}");
+    let bin_path = fake_bin_dir.join(&bin_name);
+    std::fs::write(&bin_path, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Create a fake shell script that outputs the enriched PATH when invoked with -lc
+    let fake_shell_path = data_dir.join("fake_shell.sh");
+    let shell_script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"-lc\" ]; then\n  # Execute the command but in an environment where PATH is our fake dir\n  PATH=\"{}\" eval \"$2\"\nfi\n",
+        fake_bin_dir.display()
+    );
+    std::fs::write(&fake_shell_path, shell_script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_shell_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Spawn daemon with minimal PATH and fake SHELL
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("PATH", "/usr/bin:/bin"), // Minimal PATH that won't find our binary
+        ("SHELL", fake_shell_path.to_str().unwrap()),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut ws = connect_ws(port, cfg).await;
+
+    // Call host.findBinary for our unique binary name
+    let result = wss_rpc(&mut ws, 2, "host.findBinary", json!({ "name": &bin_name })).await;
+
+    // Should find the binary via login-shell PATH enrichment
+    assert_eq!(
+        result["available"], true,
+        "Binary should be found via login-shell PATH: {result}"
+    );
+    assert_eq!(
+        result["path"].as_str().unwrap(),
+        bin_path.to_str().unwrap(),
+        "Binary path should match: {result}"
+    );
+
+    drop(daemon);
+}
