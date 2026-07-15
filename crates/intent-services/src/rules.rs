@@ -15,6 +15,9 @@ use intent_core::{Error, Result};
 use intent_store::Store;
 use serde_json::{json, Map, Value};
 
+use crate::rtk;
+use crate::settings::rtk_enabled;
+
 /// Settings-store key the per-rule-type user overrides persist under (§9.12).
 const END_USER_RULES_KEY: &str = "endUserRules";
 
@@ -324,6 +327,25 @@ fn build_isolation_hint(
     None
 }
 
+/// Build the RTK instruction line when enabled and available.
+/// Returns `None` when `rtk.enabled` is false or rtk is unavailable/has no
+/// usable subcommands. Mirrors `cloudlands-fe rtk-detector.ts getRtkPromptInstruction()`.
+async fn build_rtk_instruction(store: &Store) -> Option<String> {
+    if !rtk_enabled(store).await {
+        return None;
+    }
+
+    let status = rtk::detect_rtk();
+    if !status.available || status.subcommands.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "Prefix these commands with rtk for compressed, LLM-friendly output: {}",
+        status.subcommands.join(", ")
+    ))
+}
+
 /// Assemble the effective system prompt (the **internal** injection pipeline,
 /// §18.1) in documented precedence: base-system-prompt override →
 /// specialization rules (the 3-tier resolver: agent-type override → workspace
@@ -381,6 +403,12 @@ pub(crate) async fn assemble_system_prompt(
                 }
             }
         }
+    }
+    // RTK layer: when rtk.enabled is true and rtk is detected with ≥1 usable
+    // subcommand, append the instruction line. Placed after workspace-rules,
+    // before isolation hint / specialist role.
+    if let Some(rtk_instruction) = build_rtk_instruction(store).await {
+        parts.push(rtk_instruction);
     }
     // Mode-dependent isolation hints (Task 6): inject context about CoW
     // sandboxing for implementors and parallel delegation safety for coordinators

@@ -886,6 +886,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(1.0),
             0.5,
         ),
+        boolean(
+            "rtk.enabled",
+            "RTK enabled",
+            "Enable RTK compressed CLI output mode in agent prompts",
+            "tools",
+            false,
+        ),
         // --- Group B: server / transport ------------------------------------
         enumerated(
             "server.listenMode",
@@ -1188,6 +1195,18 @@ pub(crate) async fn auto_commit_enabled(store: &Store) -> bool {
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
         _ => true,
+    }
+}
+
+/// Read the effective `rtk.enabled` flag (default `false`). A missing/garbled
+/// row defaults to `false` (disabled) — RTK prompt injection is opt-in.
+pub(crate) async fn rtk_enabled(store: &Store) -> bool {
+    match store.get_setting("rtk.enabled").await {
+        Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        _ => false,
     }
 }
 
