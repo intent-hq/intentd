@@ -87,7 +87,7 @@ async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
 }
 
 #[tokio::test]
-async fn agent_send_message_queues_for_idle_agent() {
+async fn agent_send_message_persists_without_manager() {
     let (services, ws, ws_root, db) = setup().await;
 
     // Create target agent
