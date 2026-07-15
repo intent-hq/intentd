@@ -15,10 +15,14 @@ async fn token_generation_and_persistence() {
     std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
     let secrets_file = tmp_dir.join("secrets.json");
 
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::set_var("INTENTD_SECRETS_FILE", &secrets_file);
-
-    let store_async = AsyncTokenStore::new(Arc::new(FileTokenStore::default()));
+    let store_async = {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTENTD_SECRETS_FILE", &secrets_file);
+        let store = AsyncTokenStore::new(Arc::new(FileTokenStore::default()));
+        std::env::remove_var("INTENTD_SECRETS_FILE");
+        drop(_guard);
+        store
+    };
 
     // Generate a fresh token
     let token1 = generate_token(&store_async).await.expect("generate");
@@ -35,8 +39,6 @@ async fn token_generation_and_persistence() {
         .expect("get_or_create");
     assert_eq!(token2, token1, "get_or_create returns existing token");
 
-    std::env::remove_var("INTENTD_SECRETS_FILE");
-    drop(_guard);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
@@ -47,10 +49,14 @@ async fn token_rotation_replaces_old() {
     std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
     let secrets_file = tmp_dir.join("secrets.json");
 
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::set_var("INTENTD_SECRETS_FILE", &secrets_file);
-
-    let store_async = AsyncTokenStore::new(Arc::new(FileTokenStore::default()));
+    let store_async = {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTENTD_SECRETS_FILE", &secrets_file);
+        let store = AsyncTokenStore::new(Arc::new(FileTokenStore::default()));
+        std::env::remove_var("INTENTD_SECRETS_FILE");
+        drop(_guard);
+        store
+    };
 
     // Create initial token
     let token1 = get_or_create_token(&store_async).await.expect("create");
@@ -65,8 +71,6 @@ async fn token_rotation_replaces_old() {
     let loaded = store_async.load_token().await;
     assert_eq!(loaded, Some(token2));
 
-    std::env::remove_var("INTENTD_SECRETS_FILE");
-    drop(_guard);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
@@ -75,16 +79,19 @@ async fn token_rotation_replaces_old() {
 async fn config_paths_include_daemon_files() {
     let tmp_dir = std::env::temp_dir().join(format!("intentd-cfg-{}", uuid::Uuid::new_v4()));
 
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::set_var("INTENTD_DATA_DIR", &tmp_dir);
+    let config = {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTENTD_DATA_DIR", &tmp_dir);
+        let cfg = Config::resolve().expect("resolve config");
+        std::env::remove_var("INTENTD_DATA_DIR");
+        drop(_guard);
+        cfg
+    };
 
-    let config = Config::resolve().expect("resolve config");
     assert_eq!(config.data_dir, tmp_dir);
-
-    // Verify paths are set correctly
     assert_eq!(config.db_path, tmp_dir.join("intentd.db"));
     assert_eq!(config.socket_path, tmp_dir.join("intentd.sock"));
     assert_eq!(config.pid_path, tmp_dir.join("intentd.pid"));
 
-    std::env::remove_var("INTENTD_DATA_DIR");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }

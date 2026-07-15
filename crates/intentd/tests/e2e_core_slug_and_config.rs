@@ -15,10 +15,9 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 #[tokio::test]
 async fn workspace_id_derived_from_initial_agent_prompt() {
     let db = std::env::temp_dir().join(format!("intentd-e2e-core-{}.db", uuid::Uuid::new_v4()));
+    let ws_root = std::env::temp_dir().join(format!("itd-e2e-ws-{}", uuid::Uuid::new_v4()));
     let store = Store::open(&db).await.expect("open store");
-    let services = Services::new(store.clone()).with_workspaces_root(
-        std::env::temp_dir().join(format!("itd-e2e-ws-{}", uuid::Uuid::new_v4())),
-    );
+    let services = Services::new(store.clone()).with_workspaces_root(ws_root.clone());
 
     // Workspace create with an initialAgent prompt that should extract to "auth-fix"
     let result = services
@@ -47,6 +46,7 @@ async fn workspace_id_derived_from_initial_agent_prompt() {
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
     }
+    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
 /// Create a workspace with no prompt and verify the ID is a random slug
@@ -54,10 +54,9 @@ async fn workspace_id_derived_from_initial_agent_prompt() {
 #[tokio::test]
 async fn workspace_id_random_slug_when_no_prompt() {
     let db = std::env::temp_dir().join(format!("intentd-e2e-core-{}.db", uuid::Uuid::new_v4()));
+    let ws_root = std::env::temp_dir().join(format!("itd-e2e-ws-{}", uuid::Uuid::new_v4()));
     let store = Store::open(&db).await.expect("open store");
-    let services = Services::new(store.clone()).with_workspaces_root(
-        std::env::temp_dir().join(format!("itd-e2e-ws-{}", uuid::Uuid::new_v4())),
-    );
+    let services = Services::new(store.clone()).with_workspaces_root(ws_root.clone());
 
     // Workspace create with no prompt → should generate random slug
     let result = services
@@ -86,6 +85,7 @@ async fn workspace_id_random_slug_when_no_prompt() {
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
     }
+    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
 /// Verify Config::resolve parses env vars and fills defaults.
