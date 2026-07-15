@@ -8,9 +8,10 @@ use intent_core::{
     GitFileStatus, GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate,
     NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
     NoteId, NoteMetadata, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, Result, ScriptCreateParams,
-    ScriptMode, TaskUpdateResult, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, RepoConfig, Result,
+    ScriptCreateParams, ScriptMode, TaskUpdateResult, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
+    WorkspaceUpdate,
 };
 use serde_json::Value;
 
@@ -1535,6 +1536,51 @@ impl WorkspaceApi for FakeApi {
                 "agentId": agent_id,
                 "skipIfExplicitlySet": skip_if_explicitly_set,
             }))
+        })
+    }
+
+    fn get_repo_config(&self, id: WorkspaceId) -> BoxFuture<'_, Result<RepoConfig>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            // Return a simple config for testing
+            Ok(RepoConfig {
+                branch_prefix: Some("feature/".to_string()),
+                ..Default::default()
+            })
+        })
+    }
+
+    fn save_repo_config(
+        &self,
+        id: WorkspaceId,
+        config: RepoConfig,
+    ) -> BoxFuture<'_, Result<RepoConfig>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            // Echo back the config
+            Ok(config)
+        })
+    }
+
+    fn has_repo_config(&self, id: WorkspaceId) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            Ok(id.as_str() == "with-config")
+        })
+    }
+
+    fn ensure_repo_intent_dir(&self, id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            Ok(())
         })
     }
 }
@@ -4434,4 +4480,134 @@ mod send_message_payload_forwarding {
             "fileBlocks must be forwarded verbatim"
         );
     }
+}
+
+/// `repoConfig.*` namespace tests (additive intentd-only surface, FE parity
+/// with `packages/cloudlands-fe/src/features/workspace/main/repo-config.ipc.ts`).
+#[tokio::test]
+async fn repo_config_get_happy_path() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repoConfig.get","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["config"]["branchPrefix"], "feature/");
+}
+
+#[tokio::test]
+async fn repo_config_get_unknown_workspace() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repoConfig.get","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(v["error"]["message"], "Workspace not found");
+}
+
+#[tokio::test]
+async fn repo_config_get_missing_workspace_id() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"repoConfig.get","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        "Missing required parameter: workspaceId"
+    );
+}
+
+#[tokio::test]
+async fn repo_config_save_happy_path() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repoConfig.save","params":{"workspaceId":"ws-1","config":{"branchPrefix":"feat/"}}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["config"]["branchPrefix"], "feat/");
+}
+
+#[tokio::test]
+async fn repo_config_save_unknown_workspace() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repoConfig.save","params":{"workspaceId":"missing","config":{}}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(v["error"]["message"], "Workspace not found");
+}
+
+#[tokio::test]
+async fn repo_config_save_missing_config() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repoConfig.save","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(v["error"]["message"], "config required");
+}
+
+#[tokio::test]
+async fn repo_config_save_invalid_config() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repoConfig.save","params":{"workspaceId":"ws-1","config":"not-an-object"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("invalid config"));
+}
+
+#[tokio::test]
+async fn repo_config_has_happy_path() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repoConfig.has","params":{"workspaceId":"with-config"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["exists"], true);
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"repoConfig.has","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["exists"], false);
+}
+
+#[tokio::test]
+async fn repo_config_has_unknown_workspace() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repoConfig.has","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(v["error"]["message"], "Workspace not found");
+}
+
+#[tokio::test]
+async fn repo_config_ensure_dir_happy_path() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repoConfig.ensureDir","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], true);
+}
+
+#[tokio::test]
+async fn repo_config_ensure_dir_unknown_workspace() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repoConfig.ensureDir","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(v["error"]["message"], "Workspace not found");
 }

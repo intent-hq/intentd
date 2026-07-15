@@ -7014,6 +7014,60 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn get_repo_config(&self, id: WorkspaceId) -> BoxFuture<'_, Result<intent_core::RepoConfig>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let ws = store.get_workspace(&id).await?;
+            let Some(repo_path) = git_ops::worktree_path(&ws) else {
+                // No repo path → return empty config (tolerant, FE parity)
+                return Ok(intent_core::RepoConfig::default());
+            };
+            Ok(repo_config::read_repo_config(&repo_path).await)
+        })
+    }
+
+    fn save_repo_config(
+        &self,
+        id: WorkspaceId,
+        config: intent_core::RepoConfig,
+    ) -> BoxFuture<'_, Result<intent_core::RepoConfig>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let ws = store.get_workspace(&id).await?;
+            let Some(repo_path) = git_ops::worktree_path(&ws) else {
+                return Err(Error::Internal(
+                    "Cannot save repo config: workspace has no repository path".to_string(),
+                ));
+            };
+            repo_config::write_repo_config(&repo_path, config.clone()).await?;
+            Ok(config)
+        })
+    }
+
+    fn has_repo_config(&self, id: WorkspaceId) -> BoxFuture<'_, Result<bool>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let ws = store.get_workspace(&id).await?;
+            let Some(repo_path) = git_ops::worktree_path(&ws) else {
+                return Ok(false);
+            };
+            Ok(repo_config::has_repo_config(&repo_path))
+        })
+    }
+
+    fn ensure_repo_intent_dir(&self, id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let ws = store.get_workspace(&id).await?;
+            let Some(repo_path) = git_ops::worktree_path(&ws) else {
+                return Err(Error::Internal(
+                    "Cannot ensure .intent directory: workspace has no repository path".to_string(),
+                ));
+            };
+            repo_config::ensure_intent_dir(&repo_path).await
+        })
+    }
+
     fn get_workspace_context(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Vec<ContextItem>>> {
         let store = self.store.clone();
         Box::pin(async move {

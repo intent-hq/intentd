@@ -243,6 +243,37 @@ async fn dispatch(
             let setup_script = api.generate_setup_script(id).await.map_err(workspace_err)?;
             Ok(json!({ "setupScript": setup_script }))
         }
+        "repoConfig.get" => {
+            let id = require_workspace_id(params)?;
+            let config = api.get_repo_config(id).await.map_err(workspace_err)?;
+            Ok(json!({ "config": config }))
+        }
+        "repoConfig.save" => {
+            let id = require_workspace_id(params)?;
+            let config_value = params
+                .get("config")
+                .ok_or_else(|| rpc(INVALID_PARAMS, "config required"))?
+                .clone();
+            let config: intent_core::RepoConfig = serde_json::from_value(config_value)
+                .map_err(|e| rpc(INVALID_PARAMS, format!("invalid config: {e}")))?;
+            let saved_config = api
+                .save_repo_config(id, config)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "config": saved_config }))
+        }
+        "repoConfig.has" => {
+            let id = require_workspace_id(params)?;
+            let exists = api.has_repo_config(id).await.map_err(workspace_err)?;
+            Ok(json!({ "exists": exists }))
+        }
+        "repoConfig.ensureDir" => {
+            let id = require_workspace_id(params)?;
+            api.ensure_repo_intent_dir(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "ok": true }))
+        }
         "workspace.getContext" => {
             let id = require_workspace_id(params)?;
             let items = api.get_workspace_context(id).await.map_err(workspace_err)?;
