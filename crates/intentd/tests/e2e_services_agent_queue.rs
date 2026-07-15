@@ -154,6 +154,7 @@ async fn agent_queue_add_get_remove_lifecycle() {
     assert_eq!(removed2["success"], true);
 
     // Cleanup
+    drop(services); // Drop store handles before DB cleanup
     cleanup_db(&db);
     std::fs::remove_dir_all(&ws_root).ok();
 }
@@ -222,6 +223,7 @@ async fn agent_conversation_and_summary() {
     );
 
     // Cleanup
+    drop(services); // Drop store handles before DB cleanup
     cleanup_db(&db);
     std::fs::remove_dir_all(&ws_root).ok();
 }
@@ -264,6 +266,7 @@ async fn agent_diagnostics_baseline() {
     assert!(diag2["diagnostics"]["agents"].is_array());
 
     // Cleanup
+    drop(services); // Drop store handles before DB cleanup
     cleanup_db(&db);
     std::fs::remove_dir_all(&ws_root).ok();
 }

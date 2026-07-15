@@ -163,6 +163,7 @@ async fn note_add_edit_edit_lines() {
     assert!(note_after_line_edit.content.contains("Line replaced"));
 
     // Cleanup
+    drop(services); // Drop store handles before DB cleanup
     cleanup_db(&db);
     std::fs::remove_dir_all(&ws_root).ok();
 }
@@ -199,6 +200,7 @@ async fn note_list_tasks() {
     assert_eq!(tasks[2].status, "todo");
 
     // Cleanup
+    drop(services); // Drop store handles before DB cleanup
     cleanup_db(&db);
     std::fs::remove_dir_all(&ws_root).ok();
 }
@@ -245,6 +247,7 @@ async fn note_update_metadata() {
     assert_eq!(updated_note.content, "Content"); // Content unchanged
 
     // Cleanup
+    drop(services); // Drop store handles before DB cleanup
     cleanup_db(&db);
     std::fs::remove_dir_all(&ws_root).ok();
 }
