@@ -40,6 +40,18 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 const CHILD1_REPORT: &str = "CHILD1_DONE_PRE_RESTART";
 const CHILD2_REPORT: &str = "CHILD2_DONE_POST_RESTART";
 
+struct Daemon {
+    child: std::process::Child,
+    data_dir: PathBuf,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn free_port() -> u16 {
     StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .unwrap()
@@ -303,7 +315,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
-fn boot_daemon(data_dir: &PathBuf, port: u16, env: &[(&str, &str)]) -> std::process::Child {
+fn boot_daemon(data_dir: &PathBuf, port: u16, env: &[(&str, &str)]) -> Daemon {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
         .arg("--listen")
@@ -318,7 +330,11 @@ fn boot_daemon(data_dir: &PathBuf, port: u16, env: &[(&str, &str)]) -> std::proc
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.spawn().expect("spawn intentd serve")
+    let child = cmd.spawn().expect("spawn intentd serve");
+    Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    }
 }
 
 #[tokio::test]
@@ -328,12 +344,9 @@ async fn delegation_group_persists_across_restart() {
     };
 
     let data_dir = temp_data_dir();
-    eprintln!("[TEST] data_dir: {}", data_dir.display());
     let ws_id = seed_workspace_only(&data_dir).await;
-    eprintln!("[TEST] seeded workspace: {}", ws_id);
     let port = free_port();
     let socket = data_dir.join("intentd.sock");
-    eprintln!("[TEST] ready to boot daemon on port {}", port);
 
     // Mock ACP behavior: children report after delay (to ensure parent seals group first)
     let report1_js = format!(
@@ -397,24 +410,18 @@ async fn delegation_group_persists_across_restart() {
     ];
 
     // Phase 1: Boot, create parent, delegate both children
-    eprintln!("[TEST] booting daemon");
-    let mut daemon = boot_daemon(&data_dir, port, &env);
-    eprintln!("[TEST] waiting for UDS");
+    let _daemon = boot_daemon(&data_dir, port, &env);
     assert!(await_uds(&socket).await, "daemon start");
 
-    eprintln!("[TEST] getting fingerprint");
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .unwrap()
         .to_string();
-    eprintln!("[TEST] fingerprint: {}", fp);
     let cfg = client_config(&fp);
 
     // Subscribe BEFORE creating the parent so we don't miss events
-    eprintln!("[TEST] connecting subscription websocket");
     let mut sub = connect_ws(port, cfg.clone()).await;
-    eprintln!("[TEST] subscribing to events");
     wss_rpc(
         &mut sub,
         1,
@@ -422,11 +429,8 @@ async fn delegation_group_persists_across_restart() {
         json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
     )
     .await;
-    eprintln!("[TEST] subscription successful");
 
-    eprintln!("[TEST] connecting RPC websocket");
     let mut rpc = connect_ws(port, cfg.clone()).await;
-    eprintln!("[TEST] RPC websocket connected");
     let parent = wss_rpc(
         &mut rpc,
         10,
@@ -445,22 +449,17 @@ async fn delegation_group_persists_across_restart() {
     .await;
 
     // Wait for parent to idle after delegating
-    eprintln!("[TEST] waiting for parent idle after delegation");
     let mut parent_idle = false;
-    let mut received_events = Vec::new();
-    for i in 0..200 {
+    for _ in 0..200 {
         let frame = wss_event(&mut sub, 60).await;
         let ev = &frame["params"]["event"];
-        let ev_type = ev["type"].as_str().unwrap_or("UNKNOWN");
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
-        received_events.push(format!("{}:{}", ev_type, ev_agent));
-        eprintln!("[TEST] event {}: {} agent={}", i, ev_type, ev_agent);
         if ev["type"] == "agent:idle" && ev_agent == parent_id {
             parent_idle = true;
             break;
         }
     }
-    assert!(parent_idle, "parent went idle after delegating. Received events: {:?}", received_events);
+    assert!(parent_idle, "parent went idle after delegating");
 
     // Get child IDs from parent's waitingForAgentIds (more reliable than event capture)
     let lite = wss_rpc(&mut rpc, 12, "agent.get", json!({ "agentId": &parent_id })).await;
@@ -485,10 +484,9 @@ async fn delegation_group_persists_across_restart() {
     assert!(child1_idle, "child1 went idle");
 
     // Kill daemon before child2 completes
-    daemon.kill().expect("kill daemon");
-    daemon.wait().expect("wait daemon");
     drop(sub);
     drop(rpc);
+    drop(_daemon);
 
     // Insert interrupted_agent row for child2
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
@@ -509,7 +507,7 @@ async fn delegation_group_persists_across_restart() {
 
     // Restart daemon
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let mut daemon2 = boot_daemon(&data_dir, port, &env);
+    let _daemon2 = boot_daemon(&data_dir, port, &env);
     assert!(await_uds(&socket).await, "daemon restart");
 
     // Reconnect WSS
@@ -613,7 +611,4 @@ async fn delegation_group_persists_across_restart() {
         .await
         .expect("list groups after delivery");
     assert_eq!(final_groups.len(), 0, "group deleted after delivery");
-
-    daemon2.kill().expect("kill daemon2");
-    daemon2.wait().expect("wait daemon2");
 }
