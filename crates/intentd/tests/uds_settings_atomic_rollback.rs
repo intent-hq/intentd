@@ -503,3 +503,129 @@ async fn mixed_batch_with_sensitive_setting_full_rollback() {
     shutdown_tx.send(()).ok();
     let _ = std::fs::remove_file(&socket_path);
 }
+
+/// Regression: DB read error during old-value capture fails the batch before
+/// applying anything (Phase 3 wave 2, lib.rs:4484-4497). Proves that when
+/// Store::get_setting returns Err during snapshot capture, the whole batch fails
+/// with an error naming the key, and NO settings in the batch are applied.
+#[tokio::test]
+async fn db_read_error_during_capture_fails_batch() {
+    let tmpdb = TempDb::new();
+    let store = Store::open(&tmpdb.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store.clone())
+        .with_event_bus(bus.clone())
+        .with_secret_store(Arc::new(InMemorySecretStore::default()));
+
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+
+    let socket_path =
+        std::env::temp_dir().join(format!("db-fail-{}.sock", Uuid::new_v4().simple()));
+    let socket_path_clone = socket_path.clone();
+    let bus_clone = bus.clone();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        serve_uds(api, bus_clone, &socket_path_clone, None, async {
+            shutdown_rx.await.ok();
+        })
+        .await
+        .unwrap();
+    });
+
+    let stream = connect_retry(&socket_path).await;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // Establish baseline: set two non-sensitive keys
+    rpc(
+        &mut write_half,
+        &mut reader,
+        1,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "git.autoCommit", "value": false },
+            { "path": "workspace.autoFetch", "value": true },
+        ] }),
+    )
+    .await;
+
+    // Verify baseline
+    let v1 = rpc(
+        &mut write_half,
+        &mut reader,
+        2,
+        "settings.get",
+        json!({ "path": "git.autoCommit" }),
+    )
+    .await;
+    assert_eq!(v1["value"], false);
+    let v2 = rpc(
+        &mut write_half,
+        &mut reader,
+        3,
+        "settings.get",
+        json!({ "path": "workspace.autoFetch" }),
+    )
+    .await;
+    assert_eq!(v2["value"], true);
+
+    // Close the DB pool to inject failures into subsequent get_setting calls
+    store.pool().close().await;
+
+    // Attempt a batch update - should fail during capture before applying anything
+    let resp = call(
+        &mut write_half,
+        &mut reader,
+        4,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "git.autoCommit", "value": true },
+            { "path": "workspace.autoFetch", "value": false },
+        ] }),
+    )
+    .await;
+
+    // Should be a JSON-RPC error
+    assert!(
+        resp.get("error").is_some(),
+        "expected error response, got {resp}"
+    );
+    let err = &resp["error"];
+    let err_data = err["data"].as_str().unwrap_or("");
+    assert!(
+        err_data.contains("git.autoCommit") || err_data.contains("workspace.autoFetch"),
+        "error should name the failing key in data field: {err}"
+    );
+    assert!(
+        err_data.contains("during snapshot capture"),
+        "error should indicate failure during snapshot capture (not later during apply): {err}"
+    );
+
+    shutdown_tx.send(()).ok();
+    let _ = std::fs::remove_file(&socket_path);
+
+    // Verify atomicity: open a fresh Store against the same DB and confirm the
+    // baseline values remain unchanged (the batch failed during capture so
+    // nothing should have been applied).
+    let store2 = Store::open(&tmpdb.path).await.expect("reopen store");
+    let v1_after = store2
+        .get_setting("git.autoCommit")
+        .await
+        .expect("read git.autoCommit");
+    let v2_after = store2
+        .get_setting("workspace.autoFetch")
+        .await
+        .expect("read workspace.autoFetch");
+    assert_eq!(
+        v1_after,
+        Some("false".to_string()),
+        "git.autoCommit should still be false (baseline)"
+    );
+    assert_eq!(
+        v2_after,
+        Some("true".to_string()),
+        "workspace.autoFetch should still be true (baseline)"
+    );
+}
