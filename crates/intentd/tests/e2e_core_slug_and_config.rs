@@ -42,7 +42,9 @@ async fn workspace_id_derived_from_initial_agent_prompt() {
         "workspace id should be derived from prompt via extract_local_slug"
     );
 
-    // Clean up
+    // Clean up (drop store/services before removing SQLite files)
+    drop(services);
+    drop(store);
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
     }
@@ -81,7 +83,9 @@ async fn workspace_id_random_slug_when_no_prompt() {
         ws_id
     );
 
-    // Clean up
+    // Clean up (drop store/services before removing SQLite files)
+    drop(services);
+    drop(store);
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
     }
