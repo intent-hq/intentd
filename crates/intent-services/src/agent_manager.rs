@@ -1785,6 +1785,10 @@ impl AgentManager {
         }
         let workspace_id = self.agent_ws.lock().unwrap().remove(agent_id);
         if let Some(workspace_id) = workspace_id {
+            // Seal any open delegation group for this agent (its delegating turn is
+            // ending, so the expected set is final). Must happen before any child
+            // completions are processed to ensure the group is ready for fan-in.
+            self.services.seal_group_for_parent(&workspace_id, agent_id);
             self.services.agent_activity_end(&workspace_id).await;
             self.persist_status(agent_id, &workspace_id, AgentStatus::RuntimeIdle, false)
                 .await;

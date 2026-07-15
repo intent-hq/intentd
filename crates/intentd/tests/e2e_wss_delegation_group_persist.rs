@@ -327,7 +327,7 @@ async fn delegation_group_persists_across_restart() {
         "rules": [
             {
                 "ifPromptContains": "CHILD1",
-                "delayMs": 2000,
+                "delayMs": 8000,
                 "toolCall": {
                     "name": "workspace_api",
                     "arguments": { "code": report1_js, "summary": "child1 report" }
@@ -336,7 +336,7 @@ async fn delegation_group_persists_across_restart() {
             },
             {
                 "ifPromptContains": "CHILD2",
-                "delayMs": 2000,
+                "delayMs": 8000,
                 "toolCall": {
                     "name": "workspace_api",
                     "arguments": { "code": report2_js, "summary": "child2 report" }
@@ -565,6 +565,12 @@ async fn delegation_group_persists_across_restart() {
         .iter()
         .filter(|t| t.contains("[WORKSPACE EVENTS]"))
         .collect();
+    if wakes.len() != 1 {
+        eprintln!("\nGot {} wakes:", wakes.len());
+        for (i, w) in wakes.iter().enumerate() {
+            eprintln!("Wake {}: {}", i + 1, w);
+        }
+    }
     assert_eq!(wakes.len(), 1, "exactly one wake message");
     let wake = wakes[0];
     assert!(
