@@ -44,17 +44,18 @@ echo ""
 echo "Generating coverage report..."
 cargo llvm-cov report --summary-only
 
+# Generate lcov.info if requested (for CI artifact upload)
+# Do this BEFORE the floor check so the artifact is available even on failure
+if [ "${GENERATE_LCOV:-}" = "1" ]; then
+    echo ""
+    echo "Generating lcov.info..."
+    cargo llvm-cov report --lcov --output-path lcov.info
+fi
+
 # If --fail-under-lines is provided as first argument, enforce the floor
 if [ $# -gt 0 ]; then
     FLOOR="$1"
     echo ""
     echo "Enforcing line coverage floor: ${FLOOR}%"
     cargo llvm-cov report --fail-under-lines "$FLOOR"
-fi
-
-# Generate lcov.info if requested (for CI artifact upload)
-if [ "${GENERATE_LCOV:-}" = "1" ]; then
-    echo ""
-    echo "Generating lcov.info..."
-    cargo llvm-cov report --lcov --output-path lcov.info
 fi
