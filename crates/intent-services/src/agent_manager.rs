@@ -2271,10 +2271,11 @@ impl AgentManager {
             }
         }
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
-        let resolved = resolve_spawn(&session, workspace.as_ref())?;
+        let resolved = resolve_spawn(&session, workspace.as_ref(), &self.services.store).await?;
         let mut opts = SpawnOptions::new(&resolved.provider);
         opts.cwd = Some(&resolved.cwd);
         opts.model = resolved.model.as_deref();
+        opts.provider_binary = resolved.provider_binary.as_deref();
         opts.extra_env = resolved.extra_env.clone();
         if !self.contains(agent_id) {
             // Derive the agent type from the session's specialist `agentType`
@@ -2539,11 +2540,13 @@ fn append_attachment_blocks(blocks: &mut Vec<ContentBlock>, options: &TurnOption
 }
 
 /// Resolved spawn inputs for an agent: the provider config plus the owned model,
-/// cwd, and extra env the borrowing [`SpawnOptions`] reference during a spawn.
+/// cwd, provider binary path (when resolved), and extra env the borrowing
+/// [`SpawnOptions`] reference during a spawn.
 struct ResolvedSpawn {
     provider: ProviderConfig,
     model: Option<String>,
     cwd: PathBuf,
+    provider_binary: Option<PathBuf>,
     extra_env: BTreeMap<String, String>,
 }
 
@@ -2583,10 +2586,13 @@ fn derive_agent_type(
 /// id, else the default provider. The `mock` provider (E2E) reads its script
 /// from `MOCK_AGENT_SCRIPT_PATH` and enables `--mcp-config` so a daemon-spawned
 /// child reaches the per-agent workspace MCP server, forwarding
-/// `MOCK_AGENT_BEHAVIOR` to the child.
-fn resolve_spawn(
+/// `MOCK_AGENT_BEHAVIOR` to the child. Resolves the provider binary to an
+/// absolute path using the precedence: `providers.paths.<id>` → managed
+/// `~/.augment/bin/<command>` → enhanced PATH scan.
+async fn resolve_spawn(
     session: &AgentSession,
     workspace: Option<&intent_core::Workspace>,
+    store: &intent_store::Store,
 ) -> Result<ResolvedSpawn> {
     let provider_id = session
         .provider
@@ -2655,16 +2661,45 @@ fn resolve_spawn(
             provider,
             model: None,
             cwd,
+            provider_binary: None,
             extra_env,
         });
     }
 
+    let provider = *intent_providers::provider_config(&provider_id);
+
+    // Resolve provider binary using the precedence: setting → managed → PATH
+    let explicit_path = read_provider_path_setting(store, &provider_id).await;
+    let provider_binary = intent_providers::find_provider_binary(
+        &provider_id,
+        provider.command,
+        explicit_path.as_deref(),
+    );
+
     Ok(ResolvedSpawn {
-        provider: *intent_providers::provider_config(&provider_id),
+        provider,
         model,
         cwd,
+        provider_binary,
         extra_env,
     })
+}
+
+/// Read the `providers.paths.<id>` setting for a specific provider, if set.
+async fn read_provider_path_setting(
+    store: &intent_store::Store,
+    provider_id: &str,
+) -> Option<String> {
+    let json_str = store.get_setting("providers.paths").await.ok()??;
+    let value: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+    let map = value.as_object()?;
+    let path = map.get(provider_id)?.as_str()?;
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Background turn worker: drive the current message to completion, then drain

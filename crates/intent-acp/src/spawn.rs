@@ -85,9 +85,17 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
 
 /// Build the `tokio` command (args + env + enriched `PATH` + piped stdio +
 /// `kill_on_drop`) without spawning it. Exposed for testing/inspection.
+///
+/// When `opts.provider_binary` is set (resolved to an absolute path), spawns
+/// that path directly; otherwise falls back to the bare `opts.provider.command`
+/// and relies on the enriched `PATH`.
 pub fn build_command(opts: &SpawnOptions) -> Command {
     let args = build_args(opts);
-    let mut cmd = Command::new(opts.provider.command);
+    let command = opts
+        .provider_binary
+        .map(|p| p.as_os_str())
+        .unwrap_or_else(|| std::ffi::OsStr::new(opts.provider.command));
+    let mut cmd = Command::new(command);
     cmd.args(&args);
     if let Some(cwd) = opts.cwd {
         cmd.current_dir(cwd);
@@ -142,9 +150,13 @@ impl SpawnedAgent {
 /// Spawn the provider and wire up its [`Connection`] (§6.2 + §6.3).
 pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<SpawnedAgent> {
     let mut cmd = build_command(opts);
+    let command_name = opts
+        .provider_binary
+        .and_then(|p| p.to_str())
+        .unwrap_or(opts.provider.command);
     let mut child = cmd
         .spawn()
-        .map_err(|e| AcpError::Spawn(format!("{}: {e}", opts.provider.command)))?;
+        .map_err(|e| AcpError::Spawn(format!("{command_name}: {e}")))?;
     let stdin = child
         .stdin
         .take()
@@ -200,5 +212,45 @@ mod build_args_tests {
                 "{id} spawn args unexpectedly include --remove-tool: {args:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod build_command_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn build_command_uses_bare_command_when_provider_binary_is_none() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let opts = SpawnOptions::new(provider);
+        let cmd = build_command(&opts);
+        let program = cmd.as_std().get_program();
+        assert_eq!(program, "auggie");
+    }
+
+    #[test]
+    fn build_command_uses_absolute_path_when_provider_binary_is_set() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let resolved_path = PathBuf::from("/usr/local/bin/auggie");
+        opts.provider_binary = Some(&resolved_path);
+        let cmd = build_command(&opts);
+        let program = cmd.as_std().get_program();
+        assert_eq!(program, "/usr/local/bin/auggie");
+    }
+
+    #[test]
+    fn build_command_enriches_path_with_provider_binary_parent() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let resolved_path = PathBuf::from("/custom/dir/auggie");
+        opts.provider_binary = Some(&resolved_path);
+        let cmd = build_command(&opts);
+        let env_path = cmd.as_std().get_envs().find(|(k, _)| *k == "PATH");
+        assert!(env_path.is_some());
+        let path_value = env_path.unwrap().1.unwrap().to_string_lossy();
+        // The parent dir should be first in the PATH
+        assert!(path_value.starts_with("/custom/dir:") || path_value.starts_with("/custom/dir;"));
     }
 }
