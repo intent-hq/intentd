@@ -231,6 +231,11 @@ async function handlePrompt(id, params) {
     try {
       const resp = await callClientService(call.method, call.params);
       log(`client call ok: ${call.method} → ${JSON.stringify(resp).slice(0, 120)}`);
+      // If assertError was set, the call should have failed but succeeded instead
+      if (call.assertError !== undefined) {
+        log(`assertion failed: expected error but got success for ${call.method}`);
+        return result(id, { stopReason: 'refusal' });
+      }
       // Optional assertion on the result (structural subset match)
       if (call.assertResult !== undefined) {
         if (!structuralSubsetMatch(call.assertResult, resp)) {
@@ -365,7 +370,8 @@ rl.on('line', async (line) => {
   }
   // If this is a response to a client call we issued (has an id and either result or error),
   // resolve or reject the pending promise. Otherwise dispatch it as a daemon→agent request.
-  if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+  // JSON-RPC responses have no 'method' field.
+  if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined) && msg.method === undefined) {
     const pending = pendingClientCalls.get(msg.id);
     if (pending) {
       pendingClientCalls.delete(msg.id);
@@ -378,6 +384,10 @@ rl.on('line', async (line) => {
       }
       return;
     }
+    // Unknown/expired id (e.g., after timeout cleanup) - drop the response instead of
+    // dispatching it (responses have no 'method', so dispatch would fail/misbehave).
+    log(`dropping response for unknown/expired id ${msg.id}`);
+    return;
   }
   // Not a client-call response; dispatch it
   try {

@@ -390,6 +390,10 @@ async fn terminal_lifecycle() {
                     "command": "echo",
                     "args": ["terminal-test-marker"]
                 },
+                // Assert that terminalId is returned - proves create succeeded
+                "assertResult": {
+                    "terminalId": "pty-0"
+                }
             },
             {
                 "method": "terminal/wait_for_exit",
@@ -463,6 +467,9 @@ async fn terminal_kill_running_process() {
                     "command": "sleep",
                     "args": ["30"]
                 },
+                "assertResult": {
+                    "terminalId": "pty-0"
+                }
             },
             {
                 "method": "terminal/kill",
@@ -521,6 +528,9 @@ async fn terminal_output_truncation() {
                     "args": ["-c", "i=1; while [ $i -le 200 ]; do echo line-$i; i=$((i+1)); done"],
                     "outputByteLimit": 512
                 },
+                "assertResult": {
+                    "terminalId": "pty-0"
+                }
             },
             {
                 "method": "terminal/wait_for_exit",
@@ -591,6 +601,9 @@ async fn terminal_non_zero_exit() {
                     "command": "sh",
                     "args": ["-c", "exit 42"]
                 },
+                "assertResult": {
+                    "terminalId": "pty-0"
+                }
             },
             {
                 "method": "terminal/wait_for_exit",
@@ -756,6 +769,9 @@ async fn terminal_output_after_exit() {
                     "command": "echo",
                     "args": ["done"]
                 },
+                "assertResult": {
+                    "terminalId": "pty-0"
+                }
             },
             {
                 "method": "terminal/wait_for_exit",
