@@ -45,10 +45,53 @@ impl Services {
             }
             None => None,
         };
+        // Binary resolution order (per spec Design): self.auggie_bin (test seam) →
+        // context.auggiePath (user setting, EXCLUSIVE when set) → find_auggie().
         let auggie = match &self.auggie_bin {
             Some(bin) => bin.clone(),
-            None => intent_context::discovery::find_auggie()
-                .ok_or_else(|| Error::Internal("auggie CLI not found".to_string()))?,
+            None => {
+                // Check context.auggiePath first; when set and non-empty, use it
+                // EXCLUSIVELY (fail hard if invalid rather than falling through).
+                match self.store.get_setting("context.auggiePath").await {
+                    Ok(Some(raw)) => {
+                        let value: serde_json::Value =
+                            serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+                        if let Some(s) = value.as_str() {
+                            let trimmed = s.trim();
+                            if !trimmed.is_empty() {
+                                let p = PathBuf::from(trimmed);
+                                if p.is_file() {
+                                    p
+                                } else {
+                                    return Err(Error::InvalidParams(format!(
+                                        "configured auggie path is not a valid file: {}",
+                                        trimmed
+                                    )));
+                                }
+                            } else {
+                                // Empty string → fall through to discovery
+                                intent_context::discovery::find_auggie().ok_or_else(|| {
+                                    Error::Internal("auggie CLI not found".to_string())
+                                })?
+                            }
+                        } else {
+                            // Non-string value → invalid configuration
+                            return Err(Error::InvalidParams(
+                                "context.auggiePath must be a string".to_string(),
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        // DB error → surface it
+                        return Err(e);
+                    }
+                    Ok(None) => {
+                        // Setting not found → fall through to discovery
+                        intent_context::discovery::find_auggie()
+                            .ok_or_else(|| Error::Internal("auggie CLI not found".to_string()))?
+                    }
+                }
+            }
         };
         // `System: <system>\n\n<prompt>` mirrors the FE streamChat composition
         // when a system prompt is supplied; otherwise the raw prompt is piped
@@ -167,6 +210,55 @@ mod tests {
             err.to_string().contains("exited with code 3"),
             "got {err:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_resolution_order() {
+        use serde_json::json;
+
+        let fake = fake_auggie("setting", "printf 'from-setting\\n'");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+
+        // Case 1: context.auggiePath set and valid → use it exclusively
+        store
+            .set_setting(
+                "context.auggiePath",
+                &json!(fake.to_str().unwrap()).to_string(),
+            )
+            .await
+            .expect("set setting");
+        let services = Services::new(store.clone());
+        let result = services
+            .agent_complete_once_op("test".into(), None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result["text"], "from-setting");
+
+        // Case 2: context.auggiePath set but invalid → fail hard
+        store
+            .set_setting(
+                "context.auggiePath",
+                &json!("/nonexistent/auggie").to_string(),
+            )
+            .await
+            .expect("set setting");
+        let services = Services::new(store.clone());
+        let err = services
+            .agent_complete_once_op("test".into(), None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("configured auggie path is not a valid file"),
+            "got {err:?}"
+        );
+
+        // Case 3: context.auggiePath empty → fall through to discovery
+        // (skip this case since a real auggie on the system would make it nondeterministic)
+
+        std::fs::remove_file(&fake).ok();
     }
 
     #[tokio::test]

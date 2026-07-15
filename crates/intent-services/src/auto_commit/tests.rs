@@ -12,7 +12,9 @@ use intent_core::{
 use intent_store::Store;
 use serde_json::json;
 
-use crate::auto_commit::{is_meaningful_agent_name, is_normal_finish_reason, normalize_subject};
+use crate::auto_commit::{
+    is_meaningful_agent_name, is_normal_finish_reason, normalize_subject, parse_commit_message,
+};
 use crate::Services;
 
 struct TempDb {
@@ -204,7 +206,10 @@ async fn setup_dirty_workspace(repo: &GitRepo) -> (TempDb, Services, WorkspaceId
     store.insert_workspace(&ws).await.expect("insert ws");
     // Make the worktree dirty so git_agent_commit has something to stage.
     std::fs::write(repo.dir.join("change.txt"), "agent edit\n").unwrap();
-    let services = Services::new(store);
+    // Inject a missing auggie path so generation falls back to the deterministic
+    // subject, preserving pre-LLM test semantics.
+    let services =
+        Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
     (tmp, services, ws_id)
 }
 
@@ -244,6 +249,17 @@ async fn last_commit_trailers(dir: &std::path::Path) -> (Option<String>, Option<
     let commits = intent_git::history::history(dir, 1).unwrap();
     let head = commits.into_iter().next().expect("at least one commit");
     (head.agent_id, head.linked_note_id, head.message)
+}
+
+#[cfg(unix)]
+fn fake_auggie(tag: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("intentd-acommit-{tag}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("auggie");
+    std::fs::write(&bin, format!("#!/bin/sh\ncat > /dev/null\n{body}\n")).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
 }
 
 #[tokio::test]
@@ -364,4 +380,120 @@ async fn fallback_subject_uses_default_for_auto_named_non_task_agent() {
     svc.handle_agent_idle_auto_commit(&event).await;
     let (_a, _l, message) = last_commit_trailers(&repo.dir).await;
     assert!(message.starts_with("Agent changes"), "subject: {message}");
+}
+
+#[test]
+fn parse_commit_message_extracts_tagged_output() {
+    let output = "some preamble\n<<<COMMIT_MESSAGE>>>\nfeat: add feature\n\nBody text\n<<</COMMIT_MESSAGE>>>\ntrailing text";
+    let parsed = parse_commit_message(output).unwrap();
+    assert_eq!(parsed, "feat: add feature\n\nBody text");
+}
+
+#[test]
+fn parse_commit_message_rejects_missing_tags() {
+    assert!(parse_commit_message("no tags here").is_none());
+    assert!(parse_commit_message("<<<COMMIT_MESSAGE>>>incomplete").is_none());
+}
+
+#[test]
+fn parse_commit_message_rejects_empty() {
+    assert!(parse_commit_message("<<<COMMIT_MESSAGE>>>   <<</COMMIT_MESSAGE>>>").is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn generated_message_replaces_fallback_subject() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let bin = fake_auggie(
+        "gen-ok",
+        "printf '<<<COMMIT_MESSAGE>>>\\nfeat: implement auto-commit\\n<<</COMMIT_MESSAGE>>>'",
+    );
+    let svc = svc.with_auggie_bin(bin);
+    let agent = session("agent-g1", &ws_id, None, false, "Builder", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    let event = idle_event(&ws_id, "agent-g1", "end_turn");
+    svc.handle_agent_idle_auto_commit(&event).await;
+    let (_a, _l, message) = last_commit_trailers(&repo.dir).await;
+    assert!(
+        message.starts_with("feat: implement auto-commit"),
+        "got: {message}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn generation_timeout_falls_back_to_subject() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let bin = fake_auggie("timeout", "sleep 60");
+    let svc = svc.with_auggie_bin(bin);
+    let agent = session("agent-t1", &ws_id, None, false, "Timeout Agent", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    let event = idle_event(&ws_id, "agent-t1", "end_turn");
+    svc.handle_agent_idle_auto_commit(&event).await;
+    let (_a, _l, message) = last_commit_trailers(&repo.dir).await;
+    // Fell back to the agent name.
+    assert!(message.starts_with("Timeout Agent"), "got: {message}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn malformed_output_falls_back_to_subject() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let bin = fake_auggie("malformed", "printf 'no tags at all'");
+    let svc = svc.with_auggie_bin(bin);
+    let agent = session("agent-m1", &ws_id, None, false, "Malformed Agent", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    let event = idle_event(&ws_id, "agent-m1", "end_turn");
+    svc.handle_agent_idle_auto_commit(&event).await;
+    let (_a, _l, message) = last_commit_trailers(&repo.dir).await;
+    assert!(message.starts_with("Malformed Agent"), "got: {message}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn no_changes_skips_generation_and_commit() {
+    let repo = init_git_repo();
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    let ws = workspace_with_repo(&ws_id, &repo);
+    store.insert_workspace(&ws).await.unwrap();
+    // No dirty files — the CLI should not be spawned.
+    let bin = fake_auggie("nochanges", "exit 99");
+    let svc = Services::new(store).with_auggie_bin(bin);
+    let agent = session("agent-n1", &ws_id, None, false, "X", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    let event = idle_event(&ws_id, "agent-n1", "end_turn");
+    svc.handle_agent_idle_auto_commit(&event).await;
+    let commits = intent_git::history::history(&repo.dir, 5).unwrap();
+    // Only the seed commit exists; auggie exit 99 never ran.
+    assert_eq!(commits.len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn generated_message_preserves_trailers() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let note = task_note(&ws_id, "task-gen", "LLM commit task");
+    svc.store().insert_note(&note).await.unwrap();
+    let bin = fake_auggie(
+        "trailers",
+        "printf '<<<COMMIT_MESSAGE>>>\\nchore: generated commit\\n<<</COMMIT_MESSAGE>>>'",
+    );
+    let svc = svc.with_auggie_bin(bin);
+    let agent = session("agent-tr", &ws_id, Some("task-gen"), false, "Builder", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    let event = idle_event(&ws_id, "agent-tr", "end_turn");
+    svc.handle_agent_idle_auto_commit(&event).await;
+    let (agent_id, linked_note_id, message) = last_commit_trailers(&repo.dir).await;
+    assert_eq!(agent_id.as_deref(), Some("agent-tr"));
+    assert_eq!(linked_note_id.as_deref(), Some("task-gen"));
+    assert!(
+        message.starts_with("chore: generated commit"),
+        "got: {message}"
+    );
 }
