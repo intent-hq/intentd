@@ -80,22 +80,31 @@ pub async fn resolve(source: &TokenSource) -> Option<Credentials> {
 /// runtime on the blocking pool with a bounded timeout so a stalled backing
 /// store cannot wedge a tokio worker.
 async fn file_store_credentials() -> Option<Credentials> {
-    let handle = tokio::task::spawn_blocking(|| {
+    type LoadResult = Result<Option<(Option<String>, Option<String>)>, intent_core::error::Error>;
+    let handle = tokio::task::spawn_blocking(|| -> LoadResult {
         let store = intent_core::FileSecretStore::new();
         let token = store.load(SECRET_TOKEN_ACCOUNT)?;
         let organization = store.load(SECRET_ORG_ACCOUNT)?;
-        Some((token, organization))
+        Ok(Some((token, organization)))
     });
     let pair = match timeout(SECRET_LOAD_TIMEOUT, handle).await {
-        Ok(Ok(Some(pair))) => pair,
-        Ok(Ok(None)) | Ok(Err(_)) => return None,
+        Ok(Ok(Ok(Some(pair)))) => pair,
+        Ok(Ok(Ok(None))) => return None,
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(
+                error = %e,
+                "secrets-store load failed for sentry credentials (corrupt/unreadable file)"
+            );
+            return None;
+        }
+        Ok(Err(_)) => return None,
         Err(_) => {
             tracing::warn!("secrets-store load timed out for sentry credentials");
             return None;
         }
     };
-    let token = non_empty(pair.0)?;
-    let organization = non_empty(pair.1)?;
+    let token = non_empty(pair.0.unwrap_or_default())?;
+    let organization = non_empty(pair.1.unwrap_or_default())?;
     Some(Credentials {
         token,
         organization,

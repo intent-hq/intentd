@@ -65,7 +65,7 @@ pub struct FileTokenStore {
 
 impl TokenStore for FileTokenStore {
     fn load_token(&self) -> Option<String> {
-        self.secrets.load(TOKEN_ACCOUNT)
+        self.secrets.load(TOKEN_ACCOUNT).ok().flatten()
     }
 
     fn store_token(&self, token: &str) -> Result<()> {

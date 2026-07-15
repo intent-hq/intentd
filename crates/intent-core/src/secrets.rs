@@ -80,10 +80,11 @@ impl FileSecretStore {
         &self.path
     }
 
-    /// Return the stored secret for `account`, or `None` if unset, empty, or
-    /// the file is missing/unreadable.
-    pub fn load(&self, account: &str) -> Option<String> {
-        self.read_map().remove(account)
+    /// Return the stored secret for `account`: `Ok(Some(value))` if present,
+    /// `Ok(None)` if confirmed absent (missing file or key not in map), or
+    /// `Err` if the backing file is unreadable or corrupt (IO/parse failure).
+    pub fn load(&self, account: &str) -> Result<Option<String>> {
+        self.read_map_strict().map(|mut map| map.remove(account))
     }
 
     /// Persist `value` for `account`, replacing any existing secret.
@@ -103,8 +104,34 @@ impl FileSecretStore {
         self.persist(&map)
     }
 
+    /// Read and parse the backing file (strict, error-propagating variant).
+    /// Missing file ⇒ `Ok(empty map)`; unreadable/corrupt file ⇒ `Err`.
+    fn read_map_strict(&self) -> Result<BTreeMap<String, String>> {
+        let bytes = match std::fs::read(&self.path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(e) => {
+                return Err(Error::Internal(format!(
+                    "failed to read secrets file {}: {}",
+                    self.path.display(),
+                    e
+                )))
+            }
+        };
+        serde_json::from_slice::<BTreeMap<String, String>>(&bytes)
+            .map(|map| map.into_iter().filter(|(_, v)| !v.is_empty()).collect())
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "corrupt secrets file {}: {}",
+                    self.path.display(),
+                    e
+                ))
+            })
+    }
+
     /// Read and parse the backing file, filtering out empty-string values.
     /// Missing file ⇒ empty map; unreadable/corrupt file ⇒ warn + empty map.
+    /// (Used by `store`/`delete` which can tolerate corruption and overwrite.)
     fn read_map(&self) -> BTreeMap<String, String> {
         let bytes = match std::fs::read(&self.path) {
             Ok(b) => b,
@@ -216,14 +243,26 @@ mod tests {
     fn round_trip_store_load() {
         let tmp = TempDir::new();
         let store = tmp.store();
-        assert_eq!(store.load("github.token"), None);
+        assert_eq!(store.load("github.token").unwrap(), None);
         store.store("github.token", "s3cret").unwrap();
-        assert_eq!(store.load("github.token"), Some("s3cret".to_string()));
+        assert_eq!(
+            store.load("github.token").unwrap(),
+            Some("s3cret".to_string())
+        );
         store.store("github.token", "rotated").unwrap();
-        assert_eq!(store.load("github.token"), Some("rotated".to_string()));
+        assert_eq!(
+            store.load("github.token").unwrap(),
+            Some("rotated".to_string())
+        );
         store.store("linear.token", "other").unwrap();
-        assert_eq!(store.load("github.token"), Some("rotated".to_string()));
-        assert_eq!(store.load("linear.token"), Some("other".to_string()));
+        assert_eq!(
+            store.load("github.token").unwrap(),
+            Some("rotated".to_string())
+        );
+        assert_eq!(
+            store.load("linear.token").unwrap(),
+            Some("other".to_string())
+        );
     }
 
     #[test]
@@ -237,7 +276,7 @@ mod tests {
         );
         store.store("a", "1").unwrap();
         store.delete("a").unwrap();
-        assert_eq!(store.load("a"), None);
+        assert_eq!(store.load("a").unwrap(), None);
         store.delete("a").unwrap();
     }
 
@@ -246,23 +285,26 @@ mod tests {
         let tmp = TempDir::new();
         let store = tmp.store();
         std::fs::write(store.path(), r#"{"empty":"","set":"v"}"#).unwrap();
-        assert_eq!(store.load("empty"), None);
-        assert_eq!(store.load("set"), Some("v".to_string()));
+        assert_eq!(store.load("empty").unwrap(), None);
+        assert_eq!(store.load("set").unwrap(), Some("v".to_string()));
     }
 
     #[test]
-    fn corrupt_file_is_tolerated_and_rewritten_on_store() {
+    fn corrupt_file_errors_on_load_but_rewritten_on_store() {
         let tmp = TempDir::new();
         let store = tmp.store();
         std::fs::write(store.path(), "not json {{{").unwrap();
-        assert_eq!(store.load("a"), None);
+        // Load now returns Err for corrupt file (new fail-closed semantics)
+        assert!(store.load("a").is_err());
+        // Delete is lenient and succeeds without touching the corrupt file
         store.delete("a").unwrap();
         assert_eq!(
             std::fs::read_to_string(store.path()).unwrap(),
             "not json {{{"
         );
+        // Store overwrites the corrupt file with a fresh map
         store.store("a", "1").unwrap();
-        assert_eq!(store.load("a"), Some("1".to_string()));
+        assert_eq!(store.load("a").unwrap(), Some("1".to_string()));
         let map: BTreeMap<String, String> =
             serde_json::from_str(&std::fs::read_to_string(store.path()).unwrap()).unwrap();
         assert_eq!(map.len(), 1);

@@ -47,7 +47,7 @@ pub trait SecretStore: Send + Sync {
 /// are the sensitive setting paths (account = setting path).
 impl SecretStore for intent_core::FileSecretStore {
     fn load(&self, account: &str) -> Result<Option<String>> {
-        Ok(intent_core::FileSecretStore::load(self, account))
+        intent_core::FileSecretStore::load(self, account)
     }
 
     fn store(&self, account: &str, value: &str) -> Result<()> {
