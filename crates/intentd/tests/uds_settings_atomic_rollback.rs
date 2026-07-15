@@ -602,7 +602,26 @@ async fn db_read_error_during_capture_fails_batch() {
     shutdown_tx.send(()).ok();
     let _ = std::fs::remove_file(&socket_path);
 
-    // NOTE: We can't verify the values are unchanged by re-reading because the
-    // pool is closed. The important assertion is that the batch FAILED during
-    // capture (proven by the error response) rather than partially applying.
+    // Verify atomicity: open a fresh Store against the same DB and confirm the
+    // baseline values remain unchanged (the batch failed during capture so
+    // nothing should have been applied).
+    let store2 = Store::open(&tmpdb.path).await.expect("reopen store");
+    let v1_after = store2
+        .get_setting("git.autoCommit")
+        .await
+        .expect("read git.autoCommit");
+    let v2_after = store2
+        .get_setting("workspace.autoFetch")
+        .await
+        .expect("read workspace.autoFetch");
+    assert_eq!(
+        v1_after,
+        Some("false".to_string()),
+        "git.autoCommit should still be false (baseline)"
+    );
+    assert_eq!(
+        v2_after,
+        Some("true".to_string()),
+        "workspace.autoFetch should still be true (baseline)"
+    );
 }
