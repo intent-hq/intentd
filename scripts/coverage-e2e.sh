@@ -37,11 +37,12 @@ for test_file in "${test_files[@]}"; do
         continue
     fi
     echo "Running test: $test_name"
-    # Skip known flaky tests under llvm-cov instrumentation (STAB-40, STAB-42)
+    # Skip known flaky tests under llvm-cov instrumentation (STAB-40, STAB-42, STAB-43)
     # These skips DEFLATE coverage (we lose their contribution) but prevent spurious CI failures
     cargo llvm-cov --no-report -p intentd --test "$test_name" -- \
         --skip wss_note_save_asset_round_trip \
-        --skip slow_host_exec_does_not_block_fast_workspace_list
+        --skip slow_host_exec_does_not_block_fast_workspace_list \
+        --skip capture_login_shell_path_with_fake_shell
 done
 
 echo ""
