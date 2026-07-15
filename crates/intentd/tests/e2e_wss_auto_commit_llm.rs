@@ -100,6 +100,8 @@ fn run_git(args: &[&str], cwd: &Path) -> String {
 /// Initialize a git repo with a seed commit.
 fn init_git_repo(dir: &Path) {
     run_git(&["init", "-q", "-b", "main"], dir);
+    run_git(&["config", "user.name", "Test"], dir);
+    run_git(&["config", "user.email", "test@example.com"], dir);
     run_git(&["config", "commit.gpgsign", "false"], dir);
     std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
     run_git(&["add", "seed.txt"], dir);
