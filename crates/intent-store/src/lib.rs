@@ -15,6 +15,7 @@ pub use intent_core::{Error, Result};
 mod agent_repo;
 mod client_repo;
 mod comment_repo;
+mod delegation_group_repo;
 mod diffs_repo;
 mod draft_repo;
 mod event_repo;
@@ -36,6 +37,7 @@ mod workspace_repo;
 mod workspace_ui_context_repo;
 
 pub use agent_repo::{InterruptedAgent, ReplaceMessage};
+pub use delegation_group_repo::PersistedDelegationGroup;
 pub use diffs_repo::{DiffRow, NewDiff};
 pub use event_repo::{EventQuery, NewEvent};
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};

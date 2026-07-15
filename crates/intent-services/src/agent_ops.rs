@@ -15,8 +15,8 @@ use intent_core::events::{
 };
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
-    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput, Error, EventActor,
-    NoteId, Result, SessionStats, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
+    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput, Error, Event,
+    EventActor, NoteId, Result, SessionStats, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
 };
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
@@ -3859,6 +3859,10 @@ impl Services {
 
         let workspace_id = interrupted.workspace_id.clone();
 
+        // Rehydrate delegation groups for this workspace (idempotent, best-effort).
+        // Groups are sealed on rehydration since the original parent turn is gone.
+        let _ = self.rehydrate_delegation_groups(&workspace_id).await;
+
         // Load the session to check for delegation metadata
         let session = self.store.get_agent_session(agent_id).await?;
 
@@ -3882,25 +3886,44 @@ impl Services {
                     .map(|s| s.name)
                     .unwrap_or_default();
 
-                // Register completion watch (dedupe via find_and_refresh_ungrouped_watch)
-                let _sub_id = self
-                    .find_and_refresh_ungrouped_watch(
+                // Check if this agent is in a rehydrated delegation group
+                let groups = self.list_groups_for_parent(&workspace_id, &parent);
+                let group_id = groups
+                    .iter()
+                    .find(|g| g.expected_agent_ids.contains(agent_id))
+                    .map(|g| g.group_id.clone());
+
+                if let Some(gid) = group_id {
+                    // Register grouped completion watch for after_all fan-in
+                    let _sub_id = self.register_completion_watch(
                         &workspace_id,
-                        &parent,
-                        agent_id,
+                        parent,
+                        parent_name,
+                        agent_id.clone(),
                         true,
-                        Some(parent_name.clone()),
-                    )
-                    .unwrap_or_else(|| {
-                        self.register_completion_watch(
+                        Some(gid),
+                    );
+                } else {
+                    // Register ungrouped completion watch (dedupe via find_and_refresh)
+                    let _sub_id = self
+                        .find_and_refresh_ungrouped_watch(
                             &workspace_id,
-                            parent,
-                            parent_name,
-                            agent_id.clone(),
+                            &parent,
+                            agent_id,
                             true,
-                            None,
+                            Some(parent_name.clone()),
                         )
-                    });
+                        .unwrap_or_else(|| {
+                            self.register_completion_watch(
+                                &workspace_id,
+                                parent,
+                                parent_name,
+                                agent_id.clone(),
+                                true,
+                                None,
+                            )
+                        });
+                }
             }
         }
 
@@ -3957,6 +3980,49 @@ impl Services {
             })?;
 
         let workspace_id = interrupted.workspace_id.clone();
+
+        // Rehydrate delegation groups for this workspace (idempotent, best-effort).
+        let _ = self.rehydrate_delegation_groups(&workspace_id).await;
+
+        // Load the session to check for delegation group membership
+        let session = self.store.get_agent_session(agent_id).await.ok();
+        if let Some(session) = &session {
+            if let Some(parent_id) = &session.parent_agent_id {
+                // Check if this agent is in a delegation group
+                let groups = self.list_groups_for_parent(&workspace_id, parent_id);
+                for group in groups {
+                    if group.expected_agent_ids.contains(agent_id) {
+                        // Record this child as deleted in the group (AS-4 abandoned child path).
+                        // Build a minimal deleted-agent event for group completeness tracking.
+                        let deleted_event = Event {
+                            id: format!("abandon-{}", agent_id.0),
+                            workspace_id: workspace_id.clone(),
+                            timestamp: now_iso(),
+                            event_type: AGENT_DELETED.to_string(),
+                            actor: EventActor {
+                                actor_type: ActorType::System,
+                                id: Some("intentd".to_string()),
+                                name: Some("intentd".to_string()),
+                                ..Default::default()
+                            },
+                            session_id: Some(agent_id.0.clone()),
+                            correlation_id: None,
+                            parent_event_id: None,
+                            metadata: None,
+                            data: json!({ "agentId": agent_id.0 }),
+                        };
+                        self.record_group_child_completion(
+                            &workspace_id,
+                            &group.group_id,
+                            agent_id,
+                            true,
+                            format!("Agent {} abandoned during restart", agent_id.0),
+                            deleted_event,
+                        );
+                    }
+                }
+            }
+        }
 
         // Build the system interruption message
         let text = "This conversation was interrupted because intentd restarted. The agent's in-flight work was terminated.";

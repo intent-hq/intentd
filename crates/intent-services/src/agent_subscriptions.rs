@@ -13,13 +13,15 @@
 
 use std::sync::Arc;
 
+use intent_store::PersistedDelegationGroup;
+
 // Use `tokio::time::Instant` (not `std::time::Instant`) for the cleanup
 // deadline: Tokio timers/instants follow Tokio's time source while
 // `std::time::Instant` always reads real time; mixing them makes deadline
 // checks incorrect in paused-time tests (see `tokio::time::pause`).
 use tokio::time::Instant;
 
-use intent_core::{now_iso, AgentId, Event, WorkspaceId};
+use intent_core::{now_iso, AgentId, Error, Event, Result, WorkspaceId};
 use uuid::Uuid;
 
 use crate::Services;
@@ -331,7 +333,7 @@ impl Services {
             return g.group_id.clone();
         }
         let group_id = Uuid::new_v4().to_string();
-        entry.delegation_groups.push(DelegationGroup {
+        let group = DelegationGroup {
             group_id: group_id.clone(),
             parent_agent_id: parent_id.clone(),
             await_mode: "after_all".to_string(),
@@ -343,7 +345,11 @@ impl Services {
             delivered: false,
             event_summaries: Vec::new(),
             raw_events: Vec::new(),
-        });
+        };
+        entry.delegation_groups.push(group.clone());
+        drop(guard);
+        // Write-through persist (best-effort).
+        self.persist_delegation_group(workspace_id, &group);
         group_id
     }
 
@@ -361,7 +367,7 @@ impl Services {
         let Some(w) = guard.get_mut(workspace_id) else {
             return;
         };
-        if let Some(g) = w
+        let group_clone = if let Some(g) = w
             .delegation_groups
             .iter_mut()
             .find(|g| g.group_id == group_id)
@@ -369,6 +375,14 @@ impl Services {
             if !g.expected_agent_ids.contains(child_id) {
                 g.expected_agent_ids.push(child_id.clone());
             }
+            Some(g.clone())
+        } else {
+            None
+        };
+        drop(guard);
+        // Write-through persist (best-effort).
+        if let Some(g) = group_clone {
+            self.persist_delegation_group(workspace_id, &g);
         }
     }
 
@@ -389,7 +403,12 @@ impl Services {
             .iter_mut()
             .find(|g| &g.parent_agent_id == parent_id && !g.sealed && !g.delivered)?;
         g.sealed = true;
-        Some(g.group_id.clone())
+        let group_id = g.group_id.clone();
+        let group_clone = g.clone();
+        drop(guard);
+        // Write-through persist (best-effort).
+        self.persist_delegation_group(workspace_id, &group_clone);
+        Some(group_id)
     }
 
     /// Whether `child_id` is enrolled in an undelivered `after_all` delegation
@@ -439,26 +458,33 @@ impl Services {
         let Some(w) = guard.get_mut(workspace_id) else {
             return;
         };
-        let Some(g) = w
+        let group_clone = if let Some(g) = w
             .delegation_groups
             .iter_mut()
             .find(|g| g.group_id == group_id)
-        else {
-            return;
-        };
-        if !g.expected_agent_ids.contains(child_id) {
-            return;
-        }
-        if g.completed_agent_ids.contains(child_id) || g.deleted_agent_ids.contains(child_id) {
-            return;
-        }
-        if deleted {
-            g.deleted_agent_ids.push(child_id.clone());
+        {
+            if !g.expected_agent_ids.contains(child_id) {
+                return;
+            }
+            if g.completed_agent_ids.contains(child_id) || g.deleted_agent_ids.contains(child_id) {
+                return;
+            }
+            if deleted {
+                g.deleted_agent_ids.push(child_id.clone());
+            } else {
+                g.completed_agent_ids.push(child_id.clone());
+            }
+            g.event_summaries.push(summary);
+            g.raw_events.push(Arc::new(event));
+            Some(g.clone())
         } else {
-            g.completed_agent_ids.push(child_id.clone());
+            None
+        };
+        drop(guard);
+        // Write-through persist (best-effort).
+        if let Some(g) = group_clone {
+            self.persist_delegation_group(workspace_id, &g);
         }
-        g.event_summaries.push(summary);
-        g.raw_events.push(Arc::new(event));
     }
 
     /// Atomically claim a group for delivery if it is sealed, complete, and not
@@ -486,6 +512,9 @@ impl Services {
         }
         let mut group = w.delegation_groups.remove(idx);
         group.delivered = true;
+        drop(guard);
+        // Delete from store (best-effort).
+        self.delete_delegation_group(group_id);
         Some(group)
     }
 
@@ -586,6 +615,57 @@ impl Services {
                     .cloned()
             })
     }
+
+    /// Best-effort write-through persist of a delegation group (AS-2 persistence).
+    fn persist_delegation_group(&self, workspace_id: &WorkspaceId, group: &DelegationGroup) {
+        let store = self.store.clone();
+        let workspace_id = workspace_id.clone();
+        let group_id = group.group_id.clone();
+        let persisted = match delegation_group_to_persisted(&workspace_id, group) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("skip delegation_group persist {group_id}: {e}");
+                return;
+            }
+        };
+        tokio::spawn(async move {
+            if let Err(e) = store.upsert_delegation_group(&persisted).await {
+                tracing::warn!("delegation_group upsert failed {group_id}: {e}");
+            }
+        });
+    }
+
+    /// Best-effort delete of a persisted delegation group (AS-2 cleanup).
+    fn delete_delegation_group(&self, group_id: &str) {
+        let store = self.store.clone();
+        let group_id = group_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = store.delete_delegation_group(&group_id).await {
+                tracing::warn!("delegation_group delete failed {group_id}: {e}");
+            }
+        });
+    }
+
+    /// Rehydrate undelivered delegation groups on resume (AS-2 rehydration).
+    pub(crate) async fn rehydrate_delegation_groups(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<usize> {
+        let persisted = self.store.list_undelivered_groups(workspace_id).await?;
+        let count = persisted.len();
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let entry = guard.entry(workspace_id.clone()).or_default();
+        for p in persisted {
+            // Groups are sealed on rehydration (original parent turn is gone).
+            let mut group = persisted_to_delegation_group(&p)?;
+            group.sealed = true;
+            entry.delegation_groups.push(group);
+        }
+        Ok(count)
+    }
 }
 
 /// A group is complete when it has at least one expected child and every
@@ -595,4 +675,62 @@ fn is_group_complete(group: &DelegationGroup) -> bool {
         && group.expected_agent_ids.iter().all(|id| {
             group.completed_agent_ids.contains(id) || group.deleted_agent_ids.contains(id)
         })
+}
+
+/// Convert in-memory `DelegationGroup` to persisted form.
+fn delegation_group_to_persisted(
+    workspace_id: &WorkspaceId,
+    group: &DelegationGroup,
+) -> Result<PersistedDelegationGroup> {
+    let raw_events_json: Vec<String> = group
+        .raw_events
+        .iter()
+        .map(|e| {
+            serde_json::to_string(e.as_ref())
+                .map_err(|err| Error::Internal(format!("serialize raw_event: {err}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(PersistedDelegationGroup {
+        group_id: group.group_id.clone(),
+        workspace_id: workspace_id.clone(),
+        parent_agent_id: group.parent_agent_id.clone(),
+        await_mode: group.await_mode.clone(),
+        expected_agent_ids: group.expected_agent_ids.clone(),
+        completed_agent_ids: group.completed_agent_ids.clone(),
+        deleted_agent_ids: group.deleted_agent_ids.clone(),
+        sealed: group.sealed,
+        delivered: group.delivered,
+        event_summaries: group.event_summaries.clone(),
+        raw_events_json,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    })
+}
+
+/// Convert persisted `PersistedDelegationGroup` back to in-memory form.
+fn persisted_to_delegation_group(p: &PersistedDelegationGroup) -> Result<DelegationGroup> {
+    let raw_events: Vec<Arc<Event>> = p
+        .raw_events_json
+        .iter()
+        .map(|s| {
+            serde_json::from_str::<Event>(s)
+                .map(Arc::new)
+                .map_err(|err| Error::Internal(format!("deserialize raw_event: {err}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(DelegationGroup {
+        group_id: p.group_id.clone(),
+        parent_agent_id: p.parent_agent_id.clone(),
+        await_mode: p.await_mode.clone(),
+        expected_agent_ids: p.expected_agent_ids.clone(),
+        completed_agent_ids: p.completed_agent_ids.clone(),
+        deleted_agent_ids: p.deleted_agent_ids.clone(),
+        subscription_id: None,
+        sealed: p.sealed,
+        delivered: p.delivered,
+        event_summaries: p.event_summaries.clone(),
+        raw_events,
+    })
 }
