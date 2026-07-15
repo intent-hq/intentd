@@ -1,8 +1,8 @@
-//! E2E coverage follow-up part 3 — agent_ops + MCP bindings (PR C).
+//! E2E coverage follow-up part 3 — agent_ops services (PR C).
 //!
-//! Hermetic Services-level tests exercising agent_ops methods and agent MCP binding dispatch
-//! paths. Tests cover: agent.subscribe, agent.diagnostics, agent.status, agent.list,
-//! agent.readConversation, agent.summary via in-process Services pattern (not spawned processes).
+//! Hermetic Services-level tests exercising agent_ops service methods. Tests cover:
+//! agent.subscribe, agent.diagnostics, agent.status, agent.list, agent.readConversation,
+//! agent.summary via in-process Services pattern (not spawned processes).
 //! All tests assert concrete response contracts unconditionally.
 
 #![cfg(unix)]
@@ -92,21 +92,6 @@ async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
 async fn agent_subscribe_creates_event_subscription() {
     let (services, ws, ws_root, db) = setup().await;
 
-    let agent_val = services
-        .agent_create(
-            ws.clone(),
-            Some("SubscribeTest".into()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Default::default(),
-        )
-        .await
-        .expect("create agent");
-    let agent_id = AgentId::from(agent_val["agent"]["id"].as_str().unwrap());
-
     // Call agent.subscribe
     let result = services
         .agent_subscribe(ws.clone(), vec!["agent:*".to_string()], Some(false), None)
@@ -115,15 +100,16 @@ async fn agent_subscribe_creates_event_subscription() {
 
     // Assert concrete contract: subscription created
     assert!(result["subscriptionId"].is_string());
-    let sub_id = result["subscriptionId"].as_str().unwrap();
+    let sub_id = result["subscriptionId"].as_str().unwrap().to_string();
     assert!(!sub_id.is_empty());
 
-    // Verify subscription exists via agent_get_subscriptions
-    let subs = services
-        .agent_get_subscriptions(ws.clone(), agent_id.clone())
+    // Verify subscription works by unsubscribing
+    let unsub_result = services
+        .agent_unsubscribe(ws.clone(), sub_id.clone())
         .await
-        .expect("get subscriptions");
-    assert!(subs["subscriptions"].is_array());
+        .expect("unsubscribe");
+    assert!(unsub_result["success"].is_boolean());
+    assert_eq!(unsub_result["success"].as_bool().unwrap(), true);
 
     drop(services);
     cleanup_db(&db);
@@ -189,11 +175,13 @@ async fn agent_status_returns_full_metadata() {
         .await
         .expect("get agent");
 
-    // Assert concrete contract: AgentLite shape
+    // Assert concrete contract: AgentLite shape with stable fields
     assert_eq!(result.id, agent_id);
+    assert_eq!(result.workspace_id, ws);
     assert_eq!(result.name, "StatusTest");
-    // metadata is populated (is_background is a bool field)
-    assert!(!result.metadata.is_background || result.metadata.is_background);
+    use intent_core::AgentStatus;
+    assert_eq!(result.status, AgentStatus::Idle);
+    assert_eq!(result.metadata.is_background, false);
 
     drop(services);
     cleanup_db(&db);
@@ -201,7 +189,7 @@ async fn agent_status_returns_full_metadata() {
 }
 
 #[tokio::test]
-async fn agent_list_filters_by_completion() {
+async fn agent_list_returns_created_agents() {
     let (services, ws, ws_root, db) = setup().await;
 
     let agent1 = services
@@ -219,7 +207,7 @@ async fn agent_list_filters_by_completion() {
         .expect("create agent 1");
     let id1 = AgentId::from(agent1["agent"]["id"].as_str().unwrap());
 
-    services
+    let agent2 = services
         .agent_create(
             ws.clone(),
             Some("ListTest2".into()),
@@ -232,14 +220,15 @@ async fn agent_list_filters_by_completion() {
         )
         .await
         .expect("create agent 2");
+    let id2 = AgentId::from(agent2["agent"]["id"].as_str().unwrap());
 
     // Call agent.list
     let result = services.agent_list(ws.clone()).await.expect("list agents");
 
-    // Assert concrete contract: array of AgentLite
-    assert!(!result.is_empty());
-    assert!(result.iter().any(|a| a.id == id1));
+    // Assert concrete contract: array of AgentLite with both agents
     assert!(result.len() >= 2);
+    assert!(result.iter().any(|a| a.id == id1 && a.name == "ListTest1"));
+    assert!(result.iter().any(|a| a.id == id2 && a.name == "ListTest2"));
 
     drop(services);
     cleanup_db(&db);
@@ -289,10 +278,20 @@ async fn agent_read_conversation_returns_messages() {
         .await
         .expect("get conversation");
 
-    // Assert concrete contract: conversation shape
+    // Assert concrete contract: top-level fields and message shape
+    assert_eq!(
+        result["agentId"].as_str().unwrap(),
+        agent_id.to_string().as_str()
+    );
+    assert!(result["truncated"].is_boolean());
+    assert!(result["totalMessages"].is_number());
     assert!(result["messages"].is_array());
     let messages = result["messages"].as_array().unwrap();
     assert!(!messages.is_empty());
+    // Assert first message has role and contentBlocks
+    let first_msg = &messages[0];
+    assert!(first_msg["role"].is_string());
+    assert!(first_msg["contentBlocks"].is_array());
 
     drop(services);
     cleanup_db(&db);
@@ -324,8 +323,14 @@ async fn agent_summary_returns_text() {
         .await
         .expect("get summary");
 
-    // Assert concrete contract: returns Value (string or object)
-    assert!(result.is_string() || result.is_object());
+    // Assert concrete contract: object with required fields
+    assert!(result.is_object());
+    assert_eq!(
+        result["agentId"].as_str().unwrap(),
+        agent_id.to_string().as_str()
+    );
+    assert!(result["agentName"].is_string());
+    assert!(result["messageCount"].is_number());
 
     drop(services);
     cleanup_db(&db);
