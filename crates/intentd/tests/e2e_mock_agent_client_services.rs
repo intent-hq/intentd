@@ -545,6 +545,8 @@ async fn terminal_output_truncation() {
                     "sessionId": SESSION_ID,
                     "terminalId": "pty-0"
                 },
+                // Note: truncated field exists but PtyHostBridge always returns false
+                // (output byte limiting is configured but truncation detection not yet implemented)
             },
             {
                 "method": "terminal/release",
@@ -611,6 +613,10 @@ async fn terminal_non_zero_exit() {
                     "sessionId": SESSION_ID,
                     "terminalId": "pty-0"
                 },
+                // Assert the expected non-zero exit code
+                "assertResult": {
+                    "exitCode": 42
+                }
             },
             {
                 "method": "terminal/release",

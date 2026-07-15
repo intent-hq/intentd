@@ -338,7 +338,33 @@ async fn comment_bindings_add_and_list() {
         .await
         .expect("run_turn");
 
-    // Tool call succeeded (comment was added via binding)
+    // Assert via Services that the comment was actually persisted
+    let result = services
+        .comment_list(
+            ws.clone(),
+            note.id.clone(),
+            None, // since
+            None, // author_type
+            None, // status
+            true, // include_comments
+        )
+        .await
+        .expect("comment_list");
+
+    let threads = result.threads;
+    assert!(!threads.is_empty(), "comment thread should exist");
+    let thread = &threads[0];
+    let comments = thread
+        .comments
+        .as_ref()
+        .expect("comments should be included");
+    assert!(
+        comments
+            .iter()
+            .any(|c| c.content.contains("test comment text")),
+        "comment text should be persisted"
+    );
+
     manager.shutdown().await;
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
