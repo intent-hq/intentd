@@ -257,6 +257,26 @@ async fn dispatch(
                 .map_err(workspace_err)?;
             Ok(json!({ "items": items }))
         }
+        "workspace.getUiContext" => {
+            let id = require_workspace_id(params)?;
+            let ui_context = api
+                .get_workspace_ui_context(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "uiContext": ui_context }))
+        }
+        "workspace.updateUiContext" => {
+            let id = require_workspace_id(params)?;
+            let ui_context = params
+                .get("uiContext")
+                .ok_or_else(|| rpc(INVALID_PARAMS, "uiContext required"))?
+                .clone();
+            let persisted = api
+                .update_workspace_ui_context(id, ui_context)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "uiContext": persisted }))
+        }
         "workspace.duplicate" => {
             let id = require_workspace_id(params)?;
             let new_title = opt_str(params, "newTitle");

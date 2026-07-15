@@ -7038,6 +7038,31 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn get_workspace_ui_context(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Option<serde_json::Value>>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // `NotFound` on missing workspace propagates so the router maps to
+            // `-32602`; `None` is the pre-first-save default (§5.1).
+            store.get_workspace(&id).await?;
+            store.get_workspace_ui_context(&id).await
+        })
+    }
+
+    fn update_workspace_ui_context(
+        &self,
+        id: WorkspaceId,
+        ui_context: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            store.get_workspace(&id).await?;
+            store.update_workspace_ui_context(&id, &ui_context).await
+        })
+    }
+
     fn link_task_agent(
         &self,
         workspace_id: WorkspaceId,

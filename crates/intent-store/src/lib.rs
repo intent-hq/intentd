@@ -33,6 +33,7 @@ mod task_agent_link_repo;
 mod tracked_changes_repo;
 mod workspace_context_repo;
 mod workspace_repo;
+mod workspace_ui_context_repo;
 
 pub use agent_repo::ReplaceMessage;
 pub use diffs_repo::{DiffRow, NewDiff};

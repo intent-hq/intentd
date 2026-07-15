@@ -235,6 +235,39 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Read the workspace's UI context blob (PROTOCOL §5.1). Returns `None`
+    /// when nothing has been stored yet (pre-first-save default); `NotFound`
+    /// if the workspace itself is absent (router maps to `-32602`).
+    fn get_workspace_ui_context(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Option<serde_json::Value>>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::get_workspace_ui_context not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Update the workspace's UI context blob (PROTOCOL §5.1). The daemon
+    /// treats the payload as an opaque JSON blob authored by the FE; no
+    /// interpretation, no shape coercion — byte-for-byte round-trip
+    /// preservation is the correctness requirement. Returns the persisted blob
+    /// read back from the store. `NotFound` if the workspace is absent.
+    fn update_workspace_ui_context(
+        &self,
+        id: WorkspaceId,
+        ui_context: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, ui_context);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::update_workspace_ui_context not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Upsert a task↔agent link (PROTOCOL §5.4). The caller-supplied
     /// `taskKey` mirrors the FE derivation (`association.taskKey ??
     /// association.taskText`); `createdAt` is set to the current epoch-ms.
