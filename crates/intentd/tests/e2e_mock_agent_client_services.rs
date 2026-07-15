@@ -428,3 +428,366 @@ async fn terminal_lifecycle() {
     }
     let _ = std::fs::remove_dir_all(&ws_root);
 }
+
+/// Test terminal/kill on a running process (sleep).
+#[tokio::test]
+#[cfg(unix)]
+async fn terminal_kill_running_process() {
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping terminal kill e2e: node not on PATH");
+        return;
+    }
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("skipping terminal kill e2e: script not found");
+        return;
+    }
+
+    let (services, manager, ws, ws_root, db) =
+        setup_manager(&script, PermissionPolicy::AllowAll).await;
+
+    let behavior = serde_json::json!({
+        "clientCalls": [
+            {
+                "method": "terminal/create",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "command": "sleep",
+                    "args": ["30"]
+                },
+            },
+            {
+                "method": "terminal/kill",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "terminalId": "pty-0"
+                },
+            },
+        ],
+        "response": "killed running process"
+    });
+
+    let (agent_id, acp_session) =
+        create_agent_session(&manager, &services, &ws, &script, behavior, &ws_root).await;
+
+    let stop = run_turn(&manager, &agent_id, &ws, &acp_session).await;
+    assert_eq!(stop, "end_turn", "turn completed");
+
+    manager.shutdown().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    let _ = std::fs::remove_dir_all(&ws_root);
+}
+
+/// Test terminal output truncation when byte limit is exceeded.
+#[tokio::test]
+#[cfg(unix)]
+async fn terminal_output_truncation() {
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping terminal truncation e2e: node not on PATH");
+        return;
+    }
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("skipping terminal truncation e2e: script not found");
+        return;
+    }
+
+    let (services, manager, ws, ws_root, db) =
+        setup_manager(&script, PermissionPolicy::AllowAll).await;
+
+    // Generate large output with a small byte limit (512 bytes).
+    let behavior = serde_json::json!({
+        "clientCalls": [
+            {
+                "method": "terminal/create",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "command": "seq",
+                    "args": ["1", "1000"],
+                    "outputByteLimit": 512
+                },
+            },
+            {
+                "method": "terminal/wait_for_exit",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "terminalId": "pty-0"
+                },
+            },
+            {
+                "method": "terminal/output",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "terminalId": "pty-0"
+                },
+            },
+            {
+                "method": "terminal/release",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "terminalId": "pty-0"
+                },
+            },
+        ],
+        "response": "output truncated as expected"
+    });
+
+    let (agent_id, acp_session) =
+        create_agent_session(&manager, &services, &ws, &script, behavior, &ws_root).await;
+
+    let stop = run_turn(&manager, &agent_id, &ws, &acp_session).await;
+    assert_eq!(stop, "end_turn", "turn completed");
+
+    manager.shutdown().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    let _ = std::fs::remove_dir_all(&ws_root);
+}
+
+/// Test wait_for_exit on a process that exits with non-zero code.
+#[tokio::test]
+#[cfg(unix)]
+async fn terminal_non_zero_exit() {
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping terminal non-zero exit e2e: node not on PATH");
+        return;
+    }
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("skipping terminal non-zero exit e2e: script not found");
+        return;
+    }
+
+    let (services, manager, ws, ws_root, db) =
+        setup_manager(&script, PermissionPolicy::AllowAll).await;
+
+    let behavior = serde_json::json!({
+        "clientCalls": [
+            {
+                "method": "terminal/create",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "command": "sh",
+                    "args": ["-c", "exit 42"]
+                },
+            },
+            {
+                "method": "terminal/wait_for_exit",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "terminalId": "pty-0"
+                },
+            },
+            {
+                "method": "terminal/release",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "terminalId": "pty-0"
+                },
+            },
+        ],
+        "response": "non-zero exit captured"
+    });
+
+    let (agent_id, acp_session) =
+        create_agent_session(&manager, &services, &ws, &script, behavior, &ws_root).await;
+
+    let stop = run_turn(&manager, &agent_id, &ws, &acp_session).await;
+    assert_eq!(stop, "end_turn", "turn completed");
+
+    manager.shutdown().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    let _ = std::fs::remove_dir_all(&ws_root);
+}
+
+/// Test error path: release unknown terminal ID.
+#[tokio::test]
+#[cfg(unix)]
+async fn terminal_release_unknown() {
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping terminal error path e2e: node not on PATH");
+        return;
+    }
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("skipping terminal error path e2e: script not found");
+        return;
+    }
+
+    let (services, manager, ws, ws_root, db) =
+        setup_manager(&script, PermissionPolicy::AllowAll).await;
+
+    let behavior = serde_json::json!({
+        "clientCalls": [
+            {
+                "method": "terminal/release",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "terminalId": "pty-nonexistent"
+                },
+                "assertError": {
+                    "code": -32603
+                }
+            },
+        ],
+        "response": "error path exercised"
+    });
+
+    let (agent_id, acp_session) =
+        create_agent_session(&manager, &services, &ws, &script, behavior, &ws_root).await;
+
+    let stop = run_turn(&manager, &agent_id, &ws, &acp_session).await;
+    assert_eq!(stop, "end_turn", "turn completed");
+
+    manager.shutdown().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    let _ = std::fs::remove_dir_all(&ws_root);
+}
+
+/// Test error path: output on unknown terminal ID.
+#[tokio::test]
+#[cfg(unix)]
+async fn terminal_output_unknown() {
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping terminal output error e2e: node not on PATH");
+        return;
+    }
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("skipping terminal output error e2e: script not found");
+        return;
+    }
+
+    let (services, manager, ws, ws_root, db) =
+        setup_manager(&script, PermissionPolicy::AllowAll).await;
+
+    let behavior = serde_json::json!({
+        "clientCalls": [
+            {
+                "method": "terminal/output",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "terminalId": "pty-nonexistent"
+                },
+                "assertError": {
+                    "code": -32603
+                }
+            },
+        ],
+        "response": "error path exercised"
+    });
+
+    let (agent_id, acp_session) =
+        create_agent_session(&manager, &services, &ws, &script, behavior, &ws_root).await;
+
+    let stop = run_turn(&manager, &agent_id, &ws, &acp_session).await;
+    assert_eq!(stop, "end_turn", "turn completed");
+
+    manager.shutdown().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    let _ = std::fs::remove_dir_all(&ws_root);
+}
+
+/// Test output after terminal has exited.
+#[tokio::test]
+#[cfg(unix)]
+async fn terminal_output_after_exit() {
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping terminal output-after-exit e2e: node not on PATH");
+        return;
+    }
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("skipping terminal output-after-exit e2e: script not found");
+        return;
+    }
+
+    let (services, manager, ws, ws_root, db) =
+        setup_manager(&script, PermissionPolicy::AllowAll).await;
+
+    let behavior = serde_json::json!({
+        "clientCalls": [
+            {
+                "method": "terminal/create",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "command": "echo",
+                    "args": ["done"]
+                },
+            },
+            {
+                "method": "terminal/wait_for_exit",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "terminalId": "pty-0"
+                },
+            },
+            {
+                "method": "terminal/output",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "terminalId": "pty-0"
+                },
+            },
+            {
+                "method": "terminal/release",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "terminalId": "pty-0"
+                },
+            },
+        ],
+        "response": "output after exit retrieved"
+    });
+
+    let (agent_id, acp_session) =
+        create_agent_session(&manager, &services, &ws, &script, behavior, &ws_root).await;
+
+    let stop = run_turn(&manager, &agent_id, &ws, &acp_session).await;
+    assert_eq!(stop, "end_turn", "turn completed");
+
+    manager.shutdown().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    let _ = std::fs::remove_dir_all(&ws_root);
+}

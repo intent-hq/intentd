@@ -11,7 +11,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use intent_acp::{EventSink, SpawnOptions};
-use intent_core::events::{AGENT_STREAM_CHUNK, AGENT_STREAM_END};
 use intent_core::{
     now_iso, AgentId, NoteCreate, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
     WorkspaceId, WorkspaceStatus,
