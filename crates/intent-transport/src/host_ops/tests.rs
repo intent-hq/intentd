@@ -329,28 +329,32 @@ fn resolve_binary_path_searches_enriched_tool_dirs() {
     let test_dir = temp_dir.join(format!("enriched_test_{pid}_{nanos}"));
     let local_bin = test_dir.join(".local").join("bin");
 
-    if std::fs::create_dir_all(&local_bin).is_err() {
-        return; // Skip if we can't create temp dirs
-    }
+    std::fs::create_dir_all(&local_bin).unwrap();
 
     let test_bin_name = format!("test-enriched-binary-{pid}-{nanos}");
     let bin = local_bin.join(&test_bin_name);
     std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    // Temporarily override HOME to point to our test directory
-    let original_home = std::env::var("HOME").ok();
+    // RAII guard for panic-safe HOME restoration
+    struct HomeGuard(Option<String>);
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            if let Some(h) = &self.0 {
+                std::env::set_var("HOME", h);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
+
+    let _home_guard = HomeGuard(std::env::var("HOME").ok());
     std::env::set_var("HOME", &test_dir);
 
     // Verify the binary is found via enriched_tool_dirs (which includes ~/.local/bin)
     let resolved = resolve_binary_path(&test_bin_name, &[]);
 
-    // Restore HOME and clean up
-    if let Some(h) = original_home {
-        std::env::set_var("HOME", h);
-    } else {
-        std::env::remove_var("HOME");
-    }
+    // HOME is restored by drop guard, even on panic
     std::fs::remove_dir_all(&test_dir).ok();
 
     assert_eq!(resolved.as_deref(), Some(bin.as_path()));

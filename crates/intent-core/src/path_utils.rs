@@ -93,7 +93,7 @@ fn capture_login_shell_path_with(_shell: Option<&str>) -> Vec<PathBuf> {
 
 /// Returns cached login-shell PATH directories (unix only).
 /// Runs the shell at most once, with a 2s timeout, and degrades silently on failure.
-pub fn login_shell_dirs() -> &'static [PathBuf] {
+pub(crate) fn login_shell_dirs() -> &'static [PathBuf] {
     LOGIN_SHELL_DIRS.get_or_init(|| capture_login_shell_path_with(None))
 }
 
