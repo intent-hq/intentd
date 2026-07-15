@@ -7,7 +7,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use intent_core::{now_iso, Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus, ContentType};
+use intent_core::{
+    now_iso, ContentType, Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput,
+    NoteId, NoteMetadata, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+};
 use intent_services::{EventBus, Services};
 use intent_store::Store;
 
@@ -54,7 +58,8 @@ fn workspace(id: &WorkspaceId, path: PathBuf) -> Workspace {
 
 async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
     let db = std::env::temp_dir().join(format!("intentd-e2e-note-ops-{}.db", uuid::Uuid::new_v4()));
-    let ws_root = std::env::temp_dir().join(format!("itd-e2e-note-ops-ws-{}", uuid::Uuid::new_v4()));
+    let ws_root =
+        std::env::temp_dir().join(format!("itd-e2e-note-ops-ws-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&ws_root).expect("create ws root");
 
     let store = Store::open(&db).await.expect("open store");
@@ -102,7 +107,10 @@ async fn note_add_edit_edit_lines() {
     assert_eq!(add_result.note_id, note_id);
 
     // Read back and verify
-    let note = services.get_note(ws.clone(), note_id.clone()).await.expect("get note");
+    let note = services
+        .get_note(ws.clone(), note_id.clone())
+        .await
+        .expect("get note");
     assert!(note.content.contains("Initial content"));
     assert!(note.content.contains("Added section"));
 
@@ -118,7 +126,10 @@ async fn note_add_edit_edit_lines() {
     assert!(edit_result.match_position >= 0);
 
     // Test note.editLines
-    let note_after_edit = services.get_note(ws.clone(), note_id.clone()).await.expect("get note");
+    let note_after_edit = services
+        .get_note(ws.clone(), note_id.clone())
+        .await
+        .expect("get note");
     let lines: Vec<&str> = note_after_edit.content.lines().collect();
     if lines.len() > 0 {
         let edit_lines_input = NoteEditLinesInput {
@@ -206,7 +217,10 @@ async fn note_update_metadata() {
     assert_eq!(update_result.note_id, note.id);
 
     // Verify the changes
-    let updated_note = services.get_note(ws.clone(), note.id.clone()).await.expect("get note");
+    let updated_note = services
+        .get_note(ws.clone(), note.id.clone())
+        .await
+        .expect("get note");
     assert_eq!(updated_note.title, "New Title");
     assert_eq!(updated_note.tags, vec!["tag2".to_string()]);
     assert_eq!(updated_note.content, "Content"); // Content unchanged
