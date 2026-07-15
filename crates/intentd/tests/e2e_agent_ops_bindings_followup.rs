@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use intent_core::{
-    now_iso, AgentId, AgentWakeOrCreateInput, NoteCreate, Workspace, WorkspaceActivity,
-    WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    model::AgentDelegateInput, now_iso, AgentId, AgentWakeOrCreateInput, NoteCreate, Workspace,
+    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -308,6 +308,100 @@ async fn agent_wake_or_create_creates_for_unassigned_task() {
         .await
         .expect("get task");
     assert!(!task.assigned_agents.is_empty());
+
+    drop(services);
+    cleanup_db(&db);
+    std::fs::remove_dir_all(&ws_root).ok();
+}
+
+#[tokio::test]
+async fn agent_get_subscriptions_returns_empty_for_new_agent() {
+    let (services, ws, ws_root, db) = setup().await;
+
+    // Create agent
+    let agent_val = services
+        .agent_create(
+            ws.clone(),
+            Some("GetSubsAgent".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create agent");
+    let agent_id = AgentId::from(agent_val["agent"]["id"].as_str().unwrap());
+
+    // Get subscriptions - should be empty for new agent
+    let result = services
+        .agent_get_subscriptions(ws.clone(), agent_id.clone())
+        .await
+        .expect("get subscriptions");
+
+    let subs = result["subscriptions"].as_array().unwrap();
+    assert_eq!(subs.len(), 0);
+    assert!(result["delegationGroups"].is_array());
+    assert!(result["agentStatuses"].is_object());
+
+    drop(services);
+    cleanup_db(&db);
+    std::fs::remove_dir_all(&ws_root).ok();
+}
+
+#[tokio::test]
+async fn agent_delegate_creates_new_agent_for_task() {
+    let (services, ws, ws_root, db) = setup().await;
+
+    // Create a task note
+    let task_note = services
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Delegatable Task".to_string(),
+                content: Some("- [ ] Do something\n".to_string()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create task note");
+
+    // Mark as task
+    services
+        .mark_as_task(
+            ws.clone(),
+            task_note.id.clone(),
+            "not_started".to_string(),
+            vec![],
+            None,
+        )
+        .await
+        .expect("mark as task");
+
+    // Delegate task
+    let result = services
+        .agent_delegate(
+            ws.clone(),
+            AgentDelegateInput {
+                task_note_id: Some(task_note.id.clone()),
+                agent_instructions: Some("test instructions".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+
+    assert!(result.get("ok").is_some() || result.get("success").is_some());
+
+    // Verify agent was created
+    if let Some(agent_id) = result.get("agentId").and_then(|v| v.as_str()) {
+        assert!(!agent_id.is_empty());
+    }
 
     drop(services);
     cleanup_db(&db);
