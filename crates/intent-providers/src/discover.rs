@@ -120,7 +120,7 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
 /// logic from `intent_context::discovery` but generalized for all providers.
 /// The `_provider_id` is reserved for future use (e.g., provider-specific hints).
 pub fn find_provider_binary(
-    _provider_id: &str,
+    provider_id: &str,
     command: &str,
     explicit_path: Option<&str>,
 ) -> Option<PathBuf> {
@@ -132,6 +132,13 @@ pub fn find_provider_binary(
             if pb.is_file() {
                 return Some(pb);
             }
+            // Warn when explicit setting points to missing file
+            tracing::warn!(
+                provider_id = provider_id,
+                configured_path = trimmed,
+                "providers.paths.{} points to non-existent file; falling back to managed bin / PATH scan",
+                provider_id
+            );
         }
     }
 
@@ -317,6 +324,15 @@ mod find_provider_binary_tests {
     #[test]
     fn find_provider_binary_ignores_whitespace_only_explicit_setting() {
         let result = find_provider_binary("test", "some-cmd", Some("   "));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn find_provider_binary_falls_through_when_explicit_path_missing() {
+        // When providers.paths.<id> points to a missing file, resolution should
+        // fall through to managed bin / PATH scan (and warn)
+        let result = find_provider_binary("test", "some-cmd", Some("/nonexistent/path/binary"));
+        // Should fall through and return None since we don't have managed bin or PATH match
         assert_eq!(result, None);
     }
 
