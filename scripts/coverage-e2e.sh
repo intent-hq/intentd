@@ -3,7 +3,7 @@ set -euo pipefail
 
 # E2E coverage script
 # Measures line coverage from ALL daemon-level integration tests in crates/intentd/tests/
-# Excludes auggie_context_e2e (requires real auggie binary)
+# auggie_context_e2e test is env-gated (INTENTD_AUGGIE_E2E) and self-skips when the env var is unset
 
 cd "$(dirname "$0")/.."
 
@@ -56,7 +56,7 @@ if [ "${GENERATE_LCOV:-}" = "1" ]; then
     cargo llvm-cov report --lcov --output-path lcov.info
 fi
 
-# If --fail-under-lines is provided as first argument, enforce the floor
+# If a numeric floor is provided as first argument, enforce it
 if [ $# -gt 0 ]; then
     FLOOR="$1"
     echo ""
