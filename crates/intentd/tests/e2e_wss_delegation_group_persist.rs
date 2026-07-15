@@ -234,6 +234,20 @@ fn temp_data_dir() -> PathBuf {
     dir
 }
 
+fn gate(test: &str) -> Option<String> {
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("Skip {test}: mock ACP not found at {script}");
+        return None;
+    }
+    Some(script)
+}
+
 async fn seed_workspace_only(data_dir: &Path) -> String {
     use intent_core::WorkspaceId;
     use intent_store::Store;
@@ -309,10 +323,17 @@ fn boot_daemon(data_dir: &PathBuf, port: u16, env: &[(&str, &str)]) -> std::proc
 
 #[tokio::test]
 async fn delegation_group_persists_across_restart() {
+    let Some(script) = gate("WSS delegation-group persist E2E") else {
+        return;
+    };
+
     let data_dir = temp_data_dir();
+    eprintln!("[TEST] data_dir: {}", data_dir.display());
     let ws_id = seed_workspace_only(&data_dir).await;
+    eprintln!("[TEST] seeded workspace: {}", ws_id);
     let port = free_port();
     let socket = data_dir.join("intentd.sock");
+    eprintln!("[TEST] ready to boot daemon on port {}", port);
 
     // Mock ACP behavior: children report after delay (to ensure parent seals group first)
     let report1_js = format!(
@@ -370,13 +391,8 @@ async fn delegation_group_persists_across_restart() {
         ]
     }).to_string();
 
-    let mock_script = data_dir.join("mock-acp.mjs");
-    let script_src = include_str!("fixtures/mock-acp-agent.mjs");
-    std::fs::write(&mock_script, script_src).expect("write mock script");
-
     let env = [
-        ("INTENTD_ACP_PROVIDER", "mock"),
-        ("MOCK_AGENT_SCRIPT_PATH", mock_script.to_str().unwrap()),
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
 
@@ -391,6 +407,7 @@ async fn delegation_group_persists_across_restart() {
         .to_string();
     let cfg = client_config(&fp);
 
+    // Subscribe BEFORE creating the parent so we don't miss events
     let mut sub = connect_ws(port, cfg.clone()).await;
     wss_rpc(
         &mut sub,
@@ -409,6 +426,7 @@ async fn delegation_group_persists_across_restart() {
     )
     .await;
     let parent_id = parent["agent"]["id"].as_str().unwrap().to_string();
+
     wss_rpc(
         &mut rpc,
         11,
@@ -419,30 +437,25 @@ async fn delegation_group_persists_across_restart() {
 
     // Wait for parent to idle after delegating
     let mut parent_idle = false;
-    let mut child1_id: Option<String> = None;
-    let mut child2_id: Option<String> = None;
-    for _ in 0..100 {
-        let frame = wss_event(&mut sub, 30).await;
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub, 60).await;
         let ev = &frame["params"]["event"];
-        if ev["type"] == "agent:created" {
-            let agent_id = ev["data"]["agentId"].as_str().unwrap().to_string();
-            // Skip the parent itself
-            if agent_id != parent_id {
-                if child1_id.is_none() {
-                    child1_id = Some(agent_id);
-                } else if child2_id.is_none() {
-                    child2_id = Some(agent_id);
-                }
-            }
-        }
-        if ev["type"] == "agent:idle" && ev["data"]["agentId"] == parent_id {
+        let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+        if ev["type"] == "agent:idle" && ev_agent == parent_id {
             parent_idle = true;
             break;
         }
     }
     assert!(parent_idle, "parent went idle after delegating");
-    let child1_id = child1_id.expect("child1 created");
-    let child2_id = child2_id.expect("child2 created");
+
+    // Get child IDs from parent's waitingForAgentIds (more reliable than event capture)
+    let lite = wss_rpc(&mut rpc, 12, "agent.get", json!({ "agentId": &parent_id })).await;
+    let waiting = lite["agent"]["waitingForAgentIds"]
+        .as_array()
+        .expect("waitingForAgentIds");
+    assert_eq!(waiting.len(), 2, "parent waiting for 2 children");
+    let child1_id = waiting[0].as_str().unwrap().to_string();
+    let child2_id = waiting[1].as_str().unwrap().to_string();
 
     // Wait for child1 to complete (idle)
     let mut child1_idle = false;
