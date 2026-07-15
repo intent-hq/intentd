@@ -202,9 +202,24 @@ async fn agent_conversation_and_summary() {
         .agent_summary(ws.clone(), agent_id.clone())
         .await
         .expect("get summary");
-    assert_eq!(summary["agentId"].as_str().unwrap(), agent_id.to_string());
-    assert_eq!(summary["agentName"].as_str().unwrap(), "ConvTest");
-    assert_eq!(summary["messageCount"].as_i64().unwrap(), 1);
+    assert_eq!(
+        summary["agentId"]
+            .as_str()
+            .expect("agentId should be a string"),
+        agent_id.to_string()
+    );
+    assert_eq!(
+        summary["agentName"]
+            .as_str()
+            .expect("agentName should be a string"),
+        "ConvTest"
+    );
+    assert_eq!(
+        summary["messageCount"]
+            .as_i64()
+            .expect("messageCount should be an integer"),
+        1
+    );
 
     // Cleanup
     cleanup_db(&db);
