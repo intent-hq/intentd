@@ -441,35 +441,31 @@ async fn git_bindings_status_stage_commit() {
 
     // Create a temp git repo
     let repo_dir = std::env::temp_dir().join(format!("itd-e2e-git-{}", uuid::Uuid::new_v4()));
+
+    // Helper to run git commands and assert success
+    let run_git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {} failed to execute: {}", args.join(" "), e));
+        assert!(
+            status.status.success(),
+            "git {} failed with exit code {:?}: {}",
+            args.join(" "),
+            status.status.code(),
+            String::from_utf8_lossy(&status.stderr)
+        );
+    };
     std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
-    std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(&repo_dir)
-        .output()
-        .expect("git init");
-    std::process::Command::new("git")
-        .args(["config", "user.name", "Test"])
-        .current_dir(&repo_dir)
-        .output()
-        .expect("git config name");
-    std::process::Command::new("git")
-        .args(["config", "user.email", "test@test.com"])
-        .current_dir(&repo_dir)
-        .output()
-        .expect("git config email");
+    run_git(&["init"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["config", "user.email", "test@test.com"]);
 
     // Initial commit
     std::fs::write(repo_dir.join("README.md"), "initial").expect("write readme");
-    std::process::Command::new("git")
-        .args(["add", "README.md"])
-        .current_dir(&repo_dir)
-        .output()
-        .expect("git add");
-    std::process::Command::new("git")
-        .args(["commit", "-m", "initial"])
-        .current_dir(&repo_dir)
-        .output()
-        .expect("git commit");
+    run_git(&["add", "README.md"]);
+    run_git(&["commit", "-m", "initial"]);
 
     // Create new file for git operations
     std::fs::write(repo_dir.join("test.txt"), "test content").expect("write test");
