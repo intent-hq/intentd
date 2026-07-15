@@ -55,7 +55,7 @@ fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<Vec<PathBuf>> {
 
     // Build command with sentinel-wrapped printf
     let cmd = format!(
-        r#"printf '{}{{}}{}'  "$PATH""#,
+        r#"printf '{}%s{}'  "$PATH""#,
         PATH_START_SENTINEL, PATH_END_SENTINEL
     );
     let mut args = flags.to_vec();
