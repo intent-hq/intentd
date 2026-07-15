@@ -1,4 +1,12 @@
-//! Hermetic ACP E2E: event, git, file, agent bindings coverage.
+//! Hermetic ACP E2E: event, git, file, agent, note bindings coverage.
+//!
+//! Each test spawns the mock ACP agent with `MOCK_AGENT_BEHAVIOR` that drives
+//! real MCP `tools/call` invocations for the target binding namespace. We assert
+//! BE state changed via Services reads, not just tool-call success — proving the
+//! full loop works.
+//!
+//! This file covers: **note**, **file**, **git**, **agent**, and **event** bindings.
+//! See `e2e_mock_agent_workspace_api_bindings.rs` for task and comment.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

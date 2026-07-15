@@ -1,9 +1,12 @@
 //! Hermetic ACP E2E: comprehensive coverage of agent→BE workspace_api bindings.
 //!
 //! Each test spawns the mock ACP agent with `MOCK_AGENT_BEHAVIOR` that drives
-//! real MCP `tools/call` invocations for the target binding namespace (task,
-//! comment, event, git, file, agent read-side). We assert BE state changed via
-//! Services reads, not just tool-call success — proving the full loop works.
+//! real MCP `tools/call` invocations for the target binding namespace. We assert
+//! BE state changed via Services reads, not just tool-call success — proving the
+//! full loop works.
+//!
+//! This file covers: **task** and **comment** bindings.
+//! See `e2e_mock_agent_workspace_api_bindings2.rs` for note, file, git, agent, event.
 //!
 //! Pattern: modeled after `tests/e2e_mock_agent.rs` single-turn execution.
 
@@ -35,11 +38,11 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         updated_at: ts,
         last_activity: None,
         tags: vec![],
-        path: path.map(|p| p.to_string_lossy().to_string()),
+        path: path.as_ref().map(|p| p.to_string_lossy().to_string()),
         repository_path: None,
         repository_owner: None,
         repository_name: None,
-        worktree_path: None,
+        worktree_path: path.map(|p| p.to_string_lossy().to_string()),
         scope: None,
         skip_worktree: false,
         setup_script: None,
