@@ -215,14 +215,15 @@ async fn set_disabled_servers(store: &Store, list: &[String]) -> Result<()> {
 }
 
 /// Read the configured external servers from the sensitive `mcp.servers` secret,
-/// keyed by id. A missing/garbled secret yields an empty map.
+/// keyed by id. A missing/garbled secret yields an empty map. Best-effort: errors
+/// (timeout/backing failure) treated as absent.
 pub(crate) async fn read_configs(secrets: &AsyncSecretStore) -> Map<String, Value> {
     match secrets.load(SETTING_KEY).await {
-        Some(raw) => serde_json::from_str::<Value>(&raw)
+        Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
             .ok()
             .and_then(|v| v.as_object().cloned())
             .unwrap_or_default(),
-        None => Map::new(),
+        Ok(None) | Err(_) => Map::new(),
     }
 }
 

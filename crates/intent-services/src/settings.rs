@@ -33,8 +33,9 @@ pub(crate) const REDACTED_PLACEHOLDER: &str = "********";
 /// [`intent_core::FileSecretStore`]; tests inject [`InMemorySecretStore`] so
 /// they never touch the real secrets file.
 pub trait SecretStore: Send + Sync {
-    /// Return the stored secret for `account`, or `None` if unset/unavailable.
-    fn load(&self, account: &str) -> Option<String>;
+    /// Return the stored secret for `account`. `Ok(None)` when confirmed absent;
+    /// `Err` on timeout / backing-store failure so snapshot capture can fail closed.
+    fn load(&self, account: &str) -> Result<Option<String>>;
     /// Persist `value` for `account`, replacing any existing secret.
     fn store(&self, account: &str, value: &str) -> Result<()>;
     /// Delete the secret for `account`; absence is an idempotent success.
@@ -45,7 +46,7 @@ pub trait SecretStore: Send + Sync {
 /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`), whose accounts
 /// are the sensitive setting paths (account = setting path).
 impl SecretStore for intent_core::FileSecretStore {
-    fn load(&self, account: &str) -> Option<String> {
+    fn load(&self, account: &str) -> Result<Option<String>> {
         intent_core::FileSecretStore::load(self, account)
     }
 
@@ -65,13 +66,14 @@ pub struct InMemorySecretStore {
 }
 
 impl SecretStore for InMemorySecretStore {
-    fn load(&self, account: &str) -> Option<String> {
-        self.map
+    fn load(&self, account: &str) -> Result<Option<String>> {
+        Ok(self
+            .map
             .lock()
             .unwrap()
             .get(account)
             .filter(|v| !v.is_empty())
-            .cloned()
+            .cloned())
     }
 
     fn store(&self, account: &str, value: &str) -> Result<()> {
@@ -136,19 +138,20 @@ struct AsyncState {
 /// One per-account cache slot: either an in-flight load that later resolvers
 /// can wait on, or a resolved value valid until `expires_at`.
 enum Entry {
-    /// A blocking load is in progress. `rx` receives `Some(value)` when the
+    /// A blocking load is in progress. `rx` receives `Some(result)` when the
     /// spawn_blocking task finishes; `started_at` lets late waiters shrink their
     /// remaining budget so the effective wait per caller stays bounded.
     /// `load_id` uniquely tags this in-flight load so a delayed completion can
     /// detect an intervening store/delete/newer load and refuse to clobber the
     /// fresher slot.
     InFlight {
-        rx: watch::Receiver<Option<Option<String>>>,
+        rx: watch::Receiver<Option<Result<Option<String>>>>,
         started_at: Instant,
         load_id: u64,
     },
     /// A resolved value cached in-process; served without touching the keychain
-    /// until `expires_at`.
+    /// until `expires_at`. Only successful loads (`Ok`) are cached; errors never
+    /// cache so the next call re-attempts the backing store.
     Cached {
         value: Option<String>,
         expires_at: Instant,
@@ -190,23 +193,23 @@ impl AsyncSecretStore {
         }
     }
 
-    /// Read the secret for `account`, returning `None` on absent / timeout /
-    /// backing-error. Concurrent callers for the same `account` are coalesced
-    /// into a single spawn_blocking; a cached result is served without touching
-    /// the backing store until it expires.
-    pub(crate) async fn load(&self, account: &str) -> Option<String> {
+    /// Read the secret for `account`. `Ok(None)` when confirmed absent;
+    /// `Err` on timeout / backing-error. Concurrent callers for the same `account`
+    /// are coalesced into a single spawn_blocking; a cached result is served
+    /// without touching the backing store until it expires.
+    pub(crate) async fn load(&self, account: &str) -> Result<Option<String>> {
         let action = {
             let mut state = self.state.lock().unwrap();
             match state.entries.get(account) {
                 Some(Entry::Cached { value, expires_at }) if *expires_at > Instant::now() => {
-                    return value.clone();
+                    return Ok(value.clone());
                 }
                 Some(Entry::InFlight { rx, started_at, .. }) => LoadAction::Wait {
                     rx: rx.clone(),
                     started_at: *started_at,
                 },
                 _ => {
-                    let (tx, rx) = watch::channel::<Option<Option<String>>>(None);
+                    let (tx, rx) = watch::channel::<Option<Result<Option<String>>>>(None);
                     let started_at = Instant::now();
                     let load_id = state.next_load_id;
                     state.next_load_id = state.next_load_id.wrapping_add(1);
@@ -291,23 +294,31 @@ impl AsyncSecretStore {
     }
 
     /// Kick off the blocking load for `account`, publishing the result via `tx`
-    /// and swapping the InFlight slot for a Cached one so subsequent callers
-    /// short-circuit. Runs to completion even after every awaiting caller has
-    /// timed out — that's the point: only ONE blocking-pool thread per account.
-    /// The `load_id` generation guard ensures a delayed completion does NOT
-    /// overwrite a slot that an intervening `store` / `delete` / newer load
-    /// already refreshed: the write only happens if the slot is still the
-    /// InFlight tagged with `load_id`.
-    fn spawn_load(&self, account: String, tx: watch::Sender<Option<Option<String>>>, load_id: u64) {
+    /// and swapping the InFlight slot for a Cached one if successful (errors never
+    /// cache, so the next call re-attempts). Runs to completion even after every
+    /// awaiting caller has timed out — that's the point: only ONE blocking-pool
+    /// thread per account. The `load_id` generation guard ensures a delayed
+    /// completion does NOT overwrite a slot that an intervening `store` / `delete` /
+    /// newer load already refreshed: the write only happens if the slot is still
+    /// the InFlight tagged with `load_id`.
+    fn spawn_load(
+        &self,
+        account: String,
+        tx: watch::Sender<Option<Result<Option<String>>>>,
+        load_id: u64,
+    ) {
         let inner = self.inner.clone();
         let state = self.state.clone();
         let ttl = self.cache_ttl;
         tokio::spawn(async move {
             let load_account = account.clone();
-            let result: Option<String> =
-                tokio::task::spawn_blocking(move || inner.load(&load_account))
-                    .await
-                    .unwrap_or_default();
+            let result: Result<Option<String>> =
+                match tokio::task::spawn_blocking(move || inner.load(&load_account)).await {
+                    Ok(r) => r,
+                    Err(join_err) => Err(Error::Internal(format!(
+                        "secret-store load task panicked: {join_err}"
+                    ))),
+                };
             {
                 let mut guard = state.lock().unwrap();
                 let still_ours = matches!(
@@ -315,53 +326,75 @@ impl AsyncSecretStore {
                     Some(Entry::InFlight { load_id: id, .. }) if *id == load_id,
                 );
                 if still_ours {
-                    guard.entries.insert(
-                        account.clone(),
-                        Entry::Cached {
-                            value: result.clone(),
-                            expires_at: Instant::now() + ttl,
-                        },
-                    );
+                    // Only cache successful results; errors force retry next call.
+                    if let Ok(value) = &result {
+                        guard.entries.insert(
+                            account.clone(),
+                            Entry::Cached {
+                                value: value.clone(),
+                                expires_at: Instant::now() + ttl,
+                            },
+                        );
+                    } else {
+                        // Remove the InFlight entry so the next call creates a fresh one.
+                        guard.entries.remove(&account);
+                    }
                 }
             }
             let _ = tx.send(Some(result));
         });
     }
 
-    /// Wait up to `remaining` for the in-flight load to publish a value; on
-    /// timeout return `None` (the current caller gives up but the underlying
+    /// Wait up to `remaining` for the in-flight load to publish a result; on
+    /// timeout return `Err` (the current caller gives up but the underlying
     /// blocking task keeps running and will populate the cache when it
     /// eventually completes).
     async fn await_load(
         &self,
         account: &str,
-        rx: &mut watch::Receiver<Option<Option<String>>>,
+        rx: &mut watch::Receiver<Option<Result<Option<String>>>>,
         remaining: Duration,
-    ) -> Option<String> {
-        if let Some(v) = rx.borrow().clone() {
-            return v;
+    ) -> Result<Option<String>> {
+        if let Some(v) = rx.borrow().as_ref() {
+            return match v {
+                Ok(opt) => Ok(opt.clone()),
+                Err(e) => Err(Error::Internal(e.to_string())),
+            };
         }
         if remaining.is_zero() {
             self.warn_timeout(account, "secret-store load timed out");
-            return None;
+            return Err(Error::Internal(format!(
+                "secret-store load timed out for {account}"
+            )));
         }
         let start = Instant::now();
         loop {
             let left = remaining.saturating_sub(start.elapsed());
             if left.is_zero() {
                 self.warn_timeout(account, "secret-store load timed out");
-                return None;
+                return Err(Error::Internal(format!(
+                    "secret-store load timed out for {account}"
+                )));
             }
             match timeout(left, rx.changed()).await {
                 Ok(Ok(())) => {
-                    if let Some(v) = rx.borrow().clone() {
-                        return v;
+                    if let Some(v) = rx.borrow().as_ref() {
+                        return match v {
+                            Ok(opt) => Ok(opt.clone()),
+                            Err(e) => Err(Error::Internal(e.to_string())),
+                        };
                     }
                 }
-                Ok(Err(_)) => return None,
+                Ok(Err(_)) => {
+                    return Err(Error::Internal(
+                        "secret-store load watch channel closed".to_string(),
+                    ))
+                }
                 Err(_) => {
                     self.warn_timeout(account, "secret-store load timed out");
-                    return None;
+                    return Err(Error::Internal(format!(
+                        "secret-store load timed out for {account}"
+                    )));
                 }
             }
         }
@@ -405,15 +438,15 @@ impl AsyncSecretStore {
 enum LoadAction {
     /// A load is already in flight; wait on the existing receiver.
     Wait {
-        rx: watch::Receiver<Option<Option<String>>>,
+        rx: watch::Receiver<Option<Result<Option<String>>>>,
         started_at: Instant,
     },
     /// No load in flight; the current caller registered a new InFlight slot
     /// (tagged with `load_id`) and now owns the spawn_blocking / notify
     /// responsibility.
     Start {
-        tx: watch::Sender<Option<Option<String>>>,
-        rx: watch::Receiver<Option<Option<String>>>,
+        tx: watch::Sender<Option<Result<Option<String>>>>,
+        rx: watch::Receiver<Option<Result<Option<String>>>>,
         load_id: u64,
     },
 }
@@ -1187,12 +1220,12 @@ impl<'a> SettingsService<'a> {
     /// The current value for a definition: sensitive settings are **redacted**
     /// (placeholder when present, `null` when absent — never plaintext);
     /// non-secret settings come from the DB, falling back to the default.
+    /// Best-effort: load errors (timeout/backing failure) treated as absent for display.
     async fn current_value(&self, def: &SettingDefinition) -> Value {
         if def.sensitive {
-            if self.secrets.load(def.path).await.is_some() {
-                json!(REDACTED_PLACEHOLDER)
-            } else {
-                Value::Null
+            match self.secrets.load(def.path).await {
+                Ok(Some(_)) => json!(REDACTED_PLACEHOLDER),
+                Ok(None) | Err(_) => Value::Null,
             }
         } else {
             match self.store.get_setting(def.path).await {
@@ -1218,22 +1251,21 @@ impl<'a> SettingsService<'a> {
             .collect();
         // Drive every load future concurrently on the current task: a single
         // stalled account never blocks the others because `join_all_pinned`
-        // polls every future on each wake-up.
-        let futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>> =
-            sensitive
-                .iter()
-                .map(|path| {
-                    let fut = self.secrets.load(path);
-                    Box::pin(fut)
-                        as std::pin::Pin<
-                            Box<dyn std::future::Future<Output = Option<String>> + Send>,
-                        >
-                })
-                .collect();
+        // polls every future on each wake-up. Best-effort: errors treated as absent.
+        type LoadFuture<'a> = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>,
+        >;
+        let futs: Vec<LoadFuture<'_>> = sensitive
+            .iter()
+            .map(|path| {
+                let fut = self.secrets.load(path);
+                Box::pin(fut) as LoadFuture<'_>
+            })
+            .collect();
         let results = join_all_pinned(futs).await;
         let mut presence: HashMap<&'static str, bool> = HashMap::with_capacity(sensitive.len());
         for (path, result) in sensitive.into_iter().zip(results) {
-            presence.insert(path, result.is_some());
+            presence.insert(path, result.ok().flatten().is_some());
         }
 
         let mut out = Vec::with_capacity(defs.len());
@@ -1543,9 +1575,9 @@ mod tests {
         hang_for: Duration,
     }
     impl SecretStore for HangingSecretStore {
-        fn load(&self, _account: &str) -> Option<String> {
+        fn load(&self, _account: &str) -> Result<Option<String>> {
             std::thread::sleep(self.hang_for);
-            None
+            Ok(None)
         }
         fn store(&self, _account: &str, _value: &str) -> Result<()> {
             std::thread::sleep(self.hang_for);

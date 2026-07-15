@@ -62,8 +62,17 @@ async fn file_store_token() -> Option<String> {
     let handle =
         tokio::task::spawn_blocking(|| intent_core::FileSecretStore::new().load(SECRET_ACCOUNT));
     match timeout(SECRET_LOAD_TIMEOUT, handle).await {
-        Ok(Ok(Some(v))) => non_empty(v),
-        Ok(Ok(None)) | Ok(Err(_)) => None,
+        Ok(Ok(Ok(Some(v)))) => non_empty(v),
+        Ok(Ok(Ok(None))) => None,
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(
+                account = %SECRET_ACCOUNT,
+                error = %e,
+                "secrets-store load failed for linear token (corrupt/unreadable file)"
+            );
+            None
+        }
+        Ok(Err(_)) => None,
         Err(_) => {
             tracing::warn!(
                 account = %SECRET_ACCOUNT,

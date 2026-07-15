@@ -4455,6 +4455,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             // Capture old values for ALL settings in the batch so we can rollback on hook failure.
             // Store holds non-sensitive settings; secrets holds sensitive ones (§9.8).
+            // Fail closed: any read error during snapshot capture aborts the whole batch.
             let old_values = if let Some(entries) = changes.as_array() {
                 let mut old = Vec::new();
                 for entry in entries {
@@ -4462,20 +4463,37 @@ impl WorkspaceApi for Services {
                         // Look up the definition to check if this setting is sensitive
                         if let Some(def) = crate::settings::find_definition(path) {
                             if def.sensitive {
-                                // Sensitive setting: capture from secrets store
-                                if let Some(secret_val) = self.secrets.load(path).await {
-                                    old.push((path.to_string(), Some(secret_val), true));
-                                } else {
-                                    // No prior secret value; mark for deletion on rollback
-                                    old.push((path.to_string(), None, true));
+                                // Sensitive setting: capture from secrets store.
+                                // Fail closed: timeout/backing-error -> abort before applying anything.
+                                match self.secrets.load(path).await {
+                                    Ok(Some(secret_val)) => {
+                                        old.push((path.to_string(), Some(secret_val), true));
+                                    }
+                                    Ok(None) => {
+                                        // Confirmed absent; mark for deletion on rollback.
+                                        old.push((path.to_string(), None, true));
+                                    }
+                                    Err(e) => {
+                                        return Err(Error::Internal(format!(
+                                            "settings.update: failed to read secret {path} during snapshot capture: {e}"
+                                        )));
+                                    }
                                 }
                             } else {
                                 // Non-sensitive setting: capture from DB
-                                if let Ok(Some(raw)) = self.store.get_setting(path).await {
-                                    old.push((path.to_string(), Some(raw), false));
-                                } else {
-                                    // No prior value; mark for deletion on rollback
-                                    old.push((path.to_string(), None, false));
+                                match self.store.get_setting(path).await {
+                                    Ok(Some(raw)) => {
+                                        old.push((path.to_string(), Some(raw), false));
+                                    }
+                                    Ok(None) => {
+                                        // Confirmed absent; mark for deletion on rollback.
+                                        old.push((path.to_string(), None, false));
+                                    }
+                                    Err(e) => {
+                                        return Err(Error::Internal(format!(
+                                            "settings.update: failed to read setting {path} during snapshot capture: {e}"
+                                        )));
+                                    }
                                 }
                             }
                         }
