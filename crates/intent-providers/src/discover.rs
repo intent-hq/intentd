@@ -317,13 +317,23 @@ mod find_provider_binary_tests {
 
     #[test]
     fn find_provider_binary_ignores_empty_explicit_setting() {
-        let result = find_provider_binary("test", "some-cmd", Some(""));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let unique_cmd = format!("intent-test-cmd-{}", nanos);
+        let result = find_provider_binary("test", &unique_cmd, Some(""));
         assert_eq!(result, None);
     }
 
     #[test]
     fn find_provider_binary_ignores_whitespace_only_explicit_setting() {
-        let result = find_provider_binary("test", "some-cmd", Some("   "));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let unique_cmd = format!("intent-test-cmd-{}", nanos);
+        let result = find_provider_binary("test", &unique_cmd, Some("   "));
         assert_eq!(result, None);
     }
 
@@ -331,7 +341,12 @@ mod find_provider_binary_tests {
     fn find_provider_binary_falls_through_when_explicit_path_missing() {
         // When providers.paths.<id> points to a missing file, resolution should
         // fall through to managed bin / PATH scan (and warn)
-        let result = find_provider_binary("test", "some-cmd", Some("/nonexistent/path/binary"));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let unique_cmd = format!("intent-test-cmd-{}", nanos);
+        let result = find_provider_binary("test", &unique_cmd, Some("/nonexistent/path/binary"));
         // Should fall through and return None since we don't have managed bin or PATH match
         assert_eq!(result, None);
     }

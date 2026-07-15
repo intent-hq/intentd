@@ -237,7 +237,7 @@ mod build_command_tests {
         opts.provider_binary = Some(&resolved_path);
         let cmd = build_command(&opts);
         let program = cmd.as_std().get_program();
-        assert_eq!(program, "/usr/local/bin/auggie");
+        assert_eq!(program, resolved_path.as_os_str());
     }
 
     #[test]
