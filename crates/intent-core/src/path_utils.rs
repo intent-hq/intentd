@@ -17,16 +17,18 @@ fn home_dir() -> Option<PathBuf> {
     BaseDirs::new().map(|b| b.home_dir().to_path_buf())
 }
 
-/// Cached login-shell PATH directories. Runs at most once, with a 2s timeout.
+/// Cached login-shell PATH directories. Runs at most once, with a 5s timeout.
 static LOGIN_SHELL_DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+
+/// Sentinels for extracting PATH from potentially noisy shell output.
+const PATH_START_SENTINEL: &str = "__INTENT_PATH_S__";
+const PATH_END_SENTINEL: &str = "__INTENT_PATH_E__";
 
 /// Capture PATH from the user's login shell (unix only, cached, short timeout).
 /// On failure (timeout, spawn error, no $SHELL, non-unix), returns an empty vec.
 /// Exposed for testing via an injectable shell path.
 #[cfg(unix)]
 fn capture_login_shell_path_with(shell: Option<&str>) -> Vec<PathBuf> {
-    use std::io::Read;
-
     let shell = match shell {
         Some(s) => s.to_string(),
         None => match std::env::var("SHELL") {
@@ -35,55 +37,88 @@ fn capture_login_shell_path_with(shell: Option<&str>) -> Vec<PathBuf> {
         },
     };
 
-    // Run shell -lc 'printf %s "$PATH"' with 2s timeout
-    let mut child = match Command::new(&shell)
-        .args(["-lc", r#"printf %s "$PATH""#])
+    // Try interactive login shell first (-ilc), fall back to login shell (-lc)
+    // Interactive shells source ~/.zshrc and similar rc files that may add PATH entries
+    if let Some(dirs) = try_capture_with_flags(&shell, &["-ilc"]) {
+        return dirs;
+    }
+
+    // Fallback to non-interactive login shell
+    try_capture_with_flags(&shell, &["-lc"]).unwrap_or_default()
+}
+
+/// Helper to attempt PATH capture with specific shell flags.
+/// Returns Some(dirs) on success, None on any failure (spawn, timeout, non-zero exit, missing sentinels).
+#[cfg(unix)]
+fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<Vec<PathBuf>> {
+    use std::io::Read;
+
+    // Build command with sentinel-wrapped printf
+    let cmd = format!(
+        r#"printf '{}{{}}{}'  "$PATH""#,
+        PATH_START_SENTINEL, PATH_END_SENTINEL
+    );
+    let mut args = flags.to_vec();
+    args.push(&cmd);
+
+    let mut child = Command::new(shell)
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+        .ok()?;
 
-    // Poll for completion with 2s timeout
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    // Poll for completion with 5s timeout (interactive shells with nvm can take ~1.9s)
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 // Process exited - read stdout directly (can't use wait_with_output after try_wait succeeds)
                 if !status.success() {
-                    return Vec::new();
+                    return None;
                 }
-                let mut stdout = match child.stdout.take() {
-                    Some(s) => s,
-                    None => return Vec::new(),
-                };
+                let mut stdout = child.stdout.take()?;
                 let mut output = Vec::new();
                 if stdout.read_to_end(&mut output).is_err() {
-                    return Vec::new();
+                    return None;
                 }
-                let path_str = String::from_utf8_lossy(&output);
+                let output_str = String::from_utf8_lossy(&output);
+
+                // Extract PATH between sentinels (last occurrence wins if sentinels appear multiple times)
+                let path_str = extract_path_from_sentinels(&output_str)?;
+
                 // Filter to absolute paths only to avoid unsafe relative entries like "." or "bin"
-                return std::env::split_paths(&path_str.as_ref())
-                    .filter(|p| p.is_absolute())
-                    .collect::<Vec<_>>();
+                return Some(
+                    std::env::split_paths(path_str)
+                        .filter(|p| p.is_absolute())
+                        .collect::<Vec<_>>(),
+                );
             }
             Ok(None) => {
                 // Still running
                 if std::time::Instant::now() >= deadline {
-                    // Timeout - kill and return empty
+                    // Timeout - kill and return None
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Vec::new();
+                    return None;
                 }
                 // Sleep a bit before polling again
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(_) => return Vec::new(),
+            Err(_) => return None,
         }
     }
+}
+
+/// Extract PATH value from between sentinels in shell output.
+/// Returns Some(path_str) if both sentinels found, None otherwise.
+/// If sentinels appear multiple times, uses the last occurrence.
+#[cfg(unix)]
+fn extract_path_from_sentinels(output: &str) -> Option<&str> {
+    let start_idx = output.rfind(PATH_START_SENTINEL)? + PATH_START_SENTINEL.len();
+    let end_idx = output[start_idx..].find(PATH_END_SENTINEL)?;
+    Some(&output[start_idx..start_idx + end_idx])
 }
 
 #[cfg(not(unix))]
@@ -92,7 +127,7 @@ fn capture_login_shell_path_with(_shell: Option<&str>) -> Vec<PathBuf> {
 }
 
 /// Returns cached login-shell PATH directories (unix only).
-/// Runs the shell at most once, with a 2s timeout, and degrades silently on failure.
+/// Runs the shell at most once, with a 5s timeout, and degrades silently on failure.
 pub(crate) fn login_shell_dirs() -> &'static [PathBuf] {
     LOGIN_SHELL_DIRS.get_or_init(|| capture_login_shell_path_with(None))
 }
@@ -259,7 +294,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn capture_login_shell_path_with_fake_shell() {
-        // Create a fake shell script that outputs a known PATH
+        // Create a fake shell script that outputs a known PATH with sentinel markers
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
@@ -270,9 +305,11 @@ mod tests {
             .unwrap()
             .as_nanos();
         let fake_shell = temp_dir.join(format!("fake_shell_test_{pid}_{nanos}.sh"));
+
+        // Script responds to -ilc with sentinel-wrapped PATH
         fs::write(
             &fake_shell,
-            "#!/bin/sh\nif [ \"$1\" = \"-lc\" ]; then\n  printf '/custom/bin:/other/bin'\nfi\n",
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/custom/bin:/other/bin__INTENT_PATH_E__'\nfi\n",
         )
         .unwrap();
         fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
@@ -325,5 +362,130 @@ mod tests {
         );
         // Should also include the hardcoded dirs
         assert!(!dirs.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_path_extracts_sentinels_amid_noise() {
+        // Test that sentinel extraction works even when rc files print noise to stdout
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fake_shell = temp_dir.join(format!("fake_shell_noise_{pid}_{nanos}.sh"));
+
+        // Script prints noise before and after the sentinel-wrapped PATH
+        fs::write(
+            &fake_shell,
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  echo 'Loading nvm...'\n  echo 'nvm initialized'\n  printf '__INTENT_PATH_S__/noise/bin:/test/bin__INTENT_PATH_E__'\n  echo 'Shell ready'\nfi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
+        fs::remove_file(&fake_shell).ok();
+
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0], PathBuf::from("/noise/bin"));
+        assert_eq!(dirs[1], PathBuf::from("/test/bin"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_path_missing_sentinels_degrades_to_empty() {
+        // Test that missing sentinels result in empty vec (not a panic or crash)
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fake_shell = temp_dir.join(format!("fake_shell_no_sentinel_{pid}_{nanos}.sh"));
+
+        // Script outputs PATH without sentinels
+        fs::write(
+            &fake_shell,
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '/missing/bin:/sentinels/bin'\nfi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
+        fs::remove_file(&fake_shell).ok();
+
+        assert!(
+            dirs.is_empty(),
+            "Should degrade to empty vec when sentinels are missing"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_path_falls_back_to_lc_when_ilc_fails() {
+        // Test that -ilc failure triggers -lc fallback
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fake_shell = temp_dir.join(format!("fake_shell_fallback_{pid}_{nanos}.sh"));
+
+        // Script fails on -ilc but succeeds on -lc
+        fs::write(
+            &fake_shell,
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  exit 1\nelif [ \"$1\" = \"-lc\" ]; then\n  printf '__INTENT_PATH_S__/fallback/bin:/backup/bin__INTENT_PATH_E__'\nfi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
+        fs::remove_file(&fake_shell).ok();
+
+        assert_eq!(dirs.len(), 2, "Should fall back to -lc when -ilc fails");
+        assert_eq!(dirs[0], PathBuf::from("/fallback/bin"));
+        assert_eq!(dirs[1], PathBuf::from("/backup/bin"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_path_uses_last_sentinel_occurrence() {
+        // Test that when sentinels appear multiple times, we use the last occurrence
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fake_shell = temp_dir.join(format!("fake_shell_multi_{pid}_{nanos}.sh"));
+
+        // Script outputs sentinels multiple times
+        fs::write(
+            &fake_shell,
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/first/bin__INTENT_PATH_E__'\n  printf '__INTENT_PATH_S__/last/bin:/final/bin__INTENT_PATH_E__'\nfi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
+        fs::remove_file(&fake_shell).ok();
+
+        assert_eq!(dirs.len(), 2, "Should use last sentinel occurrence");
+        assert_eq!(dirs[0], PathBuf::from("/last/bin"));
+        assert_eq!(dirs[1], PathBuf::from("/final/bin"));
     }
 }
