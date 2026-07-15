@@ -644,12 +644,13 @@ fn run_version_enriches_path_with_binary_parent_dir_for_env_shebangs() {
     );
     assert_eq!(version.unwrap(), "fake-auggie 2.0.0");
 
-    // Prove regression coverage: probe FAILS with minimal PATH that lacks the script dir
-    let minimal_path = std::ffi::OsString::from("/usr/bin:/bin");
-    let version_minimal = super::run_version_with(&fake_auggie, &minimal_path);
+    // Prove regression coverage: probe FAILS with PATH that cannot possibly contain node
+    // Use a non-existent directory to ensure deterministic failure (not /usr/bin which may have node)
+    let impossible_path = std::ffi::OsString::from("/nonexistent/impossible/directory");
+    let version_minimal = super::run_version_with(&fake_auggie, &impossible_path);
     assert!(
         version_minimal.is_none(),
-        "run_version_with minimal PATH should fail when node is NOT on PATH (proves fix is needed)"
+        "run_version_with impossible PATH should fail when node is NOT on PATH (proves fix is needed)"
     );
 }
 
@@ -662,21 +663,23 @@ fn enhanced_path_includes_enriched_dirs_with_correct_precedence() {
     let fake_provider_bin = std::path::PathBuf::from("/fake/provider/bin/auggie");
     let path = enhanced_path(Some(&fake_provider_bin));
 
-    // Split path and check precedence
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    let parts: Vec<&str> = path.split(sep).collect();
+    // Split using platform-aware split_paths
+    let parts: Vec<PathBuf> = std::env::split_paths(&path).collect();
 
-    // 1. Provider binary's parent dir should be first
+    // 1. Provider binary's parent dir should be first (platform-agnostic comparison)
+    let expected_parent = fake_provider_bin.parent().unwrap();
     assert!(
-        parts
-            .first()
-            .map(|p| p.contains("/fake/provider/bin"))
-            .unwrap_or(false),
-        "Provider binary parent dir should be first in PATH"
+        parts.first().map(|p| p == expected_parent).unwrap_or(false),
+        "Provider binary parent dir should be first in PATH, got {:?}, expected {:?}",
+        parts.first(),
+        expected_parent
     );
 
-    // 2. Should include ~/.augment/bin early
-    let has_augment_bin = parts.iter().any(|p| p.contains(".augment/bin"));
+    // 2. Should include ~/.augment/bin early (use platform separator)
+    let augment_bin_component = format!(".augment{}bin", std::path::MAIN_SEPARATOR);
+    let has_augment_bin = parts
+        .iter()
+        .any(|p| p.to_string_lossy().contains(&augment_bin_component));
     assert!(has_augment_bin, "PATH should include ~/.augment/bin");
 
     // 3. Should include at least some enhanced dirs (can't test all as they're system-dependent)
