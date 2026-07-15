@@ -598,6 +598,10 @@ async fn db_read_error_during_capture_fails_batch() {
         err_data.contains("git.autoCommit") || err_data.contains("workspace.autoFetch"),
         "error should name the failing key in data field: {err}"
     );
+    assert!(
+        err_data.contains("during snapshot capture"),
+        "error should indicate failure during snapshot capture (not later during apply): {err}"
+    );
 
     shutdown_tx.send(()).ok();
     let _ = std::fs::remove_file(&socket_path);
