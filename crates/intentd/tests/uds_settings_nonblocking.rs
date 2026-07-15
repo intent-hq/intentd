@@ -39,13 +39,13 @@ struct BlockingSecrets {
 }
 
 impl SecretStore for BlockingSecrets {
-    fn load(&self, _account: &str) -> Option<String> {
+    fn load(&self, _account: &str) -> IntentResult<Option<String>> {
         self.load_calls.fetch_add(1, Ordering::SeqCst);
         // Longer than the production 3s read timeout; kept small enough that
         // the tokio blocking-pool shutdown at end-of-test doesn't hold up the
         // whole test binary.
         thread::sleep(Duration::from_secs(5));
-        None
+        Ok(None)
     }
     fn store(&self, _account: &str, _value: &str) -> IntentResult<()> {
         Ok(())
