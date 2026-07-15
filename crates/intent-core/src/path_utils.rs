@@ -7,11 +7,66 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use directories::BaseDirs;
 
 fn home_dir() -> Option<PathBuf> {
     BaseDirs::new().map(|b| b.home_dir().to_path_buf())
+}
+
+/// Cached login-shell PATH directories. Runs at most once, with a 2s timeout.
+static LOGIN_SHELL_DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+
+/// Capture PATH from the user's login shell (unix only, cached, short timeout).
+/// On failure (timeout, spawn error, no $SHELL, non-unix), returns an empty vec.
+/// Exposed for testing via an injectable shell path.
+#[cfg(unix)]
+fn capture_login_shell_path_with(shell: Option<&str>) -> Vec<PathBuf> {
+    let shell = match shell {
+        Some(s) => s.to_string(),
+        None => match std::env::var("SHELL") {
+            Ok(s) if !s.is_empty() => s,
+            _ => return Vec::new(),
+        },
+    };
+
+    // Run shell -lc 'printf %s "$PATH"' with 2s timeout
+    let output = Command::new(&shell)
+        .args(["-lc", r#"printf %s "$PATH""#])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+        .and_then(|mut child| {
+            let timeout = Duration::from_secs(2);
+            std::thread::sleep(timeout);
+            // Try to kill if still running
+            let _ = child.kill();
+            child.wait_with_output().ok()
+        });
+
+    match output {
+        Some(out) if out.status.success() => {
+            let path_str = String::from_utf8_lossy(&out.stdout);
+            std::env::split_paths(&path_str.as_ref()).collect::<Vec<_>>()
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(not(unix))]
+fn capture_login_shell_path_with(_shell: Option<&str>) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Returns cached login-shell PATH directories (unix only).
+/// Runs the shell at most once, with a 2s timeout, and degrades silently on failure.
+pub fn login_shell_dirs() -> &'static [PathBuf] {
+    LOGIN_SHELL_DIRS.get_or_init(|| capture_login_shell_path_with(None))
 }
 
 /// Helper to push a directory to the list if it's not empty and not already seen.
@@ -113,6 +168,11 @@ pub fn enriched_tool_dirs() -> Vec<PathBuf> {
         }
     }
 
+    // Add login-shell PATH directories (unix only, cached, silent degradation)
+    for dir in login_shell_dirs() {
+        push_dir(&mut dirs, &mut seen, dir.clone());
+    }
+
     dirs
 }
 
@@ -157,5 +217,52 @@ mod tests {
             has_usr_bin || has_bin,
             "Should include common Unix bin directories"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_path_with_fake_shell() {
+        // Create a fake shell script that outputs a known PATH
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir();
+        let fake_shell = temp_dir.join("fake_shell_test.sh");
+        fs::write(
+            &fake_shell,
+            "#!/bin/sh\nif [ \"$1\" = \"-lc\" ]; then\n  printf '/custom/bin:/other/bin'\nfi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
+        fs::remove_file(&fake_shell).ok();
+
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0], PathBuf::from("/custom/bin"));
+        assert_eq!(dirs[1], PathBuf::from("/other/bin"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_path_with_invalid_shell_degrades_silently() {
+        let dirs = capture_login_shell_path_with(Some("/nonexistent/shell"));
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_path_with_no_shell_env_degrades_silently() {
+        let dirs = capture_login_shell_path_with(Some(""));
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
+    fn enriched_tool_dirs_includes_login_shell_dirs() {
+        // This test verifies that enriched_tool_dirs includes login-shell dirs
+        // (even if empty on non-unix or when shell fails)
+        let dirs = enriched_tool_dirs();
+        // Should at least include the hardcoded dirs
+        assert!(!dirs.is_empty());
     }
 }

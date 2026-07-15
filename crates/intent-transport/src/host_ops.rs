@@ -83,17 +83,27 @@ pub(crate) fn resolve_binary_path(name: &str, common_paths: &[String]) -> Option
     if name.is_empty() {
         return None;
     }
+    // 1. PATH which (lookup_in_path uses which/where)
     if let Some(path) = lookup_in_path(name) {
         if path.is_file() || path.is_symlink() {
             return Some(path);
         }
     }
+    // 2. Caller-supplied common_paths hints
     for candidate in common_paths {
         let candidate = PathBuf::from(candidate);
         if candidate.is_file() || candidate.is_symlink() {
             return Some(candidate);
         }
     }
+    // 3. Enriched tool directories (hardcoded + login-shell PATH)
+    for dir in path_utils::enriched_tool_dirs() {
+        let candidate = dir.join(binary_filename(name));
+        if candidate.is_file() || candidate.is_symlink() {
+            return Some(candidate);
+        }
+    }
+    // 4. Common OS directories (fallback)
     for dir in common_dirs() {
         let candidate = dir.join(binary_filename(name));
         if candidate.is_file() || candidate.is_symlink() {

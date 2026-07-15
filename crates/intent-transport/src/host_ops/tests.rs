@@ -307,6 +307,26 @@ fn resolve_binary_path_finds_caller_common_path() {
     assert_eq!(resolved.as_deref(), Some(bin.as_path()));
 }
 
+#[cfg(unix)]
+#[test]
+fn resolve_binary_path_searches_enriched_tool_dirs_before_common_dirs() {
+    use std::os::unix::fs::PermissionsExt;
+    // Create a binary in ~/.local/bin (which is in enriched_tool_dirs)
+    let home = std::env::var("HOME").expect("HOME should be set");
+    let local_bin = PathBuf::from(home).join(".local").join("bin");
+    std::fs::create_dir_all(&local_bin).unwrap();
+    let test_bin_name = format!("test-enriched-binary-{}", std::process::id());
+    let bin = local_bin.join(&test_bin_name);
+    std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Verify it's found via enriched_tool_dirs, not PATH
+    let resolved = resolve_binary_path(&test_bin_name, &[]);
+    std::fs::remove_file(&bin).ok();
+
+    assert_eq!(resolved.as_deref(), Some(bin.as_path()));
+}
+
 #[test]
 fn tool_availability_op_defaults_to_canonical_tool_set() {
     let v = tool_availability_op(None);
