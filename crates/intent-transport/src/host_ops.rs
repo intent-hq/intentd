@@ -208,8 +208,10 @@ fn run_version_with(path: &Path, path_env: &OsString) -> Option<String> {
         .map(String::from)
 }
 
-/// Build an enriched PATH for executing a binary, including the binary's
-/// parent directory plus all enhanced path directories (node, nvm, etc.).
+/// Build an enriched PATH for executing a binary, with correct precedence:
+/// 1. Binary's parent directory (for co-located dependencies like node in nvm)
+/// 2. Enriched tool directories (node, nvm, homebrew, volta, asdf, etc.)
+/// 3. Inherited PATH (fallback)
 fn build_enriched_path_for_binary(binary_path: &Path) -> OsString {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -221,13 +223,20 @@ fn build_enriched_path_for_binary(binary_path: &Path) -> OsString {
         }
     }
 
-    // 2. Enhanced path directories (node, nvm, homebrew, volta, asdf, etc.)
-    for dir in path_utils::enhanced_path_dirs() {
+    // 2. Enriched tool directories (node, nvm, homebrew, volta, asdf, etc.)
+    for dir in path_utils::enriched_tool_dirs() {
         path_utils::push_dir(&mut dirs, &mut seen, dir);
     }
 
-    // Join with platform-specific separator
-    std::env::join_paths(dirs).unwrap_or_default()
+    // 3. Inherited PATH (lowest priority)
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            path_utils::push_dir(&mut dirs, &mut seen, dir);
+        }
+    }
+
+    // Join paths, fall back to inherited PATH if joining fails
+    std::env::join_paths(&dirs).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
 }
 
 /// Build the `host.checkGit` result. `available:false` (never an RPC error)

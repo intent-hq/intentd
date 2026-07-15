@@ -220,9 +220,16 @@ pub fn enhanced_path(provider_binary: Option<&Path>) -> String {
         path_utils::push_dir(&mut dirs, &mut seen, home.join(".augment").join("bin"));
     }
 
-    // 3. Enhanced path directories (node, nvm, homebrew, volta, asdf, etc.)
-    for dir in path_utils::enhanced_path_dirs() {
+    // 3. Enriched tool directories (node, nvm, homebrew, volta, asdf, etc.)
+    for dir in path_utils::enriched_tool_dirs() {
         path_utils::push_dir(&mut dirs, &mut seen, dir);
+    }
+
+    // 4. Inherited PATH (lowest priority)
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            path_utils::push_dir(&mut dirs, &mut seen, dir);
+        }
     }
 
     // Join with platform-specific separator

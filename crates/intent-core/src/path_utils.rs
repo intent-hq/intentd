@@ -25,12 +25,17 @@ pub fn push_dir(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, dir: PathB
 }
 
 /// Returns an ordered, de-duplicated list of directories commonly containing
-/// development tools (node, npm, homebrew, volta, asdf, nvm, etc.).
+/// development tools (node, npm, homebrew, volta, asdf, nvm, etc.), PLUS the
+/// inherited PATH directories.
 ///
 /// The list starts with the current PATH environment variable, then adds
 /// platform-specific common tool directories. This ensures tools and their
 /// dependencies (e.g., #!/usr/bin/env node scripts) can be found even when
 /// running in packaged app environments with minimal inherited PATH.
+///
+/// Note: Callers that need custom precedence (e.g., provider-binary dir first,
+/// then ~/.augment/bin, then enriched dirs, then inherited PATH) should use
+/// `enriched_tool_dirs()` + split_paths to build the order themselves.
 pub fn enhanced_path_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -41,6 +46,24 @@ pub fn enhanced_path_dirs() -> Vec<PathBuf> {
             push_dir(&mut dirs, &mut seen, dir);
         }
     }
+
+    // Add enriched tool directories
+    for dir in enriched_tool_dirs() {
+        push_dir(&mut dirs, &mut seen, dir);
+    }
+
+    dirs
+}
+
+/// Returns platform-specific directories commonly containing development tools
+/// (node, npm, homebrew, volta, asdf, nvm, etc.), WITHOUT the inherited PATH.
+///
+/// Use this when you need to control precedence explicitly (e.g., prepend
+/// provider-binary dir and ~/.augment/bin, then these enriched dirs, then
+/// inherited PATH last).
+pub fn enriched_tool_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
 
     let home = home_dir();
 
