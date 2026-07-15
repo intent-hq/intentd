@@ -299,7 +299,7 @@ async fn agent_read_conversation_returns_messages() {
 }
 
 #[tokio::test]
-async fn agent_summary_returns_text() {
+async fn agent_summary_returns_shape() {
     let (services, ws, ws_root, db) = setup().await;
 
     let agent_val = services
