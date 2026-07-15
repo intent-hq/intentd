@@ -8397,6 +8397,33 @@ mod rules {
         );
     }
 
+    #[tokio::test]
+    async fn assembly_omits_rtk_line_when_disabled() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+
+        // rtk.enabled defaults to false, don't set it
+
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            None,
+            false,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("assembled prompt");
+
+        // Assert RTK line is NOT present (regression guarantee)
+        assert!(
+            !prompt.contains("Prefix these commands with rtk"),
+            "RTK line should not appear when disabled"
+        );
+    }
+
     async fn recv(sub: &mut Subscription) -> Vec<intent_core::Event> {
         sub.recv().await.expect("subscription open")
     }
