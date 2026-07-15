@@ -107,7 +107,7 @@ fn get_instruction_by_id(id: &str, fallback_to_workspace: bool) -> Option<&'stat
 /// `getInstructionWithCommon`): common → workspace → specific, with the
 /// `common`/`workspace`/utility/non-interactive special cases. Unknown ids fall
 /// back to the `workspace` body via [`get_instruction_by_id`].
-pub(crate) fn get_instruction_with_common(agent_type: &str) -> String {
+pub fn get_instruction_with_common(agent_type: &str) -> String {
     let specific = get_instruction_by_id(agent_type, true).unwrap_or(WORKSPACE);
     if agent_type == "common" {
         return specific.to_string();

@@ -10,11 +10,14 @@
 //! `agent:idle` finish reason is non-normal (`error`/`cancelled`/
 //! `provider_stopped`/`refusal`).
 
+use std::path::PathBuf;
+
 use intent_core::events::AGENT_IDLE;
 use intent_core::{AgentId, AgentSession, Error, Event, NoteId, WorkspaceApi};
 use intent_git::commit::CLEAN_TREE_ERROR;
 
 use crate::events::SubscriptionFilter;
+use crate::instructions::get_instruction_with_common;
 use crate::Services;
 
 /// Subject-line cap for auto-commit fallback messages (TS
@@ -27,6 +30,20 @@ const AUTO_COMMIT_DISABLED_MARK: &str = "Auto-commit is disabled";
 /// `git_agent_commit` empty-worktree result (§5.6 parity) treated as a silent
 /// skip — there is simply nothing to attribute to the idle agent.
 const NO_CHANGES_MARK: &str = "No uncommitted changes found";
+
+/// Diff output cap (64 KB): keep prompts sane when the worktree is very dirty.
+const DIFF_CAP_BYTES: usize = 64 * 1024;
+/// Repo-root `AGENTS.md` cap (8 KB): enough context without ballooning prompts.
+const AGENTS_MD_CAP_BYTES: usize = 8 * 1024;
+/// Recent commit subjects for style mimicry (~10 commits).
+const RECENT_COMMITS_LIMIT: usize = 10;
+/// Generation timeout (~30 s) — acceptable latency on idle before falling back.
+const GENERATION_TIMEOUT_MS: u64 = 30_000;
+
+/// Opening tag that wraps the LLM-generated commit message.
+const COMMIT_MESSAGE_OPEN_TAG: &str = "<<<COMMIT_MESSAGE>>>";
+/// Closing tag that wraps the LLM-generated commit message.
+const COMMIT_MESSAGE_CLOSE_TAG: &str = "<<</COMMIT_MESSAGE>>>";
 
 /// Whether the `agent:idle` `finishReason` is a normal turn-end we should
 /// auto-commit on. Anything outside this allowlist (or missing) is treated as
@@ -53,6 +70,54 @@ fn is_meaningful_agent_name(session: &AgentSession) -> bool {
 fn normalize_subject(raw: &str) -> String {
     let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed.chars().take(SUBJECT_MAX_CHARS).collect()
+}
+
+/// Build a prompt context string for commit-message generation: uncommitted diff
+/// (capped), recent commit subjects (style mimicry), repo-root `AGENTS.md` (if
+/// present, capped), and task/agent hints.
+fn build_message_prompt(
+    diff_text: &str,
+    recent_commits: &[String],
+    agents_md: Option<&str>,
+    task_title: Option<&str>,
+    agent_name: &str,
+) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!(
+        "# Uncommitted Changes\n\n```diff\n{diff_text}\n```"
+    ));
+    if !recent_commits.is_empty() {
+        parts.push(format!(
+            "\n# Recent Commit Messages (for style reference)\n\n{}",
+            recent_commits
+                .iter()
+                .map(|s| format!("- {s}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    if let Some(md) = agents_md {
+        parts.push(format!("\n# Repository Conventions (AGENTS.md)\n\n{md}"));
+    }
+    if let Some(title) = task_title {
+        parts.push(format!(
+            "\n# Task Context\n\nTask: {title}\nAgent: {agent_name}"
+        ));
+    } else {
+        parts.push(format!("\n# Agent\n\nAgent: {agent_name}"));
+    }
+    parts.join("\n")
+}
+
+/// Parse the LLM output for the commit message wrapped in
+/// `<<<COMMIT_MESSAGE>>>` tags. Returns `None` when the output is
+/// unparseable, empty, or the tags are missing.
+fn parse_commit_message(output: &str) -> Option<String> {
+    let start = output.find(COMMIT_MESSAGE_OPEN_TAG)?;
+    let after_open = start + COMMIT_MESSAGE_OPEN_TAG.len();
+    let end = output[after_open..].find(COMMIT_MESSAGE_CLOSE_TAG)?;
+    let message = output[after_open..after_open + end].trim();
+    (!message.is_empty()).then(|| message.to_string())
 }
 
 impl Services {
@@ -125,14 +190,49 @@ impl Services {
             );
             return;
         }
+
+        // Resolve worktree path for generation + fallback.
+        let worktree_path = match self
+            .store()
+            .get_workspace(&session.workspace_id)
+            .await
+            .ok()
+            .and_then(|ws| ws.worktree_path)
+            .map(PathBuf::from)
+        {
+            Some(p) => p,
+            None => {
+                tracing::debug!(
+                    agent = %agent_id.0,
+                    workspace = %session.workspace_id.0,
+                    "auto-commit skipped: no worktree path"
+                );
+                return;
+            }
+        };
+
         let linked_note_id = session.task_note_id.clone();
-        let subject = self
-            .build_auto_commit_subject(&session, &linked_note_id)
-            .await;
+        // Attempt LLM generation; fall back to deterministic subject on any failure.
+        let message = match self
+            .generate_auto_commit_message(&worktree_path, &session, &linked_note_id)
+            .await
+        {
+            Some(msg) => msg,
+            None => {
+                tracing::debug!(
+                    agent = %agent_id.0,
+                    workspace = %session.workspace_id.0,
+                    "auto-commit using fallback subject"
+                );
+                self.build_auto_commit_subject(&session, &linked_note_id)
+                    .await
+            }
+        };
+
         match self
             .git_agent_commit(
                 session.workspace_id.clone(),
-                subject,
+                message,
                 Some(agent_id.clone()),
                 linked_note_id.clone(),
                 None,
@@ -190,6 +290,136 @@ impl Services {
             return normalize_subject(&session.name);
         }
         DEFAULT_SUBJECT.to_string()
+    }
+
+    /// Generate a commit message via LLM given the workspace worktree, session,
+    /// and linked note. Returns `None` on any failure (missing auggie CLI,
+    /// timeout, unparseable output, no uncommitted changes), logging the failure
+    /// at debug/warn level. The caller should fall back to
+    /// [`Self::build_auto_commit_subject`] when `None` is returned.
+    async fn generate_auto_commit_message(
+        &self,
+        worktree_path: &std::path::Path,
+        session: &AgentSession,
+        linked_note_id: &Option<NoteId>,
+    ) -> Option<String> {
+        // Skip generation entirely when there are no uncommitted changes.
+        // Use diff_index_to_workdir (includes untracked) since auto-commit
+        // stages everything via git_agent_commit.
+        let diff_files = match intent_git::diff::diff_index_to_workdir(worktree_path) {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::debug!(
+                    workspace = %session.workspace_id.0,
+                    error = %e,
+                    "generate_auto_commit_message: diff failed"
+                );
+                return None;
+            }
+        };
+        if diff_files.is_empty() {
+            tracing::debug!(
+                workspace = %session.workspace_id.0,
+                "generate_auto_commit_message: no changes, skipping generation"
+            );
+            return None;
+        }
+
+        // Build diff text (capped at DIFF_CAP_BYTES).
+        let mut diff_text = String::new();
+        for fd in &diff_files {
+            let line = format!("{} | +{} -{}\n", fd.path, fd.additions, fd.deletions);
+            if diff_text.len() + line.len() > DIFF_CAP_BYTES {
+                diff_text.push_str("... (diff truncated)\n");
+                break;
+            }
+            diff_text.push_str(&line);
+        }
+
+        // Recent commit subjects for style mimicry.
+        let recent_commits = intent_git::history::history(worktree_path, RECENT_COMMITS_LIMIT)
+            .ok()
+            .map(|commits| commits.into_iter().map(|c| c.message).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        // Repo-root AGENTS.md (if present, capped).
+        let agents_md = worktree_path
+            .join("AGENTS.md")
+            .exists()
+            .then(|| {
+                std::fs::read_to_string(worktree_path.join("AGENTS.md"))
+                    .ok()
+                    .map(|content| {
+                        if content.len() > AGENTS_MD_CAP_BYTES {
+                            format!("{}... (truncated)", &content[..AGENTS_MD_CAP_BYTES])
+                        } else {
+                            content
+                        }
+                    })
+            })
+            .flatten();
+
+        // Task title (if linked).
+        let task_title = if let Some(note_id) = linked_note_id {
+            self.store()
+                .get_note(&session.workspace_id, note_id)
+                .await
+                .ok()
+                .map(|n| n.title)
+        } else {
+            None
+        };
+
+        // Compose prompt.
+        let prompt = build_message_prompt(
+            &diff_text,
+            &recent_commits,
+            agents_md.as_deref(),
+            task_title.as_deref(),
+            &session.name,
+        );
+        let system_prompt = get_instruction_with_common("commit-message");
+
+        // Call agent_complete_once_op.
+        let result = self
+            .agent_complete_once_op(
+                prompt,
+                Some(system_prompt),
+                None,
+                Some(session.workspace_id.clone()),
+                Some(GENERATION_TIMEOUT_MS),
+            )
+            .await;
+
+        match result {
+            Ok(value) => {
+                let text = value["text"].as_str().unwrap_or("");
+                match parse_commit_message(text) {
+                    Some(msg) => {
+                        tracing::debug!(
+                            workspace = %session.workspace_id.0,
+                            "generate_auto_commit_message: success"
+                        );
+                        Some(msg)
+                    }
+                    None => {
+                        tracing::warn!(
+                            workspace = %session.workspace_id.0,
+                            "generate_auto_commit_message: unparseable output (missing tags or empty)"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %session.workspace_id.0,
+                    error = %e,
+                    "generate_auto_commit_message: generation failed"
+                );
+                None
+            }
+        }
     }
 }
 
