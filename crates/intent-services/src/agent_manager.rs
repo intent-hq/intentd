@@ -903,6 +903,18 @@ impl AgentManager {
                     .map_err(|e| Error::Internal(format!("write rules file failed: {e}")))?;
                 rules_file_path = Some(path.to_string_lossy().into_owned());
                 rules_config = Some(TempConfigFile { path });
+                // Persist the assembled systemPrompt on the session so
+                // `agent.getSession` can return it without re-assembly.
+                let mut updated_session = session;
+                updated_session.system_prompt = Some(prompt);
+                if let Err(e) = self
+                    .services
+                    .store
+                    .update_agent_session(&workspace_id, &updated_session)
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, error = %e, "failed to persist system_prompt on session");
+                }
             }
         }
 

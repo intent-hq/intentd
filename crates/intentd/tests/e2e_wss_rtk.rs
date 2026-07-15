@@ -1,9 +1,9 @@
-//! WSS e2e test for RTK detection + prompt injection.
-//!
-//! Verifies that when `rtk.enabled` is true and a fake `rtk` shim is on PATH,
-//! the assembled system prompt includes the RTK instruction line with the
-//! filtered subcommand list. Also tests the negative path: with flag off or
-//! rtk missing, the prompt must not contain the RTK line (regression guarantee).
+// WSS e2e test for RTK detection + prompt injection.
+//
+// Verifies that when `rtk.enabled` is true and a fake `rtk` shim is on PATH,
+// the assembled system prompt includes the RTK instruction line with the
+// filtered subcommand list. Also tests the negative path: with flag off or
+// rtk missing, the prompt must not contain the RTK line (regression guarantee).
 
 #![cfg(unix)]
 
@@ -231,6 +231,48 @@ async fn wss_rpc(
     serde_json::from_str(&text).expect("invalid json")
 }
 
+async fn wss_event(
+    ws: &mut WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+    secs: u64,
+) -> Value {
+    loop {
+        let next = timeout(Duration::from_secs(secs), ws.next())
+            .await
+            .expect("wss event timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "events.event" {
+                    return v;
+                }
+                // Skip non-event messages (e.g., RPC responses)
+            }
+            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
+                // Skip ping/pong frames
+            }
+            Some(Ok(Message::Close(_))) => {
+                panic!("websocket closed while waiting for event");
+            }
+            Some(Err(e)) => panic!("websocket error: {e}"),
+            None => panic!("websocket stream ended"),
+            _ => {
+                // Skip other frame types
+            }
+        }
+    }
+}
+
+fn gate(name: &str) -> Option<String> {
+    let key = "MOCK_AGENT_SCRIPT_PATH";
+    match std::env::var(key) {
+        Ok(path) if !path.is_empty() => Some(path),
+        _ => {
+            eprintln!("skipping {name}: {key} not set");
+            None
+        }
+    }
+}
+
 #[tokio::test]
 async fn rtk_settings_integration() {
     //Test that rtk.enabled setting round-trips correctly over WSS
@@ -313,5 +355,240 @@ async fn rtk_settings_integration() {
         reset_resp["result"]["value"],
         json!(false),
         "reset should restore default false"
+    );
+}
+
+/// WSS e2e: RTK prompt injection over the real wire transport.
+///
+/// Drives the full orchestration: `workspace.create` with `initialAgent.prompt`
+/// (the daemon-owned initial-agent flow from PROTOCOL §5.1) starts a turn, which
+/// triggers `assemble_system_prompt` → systemPrompt persistence. Then `agent.getSession`
+/// returns the assembled prompt with (or without) the RTK layer depending on the flag.
+///
+/// Positive path: rtk.enabled=true, fake-rtk.sh on PATH → systemPrompt CONTAINS
+/// "Prefix these commands with rtk for compressed, LLM-friendly output: ls, cat, grep"
+/// (the filtered subcommand list from the fake shim, excluding `test` and `help`).
+///
+/// Negative path: rtk.enabled=false → systemPrompt DOES NOT contain "Prefix these commands with rtk".
+#[tokio::test]
+async fn rtk_prompt_injection_over_wss() {
+    let Some(script) = gate("WSS RTK prompt injection E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+    let port = free_port();
+    let port_s = port.to_string();
+
+    // Fake rtk shim (outputs `ls, cat, grep, test, help`; test + help excluded)
+    // Copy to a temp directory and name it `rtk` so `which rtk` finds it
+    let fake_rtk_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-rtk.sh");
+    assert!(fake_rtk_src.exists(), "fake-rtk.sh fixture missing");
+
+    let bin_dir = data_dir.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mkdir bin");
+    let fake_rtk_dest = bin_dir.join("rtk");
+    std::fs::copy(&fake_rtk_src, &fake_rtk_dest).expect("copy fake-rtk.sh to bin/rtk");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&fake_rtk_dest).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_rtk_dest, perms).unwrap();
+    }
+
+    // Build PATH with the bin dir first so `which rtk` finds our shim
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let augmented_path = format!("{}:{}", bin_dir.display(), original_path);
+
+    // Mock ACP behavior for deterministic test
+    let behavior = json!({ "response": "build complete" }).to_string();
+
+    let mut _daemon = Daemon {
+        child: spawn_serve(
+            &data_dir,
+            "both",
+            &[
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+                ("INTENTD_TCP_PORT", &port_s),
+                ("MOCK_AGENT_SCRIPT_PATH", &script),
+                ("MOCK_AGENT_BEHAVIOR", &behavior),
+                ("PATH", &augmented_path),
+            ],
+        ),
+        data_dir: data_dir.clone(),
+    };
+
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // ===== POSITIVE PATH: rtk.enabled = true =====
+    // Enable RTK before creating workspace
+    let mut settings_ws = wss_connect(port, cfg.clone()).await;
+    let _ = wss_rpc(
+        &mut settings_ws,
+        10,
+        "settings.update",
+        json!({ "changes": [{ "path": "rtk.enabled", "value": true }] }),
+    )
+    .await;
+
+    // SUBSCRIBER conn — subscribe to events before creating workspace
+    let mut sub = wss_connect(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:*", "agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["result"]["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // RPC conn — workspace.create with initialAgent to trigger activation
+    let mut rpc = wss_connect(port, cfg.clone()).await;
+    let agent_id_1 = format!("agent-{}", Uuid::new_v4());
+    let created = wss_rpc(
+        &mut rpc,
+        20,
+        "workspace.create",
+        json!({
+            "title": "RTK enabled WS",
+            "branch": "feat/rtk-enabled-e2e",
+            "idempotencyKey": "rtk-test-1",
+            "initialAgent": {
+                "agentId": agent_id_1,
+                "prompt": "run the build",
+                "name": "Test Agent (RTK on)",
+                "model": "mock:default",
+            },
+        }),
+    )
+    .await;
+    let _ws_id_1 = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id");
+
+    // Wait for agent turn to complete by consuming events
+    let mut saw_stream_end = false;
+    for _ in 0..120 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end" {
+            saw_stream_end = true;
+            break;
+        }
+    }
+    assert!(saw_stream_end, "agent:stream:end event observed");
+
+    // Now get the session to verify systemPrompt was persisted
+    let session_1 = wss_rpc(
+        &mut rpc,
+        30,
+        "agent.getSession",
+        json!({ "agentId": agent_id_1 }),
+    )
+    .await;
+    let system_prompt_1 = session_1["result"]["session"]["systemPrompt"]
+        .as_str()
+        .expect("systemPrompt should be populated after turn completes");
+
+    assert!(
+        system_prompt_1
+            .contains("Prefix these commands with rtk for compressed, LLM-friendly output:"),
+        "systemPrompt (enabled) must contain the RTK header"
+    );
+
+    // Extract just the RTK line for clearer error messages
+    let rtk_line = system_prompt_1
+        .lines()
+        .find(|line| line.starts_with("Prefix these commands with rtk"))
+        .expect("RTK line should be present when enabled");
+
+    assert!(
+        rtk_line.contains("ls") && rtk_line.contains("cat") && rtk_line.contains("grep"),
+        "RTK line must include filtered subcommands, got: {rtk_line}"
+    );
+    assert!(
+        !rtk_line.contains(" test")
+            && !rtk_line.contains("test,")
+            && !rtk_line.contains(" help")
+            && !rtk_line.contains("help,"),
+        "RTK line must NOT include excluded commands (test, help), got: {rtk_line}"
+    );
+
+    // ===== NEGATIVE PATH: rtk.enabled = false =====
+    // Disable RTK
+    let _ = wss_rpc(
+        &mut settings_ws,
+        40,
+        "settings.update",
+        json!({ "changes": [{ "path": "rtk.enabled", "value": false }] }),
+    )
+    .await;
+
+    // Create a second workspace + agent (flag off)
+    let agent_id_2 = format!("agent-{}", Uuid::new_v4());
+    let created_2 = wss_rpc(
+        &mut rpc,
+        50,
+        "workspace.create",
+        json!({
+            "title": "RTK disabled WS",
+            "branch": "feat/rtk-disabled-e2e",
+            "idempotencyKey": "rtk-test-2",
+            "initialAgent": {
+                "agentId": agent_id_2,
+                "prompt": "run the build",
+                "name": "Test Agent (RTK off)",
+                "model": "mock:default",
+            },
+        }),
+    )
+    .await;
+    let _ws_id_2 = created_2["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id");
+
+    // Wait for the second agent turn to complete
+    let mut saw_stream_end_2 = false;
+    for _ in 0..120 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end" && ev["data"]["agentId"] == agent_id_2 {
+            saw_stream_end_2 = true;
+            break;
+        }
+    }
+    assert!(
+        saw_stream_end_2,
+        "agent:stream:end event observed for second agent"
+    );
+
+    // Get the session to verify systemPrompt was persisted
+    let session_2 = wss_rpc(
+        &mut rpc,
+        60,
+        "agent.getSession",
+        json!({ "agentId": agent_id_2 }),
+    )
+    .await;
+    let system_prompt_2 = session_2["result"]["session"]["systemPrompt"]
+        .as_str()
+        .expect("systemPrompt should be populated after turn completes");
+
+    assert!(
+        !system_prompt_2.contains("Prefix these commands with rtk"),
+        "systemPrompt (disabled) must NOT contain the RTK instruction line"
     );
 }
