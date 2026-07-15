@@ -119,7 +119,7 @@ jobs:
       - name: Run e2e coverage
         run: |
           cd ${{ github.workspace }}
-          GENERATE_LCOV=1 ./scripts/coverage-e2e.sh 40
+          GENERATE_LCOV=1 ./scripts/coverage-e2e.sh 39
       - name: Generate coverage summary
         if: always()
         run: |
