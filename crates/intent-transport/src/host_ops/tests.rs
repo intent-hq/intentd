@@ -311,6 +311,12 @@ fn resolve_binary_path_finds_caller_common_path() {
 #[test]
 fn resolve_binary_path_searches_enriched_tool_dirs() {
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+
+    // Serialize env mutation to avoid thread-safety issues in parallel test execution
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    let _guard = ENV_MUTEX.lock().unwrap();
+
     // Smoke test: verify that resolve_binary_path searches enriched_tool_dirs
     // when PATH doesn't find the binary. Use a temp directory to avoid writing
     // into the real $HOME (which can fail on CI or leave artifacts).

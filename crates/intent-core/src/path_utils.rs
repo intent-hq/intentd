@@ -298,11 +298,29 @@ mod tests {
 
     #[test]
     fn enriched_tool_dirs_includes_login_shell_dirs() {
-        // Use the injectable variant with a fake empty login-shell dirs function
-        // to avoid spawning the real shell in tests
-        static EMPTY_DIRS: [PathBuf; 0] = [];
-        let dirs = enriched_tool_dirs_with(|| &EMPTY_DIRS);
-        // Should at least include the hardcoded dirs (even with empty login-shell dirs)
+        use std::sync::LazyLock;
+
+        // Use the injectable variant with known fake login-shell dirs
+        // to verify that login-shell dirs are actually included
+        static FAKE_LOGIN_DIRS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
+            vec![
+                PathBuf::from("/fake/login/bin"),
+                PathBuf::from("/another/fake/bin"),
+            ]
+        });
+
+        let dirs = enriched_tool_dirs_with(|| &FAKE_LOGIN_DIRS);
+
+        // Verify the fake login-shell dirs actually appear in the result
+        assert!(
+            dirs.contains(&PathBuf::from("/fake/login/bin")),
+            "Login-shell dir /fake/login/bin should be included"
+        );
+        assert!(
+            dirs.contains(&PathBuf::from("/another/fake/bin")),
+            "Login-shell dir /another/fake/bin should be included"
+        );
+        // Should also include the hardcoded dirs
         assert!(!dirs.is_empty());
     }
 }
