@@ -26,10 +26,13 @@
 //! `auggie-path.ts`. The pure operations accept injected resolvers / a `home`
 //! root so they unit-test cleanly with a temp directory.
 
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use intent_core::path_utils;
 use serde_json::{json, Map, Value};
 
 /// Resolves a binary by name to an absolute path on the daemon host. Injected
@@ -160,9 +163,22 @@ fn binary_filename(name: &str) -> String {
 
 /// Run `<path> --version` (5s timeout) and return the first trimmed non-empty
 /// line of stdout, or `None` on failure.
+///
+/// Enriches the PATH environment variable to include:
+/// 1. The binary's parent directory (for co-located dependencies like node)
+/// 2. Enhanced path directories (node, nvm, homebrew, volta, asdf, etc.)
+/// 3. The inherited PATH
+///
+/// This ensures that scripts with `#!/usr/bin/env node` shebangs can find
+/// their interpreter even when running in packaged app environments with
+/// minimal inherited PATH.
 fn run_version(path: &Path) -> Option<String> {
+    // Build enriched PATH: binary's parent dir + enhanced dirs + inherited PATH
+    let enriched_path = build_enriched_path_for_binary(path);
+
     let mut child = Command::new(path)
         .arg("--version")
+        .env("PATH", enriched_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -191,6 +207,28 @@ fn run_version(path: &Path) -> Option<String> {
         .map(str::trim)
         .find(|s| !s.is_empty())
         .map(String::from)
+}
+
+/// Build an enriched PATH for executing a binary, including the binary's
+/// parent directory plus all enhanced path directories (node, nvm, etc.).
+fn build_enriched_path_for_binary(binary_path: &Path) -> OsString {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+
+    // 1. Binary's parent directory (highest priority for co-located dependencies)
+    if binary_path.is_absolute() {
+        if let Some(parent) = binary_path.parent() {
+            path_utils::push_dir(&mut dirs, &mut seen, parent.to_path_buf());
+        }
+    }
+
+    // 2. Enhanced path directories (node, nvm, homebrew, volta, asdf, etc.)
+    for dir in path_utils::enhanced_path_dirs() {
+        path_utils::push_dir(&mut dirs, &mut seen, dir);
+    }
+
+    // Join with platform-specific separator
+    std::env::join_paths(dirs).unwrap_or_default()
 }
 
 /// Build the `host.checkGit` result. `available:false` (never an RPC error)
