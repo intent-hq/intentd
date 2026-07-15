@@ -25,6 +25,11 @@ const SESSION_ID = 'mock-session-1';
 let promptCount = 0;
 const pendingPromptIds = [];
 
+// Agent→client request correlation: track outgoing request IDs separately from
+// incoming prompt IDs. The daemon responds to each client call with a matching id.
+let nextClientCallId = 1;
+const pendingClientCalls = new Map();
+
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n');
 }
@@ -94,6 +99,17 @@ function callWorkspaceTool(toolCall) {
       if (resp.error) return reject(new Error(`tool call error: ${JSON.stringify(resp.error)}`));
       resolve(resp.result);
     })().catch(reject);
+  });
+}
+
+// Issue an agent→client request (fs/*, terminal/*, session/request_permission).
+// Returns a promise that resolves with the response result or rejects with an error.
+// The correlation is via the JSON-RPC id we assign (nextClientCallId).
+function callClientService(method, params) {
+  return new Promise((resolve, reject) => {
+    const id = nextClientCallId++;
+    pendingClientCalls.set(id, { resolve, reject });
+    send({ jsonrpc: '2.0', id, method, params });
   });
 }
 
@@ -174,6 +190,33 @@ async function handlePrompt(id, params) {
     } catch (err) {
       log(`tool call failed: ${err.message}`);
       return result(id, { stopReason: 'refusal' });
+    }
+  }
+  // Client calls: agent→client requests (fs/*, terminal/*, session/request_permission).
+  // Each entry in active.clientCalls is { method, params, assertResult?, assertError? }.
+  // We issue the call, await the daemon's response, and optionally assert on it.
+  const clientCalls = Array.isArray(active.clientCalls) ? active.clientCalls : [];
+  for (const call of clientCalls) {
+    try {
+      const resp = await callClientService(call.method, call.params);
+      log(`client call ok: ${call.method} → ${JSON.stringify(resp).slice(0, 120)}`);
+      // Optional assertion on the result
+      if (call.assertResult !== undefined) {
+        const expected = JSON.stringify(call.assertResult);
+        const actual = JSON.stringify(resp);
+        if (expected !== actual) {
+          log(`assertion failed: expected ${expected}, got ${actual}`);
+          return result(id, { stopReason: 'refusal' });
+        }
+      }
+    } catch (err) {
+      log(`client call failed: ${call.method} → ${err.message}`);
+      // If the call defines assertError, treat this as expected
+      if (call.assertError !== undefined) {
+        log(`client call error matched expectation: ${JSON.stringify(call.assertError)}`);
+      } else {
+        return result(id, { stopReason: 'refusal' });
+      }
     }
   }
   const base = active.response || behavior.response || 'Mock agent completed.';
@@ -273,8 +316,30 @@ const rl = readline.createInterface({ input: process.stdin, terminal: false });
 rl.on('line', async (line) => {
   const trimmed = line.trim();
   if (!trimmed) return;
+  let msg;
   try {
-    await dispatch(JSON.parse(trimmed));
+    msg = JSON.parse(trimmed);
+  } catch (err) {
+    log(`parse error: ${err.message}`);
+    return;
+  }
+  // If this is a response to a client call we issued (has an id and either result or error),
+  // resolve or reject the pending promise. Otherwise dispatch it as a daemon→agent request.
+  if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+    const pending = pendingClientCalls.get(msg.id);
+    if (pending) {
+      pendingClientCalls.delete(msg.id);
+      if (msg.error) {
+        pending.reject(new Error(JSON.stringify(msg.error)));
+      } else {
+        pending.resolve(msg.result);
+      }
+      return;
+    }
+  }
+  // Not a client-call response; dispatch it
+  try {
+    await dispatch(msg);
   } catch (err) {
     log(`dispatch error: ${err.message}`);
   }
