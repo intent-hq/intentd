@@ -128,8 +128,16 @@ async fn agent_queue_add_get_remove_lifecycle() {
     assert_eq!(queue_result["success"], true);
     let queue = queue_result["queue"].as_array().unwrap();
     assert_eq!(queue.len(), 1);
-    assert_eq!(queue[0]["id"], msg_id);
-    assert_eq!(queue[0]["content"], "test message");
+    assert_eq!(
+        queue[0]["id"].as_str().expect("id should be a string"),
+        msg_id
+    );
+    assert_eq!(
+        queue[0]["content"]
+            .as_str()
+            .expect("content should be a string"),
+        "test message"
+    );
 
     // Remove the message
     let removed = services
