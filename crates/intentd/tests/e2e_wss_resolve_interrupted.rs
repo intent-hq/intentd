@@ -431,7 +431,11 @@ async fn resolve_interrupted_resume_and_abandon() {
     // Phase 4: Verify rows are no longer in pending list
     let list2 = wss_rpc(&mut ws, 4, "agent.listInterrupted", json!({})).await;
     let agents2 = list2["agents"].as_array().expect("agents array 2");
-    assert_eq!(agents2.len(), 0, "expected 0 interrupted agents after resolve");
+    assert_eq!(
+        agents2.len(),
+        0,
+        "expected 0 interrupted agents after resolve"
+    );
 
     // Phase 5: Verify the abandoned agent has a system message
     use intent_core::AgentId;
@@ -461,7 +465,9 @@ async fn resolve_interrupted_resume_and_abandon() {
         }),
     )
     .await;
-    let resumed2 = unknown_result["resumed"].as_array().expect("resumed array 2");
+    let resumed2 = unknown_result["resumed"]
+        .as_array()
+        .expect("resumed array 2");
     let failed2 = unknown_result["failed"].as_array().expect("failed array 2");
     assert_eq!(resumed2.len(), 0, "already resolved should not resume");
     assert_eq!(failed2.len(), 1, "already resolved should be in failed");
