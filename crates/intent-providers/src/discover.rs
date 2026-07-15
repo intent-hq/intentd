@@ -112,31 +112,31 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
 }
 
 /// Resolve a provider binary to an absolute path using the precedence order:
-/// 1. Explicit `providers.paths.<id>` setting (when provided)
+/// 1. Explicit path from `providers.paths` map (keyed by provider ID)
 /// 2. Managed `~/.augment/bin/<command>`
 /// 3. Scan enhanced PATH directories
 ///
 /// Returns `None` when the binary cannot be resolved. Reuses the discovery
 /// logic from `intent_context::discovery` but generalized for all providers.
-/// The `_provider_id` is reserved for future use (e.g., provider-specific hints).
+/// The `provider_id` is used for logging when an explicit path is invalid.
 pub fn find_provider_binary(
     provider_id: &str,
     command: &str,
     explicit_path: Option<&str>,
 ) -> Option<PathBuf> {
-    // 1. Explicit setting wins
+    // 1. Explicit setting wins (must be executable)
     if let Some(path) = explicit_path {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
             let pb = PathBuf::from(trimmed);
-            if pb.is_file() {
+            if is_executable_file(&pb) {
                 return Some(pb);
             }
-            // Warn when explicit setting points to missing file
+            // Warn when explicit setting points to missing/non-executable file
             tracing::warn!(
                 provider_id = provider_id,
                 configured_path = trimmed,
-                "providers.paths.{} points to non-existent file; falling back to managed bin / PATH scan",
+                "providers.paths[\"{}\"] points to non-existent or non-executable file; falling back to managed bin / PATH scan",
                 provider_id
             );
         }

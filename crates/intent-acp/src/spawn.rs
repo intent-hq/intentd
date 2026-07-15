@@ -152,8 +152,8 @@ pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<
     let mut cmd = build_command(opts);
     let command_name = opts
         .provider_binary
-        .and_then(|p| p.to_str())
-        .unwrap_or(opts.provider.command);
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| opts.provider.command.to_string());
     let mut child = cmd
         .spawn()
         .map_err(|e| AcpError::Spawn(format!("{command_name}: {e}")))?;
@@ -251,6 +251,14 @@ mod build_command_tests {
         assert!(env_path.is_some());
         let path_value = env_path.unwrap().1.unwrap().to_string_lossy();
         // The parent dir should be first in the PATH
-        assert!(path_value.starts_with("/custom/dir:") || path_value.starts_with("/custom/dir;"));
+        let parent_dir = resolved_path.parent().unwrap().display().to_string();
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let expected_prefix = format!("{}{}", parent_dir, sep);
+        assert!(
+            path_value.starts_with(&expected_prefix),
+            "PATH should start with {}, got: {}",
+            expected_prefix,
+            path_value
+        );
     }
 }
