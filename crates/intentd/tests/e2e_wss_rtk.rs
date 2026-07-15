@@ -222,13 +222,30 @@ async fn wss_rpc(
 ) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(req.to_string())).await.expect("send");
-    let msg = timeout(Duration::from_secs(10), ws.next())
-        .await
-        .expect("ws rpc timeout")
-        .expect("ws closed")
-        .expect("ws error");
-    let text = msg.into_text().expect("not text");
-    serde_json::from_str(&text).expect("invalid json")
+
+    // Loop until we receive the response matching our request id, skipping Ping/Pong
+    loop {
+        let msg = timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("ws rpc timeout")
+            .expect("ws closed")
+            .expect("ws error");
+        match msg {
+            Message::Text(text) => {
+                let v: Value = serde_json::from_str(&text).expect("invalid json");
+                if v["id"] == id {
+                    return v;
+                }
+                // Skip responses for other requests
+            }
+            Message::Ping(_) | Message::Pong(_) => {
+                // Skip ping/pong frames
+            }
+            _ => {
+                // Skip other frame types
+            }
+        }
+    }
 }
 
 async fn wss_event(

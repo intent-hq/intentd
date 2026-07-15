@@ -8,7 +8,9 @@
 //! its exclusion lists (RTK_INTERNAL_COMMANDS and CONFLICTING_COMMANDS).
 
 use std::process::Command;
+use std::sync::mpsc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// rtk-internal / meta commands that shouldn't be used as prefixes
 const RTK_INTERNAL_COMMANDS: &[&str] = &[
@@ -39,7 +41,7 @@ fn is_excluded(cmd: &str) -> bool {
 
 /// RTK detection result, cached per daemon run.
 #[derive(Debug, Clone)]
-pub(crate) struct RtkStatus {
+pub struct RtkStatus {
     pub available: bool,
     pub subcommands: Vec<String>,
 }
@@ -50,7 +52,8 @@ static CACHED_STATUS: Mutex<Option<RtkStatus>> = Mutex::new(None);
 /// Detect whether rtk is installed and parse its subcommands.
 /// Results are cached — only runs detection once per daemon process.
 pub(crate) fn detect_rtk() -> RtkStatus {
-    let mut cache = CACHED_STATUS.lock().unwrap();
+    // Best-effort feature gate: if mutex is poisoned, clear it and re-detect
+    let mut cache = CACHED_STATUS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(ref status) = *cache {
         return status.clone();
     }
@@ -61,17 +64,20 @@ pub(crate) fn detect_rtk() -> RtkStatus {
 }
 
 fn do_detect() -> RtkStatus {
+    const DETECTION_TIMEOUT: Duration = Duration::from_secs(2);
+
     // 1. Check if rtk exists with a timeout
-    let which_result = std::thread::spawn(|| {
-        Command::new("which")
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = Command::new("which")
             .arg("rtk")
             .output()
             .ok()
-            .filter(|out| out.status.success())
-    })
-    .join();
+            .filter(|out| out.status.success());
+        let _ = tx.send(result);
+    });
 
-    let rtk_path = match which_result {
+    let rtk_path = match rx.recv_timeout(DETECTION_TIMEOUT) {
         Ok(Some(_)) => "rtk",
         _ => {
             return RtkStatus {
@@ -82,17 +88,18 @@ fn do_detect() -> RtkStatus {
     };
 
     // 2. Parse subcommands from `rtk help` with a timeout
-    let help_result = std::thread::spawn(move || {
-        Command::new(rtk_path)
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = Command::new(rtk_path)
             .arg("help")
             .output()
             .ok()
             .filter(|out| out.status.success())
-            .and_then(|out| String::from_utf8(out.stdout).ok())
-    })
-    .join();
+            .and_then(|out| String::from_utf8(out.stdout).ok());
+        let _ = tx.send(result);
+    });
 
-    match help_result {
+    match rx.recv_timeout(DETECTION_TIMEOUT) {
         Ok(Some(stdout)) => {
             let subcommands = parse_rtk_help(&stdout);
             RtkStatus {
@@ -136,8 +143,8 @@ pub(crate) fn parse_rtk_help(output: &str) -> Vec<String> {
         }
 
         if in_commands {
-            // Command lines start with 2+ spaces
-            if line.starts_with("  ") && !line.starts_with("   ") {
+            // Command lines start with 2+ spaces (mirrors rtk-detector.ts regex ^\s{2,})
+            if line.len() >= 2 && line.chars().take(2).all(|c| c.is_whitespace()) {
                 if let Some(cmd) = line.split_whitespace().next() {
                     if !is_excluded(cmd) {
                         subcommands.push(cmd.to_string());
@@ -188,5 +195,12 @@ mod tests {
     fn test_parse_rtk_help_stops_at_new_section() {
         let output = "Commands:\n  ls  List\n  cat  Cat\nOptions:\n  --help  Show help\n";
         assert_eq!(parse_rtk_help(output), vec!["ls", "cat"]);
+    }
+
+    #[test]
+    fn test_parse_rtk_help_accepts_more_than_two_spaces() {
+        // Real rtk help often uses varied indentation (3+ spaces)
+        let output = "Commands:\n   ls    List directory\n    cat    Cat files\n  grep  Search\n";
+        assert_eq!(parse_rtk_help(output), vec!["ls", "cat", "grep"]);
     }
 }

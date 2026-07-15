@@ -335,7 +335,14 @@ async fn build_rtk_instruction(store: &Store) -> Option<String> {
         return None;
     }
 
-    let status = rtk::detect_rtk();
+    // Run detection on blocking thread pool to avoid blocking async runtime
+    let status = tokio::task::spawn_blocking(rtk::detect_rtk)
+        .await
+        .unwrap_or_else(|_| rtk::RtkStatus {
+            available: false,
+            subcommands: vec![],
+        });
+
     if !status.available || status.subcommands.is_empty() {
         return None;
     }
