@@ -336,10 +336,15 @@ async fn comment_bindings_add_and_list() {
     let block: intent_acp::session::ContentBlock =
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "add comment" }))
             .unwrap();
-    manager
+    let stop = manager
         .run_turn(&agent_id, &ws, &acp_session, vec![block])
         .await
         .expect("run_turn");
+    assert_eq!(
+        serde_json::to_value(stop).unwrap(),
+        serde_json::json!("end_turn"),
+        "agent completed turn (not refusal)"
+    );
 
     // Assert via Services that the comment was actually persisted
     let result = services

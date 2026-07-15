@@ -217,6 +217,10 @@ async fn fs_read_write_round_trip() {
             {
                 "method": "fs/read_text_file",
                 "params": { "sessionId": SESSION_ID, "path": test_file.display().to_string() },
+                // Assert the exact file content was read
+                "assertResult": {
+                    "content": test_content
+                }
             },
             {
                 "method": "fs/write_text_file",

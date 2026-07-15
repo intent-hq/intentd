@@ -174,10 +174,15 @@ async fn event_bindings_recent_files_and_query() {
     let block: intent_acp::session::ContentBlock =
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "query events" }))
             .unwrap();
-    manager
+    let stop = manager
         .run_turn(&agent_id, &ws, &acp_session, vec![block])
         .await
         .expect("run_turn");
+    assert_eq!(
+        serde_json::to_value(stop).unwrap(),
+        serde_json::json!("end_turn"),
+        "agent completed turn (not refusal)"
+    );
 
     manager.shutdown().await;
     for suffix in ["", "-wal", "-shm"] {
@@ -282,10 +287,15 @@ async fn file_bindings_read_write_list() {
         .expect("start_session");
     let block: intent_acp::session::ContentBlock =
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "file ops" })).unwrap();
-    manager
+    let stop = manager
         .run_turn(&agent_id, &ws, &acp_session, vec![block])
         .await
         .expect("run_turn");
+    assert_eq!(
+        serde_json::to_value(stop).unwrap(),
+        serde_json::json!("end_turn"),
+        "agent completed turn (not refusal)"
+    );
 
     // Assert actual filesystem effects - Services resolves paths relative to workspace root
     let workspace_record = services
@@ -414,10 +424,15 @@ async fn agent_bindings_list_and_status() {
     let block: intent_acp::session::ContentBlock =
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "list agents" }))
             .unwrap();
-    manager
+    let stop = manager
         .run_turn(&agent_id, &ws, &acp_session, vec![block])
         .await
         .expect("run_turn");
+    assert_eq!(
+        serde_json::to_value(stop).unwrap(),
+        serde_json::json!("end_turn"),
+        "agent completed turn (not refusal)"
+    );
 
     // Verify agent exists
     let session = store.get_agent_session(&agent_id).await.expect("session");
@@ -561,10 +576,15 @@ async fn git_bindings_status_stage_commit() {
         .expect("start_session");
     let block: intent_acp::session::ContentBlock =
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "git ops" })).unwrap();
-    manager
+    let stop = manager
         .run_turn(&agent_id, &ws, &acp_session, vec![block])
         .await
         .expect("run_turn");
+    assert_eq!(
+        serde_json::to_value(stop).unwrap(),
+        serde_json::json!("end_turn"),
+        "agent completed turn (not refusal)"
+    );
 
     // Tool call succeeded (bindings were exercised)
     // Note: The git operations may not persist due to how Services resolves the workspace path
@@ -687,10 +707,15 @@ async fn note_bindings_edit_and_edit_lines() {
         .expect("start_session");
     let block: intent_acp::session::ContentBlock =
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "edit note" })).unwrap();
-    manager
+    let stop = manager
         .run_turn(&agent_id, &ws, &acp_session, vec![block])
         .await
         .expect("run_turn");
+    assert_eq!(
+        serde_json::to_value(stop).unwrap(),
+        serde_json::json!("end_turn"),
+        "agent completed turn (not refusal)"
+    );
 
     // Assert BE state changed
     let updated = services
