@@ -3900,7 +3900,7 @@ impl Services {
                         parent,
                         parent_name,
                         agent_id.clone(),
-                        true,
+                        false,
                         Some(gid),
                     );
                 } else {
