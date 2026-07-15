@@ -34,27 +34,44 @@ fn capture_login_shell_path_with(shell: Option<&str>) -> Vec<PathBuf> {
     };
 
     // Run shell -lc 'printf %s "$PATH"' with 2s timeout
-    let output = Command::new(&shell)
+    let mut child = match Command::new(&shell)
         .args(["-lc", r#"printf %s "$PATH""#])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()
-        .and_then(|mut child| {
-            let timeout = Duration::from_secs(2);
-            std::thread::sleep(timeout);
-            // Try to kill if still running
-            let _ = child.kill();
-            child.wait_with_output().ok()
-        });
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
 
-    match output {
-        Some(out) if out.status.success() => {
-            let path_str = String::from_utf8_lossy(&out.stdout);
-            std::env::split_paths(&path_str.as_ref()).collect::<Vec<_>>()
+    // Poll for completion with 2s timeout
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Process exited
+                return match child.wait_with_output() {
+                    Ok(out) if status.success() => {
+                        let path_str = String::from_utf8_lossy(&out.stdout);
+                        std::env::split_paths(&path_str.as_ref()).collect::<Vec<_>>()
+                    }
+                    _ => Vec::new(),
+                };
+            }
+            Ok(None) => {
+                // Still running
+                if std::time::Instant::now() >= deadline {
+                    // Timeout - kill and return empty
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Vec::new();
+                }
+                // Sleep a bit before polling again
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return Vec::new(),
         }
-        _ => Vec::new(),
     }
 }
 
@@ -227,7 +244,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = std::env::temp_dir();
-        let fake_shell = temp_dir.join("fake_shell_test.sh");
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fake_shell = temp_dir.join(format!("fake_shell_test_{pid}_{nanos}.sh"));
         fs::write(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-lc\" ]; then\n  printf '/custom/bin:/other/bin'\nfi\n",
@@ -252,7 +274,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn capture_login_shell_path_with_no_shell_env_degrades_silently() {
+    fn capture_login_shell_path_with_empty_shell_string_degrades_silently() {
         let dirs = capture_login_shell_path_with(Some(""));
         assert!(dirs.is_empty());
     }
