@@ -77,6 +77,7 @@ mod note_ops;
 mod pagination;
 mod pr_ops;
 mod primitive_ops;
+pub mod repo_config;
 mod sandbox_ops;
 mod script_ops;
 mod search_ops;
