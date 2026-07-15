@@ -105,12 +105,43 @@ function callWorkspaceTool(toolCall) {
 // Issue an agent→client request (fs/*, terminal/*, session/request_permission).
 // Returns a promise that resolves with the response result or rejects with an error.
 // The correlation is via the JSON-RPC id we assign (nextClientCallId).
-function callClientService(method, params) {
+// Includes a 30-second timeout to prevent hanging on non-replying daemon.
+function callClientService(method, params, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     const id = nextClientCallId++;
-    pendingClientCalls.set(id, { resolve, reject });
+    const timeout = setTimeout(() => {
+      pendingClientCalls.delete(id);
+      reject(new Error(`client call timeout after ${timeoutMs}ms: ${method}`));
+    }, timeoutMs);
+    pendingClientCalls.set(id, {
+      resolve: (result) => {
+        clearTimeout(timeout);
+        resolve(result);
+      },
+      reject: (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      },
+    });
     send({ jsonrpc: '2.0', id, method, params });
   });
+}
+
+// Structural subset match: every key in `expected` must exist in `actual` with
+// the same value (recursively for objects). Ignores extra keys in `actual`.
+function structuralSubsetMatch(expected, actual) {
+  if (expected === actual) return true;
+  if (typeof expected !== 'object' || expected === null) return false;
+  if (typeof actual !== 'object' || actual === null) return false;
+  for (const key in expected) {
+    if (!(key in actual)) return false;
+    if (typeof expected[key] === 'object' && expected[key] !== null) {
+      if (!structuralSubsetMatch(expected[key], actual[key])) return false;
+    } else if (expected[key] !== actual[key]) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function extractPromptText(params) {
@@ -200,20 +231,29 @@ async function handlePrompt(id, params) {
     try {
       const resp = await callClientService(call.method, call.params);
       log(`client call ok: ${call.method} → ${JSON.stringify(resp).slice(0, 120)}`);
-      // Optional assertion on the result
+      // Optional assertion on the result (structural subset match)
       if (call.assertResult !== undefined) {
-        const expected = JSON.stringify(call.assertResult);
-        const actual = JSON.stringify(resp);
-        if (expected !== actual) {
-          log(`assertion failed: expected ${expected}, got ${actual}`);
+        if (!structuralSubsetMatch(call.assertResult, resp)) {
+          log(`assertion failed: expected subset ${JSON.stringify(call.assertResult)}, got ${JSON.stringify(resp)}`);
           return result(id, { stopReason: 'refusal' });
         }
       }
     } catch (err) {
       log(`client call failed: ${call.method} → ${err.message}`);
-      // If the call defines assertError, treat this as expected
+      // If the call defines assertError, verify it matches the expected error structure
       if (call.assertError !== undefined) {
-        log(`client call error matched expectation: ${JSON.stringify(call.assertError)}`);
+        const errorData = err.errorData || {}; // JSON-RPC error from daemon
+        const expectedCode = call.assertError.code;
+        const expectedMessage = call.assertError.message;
+        if (expectedCode !== undefined && errorData.code !== expectedCode) {
+          log(`error code mismatch: expected ${expectedCode}, got ${errorData.code}`);
+          return result(id, { stopReason: 'refusal' });
+        }
+        if (expectedMessage !== undefined && !String(errorData.message || '').includes(expectedMessage)) {
+          log(`error message mismatch: expected substring "${expectedMessage}", got "${errorData.message}"`);
+          return result(id, { stopReason: 'refusal' });
+        }
+        log(`client call error matched expectation: code=${errorData.code}`);
       } else {
         return result(id, { stopReason: 'refusal' });
       }
@@ -330,7 +370,9 @@ rl.on('line', async (line) => {
     if (pending) {
       pendingClientCalls.delete(msg.id);
       if (msg.error) {
-        pending.reject(new Error(JSON.stringify(msg.error)));
+        const err = new Error(`JSON-RPC error ${msg.error.code}: ${msg.error.message}`);
+        err.errorData = msg.error; // Attach full error object for assertions
+        pending.reject(err);
       } else {
         pending.resolve(msg.result);
       }

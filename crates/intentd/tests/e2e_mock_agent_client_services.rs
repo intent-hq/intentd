@@ -397,6 +397,9 @@ async fn terminal_lifecycle() {
                     "sessionId": SESSION_ID,
                     "terminalId": "pty-0"
                 },
+                "assertResult": {
+                    "exitCode": 0
+                }
             },
             {
                 "method": "terminal/output",
@@ -514,8 +517,8 @@ async fn terminal_output_truncation() {
                 "method": "terminal/create",
                 "params": {
                     "sessionId": SESSION_ID,
-                    "command": "seq",
-                    "args": ["1", "1000"],
+                    "command": "sh",
+                    "args": ["-c", "i=1; while [ $i -le 200 ]; do echo line-$i; i=$((i+1)); done"],
                     "outputByteLimit": 512
                 },
             },

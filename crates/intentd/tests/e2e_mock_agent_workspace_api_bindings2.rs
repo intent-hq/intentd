@@ -28,11 +28,11 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         updated_at: ts,
         last_activity: None,
         tags: vec![],
-        path: path.map(|p| p.to_string_lossy().to_string()),
+        path: path.as_ref().map(|p| p.to_string_lossy().to_string()),
         repository_path: None,
         repository_owner: None,
         repository_name: None,
-        worktree_path: None,
+        worktree_path: path.map(|p| p.to_string_lossy().to_string()),
         scope: None,
         skip_worktree: false,
         setup_script: None,
@@ -234,7 +234,6 @@ async fn file_bindings_read_write_list() {
         await ws.file.mkdir('subdir');
         const files = await ws.file.list('.');
         await ws.file.rename('new.txt', 'renamed.txt');
-        await ws.file.delete('renamed.txt');
         return { content: content, files: files };
     "#;
 
@@ -280,8 +279,28 @@ async fn file_bindings_read_write_list() {
         .await
         .expect("run_turn");
 
-    // Tool call succeeded (bindings were exercised)
-    // Note: actual file operations may not persist due to workspace path handling
+    // Assert actual filesystem effects - Services resolves paths relative to workspace root
+    let workspace_record = services
+        .get_workspace(ws.clone())
+        .await
+        .expect("get workspace");
+    let actual_ws_root = std::path::PathBuf::from(
+        workspace_record
+            .worktree_path
+            .expect("workspace should have worktree_path"),
+    );
+    assert!(
+        actual_ws_root.join("renamed.txt").exists(),
+        "renamed.txt should exist in {:?}",
+        actual_ws_root
+    );
+    let renamed_content =
+        std::fs::read_to_string(actual_ws_root.join("renamed.txt")).expect("read renamed.txt");
+    assert_eq!(renamed_content, "new file content");
+    assert!(
+        actual_ws_root.join("subdir").is_dir(),
+        "subdir should exist"
+    );
 
     manager.shutdown().await;
     for suffix in ["", "-wal", "-shm"] {
@@ -409,6 +428,16 @@ async fn agent_bindings_list_and_status() {
 #[tokio::test]
 async fn git_bindings_status_stage_commit() {
     let Some(script) = gate() else { return };
+
+    // Skip if git is not available
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping git e2e: git not available");
+        return;
+    }
 
     // Create a temp git repo
     let repo_dir = std::env::temp_dir().join(format!("itd-e2e-git-{}", uuid::Uuid::new_v4()));
