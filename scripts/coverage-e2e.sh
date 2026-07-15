@@ -8,7 +8,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "Installing cargo-llvm-cov and llvm-tools..."
-cargo install cargo-llvm-cov --locked 2>/dev/null || true
+if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
+    cargo install cargo-llvm-cov --locked
+fi
 rustup component add llvm-tools-preview
 
 echo "Cleaning coverage data..."
