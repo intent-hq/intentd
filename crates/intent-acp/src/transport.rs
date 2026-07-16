@@ -6,9 +6,12 @@
 //! each line as JSON-RPC, and dispatches: responses → the pending `oneshot` map
 //! (keyed per id), agent→client requests → a client-served handler hook, and
 //! notifications → a streaming-router hook. A stderr task drains the child's
-//! stderr into a bounded ring buffer and flags configured auth-error patterns.
+//! stderr into a bounded ring buffer, flags configured auth-error patterns,
+//! and — when a capture dir is configured — appends every line to a
+//! daily-rotated per-agent log file (STAB-53).
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -67,6 +70,58 @@ pub struct ConnectionHooks {
     pub notifications: Option<mpsc::UnboundedSender<IncomingNotification>>,
     /// Case-insensitive substrings that mark an auth failure on stderr.
     pub auth_error_patterns: Vec<String>,
+    /// When set, every stderr line is also appended to
+    /// `<dir>/<YYYY-MM-DD>.log` (the per-agent capture dir, STAB-53). Writes
+    /// are best-effort inside the dedicated stderr task: a failure disables
+    /// the file sink but never affects the agent runtime.
+    pub stderr_log_dir: Option<PathBuf>,
+}
+
+/// Best-effort daily-rotated file sink for the stderr capture (STAB-53).
+/// Opens `<dir>/<YYYY-MM-DD>.log` lazily in append mode and reopens when the
+/// (UTC) date rolls over. The first write failure disables the sink for the
+/// connection's lifetime so a bad disk never loops warnings per line.
+struct StderrLogSink {
+    dir: PathBuf,
+    current: Option<(String, tokio::fs::File)>,
+    disabled: bool,
+}
+
+impl StderrLogSink {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            current: None,
+            disabled: false,
+        }
+    }
+
+    async fn write_line(&mut self, line: &str) {
+        if self.disabled {
+            return;
+        }
+        if let Err(e) = self.try_write_line(line).await {
+            tracing::warn!(dir = %self.dir.display(), error = %e, "agent stderr log capture disabled (write failed)");
+            self.disabled = true;
+        }
+    }
+
+    async fn try_write_line(&mut self, line: &str) -> std::io::Result<()> {
+        let name = intent_core::current_agent_log_file_name();
+        if self.current.as_ref().map(|(n, _)| n.as_str()) != Some(name.as_str()) {
+            tokio::fs::create_dir_all(&self.dir).await?;
+            let file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.dir.join(&name))
+                .await?;
+            self.current = Some((name, file));
+        }
+        let (_, file) = self.current.as_mut().expect("sink file just opened");
+        file.write_all(line.as_bytes()).await?;
+        file.write_all(b"\n").await?;
+        file.flush().await
+    }
 }
 
 /// Bounded ring buffer of recent stderr lines (parity: `recentStderrErrors`).
@@ -237,7 +292,8 @@ impl Connection {
             }
         }));
 
-        // Stderr task: ring-buffer recent lines + flag auth-error patterns.
+        // Stderr task: ring-buffer recent lines, flag auth-error patterns, and
+        // append every raw line to the per-agent capture file when configured.
         if let Some(stderr) = stderr {
             let stderr_buf_task = Arc::clone(&stderr_buf);
             let auth_flag = Arc::clone(&auth_error);
@@ -246,9 +302,13 @@ impl Connection {
                 .iter()
                 .map(|p| p.to_lowercase())
                 .collect();
+            let mut log_sink = hooks.stderr_log_dir.map(StderrLogSink::new);
             tasks.push(tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(sink) = log_sink.as_mut() {
+                        sink.write_line(&line).await;
+                    }
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         continue;
