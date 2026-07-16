@@ -225,6 +225,11 @@ pub struct Services {
     /// keyed by script id. Scripts run on the same [`pty`](Self::pty) host as
     /// `terminal.*`, so a terminal can attach to a running script (§12.2).
     scripts: script_ops::ScriptRegistry,
+    /// Per-workspace async-mutex map for script bootstrap operations, preventing
+    /// concurrent `script.list` calls from creating duplicate repo-config scripts.
+    /// Shared across clones so all `ScriptManager` instances serialize bootstrap
+    /// per workspace (modeled after `intent-git::WorktreeLocks`).
+    script_bootstrap_locks: script_ops::WorkspaceScriptLocks,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -324,6 +329,7 @@ impl Services {
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
             pty: Arc::new(intent_pty::PtyHost::new()),
             scripts: Arc::new(Mutex::new(HashMap::new())),
+            script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -473,13 +479,14 @@ impl Services {
     }
 
     /// Build a [`ScriptManager`](script_ops::ScriptManager) view over the shared
-    /// PTY host, event bus, store, and script registry for one `script.*` call.
+    /// PTY host, event bus, store, script registry, and bootstrap locks for one `script.*` call.
     fn script_manager(&self) -> script_ops::ScriptManager {
         script_ops::ScriptManager::new(
             self.pty.clone(),
             self.event_bus.clone(),
             self.store.clone(),
             self.scripts.clone(),
+            self.script_bootstrap_locks.clone(),
         )
     }
 
