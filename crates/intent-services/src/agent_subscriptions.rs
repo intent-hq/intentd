@@ -412,8 +412,8 @@ impl Services {
             let group_clone = g.clone();
             (group_id, group_clone)
         }; // guard is dropped here automatically
-        // Durable write-through persist: await the write so the sealed flag is
-        // persisted before the caller continues.
+           // Durable write-through persist: await the write so the sealed flag is
+           // persisted before the caller continues.
         let persisted = match delegation_group_to_persisted(workspace_id, &group_clone) {
             Ok(p) => p,
             Err(e) => {
@@ -487,7 +487,9 @@ impl Services {
                 if !g.expected_agent_ids.contains(child_id) {
                     return;
                 }
-                if g.completed_agent_ids.contains(child_id) || g.deleted_agent_ids.contains(child_id) {
+                if g.completed_agent_ids.contains(child_id)
+                    || g.deleted_agent_ids.contains(child_id)
+                {
                     return;
                 }
                 if deleted {
@@ -502,8 +504,8 @@ impl Services {
                 None
             }
         }; // guard is dropped here automatically
-        // Durable write-through persist: await the write so the completion is
-        // persisted before the caller continues / before the event is observable.
+           // Durable write-through persist: await the write so the completion is
+           // persisted before the caller continues / before the event is observable.
         if let Some(g) = group_clone {
             let persisted = match delegation_group_to_persisted(workspace_id, &g) {
                 Ok(p) => p,
@@ -725,14 +727,12 @@ impl Services {
                 .agent_subscriptions
                 .lock()
                 .expect("agent subscription registry poisoned");
-            guard
-                .get(workspace_id)
-                .and_then(|w| {
-                    w.delegation_groups
-                        .iter()
-                        .find(|g| g.expected_agent_ids.contains(agent_id))
-                        .map(|g| g.group_id.clone())
-                })
+            guard.get(workspace_id).and_then(|w| {
+                w.delegation_groups
+                    .iter()
+                    .find(|g| g.expected_agent_ids.contains(agent_id))
+                    .map(|g| g.group_id.clone())
+            })
         };
 
         if let Some(group_id) = group_id {

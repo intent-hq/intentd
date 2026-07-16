@@ -334,7 +334,6 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
-
 /// Increment 6: full restart scenario - wait for the aggregated wake with both reports.
 #[tokio::test]
 async fn baseline_plus_aggregated_wake() {
@@ -546,20 +545,48 @@ async fn baseline_plus_aggregated_wake() {
         eprintln!("  parent_agent_id: {}", g.parent_agent_id.0);
         eprintln!("  sealed: {}", g.sealed);
         eprintln!("  delivered: {}", g.delivered);
-        eprintln!("  expected_agent_ids: {:?}", g.expected_agent_ids.iter().map(|id| &id.0).collect::<Vec<_>>());
-        eprintln!("  completed_agent_ids: {:?}", g.completed_agent_ids.iter().map(|id| &id.0).collect::<Vec<_>>());
-        eprintln!("  deleted_agent_ids: {:?}", g.deleted_agent_ids.iter().map(|id| &id.0).collect::<Vec<_>>());
+        eprintln!(
+            "  expected_agent_ids: {:?}",
+            g.expected_agent_ids
+                .iter()
+                .map(|id| &id.0)
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "  completed_agent_ids: {:?}",
+            g.completed_agent_ids
+                .iter()
+                .map(|id| &id.0)
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "  deleted_agent_ids: {:?}",
+            g.deleted_agent_ids
+                .iter()
+                .map(|id| &id.0)
+                .collect::<Vec<_>>()
+        );
     }
     // HYPOTHESIS A: If child1's completion was not persisted, completed_agent_ids will be empty here
     assert_eq!(groups.len(), 1, "exactly one delegation group persisted");
     let persisted_group = &groups[0];
     eprintln!("\n*** HYPOTHESIS A CHECK ***");
-    eprintln!("Expected child1 ({}) in completed_agent_ids: {}",
-              child1_id,
-              persisted_group.completed_agent_ids.iter().any(|id| id.0 == child1_id));
-    eprintln!("Expected child2 ({}) in expected_agent_ids: {}",
-              child2_id,
-              persisted_group.expected_agent_ids.iter().any(|id| id.0 == child2_id));
+    eprintln!(
+        "Expected child1 ({}) in completed_agent_ids: {}",
+        child1_id,
+        persisted_group
+            .completed_agent_ids
+            .iter()
+            .any(|id| id.0 == child1_id)
+    );
+    eprintln!(
+        "Expected child2 ({}) in expected_agent_ids: {}",
+        child2_id,
+        persisted_group
+            .expected_agent_ids
+            .iter()
+            .any(|id| id.0 == child2_id)
+    );
 
     // Increment 3: boot daemon2 using the SAME data_dir
     eprintln!("Booting daemon2 with same data_dir...");

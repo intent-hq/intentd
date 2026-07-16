@@ -1299,7 +1299,10 @@ impl Services {
         // open after_all group (the expected set is now final) and try to fire it
         // — covers the case where every child finished before the parent idled.
         if event.event_type == AGENT_IDLE {
-            if let Some(gid) = self.seal_group_for_parent(&event.workspace_id, &child).await {
+            if let Some(gid) = self
+                .seal_group_for_parent(&event.workspace_id, &child)
+                .await
+            {
                 self.try_fire_group(&event.workspace_id, &gid).await;
             }
         }
