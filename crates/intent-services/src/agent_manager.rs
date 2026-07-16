@@ -800,13 +800,16 @@ impl AgentManager {
         self
     }
 
-    /// Today's stderr capture path for `agent_id`, when capture is enabled —
+    /// Stderr capture directory for `agent_id`, when capture is enabled —
     /// the "agent stderr captured at …" hint on terminal-failure WARN lines.
-    fn agent_stderr_log_path(&self, agent_id: &AgentId) -> Option<PathBuf> {
-        self.agent_log_root.as_ref().map(|root| {
-            root.join(&agent_id.0)
-                .join(intent_core::current_agent_log_file_name())
-        })
+    /// Points at the per-agent directory rather than today's daily file: the
+    /// writer rotates by UTC date, so around midnight the last lines may sit
+    /// in yesterday's file, making a file path misleading. The directory is
+    /// rollover-stable and still immediately actionable.
+    fn agent_stderr_log_dir(&self, agent_id: &AgentId) -> Option<PathBuf> {
+        self.agent_log_root
+            .as_ref()
+            .map(|root| root.join(&agent_id.0))
     }
 
     /// Borrow the process registry (lifecycle / diagnostics).
@@ -3111,7 +3114,7 @@ fn is_benign_turn_error(err: &Error) -> bool {
 }
 
 /// STAB-53: when a terminal failure means the child died mid-turn ("agent
-/// stdout closed") and stderr capture is enabled, return today's capture path
+/// stdout closed") and stderr capture is enabled, return the capture directory
 /// for `agent_id` so the WARN line can point at the child's last words.
 /// Matches on the structured `Error::Internal` payload — the transport's
 /// child-death error is always wrapped there (handshake/prompt failures) —
@@ -3124,7 +3127,7 @@ fn stderr_capture_hint(
     if !matches!(err, Error::Internal(msg) if msg.contains("agent stdout closed")) {
         return None;
     }
-    mgr.agent_stderr_log_path(agent_id)
+    mgr.agent_stderr_log_dir(agent_id)
 }
 
 /// Whether `run_prompt_turn` already emitted the terminal `agent:failed` +

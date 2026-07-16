@@ -517,10 +517,10 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
         capture_dir.display()
     );
 
-    // STAB-53: the terminal-failure WARN points at the capture path so the
-    // crash is diagnosable straight from the daemon log. Match on the
-    // rollover-stable dir prefix (the hint's file name is the daemon's
-    // "today", which may differ across a midnight boundary).
+    // STAB-53: the terminal-failure WARN points at the per-agent capture
+    // directory (rollover-stable: the daily file name would be misleading
+    // across a UTC midnight boundary) so the crash is diagnosable straight
+    // from the daemon log.
     let daemon_log_path = data_dir.join("daemon.log");
     let expected_hint = format!("agent stderr captured at {}", capture_dir.display());
     let mut daemon_log = String::new();
