@@ -534,48 +534,55 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     // The handles are held for the lifetime of `serve` and torn down on return.
     let _watchers = start_workspace_watchers(&bus, api.as_ref()).await;
 
-    // Prepare runtime control for the HTTPS+WSS listener (§5.12). When TCP is
-    // enabled (--listen tcp/both), build the construction args so settings can
-    // toggle the listener on/off. The CLI --listen flag + env (INTENTD_TCP_PORT,
-    // INTENTD_DISCOVERY, --insecure) override persisted settings, logged when they
-    // win. TLS and bearer auth are auto-on for TCP (§5.2/§5.3) unless --insecure.
-    let (_ws_server, _ws_port, ws_runtime) = if serve_tcp_enabled {
-        let mut ws_options = ws_options_from_env();
-        ws_options.locality_override = locality_override;
+    // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
+    // construction args ALWAYS (regardless of --listen mode) so settings can
+    // toggle the listener on/off at runtime. Boot-time auto-start of the listener
+    // remains ONLY for --listen tcp/both (current behavior preserved, including
+    // the "CLI flag + env override persisted settings" semantics). With --listen
+    // uds: settings.update server.wsApi.enabled=true starts the listener at runtime
+    // (TLS + bearer auth on, same as any TCP listener unless --insecure); persisted
+    // enabled=true is also honored on next boot (same contract as tcp/both).
+    let mut ws_options = ws_options_from_env();
+    ws_options.locality_override = locality_override;
 
-        let (tls_cert, token_store) = if insecure {
-            tracing::warn!(
-                "intentd INSECURE dev mode: TLS disabled, bearer-token auth disabled, plain ws:// on {}:{} — do NOT use outside local dev",
-                ws_options.bind_address,
-                ws_options.base_port
-            );
-            (None, None)
-        } else {
-            let tls = ensure_tls_certificate(&config.data_dir)
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            let async_token_store = Arc::new(AsyncTokenStore::new(resolve_token_store()));
-            get_or_create_token(&async_token_store)
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            (Some(tls), Some(async_token_store))
-        };
+    // TLS + bearer auth: provision the cert (lazy; cert stays on disk) + build
+    // the token store for auth layers (§5.2/§5.3). Always provision for runtime
+    // toggle, even under --listen uds (listener can be started later via settings).
+    let (tls_cert, token_store) = if insecure {
+        tracing::warn!(
+            "intentd INSECURE dev mode: TLS disabled, bearer-token auth disabled, plain ws:// on {}:{} — do NOT use outside local dev",
+            ws_options.bind_address,
+            ws_options.base_port
+        );
+        (None, None)
+    } else {
+        let tls =
+            ensure_tls_certificate(&config.data_dir).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let async_token_store = Arc::new(AsyncTokenStore::new(resolve_token_store()));
+        get_or_create_token(&async_token_store)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        (Some(tls), Some(async_token_store))
+    };
 
-        // Build runtime control struct
-        let runtime = Arc::new(WsRuntimeControl {
-            api: api.clone(),
-            bus: bus.clone(),
-            tls_cert: tls_cert.clone(),
-            token_store: token_store.clone(),
-            ws_options: ws_options.clone(),
-            reverse_registry: reverse_registry.clone(),
-            data_dir: config.data_dir.clone(),
-            state: tokio::sync::Mutex::new(WsRuntimeState {
-                ws_server: None,
-                port: None,
-            }),
-        });
+    // Build runtime control struct (always, regardless of --listen mode)
+    let runtime = Arc::new(WsRuntimeControl {
+        api: api.clone(),
+        bus: bus.clone(),
+        tls_cert: tls_cert.clone(),
+        token_store: token_store.clone(),
+        ws_options: ws_options.clone(),
+        reverse_registry: reverse_registry.clone(),
+        data_dir: config.data_dir.clone(),
+        state: tokio::sync::Mutex::new(WsRuntimeState {
+            ws_server: None,
+            port: None,
+        }),
+    });
 
-        // Start the listener immediately (CLI --listen wins over settings)
+    // Boot-time auto-start of the listener ONLY when --listen tcp/both
+    // (CLI --listen wins over persisted settings)
+    let (_ws_server, _ws_port) = if serve_tcp_enabled {
         let mut server = if insecure {
             WsApiServer::new_insecure_with_reverse(
                 api.clone(),
@@ -621,10 +628,13 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             state.port = Some(port);
         }
 
-        (Some(server), Some(port), Some(runtime))
+        (Some(server), Some(port))
     } else {
-        (None, None, None)
+        (None, None)
     };
+
+    // ws_runtime is always Some now (constructed above for all listen modes)
+    let ws_runtime = Some(runtime);
 
     // System control surface (§5.7 + §5.12): exposes `system.status` /
     // `system.shutdown` to local UDS clients plus runtime WSS listener control.
@@ -733,8 +743,8 @@ struct DaemonControl {
     shutdown: Arc<tokio::sync::Notify>,
     /// Runtime state for settings-driven listener control (§5.12). Holds the
     /// WsApiServer construction args so `start_ws_listener` can build a fresh
-    /// server when toggled on. `None` when the daemon was started with --listen uds
-    /// (no TCP listener capability at all).
+    /// server when toggled on. Always `Some` (constructed regardless of --listen
+    /// mode so runtime toggle works for all modes, including --listen uds).
     ws_runtime: Option<Arc<WsRuntimeControl>>,
 }
 
@@ -765,8 +775,10 @@ struct WsRuntimeState {
 struct DaemonPairingInfo {
     data_dir: PathBuf,
     token_store: Arc<AsyncTokenStore>,
-    /// Runtime control reference to read the current bound port. `None` when the
-    /// daemon was started with --listen uds (no TCP listener capability).
+    /// Runtime control reference to read the current bound port. Always `Some`
+    /// (WsRuntimeControl is constructed for all listen modes; the listener is
+    /// auto-started at boot only for --listen tcp/both, but can be started at
+    /// runtime for all modes including --listen uds).
     ws_runtime: Option<Arc<WsRuntimeControl>>,
 }
 
@@ -847,11 +859,11 @@ impl intent_core::ServerControl for DaemonControl {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<u16>> + Send + '_>>
     {
         Box::pin(async move {
-            let runtime = self.ws_runtime.as_ref().ok_or_else(|| {
-                intent_core::Error::Internal(
-                    "WSS listener not available (daemon started with --listen uds)".to_string(),
-                )
-            })?;
+            // ws_runtime is always Some (constructed for all listen modes)
+            let runtime = self
+                .ws_runtime
+                .as_ref()
+                .expect("ws_runtime always initialized");
 
             // Check if already running (don't hold lock across await)
             let existing_server = {
@@ -979,11 +991,11 @@ impl intent_core::ServerControl for DaemonControl {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<()>> + Send + '_>>
     {
         Box::pin(async move {
-            let runtime = self.ws_runtime.as_ref().ok_or_else(|| {
-                intent_core::Error::Internal(
-                    "WSS listener not available (daemon started with --listen uds)".to_string(),
-                )
-            })?;
+            // ws_runtime is always Some (constructed for all listen modes)
+            let runtime = self
+                .ws_runtime
+                .as_ref()
+                .expect("ws_runtime always initialized");
 
             // Get the server without holding lock across await
             let server = {
