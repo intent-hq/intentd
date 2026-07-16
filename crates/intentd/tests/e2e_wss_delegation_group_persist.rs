@@ -337,10 +337,9 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 }
 
 
-/// Increment 5: baseline + child1 + kill daemon1 + boot daemon2 + resume child2 + wait for child2 idle.
-/// THIS is where the previous implementors identified the hang (mock ACP died with daemon1).
+/// Increment 6: full restart scenario - wait for the aggregated wake with both reports.
 #[tokio::test]
-async fn baseline_plus_wait_child2_idle() {
+async fn baseline_plus_aggregated_wake() {
     let Some(script) = gate("WSS after_all baseline (no restart)") else {
         return;
     };
@@ -618,8 +617,48 @@ async fn baseline_plus_wait_child2_idle() {
         }
     }
     assert!(child2_idle, "child2 completed post-restart");
-    eprintln!("Test ends here for increment 5 (child2 idle observed).");
-    return; // Stop here for increment 5
+    eprintln!("Child2 idle confirmed.");
+
+    // Increment 6: wait for the aggregated wake (parent receives stream events)
+    eprintln!("Waiting for parent aggregated wake...");
+    let mut wake_chunks = 0u32;
+    let mut wake_ends = 0u32;
+    let mut parent_idle_again = false;
+    for i in 0..400 {
+        if i % 50 == 0 {
+            eprintln!("  ... waiting for parent wake (iteration {i})");
+        }
+        let frame = wss_event(&mut sub2, 90).await;
+        let ev = &frame["params"]["event"];
+        let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+        if ev_agent != parent_id {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:stream:chunk") => {
+                wake_chunks += 1;
+                eprintln!("  parent stream:chunk (wake_chunks={})", wake_chunks);
+            }
+            Some("agent:stream:end") => {
+                wake_ends += 1;
+                eprintln!("  parent stream:end (wake_ends={})", wake_ends);
+            }
+            Some("agent:idle") => {
+                parent_idle_again = true;
+                eprintln!("  parent idle again");
+            }
+            _ => {}
+        }
+        if parent_idle_again && wake_ends >= 1 {
+            break;
+        }
+    }
+    assert!(wake_chunks >= 1, "wake turn streamed ≥1 chunk");
+    assert_eq!(wake_ends, 1, "exactly one wake stream:end");
+    assert!(parent_idle_again, "parent idled after wake");
+    eprintln!("Aggregated wake observed successfully!");
+    eprintln!("Test ends here for increment 6.");
+    return; // Stop here for increment 6
 
     // Phase 2 — children finish; the group fires ONE aggregated wake that runs
     // a real parent turn (stream lifecycle keyed by the parent, trailing idle)
