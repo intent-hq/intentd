@@ -69,7 +69,7 @@ async fn read_json(reader: &mut BufReader<OwnedReadHalf>, budget: Duration) -> V
 /// A slow `host.exec` (sleeping ~1s) must not block a subsequent
 /// `workspace.list` on the same connection: the fast response comes back well
 /// before the slow one, and out-of-order responses are correlated by id.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_host_exec_does_not_block_fast_workspace_list() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");

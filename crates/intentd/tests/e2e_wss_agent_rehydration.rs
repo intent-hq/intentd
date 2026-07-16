@@ -18,6 +18,16 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Apply timeout multiplier from environment for coverage instrumentation.
+/// Reads INTENTD_TEST_TIMEOUT_MULTIPLIER (defaults to 1.0).
+fn test_timeout(base: Duration) -> Duration {
+    let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(1.0);
+    base.mul_f64(multiplier.max(1.0))
+}
+
 use futures_util::{SinkExt, StreamExt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -85,7 +95,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
 }
 
 async fn await_uds(socket: &Path) -> bool {
-    timeout(Duration::from_secs(10), async {
+    timeout(test_timeout(Duration::from_secs(10)), async {
         loop {
             if UnixStream::connect(socket).await.is_ok() {
                 return;
@@ -110,10 +120,13 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     write_half.flush().await.unwrap();
     let mut reader = BufReader::new(read_half);
     let mut buf = String::new();
-    timeout(Duration::from_secs(5), reader.read_line(&mut buf))
-        .await
-        .expect("uds rpc timed out")
-        .expect("read uds response");
+    timeout(
+        test_timeout(Duration::from_secs(5)),
+        reader.read_line(&mut buf),
+    )
+    .await
+    .expect("uds rpc timed out")
+    .expect("read uds response");
     serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
 
@@ -229,7 +242,7 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
+        let next = timeout(test_timeout(Duration::from_secs(15)), ws.next())
             .await
             .expect("wss rpc timed out");
         match next {
