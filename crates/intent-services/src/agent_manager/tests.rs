@@ -85,6 +85,24 @@ fn recording_kill(id: AgentId, log: Arc<Mutex<Vec<AgentId>>>) -> KillFn {
 }
 
 #[test]
+fn title_case_ascii_capitalizes_first_char() {
+    assert_eq!(super::title_case_ascii("bearer"), "Bearer");
+    assert_eq!(super::title_case_ascii("basic"), "Basic");
+    assert_eq!(super::title_case_ascii("foo"), "Foo");
+    assert_eq!(super::title_case_ascii("a"), "A");
+}
+
+#[test]
+fn title_case_ascii_empty_string_returns_empty() {
+    assert_eq!(super::title_case_ascii(""), "");
+}
+
+#[test]
+fn title_case_ascii_already_capitalized_unchanged() {
+    assert_eq!(super::title_case_ascii("Bearer"), "Bearer");
+}
+
+#[test]
 fn compute_process_cap_matches_ts_thresholds() {
     assert_eq!(compute_process_cap(8 * super::GB), 4);
     assert_eq!(compute_process_cap(16 * super::GB), 8);
