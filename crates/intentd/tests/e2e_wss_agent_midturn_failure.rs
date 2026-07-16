@@ -497,7 +497,7 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
         .join(intent_core::current_agent_log_file_name());
     let mut captured = String::new();
     for _ in 0..100 {
-        if let Ok(c) = std::fs::read_to_string(&capture_path) {
+        if let Ok(c) = tokio::fs::read_to_string(&capture_path).await {
             captured = c;
             if captured.contains("exiting during prompt") {
                 break;
@@ -517,7 +517,9 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
     let expected_hint = format!("agent stderr captured at {}", capture_path.display());
     let mut daemon_log = String::new();
     for _ in 0..100 {
-        daemon_log = std::fs::read_to_string(&daemon_log_path).unwrap_or_default();
+        daemon_log = tokio::fs::read_to_string(&daemon_log_path)
+            .await
+            .unwrap_or_default();
         if daemon_log.contains(&expected_hint) {
             break;
         }

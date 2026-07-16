@@ -3113,12 +3113,15 @@ fn is_benign_turn_error(err: &Error) -> bool {
 /// STAB-53: when a terminal failure means the child died mid-turn ("agent
 /// stdout closed") and stderr capture is enabled, return today's capture path
 /// for `agent_id` so the WARN line can point at the child's last words.
+/// Matches on the structured `Error::Internal` payload — the transport's
+/// child-death error is always wrapped there (handshake/prompt failures) —
+/// avoiding a Display allocation per check.
 fn stderr_capture_hint(
     mgr: &AgentManager,
     agent_id: &AgentId,
     err: &Error,
 ) -> Option<std::path::PathBuf> {
-    if !err.to_string().contains("agent stdout closed") {
+    if !matches!(err, Error::Internal(msg) if msg.contains("agent stdout closed")) {
         return None;
     }
     mgr.agent_stderr_log_path(agent_id)
