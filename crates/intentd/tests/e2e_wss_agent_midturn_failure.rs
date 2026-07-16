@@ -2,7 +2,9 @@
 //! the child spawns and handshakes fine, then dies while `session/prompt` is
 //! in flight. The daemon must surface the failure — `agent:failed`,
 //! `agent:stream:end`, persisted `status=error` — requeue the message, and
-//! redrive it via `agent.retry` (no silent drop).
+//! redrive it via `agent.retry` (no silent drop). The crash must also leave
+//! the child's stderr captured under `<data_dir>/agent-logs/<agent-id>/`
+//! with the terminal-failure WARN pointing at the capture path (STAB-53).
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -485,6 +487,55 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
     assert_eq!(
         session["session"]["status"], "error",
         "session status is error after mid-turn failure"
+    );
+
+    // STAB-53: the mid-turn crash left the child's stderr captured under
+    // `<data_dir>/agent-logs/<agent-id>/<YYYY-MM-DD>.log` — the mock logs
+    // every phase to stderr, including the deliberate exit inside
+    // session/prompt. Scan every daily file in the agent's capture dir
+    // rather than hard-coding today's name: the writer rotates by UTC date,
+    // so a midnight rollover between emit and read must not flake the test.
+    let capture_dir = intent_core::agent_logs_root(&data_dir).join(&agent_id);
+    let mut captured = String::new();
+    for _ in 0..100 {
+        captured.clear();
+        if let Ok(mut entries) = tokio::fs::read_dir(&capture_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Ok(c) = tokio::fs::read_to_string(entry.path()).await {
+                    captured.push_str(&c);
+                }
+            }
+        }
+        if captured.contains("exiting during prompt") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        captured.contains("exiting during prompt"),
+        "stderr capture under {} holds the child's last words; got: {captured:?}",
+        capture_dir.display()
+    );
+
+    // STAB-53: the terminal-failure WARN points at the per-agent capture
+    // directory (rollover-stable: the daily file name would be misleading
+    // across a UTC midnight boundary) so the crash is diagnosable straight
+    // from the daemon log.
+    let daemon_log_path = data_dir.join("daemon.log");
+    let expected_hint = format!("agent stderr captured at {}", capture_dir.display());
+    let mut daemon_log = String::new();
+    for _ in 0..100 {
+        daemon_log = tokio::fs::read_to_string(&daemon_log_path)
+            .await
+            .unwrap_or_default();
+        if daemon_log.contains(&expected_hint) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        daemon_log.contains(&expected_hint),
+        "terminal-failure WARN includes the stderr capture path hint {expected_hint:?}"
     );
 
     // The failed message was requeued (not silently dropped): the queue holds

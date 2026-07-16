@@ -109,6 +109,7 @@ async fn routes_requests_and_notifications() {
         requests: Some(req_tx),
         notifications: Some(note_tx),
         auth_error_patterns: Vec::new(),
+        stderr_log_dir: None,
     };
 
     let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);
@@ -168,6 +169,69 @@ async fn stderr_captured_and_auth_flagged() {
     assert!(conn.auth_error_detected(), "auth pattern matched on stderr");
     assert_eq!(captured.len(), 2);
     assert!(captured[1].contains("auggie login"));
+}
+
+/// STAB-53: with `stderr_log_dir` set, every stderr line a (real, exiting)
+/// child emits lands in `<dir>/<YYYY-MM-DD>.log`.
+#[cfg(unix)]
+#[tokio::test]
+async fn stderr_capture_written_to_daily_log_file() {
+    use crate::spawn::{spawn_provider, SpawnOptions};
+
+    let dir = std::env::temp_dir().join(format!("intent-acp-stderr-{}", uuid::Uuid::new_v4()));
+
+    let base = *intent_providers::find_provider("auggie").unwrap();
+    let provider = intent_providers::ProviderConfig {
+        command: "sh",
+        base_args: &[
+            "-c",
+            "echo 'boom: child crashed' >&2; echo 'second line' >&2",
+        ],
+        model_flag: None,
+        rules_flag: None,
+        mcp_config_flag: None,
+        quiet_flag: None,
+        supports_mcp_config: false,
+        supports_rules_file: false,
+        ..base
+    };
+
+    let opts = SpawnOptions::new(&provider);
+    let hooks = ConnectionHooks {
+        stderr_log_dir: Some(dir.clone()),
+        ..ConnectionHooks::default()
+    };
+    let mut agent = spawn_provider(&opts, hooks).expect("spawn sh child");
+
+    // Concatenate every daily file in the capture dir rather than assuming
+    // today's name: the writer rotates by UTC date, so a rollover between
+    // emit and read must not flake the test.
+    let mut content = String::new();
+    for _ in 0..100 {
+        content.clear();
+        if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Ok(c) = tokio::fs::read_to_string(entry.path()).await {
+                    content.push_str(&c);
+                }
+            }
+        }
+        if content.contains("second line") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        content.contains("boom: child crashed"),
+        "first stderr line captured; got: {content:?}"
+    );
+    assert!(
+        content.contains("second line"),
+        "second stderr line captured; got: {content:?}"
+    );
+
+    agent.kill().await.ok();
+    tokio::fs::remove_dir_all(&dir).await.ok();
 }
 
 /// Minimal portable ACP responder: echoes a `{protocolVersion:1}` result for

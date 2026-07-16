@@ -449,6 +449,7 @@ fn build_inner(
         requests: Some(req_tx),
         notifications: Some(note_tx),
         auth_error_patterns: auth_patterns,
+        stderr_log_dir: None,
     };
     let conn = Arc::new(Connection::new(
         c2a_client,

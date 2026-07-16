@@ -5,6 +5,7 @@
 //! and the cross-layer traits (`WorkspaceApi`, `ContextEngine`) that higher
 //! layers implement and consume.
 
+pub mod agent_logs;
 pub mod clock;
 pub mod config;
 pub mod error;
@@ -17,6 +18,10 @@ pub mod server_control;
 pub mod slug;
 pub mod traits;
 
+pub use agent_logs::{
+    agent_logs_root, current_agent_log_file_name, sweep_agent_logs, AGENT_LOGS_DIR_NAME,
+    AGENT_LOG_RETENTION_DAYS,
+};
 pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso};
 pub use config::Config;
 pub use error::{Error, Result};
