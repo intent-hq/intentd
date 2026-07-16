@@ -202,7 +202,7 @@ jobs:
       - name: Run combined coverage
         run: |
           cd ${{ github.workspace }}
-          GENERATE_LCOV=1 ./scripts/coverage-all.sh 79
+          GENERATE_LCOV=1 ./scripts/coverage-all.sh 80
       - name: Generate coverage summary
         if: always()
         run: |
