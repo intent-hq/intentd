@@ -4380,6 +4380,42 @@ impl Services {
         for change in sorted_changes {
             if let Some(path) = change.get("path").and_then(|v| v.as_str()) {
                 match path {
+                    "server.wsApi.port" => {
+                        if let Some(new_port) = change.get("value").and_then(|v| v.as_f64()) {
+                            let port = new_port as u16;
+                            // Check if listener is running
+                            if let Some(current_port) = control.ws_listener_port().await {
+                                // Listener is running: restart it on the new port
+                                tracing::info!(
+                                    old_port = current_port,
+                                    new_port = port,
+                                    "server.wsApi.port → {}: restarting WSS listener",
+                                    port
+                                );
+                                control.stop_ws_listener().await;
+                                let bound_port = control.start_ws_listener().await.map_err(|e| {
+                                    tracing::error!(
+                                        error = ?e,
+                                        port = port,
+                                        "server.wsApi.port → {}: failed to restart WSS listener", port
+                                    );
+                                    Error::Internal(format!("failed to restart WSS listener on port {}: {}", port, e))
+                                })?;
+                                tracing::info!(
+                                    port = bound_port,
+                                    "server.wsApi.port → {}: restarted WSS listener",
+                                    port
+                                );
+                            } else {
+                                // Listener is not running: persisting the value is enough
+                                tracing::info!(
+                                    port = port,
+                                    "server.wsApi.port → {}: persisted (listener not running)",
+                                    port
+                                );
+                            }
+                        }
+                    }
                     "server.wsApi.enabled" => {
                         if let Some(enabled) = change.get("value").and_then(|v| v.as_bool()) {
                             if enabled {

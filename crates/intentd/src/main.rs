@@ -868,6 +868,38 @@ impl intent_core::ServerControl for DaemonControl {
                 }
             }
 
+            // Read the persisted port from settings (fall back to env/default)
+            let desired_port = match runtime
+                .api
+                .settings_get("server.wsApi.port".to_string())
+                .await
+            {
+                Ok(result) => {
+                    result
+                        .get("value")
+                        .and_then(|v| v.as_f64())
+                        .map(|p| p as u16)
+                        .unwrap_or_else(|| {
+                            // Fall back to env INTENTD_TCP_PORT / default 5181
+                            std::env::var("INTENTD_TCP_PORT")
+                                .ok()
+                                .and_then(|v| v.trim().parse::<u16>().ok())
+                                .unwrap_or(runtime.ws_options.base_port)
+                        })
+                }
+                Err(_) => {
+                    // Fall back to env INTENTD_TCP_PORT / default 5181
+                    std::env::var("INTENTD_TCP_PORT")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<u16>().ok())
+                        .unwrap_or(runtime.ws_options.base_port)
+                }
+            };
+
+            // Clone ws_options and override the port
+            let mut ws_options = runtime.ws_options.clone();
+            ws_options.base_port = desired_port;
+
             // Build a fresh WsApiServer and start it
             let mut server = if let Some(ref tls) = runtime.tls_cert {
                 // Secure mode
@@ -885,7 +917,7 @@ impl intent_core::ServerControl for DaemonControl {
                     runtime.bus.clone(),
                     tls,
                     token_store.clone(),
-                    runtime.ws_options.clone(),
+                    ws_options,
                     runtime.reverse_registry.clone(),
                 )
                 .map_err(|e| intent_core::Error::Internal(e.to_string()))?
@@ -894,7 +926,7 @@ impl intent_core::ServerControl for DaemonControl {
                 WsApiServer::new_insecure_with_reverse(
                     runtime.api.clone(),
                     runtime.bus.clone(),
-                    runtime.ws_options.clone(),
+                    ws_options,
                     runtime.reverse_registry.clone(),
                 )
             };
@@ -911,7 +943,18 @@ impl intent_core::ServerControl for DaemonControl {
             }
 
             let port = server.start().await.map_err(|e| {
-                intent_core::Error::Internal(format!("failed to start WSS listener: {}", e))
+                // Map bind failures to friendly, actionable error messages
+                let error_kind = e.kind();
+                let error_msg = if error_kind == std::io::ErrorKind::AddrInUse {
+                    format!(
+                        "Port {} is already in use — choose a different port or stop the process using it",
+                        desired_port
+                    )
+                } else {
+                    // Other bind errors: include the port and OS error text
+                    format!("failed to bind port {}: {}", desired_port, e)
+                };
+                intent_core::Error::Internal(error_msg)
             })?;
 
             // mDNS discovery is now managed internally by WsApiServer.start() based on

@@ -925,6 +925,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(65535.0),
             5181.0,
         ),
+        number(
+            "server.wsApi.port",
+            "WSS API port",
+            "TCP port for the WSS listener",
+            "server",
+            Some(1024.0),
+            Some(65535.0),
+            5181.0,
+        ),
         boolean(
             "server.wsApi.enabled",
             "WS API enabled",
