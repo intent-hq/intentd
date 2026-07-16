@@ -632,3 +632,172 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
         "exactly one user row after retry (no duplicate): {convo}"
     );
 }
+
+/// MIDTURN-2 (STAB-54): `agent.retry` on an errored agent whose queue is
+/// EMPTY must not be an invisible no-op. The response carries
+/// `redriven: false` and the status clears to `idle` (not `pending` — nothing
+/// queued will ever drive a pending agent forward), with the matching
+/// `agent:status-changed` event on the wire.
+#[tokio::test]
+async fn agent_retry_with_empty_queue_clears_to_idle_over_wss() {
+    let Some(script) = gate("WSS empty-queue retry E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let attempt_file = data_dir.join("attempts.txt");
+    let attempt_file_s = attempt_file.to_string_lossy().into_owned();
+    let behavior = json!({
+        "exitDuringPromptAttempts": 1,
+        "response": "unused",
+    })
+    .to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 7] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
+        ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "2000"),
+        ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-RETRY-EMPTY", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "dies mid-turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Wait for the persisted error status (the status-changed event is
+    // emitted AFTER the persist, so seeing it guarantees the write landed).
+    let mut saw_status_error = false;
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() == Some(agent_id.as_str())
+            && event["type"] == "agent:status-changed"
+            && event["data"]["status"] == "error"
+        {
+            saw_status_error = true;
+            break;
+        }
+    }
+    assert!(
+        saw_status_error,
+        "agent parked in error after mid-turn death"
+    );
+
+    // Empty the queue: remove the requeued failed message so the retry hits
+    // the STAB-54 empty-queue path.
+    let queue = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getQueue",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = queue["queue"].as_array().expect("queue array");
+    assert_eq!(messages.len(), 1, "failed message requeued: {queue}");
+    let message_id = messages[0]["id"].as_str().expect("message id");
+    let removed = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.removeQueuedMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "messageId": message_id }),
+    )
+    .await;
+    assert_eq!(
+        removed["success"], true,
+        "queued message removed: {removed}"
+    );
+
+    // Retry with an empty queue: explicit `redriven: false` in the response.
+    let retry_result = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.retry",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(retry_result["ok"], true, "agent.retry ok on error status");
+    assert_eq!(
+        retry_result["redriven"], false,
+        "empty-queue retry reports nothing was redriven: {retry_result}"
+    );
+
+    // The status clears to idle — pending would park the agent forever — and
+    // the transition is announced on the event stream.
+    let mut saw_status_idle = false;
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() == Some(agent_id.as_str())
+            && event["type"] == "agent:status-changed"
+            && event["data"]["status"] == "idle"
+        {
+            saw_status_idle = true;
+            break;
+        }
+    }
+    assert!(
+        saw_status_idle,
+        "agent:status-changed(status=idle) emitted for empty-queue retry"
+    );
+
+    // Persisted status is visible over the RPC surface.
+    let session = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        session["session"]["status"], "idle",
+        "session status cleared to idle after empty-queue retry"
+    );
+}
