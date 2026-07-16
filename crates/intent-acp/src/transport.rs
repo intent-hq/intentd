@@ -121,6 +121,7 @@ impl StderrLogSink {
         file.write_all(line.as_bytes()).await?;
         file.write_all(b"\n").await?;
         Ok(())
+    }
 }
 
 /// Bounded ring buffer of recent stderr lines (parity: `recentStderrErrors`).

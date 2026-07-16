@@ -47,35 +47,35 @@ pub fn sweep_agent_logs(root: &Path, max_age: Duration) -> std::io::Result<usize
         .checked_sub(max_age)
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let mut removed = 0;
-for agent_dir in entries.flatten() {
-    let dir_path = agent_dir.path();
-    let Ok(dir_ft) = agent_dir.file_type() else {
-        continue;
-    };
-    if !dir_ft.is_dir() || dir_ft.is_symlink() {
-        continue;
-    }
-    let Ok(files) = std::fs::read_dir(&dir_path) else {
-        continue;
-    };
-    for file in files.flatten() {
-        let path = file.path();
-        let Ok(ft) = file.file_type() else { continue };
-        if !ft.is_file() || ft.is_symlink() {
-            continue;
-        }
-        let Ok(meta) = file.metadata() else { continue };
-        let Ok(modified) = meta.modified() else {
+    for agent_dir in entries.flatten() {
+        let dir_path = agent_dir.path();
+        let Ok(dir_ft) = agent_dir.file_type() else {
             continue;
         };
-        if modified < cutoff && std::fs::remove_file(&path).is_ok() {
-            removed += 1;
+        if !dir_ft.is_dir() || dir_ft.is_symlink() {
+            continue;
         }
+        let Ok(files) = std::fs::read_dir(&dir_path) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            let Ok(ft) = file.file_type() else { continue };
+            if !ft.is_file() || ft.is_symlink() {
+                continue;
+            }
+            let Ok(meta) = file.metadata() else { continue };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            if modified < cutoff && std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        // Drop the per-agent dir when the sweep emptied it (fails harmlessly
+        // when files remain).
+        std::fs::remove_dir(&dir_path).ok();
     }
-    // Drop the per-agent dir when the sweep emptied it (fails harmlessly
-    // when files remain).
-    std::fs::remove_dir(&dir_path).ok();
-}
     Ok(removed)
 }
 
