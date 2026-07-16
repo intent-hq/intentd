@@ -48,6 +48,30 @@ impl Drop for TempDb {
     }
 }
 
+/// Unsets an env var for the guard's lifetime and restores the prior value on
+/// drop so tests stay hermetic (mirrors `intent-acp`'s test `EnvGuard`).
+struct EnvGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+impl EnvGuard {
+    fn unset(key: &'static str) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 /// A kill callback that records the agents it was invoked for (the registry
 /// itself performs the follow-up `deregister`).
 fn recording_kill(id: AgentId, log: Arc<Mutex<Vec<AgentId>>>) -> KillFn {
@@ -2527,6 +2551,127 @@ async fn try_drain_queue_no_op_without_ready_messages() {
         "no slot claim without ready-to-send work"
     );
     assert_eq!(mgr.services.queue_snapshot(&id).len(), 0);
+}
+
+/// STAB-52 regression: a session parked in `Error` must NOT be auto-redriven
+/// by the self-drain path. The terminal-failure handler requeues the failed
+/// message and persists `Error`, so any queue kick (queueMessage, edit-save,
+/// wake delivery) that reached `try_drain_queue` used to re-claim the slot and
+/// re-spawn the failing turn in a crash-loop, flapping `is_active`.
+#[tokio::test]
+async fn try_drain_queue_skips_agent_parked_in_error() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-err"), AgentId::from("a-err"));
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_agent_session_status(&ws, &id, AgentStatus::Error, false, &now_iso())
+        .await
+        .expect("park session in error");
+    // A ready-to-send message is waiting (the terminal-failure requeue).
+    mgr.services
+        .enqueue_message(&id, "requeued".to_string(), None, None);
+
+    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+
+    assert!(!mgr.is_busy(&id), "no slot claim while parked in error");
+    assert!(
+        mgr.workers.lock().unwrap().is_empty(),
+        "no worker spawned for an errored session"
+    );
+    assert_eq!(
+        mgr.services.queue_snapshot(&id).len(),
+        1,
+        "the message stays queued for agent.retry"
+    );
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.status, AgentStatus::Error, "error status untouched");
+    assert!(!session.is_active, "is_active stays 0");
+}
+
+/// STAB-52 regression (full loop): a message sent to an agent whose spawn
+/// always fails terminally must land the row in exactly `status = Error,
+/// is_active = 0` after a single failure — and a subsequent queue kick must
+/// NOT re-spawn the failing turn. Uses the `mock` provider WITHOUT its
+/// required `MOCK_AGENT_SCRIPT_PATH` env, so `resolve_spawn` fails
+/// deterministically with a non-retryable error before any child exists.
+#[tokio::test]
+async fn terminal_spawn_failure_parks_error_without_crash_loop() {
+    // Unset (and restore on drop) so the spawn-failure path is exercised even
+    // in environments that export the mock script path globally.
+    let _env = EnvGuard::unset("MOCK_AGENT_SCRIPT_PATH");
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-loop"), AgentId::from("a-loop"));
+    seed_agent(&mgr, &ws, &id).await;
+    // Point the session at the mock provider (immutable once set, but the
+    // seeded session has none) so the spawn fails before launching a child.
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.provider = Some("mock".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set mock provider");
+
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "boom".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("send_message spawns the worker inline");
+    assert_eq!(result["queued"], json!(false));
+
+    // Wait for the worker to hit the terminal spawn failure and exit.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::Error
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker parks the session in error and exits");
+
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.status, AgentStatus::Error);
+    assert!(
+        !session.is_active,
+        "terminal failure must not leak is_active=1"
+    );
+    // The failed message was requeued (already persisted) for agent.retry.
+    let snap = mgr.services.queue_snapshot(&id);
+    assert_eq!(snap.len(), 1, "failed message requeued exactly once");
+    assert_eq!(snap[0]["content"], json!("boom"));
+
+    // The crash-loop trigger: a queue kick lands on the requeued message.
+    // Before the STAB-52 gate this re-claimed the slot and re-spawned the
+    // failing turn indefinitely.
+    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+
+    assert!(!mgr.is_busy(&id), "no re-claim of the in-flight slot");
+    assert!(
+        mgr.workers.lock().unwrap().is_empty(),
+        "no re-spawned worker"
+    );
+    assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        session.status,
+        AgentStatus::Error,
+        "still parked in error awaiting agent.retry"
+    );
+    assert!(!session.is_active);
 }
 
 #[tokio::test]
