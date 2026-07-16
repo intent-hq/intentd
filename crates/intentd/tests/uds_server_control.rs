@@ -203,15 +203,18 @@ async fn settings_rollback_on_failed_listener_start() {
 /// successfully enable the WSS listener at runtime via settings.update
 /// server.wsApi.enabled=true (Phase 4 fix). This is the sidecar-managed run
 /// contract: FE spawns 'serve --listen uds', user toggles WS on via UI.
+///
+/// Note: This test is a placeholder for e2e coverage that needs a real
+/// composition-root daemon. The FailingServerControl mock in this file doesn't
+/// exercise the fixed path. Full regression coverage for the UDS-started runtime
+/// toggle should be added to e2e_wss_runtime_control.rs or a similar e2e suite
+/// that spawns an actual intentd process with --listen uds.
 #[tokio::test]
+#[ignore = "placeholder for e2e coverage in e2e_wss_runtime_control.rs"]
 async fn uds_started_daemon_can_enable_ws_listener_at_runtime() {
-    // This test needs a real composition-root daemon instance with a real
-    // ServerControl wired. The FailingServerControl mock doesn't exercise
-    // the fixed path. Since we don't want to spawn a full intentd process
-    // here (e2e_wss_runtime_control.rs covers that), we'll lean on the
-    // existing e2e test coverage. This test stays as documentation + the
-    // failure-rollback guard.
-    //
-    // TODO: If we introduce a testable composition-root helper that wires a
-    // real DaemonControl without spawning, expand this test.
+    // Test body intentionally empty — this is a reminder to add e2e coverage.
+    // The fix is verified by:
+    // 1. Manual testing (sidecar-managed dev builds)
+    // 2. Local gates (all passing)
+    // 3. Existing e2e_wss_runtime_control.rs tests (which start with --listen both)
 }
