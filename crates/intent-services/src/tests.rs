@@ -11913,3 +11913,143 @@ mod browser_exec_reverse {
         assert!(matches!(err, Error::Internal(m) if m.contains("timeout")));
     }
 }
+
+/// `scan_workspace_token_usage` tallies agent-session token counters into the
+/// workspace's durable `tokenUsage` field, returning `true` when the materialized
+/// tally changed and `false` when it matched the existing snapshot.
+#[tokio::test]
+async fn scan_workspace_token_usage_tallies_and_detects_change() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let svc = Services::new(store);
+
+    let sess1 = intent_core::AgentSession {
+        id: intent_core::AgentId::from("agent-1"),
+        workspace_id: ws.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: Some("s1".to_string()),
+        name: "Agent One".to_string(),
+        name_explicitly_set: false,
+        model: Some("sonnet".to_string()),
+        provider: Some("auggie".to_string()),
+        system_prompt: None,
+        specialist: None,
+        status: intent_core::AgentStatus::Active,
+        is_active: true,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        delegation_depth: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        is_background: false,
+        metadata: None,
+    };
+
+    let sess2 = intent_core::AgentSession {
+        id: intent_core::AgentId::from("agent-2"),
+        workspace_id: ws.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: Some("s2".to_string()),
+        name: "Agent Two".to_string(),
+        name_explicitly_set: false,
+        model: Some("gpt4".to_string()),
+        provider: Some("openai".to_string()),
+        system_prompt: None,
+        specialist: None,
+        status: intent_core::AgentStatus::Active,
+        is_active: true,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        delegation_depth: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        is_background: false,
+        metadata: None,
+    };
+
+    let ts = now_iso();
+    svc.store.insert_agent_session(&sess1).await.expect("ins1");
+    svc.store
+        .append_agent_message(
+            &intent_core::AgentId::from("agent-1"),
+            "user",
+            &serde_json::json!({}),
+            &ts,
+        )
+        .await
+        .expect("msg1");
+    svc.store
+        .append_agent_message(
+            &intent_core::AgentId::from("agent-1"),
+            "assistant",
+            &serde_json::json!({
+                "usage": {
+                    "inputTokens": 10,
+                    "outputTokens": 20,
+                    "cacheReadTokens": 5,
+                    "cacheCreationTokens": 3
+                }
+            }),
+            &ts,
+        )
+        .await
+        .expect("msg2");
+
+    svc.store.insert_agent_session(&sess2).await.expect("ins2");
+    svc.store
+        .append_agent_message(
+            &intent_core::AgentId::from("agent-2"),
+            "assistant",
+            &serde_json::json!({
+                "usage": { "inputTokens": 15, "outputTokens": 25 }
+            }),
+            &ts,
+        )
+        .await
+        .expect("msg3");
+
+    let changed = svc.scan_workspace_token_usage(&ws).await.expect("scan ok");
+    assert!(changed, "first scan writes new usage");
+
+    let workspace = svc.get_workspace(ws.clone()).await.expect("get ws");
+    let usage = workspace.token_usage.as_ref().expect("usage set");
+    assert_eq!(usage.totals.input_tokens, 25);
+    assert_eq!(usage.totals.output_tokens, 45);
+    assert_eq!(usage.totals.cache_read_tokens, 5);
+    assert_eq!(usage.totals.cache_creation_tokens, 3);
+    assert_eq!(usage.by_agent_id.get("agent-1").unwrap().input_tokens, 10);
+    assert_eq!(usage.by_agent_id.get("agent-2").unwrap().input_tokens, 15);
+    assert_eq!(usage.by_model.get("sonnet").unwrap().input_tokens, 10);
+    assert_eq!(usage.by_model.get("gpt4").unwrap().input_tokens, 15);
+    assert!(usage.last_scan_at.is_some());
+
+    let changed2 = svc.scan_workspace_token_usage(&ws).await.expect("scan2 ok");
+    assert!(!changed2, "second scan finds no change");
+
+    let ws2 = svc.get_workspace(ws.clone()).await.expect("get ws2");
+    assert_eq!(ws2.token_usage.as_ref().unwrap().totals.input_tokens, 25);
+}
