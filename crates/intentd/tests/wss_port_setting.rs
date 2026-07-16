@@ -358,8 +358,7 @@ async fn port_bind_failure_friendly_error() {
     // The error from the hook should be "failed to start WSS listener: {inner error}"
     // where inner error is from the mock: "Port 5182 is already in use..."
     assert!(
-        error_msg.contains("already in use") ||
-        error_msg.contains("failed to start WSS listener"),
+        error_msg.contains("already in use") || error_msg.contains("failed to start WSS listener"),
         "error data should mention bind failure, got: {error_msg}"
     );
 

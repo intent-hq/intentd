@@ -1,1 +1,0 @@
-Fixed in commit 5dd6489. Added release_in_flight_slot() that clears busy/agent_ws without persisting status, called after handle_terminal_spawn_failure to allow future messages or agent.retry to restart the worker. The Error status persisted by the terminal-failure handler is preserved.

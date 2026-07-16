@@ -1,1 +1,0 @@
-Fixed in commit 734ef1f. The implementation already excludes stderr from agent:failed events (lines 2688-2690: only error.to_string() is included, no stderr). The PR description reference to "stderr-enriched" was stale from an earlier iteration. The current behavior is correct for production: stderr can expose secrets and is only available server-side in logs.

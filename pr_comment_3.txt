@@ -1,1 +1,0 @@
-Fixed in commit 5dd6489. Now uses MAX_SPAWN_ATTEMPTS instead of hardcoded /3, and inspects the error message to determine failure kind (timed out, stdout closed, or failed) so the retry hint is accurate.
