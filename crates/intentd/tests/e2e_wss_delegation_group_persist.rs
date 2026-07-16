@@ -337,9 +337,9 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 }
 
 
-/// Increment 2: baseline + child1 completion + kill daemon1 (no restart yet).
+/// Increment 3: baseline + child1 + kill daemon1 + boot daemon2 + connect (no resume yet).
 #[tokio::test]
-async fn baseline_plus_kill_daemon1() {
+async fn baseline_plus_boot_daemon2() {
     let Some(script) = gate("WSS after_all baseline (no restart)") else {
         return;
     };
@@ -531,8 +531,45 @@ async fn baseline_plus_kill_daemon1() {
         .args(["-9", "-f", "mock-acp-agent"])
         .status();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    eprintln!("Daemon1 killed. Test ends here for increment 2 (no restart yet).");
-    return; // Stop here for increment 2
+    eprintln!("Daemon1 killed.");
+
+    // Increment 3: boot daemon2 using the SAME data_dir
+    eprintln!("Booting daemon2 with same data_dir...");
+    let child2_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon2 = Daemon {
+        child: child2_proc,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon2 started");
+    eprintln!("Daemon2 is up.");
+
+    // Get daemon2 port + fingerprint
+    let status2 = uds_rpc(&socket, 20, "system.status", json!({})).await;
+    let port2 = status2["result"]["port"].as_u64().expect("port2") as u16;
+    let fp2 = status2["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint2")
+        .to_string();
+    let cfg2 = client_config(&fp2);
+    eprintln!("Daemon2 port={port2}, fingerprint={fp2}");
+
+    // Connect + subscribe on daemon2
+    let mut sub2 = connect_ws(port2, cfg2.clone()).await;
+    let sub2_resp = wss_rpc(
+        &mut sub2,
+        21,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(
+        sub2_resp["subscriptionId"].is_string(),
+        "subscribed to daemon2: {sub2_resp}"
+    );
+    let mut rpc2 = connect_ws(port2, cfg2).await;
+    eprintln!("Connected to daemon2. Test ends here for increment 3 (no resume yet).");
+    return; // Stop here for increment 3
 
     // Phase 2 — children finish; the group fires ONE aggregated wake that runs
     // a real parent turn (stream lifecycle keyed by the parent, trailing idle)
