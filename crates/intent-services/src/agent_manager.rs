@@ -1901,6 +1901,23 @@ impl AgentManager {
         if !self.services.has_ready_to_send(&agent_id) {
             return;
         }
+        // A session parked in `Error` must NOT be auto-redriven (STAB-52): the
+        // terminal spawn/turn-failure handler requeues the failed message and
+        // persists `Error` so redriving it is a deliberate act — `agent.retry`
+        // (which resets the status to `Pending` before draining) or a fresh
+        // `agent.sendMessage`. Without this gate any queue kick (queueMessage,
+        // edit-save, wake delivery) re-claims the slot, re-spawns the failing
+        // turn, and crash-loops the agent — flapping `is_active` and leaking
+        // `is_active=1` rows whenever the cycle is interrupted mid-claim.
+        if let Ok(session) = self.services.store.get_agent_session(&agent_id).await {
+            if session.status == AgentStatus::Error {
+                tracing::debug!(
+                    agent = %agent_id,
+                    "skipping queue drain: session parked in error state (awaiting agent.retry)"
+                );
+                return;
+            }
+        }
         if !self.try_begin(&agent_id, &workspace_id).await {
             return;
         }
