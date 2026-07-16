@@ -177,6 +177,18 @@ async function handlePrompt(id, params) {
   } catch {
     behavior = {};
   }
+  // Deterministic mid-turn failure: die while the prompt is in flight for the
+  // first N attempts (counter persists across spawns via MOCK_AGENT_ATTEMPT_FILE).
+  // The exit closes stdout, so the daemon's pending session/prompt fails with
+  // "agent stdout closed" — the mid-turn crash the STAB terminal-failure path
+  // must surface (agent:failed + requeue for agent.retry).
+  if (typeof behavior.exitDuringPromptAttempts === 'number' && behavior.exitDuringPromptAttempts > 0) {
+    const attempt = getAndIncrementAttempt();
+    if (attempt <= behavior.exitDuringPromptAttempts) {
+      log(`exiting during prompt (attempt ${attempt}/${behavior.exitDuringPromptAttempts})`);
+      process.exit(1);
+    }
+  }
   // Keep-alive interrupt test: the FIRST turn streams a chunk then parks without
   // resolving, so the daemon can issue `agent.stop` mid-turn. It is left pending
   // until a `session/cancel` arrives; the child stays alive for the follow-up.
