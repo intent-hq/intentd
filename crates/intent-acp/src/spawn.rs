@@ -92,7 +92,7 @@ pub fn build_command(opts: &SpawnOptions) -> Command {
     if let Some(cwd) = opts.cwd {
         cmd.current_dir(cwd);
     }
-    for (key, value) in build_provider_env(opts.provider.id, opts.model) {
+    for (key, value) in build_provider_env(opts.provider, opts.model) {
         cmd.env(key, value);
     }
     for (key, value) in &opts.extra_env {
