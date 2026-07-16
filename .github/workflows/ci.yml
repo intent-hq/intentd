@@ -122,7 +122,9 @@ jobs:
       # the extra ~19G of headroom, but reclaim it in the background instead of
       # stalling the job for ~60s (baseline: ~16G free, ~35G after cleanup).
       - name: Free disk space (background)
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup >/dev/null 2>&1 &
+        run: |
+          sudo -n true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup >/dev/null 2>&1 &
       - uses: actions/checkout@v4
       - name: Resolve pinned Rust channel
         id: toolchain
@@ -176,7 +178,9 @@ jobs:
       # the extra ~19G of headroom, but reclaim it in the background instead of
       # stalling the job for ~60s (baseline: ~16G free, ~35G after cleanup).
       - name: Free disk space (background)
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup >/dev/null 2>&1 &
+        run: |
+          sudo -n true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup >/dev/null 2>&1 &
       - uses: actions/checkout@v4
       - name: Resolve pinned Rust channel
         id: toolchain
