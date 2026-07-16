@@ -23,7 +23,7 @@ cargo llvm-cov clean --workspace
 
 echo "Running e2e tests with coverage instrumentation (nextest)..."
 
-# Run all daemon-level integration tests (kind(test) = crates/intentd/tests/*)
+# Run intentd's integration-test binaries (crates/intentd/tests/*)
 # under nextest so the test binaries execute in parallel instead of one at a time.
 # Skip auggie_context_e2e (needs real auggie binary)
 # Skip known flaky tests under llvm-cov instrumentation (STAB-40, STAB-42)
@@ -31,7 +31,7 @@ echo "Running e2e tests with coverage instrumentation (nextest)..."
 # Note: capture_login_shell_path_with_fake_shell (STAB-43) is an intent-core unit test,
 # not an intentd integration test, so it's skipped in coverage-all.sh but not here
 cargo llvm-cov --no-report nextest -p intentd \
-    -E 'kind(test) and not binary(auggie_context_e2e) and not (test(wss_note_save_asset_round_trip) | test(slow_host_exec_does_not_block_fast_workspace_list))'
+    -E 'kind(test) and not binary(intentd) and not binary(auggie_context_e2e) and not (test(wss_note_save_asset_round_trip) | test(slow_host_exec_does_not_block_fast_workspace_list))'
 
 echo ""
 echo "Generating coverage report..."
