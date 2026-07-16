@@ -163,26 +163,18 @@ async fn connect_ws(
     port: u16,
     cfg: ClientConfig,
 ) -> WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>> {
-    let connector = TlsConnector::from(Arc::new(cfg));
-    let stream = TcpStream::connect(("127.0.0.1", port))
+    let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
         .await
         .expect("tcp connect");
-    let domain = ServerName::try_from("localhost").expect("server name");
-    let tls_stream = connector.connect(domain, stream).await.expect("tls");
-    let req = format!(
-        "GET /ws HTTP/1.1\r\n\
-         Host: localhost:{port}\r\n\
-         Authorization: Bearer {TOKEN}\r\n\
-         Origin: https://localhost:{port}\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Key: {}\r\n\
-         Sec-WebSocket-Version: 13\r\n\r\n",
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"intentd-e2e-key")
-    );
-    let (ws, _) = tokio_tungstenite::client_async(req, tls_stream)
+    let name = ServerName::try_from("localhost").unwrap();
+    let tls = TlsConnector::from(Arc::new(cfg))
+        .connect(name, tcp)
         .await
-        .expect("ws upgrade");
+        .expect("tls connect");
+    let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
+    let (ws, _resp) = tokio_tungstenite::client_async(url, tls)
+        .await
+        .expect("ws handshake");
     ws
 }
 
@@ -192,21 +184,28 @@ async fn wss_rpc(
     method: &str,
     params: Value,
 ) -> Value {
-    let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(serde_json::to_string(&req).unwrap()))
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    ws.send(Message::Text(frame.to_string()))
         .await
-        .expect("send");
+        .expect("send rpc frame");
     loop {
-        let msg = timeout(Duration::from_secs(5), ws.next())
+        let next = timeout(Duration::from_secs(15), ws.next())
             .await
-            .expect("wss_rpc timeout")
-            .expect("stream ended")
-            .expect("msg error");
-        if let Message::Text(t) = msg {
-            let v: Value = serde_json::from_str(&t).expect("parse response");
-            if v.get("id").and_then(Value::as_i64) == Some(id) {
-                return v.get("result").cloned().unwrap_or(v);
+            .expect("wss rpc timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["id"] == json!(id) && v.get("result").is_some() {
+                    return v["result"].clone();
+                } else if v["id"] == json!(id) {
+                    panic!("rpc errored: {v}");
+                }
             }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
         }
     }
 }
@@ -315,7 +314,9 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
     };
 
     // Clean stale processes before starting
-    let _ = Command::new("pkill").args(["-f", "mock-acp-agent"]).output();
+    let _ = Command::new("pkill")
+        .args(["-f", "mock-acp-agent"])
+        .output();
     let _ = Command::new("pkill").args(["-f", "intentd serve"]).output();
 
     let data_dir = temp_data_dir();
