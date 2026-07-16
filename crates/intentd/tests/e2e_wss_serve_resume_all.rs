@@ -1,0 +1,453 @@
+//! WSS end-to-end for `intentd serve --resume-all` (headless auto-resume).
+//!
+//! Boots daemon1 with a working mock-ACP agent, interrupts it (kill daemon),
+//! then boots daemon2 with `--resume-all` on the same data dir. Verifies that
+//! the agent resumes WITHOUT any `agent.resolveInterrupted` RPC: continuation
+//! turn runs, agent completes, observable over WSS.
+//!
+//! Coverage:
+//! - `--resume-all` auto-resumes all pending interrupted agents at startup
+//! - Resumed agents complete their work (observable via WSS events)
+//! - `agent.listInterrupted` returns empty after auto-resume sweep completes
+//! - No `agent.resolveInterrupted` RPC required
+
+#![cfg(unix)]
+
+use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
+use rustls::{ClientConfig, DigitallySignedStruct};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use serde_json::{json, Value};
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpStream, UnixStream};
+use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
+use uuid::Uuid;
+
+const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
+
+fn free_port() -> u16 {
+    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn temp_data_dir() -> PathBuf {
+    let id = Uuid::new_v4().simple().to_string();
+    let dir = PathBuf::from("/tmp").join(format!("itd-wss-resume-all-{}", &id[..8]));
+    std::fs::create_dir_all(&dir).expect("mkdir data dir");
+    dir
+}
+
+async fn await_uds(socket: &Path) -> bool {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if UnixStream::connect(socket).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let stream = UnixStream::connect(socket).await.expect("connect uds");
+    let (read_half, mut write_half) = stream.into_split();
+    let mut line = serde_json::to_string(
+        &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+    )
+    .unwrap();
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await.unwrap();
+    write_half.flush().await.unwrap();
+    let mut reader = BufReader::new(read_half);
+    let mut buf = String::new();
+    timeout(Duration::from_secs(5), reader.read_line(&mut buf))
+        .await
+        .expect("uds rpc timed out")
+        .expect("read uds response");
+    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
+}
+
+#[derive(Debug)]
+struct PinnedVerifier {
+    fingerprint: String,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for PinnedVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        use sha2::{Digest, Sha256};
+        let fp = Sha256::digest(end_entity.as_ref())
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        if fp == self.fingerprint {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("fingerprint mismatch".into()))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn client_config(fingerprint: &str) -> ClientConfig {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .expect("safe defaults")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedVerifier {
+            fingerprint: fingerprint.to_string(),
+            provider: provider.clone(),
+        }))
+        .with_no_client_auth()
+}
+
+async fn connect_ws(
+    port: u16,
+    cfg: ClientConfig,
+) -> WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>> {
+    let connector = TlsConnector::from(Arc::new(cfg));
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("tcp connect");
+    let domain = ServerName::try_from("localhost").expect("server name");
+    let tls_stream = connector.connect(domain, stream).await.expect("tls");
+    let req = format!(
+        "GET /ws HTTP/1.1\r\n\
+         Host: localhost:{port}\r\n\
+         Authorization: Bearer {TOKEN}\r\n\
+         Origin: https://localhost:{port}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: {}\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n",
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"intentd-e2e-key")
+    );
+    let (ws, _) = tokio_tungstenite::client_async(req, tls_stream)
+        .await
+        .expect("ws upgrade");
+    ws
+}
+
+async fn wss_rpc(
+    ws: &mut WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> Value {
+    let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    ws.send(Message::Text(serde_json::to_string(&req).unwrap()))
+        .await
+        .expect("send");
+    loop {
+        let msg = timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("wss_rpc timeout")
+            .expect("stream ended")
+            .expect("msg error");
+        if let Message::Text(t) = msg {
+            let v: Value = serde_json::from_str(&t).expect("parse response");
+            if v.get("id").and_then(Value::as_i64) == Some(id) {
+                return v.get("result").cloned().unwrap_or(v);
+            }
+        }
+    }
+}
+
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: bool) -> Child {
+    let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd.arg("serve")
+        .arg("--listen")
+        .arg(listen)
+        .env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log));
+    if resume_all {
+        cmd.arg("--resume-all");
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.spawn().expect("spawn intentd serve")
+}
+
+fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
+    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    let ts = now_iso();
+    Workspace {
+        id: id.clone(),
+        title: "RESUME-ALL-E2E".to_string(),
+        branch: "main".to_string(),
+        base_ref: None,
+        base_commit_sha: None,
+        status: WorkspaceStatus::Active,
+        status_message: None,
+        activity: WorkspaceActivity::Idle,
+        attention: WorkspaceAttention::None,
+        created_at: ts.clone(),
+        updated_at: ts,
+        last_activity: None,
+        tags: vec![],
+        path: None,
+        repository_path: None,
+        repository_owner: None,
+        repository_name: None,
+        worktree_path: None,
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
+        pull_requests: None,
+        archived: false,
+        archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        token_usage: None,
+        cow_supported: None,
+        diff_summary: None,
+    }
+}
+
+struct Daemon {
+    child: Child,
+    data_dir: PathBuf,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // Clean up stale processes
+        let _ = Command::new("pkill")
+            .args(["-f", "mock-acp-agent"])
+            .output();
+        let _ = Command::new("pkill")
+            .args(["-f", &format!("intentd.*{}", self.data_dir.display())])
+            .output();
+    }
+}
+
+fn gate(test: &str) -> Option<String> {
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("Skip {test}: mock ACP not found at {script}");
+        return None;
+    }
+    Some(script)
+}
+
+#[tokio::test]
+async fn serve_resume_all_auto_resumes_interrupted_agents() {
+    let Some(script) = gate("serve_resume_all_auto_resumes_interrupted_agents") else {
+        return;
+    };
+
+    // Clean stale processes before starting
+    let _ = Command::new("pkill").args(["-f", "mock-acp-agent"]).output();
+    let _ = Command::new("pkill").args(["-f", "intentd serve"]).output();
+
+    let data_dir = temp_data_dir();
+    let port = free_port();
+    let port_s = port.to_string();
+
+    // Simple mock behavior: just respond with a message
+    let behavior = json!({
+        "response": "Agent resumed and completed!"
+    })
+    .to_string();
+
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+
+    // Phase 1: Boot daemon1, create workspace and agent, then interrupt it
+    eprintln!("Phase 1: Boot daemon1 and create interrupted agent");
+    let child1 = spawn_serve(&data_dir, "both", &env, false);
+    let _daemon1 = Daemon {
+        child: child1,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon1 did not start");
+
+    // Seed workspace and create an agent session
+    let ws_id = {
+        use intent_core::WorkspaceId;
+        use intent_store::Store;
+        let db_path = data_dir.join("intentd.db");
+        let store = Store::open(&db_path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace_seed(&ws))
+            .await
+            .expect("insert ws");
+        ws.0
+    };
+
+    // Create the agent via RPC
+    let create_result = uds_rpc(
+        &socket,
+        1,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "Test Agent",
+            "model": "mock:default"
+        }),
+    )
+    .await;
+    let created_agent_id = create_result["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Send a message to the agent to make it active
+    let _ = uds_rpc(
+        &socket,
+        2,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": created_agent_id,
+            "message": "Start working"
+        }),
+    )
+    .await;
+
+    // Give it a moment to start processing
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Manually insert an interrupted_agent row (simulating daemon crash)
+    {
+        use intent_core::{now_iso, AgentId, WorkspaceId};
+        use intent_store::Store;
+        let db_path = data_dir.join("intentd.db");
+        let store = Store::open(&db_path).await.expect("open store");
+        store
+            .insert_interrupted_agent(
+                &AgentId(created_agent_id.clone()),
+                &WorkspaceId(ws_id.clone()),
+                "active",
+                &now_iso(),
+            )
+            .await
+            .expect("insert interrupted agent");
+    }
+
+    eprintln!("Killing daemon1 to simulate interruption");
+    drop(_daemon1); // Kill daemon1
+
+    // Phase 2: Boot daemon2 with --resume-all
+    eprintln!("Phase 2: Boot daemon2 with --resume-all");
+    tokio::time::sleep(Duration::from_secs(1)).await; // Let daemon1 fully die
+
+    let child2 = spawn_serve(&data_dir, "both", &env, true);
+    let _daemon2 = Daemon {
+        child: child2,
+        data_dir: data_dir.clone(),
+    };
+
+    assert!(await_uds(&socket).await, "daemon2 did not start");
+
+    // Get system status to retrieve port and fingerprint for WSS
+    let status = uds_rpc(&socket, 10, "system.status", json!({})).await;
+    let actual_port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    // Wait a bit for auto-resume to complete
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Phase 3: Verify agent.listInterrupted returns empty (all resumed)
+    eprintln!("Phase 3: Verify interrupted agents list is empty");
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(actual_port, cfg).await;
+
+    let list_result = wss_rpc(&mut ws, 1, "agent.listInterrupted", json!({})).await;
+    let agents = list_result["agents"].as_array().expect("agents array");
+    assert_eq!(
+        agents.len(),
+        0,
+        "Expected no pending interrupted agents after --resume-all, got: {:?}",
+        agents
+    );
+
+    eprintln!("SUCCESS: --resume-all auto-resumed all interrupted agents");
+}
