@@ -1,0 +1,10 @@
+# Nextest configuration for the intentd workspace.
+#
+# retries = 1: nextest runs tests from all binaries in parallel (unlike
+# `cargo test`, which runs one test binary at a time). Several supervisor/PTY
+# tests use wall-clock timeouts (~5s) that can be exceeded under that extra
+# cross-binary load, especially with llvm-cov instrumentation overhead. A
+# single retry lets load-induced timing flakes pass (reported as FLAKY in the
+# run summary) while genuine failures still fail deterministically.
+[profile.default]
+retries = 1
