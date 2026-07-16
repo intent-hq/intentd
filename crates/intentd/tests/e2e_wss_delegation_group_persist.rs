@@ -337,10 +337,9 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 }
 
 
-/// GREEN BASELINE: verbatim copy of after_all_group_delivers_single_aggregated_wake_over_wss
-/// from e2e_wss_agent_lifecycle.rs to confirm it passes in this file before adding restart.
+/// Increment 1: baseline + capture child IDs + wait for child1 completion (before adding restart).
 #[tokio::test]
-async fn baseline_after_all_group_no_restart() {
+async fn baseline_plus_child_ids_and_wait_child1() {
     let Some(script) = gate("WSS after_all baseline (no restart)") else {
         return;
     };
@@ -501,6 +500,25 @@ async fn baseline_after_all_group_no_restart() {
             .all(|id| id.as_str().unwrap_or_default() != parent_id),
         "waiting ids are the children, not the parent: {lite}"
     );
+
+    // Increment 1a: capture child IDs
+    let child1_id = waiting[0].as_str().unwrap().to_string();
+    let child2_id = waiting[1].as_str().unwrap().to_string();
+    eprintln!("Captured child IDs: child1={child1_id}, child2={child2_id}");
+
+    // Increment 1b: wait for child1 to complete
+    let mut child1_idle = false;
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub, 60).await;
+        if frame["params"]["event"]["type"] == "agent:idle"
+            && frame["params"]["event"]["data"]["agentId"] == child1_id
+        {
+            child1_idle = true;
+            eprintln!("child1 went idle");
+            break;
+        }
+    }
+    assert!(child1_idle, "child1 completed");
 
     // Phase 2 — children finish; the group fires ONE aggregated wake that runs
     // a real parent turn (stream lifecycle keyed by the parent, trailing idle)
