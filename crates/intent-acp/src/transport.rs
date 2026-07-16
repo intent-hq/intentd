@@ -7,11 +7,12 @@
 //! (keyed per id), agent→client requests → a client-served handler hook, and
 //! notifications → a streaming-router hook. A stderr task drains the child's
 //! stderr into a bounded ring buffer, flags configured auth-error patterns,
-//! and — when a capture dir is configured — appends every line to a
+//! and — when a capture dir is configured — forwards every line through a
+//! bounded channel to a dedicated writer task that appends it to a
 //! daily-rotated per-agent log file (STAB-53).
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -72,56 +73,101 @@ pub struct ConnectionHooks {
     pub auth_error_patterns: Vec<String>,
     /// When set, every stderr line is also appended to
     /// `<dir>/<YYYY-MM-DD>.log` (the per-agent capture dir, STAB-53). Writes
-    /// are best-effort inside the dedicated stderr task: a failure disables
-    /// the file sink but never affects the agent runtime.
+    /// are best-effort in a dedicated writer task behind a bounded channel:
+    /// lines are dropped when the writer stalls or fails, so capture never
+    /// backpressures the stderr drain or the agent runtime.
     pub stderr_log_dir: Option<PathBuf>,
 }
 
+/// Lines buffered between the stderr drain and the log writer task before
+/// drop-on-full kicks in (STAB-53).
+const STDERR_LOG_CHANNEL_CAPACITY: usize = 256;
+
 /// Best-effort daily-rotated file sink for the stderr capture (STAB-53).
-/// Opens `<dir>/<YYYY-MM-DD>.log` lazily in append mode and reopens when the
-/// (UTC) date rolls over. The first write failure disables the sink for the
-/// connection's lifetime so a bad disk never loops warnings per line.
+///
+/// A bounded channel decouples the stderr drain loop from file I/O: the drain
+/// side `try_send`s lines and drops them when the channel is full or the
+/// writer has exited, so a stalled disk can never backpressure the child's
+/// stderr pipe. A dedicated writer task owns the file handle — it opens
+/// `<dir>/<YYYY-MM-DD>.log` lazily in append mode, reopens when the (UTC)
+/// date rolls over, and exits on the first write failure so a bad disk never
+/// loops warnings per line.
 struct StderrLogSink {
-    dir: PathBuf,
-    current: Option<(String, tokio::fs::File)>,
-    disabled: bool,
+    tx: mpsc::Sender<String>,
+    drop_warned: bool,
 }
 
 impl StderrLogSink {
     fn new(dir: PathBuf) -> Self {
+        let (tx, rx) = mpsc::channel::<String>(STDERR_LOG_CHANNEL_CAPACITY);
+        tokio::spawn(stderr_log_writer(dir, rx));
         Self {
-            dir,
-            current: None,
-            disabled: false,
+            tx,
+            drop_warned: false,
         }
     }
 
-    async fn write_line(&mut self, line: &str) {
-        if self.disabled {
+    /// Hand a line to the writer task without ever awaiting: on a full
+    /// channel (stalled disk) or a closed one (writer exited after an I/O
+    /// error) the line is dropped — capture is best-effort by design.
+    fn send_line(&mut self, line: &str) {
+        match self.tx.try_send(line.to_string()) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if !self.drop_warned {
+                    self.drop_warned = true;
+                    tracing::warn!("agent stderr log capture dropping lines (writer backlogged)");
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+}
+
+/// Writer task behind [`StderrLogSink`]: owns the daily-rotated file and
+/// exits on the first write failure (subsequent sends then see a closed
+/// channel and drop silently). When the sink is dropped (child exited /
+/// connection closed) it drains the remaining lines and flushes.
+async fn stderr_log_writer(dir: PathBuf, mut rx: mpsc::Receiver<String>) {
+    let mut current: Option<(String, tokio::fs::File)> = None;
+    while let Some(line) = rx.recv().await {
+        let flush = rx.is_empty();
+        if let Err(e) = write_stderr_log_line(&dir, &mut current, &line, flush).await {
+            tracing::warn!(dir = %dir.display(), error = %e, "agent stderr log capture disabled (write failed)");
             return;
         }
-        if let Err(e) = self.try_write_line(line).await {
-            tracing::warn!(dir = %self.dir.display(), error = %e, "agent stderr log capture disabled (write failed)");
-            self.disabled = true;
-        }
     }
+    if let Some((_, mut file)) = current {
+        let _ = file.flush().await;
+    }
+}
 
-    async fn try_write_line(&mut self, line: &str) -> std::io::Result<()> {
-        let name = intent_core::current_agent_log_file_name();
-        if self.current.as_ref().map(|(n, _)| n.as_str()) != Some(name.as_str()) {
-            tokio::fs::create_dir_all(&self.dir).await?;
-            let file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(self.dir.join(&name))
-                .await?;
-            self.current = Some((name, file));
-        }
-        let (_, file) = self.current.as_mut().expect("sink file just opened");
-        file.write_all(line.as_bytes()).await?;
-        file.write_all(b"\n").await?;
-        Ok(())
+/// Append one line to the daily capture file, opening/rolling it as needed.
+/// Flushes only when the writer's channel drained empty, batching flushes
+/// under bursts.
+async fn write_stderr_log_line(
+    dir: &Path,
+    current: &mut Option<(String, tokio::fs::File)>,
+    line: &str,
+    flush: bool,
+) -> std::io::Result<()> {
+    let name = intent_core::current_agent_log_file_name();
+    if current.as_ref().map(|(n, _)| n.as_str()) != Some(name.as_str()) {
+        tokio::fs::create_dir_all(dir).await?;
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(&name))
+            .await?;
+        *current = Some((name, file));
     }
+    let (_, file) = current.as_mut().expect("sink file just opened");
+    file.write_all(line.as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    if flush {
+        file.flush().await?;
+    }
+    Ok(())
 }
 
 /// Bounded ring buffer of recent stderr lines (parity: `recentStderrErrors`).
@@ -307,7 +353,7 @@ impl Connection {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if let Some(sink) = log_sink.as_mut() {
-                        sink.write_line(&line).await;
+                        sink.send_line(&line);
                     }
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
