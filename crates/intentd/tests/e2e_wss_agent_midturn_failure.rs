@@ -2,7 +2,9 @@
 //! the child spawns and handshakes fine, then dies while `session/prompt` is
 //! in flight. The daemon must surface the failure — `agent:failed`,
 //! `agent:stream:end`, persisted `status=error` — requeue the message, and
-//! redrive it via `agent.retry` (no silent drop).
+//! redrive it via `agent.retry` (no silent drop). The crash must also leave
+//! the child's stderr captured under `<data_dir>/agent-logs/<agent-id>/`
+//! with the terminal-failure WARN pointing at the capture path (STAB-53).
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -485,6 +487,45 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
     assert_eq!(
         session["session"]["status"], "error",
         "session status is error after mid-turn failure"
+    );
+
+    // STAB-53: the mid-turn crash left the child's stderr captured under
+    // `<data_dir>/agent-logs/<agent-id>/<today>.log` — the mock logs every
+    // phase to stderr, including the deliberate exit inside session/prompt.
+    let capture_path = intent_core::agent_logs_root(&data_dir)
+        .join(&agent_id)
+        .join(intent_core::current_agent_log_file_name());
+    let mut captured = String::new();
+    for _ in 0..100 {
+        if let Ok(c) = std::fs::read_to_string(&capture_path) {
+            captured = c;
+            if captured.contains("exiting during prompt") {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        captured.contains("exiting during prompt"),
+        "stderr capture at {} holds the child's last words; got: {captured:?}",
+        capture_path.display()
+    );
+
+    // STAB-53: the terminal-failure WARN points at the capture path so the
+    // crash is diagnosable straight from the daemon log.
+    let daemon_log_path = data_dir.join("daemon.log");
+    let expected_hint = format!("agent stderr captured at {}", capture_path.display());
+    let mut daemon_log = String::new();
+    for _ in 0..100 {
+        daemon_log = std::fs::read_to_string(&daemon_log_path).unwrap_or_default();
+        if daemon_log.contains(&expected_hint) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        daemon_log.contains(&expected_hint),
+        "terminal-failure WARN includes the stderr capture path hint {expected_hint:?}"
     );
 
     // The failed message was requeued (not silently dropped): the queue holds
