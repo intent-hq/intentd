@@ -48,6 +48,30 @@ impl Drop for TempDb {
     }
 }
 
+/// Unsets an env var for the guard's lifetime and restores the prior value on
+/// drop so tests stay hermetic (mirrors `intent-acp`'s test `EnvGuard`).
+struct EnvGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+impl EnvGuard {
+    fn unset(key: &'static str) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 /// A kill callback that records the agents it was invoked for (the registry
 /// itself performs the follow-up `deregister`).
 fn recording_kill(id: AgentId, log: Arc<Mutex<Vec<AgentId>>>) -> KillFn {
@@ -2574,10 +2598,9 @@ async fn try_drain_queue_skips_agent_parked_in_error() {
 /// deterministically with a non-retryable error before any child exists.
 #[tokio::test]
 async fn terminal_spawn_failure_parks_error_without_crash_loop() {
-    if std::env::var("MOCK_AGENT_SCRIPT_PATH").is_ok() {
-        eprintln!("skipping: MOCK_AGENT_SCRIPT_PATH is set (mock spawn would succeed)");
-        return;
-    }
+    // Unset (and restore on drop) so the spawn-failure path is exercised even
+    // in environments that export the mock script path globally.
+    let _env = EnvGuard::unset("MOCK_AGENT_SCRIPT_PATH");
     let (_tmp, mgr) = manager().await;
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-loop"), AgentId::from("a-loop"));

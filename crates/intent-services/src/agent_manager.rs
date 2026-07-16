@@ -1909,11 +1909,23 @@ impl AgentManager {
         // edit-save, wake delivery) re-claims the slot, re-spawns the failing
         // turn, and crash-loops the agent — flapping `is_active` and leaking
         // `is_active=1` rows whenever the cycle is interrupted mid-claim.
-        if let Ok(session) = self.services.store.get_agent_session(&agent_id).await {
-            if session.status == AgentStatus::Error {
+        // Fail closed: a session lookup error (transient store error, missing
+        // row) also skips the drain — a later queue kick retries, and silently
+        // redriving a possibly-errored agent is the exact bug this gate stops.
+        match self.services.store.get_agent_session(&agent_id).await {
+            Ok(session) if session.status == AgentStatus::Error => {
                 tracing::debug!(
                     agent = %agent_id,
                     "skipping queue drain: session parked in error state (awaiting agent.retry)"
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    "skipping queue drain: agent session lookup failed"
                 );
                 return;
             }
