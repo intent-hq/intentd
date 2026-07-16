@@ -337,55 +337,50 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 }
 
 
-
+/// GREEN BASELINE: verbatim copy of after_all_group_delivers_single_aggregated_wake_over_wss
+/// from e2e_wss_agent_lifecycle.rs to confirm it passes in this file before adding restart.
 #[tokio::test]
-async fn delegation_group_persists_across_restart() {
-    eprintln!("CHECKPOINT 0: test function entered");
-    let Some(script) = gate("WSS delegation-group persist E2E") else {
-        eprintln!("CHECKPOINT 0.5: gate returned None, skipping");
+async fn baseline_after_all_group_no_restart() {
+    let Some(script) = gate("WSS after_all baseline (no restart)") else {
         return;
     };
-    eprintln!("CHECKPOINT 0.9: gate returned script: {}", script);
 
-    eprintln!("CHECKPOINT 1: test start");
     let data_dir = temp_data_dir();
-    eprintln!("CHECKPOINT 2: data_dir created");
     let ws_id = seed_workspace_only(&data_dir).await;
-    eprintln!("CHECKPOINT 3: workspace seeded");
-    let socket = data_dir.join("intentd.sock");
-    eprintln!("CHECKPOINT 4: socket path set");
-
-    // Mock ACP behavior - verbatim copy from reference test adapted for this scenario
-    const PARENT_GO: &str = "DELGRP_PARENT_GO";
-    let report1_js = format!("return await ws.agent.reportToParent({});", json!(CHILD1_REPORT));
-    let report2_js = format!("return await ws.agent.reportToParent({});", json!(CHILD2_REPORT));
-    let delegate1_js = format!(
+    const CHILD_A: &str = "WAKE1_CHILD_ALPHA";
+    const CHILD_B: &str = "WAKE1_CHILD_BETA";
+    const REPORT_A: &str = "REPORT_ALPHA finished the alpha task";
+    const REPORT_B: &str = "REPORT_BETA finished the beta task";
+    const PARENT_GO: &str = "WAKE1_PARENT_GO";
+    let report_a_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_A));
+    let report_b_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_B));
+    let delegate_a_js = format!(
         "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
-        json!("CHILD1"),
+        json!(CHILD_A),
     );
-    let delegate2_js = format!(
+    let delegate_b_js = format!(
         "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
-        json!("CHILD2"),
+        json!(CHILD_B),
     );
     let behavior = json!({
         "rules": [
             {
-                "ifPromptContains": "CHILD1",
+                "ifPromptContains": CHILD_A,
                 "delayMs": 8000,
                 "toolCall": {
                     "name": "workspace_api",
-                    "arguments": { "code": report1_js, "summary": "child1 reportToParent" }
+                    "arguments": { "code": report_a_js, "summary": "alpha reportToParent" }
                 },
-                "response": "child1 done",
+                "response": "alpha child done",
             },
             {
-                "ifPromptContains": "CHILD2",
+                "ifPromptContains": CHILD_B,
                 "delayMs": 8000,
                 "toolCall": {
                     "name": "workspace_api",
-                    "arguments": { "code": report2_js, "summary": "child2 reportToParent" }
+                    "arguments": { "code": report_b_js, "summary": "beta reportToParent" }
                 },
-                "response": "child2 done",
+                "response": "beta child done",
             },
             {
                 "ifPromptContains": "[WORKSPACE EVENTS]",
@@ -396,11 +391,11 @@ async fn delegation_group_persists_across_restart() {
                 "toolCalls": [
                     {
                         "name": "workspace_api",
-                        "arguments": { "code": delegate1_js, "summary": "delegate child1 after_all" }
+                        "arguments": { "code": delegate_a_js, "summary": "delegate alpha after_all" }
                     },
                     {
                         "name": "workspace_api",
-                        "arguments": { "code": delegate2_js, "summary": "delegate child2 after_all" }
+                        "arguments": { "code": delegate_b_js, "summary": "delegate beta after_all" }
                     },
                 ],
                 "response": "parent delegated two after_all children",
@@ -408,51 +403,43 @@ async fn delegation_group_persists_across_restart() {
         ],
     })
     .to_string();
-
-    let env = [
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
-
-    // Phase 1: Boot, create parent, delegate both children
-    eprintln!("CHECKPOINT 5: booting daemon");
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
     };
-    eprintln!("CHECKPOINT 6: daemon spawned, waiting for UDS");
-    assert!(await_uds(&socket).await, "daemon start");
-    eprintln!("CHECKPOINT 7: UDS ready");
-
-    eprintln!("CHECKPOINT 8: fetching port and fingerprint");
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
     let port = status["result"]["port"].as_u64().expect("port") as u16;
-    eprintln!("CHECKPOINT 9: got port={}", port);
-    let fp = status["result"]["fingerprint"]
+    let fingerprint = status["result"]["fingerprint"]
         .as_str()
-        .unwrap()
+        .expect("fingerprint")
         .to_string();
-    eprintln!("CHECKPOINT 10: fingerprint extracted: {}", fp);
-    let cfg = client_config(&fp);
+    let cfg = client_config(&fingerprint);
 
-    // Subscribe BEFORE creating the parent so we don't miss events
-    eprintln!("CHECKPOINT 11: connecting subscription WSS");
+    // SUBSCRIBER conn — subscribe BEFORE the turn so we miss no events.
     let mut sub = connect_ws(port, cfg.clone()).await;
-    eprintln!("CHECKPOINT 12: subscription WSS connected, subscribing");
-    wss_rpc(
+    let sub_resp = wss_rpc(
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
     )
     .await;
-    eprintln!("CHECKPOINT 13: subscription successful");
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
 
-    eprintln!("CHECKPOINT 14: connecting RPC WSS");
     let mut rpc = connect_ws(port, cfg.clone()).await;
-    eprintln!("CHECKPOINT 15: RPC WSS connected, creating parent");
     let parent = wss_rpc(
         &mut rpc,
         10,
@@ -460,162 +447,123 @@ async fn delegation_group_persists_across_restart() {
         json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
     )
     .await;
-    eprintln!("CHECKPOINT 16: parent created");
-    let parent_id = parent["agent"]["id"].as_str().unwrap().to_string();
-    eprintln!("CHECKPOINT 17: parent_id extracted: {}", parent_id);
-
-    wss_rpc(
+    let parent_id = parent["agent"]["id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
+    let sent = wss_rpc(
         &mut rpc,
         11,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": parent_id, "content": PARENT_GO }),
     )
     .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // Wait for parent to idle after delegating
+    // Phase 1 — the parent's delegating turn: both delegate_task registrations
+    // push agent:subscriptions-changed with the waiting flags; the turn ends
+    // with the parent's first agent:idle (which seals the group).
+    let mut saw_waiting_true_event = false;
     let mut parent_idle = false;
     for _ in 0..200 {
         let frame = wss_event(&mut sub, 60).await;
         let ev = &frame["params"]["event"];
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+        if ev["type"] == "agent:subscriptions-changed"
+            && ev_agent == parent_id
+            && ev["data"]["isWaitingForOtherAgents"] == json!(true)
+        {
+            saw_waiting_true_event = true;
+        }
         if ev["type"] == "agent:idle" && ev_agent == parent_id {
             parent_idle = true;
             break;
         }
     }
     assert!(parent_idle, "parent went idle after delegating");
+    assert!(
+        saw_waiting_true_event,
+        "watch registration pushed agent:subscriptions-changed with isWaitingForOtherAgents=true"
+    );
 
-    // Get child IDs from parent's waitingForAgentIds (more reliable than event capture)
-    let lite = wss_rpc(&mut rpc, 12, "agent.get", json!({ "agentId": &parent_id })).await;
-    let waiting = lite["agent"]["waitingForAgentIds"]
+    // While the (delayed) children are still running, the parent's AgentLite
+    // reports the waiting flags with BOTH child ids (PROTOCOL §5.5/§7.1).
+    let lite = wss_rpc(&mut rpc, 12, "agent.get", json!({ "agentId": parent_id })).await;
+    let lite = &lite["agent"];
+    assert_eq!(lite["isWaitingForOtherAgents"], true, "waiting: {lite}");
+    let waiting = lite["waitingForAgentIds"]
         .as_array()
         .expect("waitingForAgentIds");
-    assert_eq!(waiting.len(), 2, "parent waiting for 2 children");
-    let child1_id = waiting[0].as_str().unwrap().to_string();
-    let child2_id = waiting[1].as_str().unwrap().to_string();
+    assert_eq!(waiting.len(), 2, "waiting on both children: {lite}");
+    assert!(
+        waiting
+            .iter()
+            .all(|id| id.as_str().unwrap_or_default() != parent_id),
+        "waiting ids are the children, not the parent: {lite}"
+    );
 
-    // Wait for child1 to complete (idle)
-    let mut child1_idle = false;
-    for _ in 0..100 {
-        let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:idle"
-            && frame["params"]["event"]["data"]["agentId"] == child1_id
-        {
-            child1_idle = true;
-            break;
-        }
-    }
-    assert!(child1_idle, "child1 went idle");
-
-    // Kill daemon before child2 completes
-    drop(sub);
-    drop(rpc);
-    drop(_daemon);
-
-    // Insert interrupted_agent row for child2
-    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
-        .await
-        .expect("open store");
-    {
-        use intent_core::{now_iso, AgentId, WorkspaceId};
-        store
-            .insert_interrupted_agent(
-                &AgentId(child2_id.clone()),
-                &WorkspaceId(ws_id.to_string()),
-                "active",
-                &now_iso(),
-            )
-            .await
-            .expect("insert interrupted child2");
-    }
-
-    // Restart daemon
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let child2 = spawn_serve(&data_dir, "both", &env);
-    let _daemon2 = Daemon {
-        child: child2,
-        data_dir: data_dir.clone(),
-    };
-    assert!(await_uds(&socket).await, "daemon restart");
-
-    // Reconnect WSS — daemon2 gets new port
-    let status2 = uds_rpc(&socket, 20, "system.status", json!({})).await;
-    let port2 = status2["result"]["port"].as_u64().expect("port2") as u16;
-    let fp2 = status2["result"]["fingerprint"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let cfg2 = client_config(&fp2);
-
-    let mut sub2 = connect_ws(port2, cfg2.clone()).await;
-    wss_rpc(
-        &mut sub2,
-        21,
-        "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
-    )
-    .await;
-
-    let mut rpc2 = connect_ws(port2, cfg2).await;
-
-    // Resume child2
-    wss_rpc(
-        &mut rpc2,
-        30,
-        "agent.resolveInterrupted",
-        json!({ "resume": [child2_id.clone()] }),
-    )
-    .await;
-
-    // Wait for child2 to complete
-    let mut child2_idle = false;
-    for _ in 0..100 {
-        let frame = wss_event(&mut sub2, 30).await;
-        if frame["params"]["event"]["type"] == "agent:idle"
-            && frame["params"]["event"]["data"]["agentId"] == child2_id
-        {
-            child2_idle = true;
-            break;
-        }
-    }
-    assert!(child2_idle, "child2 went idle post-restart");
-
-    // Observe the aggregated wake: parent receives stream events
+    // Phase 2 — children finish; the group fires ONE aggregated wake that runs
+    // a real parent turn (stream lifecycle keyed by the parent, trailing idle)
+    // and the group clear pushes the refreshed (false/empty) waiting flags.
+    let mut saw_waiting_false_event = false;
     let mut wake_chunks = 0u32;
     let mut wake_ends = 0u32;
     let mut parent_idle_again = false;
-    for _ in 0..200 {
-        let frame = wss_event(&mut sub2, 60).await;
+    for _ in 0..400 {
+        let frame = wss_event(&mut sub, 90).await;
         let ev = &frame["params"]["event"];
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
         if ev_agent != parent_id {
             continue;
         }
         match ev["type"].as_str() {
+            Some("agent:subscriptions-changed")
+                if ev["data"]["isWaitingForOtherAgents"] == json!(false) =>
+            {
+                saw_waiting_false_event = true;
+            }
             Some("agent:stream:chunk") => wake_chunks += 1,
             Some("agent:stream:end") => wake_ends += 1,
-            Some("agent:idle") => parent_idle_again = true,
+            Some("agent:idle") => {
+                parent_idle_again = true;
+            }
             _ => {}
         }
         if parent_idle_again && wake_ends >= 1 {
             break;
         }
     }
-    assert!(wake_chunks >= 1, "wake turn streamed ≥1 chunk");
-    assert_eq!(wake_ends, 1, "exactly one wake stream:end");
-    assert!(parent_idle_again, "parent idled after wake");
+    assert!(
+        saw_waiting_false_event,
+        "group clear pushed agent:subscriptions-changed with isWaitingForOtherAgents=false"
+    );
+    assert!(
+        wake_chunks >= 1,
+        "wake turn streamed ≥1 chunk for the parent"
+    );
+    assert_eq!(
+        wake_ends, 1,
+        "exactly one wake-turn stream:end for the parent"
+    );
+    assert!(parent_idle_again, "parent idled again after the wake turn");
 
-    // Verify parent transcript has ONE wake with both reports
+    // After delivery the waiting flags are cleared on the projection too.
+    let lite = wss_rpc(&mut rpc, 13, "agent.get", json!({ "agentId": parent_id })).await;
+    let lite = &lite["agent"];
+    assert_eq!(lite["isWaitingForOtherAgents"], false, "cleared: {lite}");
+    assert_eq!(lite["waitingForAgentIds"], json!([]), "cleared: {lite}");
+
+    // The parent transcript carries EXACTLY ONE [WORKSPACE EVENTS] wake with
+    // both reports aggregated — and the reports appear NOWHERE else (the
+    // individual reportToParent sends were suppressed).
     let conv = wss_rpc(
-        &mut rpc2,
-        40,
+        &mut rpc,
+        14,
         "agent.getConversation",
         json!({ "agentId": parent_id }),
     )
     .await;
     let messages = conv["messages"].as_array().expect("messages array");
-
-    // Debug: Count and show wake messages
     let texts: Vec<String> = messages
         .iter()
         .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
@@ -624,20 +572,62 @@ async fn delegation_group_persists_across_restart() {
         .iter()
         .filter(|t| t.contains("[WORKSPACE EVENTS]"))
         .collect();
-
-    assert_eq!(wakes.len(), 1, "exactly one wake message");
+    assert_eq!(wakes.len(), 1, "exactly one wake message: {conv}");
     let wake = wakes[0];
     assert!(
         wake.contains("All 2 delegated child agent(s) settled"),
-        "wake header"
+        "aggregated wake header: {wake}"
     );
-    assert!(wake.contains(CHILD1_REPORT), "wake has child1 report");
-    assert!(wake.contains(CHILD2_REPORT), "wake has child2 report");
 
-    // Verify delegation_group row deleted after delivery
-    let final_groups = store
-        .list_undelivered_groups(&intent_core::WorkspaceId(ws_id.to_string()))
-        .await
-        .expect("list groups after delivery");
-    assert_eq!(final_groups.len(), 0, "group deleted after delivery");
+    // The wake user-message row carries FE `event_notification` metadata so
+    // `EventWakeupBanner` reads a real `eventCount` / `eventTypes` / `events`
+    // payload instead of the fallback "Subscription update — 0 events".
+    let wake_msg = messages
+        .iter()
+        .find(|m| {
+            serde_json::to_string(&m["contentBlocks"])
+                .unwrap_or_default()
+                .contains("[WORKSPACE EVENTS]")
+        })
+        .expect("wake message present");
+    let metadata = &wake_msg["metadata"];
+    assert_eq!(
+        metadata["type"], "event_notification",
+        "wake metadata type: {wake_msg}"
+    );
+    assert_eq!(
+        metadata["eventCount"], 2,
+        "wake metadata eventCount: {wake_msg}"
+    );
+    let event_types = metadata["eventTypes"].as_array().expect("eventTypes array");
+    assert!(
+        event_types.iter().any(|t| t == "agent:idle"),
+        "eventTypes contains agent:idle: {metadata}"
+    );
+    let events = metadata["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 2, "wake metadata events length: {metadata}");
+    for event in events {
+        assert!(event["id"].is_string(), "event.id string: {event}");
+        assert!(event["type"].is_string(), "event.type string: {event}");
+        assert!(event["timestamp"].is_string(), "event.timestamp: {event}");
+        assert!(event["actor"].is_object(), "event.actor object: {event}");
+    }
+    assert!(
+        wake.contains(REPORT_A),
+        "wake carries the alpha report: {wake}"
+    );
+    assert!(
+        wake.contains(REPORT_B),
+        "wake carries the beta report: {wake}"
+    );
+    assert_eq!(
+        texts.iter().filter(|t| t.contains(REPORT_A)).count(),
+        1,
+        "alpha report appears only inside the wake: {conv}"
+    );
+    assert_eq!(
+        texts.iter().filter(|t| t.contains(REPORT_B)).count(),
+        1,
+        "beta report appears only inside the wake: {conv}"
+    );
 }
