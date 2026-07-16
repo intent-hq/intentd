@@ -1876,6 +1876,7 @@ name = "intent-providers"
 version = "0.1.0"
 dependencies = [
  "intent-core",
+ "tracing",
 ]
 
 [[package]]

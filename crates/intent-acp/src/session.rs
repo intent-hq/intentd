@@ -63,13 +63,19 @@ fn session_setup_timeout() -> Duration {
 /// of silence (no `session/update` traffic). Actively-streaming turns reset
 /// the timer on every update and never time out. Overridable via
 /// `INTENTD_PROMPT_IDLE_TIMEOUT_MS`.
+///
+/// The 30-minute default aligns with the FE contract: cloudlands-fe's
+/// `SESSION_TIMEOUT`, `abandonedStreamTimeout`, and `inactiveThreshold` are
+/// all 30 minutes, so the daemon must not cut idle turns earlier than the FE
+/// stops waiting (STAB-49; the previous 15-minute default killed healthy
+/// long-running implementor turns).
 fn prompt_idle_timeout() -> Duration {
     if let Ok(val) = std::env::var("INTENTD_PROMPT_IDLE_TIMEOUT_MS") {
         if let Ok(ms) = val.parse::<u64>() {
             return Duration::from_millis(ms);
         }
     }
-    Duration::from_secs(15 * 60)
+    Duration::from_secs(30 * 60)
 }
 
 /// Shared last-activity timestamp for idle-timeout tracking. The caller updates
@@ -483,5 +489,53 @@ fn tool_status_word(status: ToolCallStatus) -> &'static str {
         ToolCallStatus::Completed => "completed",
         ToolCallStatus::Failed => "error",
         _ => "started",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Restores an env var to its prior state on drop so tests stay hermetic.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                prev: std::env::var(key).ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Default idle window is 30 minutes, matching the FE contract
+    /// (`SESSION_TIMEOUT` / `abandonedStreamTimeout` / `inactiveThreshold` are
+    /// all 30 min), and the `INTENTD_PROMPT_IDLE_TIMEOUT_MS` override still
+    /// applies (STAB-49). Default and override are checked in one test because
+    /// the env var is process-global and tests run in parallel.
+    #[test]
+    fn prompt_idle_timeout_default_and_env_override() {
+        let _guard = EnvGuard::new("INTENTD_PROMPT_IDLE_TIMEOUT_MS");
+
+        std::env::remove_var("INTENTD_PROMPT_IDLE_TIMEOUT_MS");
+        assert_eq!(prompt_idle_timeout(), Duration::from_secs(30 * 60));
+
+        std::env::set_var("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "5000");
+        assert_eq!(prompt_idle_timeout(), Duration::from_millis(5000));
+
+        std::env::remove_var("INTENTD_PROMPT_IDLE_TIMEOUT_MS");
+        assert_eq!(prompt_idle_timeout(), Duration::from_secs(30 * 60));
     }
 }

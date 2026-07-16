@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::config::ProviderConfig;
+use crate::config::{ProviderConfig, ProviderRuntime};
 use intent_core::path_utils;
 
 /// Sentinel model id meaning "let the provider pick" — never passed as a real
@@ -152,14 +152,45 @@ pub fn apply_codex_config_args(
     args
 }
 
+/// Default V8 old-space cap (MB) injected for Node/Electron provider
+/// subprocesses.
+///
+/// V8's default old-space cap (~1.7 GB) is too small for long-lived
+/// coordinator sessions, which V8-OOM (SIGABRT, `FatalProcessOutOfMemory`)
+/// mid-turn with no error surfaced (STAB-50). 8 GB gives ample headroom.
+const DEFAULT_MAX_OLD_SPACE_MB: u32 = 8192;
+
+/// Env seam overriding [`DEFAULT_MAX_OLD_SPACE_MB`].
+const MAX_OLD_SPACE_ENV: &str = "INTENTD_ACP_NODE_MAX_OLD_SPACE_MB";
+
 /// Build provider-specific environment variables. Port of `buildProviderEnv`.
 ///
+/// - Any provider on a V8 runtime ([`ProviderRuntime::Node`] or
+///   [`ProviderRuntime::Electron`]): `NODE_OPTIONS=--max-old-space-size=<MB>`
+///   to raise the V8 heap cap (STAB-50); appends to an inherited
+///   `NODE_OPTIONS` and skips entirely when the caller already set
+///   `--max-old-space-size`. [`ProviderRuntime::Native`] binaries are left
+///   untouched.
 /// - `cortex`: `ELECTRON_RUN_AS_NODE=1` (run the Electron binary as Node).
 /// - `opencode`: `OPENCODE_CONFIG_CONTENT={"model":"<model>"}` when a model is
 ///   set, because the `opencode acp` subcommand has no `--model` flag.
-pub fn build_provider_env(provider_id: &str, model: Option<&str>) -> BTreeMap<String, String> {
+pub fn build_provider_env(
+    config: &ProviderConfig,
+    model: Option<&str>,
+) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
-    match provider_id {
+    if matches!(
+        config.runtime,
+        ProviderRuntime::Node | ProviderRuntime::Electron
+    ) {
+        let parent = std::env::var("NODE_OPTIONS").ok();
+        if let Some(node_options) =
+            node_options_with_heap_cap(parent.as_deref(), max_old_space_mb())
+        {
+            env.insert("NODE_OPTIONS".to_string(), node_options);
+        }
+    }
+    match config.id {
         "cortex" => {
             env.insert("ELECTRON_RUN_AS_NODE".to_string(), "1".to_string());
         }
@@ -176,8 +207,50 @@ pub fn build_provider_env(provider_id: &str, model: Option<&str>) -> BTreeMap<St
     env
 }
 
+/// Resolve the V8 old-space cap in MB: `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB`
+/// when set and parseable as `u32`, else [`DEFAULT_MAX_OLD_SPACE_MB`]
+/// (with a WARN on unparseable or non-unicode overrides so a misconfigured
+/// value is visible).
+pub(crate) fn max_old_space_mb() -> u32 {
+    match std::env::var(MAX_OLD_SPACE_ENV) {
+        Ok(raw) => raw.trim().parse::<u32>().unwrap_or_else(|_| {
+            tracing::warn!(
+                value = %raw,
+                default = DEFAULT_MAX_OLD_SPACE_MB,
+                "invalid {MAX_OLD_SPACE_ENV}; falling back to default"
+            );
+            DEFAULT_MAX_OLD_SPACE_MB
+        }),
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            tracing::warn!(
+                value = ?raw,
+                default = DEFAULT_MAX_OLD_SPACE_MB,
+                "non-unicode {MAX_OLD_SPACE_ENV}; falling back to default"
+            );
+            DEFAULT_MAX_OLD_SPACE_MB
+        }
+        Err(std::env::VarError::NotPresent) => DEFAULT_MAX_OLD_SPACE_MB,
+    }
+}
+
+/// Compose the `NODE_OPTIONS` value carrying `--max-old-space-size=<mb>`.
+///
+/// - No (or blank) inherited `NODE_OPTIONS` → just the flag.
+/// - Inherited value without the flag → append (never clobber user options).
+/// - Inherited value that already sets `--max-old-space-size` → `None`
+///   (respect the user's cap; the child inherits the parent env untouched).
+pub(crate) fn node_options_with_heap_cap(parent: Option<&str>, mb: u32) -> Option<String> {
+    let flag = format!("--max-old-space-size={mb}");
+    match parent.map(str::trim) {
+        None | Some("") => Some(flag),
+        Some(existing) if existing.contains("--max-old-space-size") => None,
+        Some(existing) => Some(format!("{existing} {flag}")),
+    }
+}
+
 /// Minimal JSON string escaping for the small `OPENCODE_CONFIG_CONTENT` value
-/// (avoids pulling a serializer in to keep deps to `intent-core` only).
+/// (avoids pulling a serializer in to keep deps minimal — `intent-core` plus
+/// `tracing` for the heap-cap parse-failure WARN).
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {

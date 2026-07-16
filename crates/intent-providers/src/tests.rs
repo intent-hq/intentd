@@ -260,22 +260,159 @@ fn arg_assembly_remove_tool_after_mcp_config() {
 }
 
 #[test]
-fn env_assembly_quirks() {
-    assert!(build_provider_env("auggie", Some("sonnet4.5")).is_empty());
+fn provider_runtimes() {
+    let runtime = |id: &str| find_provider(id).unwrap().runtime;
+    assert_eq!(runtime("auggie"), ProviderRuntime::Node);
+    assert_eq!(runtime("claude-code"), ProviderRuntime::Node);
+    assert_eq!(runtime("opencode"), ProviderRuntime::Node);
+    assert_eq!(runtime("mock"), ProviderRuntime::Node);
+    assert_eq!(runtime("cortex"), ProviderRuntime::Electron);
+    assert_eq!(runtime("codex"), ProviderRuntime::Native);
+    assert_eq!(runtime("droid"), ProviderRuntime::Native);
+}
 
-    let cortex = build_provider_env("cortex", None);
+#[test]
+fn env_assembly_quirks() {
+    let cortex = build_provider_env(find_provider("cortex").unwrap(), None);
     assert_eq!(
         cortex.get("ELECTRON_RUN_AS_NODE").map(String::as_str),
         Some("1")
     );
 
-    let oc = build_provider_env("opencode", Some("claude-sonnet-4"));
+    let opencode = find_provider("opencode").unwrap();
+    let oc = build_provider_env(opencode, Some("claude-sonnet-4"));
     assert_eq!(
         oc.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
         Some(r#"{"model":"claude-sonnet-4"}"#)
     );
-    // No model → no opencode env.
-    assert!(build_provider_env("opencode", None).is_empty());
+    // No model → no OPENCODE_CONFIG_CONTENT.
+    assert!(!build_provider_env(opencode, None).contains_key("OPENCODE_CONFIG_CONTENT"));
+}
+
+/// Serializes env-var mutation across tests in this binary: the vars are
+/// process-global, so concurrent mutation would race with parallel tests.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Restores an env var to its prior state on drop so tests stay hermetic.
+/// Snapshots via `var_os` so a pre-existing non-UTF8 value is restored
+/// exactly rather than being dropped.
+struct EnvGuard {
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn new(key: &'static str) -> Self {
+        Self {
+            key,
+            prev: std::env::var_os(key),
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+/// STAB-50: NODE_OPTIONS heap-cap injection for V8-runtime (Node/Electron)
+/// providers. All scenarios run inside one test fn because they mutate
+/// process-global env vars — parallel test threads must not race on
+/// `NODE_OPTIONS` / the override seam.
+#[test]
+fn v8_runtime_node_options_heap_cap() {
+    let _env_lock = ENV_LOCK.lock().unwrap();
+    let _node_options_guard = EnvGuard::new("NODE_OPTIONS");
+    let _max_old_space_guard = EnvGuard::new("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB");
+
+    // Pure composition helper: append vs skip vs fresh.
+    assert_eq!(
+        args::node_options_with_heap_cap(None, 8192).as_deref(),
+        Some("--max-old-space-size=8192")
+    );
+    assert_eq!(
+        args::node_options_with_heap_cap(Some(""), 8192).as_deref(),
+        Some("--max-old-space-size=8192")
+    );
+    // Inherited NODE_OPTIONS is appended to, not clobbered.
+    assert_eq!(
+        args::node_options_with_heap_cap(Some("--enable-source-maps"), 8192).as_deref(),
+        Some("--enable-source-maps --max-old-space-size=8192")
+    );
+    // A user-set --max-old-space-size wins: no injection at all.
+    assert_eq!(
+        args::node_options_with_heap_cap(Some("--max-old-space-size=2048"), 8192),
+        None
+    );
+    assert_eq!(
+        args::node_options_with_heap_cap(
+            Some("--enable-source-maps --max-old-space-size=2048"),
+            8192
+        ),
+        None
+    );
+
+    let env_for = |id: &str| build_provider_env(find_provider(id).unwrap(), None);
+
+    // Env-driven scenarios (serialized within this single test).
+    std::env::remove_var("NODE_OPTIONS");
+    std::env::remove_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB");
+
+    // Default cap is 8192 for every Node/Electron provider.
+    assert_eq!(args::max_old_space_mb(), 8192);
+    for id in ["auggie", "claude-code", "opencode", "cortex", "mock"] {
+        assert_eq!(
+            env_for(id).get("NODE_OPTIONS").map(String::as_str),
+            Some("--max-old-space-size=8192"),
+            "provider {id} should get the heap cap"
+        );
+    }
+    // Native runtimes get no NODE_OPTIONS.
+    for id in ["codex", "droid"] {
+        assert!(
+            !env_for(id).contains_key("NODE_OPTIONS"),
+            "native provider {id} must not get NODE_OPTIONS"
+        );
+    }
+
+    // Override seam produces the requested cap for all V8 providers.
+    std::env::set_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB", "4096");
+    assert_eq!(args::max_old_space_mb(), 4096);
+    for id in ["auggie", "claude-code", "opencode", "cortex", "mock"] {
+        assert_eq!(
+            env_for(id).get("NODE_OPTIONS").map(String::as_str),
+            Some("--max-old-space-size=4096"),
+            "provider {id} should honor the env override"
+        );
+    }
+
+    // Unparseable override falls back to the default (WARN logged).
+    std::env::set_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB", "not-a-number");
+    assert_eq!(args::max_old_space_mb(), 8192);
+    std::env::remove_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB");
+
+    // Parent NODE_OPTIONS is appended to, not clobbered.
+    std::env::set_var("NODE_OPTIONS", "--enable-source-maps");
+    for id in ["auggie", "claude-code", "opencode", "cortex", "mock"] {
+        assert_eq!(
+            env_for(id).get("NODE_OPTIONS").map(String::as_str),
+            Some("--enable-source-maps --max-old-space-size=8192"),
+            "provider {id} should append to inherited NODE_OPTIONS"
+        );
+    }
+
+    // Parent already caps old-space → left alone (no double flag).
+    std::env::set_var("NODE_OPTIONS", "--max-old-space-size=2048");
+    for id in ["auggie", "claude-code", "opencode", "cortex", "mock"] {
+        assert!(
+            !env_for(id).contains_key("NODE_OPTIONS"),
+            "provider {id} must respect a user-set --max-old-space-size"
+        );
+    }
 }
 
 #[test]
