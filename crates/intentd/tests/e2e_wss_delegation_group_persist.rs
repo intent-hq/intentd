@@ -337,10 +337,10 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 }
 
 
-/// Increment 4: baseline + child1 + kill daemon1 + boot daemon2 + resolveInterrupted(child2).
-/// THIS is the increment that will show whether the hang is in the resume path or later.
+/// Increment 5: baseline + child1 + kill daemon1 + boot daemon2 + resume child2 + wait for child2 idle.
+/// THIS is where the previous implementors identified the hang (mock ACP died with daemon1).
 #[tokio::test]
-async fn baseline_plus_resume_child2() {
+async fn baseline_plus_wait_child2_idle() {
     let Some(script) = gate("WSS after_all baseline (no restart)") else {
         return;
     };
@@ -600,8 +600,26 @@ async fn baseline_plus_resume_child2() {
     )
     .await;
     eprintln!("agent.resolveInterrupted returned: {resolve_resp}");
-    eprintln!("Test ends here for increment 4 (no wait for child2 completion yet).");
-    return; // Stop here for increment 4
+
+    // Increment 5: wait for child2 to idle
+    eprintln!("Waiting for child2 to idle (this is where the previous hang occurred)...");
+    let mut child2_idle = false;
+    for i in 0..100 {
+        if i % 10 == 0 {
+            eprintln!("  ... still waiting for child2 idle (iteration {i})");
+        }
+        let frame = wss_event(&mut sub2, 30).await;
+        if frame["params"]["event"]["type"] == "agent:idle"
+            && frame["params"]["event"]["data"]["agentId"] == child2_id
+        {
+            child2_idle = true;
+            eprintln!("child2 went idle!");
+            break;
+        }
+    }
+    assert!(child2_idle, "child2 completed post-restart");
+    eprintln!("Test ends here for increment 5 (child2 idle observed).");
+    return; // Stop here for increment 5
 
     // Phase 2 — children finish; the group fires ONE aggregated wake that runs
     // a real parent turn (stream lifecycle keyed by the parent, trailing idle)
