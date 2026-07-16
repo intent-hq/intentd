@@ -1920,7 +1920,11 @@ impl AgentManager {
                 self.services.queue_snapshot(&agent_id),
             )
             .await;
-        persist_user(&self, &agent_id, &workspace_id, &next.content).await;
+        // Skip the transcript append for a terminal-failure requeue — its
+        // user row was already persisted before the failed turn began.
+        if !next.persisted {
+            persist_user(&self, &agent_id, &workspace_id, &next.content).await;
+        }
         // Queue-drained turns carry no per-turn prompt hints of their own,
         // but the FE-supplied attachments captured at enqueue time do ride
         // along so the drained turn receives the same image + file blocks.
@@ -2661,7 +2665,11 @@ async fn run_message_worker(
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
-            persist_user(&mgr, &agent_id, &workspace_id, &next.content).await;
+            // A terminal-failure requeue was already persisted before its
+            // failed turn began — don't duplicate the user row on retry.
+            if !next.persisted {
+                persist_user(&mgr, &agent_id, &workspace_id, &next.content).await;
+            }
             content = next.content;
             options = TurnOptions {
                 image_blocks: next_image_blocks,
@@ -2689,7 +2697,9 @@ async fn run_message_worker(
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
-            persist_user(&mgr, &agent_id, &workspace_id, &next.content).await;
+            if !next.persisted {
+                persist_user(&mgr, &agent_id, &workspace_id, &next.content).await;
+            }
             content = next.content;
             options = TurnOptions {
                 image_blocks: next_image_blocks,
@@ -2964,7 +2974,10 @@ async fn persist_error_and_requeue(
         crate::publish_event(&mgr.services.event_bus, event).await;
     }
 
-    // Requeue the failed message to the front of the queue
+    // Requeue the failed message to the front of the queue. `persisted` is
+    // set: the user row already reached the transcript before the failed
+    // turn began (send_message / drain persist before spawn_worker), so the
+    // retry drain must not append a duplicate.
     let queued = crate::agent_ops::QueuedMessage {
         id: new_message_id(),
         content: content.to_string(),
@@ -2972,6 +2985,7 @@ async fn persist_error_and_requeue(
         file_blocks: options.file_blocks.clone(),
         queued_at: now_iso(),
         editing: false,
+        persisted: true,
     };
     mgr.services.requeue_front(agent_id, queued);
 

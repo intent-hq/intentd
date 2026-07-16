@@ -554,4 +554,26 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
         final_session["session"]["status"], "error",
         "session status recovered after agent.retry"
     );
+
+    // The retry redrive must NOT duplicate the user message: the original
+    // send persisted it before the failed turn, and the requeued entry is
+    // flagged `persisted` so the drain skips a second transcript append.
+    let convo = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let user_rows: Vec<&Value> = convo["messages"]
+        .as_array()
+        .expect("conversation messages array")
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .collect();
+    assert_eq!(
+        user_rows.len(),
+        1,
+        "exactly one user row after retry (no duplicate): {convo}"
+    );
 }
