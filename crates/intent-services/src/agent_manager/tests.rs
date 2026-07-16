@@ -2795,10 +2795,14 @@ async fn build_turn_body_clears_flag_when_only_current_message_exists() {
 
 /// A bare session with no `provider`/`model` resolves to the default ACP
 /// provider (auggie), no model, and the temp dir as cwd (no workspace path).
-#[test]
-fn resolve_spawn_defaults_to_default_provider_and_temp_cwd() {
+#[tokio::test]
+async fn resolve_spawn_defaults_to_default_provider_and_temp_cwd() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("store opens");
     let session = session_with_specialist(None);
-    let resolved = resolve_spawn(&session, None).expect("default resolves");
+    let resolved = resolve_spawn(&session, None, &store)
+        .await
+        .expect("default resolves");
     assert_eq!(
         resolved.provider.id,
         intent_providers::default_provider_id()
@@ -2806,27 +2810,36 @@ fn resolve_spawn_defaults_to_default_provider_and_temp_cwd() {
     assert!(resolved.model.is_none(), "no model selected");
     assert!(resolved.extra_env.is_empty());
     assert_eq!(resolved.cwd, std::env::temp_dir());
+    // provider_binary may or may not be resolved depending on what's installed
 }
 
 /// A compound `provider:model` id selects both the provider and the bare model
 /// id, without needing an explicit `provider` on the session.
-#[test]
-fn resolve_spawn_parses_compound_model_id() {
+#[tokio::test]
+async fn resolve_spawn_parses_compound_model_id() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("store opens");
     let mut session = session_with_specialist(None);
     session.model = Some("claude-code:sonnet".to_string());
-    let resolved = resolve_spawn(&session, None).expect("compound resolves");
+    let resolved = resolve_spawn(&session, None, &store)
+        .await
+        .expect("compound resolves");
     assert_eq!(resolved.provider.id, "claude-code");
     assert_eq!(resolved.model.as_deref(), Some("sonnet"));
 }
 
 /// An explicit `session.provider` wins over the prefix encoded in the model id
 /// (the session row is authoritative).
-#[test]
-fn resolve_spawn_session_provider_overrides_model_prefix() {
+#[tokio::test]
+async fn resolve_spawn_session_provider_overrides_model_prefix() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("store opens");
     let mut session = session_with_specialist(None);
     session.provider = Some("codex".to_string());
     session.model = Some("claude-code:sonnet".to_string());
-    let resolved = resolve_spawn(&session, None).expect("explicit provider wins");
+    let resolved = resolve_spawn(&session, None, &store)
+        .await
+        .expect("explicit provider wins");
     assert_eq!(resolved.provider.id, "codex");
     // The model string is still split off the compound id (the bare half).
     assert_eq!(resolved.model.as_deref(), Some("sonnet"));
@@ -2834,8 +2847,10 @@ fn resolve_spawn_session_provider_overrides_model_prefix() {
 
 /// A workspace whose `path` exists on disk becomes the spawn cwd; a missing
 /// path silently falls back to the temp dir.
-#[test]
-fn resolve_spawn_prefers_existing_workspace_path() {
+#[tokio::test]
+async fn resolve_spawn_prefers_existing_workspace_path() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("store opens");
     let session = session_with_specialist(None);
     let ws_dir = std::env::temp_dir().join(format!("intentd-rs-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&ws_dir).unwrap();
@@ -2876,8 +2891,9 @@ fn resolve_spawn_prefers_existing_workspace_path() {
         token_usage: None,
         cow_supported: None,
     };
-    let resolved =
-        resolve_spawn(&session, Some(&workspace)).expect("existing workspace path resolves");
+    let resolved = resolve_spawn(&session, Some(&workspace), &store)
+        .await
+        .expect("existing workspace path resolves");
     assert_eq!(resolved.cwd, ws_dir);
 
     // Switch to a non-existent path → fall back to temp.
@@ -2887,7 +2903,9 @@ fn resolve_spawn_prefers_existing_workspace_path() {
             .display()
             .to_string(),
     );
-    let resolved = resolve_spawn(&session, Some(&workspace)).expect("falls back to temp");
+    let resolved = resolve_spawn(&session, Some(&workspace), &store)
+        .await
+        .expect("falls back to temp");
     assert_eq!(resolved.cwd, std::env::temp_dir());
 
     let _ = std::fs::remove_dir_all(&ws_dir);

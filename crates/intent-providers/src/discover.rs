@@ -110,3 +110,276 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
         })
         .collect()
 }
+
+/// Resolve a provider binary to an absolute path using the precedence order:
+/// 1. Explicit path from `providers.paths` map (keyed by provider ID)
+/// 2. Managed `~/.augment/bin/<command>`
+/// 3. Scan enhanced PATH directories
+///
+/// Returns `None` when the binary cannot be resolved. Reuses the discovery
+/// logic from `intent_context::discovery` but generalized for all providers.
+/// The `provider_id` is used for logging when an explicit path is invalid.
+pub fn find_provider_binary(
+    provider_id: &str,
+    command: &str,
+    explicit_path: Option<&str>,
+) -> Option<PathBuf> {
+    // 1. Explicit setting wins (must be executable and absolute)
+    if let Some(path) = explicit_path {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            let pb = PathBuf::from(trimmed);
+            if pb.is_absolute() && is_executable_file(&pb) {
+                return Some(pb);
+            }
+            // Warn when explicit setting points to missing/non-executable/relative file
+            tracing::warn!(
+                provider_id = provider_id,
+                configured_path = trimmed,
+                "providers.paths[\"{}\"] must be absolute and executable; falling back to managed bin / PATH scan",
+                provider_id
+            );
+        }
+    }
+
+    // 2. Managed binary in ~/.augment/bin
+    if let Some(managed) = managed_binary_path(command) {
+        if is_executable_file(&managed) {
+            return Some(managed);
+        }
+    }
+
+    // 3. Scan enhanced PATH directories
+    find_in_enhanced_dirs(command)
+}
+
+/// The Intent-managed binary path (`~/.augment/bin/<command>[.exe]`).
+fn managed_binary_path(command: &str) -> Option<PathBuf> {
+    let home = home_dir()?;
+    let name = if cfg!(windows) {
+        format!("{command}.exe")
+    } else {
+        command.to_string()
+    };
+    Some(home.join(".augment").join("bin").join(name))
+}
+
+/// Resolve the user's home directory from environment, cross-platform.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// True when `p` is a file that is executable (unix checks the exec bit; on
+/// other platforms existence as a file is sufficient).
+fn is_executable_file(p: &std::path::Path) -> bool {
+    if !p.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Find the first executable for `command` by scanning enhanced PATH directories.
+/// Enhanced PATH includes inherited PATH plus common node/npm/nvm locations
+/// (same discovery dirs as `intent_context::discovery::enhanced_path_dirs`).
+fn find_in_enhanced_dirs(command: &str) -> Option<PathBuf> {
+    let dirs = enhanced_path_dirs();
+    let candidates = name_candidates(command);
+    for dir in &dirs {
+        for candidate in &candidates {
+            let full = dir.join(candidate);
+            if is_executable_file(&full) {
+                return Some(full);
+            }
+        }
+    }
+    None
+}
+
+/// Build the ordered, de-duplicated list of directories to search (port of
+/// `getEnhancedPath` from `intent_context::discovery`).
+fn enhanced_path_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+    let push =
+        |d: PathBuf, dirs: &mut Vec<PathBuf>, seen: &mut std::collections::HashSet<PathBuf>| {
+            if !d.as_os_str().is_empty() && seen.insert(d.clone()) {
+                dirs.push(d);
+            }
+        };
+
+    // Inherited PATH first
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            push(dir, &mut dirs, &mut seen);
+        }
+    }
+
+    let home = home_dir();
+
+    if cfg!(windows) {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            push(PathBuf::from(&appdata).join("npm"), &mut dirs, &mut seen);
+        }
+        if let Some(h) = &home {
+            push(h.join(".npm-global"), &mut dirs, &mut seen);
+        }
+    } else {
+        for p in [
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/opt/node/bin",
+        ] {
+            push(PathBuf::from(p), &mut dirs, &mut seen);
+        }
+        if let Some(h) = &home {
+            for sub in [
+                [".npm-global", "bin"],
+                [".npm-packages", "bin"],
+                [".local", "bin"],
+                [".volta", "bin"],
+            ] {
+                push(h.join(sub[0]).join(sub[1]), &mut dirs, &mut seen);
+            }
+            push(h.join(".asdf").join("shims"), &mut dirs, &mut seen);
+        }
+    }
+
+    if let Some(h) = &home {
+        let nvm_dir = h.join(".nvm").join("versions").join("node");
+        if let Ok(entries) = std::fs::read_dir(&nvm_dir) {
+            for entry in entries.flatten() {
+                push(entry.path().join("bin"), &mut dirs, &mut seen);
+            }
+        }
+    }
+
+    dirs
+}
+
+#[cfg(test)]
+mod find_provider_binary_tests {
+    use super::*;
+    use std::fs;
+
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("intent-providers-{tag}-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(path: &std::path::Path) {
+        fs::write(path, "exit 0").unwrap();
+    }
+
+    #[test]
+    fn find_provider_binary_returns_none_when_absent() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let unique_cmd = format!("intent-test-absent-{}", nanos);
+        let result = find_provider_binary("nonexistent", &unique_cmd, None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn find_provider_binary_prefers_explicit_setting() {
+        let dir = unique_temp_dir("explicit");
+        let bin = dir.join("my-provider");
+        make_executable(&bin);
+        let result = find_provider_binary("test", "my-provider", Some(bin.to_str().unwrap()));
+        assert_eq!(result, Some(bin));
+    }
+
+    #[test]
+    fn find_provider_binary_ignores_empty_explicit_setting() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let unique_cmd = format!("intent-test-cmd-{}", nanos);
+        let result = find_provider_binary("test", &unique_cmd, Some(""));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn find_provider_binary_ignores_whitespace_only_explicit_setting() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let unique_cmd = format!("intent-test-cmd-{}", nanos);
+        let result = find_provider_binary("test", &unique_cmd, Some("   "));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn find_provider_binary_falls_through_when_explicit_path_missing() {
+        // When providers.paths.<id> points to a missing file, resolution should
+        // fall through to managed bin / PATH scan (and warn)
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let unique_cmd = format!("intent-test-cmd-{}", nanos);
+        let result = find_provider_binary("test", &unique_cmd, Some("/nonexistent/path/binary"));
+        // Should fall through and return None since we don't have managed bin or PATH match
+        assert_eq!(result, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_provider_binary_returns_none_when_no_candidates_found() {
+        // Verify function returns None when binary is not in any of the search locations
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let unique_cmd = format!("intent-test-nocand-{}", nanos);
+        let result = find_provider_binary("test", &unique_cmd, None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn managed_binary_path_returns_expected_location() {
+        if let Some(home) = home_dir() {
+            let result = managed_binary_path("auggie");
+            let expected = if cfg!(windows) {
+                home.join(".augment").join("bin").join("auggie.exe")
+            } else {
+                home.join(".augment").join("bin").join("auggie")
+            };
+            assert_eq!(result, Some(expected));
+        }
+    }
+}

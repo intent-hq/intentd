@@ -25,7 +25,9 @@ pub use config::{
     default_provider_id, disableable_providers, find_provider, is_provider_authentication_error,
     provider_config, ProviderConfig, ProviderRuntime, ACP_PROVIDERS,
 };
-pub use discover::{discover_providers, resolve_on_path, ProviderAvailability};
+pub use discover::{
+    discover_providers, find_provider_binary, resolve_on_path, ProviderAvailability,
+};
 pub use models::{
     create_compound_model_id, default_model_for_provider, fuzzy_match_model_in_pool,
     is_model_valid_for_provider, model_tier_from_model, normalize_model_override,
