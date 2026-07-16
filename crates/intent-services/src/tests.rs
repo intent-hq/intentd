@@ -12053,3 +12053,144 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
     let ws2 = svc.get_workspace(ws.clone()).await.expect("get ws2");
     assert_eq!(ws2.token_usage.as_ref().unwrap().totals.input_tokens, 25);
 }
+
+/// `scan_all_token_usage` sweeps all non-archived workspaces and tallies each
+/// one's token usage, logging errors per workspace and continuing the sweep.
+#[tokio::test]
+async fn scan_all_token_usage_sweeps_multiple_workspaces() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws1 = WorkspaceId::new();
+    let ws2 = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws1)).await.expect("ws1");
+    store.insert_workspace(&workspace(&ws2)).await.expect("ws2");
+
+    let svc = Services::new(store);
+    let ts = now_iso();
+
+    let sess = intent_core::AgentSession {
+        id: intent_core::AgentId::from("agent-a"),
+        workspace_id: ws1.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Agent A".to_string(),
+        name_explicitly_set: false,
+        model: Some("opus".to_string()),
+        provider: Some("anthropic".to_string()),
+        system_prompt: None,
+        specialist: None,
+        status: intent_core::AgentStatus::Active,
+        is_active: true,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        delegation_depth: None,
+        created_at: ts.clone(),
+        updated_at: ts.clone(),
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        is_background: false,
+        metadata: None,
+    };
+    svc.store.insert_agent_session(&sess).await.expect("sess");
+    svc.store
+        .append_agent_message(
+            &intent_core::AgentId::from("agent-a"),
+            "assistant",
+            &serde_json::json!({"usage": {"inputTokens": 100}}),
+            &ts,
+        )
+        .await
+        .expect("msg");
+
+    svc.scan_all_token_usage().await;
+
+    let w1 = svc.get_workspace(ws1).await.expect("get ws1");
+    assert!(w1.token_usage.is_some());
+    assert_eq!(w1.token_usage.as_ref().unwrap().totals.input_tokens, 100);
+
+    let w2 = svc.get_workspace(ws2).await.expect("get ws2");
+    if let Some(usage) = &w2.token_usage {
+        assert_eq!(usage.totals.input_tokens, 0, "ws2 has no sessions");
+    }
+}
+
+/// `parse_undo_metadata` extracts undo commit metadata from JSON, skipping
+/// malformed entries and returning an empty vec when the input is absent/non-array.
+#[test]
+fn parse_undo_metadata_extracts_agent_and_file_attribution() {
+    use crate::parse_undo_metadata;
+
+    let valid = serde_json::json!([
+        {
+            "agentId": "agent-1",
+            "linkedNoteId": "task-a",
+            "files": ["src/foo.rs", "src/bar.rs"]
+        },
+        {
+            "agentId": "agent-2",
+            "files": ["test.rs"]
+        },
+        {
+            "linkedNoteId": "task-b"
+        }
+    ]);
+    let result = parse_undo_metadata(Some(&valid));
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0].agent_id.as_deref(), Some("agent-1"));
+    assert_eq!(result[0].linked_note_id.as_deref(), Some("task-a"));
+    assert_eq!(result[0].files, vec!["src/foo.rs", "src/bar.rs"]);
+    assert_eq!(result[1].agent_id.as_deref(), Some("agent-2"));
+    assert_eq!(result[1].files, vec!["test.rs"]);
+    assert!(result[2].agent_id.is_none());
+    assert_eq!(result[2].linked_note_id.as_deref(), Some("task-b"));
+
+    assert!(parse_undo_metadata(None).is_empty());
+    assert!(parse_undo_metadata(Some(&serde_json::json!({}))).is_empty());
+
+    let mixed = serde_json::json!([
+        {"agentId": "valid"},
+        "not an object",
+        null,
+        {"files": [123, "valid.rs", null]}
+    ]);
+    let mixed_result = parse_undo_metadata(Some(&mixed));
+    assert_eq!(mixed_result.len(), 2);
+    assert_eq!(mixed_result[0].agent_id.as_deref(), Some("valid"));
+    assert_eq!(mixed_result[1].files, vec!["valid.rs"]);
+}
+
+/// `git_push_event` builds a git:push event with the correct schema and force flag.
+#[test]
+fn git_push_event_builds_correct_event_payload() {
+    use crate::git_push_event;
+    use intent_core::WorkspaceId;
+
+    let ws = WorkspaceId::from("ws-123");
+    let event = git_push_event(&ws, "main", "abc123", false);
+
+    assert_eq!(event.workspace_id.0, "ws-123");
+    assert_eq!(event.event_type, "git:push");
+    assert_eq!(event.actor.actor_type, intent_core::ActorType::System);
+
+    let data = event.data;
+    assert_eq!(data["workspaceId"], "ws-123");
+    assert_eq!(data["operation"], "push");
+    assert_eq!(data["branch"], "main");
+    assert_eq!(data["commit"], "abc123");
+    assert_eq!(data["force"], false);
+
+    let forced = git_push_event(&ws, "feat/test", "def456", true);
+    assert_eq!(forced.data["force"], true);
+    assert_eq!(forced.data["branch"], "feat/test");
+    assert_eq!(forced.data["commit"], "def456");
+}
