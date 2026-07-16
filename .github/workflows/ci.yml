@@ -18,16 +18,8 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
-      - name: Free disk space
-        run: |
-          echo "Disk space before cleanup:"
-          df -h
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/.ghcup
-          echo "Disk space after cleanup:"
-          df -h
+      # No disk-space cleanup: with debug info disabled (CARGO_PROFILE_*_DEBUG=0)
+      # this job's target dir stays small; the stock ~16G headroom is plenty.
       - uses: actions/checkout@v4
       - name: Resolve pinned Rust channel
         id: toolchain
@@ -74,6 +66,14 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     runs-on: ${{ matrix.os }}
+    # Keeps the cargo-check steps free of debuginfo/incremental artifacts
+    # (cheaper compile, smaller shared cache). Safe job-wide: the release
+    # build is unaffected — these vars only touch the dev/test profiles, and
+    # release builds are non-incremental by default.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
       - name: Resolve pinned Rust channel
@@ -90,8 +90,21 @@ jobs:
         with:
           shared-key: build-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build
+      # On PRs a cheap `cargo check` proves per-target compilation; the full
+      # `--release` build (the expensive part, esp. on Windows) only runs on
+      # push to main and in the merge queue. The cache key stays shared: only
+      # main saves it (save-if above), and main also runs the check step below
+      # so the cache PRs restore contains warm check artifacts alongside the
+      # release ones.
+      - name: Check (PR compilation proof)
+        if: github.event_name == 'pull_request'
+        run: cargo check --workspace --target ${{ matrix.target }}
+      - name: Build (release)
+        if: github.event_name != 'pull_request'
         run: cargo build --workspace --release --target ${{ matrix.target }}
+      - name: Warm PR check cache
+        if: github.event_name == 'push'
+        run: cargo check --workspace --target ${{ matrix.target }}
 
   coverage-e2e:
     runs-on: ubuntu-latest
@@ -105,16 +118,13 @@ jobs:
       # by .config/nextest.toml).
       NEXTEST_TEST_THREADS: 8
     steps:
-      - name: Free disk space
+      # Non-blocking cleanup: coverage runs accumulate profraw files, so keep
+      # the extra ~19G of headroom, but reclaim it in the background instead of
+      # stalling the job for ~60s (baseline: ~16G free, ~35G after cleanup).
+      - name: Free disk space (background)
         run: |
-          echo "Disk space before cleanup:"
-          df -h
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/.ghcup
-          echo "Disk space after cleanup:"
-          df -h
+          sudo -n true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup >/dev/null 2>&1 &
       - uses: actions/checkout@v4
       - name: Resolve pinned Rust channel
         id: toolchain
@@ -164,16 +174,13 @@ jobs:
       # .config/nextest.toml).
       NEXTEST_TEST_THREADS: 8
     steps:
-      - name: Free disk space
+      # Non-blocking cleanup: coverage runs accumulate profraw files, so keep
+      # the extra ~19G of headroom, but reclaim it in the background instead of
+      # stalling the job for ~60s (baseline: ~16G free, ~35G after cleanup).
+      - name: Free disk space (background)
         run: |
-          echo "Disk space before cleanup:"
-          df -h
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/.ghcup
-          echo "Disk space after cleanup:"
-          df -h
+          sudo -n true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup >/dev/null 2>&1 &
       - uses: actions/checkout@v4
       - name: Resolve pinned Rust channel
         id: toolchain
