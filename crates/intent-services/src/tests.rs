@@ -12119,9 +12119,15 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
     assert_eq!(w1.token_usage.as_ref().unwrap().totals.input_tokens, 100);
 
     let w2 = svc.get_workspace(ws2).await.expect("get ws2");
-    if let Some(usage) = &w2.token_usage {
-        assert_eq!(usage.totals.input_tokens, 0, "ws2 has no sessions");
-    }
+    assert!(
+        w2.token_usage.is_some(),
+        "sweep writes snapshot even for zero sessions"
+    );
+    let usage = w2.token_usage.as_ref().unwrap();
+    assert_eq!(usage.totals.input_tokens, 0);
+    assert_eq!(usage.totals.output_tokens, 0);
+    assert_eq!(usage.totals.cache_read_tokens, 0);
+    assert_eq!(usage.totals.cache_creation_tokens, 0);
 }
 
 /// `parse_undo_metadata` extracts undo commit metadata from JSON, skipping
