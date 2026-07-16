@@ -2180,37 +2180,16 @@ impl AgentManager {
         // Empty queue → nothing will drive a `pending` status forward, so
         // clear the error to `idle` instead (idle is permitted iff no
         // ready-to-send work remains, PROTOCOL §5.5/§6.5 invariant).
-        let redriven = self.services.has_ready_to_send(&agent_id);
-        let (next_status, next_status_str) = if redriven {
-            (AgentStatus::Pending, "pending")
+        let mut redriven = self.services.has_ready_to_send(&agent_id);
+        let next_status = if redriven {
+            AgentStatus::Pending
         } else {
-            (AgentStatus::Idle, "idle")
+            AgentStatus::RuntimeIdle
         };
 
-        // Clear the error status
-        let ts = now_iso();
-        self.services
-            .store
-            .set_agent_session_status(workspace_id, &agent_id, next_status, false, &ts)
+        // Clear the error status and emit agent:status-changed
+        self.persist_retry_status(&agent_id, workspace_id, next_status)
             .await?;
-
-        // Emit agent:status-changed
-        let event = NewEvent {
-            workspace_id: workspace_id.clone(),
-            timestamp: ts,
-            event_type: AGENT_STATUS_CHANGED.to_string(),
-            actor: agent_actor(&agent_id),
-            session_id: Some(agent_id.0.clone()),
-            correlation_id: None,
-            parent_event_id: None,
-            metadata: None,
-            data: json!({
-                "agentId": agent_id.0,
-                "status": next_status_str,
-                "isActive": false,
-            }),
-        };
-        crate::publish_event(&self.services.event_bus, event).await;
 
         // Abort any in-flight worker task and release the in-flight slot
         if let Some(worker) = self.workers.lock().unwrap().remove(&agent_id) {
@@ -2222,6 +2201,17 @@ impl AgentManager {
         // overwriting the status we just set)
         self.kill_child_only(&agent_id).await;
 
+        // Close the check-then-flip race: a message enqueued between the queue
+        // check above and the status flip had its own drain attempt suppressed
+        // by the Error gate in `try_drain_queue` (STAB-52), and this path was
+        // about to skip the drain too — stranding a ready-to-send message.
+        // Re-poll under the post-Error status; anything there is a redrive.
+        if !redriven && self.services.has_ready_to_send(&agent_id) {
+            redriven = true;
+            self.persist_retry_status(&agent_id, workspace_id, AgentStatus::Pending)
+                .await?;
+        }
+
         // Start the drain loop to redrive the requeued message
         if redriven {
             self.clone()
@@ -2230,6 +2220,44 @@ impl AgentManager {
         }
 
         Ok(json!({ "ok": true, "redriven": redriven }))
+    }
+
+    /// Persist an `agent.retry` status transition and publish the matching
+    /// `agent:status-changed` event. Shared by the initial Error-clear flip
+    /// and the post-flip re-check that promotes Idle → Pending when a message
+    /// slipped into the queue during the retry (see [`AgentManager::agent_retry`]).
+    async fn persist_retry_status(
+        self: &Arc<Self>,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        status: AgentStatus,
+    ) -> Result<()> {
+        let status_str = match status {
+            AgentStatus::Pending => "pending",
+            _ => "idle",
+        };
+        let ts = now_iso();
+        self.services
+            .store
+            .set_agent_session_status(workspace_id, agent_id, status, false, &ts)
+            .await?;
+        let event = NewEvent {
+            workspace_id: workspace_id.clone(),
+            timestamp: ts,
+            event_type: AGENT_STATUS_CHANGED.to_string(),
+            actor: agent_actor(agent_id),
+            session_id: Some(agent_id.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({
+                "agentId": agent_id.0,
+                "status": status_str,
+                "isActive": false,
+            }),
+        };
+        crate::publish_event(&self.services.event_bus, event).await;
+        Ok(())
     }
 
     /// Spawn the background turn worker after the caller has already claimed
@@ -3833,7 +3861,7 @@ mod agent_retry_tests {
             .get_agent_session(&agent_id)
             .await
             .expect("session");
-        assert_eq!(session.status, AgentStatus::Idle);
+        assert_eq!(session.status, AgentStatus::RuntimeIdle);
     }
 
     #[tokio::test]
@@ -3858,6 +3886,55 @@ mod agent_retry_tests {
             !mgr.services.has_ready_to_send(&agent_id),
             "queued message dequeued for redrive"
         );
+    }
+
+    /// Regression for the check-then-flip race in `agent_retry`: a message
+    /// enqueued while the session is still `Error` has its own drain kick
+    /// suppressed (STAB-52 gate), so if it lands after retry's initial queue
+    /// check the post-flip re-check must promote Idle → Pending and drain it.
+    /// Sweeps interleavings by varying the number of yields before the
+    /// concurrent enqueue; whatever the timing, the raced message must never
+    /// be stranded ready-to-send on an `Idle` session.
+    #[tokio::test]
+    async fn retry_racing_concurrent_enqueue_never_strands_message() {
+        for yields in 0..8u32 {
+            let id = format!("agent-race-{yields}");
+            let agent_id = AgentId::from(id.as_str());
+            let ws = WorkspaceId::from("ws-race");
+            let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+
+            let retry_fut = mgr.agent_retry(agent_id.clone(), ws.clone());
+            let enqueue_fut = async {
+                for _ in 0..yields {
+                    tokio::task::yield_now().await;
+                }
+                mgr.services
+                    .enqueue_message(&agent_id, "raced".to_string(), None, None);
+                mgr.clone()
+                    .try_drain_queue(agent_id.clone(), ws.clone())
+                    .await;
+            };
+            let (retry_result, ()) = tokio::join!(retry_fut, enqueue_fut);
+            let result = retry_result.expect("retry");
+            assert_eq!(result["ok"], true);
+
+            // Whichever side won the race, the message must have been claimed
+            // by a drain: either retry's post-flip re-check redrove it, or the
+            // enqueue's own drain kick ran after the Error gate lifted. An
+            // `Idle` session with a ready-to-send message means it was
+            // stranded — the exact bug the re-check closes.
+            let session = mgr
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .expect("session");
+            assert!(
+                !(session.status == AgentStatus::RuntimeIdle
+                    && mgr.services.has_ready_to_send(&agent_id)),
+                "raced message stranded on idle session (yields={yields})"
+            );
+        }
     }
 
     #[tokio::test]
