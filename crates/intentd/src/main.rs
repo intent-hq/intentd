@@ -1377,15 +1377,24 @@ fn spawn_idempotency_reap_loop(
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "idempotency reaper sweep failed"),
             }
-            match intent_core::sweep_agent_logs(
-                &agent_log_root,
-                Duration::from_secs(intent_core::AGENT_LOG_RETENTION_DAYS * 86_400),
-            ) {
-                Ok(removed) if removed > 0 => {
+            let sweep_result = tokio::task::spawn_blocking({
+                let root = agent_log_root.clone();
+                move || {
+                    intent_core::sweep_agent_logs(
+                        &root,
+                        Duration::from_secs(intent_core::AGENT_LOG_RETENTION_DAYS * 86_400),
+                    )
+                }
+            })
+            .await;
+
+            match sweep_result {
+                Ok(Ok(removed)) if removed > 0 => {
                     tracing::info!(removed, "agent stderr log sweep pruned old capture files");
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "agent stderr log sweep failed"),
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "agent stderr log sweep failed"),
+                Err(e) => tracing::warn!(error = %e, "agent stderr log sweep task failed"),
             }
         }
     })

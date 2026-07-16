@@ -120,8 +120,7 @@ impl StderrLogSink {
         let (_, file) = self.current.as_mut().expect("sink file just opened");
         file.write_all(line.as_bytes()).await?;
         file.write_all(b"\n").await?;
-        file.flush().await
-    }
+        Ok(())
 }
 
 /// Bounded ring buffer of recent stderr lines (parity: `recentStderrErrors`).
