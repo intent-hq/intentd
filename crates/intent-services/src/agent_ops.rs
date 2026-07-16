@@ -4018,7 +4018,8 @@ impl Services {
                             true,
                             format!("Agent {} abandoned during restart", agent_id.0),
                             deleted_event,
-                        );
+                        )
+                        .await;
                     }
                 }
             }

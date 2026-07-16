@@ -17,7 +17,7 @@
 
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -533,6 +533,36 @@ async fn baseline_plus_aggregated_wake() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     eprintln!("Daemon1 killed.");
 
+    // EVIDENCE GATHERING: Inspect the persisted delegation_group row after daemon1 kill
+    eprintln!("Inspecting persisted delegation_group row...");
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open store for inspection");
+    let groups = store
+        .list_undelivered_groups(&intent_core::WorkspaceId(ws_id.to_string()))
+        .await
+        .expect("list undelivered groups");
+    eprintln!("Found {} undelivered groups", groups.len());
+    for g in &groups {
+        eprintln!("  group_id: {}", g.group_id);
+        eprintln!("  parent_agent_id: {}", g.parent_agent_id.0);
+        eprintln!("  sealed: {}", g.sealed);
+        eprintln!("  delivered: {}", g.delivered);
+        eprintln!("  expected_agent_ids: {:?}", g.expected_agent_ids.iter().map(|id| &id.0).collect::<Vec<_>>());
+        eprintln!("  completed_agent_ids: {:?}", g.completed_agent_ids.iter().map(|id| &id.0).collect::<Vec<_>>());
+        eprintln!("  deleted_agent_ids: {:?}", g.deleted_agent_ids.iter().map(|id| &id.0).collect::<Vec<_>>());
+    }
+    // HYPOTHESIS A: If child1's completion was not persisted, completed_agent_ids will be empty here
+    assert_eq!(groups.len(), 1, "exactly one delegation group persisted");
+    let persisted_group = &groups[0];
+    eprintln!("\n*** HYPOTHESIS A CHECK ***");
+    eprintln!("Expected child1 ({}) in completed_agent_ids: {}",
+              child1_id,
+              persisted_group.completed_agent_ids.iter().any(|id| id.0 == child1_id));
+    eprintln!("Expected child2 ({}) in expected_agent_ids: {}",
+              child2_id,
+              persisted_group.expected_agent_ids.iter().any(|id| id.0 == child2_id));
+
     // Increment 3: boot daemon2 using the SAME data_dir
     eprintln!("Booting daemon2 with same data_dir...");
     let child2_proc = spawn_serve(&data_dir, "both", &env);
@@ -657,8 +687,6 @@ async fn baseline_plus_aggregated_wake() {
     assert_eq!(wake_ends, 1, "exactly one wake stream:end");
     assert!(parent_idle_again, "parent idled after wake");
     eprintln!("Aggregated wake observed successfully!");
-    eprintln!("Test ends here for increment 6.");
-    return; // Stop here for increment 6
 
     // Phase 2 — children finish; the group fires ONE aggregated wake that runs
     // a real parent turn (stream lifecycle keyed by the parent, trailing idle)
@@ -668,7 +696,7 @@ async fn baseline_plus_aggregated_wake() {
     let mut wake_ends = 0u32;
     let mut parent_idle_again = false;
     for _ in 0..400 {
-        let frame = wss_event(&mut sub, 90).await;
+        let frame = wss_event(&mut sub2, 90).await;
         let ev = &frame["params"]["event"];
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
         if ev_agent != parent_id {
@@ -706,7 +734,7 @@ async fn baseline_plus_aggregated_wake() {
     assert!(parent_idle_again, "parent idled again after the wake turn");
 
     // After delivery the waiting flags are cleared on the projection too.
-    let lite = wss_rpc(&mut rpc, 13, "agent.get", json!({ "agentId": parent_id })).await;
+    let lite = wss_rpc(&mut rpc2, 13, "agent.get", json!({ "agentId": parent_id })).await;
     let lite = &lite["agent"];
     assert_eq!(lite["isWaitingForOtherAgents"], false, "cleared: {lite}");
     assert_eq!(lite["waitingForAgentIds"], json!([]), "cleared: {lite}");
@@ -715,7 +743,7 @@ async fn baseline_plus_aggregated_wake() {
     // both reports aggregated — and the reports appear NOWHERE else (the
     // individual reportToParent sends were suppressed).
     let conv = wss_rpc(
-        &mut rpc,
+        &mut rpc2,
         14,
         "agent.getConversation",
         json!({ "agentId": parent_id }),
