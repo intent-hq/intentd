@@ -2179,15 +2179,15 @@ async fn idempotency_reaper_deletes_only_rows_older_than_cutoff() {
 }
 
 /// Smoke test: verify the pool opens successfully with explicit configuration
-/// (max_connections=10, acquire_timeout=10s per STAB-6) and supports basic
+/// (max_connections=20, acquire_timeout=10s per STAB-6) and supports basic
 /// queries and concurrent access.
 ///
 /// This does NOT directly assert acquire timeout behavior (saturating the pool
-/// and confirming PoolTimedOut). That would require holding 10+ connections
+/// and confirming PoolTimedOut). That would require holding 20+ connections
 /// and timing a failure, which risks test flakiness. The configuration itself
-/// (lib.rs:122-123) ensures pool exhaustion fails within 10s instead of silently
-/// queueing for the sqlx default 30s, which would exceed the sidecar health
-/// probe's 3s timeout and risk a false-positive daemon kill (STAB-6).
+/// (lib.rs `connect()`) ensures pool exhaustion fails within 10s instead of
+/// silently queueing for the sqlx default 30s, which would exceed the sidecar
+/// health probe's 3s timeout and risk a false-positive daemon kill (STAB-6).
 #[tokio::test]
 async fn pool_smoke_test_with_explicit_config() {
     let tmp = TempDb::new();
@@ -2200,7 +2200,11 @@ async fn pool_smoke_test_with_explicit_config() {
         .expect("basic query works");
     assert_eq!(row.0, 1);
 
-    // Verify multiple concurrent acquires work (pool has max_connections=10).
+    // Verify the configured pool size (STAB-46: raised from 10 to 20 to absorb
+    // the client-driven startup read burst without slow-acquire warnings).
+    assert_eq!(pool.options().get_max_connections(), 20);
+
+    // Verify multiple concurrent acquires work (pool has max_connections=20).
     let mut handles = Vec::new();
     for _ in 0..5 {
         let p = pool.clone();
