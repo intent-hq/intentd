@@ -534,48 +534,56 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     // The handles are held for the lifetime of `serve` and torn down on return.
     let _watchers = start_workspace_watchers(&bus, api.as_ref()).await;
 
-    // Prepare runtime control for the HTTPS+WSS listener (§5.12). When TCP is
-    // enabled (--listen tcp/both), build the construction args so settings can
-    // toggle the listener on/off. The CLI --listen flag + env (INTENTD_TCP_PORT,
-    // INTENTD_DISCOVERY, --insecure) override persisted settings, logged when they
-    // win. TLS and bearer auth are auto-on for TCP (§5.2/§5.3) unless --insecure.
-    let (_ws_server, _ws_port, ws_runtime) = if serve_tcp_enabled {
-        let mut ws_options = ws_options_from_env();
-        ws_options.locality_override = locality_override;
+    // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
+    // construction args ALWAYS (regardless of --listen mode) so settings can
+    // toggle the listener on/off at runtime. Boot-time auto-start of the listener
+    // remains ONLY for --listen tcp/both (CLI/env win over persisted settings).
+    // With --listen uds: listener does NOT auto-start at boot (regardless of
+    // persisted server.wsApi.enabled), but settings.update server.wsApi.enabled=true
+    // can start it at runtime (TLS + bearer auth on, same as any TCP listener unless
+    // --insecure). Note: persisted settings are NOT honored at boot for any mode —
+    // only CLI --listen and env (INTENTD_TCP_PORT, INTENTD_DISCOVERY) matter.
+    let mut ws_options = ws_options_from_env();
+    ws_options.locality_override = locality_override;
 
-        let (tls_cert, token_store) = if insecure {
-            tracing::warn!(
-                "intentd INSECURE dev mode: TLS disabled, bearer-token auth disabled, plain ws:// on {}:{} — do NOT use outside local dev",
-                ws_options.bind_address,
-                ws_options.base_port
-            );
-            (None, None)
-        } else {
-            let tls = ensure_tls_certificate(&config.data_dir)
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            let async_token_store = Arc::new(AsyncTokenStore::new(resolve_token_store()));
-            get_or_create_token(&async_token_store)
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            (Some(tls), Some(async_token_store))
-        };
+    // TLS + bearer auth: provision the cert (lazy; cert stays on disk) + build
+    // the token store for auth layers (§5.2/§5.3). Always provision for runtime
+    // toggle, even under --listen uds (listener can be started later via settings).
+    let (tls_cert, token_store) = if insecure {
+        tracing::warn!(
+            "intentd INSECURE dev mode: TLS disabled, bearer-token auth disabled, plain ws:// on {}:{} — do NOT use outside local dev",
+            ws_options.bind_address,
+            ws_options.base_port
+        );
+        (None, None)
+    } else {
+        let tls =
+            ensure_tls_certificate(&config.data_dir).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let async_token_store = Arc::new(AsyncTokenStore::new(resolve_token_store()));
+        get_or_create_token(&async_token_store)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        (Some(tls), Some(async_token_store))
+    };
 
-        // Build runtime control struct
-        let runtime = Arc::new(WsRuntimeControl {
-            api: api.clone(),
-            bus: bus.clone(),
-            tls_cert: tls_cert.clone(),
-            token_store: token_store.clone(),
-            ws_options: ws_options.clone(),
-            reverse_registry: reverse_registry.clone(),
-            data_dir: config.data_dir.clone(),
-            state: tokio::sync::Mutex::new(WsRuntimeState {
-                ws_server: None,
-                port: None,
-            }),
-        });
+    // Build runtime control struct (always, regardless of --listen mode)
+    let runtime = Arc::new(WsRuntimeControl {
+        api: api.clone(),
+        bus: bus.clone(),
+        tls_cert: tls_cert.clone(),
+        token_store: token_store.clone(),
+        ws_options: ws_options.clone(),
+        reverse_registry: reverse_registry.clone(),
+        data_dir: config.data_dir.clone(),
+        state: tokio::sync::Mutex::new(WsRuntimeState {
+            ws_server: None,
+            port: None,
+        }),
+    });
 
-        // Start the listener immediately (CLI --listen wins over settings)
+    // Boot-time auto-start of the listener ONLY when --listen tcp/both
+    // (CLI --listen wins over persisted settings)
+    let (_ws_server, _ws_port) = if serve_tcp_enabled {
         let mut server = if insecure {
             WsApiServer::new_insecure_with_reverse(
                 api.clone(),
@@ -600,7 +608,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             let pairing_provider = Arc::new(DaemonPairingInfo {
                 data_dir: config.data_dir.clone(),
                 token_store: token_store.clone().unwrap(),
-                ws_runtime: Some(runtime.clone()),
+                ws_runtime: runtime.clone(),
             });
             server.install_pairing_info(pairing_provider);
         }
@@ -621,9 +629,9 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             state.port = Some(port);
         }
 
-        (Some(server), Some(port), Some(runtime))
+        (Some(server), Some(port))
     } else {
-        (None, None, None)
+        (None, None)
     };
 
     // System control surface (§5.7 + §5.12): exposes `system.status` /
@@ -637,7 +645,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
         tcp: serve_tcp_enabled,
         manager: manager.clone(),
         shutdown: shutdown_notify.clone(),
-        ws_runtime: ws_runtime.clone(),
+        ws_runtime: runtime.clone(),
     });
 
     // Wire ServerControl to Services for settings-driven runtime control (§5.12).
@@ -648,21 +656,18 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     // Build pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
     // Only built when there's a token store (secure mode); `None` in insecure mode.
     // Available to UDS clients even when TCP is disabled (they can still call the RPCs).
-    let pairing_info: Option<Arc<dyn intent_transport::ServerPairingInfo>> = if insecure {
-        None
-    } else {
-        // Share the same AsyncTokenStore instance as the WSS listener (if enabled)
-        // so rotations propagate to the live auth layer.
-        let token_store = match ws_runtime.as_ref() {
-            Some(rt) => rt.token_store.clone().expect("secure mode token_store"),
-            None => Arc::new(AsyncTokenStore::new(resolve_token_store())),
+    let pairing_info: Option<Arc<dyn intent_transport::ServerPairingInfo>> =
+        if let Some(ref ts) = token_store {
+            // Share the same AsyncTokenStore instance as the WSS listener
+            // so rotations propagate to the live auth layer.
+            Some(Arc::new(DaemonPairingInfo {
+                data_dir: config.data_dir.clone(),
+                token_store: ts.clone(),
+                ws_runtime: runtime.clone(),
+            }))
+        } else {
+            None
         };
-        Some(Arc::new(DaemonPairingInfo {
-            data_dir: config.data_dir.clone(),
-            token_store,
-            ws_runtime: ws_runtime.clone(),
-        }))
-    };
 
     let shutdown = {
         let notify = shutdown_notify.clone();
@@ -733,9 +738,9 @@ struct DaemonControl {
     shutdown: Arc<tokio::sync::Notify>,
     /// Runtime state for settings-driven listener control (§5.12). Holds the
     /// WsApiServer construction args so `start_ws_listener` can build a fresh
-    /// server when toggled on. `None` when the daemon was started with --listen uds
-    /// (no TCP listener capability at all).
-    ws_runtime: Option<Arc<WsRuntimeControl>>,
+    /// server when toggled on. Always present (constructed regardless of --listen
+    /// mode so runtime toggle works for all modes, including --listen uds).
+    ws_runtime: Arc<WsRuntimeControl>,
 }
 
 /// Runtime control for the WSS listener + mDNS, shared between DaemonControl and
@@ -765,9 +770,11 @@ struct WsRuntimeState {
 struct DaemonPairingInfo {
     data_dir: PathBuf,
     token_store: Arc<AsyncTokenStore>,
-    /// Runtime control reference to read the current bound port. `None` when the
-    /// daemon was started with --listen uds (no TCP listener capability).
-    ws_runtime: Option<Arc<WsRuntimeControl>>,
+    /// Runtime control reference to read the current bound port. Always present
+    /// (WsRuntimeControl is constructed for all listen modes; the listener is
+    /// auto-started at boot only for --listen tcp/both, but can be started at
+    /// runtime for all modes including --listen uds).
+    ws_runtime: Arc<WsRuntimeControl>,
 }
 
 impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
@@ -777,13 +784,8 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
         Box<dyn std::future::Future<Output = intent_transport::PairingSnapshot> + Send + '_>,
     > {
         Box::pin(async move {
-            let port = if let Some(ref runtime) = self.ws_runtime {
-                let state = runtime.state.lock().await;
-                state.port
-            } else {
-                None
-            };
-            intent_transport::PairingSnapshot { port }
+            let state = self.ws_runtime.state.lock().await;
+            intent_transport::PairingSnapshot { port: state.port }
         })
     }
 
@@ -800,22 +802,18 @@ impl SystemControl for DaemonControl {
     fn status(&self) -> SystemStatus {
         // Read live port/fingerprint/client count from runtime state (§5.12 fix).
         // Use try_lock to avoid blocking; if locked, report as unavailable.
-        let (port, fingerprint, clients) = if let Some(ref runtime) = self.ws_runtime {
-            if let Ok(state) = runtime.state.try_lock() {
-                let port = state.port;
-                let fingerprint = state
-                    .ws_server
-                    .as_ref()
-                    .and_then(|s| s.fingerprint().map(str::to_string));
-                let clients = state
-                    .ws_server
-                    .as_ref()
-                    .map(|s| s.client_count())
-                    .unwrap_or(0);
-                (port, fingerprint, clients)
-            } else {
-                (None, None, 0)
-            }
+        let (port, fingerprint, clients) = if let Ok(state) = self.ws_runtime.state.try_lock() {
+            let port = state.port;
+            let fingerprint = state
+                .ws_server
+                .as_ref()
+                .and_then(|s| s.fingerprint().map(str::to_string));
+            let clients = state
+                .ws_server
+                .as_ref()
+                .map(|s| s.client_count())
+                .unwrap_or(0);
+            (port, fingerprint, clients)
         } else {
             (None, None, 0)
         };
@@ -847,11 +845,7 @@ impl intent_core::ServerControl for DaemonControl {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<u16>> + Send + '_>>
     {
         Box::pin(async move {
-            let runtime = self.ws_runtime.as_ref().ok_or_else(|| {
-                intent_core::Error::Internal(
-                    "WSS listener not available (daemon started with --listen uds)".to_string(),
-                )
-            })?;
+            let runtime = &self.ws_runtime;
 
             // Check if already running (don't hold lock across await)
             let existing_server = {
@@ -898,11 +892,11 @@ impl intent_core::ServerControl for DaemonControl {
             };
 
             // Install pairing info provider (§5.2) on runtime-started servers
-            if runtime.token_store.is_some() {
+            if let Some(ref ts) = runtime.token_store {
                 let pairing_provider = Arc::new(DaemonPairingInfo {
                     data_dir: runtime.data_dir.clone(),
-                    token_store: runtime.token_store.clone().unwrap(),
-                    ws_runtime: Some(self.ws_runtime.clone().unwrap()),
+                    token_store: ts.clone(),
+                    ws_runtime: self.ws_runtime.clone(),
                 })
                     as Arc<dyn intent_transport::ServerPairingInfo>;
                 server.install_pairing_info(pairing_provider);
@@ -930,18 +924,17 @@ impl intent_core::ServerControl for DaemonControl {
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            if let Some(runtime) = &self.ws_runtime {
-                // Extract server without holding lock across await
-                let server = {
-                    let mut state = runtime.state.lock().await;
-                    state.port = None;
-                    state.ws_server.take()
-                };
+            let runtime = &self.ws_runtime;
+            // Extract server without holding lock across await
+            let server = {
+                let mut state = runtime.state.lock().await;
+                state.port = None;
+                state.ws_server.take()
+            };
 
-                // Stop the WS server (async, handles mDNS internally)
-                if let Some(s) = server {
-                    s.stop().await;
-                }
+            // Stop the WS server (async, handles mDNS internally)
+            if let Some(s) = server {
+                s.stop().await;
             }
         })
     }
@@ -950,17 +943,14 @@ impl intent_core::ServerControl for DaemonControl {
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u16>> + Send + '_>> {
         Box::pin(async move {
-            if let Some(runtime) = &self.ws_runtime {
-                // Extract server without holding lock across await
-                let server = {
-                    let state = runtime.state.lock().await;
-                    state.ws_server.clone()
-                };
-                if let Some(ref s) = server {
-                    s.bound_port().await
-                } else {
-                    None
-                }
+            let runtime = &self.ws_runtime;
+            // Extract server without holding lock across await
+            let server = {
+                let state = runtime.state.lock().await;
+                state.ws_server.clone()
+            };
+            if let Some(ref s) = server {
+                s.bound_port().await
             } else {
                 None
             }
@@ -979,11 +969,7 @@ impl intent_core::ServerControl for DaemonControl {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<()>> + Send + '_>>
     {
         Box::pin(async move {
-            let runtime = self.ws_runtime.as_ref().ok_or_else(|| {
-                intent_core::Error::Internal(
-                    "WSS listener not available (daemon started with --listen uds)".to_string(),
-                )
-            })?;
+            let runtime = &self.ws_runtime;
 
             // Get the server without holding lock across await
             let server = {
@@ -1003,15 +989,14 @@ impl intent_core::ServerControl for DaemonControl {
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            if let Some(runtime) = &self.ws_runtime {
-                let server = {
-                    let state = runtime.state.lock().await;
-                    state.ws_server.clone()
-                };
+            let runtime = &self.ws_runtime;
+            let server = {
+                let state = runtime.state.lock().await;
+                state.ws_server.clone()
+            };
 
-                if let Some(s) = server {
-                    s.stop_discovery().await;
-                }
+            if let Some(s) = server {
+                s.stop_discovery().await;
             }
         })
     }
@@ -1020,17 +1005,14 @@ impl intent_core::ServerControl for DaemonControl {
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         Box::pin(async move {
-            if let Some(runtime) = &self.ws_runtime {
-                let server = {
-                    let state = runtime.state.lock().await;
-                    state.ws_server.clone()
-                };
+            let runtime = &self.ws_runtime;
+            let server = {
+                let state = runtime.state.lock().await;
+                state.ws_server.clone()
+            };
 
-                if let Some(s) = server {
-                    s.is_discovery_active().await
-                } else {
-                    false
-                }
+            if let Some(s) = server {
+                s.is_discovery_active().await
             } else {
                 false
             }

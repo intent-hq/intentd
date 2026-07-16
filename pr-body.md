@@ -1,31 +1,35 @@
-## Summary
-Make daemon-side binary discovery find tools the same way a user's terminal would, so `host.findBinary` / `host.toolAvailability` / `host.checkAuggie` succeed in Finder-launched (minimal PATH) sessions.
-
-## Changes
-- **path_utils.rs**: Add login-shell PATH capture (unix only, cached, 2s timeout)
-  - `capture_login_shell_path_with()`: Run `$SHELL -lc 'printf %s "$PATH"'` once
-  - `login_shell_dirs()`: Cached accessor using `OnceLock`
-  - Silent degradation on failure (timeout, spawn error, non-unix)
-- **path_utils.rs**: Update `enriched_tool_dirs()` to include login-shell PATH entries
-- **host_ops.rs**: Update `resolve_binary_path()` precedence:
-  1. PATH which (existing)
-  2. Caller-supplied common_paths hints (existing)
-  3. **NEW**: Enriched tool dirs (hardcoded + login-shell PATH)
-  4. Common OS directories fallback (existing)
-
-## Testing
-- Unit tests with injectable fake shell (no reliance on CI machine's real shell config)
-- Tests verify silent degradation on invalid shell / missing $SHELL
-- All existing tests pass
-- `cargo test -p intent-core -p intent-transport` ✅
-- `cargo clippy -p intent-core -p intent-transport -- -D warnings` ✅
-- `cargo fmt --check` ✅
-
-## Verification
-```bash
-cargo test -p intent-transport -p intent-core
-cargo clippy -p intent-core -p intent-transport -- -D warnings
-cargo fmt --check
+**Problem:**
+In sidecar-managed runs (dev AND packaged; FE spawns `intentd serve --listen uds`), toggling `server.wsApi.enabled=true` via the Settings UI fails with:
 ```
+Internal("WSS listener not available (daemon started with --listen uds)")
+```
+The compensating hook reverts the setting, and the WSS listener never starts.
 
-Fixes host.findBinary / host.toolAvailability / host.checkAuggie in Finder-launched sessions by searching the login-shell PATH for binaries that live in directories only present there (e.g. `~/Library/Application Support/revedev-*/bin`).
+**Root cause:**
+`main.rs` only constructed `WsRuntimeControl` when `serve_tcp_enabled` (--listen tcp/both). Under `--listen uds`, `DaemonControl.ws_runtime` was `None`, so `start_ws_listener` failed.
+
+**Fix:**
+- `WsRuntimeControl` now constructed for ALL listen modes (uds/tcp/both), not just tcp/both
+- Boot-time auto-start remains ONLY for --listen tcp/both (CLI/env always win over persisted settings)
+- Runtime toggle via `settings.update server.wsApi.enabled=true` now works for all modes including --listen uds (the sidecar contract)
+- Persisted settings (`server.wsApi.enabled`) NOT honored at boot — only CLI `--listen` and env (`INTENTD_TCP_PORT`, `INTENTD_DISCOVERY`) matter. Persisted settings are only applied via runtime `settings.update` hooks.
+- TLS cert + token store are always provisioned (even for --listen uds) so runtime toggle has all required args. Trade-off: TLS/token failure prevents UDS-only daemon startup (accepted per task scope).
+- Refactored `DaemonControl` and `DaemonPairingInfo` to use `Arc<WsRuntimeControl>` (non-optional) instead of `Option<Arc<...>>` — eliminates all `expect()` calls that could panic, makes requirement compile-time instead of runtime.
+
+**Boot semantics (preserved):**
+- With --listen tcp/both: listener auto-starts at boot (CLI/env win over persisted settings, logged when they do)
+- With --listen uds: listener does NOT auto-start at boot, but CAN be started at runtime via settings.update
+
+**Tests:**
+- Updated `uds_server_control.rs` header comment
+- Kept rollback test (still valuable for failure path)
+- All existing tests pass (`uds_server_control`, `e2e_wss_runtime_control`)
+
+**Documentation:**
+- Added `docs/01_stabilizing/KNOWN_ISSUES.md` with STAB-1 entry (P1, area: intentd runtime listener control, repro, root cause, fix summary)
+
+**Verification:**
+```bash
+cargo fmt --check && cargo clippy -- -D warnings && cargo test
+```
+All passing ✅
