@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use intent_acp::permission::{PermissionOptionView, RiskLevel};
 use intent_acp::{
-    Connection, ConnectionHooks, EventSink, IncomingNotification, PermissionOutcome,
-    PermissionPolicy, PermissionRequestData,
+    AcpError, Connection, ConnectionHooks, EventSink, IncomingNotification, JsonRpcError,
+    PermissionOutcome, PermissionPolicy, PermissionRequestData,
 };
 use intent_core::{
     now_iso, AgentId, AgentSession, AgentStatus, Error, Workspace, WorkspaceActivity, WorkspaceApi,
@@ -22,8 +22,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
 use super::{
-    compute_process_cap, derive_agent_type, resolve_spawn, text_prompt, user_text_blocks,
-    AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry, DEFAULT_AGENT_TYPE,
+    compute_process_cap, derive_agent_type, is_cancel_transport_closed, resolve_spawn, text_prompt,
+    user_text_blocks, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry,
+    DEFAULT_AGENT_TYPE,
 };
 use crate::events::{EventBus, SubscriptionFilter};
 use crate::Services;
@@ -920,6 +921,10 @@ where
                     json!({ "sessionId": MGR_ACP_SID, "modes": modes.to_json() })
                 }
                 "session/load" => json!({ "modes": modes.to_json() }),
+                // A valid stop reason: an invalid/empty prompt response would
+                // now be classified as a terminal mid-turn failure (killing
+                // the tracked handle), not a benign warn-and-continue.
+                "session/prompt" => json!({ "stopReason": "end_turn" }),
                 _ => json!({}),
             };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -3274,5 +3279,40 @@ mod merge_user_mcp_servers_tests {
     #[allow(dead_code)]
     async fn _use_manager() {
         let _ = manager().await;
+    }
+}
+
+/// Classifier for the `session/cancel` log level in [`AgentManager::interrupt`]:
+/// transport-closed errors (child already dead) are demoted to DEBUG; every
+/// other `AcpError` keeps the WARN.
+mod session_cancel_log_classifier_tests {
+    use super::*;
+
+    #[test]
+    fn transport_closed_is_demoted_to_debug() {
+        assert!(is_cancel_transport_closed(&AcpError::Transport(
+            "writer task closed".to_string()
+        )));
+        assert!(is_cancel_transport_closed(&AcpError::Transport(
+            "response channel dropped".to_string()
+        )));
+    }
+
+    #[test]
+    fn other_acp_errors_stay_at_warn() {
+        assert!(!is_cancel_transport_closed(&AcpError::Timeout(
+            "session/cancel".to_string()
+        )));
+        assert!(!is_cancel_transport_closed(&AcpError::Rpc(JsonRpcError {
+            code: -32600,
+            message: "invalid request".to_string(),
+            data: None,
+        })));
+        assert!(!is_cancel_transport_closed(&AcpError::Protocol(
+            "malformed response".to_string()
+        )));
+        assert!(!is_cancel_transport_closed(&AcpError::Serde(
+            "bad payload".to_string()
+        )));
     }
 }

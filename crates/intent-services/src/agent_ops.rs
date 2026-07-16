@@ -63,6 +63,12 @@ pub(crate) struct QueuedMessage {
     pub file_blocks: Option<Value>,
     pub queued_at: String,
     pub editing: bool,
+    /// `true` when the user-message row already reached the transcript before
+    /// this entry was (re)queued — set by the terminal-failure requeue, whose
+    /// message was persisted before its turn started. Drain paths skip
+    /// `persist_user` for such entries so a retry does not duplicate the user
+    /// message in chat history. Internal only — not part of the wire shape.
+    pub persisted: bool,
 }
 
 impl QueuedMessage {
@@ -3581,6 +3587,7 @@ impl Services {
             file_blocks,
             queued_at: now_iso(),
             editing: false,
+            persisted: false,
         };
         let mut guard = self
             .agent_queues

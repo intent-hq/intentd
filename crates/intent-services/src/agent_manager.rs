@@ -65,6 +65,15 @@ fn title_case_ascii(s: &str) -> String {
 
 const GB: u64 = 1024 * 1024 * 1024;
 
+/// Whether a `session/cancel` error means the child's transport is already
+/// closed (writer task / pipe gone because the child died mid-turn). That is
+/// the EXPECTED outcome of cancelling a dead turn — the interrupt path logs it
+/// at DEBUG. Anything else (protocol error, malformed payload, timeout on a
+/// live socket) is a real anomaly and stays at WARN.
+fn is_cancel_transport_closed(e: &intent_acp::AcpError) -> bool {
+    matches!(e, intent_acp::AcpError::Transport(_))
+}
+
 /// Per-turn prompt-assembly hints threaded through `agent.sendMessage` /
 /// `agent.forceMessage` (PROTOCOL §5.5). `stdin_context` is prepended
 /// verbatim to the outbound prompt as a `Context:` block (reference-parity
@@ -1623,7 +1632,13 @@ impl AgentManager {
         // resolves its in-flight `session/prompt` with `StopReason::Cancelled`;
         // best-effort — a wire error never blocks the stop.
         if let Err(e) = intent_acp::session::cancel(&conn, &acp_session_id).await {
-            tracing::warn!(agent = %agent_id, error = %e, "session/cancel failed");
+            if is_cancel_transport_closed(&e) {
+                // Child already dead — expected race when cancelling a dead
+                // turn; the run_turn branch surfaces the real failure.
+                tracing::debug!(agent = %agent_id, error = %e, "session/cancel skipped: transport already closed");
+            } else {
+                tracing::warn!(agent = %agent_id, error = %e, "session/cancel failed");
+            }
         }
         // Release the in-flight slot (recomputes workspace activity) and capture
         // the owning workspace BEFORE the slot is dropped so the terminal event
@@ -1905,7 +1920,11 @@ impl AgentManager {
                 self.services.queue_snapshot(&agent_id),
             )
             .await;
-        persist_user(&self, &agent_id, &workspace_id, &next.content).await;
+        // Skip the transcript append for a terminal-failure requeue — its
+        // user row was already persisted before the failed turn began.
+        if !next.persisted {
+            persist_user(&self, &agent_id, &workspace_id, &next.content).await;
+        }
         // Queue-drained turns carry no per-turn prompt hints of their own,
         // but the FE-supplied attachments captured at enqueue time do ride
         // along so the drained turn receives the same image + file blocks.
@@ -2594,7 +2613,27 @@ async fn run_message_worker(
                     .run_turn(&agent_id, &workspace_id, &acp_session_id, prompt)
                     .await
                 {
-                    tracing::warn!(agent = %agent_id, error = %e, "agent turn failed");
+                    if is_benign_turn_error(&e) {
+                        // Concurrent stop/cancel won the turn — not a failure.
+                        // Keep draining: any queued message re-spawns lazily.
+                        tracing::warn!(agent = %agent_id, error = %e, "agent turn ended (benign)");
+                    } else {
+                        tracing::warn!(agent = %agent_id, error = %e, "agent turn failed terminally");
+                        handle_terminal_turn_failure(
+                            &mgr,
+                            &agent_id,
+                            &workspace_id,
+                            &content,
+                            &options,
+                            &e,
+                        )
+                        .await;
+                        // Release the in-flight slot without overwriting the
+                        // Error status just persisted, so `agent.retry` (or a
+                        // future message) can restart the worker.
+                        mgr.release_in_flight_slot(&agent_id).await;
+                        break 'outer;
+                    }
                 }
             }
             Err(e) => {
@@ -2626,7 +2665,11 @@ async fn run_message_worker(
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
-            persist_user(&mgr, &agent_id, &workspace_id, &next.content).await;
+            // A terminal-failure requeue was already persisted before its
+            // failed turn began — don't duplicate the user row on retry.
+            if !next.persisted {
+                persist_user(&mgr, &agent_id, &workspace_id, &next.content).await;
+            }
             content = next.content;
             options = TurnOptions {
                 image_blocks: next_image_blocks,
@@ -2654,7 +2697,9 @@ async fn run_message_worker(
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
-            persist_user(&mgr, &agent_id, &workspace_id, &next.content).await;
+            if !next.persisted {
+                persist_user(&mgr, &agent_id, &workspace_id, &next.content).await;
+            }
             content = next.content;
             options = TurnOptions {
                 image_blocks: next_image_blocks,
@@ -2859,27 +2904,18 @@ async fn retry_spawn(
         .unwrap_or_else(|| Error::Internal("spawn retry loop exhausted without error".to_string())))
 }
 
-/// Handle terminal spawn failure after all retries are exhausted. Publishes
-/// terminal `agent:failed` and `agent:stream:end` events, persists the agent
-/// status as `Error`, requeues the failed message to the front of the queue,
-/// and stops draining further messages.
-async fn handle_terminal_spawn_failure(
+/// Publish the terminal `agent:failed` + `agent:stream:end` event pair for a
+/// failure the streaming path did NOT already surface. The error message
+/// deliberately excludes recent stderr to avoid leaking secrets (API keys,
+/// tokens, file paths) to subscribed clients; stderr stays server-side in logs.
+async fn publish_terminal_failure_events(
     mgr: &AgentManager,
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
-    content: &str,
-    options: &TurnOptions,
-    error: &Error,
+    error_msg: &str,
 ) {
-    use intent_core::events::{AGENT_FAILED, AGENT_STATUS_CHANGED, AGENT_STREAM_END};
-    use serde_json::json;
+    use intent_core::events::{AGENT_FAILED, AGENT_STREAM_END};
 
-    // Build error message. We do NOT include recent stderr in the agent:failed
-    // event to avoid leaking secrets (API keys, tokens, file paths) to subscribed
-    // clients. Stderr is available server-side in logs for debugging.
-    let error_msg = error.to_string();
-
-    // Publish terminal agent:failed event
     mgr.services
         .publish_agent_event(
             workspace_id,
@@ -2888,8 +2924,6 @@ async fn handle_terminal_spawn_failure(
             json!({ "agentId": agent_id.0, "error": error_msg }),
         )
         .await;
-
-    // Publish terminal agent:stream:end event
     mgr.services
         .publish_agent_event(
             workspace_id,
@@ -2898,7 +2932,19 @@ async fn handle_terminal_spawn_failure(
             json!({ "agentId": agent_id.0 }),
         )
         .await;
+}
 
+/// Persist `AgentStatus::Error` (emitting `agent:status-changed`) and requeue
+/// the failed message to the front of the queue so `agent.retry` — or a future
+/// `agent.sendMessage` — can redrive it. Shared by the terminal spawn- and
+/// turn-failure paths.
+async fn persist_error_and_requeue(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    content: &str,
+    options: &TurnOptions,
+) {
     // Persist agent status as Error and emit agent:status-changed
     let ts = now_iso();
     if let Err(e) = mgr
@@ -2928,7 +2974,10 @@ async fn handle_terminal_spawn_failure(
         crate::publish_event(&mgr.services.event_bus, event).await;
     }
 
-    // Requeue the failed message to the front of the queue
+    // Requeue the failed message to the front of the queue. `persisted` is
+    // set: the user row already reached the transcript before the failed
+    // turn began (send_message / drain persist before spawn_worker), so the
+    // retry drain must not append a duplicate.
     let queued = crate::agent_ops::QueuedMessage {
         id: new_message_id(),
         content: content.to_string(),
@@ -2936,6 +2985,7 @@ async fn handle_terminal_spawn_failure(
         file_blocks: options.file_blocks.clone(),
         queued_at: now_iso(),
         editing: false,
+        persisted: true,
     };
     mgr.services.requeue_front(agent_id, queued);
 
@@ -2947,6 +2997,103 @@ async fn handle_terminal_spawn_failure(
             mgr.services.queue_snapshot(agent_id),
         )
         .await;
+}
+
+/// Handle terminal spawn failure after all retries are exhausted. Publishes
+/// terminal `agent:failed` and `agent:stream:end` events, persists the agent
+/// status as `Error`, requeues the failed message to the front of the queue,
+/// and stops draining further messages.
+async fn handle_terminal_spawn_failure(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    content: &str,
+    options: &TurnOptions,
+    error: &Error,
+) {
+    publish_terminal_failure_events(mgr, agent_id, workspace_id, &error.to_string()).await;
+    persist_error_and_requeue(mgr, agent_id, workspace_id, content, options).await;
+}
+
+/// Prefix `run_prompt_turn` wraps every post-prompt failure with (see
+/// `agent_session.rs`): `Error::Internal(format!("session/prompt failed: {e}"))`.
+const PROMPT_FAILED_PREFIX: &str = "session/prompt failed:";
+
+/// The ACP cancellation surface inside the [`PROMPT_FAILED_PREFIX`] wrapper,
+/// if any. The structured `AcpError` is flattened to a string at the wrap
+/// boundary, so this recovers the cancellation signal from the two known
+/// shapes: the JSON-RPC `-32800` request-cancelled code (rendered as
+/// `JSON-RPC error -32800: …` by `intent-acp`'s `JsonRpcError` Display), or a
+/// provider resolving the prompt with a "cancelled" error message.
+fn prompt_cancellation_error(err: &Error) -> bool {
+    let Error::Internal(msg) = err else {
+        return false;
+    };
+    let Some(inner) = msg.strip_prefix(PROMPT_FAILED_PREFIX) else {
+        return false;
+    };
+    inner.contains("-32800") || inner.to_ascii_lowercase().contains("cancelled")
+}
+
+/// Classify a [`AgentManager::run_turn`] error as benign (an expected outcome
+/// of a concurrent stop/cancel — NOT a failure to surface) vs terminal.
+///
+/// Benign:
+/// - `NotFound` — the agent handle disappeared between `ensure_started` and
+///   `run_turn`, i.e. a concurrent `agent.stop`/teardown won the race.
+/// - a cancellation error inside the `session/prompt failed:` wrapper — the
+///   provider resolved the in-flight `session/prompt` with the JSON-RPC
+///   `-32800` request-cancelled code (or a "cancelled" message) instead of
+///   `StopReason::Cancelled` after a `session/cancel`. Errors that merely
+///   mention "cancelled" OUTSIDE that wrapper stay terminal.
+///
+/// Everything else (transport closed, agent stdout closed, response channel
+/// dropped, prompt timeout, provider JSON-RPC errors, store append failures)
+/// is terminal: the turn died mid-flight and must be surfaced (STAB-6
+/// semantics). Deliberately errs on the side of terminal — a false "failed"
+/// surface with a Retry button beats a silently dropped message.
+fn is_benign_turn_error(err: &Error) -> bool {
+    if matches!(err, Error::NotFound(_)) {
+        return true;
+    }
+    prompt_cancellation_error(err)
+}
+
+/// Whether `run_prompt_turn` already emitted the terminal `agent:failed` +
+/// `agent:stream:end` pair for this error. Its post-prompt failure path wraps
+/// every prompt error as `Internal("session/prompt failed: …")` AFTER emitting
+/// both events; errors WITHOUT that prefix (e.g. the transcript-append store
+/// error, which propagates via `?` before the emits) still need the events.
+/// Prefix-anchored on the structured `Error::Internal` payload so an
+/// unrelated error that merely mentions the phrase mid-string cannot
+/// suppress the terminal events.
+fn turn_failure_events_already_emitted(err: &Error) -> bool {
+    matches!(err, Error::Internal(msg) if msg.starts_with(PROMPT_FAILED_PREFIX))
+}
+
+/// Handle a terminal mid-turn failure (`run_turn` error that is not a benign
+/// cancel): tear down the dead child, ensure the terminal `agent:failed` +
+/// `agent:stream:end` pair reached the bus, persist `AgentStatus::Error`, and
+/// requeue the message for `agent.retry`. Mirrors
+/// [`handle_terminal_spawn_failure`] but does NOT auto-retry inline — the
+/// prompt may have been partially processed, so redriving it is a user
+/// decision (the STAB-6 Retry surface).
+async fn handle_terminal_turn_failure(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    content: &str,
+    options: &TurnOptions,
+    error: &Error,
+) {
+    // Tear down the (likely dead) child so the retry path spawns fresh. Safe
+    // from within the worker: only kills child/handle, no worker/busy touch.
+    mgr.kill_child_only(agent_id).await;
+
+    if !turn_failure_events_already_emitted(error) {
+        publish_terminal_failure_events(mgr, agent_id, workspace_id, &error.to_string()).await;
+    }
+    persist_error_and_requeue(mgr, agent_id, workspace_id, content, options).await;
 }
 
 #[cfg(test)]
@@ -3329,6 +3476,102 @@ mod retry_tests {
             current: serde_json::json!({"rev": 2}),
         };
         assert!(!is_retryable_spawn_error(&err));
+    }
+}
+
+#[cfg(test)]
+mod turn_failure_tests {
+    //! Unit tests for the mid-turn failure classifier (benign cancel vs
+    //! terminal failure) and the events-already-emitted marker.
+
+    use super::*;
+
+    #[test]
+    fn not_found_is_benign() {
+        // Handle disappeared mid-worker → a concurrent stop/teardown won.
+        let err = Error::NotFound("agent agent-x".to_string());
+        assert!(is_benign_turn_error(&err));
+    }
+
+    #[test]
+    fn cancelled_rpc_error_is_benign() {
+        let err = Error::Internal(
+            "session/prompt failed: JSON-RPC error -32800: Request cancelled".to_string(),
+        );
+        assert!(is_benign_turn_error(&err));
+    }
+
+    #[test]
+    fn cancellation_code_without_message_is_benign() {
+        // Some providers omit a human-readable message; the -32800 code alone
+        // is the cancellation signal.
+        let err = Error::Internal("session/prompt failed: JSON-RPC error -32800: ".to_string());
+        assert!(is_benign_turn_error(&err));
+    }
+
+    #[test]
+    fn cancelled_outside_prompt_wrapper_is_terminal() {
+        // "cancelled" in an unrelated error (no session/prompt wrapper) must
+        // not be mistaken for a benign turn cancel.
+        let err = Error::Internal("store: write cancelled by shutdown".to_string());
+        assert!(!is_benign_turn_error(&err));
+    }
+
+    #[test]
+    fn transport_closed_is_terminal() {
+        let err = Error::Internal(
+            "session/prompt failed: transport closed: writer task closed".to_string(),
+        );
+        assert!(!is_benign_turn_error(&err));
+    }
+
+    #[test]
+    fn stdout_closed_is_terminal() {
+        let err = Error::Internal(
+            "session/prompt failed: JSON-RPC error 0: agent stdout closed".to_string(),
+        );
+        assert!(!is_benign_turn_error(&err));
+    }
+
+    #[test]
+    fn prompt_timeout_is_terminal() {
+        let err = Error::Internal(
+            "session/prompt failed: request `session/prompt` timed out".to_string(),
+        );
+        assert!(!is_benign_turn_error(&err));
+    }
+
+    #[test]
+    fn store_append_failure_is_terminal() {
+        let err = Error::Internal("store: database is locked".to_string());
+        assert!(!is_benign_turn_error(&err));
+    }
+
+    #[test]
+    fn prompt_failed_marker_means_events_already_emitted() {
+        // run_prompt_turn emits agent:failed + stream:end BEFORE wrapping the
+        // error with the "session/prompt failed" prefix.
+        let err = Error::Internal(
+            "session/prompt failed: transport closed: writer task closed".to_string(),
+        );
+        assert!(turn_failure_events_already_emitted(&err));
+    }
+
+    #[test]
+    fn store_error_needs_events_emitted() {
+        // The transcript-append store error propagates via `?` before
+        // run_prompt_turn reaches its emit path.
+        let err = Error::Internal("store: database is locked".to_string());
+        assert!(!turn_failure_events_already_emitted(&err));
+    }
+
+    #[test]
+    fn mid_string_marker_needs_events_emitted() {
+        // Prefix-anchored: an unrelated error merely mentioning the phrase
+        // mid-string must not suppress the terminal event pair.
+        let err =
+            Error::Internal("store: could not log that session/prompt failed earlier".to_string());
+        assert!(!turn_failure_events_already_emitted(&err));
     }
 }
 
