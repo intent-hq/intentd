@@ -1,11 +1,9 @@
-//! Server runtime control regression: prove that runtime WSS listener toggle
-//! works even when the daemon is started with --listen uds (Phase 4 fix for
-//! sidecar-managed runs). The daemon now constructs WsRuntimeControl for all
-//! listen modes, so settings.update server.wsApi.enabled=true can start the
-//! listener at runtime.
+//! Server runtime control regression: settings rollback on failed listener start.
 //!
-//! Also proves that failed listener starts do not persist server.wsApi.enabled=true
-//! (settings rollback guard from PR #135).
+//! Proves that failed listener starts do not persist `server.wsApi.enabled=true`
+//! (settings rollback guard from PR #135). This test does NOT prove the runtime WSS
+//! toggle works under `--listen uds`; that requires a real composition-root daemon
+//! and is covered by e2e_wss_runtime_control.rs (see the placeholder test below).
 
 use std::path::PathBuf;
 use std::pin::Pin;

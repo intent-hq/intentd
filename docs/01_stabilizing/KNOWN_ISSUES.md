@@ -22,6 +22,7 @@ Issues discovered during dogfooding (using intentd + cloudlands-fe for daily dev
 
 **Fix summary:**
 - `WsRuntimeControl` now constructed for ALL listen modes (uds/tcp/both)
-- Boot-time auto-start remains ONLY for --listen tcp/both (preserves existing behavior)
+- Boot-time auto-start remains ONLY for --listen tcp/both (CLI/env always win over persisted settings)
 - Runtime toggle works for all modes: `settings.update server.wsApi.enabled=true` starts the listener under --listen uds
-- Persisted `enabled=true` honored on next boot (same contract as tcp/both)
+- Persisted settings NOT honored at boot (only CLI `--listen` and env vars matter); persisted settings only applied via runtime `settings.update` hooks
+- Refactored to non-optional `Arc<WsRuntimeControl>` (compile-time guarantee, eliminates panic risk from `expect()` calls)

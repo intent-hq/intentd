@@ -10,11 +10,11 @@ The compensating hook reverts the setting, and the WSS listener never starts.
 
 **Fix:**
 - `WsRuntimeControl` now constructed for ALL listen modes (uds/tcp/both), not just tcp/both
-- Boot-time auto-start remains ONLY for --listen tcp/both (preserves existing behavior)
+- Boot-time auto-start remains ONLY for --listen tcp/both (CLI/env always win over persisted settings)
 - Runtime toggle via `settings.update server.wsApi.enabled=true` now works for all modes including --listen uds (the sidecar contract)
-- Persisted `enabled=true` is honored on next boot (same contract as tcp/both)
-- TLS cert + token store are always provisioned (even for --listen uds) so runtime toggle has all required args
-- Updated comments: `ws_runtime` now always `Some`, removed stale error messages
+- Persisted settings (`server.wsApi.enabled`) NOT honored at boot — only CLI `--listen` and env (`INTENTD_TCP_PORT`, `INTENTD_DISCOVERY`) matter. Persisted settings are only applied via runtime `settings.update` hooks.
+- TLS cert + token store are always provisioned (even for --listen uds) so runtime toggle has all required args. Trade-off: TLS/token failure prevents UDS-only daemon startup (accepted per task scope).
+- Refactored `DaemonControl` and `DaemonPairingInfo` to use `Arc<WsRuntimeControl>` (non-optional) instead of `Option<Arc<...>>` — eliminates all `expect()` calls that could panic, makes requirement compile-time instead of runtime.
 
 **Boot semantics (preserved):**
 - With --listen tcp/both: listener auto-starts at boot (CLI/env win over persisted settings, logged when they do)
