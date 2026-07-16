@@ -564,6 +564,10 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
     )
     .await;
     assert_eq!(retry_result["ok"], true, "agent.retry ok on error status");
+    assert_eq!(
+        retry_result["redriven"], true,
+        "agent.retry reports the requeued message is being redriven"
+    );
 
     let mut saw_chunk = false;
     let mut saw_retry_end = false;

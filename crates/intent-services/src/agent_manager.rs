@@ -2149,10 +2149,18 @@ impl AgentManager {
 
     /// Retry a failed agent spawn (`agent.retry` RPC path). Only valid when
     /// the agent status is `error`; returns `{ ok: false }` otherwise. Clears
-    /// the error status back to pending, tears down any stale child, and
-    /// attempts to redrive the front-of-queue message (requeued at exhaustion)
-    /// plus any subsequent messages. Reuses the spawn-retry/backoff machinery,
-    /// so a retry that fails again lands back in the `error` state with events.
+    /// the error status, tears down any stale child, and attempts to redrive
+    /// the front-of-queue message (requeued at exhaustion) plus any subsequent
+    /// messages. Reuses the spawn-retry/backoff machinery, so a retry that
+    /// fails again lands back in the `error` state with events.
+    ///
+    /// The result carries `redriven` so clients can distinguish "a queued
+    /// message is being redriven" (`true` — status cleared to `pending`, drain
+    /// started) from "the queue was empty, nothing to redrive" (`false` —
+    /// status cleared to `idle`; the next `agent.sendMessage` starts a fresh
+    /// turn). Without this, an empty-queue retry was an invisible no-op: the
+    /// agent parked in `pending` with no worker and the FE got a bare
+    /// `{ ok: true }` (STAB-54).
     pub async fn agent_retry(
         self: &Arc<Self>,
         agent_id: AgentId,
@@ -2169,11 +2177,21 @@ impl AgentManager {
         // Use the session's persisted workspace_id for safety (cross-workspace guard)
         let workspace_id = &session.workspace_id;
 
-        // Clear the error status back to pending
+        // Empty queue → nothing will drive a `pending` status forward, so
+        // clear the error to `idle` instead (idle is permitted iff no
+        // ready-to-send work remains, PROTOCOL §5.5/§6.5 invariant).
+        let redriven = self.services.has_ready_to_send(&agent_id);
+        let (next_status, next_status_str) = if redriven {
+            (AgentStatus::Pending, "pending")
+        } else {
+            (AgentStatus::Idle, "idle")
+        };
+
+        // Clear the error status
         let ts = now_iso();
         self.services
             .store
-            .set_agent_session_status(workspace_id, &agent_id, AgentStatus::Pending, false, &ts)
+            .set_agent_session_status(workspace_id, &agent_id, next_status, false, &ts)
             .await?;
 
         // Emit agent:status-changed
@@ -2188,7 +2206,7 @@ impl AgentManager {
             metadata: None,
             data: json!({
                 "agentId": agent_id.0,
-                "status": "pending",
+                "status": next_status_str,
                 "isActive": false,
             }),
         };
@@ -2201,15 +2219,17 @@ impl AgentManager {
         self.release_in_flight_slot(&agent_id).await;
 
         // Tear down any stale child handle (use kill_child_only to avoid
-        // overwriting the status we just set to Pending)
+        // overwriting the status we just set)
         self.kill_child_only(&agent_id).await;
 
         // Start the drain loop to redrive the requeued message
-        self.clone()
-            .try_drain_queue(agent_id, workspace_id.clone())
-            .await;
+        if redriven {
+            self.clone()
+                .try_drain_queue(agent_id, workspace_id.clone())
+                .await;
+        }
 
-        Ok(json!({ "ok": true }))
+        Ok(json!({ "ok": true, "redriven": redriven }))
     }
 
     /// Spawn the background turn worker after the caller has already claimed
@@ -3791,7 +3811,7 @@ mod agent_retry_tests {
     }
 
     #[tokio::test]
-    async fn retry_from_error_status_returns_ok_true() {
+    async fn retry_from_error_status_with_empty_queue_clears_to_idle() {
         let agent_id = AgentId::from("agent-1");
         let ws = WorkspaceId::from("ws-1");
         let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
@@ -3801,15 +3821,43 @@ mod agent_retry_tests {
             .await
             .expect("retry");
         assert_eq!(result["ok"], true);
+        // Nothing queued → nothing redriven; the client is told explicitly
+        // (STAB-54: an empty-queue retry must not be a silent no-op).
+        assert_eq!(result["redriven"], false);
 
-        // Status should be cleared to Pending
+        // Status should be cleared to Idle — a `pending` status would park the
+        // agent forever since no queued message will ever drive it forward.
         let session = mgr
             .services
             .store
             .get_agent_session(&agent_id)
             .await
             .expect("session");
-        assert_eq!(session.status, AgentStatus::Pending);
+        assert_eq!(session.status, AgentStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn retry_from_error_status_with_queued_message_redrives() {
+        let agent_id = AgentId::from("agent-redrive");
+        let ws = WorkspaceId::from("ws-redrive");
+        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+
+        // A requeued message is waiting (the persist_error_and_requeue path).
+        mgr.services
+            .enqueue_message(&agent_id, "requeued".to_string(), None, None);
+
+        let result = mgr
+            .agent_retry(agent_id.clone(), ws.clone())
+            .await
+            .expect("retry");
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["redriven"], true);
+
+        // The drain loop claimed the queued message (dequeued for redrive).
+        assert!(
+            !mgr.services.has_ready_to_send(&agent_id),
+            "queued message dequeued for redrive"
+        );
     }
 
     #[tokio::test]
