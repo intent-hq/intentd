@@ -18,7 +18,7 @@ Issues discovered during dogfooding (using intentd + cloudlands-fe for daily dev
 **Root cause:**
 `main.rs` only constructed `WsRuntimeControl` when `serve_tcp_enabled` (--listen tcp/both). Under `--listen uds`, `DaemonControl.ws_runtime` was `None`, so `start_ws_listener` failed with the error above.
 
-**Status:** fixed (PR #XXXX, 2026-07-16)
+**Status:** fixed (PR #195, 2026-07-16)
 
 **Fix summary:**
 - `WsRuntimeControl` now constructed for ALL listen modes (uds/tcp/both)
