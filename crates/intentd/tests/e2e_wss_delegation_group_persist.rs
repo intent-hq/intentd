@@ -711,6 +711,42 @@ async fn baseline_plus_aggregated_wake() {
     assert!(wake_chunks >= 1, "wake turn streamed ≥1 chunk");
     assert_eq!(wake_ends, 1, "exactly one wake stream:end");
     assert!(parent_idle_again, "parent idled after wake");
+
+    // CRITICAL: Assert the aggregated wake payload contains BOTH children's reports.
+    // The wake is delivered as a user message to the parent, so read it from the
+    // conversation transcript (mirroring after_all_group_delivers_single_aggregated_wake_over_wss).
+    let conv = wss_rpc(
+        &mut rpc2,
+        40,
+        "agent.getConversation",
+        json!({ "agentId": &parent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let texts: Vec<String> = messages
+        .iter()
+        .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
+        .collect();
+    let wakes: Vec<&String> = texts
+        .iter()
+        .filter(|t| t.contains("[WORKSPACE EVENTS]"))
+        .collect();
+    assert_eq!(wakes.len(), 1, "exactly one wake message: {conv}");
+    let wake = wakes[0];
+    assert!(
+        wake.contains(REPORT_A),
+        "wake must contain child1 report ({}): wake={}",
+        REPORT_A,
+        wake
+    );
+    assert!(
+        wake.contains(REPORT_B),
+        "wake must contain child2 report ({}): wake={}",
+        REPORT_B,
+        wake
+    );
     eprintln!("✓ Aggregated wake delivered successfully post-restart!");
     eprintln!("✓ Exactly ONE wake fired after both children settled (pre+post restart)");
+    eprintln!("✓ Wake payload contains BOTH child reports: {}", REPORT_A);
+    eprintln!("✓ Wake payload contains BOTH child reports: {}", REPORT_B);
 }
