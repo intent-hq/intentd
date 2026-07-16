@@ -736,10 +736,17 @@ impl Services {
         };
 
         if let Some(group_id) = group_id {
-            // Build a minimal Event to pass to record_group_child_completion
-            let summary = format!("Agent {} completed", agent_id.0);
+            // Build event for group recording. Prefer the child's persisted
+            // completion_report (set by agent.reportToParent) over the generic
+            // summary, mirroring deliver_completion_to_watches logic.
+            let report = self
+                .store
+                .get_agent_session(agent_id)
+                .await
+                .ok()
+                .and_then(|s| s.completion_report);
             let event = Event {
-                id: String::new(), // Not used by record_group_child_completion
+                id: String::new(),
                 workspace_id: workspace_id.clone(),
                 timestamp: now_iso(),
                 event_type: intent_core::events::AGENT_IDLE.to_string(),
@@ -754,6 +761,7 @@ impl Services {
                 metadata: None,
                 data: event_data.clone(),
             };
+            let summary = crate::format_group_child_line(agent_id, &event, report.as_deref());
 
             self.record_group_child_completion(
                 workspace_id,

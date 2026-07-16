@@ -4012,7 +4012,7 @@ fn format_completion_wake(child_id: &AgentId, event: &Event) -> String {
 /// non-empty `completion_report` (the child's persisted
 /// `metadata.completionReport`) wins over the event's `lastResponseSummary`,
 /// mirroring the TS event-notification formatter.
-fn format_group_child_line(
+pub(crate) fn format_group_child_line(
     child_id: &AgentId,
     event: &Event,
     completion_report: Option<&str>,
