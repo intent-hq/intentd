@@ -66,6 +66,14 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     runs-on: ${{ matrix.os }}
+    # Keeps the cargo-check steps free of debuginfo/incremental artifacts
+    # (cheaper compile, smaller shared cache). Safe job-wide: the release
+    # build is unaffected — these vars only touch the dev/test profiles, and
+    # release builds are non-incremental by default.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
       - name: Resolve pinned Rust channel
