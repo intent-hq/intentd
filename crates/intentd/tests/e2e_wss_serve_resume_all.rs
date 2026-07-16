@@ -413,7 +413,7 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
     eprintln!("Killing daemon1 to simulate interruption");
     drop(_daemon1); // Kill daemon1
 
-    // Phase 2: Boot daemon2 with --resume-all
+    // Phase 2: Boot daemon2 with --resume-all and subscribe to agent events
     eprintln!("Phase 2: Boot daemon2 with --resume-all");
     tokio::time::sleep(Duration::from_secs(1)).await; // Let daemon1 fully die
 
@@ -433,15 +433,51 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
         .expect("fingerprint")
         .to_string();
 
-    // Wait a bit for auto-resume to complete
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Phase 3: Verify agent.listInterrupted returns empty (all resumed)
-    eprintln!("Phase 3: Verify interrupted agents list is empty");
+    // Phase 3: Poll agent status to confirm turn completion (agent reached idle)
+    eprintln!("Phase 3: Poll agent status to confirm turn completion");
     let cfg = client_config(&fingerprint);
     let mut ws = connect_ws(actual_port, cfg).await;
 
-    let list_result = wss_rpc(&mut ws, 1, "agent.listInterrupted", json!({})).await;
+    // Poll agent.get to wait for the agent to complete its turn and reach idle
+    eprintln!("Polling agent.get until agent is idle (bounded to 30s)...");
+    let mut agent_is_idle = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        let agent_result = wss_rpc(
+            &mut ws,
+            1,
+            "agent.get",
+            json!({
+                "workspaceId": ws_id,
+                "agentId": created_agent_id
+            }),
+        )
+        .await;
+
+        let is_active = agent_result["agent"]["isActive"].as_bool().unwrap_or(false);
+        let status = agent_result["agent"]["status"].as_str().unwrap_or("");
+
+        eprintln!("Agent status: {status}, isActive: {is_active}");
+
+        // Agent has completed its turn when it's not active (isActive=false)
+        // The status field uses lowercase: "idle", "complete", etc.
+        if !is_active {
+            eprintln!("✓ Agent reached idle state after resume (isActive=false)");
+            agent_is_idle = true;
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    assert!(
+        agent_is_idle,
+        "Expected agent {created_agent_id} to complete turn and reach idle, but timed out"
+    );
+
+    // Phase 4: Verify agent.listInterrupted returns empty (all resumed)
+    eprintln!("Phase 4: Verify interrupted agents list is empty");
+    let list_result = wss_rpc(&mut ws, 2, "agent.listInterrupted", json!({})).await;
     let agents = list_result["agents"].as_array().expect("agents array");
     assert_eq!(
         agents.len(),
@@ -450,5 +486,5 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
         agents
     );
 
-    eprintln!("SUCCESS: --resume-all auto-resumed all interrupted agents");
+    eprintln!("SUCCESS: --resume-all auto-resumed agent AND agent completed its turn");
 }
