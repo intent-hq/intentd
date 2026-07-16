@@ -254,8 +254,22 @@ async fn runtime_ws_listener_toggle_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
+    // Persist the ephemeral port to the setting so re-enable uses the same port
+    let port_value: u64 = port_s.parse().unwrap();
+    let set_port = uds_rpc(
+        &socket,
+        1,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.wsApi.port", "value": port_value }] }),
+    )
+    .await;
+    assert!(
+        set_port.get("error").is_none(),
+        "settings.update port should succeed: {set_port}"
+    );
+
     // Verify initial system.status shows the WSS listener (started at boot)
-    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let status = uds_rpc(&socket, 2, "system.status", json!({})).await;
     let initial_port = status["result"]["port"]
         .as_u64()
         .expect("port should be set at boot") as u16;
@@ -286,7 +300,7 @@ async fn runtime_ws_listener_toggle_over_wss() {
     // Disable the WSS listener via settings.update over UDS (not over WSS to avoid self-termination)
     let disable = uds_rpc(
         &socket,
-        2,
+        3,
         "settings.update",
         json!({ "changes": [{ "path": "server.wsApi.enabled", "value": false }] }),
     )
@@ -300,7 +314,7 @@ async fn runtime_ws_listener_toggle_over_wss() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Verify system.status shows no listener
-    let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
+    let status = uds_rpc(&socket, 4, "system.status", json!({})).await;
     assert!(
         status["result"]["port"].is_null(),
         "port should be null after disable"
@@ -320,7 +334,7 @@ async fn runtime_ws_listener_toggle_over_wss() {
     // Re-enable the WSS listener via settings.update over UDS
     let enable = uds_rpc(
         &socket,
-        4,
+        5,
         "settings.update",
         json!({ "changes": [{ "path": "server.wsApi.enabled", "value": true }] }),
     )
@@ -334,7 +348,7 @@ async fn runtime_ws_listener_toggle_over_wss() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Verify system.status shows the WSS listener again
-    let status = uds_rpc(&socket, 5, "system.status", json!({})).await;
+    let status = uds_rpc(&socket, 6, "system.status", json!({})).await;
     let new_port = status["result"]["port"]
         .as_u64()
         .expect("port should be set after re-enable") as u16;
@@ -377,10 +391,24 @@ async fn batch_hook_ordering_enable_both_services() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
+    // Persist the ephemeral port to the setting so re-enable uses the same port
+    let port_value: u64 = port_s.parse().unwrap();
+    let set_port = uds_rpc(
+        &socket,
+        1,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.wsApi.port", "value": port_value }] }),
+    )
+    .await;
+    assert!(
+        set_port.get("error").is_none(),
+        "settings.update port should succeed: {set_port}"
+    );
+
     // Disable both listener and discovery
     let disable_all = uds_rpc(
         &socket,
-        1,
+        2,
         "settings.update",
         json!({
             "changes": [
@@ -401,7 +429,7 @@ async fn batch_hook_ordering_enable_both_services() {
     // before discovery.enabled (priority 11), so the listener starts before mDNS discovery.
     let batch_enable = uds_rpc(
         &socket,
-        2,
+        3,
         "settings.update",
         json!({
             "changes": [
@@ -419,7 +447,7 @@ async fn batch_hook_ordering_enable_both_services() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Verify system.status shows both services enabled
-    let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
+    let status = uds_rpc(&socket, 4, "system.status", json!({})).await;
     assert!(
         status["result"]["port"].as_u64().is_some(),
         "WSS listener should be enabled"
