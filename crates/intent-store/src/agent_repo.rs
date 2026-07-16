@@ -103,6 +103,23 @@ impl Store {
         }
     }
 
+    /// Lightweight status-only lookup used by hot paths that just need the
+    /// session's lifecycle status (e.g. the STAB-52 queue-drain gate). Selects
+    /// a single column and skips the full message-log fetch that
+    /// `get_agent_session` performs. `NotFound` if the session is absent,
+    /// matching `get_agent_session`.
+    pub async fn get_agent_session_status(&self, id: &AgentId) -> Result<AgentStatus> {
+        let row = sqlx::query("SELECT status FROM agent_session WHERE id = ?")
+            .bind(&id.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent session status failed: {e}")))?;
+        match row {
+            Some(r) => enum_from_db::<AgentStatus>(&r.get::<String, _>("status")),
+            None => Err(Error::NotFound(format!("agent session {id}"))),
+        }
+    }
+
     /// Lightweight name-only lookup used by hot paths that just need the
     /// session's display name (e.g. note-version author stamping). Skips the
     /// full message-log fetch that `get_agent_session` performs.

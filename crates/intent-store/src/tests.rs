@@ -1411,6 +1411,48 @@ async fn agent_session_round_trip_and_append_only_log() {
     assert_eq!(listed[0].messages.len(), 2);
 }
 
+/// `get_agent_session_status` is the lightweight status-only accessor backing
+/// the STAB-52 queue-drain gate: it returns the persisted status without
+/// loading the message log, tracks `set_agent_session_status` updates, and
+/// mirrors `get_agent_session`'s `NotFound` for missing rows.
+#[tokio::test]
+async fn agent_session_status_only_lookup() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::from("agent-aaaaaaaa-5555-6666-7777-888888888888");
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+
+    let status = store
+        .get_agent_session_status(&agent_id)
+        .await
+        .expect("status");
+    assert_eq!(status, AgentStatus::Pending);
+
+    store
+        .set_agent_session_status(&ws, &agent_id, AgentStatus::Error, false, "t1")
+        .await
+        .expect("set status");
+    let status = store
+        .get_agent_session_status(&agent_id)
+        .await
+        .expect("status after update");
+    assert_eq!(status, AgentStatus::Error);
+
+    let missing = AgentId::from("agent-ffffffff-0000-0000-0000-000000000000");
+    assert!(matches!(
+        store.get_agent_session_status(&missing).await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+}
+
 /// `append_agent_message_with_metadata` persists the opaque per-message
 /// `messageMetadata` payload (PROTOCOL §5.5) verbatim on the row and
 /// round-trips it on transcript reads; the plain `append_agent_message`
