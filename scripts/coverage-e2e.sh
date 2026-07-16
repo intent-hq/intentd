@@ -3,13 +3,16 @@ set -euo pipefail
 
 # E2E coverage script
 # Measures line coverage from ALL daemon-level integration tests in crates/intentd/tests/
-# Explicitly skips auggie_context_e2e in the loop below (requires real auggie binary)
+# Explicitly skips auggie_context_e2e via the nextest filterset below (requires real auggie binary)
 
 cd "$(dirname "$0")/.."
 
-echo "Installing cargo-llvm-cov and llvm-tools..."
+echo "Installing cargo-llvm-cov, cargo-nextest and llvm-tools..."
 if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
     cargo install cargo-llvm-cov --locked
+fi
+if ! command -v cargo-nextest >/dev/null 2>&1; then
+    cargo install cargo-nextest --locked
 fi
 if ! rustup component list --installed | grep -q llvm-tools; then
     rustup component add llvm-tools-preview
@@ -18,33 +21,17 @@ fi
 echo "Cleaning coverage data..."
 cargo llvm-cov clean --workspace
 
-echo "Running e2e tests with coverage instrumentation..."
+echo "Running e2e tests with coverage instrumentation (nextest)..."
 
-# Enumerate all test targets dynamically from crates/intentd/tests/*.rs
+# Run all daemon-level integration tests (kind(test) = crates/intentd/tests/*)
+# under nextest so the test binaries execute in parallel instead of one at a time.
 # Skip auggie_context_e2e (needs real auggie binary)
-# Guard against empty glob with nullglob
-shopt -s nullglob
-test_files=(crates/intentd/tests/*.rs)
-if [ ${#test_files[@]} -eq 0 ]; then
-    echo "Error: No test files found in crates/intentd/tests/" >&2
-    exit 1
-fi
-
-for test_file in "${test_files[@]}"; do
-    test_name=$(basename "$test_file" .rs)
-    if [ "$test_name" = "auggie_context_e2e" ]; then
-        echo "Skipping $test_name (requires auggie binary)"
-        continue
-    fi
-    echo "Running test: $test_name"
-    # Skip known flaky tests under llvm-cov instrumentation (STAB-40, STAB-42)
-    # These skips DEFLATE coverage (we lose their contribution) but prevent spurious CI failures
-    # Note: capture_login_shell_path_with_fake_shell (STAB-43) is an intent-core unit test,
-    # not an intentd integration test, so it's skipped in coverage-all.sh but not here
-    cargo llvm-cov --no-report -p intentd --test "$test_name" -- \
-        --skip wss_note_save_asset_round_trip \
-        --skip slow_host_exec_does_not_block_fast_workspace_list
-done
+# Skip known flaky tests under llvm-cov instrumentation (STAB-40, STAB-42)
+# These skips DEFLATE coverage (we lose their contribution) but prevent spurious CI failures
+# Note: capture_login_shell_path_with_fake_shell (STAB-43) is an intent-core unit test,
+# not an intentd integration test, so it's skipped in coverage-all.sh but not here
+cargo llvm-cov --no-report nextest -p intentd \
+    -E 'kind(test) and not binary(auggie_context_e2e) and not (test(wss_note_save_asset_round_trip) | test(slow_host_exec_does_not_block_fast_workspace_list))'
 
 echo ""
 echo "Generating coverage report..."

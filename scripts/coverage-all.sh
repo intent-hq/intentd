@@ -7,9 +7,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-echo "Installing cargo-llvm-cov and llvm-tools..."
+echo "Installing cargo-llvm-cov, cargo-nextest and llvm-tools..."
 if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
     cargo install cargo-llvm-cov --locked
+fi
+if ! command -v cargo-nextest >/dev/null 2>&1; then
+    cargo install cargo-nextest --locked
 fi
 if ! rustup component list --installed | grep -q llvm-tools; then
     rustup component add llvm-tools-preview
@@ -18,16 +21,15 @@ fi
 echo "Cleaning coverage data..."
 cargo llvm-cov clean --workspace
 
-echo "Running all workspace tests with coverage instrumentation..."
+echo "Running all workspace tests with coverage instrumentation (nextest)..."
 
-# Run all workspace tests (unit + integration + e2e)
+# Run all workspace tests (unit + integration + e2e) under nextest for parallelism
 # auggie_context_e2e test is env-gated (INTENTD_AUGGIE_E2E) and skips cleanly in CI
 # Skip known flaky tests under llvm-cov instrumentation (STAB-40, STAB-42, STAB-43)
 # These skips DEFLATE coverage (we lose their contribution) but prevent spurious CI failures
-cargo llvm-cov --no-report --workspace -- \
-    --skip wss_note_save_asset_round_trip \
-    --skip slow_host_exec_does_not_block_fast_workspace_list \
-    --skip capture_login_shell_path_with_fake_shell
+# Note: nextest does not run doctests; the workspace has none, so nothing is lost
+cargo llvm-cov --no-report nextest --workspace \
+    -E 'not (test(wss_note_save_asset_round_trip) | test(slow_host_exec_does_not_block_fast_workspace_list) | test(capture_login_shell_path_with_fake_shell))'
 
 echo ""
 echo "Generating coverage report..."

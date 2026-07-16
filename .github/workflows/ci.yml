@@ -46,12 +46,9 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
-      - name: Disk space before tests
-        run: df -h
-      - name: Tests
-        run: cargo test --workspace
-      - name: Disk space after tests
-        run: df -h
+      # Tests are not run here: coverage-all executes the full suite (instrumented,
+      # via cargo llvm-cov nextest) and is the test gate for PRs. Running them
+      # plainly here as well would double the critical path.
 
   build:
     strategy:
@@ -113,6 +110,7 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
       - uses: swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -167,6 +165,7 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
       - uses: swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
