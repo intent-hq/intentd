@@ -3001,15 +3001,37 @@ async fn handle_terminal_spawn_failure(
     persist_error_and_requeue(mgr, agent_id, workspace_id, content, options).await;
 }
 
+/// Prefix `run_prompt_turn` wraps every post-prompt failure with (see
+/// `agent_session.rs`): `Error::Internal(format!("session/prompt failed: {e}"))`.
+const PROMPT_FAILED_PREFIX: &str = "session/prompt failed:";
+
+/// The ACP cancellation surface inside the [`PROMPT_FAILED_PREFIX`] wrapper,
+/// if any. The structured `AcpError` is flattened to a string at the wrap
+/// boundary, so this recovers the cancellation signal from the two known
+/// shapes: the JSON-RPC `-32800` request-cancelled code (rendered as
+/// `JSON-RPC error -32800: …` by `intent-acp`'s `JsonRpcError` Display), or a
+/// provider resolving the prompt with a "cancelled" error message.
+fn prompt_cancellation_error(err: &Error) -> bool {
+    let Error::Internal(msg) = err else {
+        return false;
+    };
+    let Some(inner) = msg.strip_prefix(PROMPT_FAILED_PREFIX) else {
+        return false;
+    };
+    inner.contains("-32800") || inner.to_ascii_lowercase().contains("cancelled")
+}
+
 /// Classify a [`AgentManager::run_turn`] error as benign (an expected outcome
 /// of a concurrent stop/cancel — NOT a failure to surface) vs terminal.
 ///
 /// Benign:
 /// - `NotFound` — the agent handle disappeared between `ensure_started` and
 ///   `run_turn`, i.e. a concurrent `agent.stop`/teardown won the race.
-/// - a "cancelled" JSON-RPC error — the provider resolved the in-flight
-///   `session/prompt` with a cancellation error instead of
-///   `StopReason::Cancelled` after a `session/cancel`.
+/// - a cancellation error inside the `session/prompt failed:` wrapper — the
+///   provider resolved the in-flight `session/prompt` with the JSON-RPC
+///   `-32800` request-cancelled code (or a "cancelled" message) instead of
+///   `StopReason::Cancelled` after a `session/cancel`. Errors that merely
+///   mention "cancelled" OUTSIDE that wrapper stay terminal.
 ///
 /// Everything else (transport closed, agent stdout closed, response channel
 /// dropped, prompt timeout, provider JSON-RPC errors, store append failures)
@@ -3020,16 +3042,19 @@ fn is_benign_turn_error(err: &Error) -> bool {
     if matches!(err, Error::NotFound(_)) {
         return true;
     }
-    err.to_string().to_ascii_lowercase().contains("cancelled")
+    prompt_cancellation_error(err)
 }
 
 /// Whether `run_prompt_turn` already emitted the terminal `agent:failed` +
 /// `agent:stream:end` pair for this error. Its post-prompt failure path wraps
 /// every prompt error as `Internal("session/prompt failed: …")` AFTER emitting
-/// both events; errors WITHOUT that marker (e.g. the transcript-append store
+/// both events; errors WITHOUT that prefix (e.g. the transcript-append store
 /// error, which propagates via `?` before the emits) still need the events.
+/// Prefix-anchored on the structured `Error::Internal` payload so an
+/// unrelated error that merely mentions the phrase mid-string cannot
+/// suppress the terminal events.
 fn turn_failure_events_already_emitted(err: &Error) -> bool {
-    err.to_string().contains("session/prompt failed")
+    matches!(err, Error::Internal(msg) if msg.starts_with(PROMPT_FAILED_PREFIX))
 }
 
 /// Handle a terminal mid-turn failure (`run_turn` error that is not a benign
@@ -3463,6 +3488,22 @@ mod turn_failure_tests {
     }
 
     #[test]
+    fn cancellation_code_without_message_is_benign() {
+        // Some providers omit a human-readable message; the -32800 code alone
+        // is the cancellation signal.
+        let err = Error::Internal("session/prompt failed: JSON-RPC error -32800: ".to_string());
+        assert!(is_benign_turn_error(&err));
+    }
+
+    #[test]
+    fn cancelled_outside_prompt_wrapper_is_terminal() {
+        // "cancelled" in an unrelated error (no session/prompt wrapper) must
+        // not be mistaken for a benign turn cancel.
+        let err = Error::Internal("store: write cancelled by shutdown".to_string());
+        assert!(!is_benign_turn_error(&err));
+    }
+
+    #[test]
     fn transport_closed_is_terminal() {
         let err = Error::Internal(
             "session/prompt failed: transport closed: writer task closed".to_string(),
@@ -3507,6 +3548,15 @@ mod turn_failure_tests {
         // The transcript-append store error propagates via `?` before
         // run_prompt_turn reaches its emit path.
         let err = Error::Internal("store: database is locked".to_string());
+        assert!(!turn_failure_events_already_emitted(&err));
+    }
+
+    #[test]
+    fn mid_string_marker_needs_events_emitted() {
+        // Prefix-anchored: an unrelated error merely mentioning the phrase
+        // mid-string must not suppress the terminal event pair.
+        let err =
+            Error::Internal("store: could not log that session/prompt failed earlier".to_string());
         assert!(!turn_failure_events_already_emitted(&err));
     }
 }
