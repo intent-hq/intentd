@@ -46,9 +46,18 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
-      # Tests are not run here: coverage-all executes the full suite (instrumented,
-      # via cargo llvm-cov nextest) and is the test gate for PRs. Running them
-      # plainly here as well would double the critical path.
+      # The full suite is not run here: coverage-all executes it (instrumented,
+      # via cargo llvm-cov nextest) and is the test gate for PRs. Running it
+      # plainly here as well would double the critical path. The only exception
+      # is the three tests the coverage scripts skip (STAB-40/42/43): they are
+      # flaky under llvm-cov instrumentation / heavy parallel load, so they run
+      # here instead — non-instrumented and serially, the conditions under
+      # which they pass reliably — to keep them covered on every PR.
+      - name: Coverage-skipped tests (STAB-40/42/43)
+        run: |
+          cargo test -p intent-core --lib capture_login_shell_path_with_fake_shell
+          cargo test -p intentd --test wss_integration wss_note_save_asset_round_trip
+          cargo test -p intentd --test uds_concurrent_dispatch slow_host_exec_does_not_block_fast_workspace_list
 
   build:
     strategy:
