@@ -3845,7 +3845,7 @@ impl Services {
     /// parent completion watch when the agent was delegated, then deliver a
     /// continuation message via `agent.sendMessage`. Delivery failures leave the
     /// row pending so the caller can retry.
-    pub(crate) async fn resume_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
+    pub async fn resume_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
         // Verify the agent is in pending interrupted state
         let rows = self.store.list_interrupted_agents().await?;
         let interrupted = rows
