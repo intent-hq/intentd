@@ -195,9 +195,10 @@ fn is_executable_file(p: &std::path::Path) -> bool {
 /// (same discovery dirs as `intent_context::discovery::enhanced_path_dirs`).
 fn find_in_enhanced_dirs(command: &str) -> Option<PathBuf> {
     let dirs = enhanced_path_dirs();
+    let candidates = name_candidates(command);
     for dir in &dirs {
-        for candidate in name_candidates(command) {
-            let full = dir.join(&candidate);
+        for candidate in &candidates {
+            let full = dir.join(candidate);
             if is_executable_file(&full) {
                 return Some(full);
             }
@@ -302,7 +303,12 @@ mod find_provider_binary_tests {
 
     #[test]
     fn find_provider_binary_returns_none_when_absent() {
-        let result = find_provider_binary("nonexistent", "no-such-binary", None);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let unique_cmd = format!("intent-test-absent-{}", nanos);
+        let result = find_provider_binary("nonexistent", &unique_cmd, None);
         assert_eq!(result, None);
     }
 
@@ -355,7 +361,12 @@ mod find_provider_binary_tests {
     #[test]
     fn find_provider_binary_returns_none_when_no_candidates_found() {
         // Verify function returns None when binary is not in any of the search locations
-        let result = find_provider_binary("test", "unlikely-name-12345", None);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let unique_cmd = format!("intent-test-nocand-{}", nanos);
+        let result = find_provider_binary("test", &unique_cmd, None);
         assert_eq!(result, None);
     }
 
