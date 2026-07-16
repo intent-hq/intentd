@@ -203,14 +203,21 @@ async fn stderr_capture_written_to_daily_log_file() {
     };
     let mut agent = spawn_provider(&opts, hooks).expect("spawn sh child");
 
-    let log_path = dir.join(intent_core::current_agent_log_file_name());
+    // Concatenate every daily file in the capture dir rather than assuming
+    // today's name: the writer rotates by UTC date, so a rollover between
+    // emit and read must not flake the test.
     let mut content = String::new();
     for _ in 0..100 {
-        if let Ok(c) = tokio::fs::read_to_string(&log_path).await {
-            content = c;
-            if content.contains("second line") {
-                break;
+        content.clear();
+        if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Ok(c) = tokio::fs::read_to_string(entry.path()).await {
+                    content.push_str(&c);
+                }
             }
+        }
+        if content.contains("second line") {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

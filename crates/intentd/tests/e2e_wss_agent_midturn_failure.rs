@@ -490,31 +490,39 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
     );
 
     // STAB-53: the mid-turn crash left the child's stderr captured under
-    // `<data_dir>/agent-logs/<agent-id>/<today>.log` — the mock logs every
-    // phase to stderr, including the deliberate exit inside session/prompt.
-    let capture_path = intent_core::agent_logs_root(&data_dir)
-        .join(&agent_id)
-        .join(intent_core::current_agent_log_file_name());
+    // `<data_dir>/agent-logs/<agent-id>/<YYYY-MM-DD>.log` — the mock logs
+    // every phase to stderr, including the deliberate exit inside
+    // session/prompt. Scan every daily file in the agent's capture dir
+    // rather than hard-coding today's name: the writer rotates by UTC date,
+    // so a midnight rollover between emit and read must not flake the test.
+    let capture_dir = intent_core::agent_logs_root(&data_dir).join(&agent_id);
     let mut captured = String::new();
     for _ in 0..100 {
-        if let Ok(c) = tokio::fs::read_to_string(&capture_path).await {
-            captured = c;
-            if captured.contains("exiting during prompt") {
-                break;
+        captured.clear();
+        if let Ok(mut entries) = tokio::fs::read_dir(&capture_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Ok(c) = tokio::fs::read_to_string(entry.path()).await {
+                    captured.push_str(&c);
+                }
             }
+        }
+        if captured.contains("exiting during prompt") {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(
         captured.contains("exiting during prompt"),
-        "stderr capture at {} holds the child's last words; got: {captured:?}",
-        capture_path.display()
+        "stderr capture under {} holds the child's last words; got: {captured:?}",
+        capture_dir.display()
     );
 
     // STAB-53: the terminal-failure WARN points at the capture path so the
-    // crash is diagnosable straight from the daemon log.
+    // crash is diagnosable straight from the daemon log. Match on the
+    // rollover-stable dir prefix (the hint's file name is the daemon's
+    // "today", which may differ across a midnight boundary).
     let daemon_log_path = data_dir.join("daemon.log");
-    let expected_hint = format!("agent stderr captured at {}", capture_path.display());
+    let expected_hint = format!("agent stderr captured at {}", capture_dir.display());
     let mut daemon_log = String::new();
     for _ in 0..100 {
         daemon_log = tokio::fs::read_to_string(&daemon_log_path)
