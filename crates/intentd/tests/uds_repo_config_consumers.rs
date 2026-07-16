@@ -432,3 +432,115 @@ async fn test_repo_instructions_in_system_prompt() {
     shutdown_tx.send(()).ok();
     let _ = server.await;
 }
+
+/// Regression test for PR #184 race condition: concurrent `script.list` calls
+/// on an empty workspace with repo config scripts must produce exactly one
+/// set of scripts (no duplicates). The fix uses a per-workspace async lock
+/// (WorkspaceScriptLocks) to serialize bootstrap operations.
+#[tokio::test]
+async fn concurrent_script_list_no_duplicates() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store.clone()));
+    let socket_path = std::env::temp_dir().join(format!("intentd-{}.sock", Uuid::new_v4()));
+
+    let repo = create_test_repo_with_config(
+        r#"{"scripts": [
+            {"name": "test", "command": "npm test", "mode": "command"},
+            {"name": "dev", "command": "npm run dev", "mode": "service"}
+        ]}"#,
+    );
+
+    // Create a workspace with the repo
+    use intent_core::WorkspaceCreate;
+    let input: WorkspaceCreate = serde_json::from_value(json!({
+        "repositoryPath": repo.0.to_string_lossy(),
+        "skipWorktree": true
+    }))
+    .unwrap();
+    let ws_id = services
+        .create_workspace(input, None)
+        .await
+        .expect("workspace create")
+        .workspace
+        .id
+        .to_string();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let _server = tokio::spawn({
+        let services = services.clone();
+        let bus = bus.clone();
+        let socket = socket_path.clone();
+        async move {
+            serve_uds(services, bus, &socket, None, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("serve_uds failed");
+        }
+    });
+
+    // Wait for socket
+    let stream = connect_retry(&socket_path).await;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // Fire 10 concurrent script.list calls — all should see the same workspace as empty
+    // initially, triggering the bootstrap path. With the fix, only one succeeds in
+    // bootstrapping; the others block and then find the already-bootstrapped scripts.
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let socket = socket_path.clone();
+        let ws_id = ws_id.clone();
+        handles.push(tokio::spawn(async move {
+            let stream = UnixStream::connect(&socket).await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let resp = call(
+                &mut write_half,
+                &mut reader,
+                i,
+                "script.list",
+                json!({ "workspaceId": ws_id }),
+            )
+            .await;
+            resp["result"]["scripts"].as_array().unwrap().len()
+        }));
+    }
+
+    // All 10 calls should return exactly 2 scripts (no duplicates)
+    for h in handles {
+        let count = h.await.unwrap();
+        assert_eq!(count, 2, "concurrent script.list created duplicates");
+    }
+
+    // Verify database contains exactly 2 script rows
+    let db_scripts = store
+        .list_all_scripts()
+        .await
+        .expect("list scripts from DB");
+    assert_eq!(
+        db_scripts.len(),
+        2,
+        "database should contain exactly 2 scripts, found {}",
+        db_scripts.len()
+    );
+
+    // Verify final script.list still returns 2
+    let final_resp = call(
+        &mut write_half,
+        &mut reader,
+        999,
+        "script.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        final_resp["result"]["scripts"].as_array().unwrap().len(),
+        2,
+        "final script.list should return 2 scripts"
+    );
+
+    shutdown_tx.send(()).ok();
+}
