@@ -337,9 +337,10 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 }
 
 
-/// Increment 3: baseline + child1 + kill daemon1 + boot daemon2 + connect (no resume yet).
+/// Increment 4: baseline + child1 + kill daemon1 + boot daemon2 + resolveInterrupted(child2).
+/// THIS is the increment that will show whether the hang is in the resume path or later.
 #[tokio::test]
-async fn baseline_plus_boot_daemon2() {
+async fn baseline_plus_resume_child2() {
     let Some(script) = gate("WSS after_all baseline (no restart)") else {
         return;
     };
@@ -568,8 +569,39 @@ async fn baseline_plus_boot_daemon2() {
         "subscribed to daemon2: {sub2_resp}"
     );
     let mut rpc2 = connect_ws(port2, cfg2).await;
-    eprintln!("Connected to daemon2. Test ends here for increment 3 (no resume yet).");
-    return; // Stop here for increment 3
+    eprintln!("Connected to daemon2.");
+
+    // Increment 4: call agent.resolveInterrupted to resume child2
+    // First, insert interrupted_agent row for child2 (the previous implementors manually did this)
+    eprintln!("Inserting interrupted_agent row for child2...");
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open store");
+    {
+        use intent_core::{now_iso, AgentId, WorkspaceId};
+        store
+            .insert_interrupted_agent(
+                &AgentId(child2_id.clone()),
+                &WorkspaceId(ws_id.to_string()),
+                "active",
+                &now_iso(),
+            )
+            .await
+            .expect("insert interrupted child2");
+    }
+    eprintln!("Interrupted_agent row inserted for child2.");
+
+    eprintln!("Calling agent.resolveInterrupted to resume child2...");
+    let resolve_resp = wss_rpc(
+        &mut rpc2,
+        30,
+        "agent.resolveInterrupted",
+        json!({ "resume": [child2_id.clone()] }),
+    )
+    .await;
+    eprintln!("agent.resolveInterrupted returned: {resolve_resp}");
+    eprintln!("Test ends here for increment 4 (no wait for child2 completion yet).");
+    return; // Stop here for increment 4
 
     // Phase 2 — children finish; the group fires ONE aggregated wake that runs
     // a real parent turn (stream lifecycle keyed by the parent, trailing idle)
