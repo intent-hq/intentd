@@ -656,21 +656,18 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     // Build pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
     // Only built when there's a token store (secure mode); `None` in insecure mode.
     // Available to UDS clients even when TCP is disabled (they can still call the RPCs).
-    let pairing_info: Option<Arc<dyn intent_transport::ServerPairingInfo>> = if insecure {
-        None
-    } else {
-        // Share the same AsyncTokenStore instance as the WSS listener
-        // so rotations propagate to the live auth layer.
-        let token_store = runtime
-            .token_store
-            .clone()
-            .expect("secure mode token_store");
-        Some(Arc::new(DaemonPairingInfo {
-            data_dir: config.data_dir.clone(),
-            token_store,
-            ws_runtime: runtime.clone(),
-        }))
-    };
+    let pairing_info: Option<Arc<dyn intent_transport::ServerPairingInfo>> =
+        if let Some(ref ts) = token_store {
+            // Share the same AsyncTokenStore instance as the WSS listener
+            // so rotations propagate to the live auth layer.
+            Some(Arc::new(DaemonPairingInfo {
+                data_dir: config.data_dir.clone(),
+                token_store: ts.clone(),
+                ws_runtime: runtime.clone(),
+            }))
+        } else {
+            None
+        };
 
     let shutdown = {
         let notify = shutdown_notify.clone();
@@ -895,10 +892,10 @@ impl intent_core::ServerControl for DaemonControl {
             };
 
             // Install pairing info provider (§5.2) on runtime-started servers
-            if runtime.token_store.is_some() {
+            if let Some(ref ts) = runtime.token_store {
                 let pairing_provider = Arc::new(DaemonPairingInfo {
                     data_dir: runtime.data_dir.clone(),
-                    token_store: runtime.token_store.clone().unwrap(),
+                    token_store: ts.clone(),
                     ws_runtime: self.ws_runtime.clone(),
                 })
                     as Arc<dyn intent_transport::ServerPairingInfo>;
