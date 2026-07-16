@@ -87,6 +87,10 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
+      # Oversubscribe the 4-vCPU runner: the e2e tests spend most of their
+      # time blocked on daemon startup/IO, not CPU (flake retries are handled
+      # by .config/nextest.toml).
+      NEXTEST_TEST_THREADS: 8
     steps:
       - name: Free disk space
         run: |
@@ -142,6 +146,10 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
+      # Oversubscribe the 4-vCPU runner: much of the suite is blocked on
+      # daemon startup/IO/timeouts, not CPU (flake retries are handled by
+      # .config/nextest.toml).
+      NEXTEST_TEST_THREADS: 8
     steps:
       - name: Free disk space
         run: |
