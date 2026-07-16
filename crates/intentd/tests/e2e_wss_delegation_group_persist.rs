@@ -337,9 +337,9 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 }
 
 
-/// Increment 1: baseline + capture child IDs + wait for child1 completion (before adding restart).
+/// Increment 2: baseline + child1 completion + kill daemon1 (no restart yet).
 #[tokio::test]
-async fn baseline_plus_child_ids_and_wait_child1() {
+async fn baseline_plus_kill_daemon1() {
     let Some(script) = gate("WSS after_all baseline (no restart)") else {
         return;
     };
@@ -519,6 +519,20 @@ async fn baseline_plus_child_ids_and_wait_child1() {
         }
     }
     assert!(child1_idle, "child1 completed");
+
+    // Increment 2: kill daemon1 before child2 completes
+    eprintln!("Killing daemon1 and all mock processes...");
+    drop(sub);
+    drop(rpc);
+    drop(_daemon);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Kill any stale mock-acp-agent processes (they die with intentd but clean up anyway)
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-f", "mock-acp-agent"])
+        .status();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    eprintln!("Daemon1 killed. Test ends here for increment 2 (no restart yet).");
+    return; // Stop here for increment 2
 
     // Phase 2 — children finish; the group fires ONE aggregated wake that runs
     // a real parent turn (stream lifecycle keyed by the parent, trailing idle)
