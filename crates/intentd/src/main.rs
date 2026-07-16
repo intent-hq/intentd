@@ -444,7 +444,10 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             Arc::new(BusEventSink::new(bus.clone())),
             process_cap,
         )
-        .with_policy(permission_policy),
+        .with_policy(permission_policy)
+        // STAB-53: capture each spawned child's stderr under
+        // `<data_dir>/agent-logs/<agent-id>/<YYYY-MM-DD>.log`.
+        .with_agent_log_root(intent_core::agent_logs_root(&config.data_dir)),
     );
     // Attach the manager to the services surface so the `agent.*` RPC handlers
     // drive the live spawn/turn/MCP loop at runtime (the shared `OnceLock` is
@@ -516,8 +519,13 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     let retention_task =
         spawn_stream_retention_loop(retention_store, config.stream_retention_hours);
     // Idempotency-key reaper (§5.4): hourly sweep deleting dedupe rows older than
-    // 24h so the `idempotency_key` table stays bounded. Aborted on clean shutdown.
-    let idempotency_reap_task = spawn_idempotency_reap_loop(idempotency_store);
+    // 24h so the `idempotency_key` table stays bounded. The same cadence prunes
+    // per-agent stderr capture files older than 7 days (STAB-53); the first tick
+    // fires immediately so both sweeps run on startup. Aborted on clean shutdown.
+    let idempotency_reap_task = spawn_idempotency_reap_loop(
+        idempotency_store,
+        intent_core::agent_logs_root(&config.data_dir),
+    );
     // External MCP servers (§18.3): start every enabled, non-disabled server,
     // then run the health monitor (periodic ping + auto-restart pushing
     // `mcp.servers:status-changed`). The hub is reaped on shutdown so no orphan
@@ -1340,10 +1348,15 @@ fn spawn_stream_retention_loop(
 
 /// Spawn the periodic idempotency-key reaper (design note TB-0 §5.4). Runs
 /// ~hourly: deletes `idempotency_key` rows whose `created_at` is older than 24h
-/// (via `idx_idempotency_created`), bounding the dedupe store. The first tick
-/// fires immediately so a long-lived daemon trims on startup; a failed sweep is
-/// logged and retried on the next tick (never aborts the loop).
-fn spawn_idempotency_reap_loop(store: Store) -> tokio::task::JoinHandle<()> {
+/// (via `idx_idempotency_created`), bounding the dedupe store. The same tick
+/// prunes per-agent stderr capture files older than 7 days under
+/// `agent_log_root` (STAB-53). The first tick fires immediately so a long-lived
+/// daemon trims on startup; a failed sweep is logged and retried on the next
+/// tick (never aborts the loop).
+fn spawn_idempotency_reap_loop(
+    store: Store,
+    agent_log_root: std::path::PathBuf,
+) -> tokio::task::JoinHandle<()> {
     const RETENTION_HOURS: i64 = 24;
     let interval = Duration::from_secs(3600);
     tracing::info!(
@@ -1363,6 +1376,16 @@ fn spawn_idempotency_reap_loop(store: Store) -> tokio::task::JoinHandle<()> {
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "idempotency reaper sweep failed"),
+            }
+            match intent_core::sweep_agent_logs(
+                &agent_log_root,
+                Duration::from_secs(intent_core::AGENT_LOG_RETENTION_DAYS * 86_400),
+            ) {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(removed, "agent stderr log sweep pruned old capture files");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "agent stderr log sweep failed"),
             }
         }
     })

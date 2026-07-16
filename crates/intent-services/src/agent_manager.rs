@@ -682,6 +682,10 @@ pub struct AgentManager {
     permissions: Arc<PermissionRegistry>,
     policy: PermissionPolicy,
     mcp_bridge_exe: PathBuf,
+    /// Root the per-agent stderr capture files live under (STAB-53), laid out
+    /// as `<root>/<agent-id>/<YYYY-MM-DD>.log`. The composition root wires
+    /// `<data_dir>/agent-logs`; `None` (tests / bare wiring) disables capture.
+    agent_log_root: Option<PathBuf>,
     /// Agents with an in-flight turn loop (a worker is draining their stream).
     /// `agent.sendMessage` consults this to flip a message to the queue while a
     /// turn is mid-stream (the TS "queue while streaming" semantics).
@@ -760,6 +764,7 @@ impl AgentManager {
             // `AutoByRisk` / `DenyAll` remain selectable via the same env var.
             policy: PermissionPolicy::AllowAll,
             mcp_bridge_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("intentd")),
+            agent_log_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
@@ -785,6 +790,23 @@ impl AgentManager {
     pub fn with_mcp_bridge_exe(mut self, exe: impl Into<PathBuf>) -> Self {
         self.mcp_bridge_exe = exe.into();
         self
+    }
+
+    /// Enable per-agent stderr capture (STAB-53): every spawned child's stderr
+    /// is appended to `<root>/<agent-id>/<YYYY-MM-DD>.log`. The composition
+    /// root passes `intent_core::agent_logs_root(&config.data_dir)`.
+    pub fn with_agent_log_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.agent_log_root = Some(root.into());
+        self
+    }
+
+    /// Today's stderr capture path for `agent_id`, when capture is enabled —
+    /// the "agent stderr captured at …" hint on terminal-failure WARN lines.
+    fn agent_stderr_log_path(&self, agent_id: &AgentId) -> Option<PathBuf> {
+        self.agent_log_root.as_ref().map(|root| {
+            root.join(&agent_id.0)
+                .join(intent_core::current_agent_log_file_name())
+        })
     }
 
     /// Borrow the process registry (lifecycle / diagnostics).
@@ -950,6 +972,13 @@ impl AgentManager {
                 .auth_error_patterns
                 .map(|p| p.iter().map(|s| s.to_string()).collect())
                 .unwrap_or_default(),
+            // STAB-53: capture the child's stderr under
+            // `<agent-logs>/<agent-id>/<YYYY-MM-DD>.log` so a child that dies
+            // mid-turn leaves a diagnosable trace.
+            stderr_log_dir: self
+                .agent_log_root
+                .as_ref()
+                .map(|root| root.join(&agent_id.0)),
         };
         // Pre-first-token turn-startup hint: the child process is about to be
         // spawned for this agent, so surface the `launch` phase before the
@@ -2618,7 +2647,19 @@ async fn run_message_worker(
                         // Keep draining: any queued message re-spawns lazily.
                         tracing::warn!(agent = %agent_id, error = %e, "agent turn ended (benign)");
                     } else {
-                        tracing::warn!(agent = %agent_id, error = %e, "agent turn failed terminally");
+                        // STAB-53: on a child-death failure, point at the
+                        // captured stderr file so the crash is diagnosable.
+                        match stderr_capture_hint(&mgr, &agent_id, &e) {
+                            Some(log) => tracing::warn!(
+                                agent = %agent_id,
+                                error = %e,
+                                "agent turn failed terminally (agent stderr captured at {})",
+                                log.display()
+                            ),
+                            None => {
+                                tracing::warn!(agent = %agent_id, error = %e, "agent turn failed terminally")
+                            }
+                        }
                         handle_terminal_turn_failure(
                             &mgr,
                             &agent_id,
@@ -2637,7 +2678,17 @@ async fn run_message_worker(
                 }
             }
             Err(e) => {
-                tracing::warn!(agent = %agent_id, error = %e, "agent spawn failed after all retries");
+                match stderr_capture_hint(&mgr, &agent_id, &e) {
+                    Some(log) => tracing::warn!(
+                        agent = %agent_id,
+                        error = %e,
+                        "agent spawn failed after all retries (agent stderr captured at {})",
+                        log.display()
+                    ),
+                    None => {
+                        tracing::warn!(agent = %agent_id, error = %e, "agent spawn failed after all retries")
+                    }
+                }
                 handle_terminal_spawn_failure(
                     &mgr,
                     &agent_id,
@@ -3057,6 +3108,20 @@ fn is_benign_turn_error(err: &Error) -> bool {
         return true;
     }
     prompt_cancellation_error(err)
+}
+
+/// STAB-53: when a terminal failure means the child died mid-turn ("agent
+/// stdout closed") and stderr capture is enabled, return today's capture path
+/// for `agent_id` so the WARN line can point at the child's last words.
+fn stderr_capture_hint(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    err: &Error,
+) -> Option<std::path::PathBuf> {
+    if !err.to_string().contains("agent stdout closed") {
+        return None;
+    }
+    mgr.agent_stderr_log_path(agent_id)
 }
 
 /// Whether `run_prompt_turn` already emitted the terminal `agent:failed` +
