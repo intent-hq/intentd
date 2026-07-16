@@ -4,6 +4,20 @@
 //! (`src/shared/config/provider-config.ts`). Each entry is data; adding a
 //! provider is a config change, not a code change.
 
+/// The runtime a provider's subprocess executes on. Drives runtime-specific
+/// env assembly — V8-backed runtimes (`Node`, `Electron`) get a
+/// `--max-old-space-size` heap cap injected via `NODE_OPTIONS` (STAB-50);
+/// `Native` binaries are left untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderRuntime {
+    /// Plain Node.js subprocess (V8).
+    Node,
+    /// Electron binary run with `ELECTRON_RUN_AS_NODE=1` (still V8).
+    Electron,
+    /// Natively-compiled binary — not V8, no NODE_OPTIONS handling.
+    Native,
+}
+
 /// Configuration for an ACP provider (port of `ACPProviderConfig`).
 ///
 /// UI-only fields from the TS interface (`ipcChannelPrefix`, `iconPath`) are
@@ -13,6 +27,8 @@
 pub struct ProviderConfig {
     /// Unique identifier (e.g., `auggie`, `opencode`).
     pub id: &'static str,
+    /// Runtime the provider subprocess executes on (see [`ProviderRuntime`]).
+    pub runtime: ProviderRuntime,
     /// Display name shown in UI (e.g., `Augment Auggie`).
     pub display_name: &'static str,
     /// CLI command to spawn the agent.
@@ -69,6 +85,9 @@ impl ProviderConfig {
     const fn empty(id: &'static str, display_name: &'static str, command: &'static str) -> Self {
         Self {
             id,
+            // Safest "do nothing" default: `Native` opts out of NODE_OPTIONS
+            // injection. V8-backed providers override this per entry.
+            runtime: ProviderRuntime::Native,
             display_name,
             command,
             base_args: &[],
@@ -109,6 +128,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
     // shipped `AllowAll` policy the local auto-approve path in
     // `ClientRequestHandler` remains authoritative for auggie sessions.
     ProviderConfig {
+        runtime: ProviderRuntime::Node,
         base_args: &["--acp", "--allow-indexing"],
         model_flag: Some("--model"),
         supports_authenticate: true,
@@ -129,6 +149,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         ..ProviderConfig::empty("auggie", "Augment Auggie", "auggie")
     },
     ProviderConfig {
+        runtime: ProviderRuntime::Node,
         can_be_disabled: true,
         auth_check_args: Some(&["auth", "status"]),
         login_docs_url: Some(
@@ -137,17 +158,22 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {
+        // Rust binary — Native (the `empty()` default): no V8 heap-cap env.
         can_be_disabled: true,
         auth_check_args: Some(&["login", "status"]),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
         ..ProviderConfig::empty("codex", "OpenAI Codex", "codex-acp")
     },
     ProviderConfig {
+        // Electron binary run with `ELECTRON_RUN_AS_NODE=1` — still V8, so it
+        // gets the NODE_OPTIONS heap cap like plain Node providers (STAB-50).
+        runtime: ProviderRuntime::Electron,
         can_be_disabled: true,
         requires_feature_code: Some("cortex"),
         ..ProviderConfig::empty("cortex", "Snowflake Cortex", "cortex-acp")
     },
     ProviderConfig {
+        runtime: ProviderRuntime::Node,
         base_args: &["acp"],
         can_be_disabled: true,
         auth_check_args: Some(&["models"]),
@@ -155,6 +181,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         ..ProviderConfig::empty("opencode", "OpenCode", "opencode")
     },
     ProviderConfig {
+        // Native binary (the `empty()` default): no V8 heap-cap env.
         base_args: &["exec", "--output-format", "acp"],
         model_flag: Some("--model"),
         can_be_disabled: true,
@@ -162,6 +189,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         ..ProviderConfig::empty("droid", "Factory Droid", "droid")
     },
     ProviderConfig {
+        runtime: ProviderRuntime::Node,
         supports_authenticate: true,
         can_be_disabled: true,
         requires_env_var: Some("MOCK_AGENT_SCRIPT_PATH"),

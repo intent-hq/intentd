@@ -1,7 +1,9 @@
 //! intent-providers — provider registry + launch arg/env assembly + model
 //! resolution (§3.1, §6.9).
 //!
-//! Depends on `intent-core` only (§3.2). Provider quirks are data, not code:
+//! Depends on `intent-core` plus `tracing` (§3.2; `tracing` is needed only to
+//! WARN when the `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB` override fails to parse).
+//! Provider quirks are data, not code:
 //! the [`ProviderConfig`] registry ([`ACP_PROVIDERS`]) ports
 //! `provider-config.ts` so adding a provider is a config change. Arg/env
 //! assembly and PATH enrichment ([`args`]) are pure helpers (no spawning/IO —
@@ -21,7 +23,7 @@ pub use args::{
 pub use config::{
     all_provider_ids, always_enabled_providers, auth_error_message, default_provider_config,
     default_provider_id, disableable_providers, find_provider, is_provider_authentication_error,
-    provider_config, ProviderConfig, ACP_PROVIDERS,
+    provider_config, ProviderConfig, ProviderRuntime, ACP_PROVIDERS,
 };
 pub use discover::{discover_providers, resolve_on_path, ProviderAvailability};
 pub use models::{
