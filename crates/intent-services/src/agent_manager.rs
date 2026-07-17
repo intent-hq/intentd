@@ -2354,6 +2354,9 @@ impl AgentManager {
             };
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
             // Use get_agent_session_status (lightweight, skips message log).
+            // RACE: try_begin inserts into busy BEFORE persist_status(Active) completes, so
+            // shutdown in that window may read Pending. Busy-set membership is authoritative:
+            // if the agent is in busy, it's mid-turn regardless of the persisted status.
             let prev_status = match self.services.store.get_agent_session_status(id).await {
                 Ok(status) => status,
                 Err(e) => {
@@ -2363,9 +2366,26 @@ impl AgentManager {
             };
             // Serialize the status via serde to match the DB form (e.g., "active", "Waiting").
             // If encoding fails or produces a non-string, skip this agent (do not persist an
-            // undocumented status string).
+            // undocumented status string). If the persisted status is non-in-flight (e.g.,
+            // Pending due to the try_begin race), fall back to "active" — busy membership
+            // proves the agent is mid-turn.
             let prev_str = match serde_json::to_value(prev_status) {
-                Ok(serde_json::Value::String(s)) => s,
+                Ok(serde_json::Value::String(s)) => {
+                    // Non-in-flight statuses (pending/idle/error/deleted) mean we raced with
+                    // persist_status. Busy membership is authoritative: use "active".
+                    if matches!(
+                        prev_status,
+                        AgentStatus::Pending
+                            | AgentStatus::RuntimeIdle
+                            | AgentStatus::Idle
+                            | AgentStatus::Error
+                            | AgentStatus::Deleted
+                    ) {
+                        "active".to_string()
+                    } else {
+                        s
+                    }
+                }
                 Ok(other) => {
                     tracing::warn!(agent_id = %id, status = ?prev_status, encoded = ?other, "graceful shutdown: status encoded to non-string, skipping interrupted_agent row");
                     continue;

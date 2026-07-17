@@ -16,7 +16,7 @@
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -223,14 +223,21 @@ where
 }
 
 /// Read one `events.event` notification from a subscriber connection (bounded).
+/// The timeout is total (not per-frame), so heartbeat Pings do not reset it.
 async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let remaining = match deadline.checked_duration_since(tokio::time::Instant::now()) {
+            Some(d) if !d.is_zero() => d,
+            _ => panic!("wss event timed out"),
+        };
+        let next = match timeout(remaining, ws.next()).await {
+            Ok(next) => next,
+            Err(_) => panic!("wss event timed out"),
+        };
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -436,6 +443,20 @@ fn gate(test: &str) -> Option<String> {
     Some(script)
 }
 
+/// Live `intentd serve` process; killed on drop. Prevents daemon + Node mock
+/// leaks if the test panics before shutdown. Does not clean up data_dir — the test
+/// should do that explicitly at the very end (or rely on temp-dir auto-cleanup).
+struct Daemon {
+    child: Child,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[tokio::test]
 async fn graceful_shutdown_captures_interrupted_agents() {
     let Some(script) = gate("graceful_shutdown_captures_interrupted_agents") else {
@@ -484,7 +505,8 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         ));
     #[cfg(unix)]
     cmd1.process_group(0);
-    let mut daemon = cmd1.spawn().expect("spawn intentd serve");
+    let child = cmd1.spawn().expect("spawn intentd serve");
+    let mut daemon = Daemon { child };
     if !await_uds(&socket).await {
         let log_path = data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
@@ -551,7 +573,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     );
 
     // Now trigger graceful shutdown via system.shutdown RPC over UDS (system.*
-    // methods are not exposed via WSS, only via local UDS — see ws.rs:526-527).
+    // is UDS-only; see PROTOCOL §5.7).
     let shutdown_result = uds_rpc(&socket, 13, "system.shutdown", json!({})).await;
     assert_eq!(shutdown_result["result"].get("ok"), Some(&json!(true)));
     assert_eq!(
@@ -560,10 +582,10 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     );
 
     // Wait for daemon to exit gracefully (up to 10 seconds).
-    // daemon.wait() is blocking, so we poll for process death.
+    // daemon.child.wait() is blocking, so we poll for process death.
     let exit_ok = timeout(Duration::from_secs(10), async {
         loop {
-            match daemon.try_wait() {
+            match daemon.child.try_wait() {
                 Ok(Some(status)) => return status.success(),
                 Ok(None) => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -576,6 +598,8 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     .expect("daemon did not exit within timeout");
     // Graceful shutdown should exit 0.
     assert!(exit_ok, "daemon exited non-zero");
+    // Explicitly drop the first Daemon so its Drop guard doesn't kill data_dir cleanup.
+    std::mem::drop(daemon);
 
     // Phase 2: Restart daemon — should list the interrupted agent.
     let mut cmd2 = Command::new(env!("CARGO_BIN_EXE_intentd"));
@@ -591,7 +615,8 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         ));
     #[cfg(unix)]
     cmd2.process_group(0);
-    daemon = cmd2.spawn().expect("spawn intentd serve 2");
+    let child2 = cmd2.spawn().expect("spawn intentd serve 2");
+    let _daemon2 = Daemon { child: child2 };
     assert!(await_uds(&socket).await, "daemon did not restart");
 
     let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
@@ -623,8 +648,8 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     );
     assert!(interrupted["interruptedAt"].is_string());
 
-    daemon.kill().ok();
-    daemon.wait().ok();
+    // Daemon Drop guard will kill the process. Clean up data_dir explicitly.
+    std::fs::remove_dir_all(&data_dir).ok();
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
