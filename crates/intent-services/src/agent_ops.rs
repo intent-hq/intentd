@@ -2007,11 +2007,10 @@ impl Services {
                     );
                     continue;
                 }
-                // Remove the oneShot watch so agent:idle does NOT deliver a second wake.
-                self.remove_watch(&workspace_id, &watch.id);
-                // Publish subscriptions-changed to reflect the watch removal.
-                self.publish_subscriptions_changed(&workspace_id, &watch.parent_agent_id)
-                    .await;
+                // Mark the watch as report-delivered so agent:idle does NOT deliver
+                // a second wake, but agent:failed / agent:deleted still do (failure
+                // after reporting is a new signal, not a duplicate).
+                self.mark_watch_report_delivered(&workspace_id, &watch.id);
             }
         }
 

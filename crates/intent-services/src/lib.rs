@@ -1624,6 +1624,24 @@ impl Services {
                 self.try_fire_group(workspace_id, &gid).await;
                 continue;
             }
+            // Report-time wake suppression: if the watch has already delivered the
+            // report wake (via agent.reportToParent), skip delivery ONLY for
+            // agent:idle. agent:failed / agent:deleted still deliver (failure after
+            // reporting is a new signal, not a duplicate).
+            if watch.report_delivered && event.event_type == intent_core::events::AGENT_IDLE {
+                tracing::debug!(
+                    child = %child_id.0,
+                    parent = %watch.parent_agent_id.0,
+                    "skipping agent:idle wake — report already delivered at reportToParent time"
+                );
+                // Remove the oneShot watch now that the completion cycle is done.
+                if watch.one_shot {
+                    self.remove_watch(workspace_id, &watch.id);
+                    self.publish_subscriptions_changed(workspace_id, &watch.parent_agent_id)
+                        .await;
+                }
+                continue;
+            }
             // Wave B (STAB-18 fix): remove oneShot watch BEFORE delivery so a
             // reprocessed event or reentrant loop cannot deliver the same
             // completion twice. The watch is atomically removed from the registry;
