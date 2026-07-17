@@ -241,7 +241,7 @@ async fn test_workspace_create_setup_script_fallback() {
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd);
 
-    // Test 1: repo setupScript is used when request omits it
+    // Test 1: repo setupScript is readable via workspace.getSetupScript
     let repo1 = create_test_repo_with_config(r#"{"setupScript": "npm install"}"#);
     let repo_path1 = repo1.0.to_str().unwrap();
 
@@ -253,17 +253,40 @@ async fn test_workspace_create_setup_script_fallback() {
         json!({ "repositoryPath": repo_path1 }),
     )
     .await;
+    let ws_id1 = resp1["result"]["workspace"]["id"].as_str().unwrap();
 
+    // Workspace DB row should NOT have setupScript (retired field)
     assert_eq!(
-        resp1["result"]["workspace"]["setupScript"]["script"],
-        json!("npm install")
+        resp1["result"]["workspace"].get("setupScript"),
+        None,
+        "workspace DB row should not have setupScript"
+    );
+
+    // But getSetupScript should return the repo config value
+    let get_resp1 = call(
+        &mut wr,
+        &mut reader,
+        10,
+        "workspace.getSetupScript",
+        json!({ "workspaceId": ws_id1 }),
+    )
+    .await;
+    assert_eq!(
+        get_resp1["result"]["setupScript"]["script"],
+        json!("npm install"),
+        "getSetupScript should return repo config value"
     );
     assert_eq!(
-        resp1["result"]["workspace"]["setupScript"]["generatedBy"],
-        json!("user")
+        get_resp1["result"]["setupScript"]["generatedBy"],
+        json!("user"),
+        "generatedBy should be user for repo config scripts"
+    );
+    assert!(
+        get_resp1["result"]["setupScript"]["updatedAt"].is_number(),
+        "updatedAt should be present (file mtime)"
     );
 
-    // Test 2: request-supplied script wins over repo config
+    // Test 2: request-supplied script is written to repo config
     let repo2 = create_test_repo_with_config(r#"{"setupScript": "npm install"}"#);
     let repo_path2 = repo2.0.to_str().unwrap();
 
@@ -278,14 +301,37 @@ async fn test_workspace_create_setup_script_fallback() {
         }),
     )
     .await;
+    let ws_id2 = resp2["result"]["workspace"]["id"].as_str().unwrap();
 
+    // Workspace DB row should NOT have setupScript
     assert_eq!(
-        resp2["result"]["workspace"]["setupScript"]["script"],
-        json!("yarn install")
+        resp2["result"]["workspace"].get("setupScript"),
+        None,
+        "workspace DB row should not have setupScript"
+    );
+
+    // getSetupScript should return the explicit request-supplied value
+    let get_resp2 = call(
+        &mut wr,
+        &mut reader,
+        11,
+        "workspace.getSetupScript",
+        json!({ "workspaceId": ws_id2 }),
+    )
+    .await;
+    assert_eq!(
+        get_resp2["result"]["setupScript"]["script"],
+        json!("yarn install"),
+        "getSetupScript should return request-supplied value"
     );
     assert_eq!(
-        resp2["result"]["workspace"]["setupScript"]["generatedBy"],
-        json!("user")
+        get_resp2["result"]["setupScript"]["generatedBy"],
+        json!("user"),
+        "generatedBy should be user for explicit scripts"
+    );
+    assert!(
+        get_resp2["result"]["setupScript"]["updatedAt"].is_number(),
+        "updatedAt should be present"
     );
 
     shutdown_tx.send(()).ok();

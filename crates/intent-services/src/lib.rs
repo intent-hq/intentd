@@ -287,6 +287,19 @@ pub struct Services {
     /// reseeds from disk. Shared across clones like the other in-memory
     /// registries.
     crdt_notes: Arc<crdt_notes::CrdtNoteManager>,
+    /// Per-workspace debouncers for `workspace:updated { lastActivity }` event
+    /// emission (§10.1). Each write that can move derived `lastActivity`
+    /// schedules a trailing-edge debounced emit; rapid bumps coalesce into one
+    /// event carrying the latest value. Shared across clones so all service
+    /// handles observe the same pending timers. In-memory only (no persistence);
+    /// pending timers are dropped on daemon shutdown without flushing.
+    ///
+    /// To prevent race conditions where an old task removes a newer handle, each
+    /// entry stores a generation counter alongside the abort handle. Tasks only
+    /// remove their own entry if the generation still matches.
+    last_activity_debouncers: Arc<Mutex<HashMap<WorkspaceId, (u64, tokio::task::AbortHandle)>>>,
+    /// Generation counter for debounce tasks (incremented on each schedule).
+    last_activity_debounce_gen: Arc<Mutex<u64>>,
     /// REV-1 agent-initiated reverse-dispatch seam: when an agent calls
     /// `ws.browser.exec` via the MCP front door there is no ambient client
     /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
@@ -341,6 +354,8 @@ impl Services {
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
+            last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
+            last_activity_debounce_gen: Arc::new(Mutex::new(0)),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
         }
@@ -540,6 +555,102 @@ impl Services {
         }
         if activity_max.is_some() {
             ws.last_activity = activity_max;
+        }
+    }
+
+    /// Schedule a debounced `workspace:updated { changes: { lastActivity } }` event
+    /// emission for the workspace (§10.1). Recomputes the derived `lastActivity` via
+    /// the existing aggregation and emits the event only when it differs from the
+    /// previously known value. Rapid calls for the same workspace coalesce into at most
+    /// one event per `LAST_ACTIVITY_DEBOUNCE_MS` window, carrying the latest derived
+    /// value. Cancels any pending timer for the workspace before scheduling a new one.
+    /// Best-effort: store/emit failures are logged but do not surface to the caller.
+    pub(crate) fn schedule_last_activity_event(&self, workspace_id: WorkspaceId) {
+        // Cancel any pending debounce timer for this workspace and increment generation.
+        let gen = if let Ok(mut gen_lock) = self.last_activity_debounce_gen.lock() {
+            *gen_lock = gen_lock.wrapping_add(1);
+            *gen_lock
+        } else {
+            0
+        };
+
+        if let Ok(mut debouncers) = self.last_activity_debouncers.lock() {
+            if let Some((_, handle)) = debouncers.remove(&workspace_id) {
+                handle.abort();
+            }
+        }
+
+        // Clone the state we'll need in the spawned task.
+        let this = self.clone();
+        let debouncers = self.last_activity_debouncers.clone();
+        let ws_id = workspace_id.clone();
+
+        // Debounce window: production constant, overridable via env for tests.
+        let debounce_ms = std::env::var("LAST_ACTIVITY_DEBOUNCE_TEST_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(LAST_ACTIVITY_DEBOUNCE_MS);
+
+        // Spawn a task that sleeps for the debounce window, then derives + emits.
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
+
+            // Get the current workspace and capture its old lastActivity.
+            let mut ws = match this.store.get_workspace(&ws_id).await {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(workspace = %ws_id.as_str(), error = %e, "schedule_last_activity_event: get_workspace failed");
+                    return;
+                }
+            };
+            let old_activity = ws.last_activity.clone();
+
+            // Recompute lastActivity via the existing aggregation.
+            this.derive_last_activity(&mut ws).await;
+            let new_activity = ws.last_activity.clone();
+
+            // Emit only when the derived value changed.
+            if old_activity != new_activity {
+                if let Some(new_val) = &new_activity {
+                    publish_event(
+                        &this.event_bus,
+                        workspace_updated_event(
+                            &ws_id,
+                            serde_json::json!({ "lastActivity": new_val }),
+                        ),
+                    )
+                    .await;
+                }
+            }
+
+            // Remove ourselves from the debouncers map only if we're still the current task.
+            if let Ok(mut map) = debouncers.lock() {
+                if let Some((current_gen, _)) = map.get(&ws_id) {
+                    if *current_gen == gen {
+                        map.remove(&ws_id);
+                    }
+                }
+            }
+        });
+
+        // Store the abort handle with generation. Only insert if no entry exists or our
+        // generation is newer (prevents older schedules from overwriting newer ones).
+        if let Ok(mut map) = self.last_activity_debouncers.lock() {
+            let should_insert = map
+                .get(&workspace_id)
+                .map(|(existing_gen, _)| gen > *existing_gen)
+                .unwrap_or(true);
+
+            if should_insert {
+                if let Some((_, old_handle)) =
+                    map.insert(workspace_id, (gen, handle.abort_handle()))
+                {
+                    old_handle.abort();
+                }
+            } else {
+                // Our generation is older; abort this task immediately.
+                handle.abort();
+            }
         }
     }
 
@@ -825,6 +936,8 @@ impl Services {
             attention_changed_event(&ws.id, ws.attention),
         )
         .await;
+        // Schedule debounced lastActivity event (§10.1).
+        self.schedule_last_activity_event(workspace_id.clone());
         Ok(())
     }
 
@@ -1341,6 +1454,8 @@ impl Services {
             token_usage_changed_event(workspace_id, &usage),
         )
         .await;
+        // Schedule debounced lastActivity event (§10.1).
+        self.schedule_last_activity_event(workspace_id.clone());
         Ok(true)
     }
 
@@ -2207,6 +2322,12 @@ fn latest_activity_candidate(candidates: &[Option<&str>]) -> Option<String> {
     }
     best.map(|(_, s)| s)
 }
+
+/// Trailing-edge debounce window for `workspace:updated { lastActivity }` event
+/// emission (§10.1). Production value (~3 seconds) keeps the FE sidebar live
+/// without event storms during agent streaming; tests override with a short
+/// window (see `LAST_ACTIVITY_DEBOUNCE_TEST_MS` env var).
+const LAST_ACTIVITY_DEBOUNCE_MS: u64 = 3000;
 
 /// Conservative allowlist of remote names whose first path segment may be
 /// stripped when canonicalising a workspace `baseRef` on write. Mirrors the
@@ -5143,26 +5264,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn search_memories(
-        &self,
-        query: String,
-        workspace_id: Option<WorkspaceId>,
-        request_id: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let registry = self.search_cancels.clone();
-        let services = self.clone();
-        Box::pin(async move {
-            let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let token = registry.register(&request_id);
-            // `workspaceId` is optional: scope to it when present, else span all.
-            let memories = memories::list(&store, workspace_id.as_ref()).await?;
-            let matches = search_ops::memory_matches(&memories, &query);
-            let matches = to_value_vec(matches)?;
-            Ok(services.deliver_search(request_id, workspace_id, matches, token))
-        })
-    }
-
     fn search_notes(
         &self,
         query: String,
@@ -6050,26 +6151,17 @@ impl WorkspaceApi for Services {
                         .title
                         .map(|t| t.trim().to_string())
                         .unwrap_or_default();
-                    // Setup script fallback: request > repo config > none
-                    // (FE parity: workspace.service.ts L1788-1791).
-                    let setup_script = match input.setup_script.clone().filter(|s| !s.is_empty()) {
-                        Some(explicit) => Some(setup_scripts::user_script(explicit)),
-                        None => {
-                            if let Some(repo_path) = input
-                                .repository_path
-                                .as_deref()
-                                .filter(|p| !p.is_empty())
-                                .map(PathBuf::from)
-                            {
-                                let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
-                                repo_config.setup_script
-                                    .filter(|s| !s.is_empty())
-                                    .map(setup_scripts::user_script)
-                            } else {
-                                None
-                            }
-                        }
-                    };
+                    // Setup script write (§5.25 repo-config sole source of truth):
+                    // when an explicit non-empty `setupScript` is provided, write it
+                    // into the repo config; otherwise leave the repo config alone
+                    // (the existing `setupScript` key, if any, remains readable).
+                    // The workspace DB row's `setup_script` column is retired from
+                    // the write path — it stays NULL (wire compat) and the read path
+                    // (§5.25) routes through the repo config with a legacy fallback.
+                    // Stash explicit setupScript for write AFTER worktree provisioning
+                    // (must land in the workspace's worktree, not the repo root, to be
+                    // visible as a committable change in the workspace).
+                    let explicit_setup_script = input.setup_script.clone().filter(|s| !s.is_empty());
                     let mut ws = Workspace {
                         id,
                         title,
@@ -6099,7 +6191,7 @@ impl WorkspaceApi for Services {
                         worktree_path: input.worktree_path,
                         scope: input.scope,
                         skip_worktree: input.skip_worktree.unwrap_or(false),
-                        setup_script,
+                        setup_script: None,
                         is_remote: input.is_remote.unwrap_or(false),
                         default_model: input.default_model,
                         pr_number: None,
@@ -6185,6 +6277,41 @@ impl WorkspaceApi for Services {
                         }
                     }
                     store.insert_workspace(&ws).await?;
+                    // Write explicit setupScript to the workspace's worktree (AFTER provisioning
+                    // so git_ops::worktree_path resolves correctly). Must land as a committable
+                    // change in the workspace, visible in the workspace's diff view.
+                    // Best-effort — a failure warns and continues (matches post-insert pattern
+                    // for other filesystem operations like .workspace/workspace.json).
+                    if let Some(explicit) = explicit_setup_script {
+                        // Use git_ops::worktree_path (worktreePath first, repositoryPath fallback)
+                        // to match getSetupScript/saveSetupScript and other repoConfig.* methods.
+                        match git_ops::worktree_path(&ws) {
+                            Some(repo_path) => {
+                                let mut repo_config =
+                                    crate::repo_config::read_repo_config(&repo_path).await;
+                                // Only write if the script differs (no-op when identical).
+                                if repo_config.setup_script.as_deref() != Some(explicit.as_str()) {
+                                    repo_config.setup_script = Some(explicit.clone());
+                                    if let Err(e) =
+                                        crate::repo_config::write_repo_config(&repo_path, repo_config)
+                                            .await
+                                    {
+                                        tracing::warn!(
+                                            workspace = %ws.id.as_str(),
+                                            error = %e,
+                                            "workspace.create: failed to write explicit setupScript to repo config"
+                                        );
+                                    }
+                                }
+                            }
+                            None => {
+                                tracing::warn!(
+                                    workspace = %ws.id.as_str(),
+                                    "workspace.create: cannot persist setupScript; worktreePath and repositoryPath both empty"
+                                );
+                            }
+                        }
+                    }
                     // Write the legacy `<root>/<id>/.workspace/workspace.json`
                     // file so renderer paths (FE `FileSystemWorkspaceRepository`)
                     // find their per-workspace metadata without ENOENT spam.
@@ -6330,20 +6457,49 @@ impl WorkspaceApi for Services {
                         let child = AgentId::from(
                             created["agent"]["id"].as_str().unwrap_or_default(),
                         );
-                        // Deliver the prompt and start the first turn only
-                        // when one was supplied (delegate parity): the runtime
-                        // `AgentManager` when attached, else the store-only
-                        // persist. Best-effort like the delegate path — the
+                        // Extract image_blocks and context_references from the created
+                        // agent (STAB-69: thread them into the first turn so imageBlocks
+                        // attached to the initial prompt reach the ACP).
+                        let created_image_blocks = created
+                            .get("agent")
+                            .and_then(|a| a.get("imageBlocks"))
+                            .filter(|v| !v.is_null())
+                            .cloned();
+                        let created_context_refs = created
+                            .get("agent")
+                            .and_then(|a| a.get("contextReferences"))
+                            .filter(|v| !v.is_null())
+                            .cloned();
+                        // Deliver the prompt and start the first turn when a prompt OR
+                        // imageBlocks are supplied (STAB-69: image-only first messages
+                        // should start a turn, consistent with agent.sendMessage
+                        // semantics). The runtime `AgentManager` when attached, else the
+                        // store-only persist. Best-effort like the delegate path — the
                         // agent holds `metadata.initialMessage` for resume.
-                        if let Some(prompt) = prompt {
+                        let has_content = prompt.is_some() || created_image_blocks.is_some();
+                        if has_content {
+                            let prompt_text = prompt.unwrap_or_default();
+                            let options = crate::agent_manager::TurnOptions {
+                                image_blocks: created_image_blocks.clone(),
+                                context_references: created_context_refs,
+                                ..crate::agent_manager::TurnOptions::default()
+                            };
                             let send = match services.agent_manager() {
                                 Some(manager) => {
                                     manager
-                                        .send_message(child, ws.id.clone(), prompt, None, crate::agent_manager::TurnOptions::default())
+                                        .send_message(child, ws.id.clone(), prompt_text, None, options)
                                         .await
                                 }
                                 None => {
-                                    services.agent_send_message_op(child, prompt, None, None, None).await
+                                    services
+                                        .agent_send_message_op(
+                                            child,
+                                            prompt_text,
+                                            None,
+                                            created_image_blocks,
+                                            None,
+                                        )
+                                        .await
                                 }
                             };
                             if let Err(e) = send {
@@ -6842,7 +6998,7 @@ impl WorkspaceApi for Services {
                 worktree_path: None,
                 scope: source.scope.clone(),
                 skip_worktree: source.skip_worktree,
-                setup_script: source.setup_script.clone(),
+                setup_script: None,
                 is_remote: source.is_remote,
                 default_model: source.default_model.clone(),
                 pr_number: None,
@@ -7205,6 +7361,7 @@ impl WorkspaceApi for Services {
     fn dismiss_attention(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let this = self.clone();
         Box::pin(async move {
             // Chief has no attention state to dismiss (synthesized as `None`).
             if id.is_chief() {
@@ -7219,6 +7376,8 @@ impl WorkspaceApi for Services {
             // the blue dot together (PROTOCOL §6.5); emit only on an actual change.
             if changed {
                 publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
+                // Schedule debounced lastActivity event (§10.1).
+                this.schedule_last_activity_event(id.clone());
             }
             Ok(ws)
         })
@@ -7227,6 +7386,7 @@ impl WorkspaceApi for Services {
     fn mark_seen(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let this = self.clone();
         Box::pin(async move {
             if id.is_chief() {
                 return Ok(chief_workspace());
@@ -7238,6 +7398,8 @@ impl WorkspaceApi for Services {
                 ws.updated_at = now_iso();
                 store.update_workspace(&ws).await?;
                 publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
+                // Schedule debounced lastActivity event (§10.1).
+                this.schedule_last_activity_event(id.clone());
             }
             Ok(ws)
         })
@@ -7257,9 +7419,34 @@ impl WorkspaceApi for Services {
     fn get_setup_script(&self, id: WorkspaceId) -> BoxFuture<'_, Result<SetupScript>> {
         let store = self.store.clone();
         Box::pin(async move {
-            // Surface a default (empty `script`, `updatedAt: 0`) record before the
-            // first save; `NotFound` propagates so the router maps it to `-32602`.
             let ws = store.get_workspace(&id).await?;
+            // Read from repo config (§5.25 sole source of truth); synthesize the
+            // SetupScript record from the string. Legacy fallback: if repo config
+            // is empty but the workspace DB row still has a setupScript (pre-change
+            // data), return it read-only — never write it back to the DB.
+            // Use git_ops::worktree_path (worktreePath first, repositoryPath fallback)
+            // to match workspace.create and saveSetupScript (§5.25 + §5.33 consistency).
+            if let Some(repo_path) = git_ops::worktree_path(&ws) {
+                let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                if let Some(script_str) = repo_config.setup_script.filter(|s| !s.is_empty()) {
+                    // Repo config has a script — derive updatedAt from file mtime (epoch ms).
+                    let config_path = crate::repo_config::get_config_file_path(&repo_path);
+                    let updated_at = tokio::fs::metadata(&config_path)
+                        .await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    return Ok(SetupScript {
+                        script: script_str,
+                        project_type: None,
+                        updated_at,
+                        generated_by: Some(intent_core::SetupScriptGeneratedBy::User),
+                    });
+                }
+            }
+            // Legacy fallback: return the DB value if present, else the default.
             Ok(ws.setup_script.unwrap_or_else(|| SetupScript {
                 script: String::new(),
                 project_type: None,
@@ -7276,12 +7463,30 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<SetupScript>> {
         let store = self.store.clone();
         Box::pin(async move {
-            let mut ws = store.get_workspace(&id).await?;
-            let record = setup_scripts::user_script(script);
-            ws.setup_script = Some(record.clone());
-            ws.updated_at = now_iso();
-            store.update_workspace(&ws).await?;
-            Ok(record)
+            // Write to repo config instead of the DB row (§5.25 sole source of truth).
+            let ws = store.get_workspace(&id).await?;
+            // Use git_ops::worktree_path (worktreePath first, repositoryPath fallback)
+            // to match workspace.create and getSetupScript (§5.25 + §5.33 consistency).
+            let repo_path_buf = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::InvalidParams(
+                    "workspace has no worktreePath or repositoryPath; cannot persist setup script"
+                        .to_string(),
+                )
+            })?;
+            let mut repo_config = crate::repo_config::read_repo_config(&repo_path_buf).await;
+            repo_config.setup_script = if script.is_empty() {
+                None
+            } else {
+                Some(script)
+            };
+            let written_script = repo_config
+                .setup_script
+                .as_deref()
+                .unwrap_or("")
+                .to_string();
+            crate::repo_config::write_repo_config(&repo_path_buf, repo_config).await?;
+            // Return the §5.25 SetupScript wire shape (synthesized from the written string).
+            Ok(setup_scripts::user_script(written_script))
         })
     }
 
@@ -14851,7 +15056,6 @@ pub mod event {}
 mod instructions;
 mod mcp_oauth;
 mod mcp_servers;
-mod memories;
 mod rules;
 mod specialists;
 

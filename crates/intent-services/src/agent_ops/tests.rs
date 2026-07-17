@@ -5997,3 +5997,72 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
         [&a, &b, &c].into_iter().map(|id| id.0.clone()).collect();
     assert_eq!(deleted_ids, expected, "one agent:deleted per session");
 }
+
+/// When a delegated agent starts a new turn after persisting a completion
+/// report, the store clears `completion_report` + `completion_report_timestamp`
+/// and returns `true`. A subsequent `agent.get` shows no report in metadata.
+/// When no report is set, the clear returns `false` (no-op, no write).
+#[tokio::test]
+async fn clear_completion_report_on_turn_begin() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    // No report initially — clear returns false.
+    let ts = now_iso();
+    let cleared = svc
+        .store()
+        .clear_completion_report(&ws, &child, &ts)
+        .await
+        .expect("clear when none");
+    assert!(!cleared, "no report to clear initially");
+
+    // Set a report.
+    svc.agent_report_to_parent_op(ws.clone(), json!("shipped it"), Some(child.clone()))
+        .await
+        .expect("report");
+    let before = svc.agent_get_op(child.clone(), None).await.expect("get");
+    let v = serde_json::to_value(&before).expect("lite json");
+    assert_eq!(v["metadata"]["completionReport"], "shipped it");
+
+    // Clear the report (simulates the turn-begin hook).
+    let ts2 = now_iso();
+    let cleared = svc
+        .store()
+        .clear_completion_report(&ws, &child, &ts2)
+        .await
+        .expect("clear when set");
+    assert!(cleared, "report was present and cleared");
+
+    // The report is now absent from metadata.
+    let after = svc
+        .agent_get_op(child.clone(), None)
+        .await
+        .expect("get after clear");
+    let v = serde_json::to_value(&after).expect("lite json");
+    assert!(v["metadata"]["completionReport"].is_null());
+    assert!(v["metadata"]["completionReportTimestamp"].is_null());
+
+    // Second clear returns false (no report to clear).
+    let ts3 = now_iso();
+    let cleared = svc
+        .store()
+        .clear_completion_report(&ws, &child, &ts3)
+        .await
+        .expect("second clear");
+    assert!(!cleared, "no report on second clear");
+}

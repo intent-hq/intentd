@@ -5020,3 +5020,218 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
         "no messages persisted without a prompt: {conv}"
     );
 }
+
+/// When a delegated agent calls `report_to_parent`, the report persists and is
+/// visible via `agent.get` metadata. When the parent sends the agent NEW WORK
+/// (a follow-up message), a new turn begins and clears the persisted
+/// completion report, emitting `agent:updated` with `completionReportCleared:
+/// true`. A subsequent `agent.get` shows no completion report in metadata. The
+/// original `agent:idle` wake that delivered the report is unaffected (it
+/// fires at turn-end before the next turn begins).
+#[tokio::test]
+async fn completion_report_cleared_when_new_turn_begins_over_wss() {
+    let Some(script) = gate("WSS clear completion report on new turn") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    const CHILD_TAG: &str = "CLEAR_REPORT_CHILD";
+    const REPORT: &str = "CLEAR_REPORT shipped the thing";
+    const SECOND_WORK: &str = "CLEAR_REPORT_SECOND do more work";
+    const PARENT_GO: &str = "CLEAR_REPORT_PARENT_GO";
+    // Child behavior: first turn reports back, second turn acknowledges.
+    let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
+    let delegate_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        json!(CHILD_TAG),
+    );
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": CHILD_TAG,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": report_js, "summary": "child reportToParent" }
+                },
+                "response": "child finished first task",
+            },
+            {
+                "ifPromptContains": SECOND_WORK,
+                "response": "child working on second task",
+            },
+            {
+                "ifPromptContains": PARENT_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": delegate_js, "summary": "parent delegates child" }
+                },
+                "response": "parent delegated child",
+            },
+        ],
+    })
+    .to_string();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child: child_proc,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // Subscribe to agent events.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    // Create a parent agent.
+    let parent = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Clear Parent", "model": "mock:default" }),
+    )
+    .await;
+    let parent_id = parent["agent"]["id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
+    // Send the parent a message to trigger delegation.
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent_id, "content": PARENT_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Wait for the parent to go idle (delegation complete). Use wss_event_opt
+    // with a single deadline so heartbeat Pings don't extend the wait forever.
+    let mut parent_idle = false;
+    for _ in 0..100 {
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:idle" && ev["data"]["agentId"] == parent_id {
+            parent_idle = true;
+            break;
+        }
+    }
+    assert!(parent_idle, "parent agent went idle after delegation");
+
+    // The child ID is in the parent's waitingForAgentIds (delegation metadata).
+    let parent_get = wss_rpc(&mut rpc, 15, "agent.get", json!({ "agentId": parent_id })).await;
+    let waiting = parent_get["agent"]["waitingForAgentIds"]
+        .as_array()
+        .expect("parent has waitingForAgentIds");
+    assert_eq!(waiting.len(), 1, "parent waiting on exactly one child");
+    let child_id = waiting[0].as_str().expect("child id").to_string();
+
+    // Wait for the child to report and idle. Use wss_event_opt with a single
+    // deadline so heartbeat Pings don't extend the wait forever.
+    let mut child_idle = false;
+    for _ in 0..100 {
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:idle" && ev["data"]["agentId"] == child_id {
+            child_idle = true;
+            break;
+        }
+    }
+    assert!(child_idle, "child went idle after reportToParent");
+
+    // Assert the report is present in metadata.
+    let get_before = wss_rpc(&mut rpc, 12, "agent.get", json!({ "agentId": child_id })).await;
+    assert_eq!(
+        get_before["agent"]["metadata"]["completionReport"],
+        json!(REPORT),
+        "completion report persisted after reportToParent"
+    );
+
+    // Send the child a new message (starts a new turn).
+    let sent = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": child_id, "content": SECOND_WORK }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Wait for the agent:updated event with completionReportCleared. Use
+    // wss_event_opt with a single deadline so heartbeat Pings don't extend
+    // the wait forever.
+    let mut saw_cleared_event = false;
+    for _ in 0..100 {
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:updated"
+            && ev["data"]["agentId"] == child_id
+            && ev["data"]["completionReportCleared"] == true
+        {
+            saw_cleared_event = true;
+            break;
+        }
+    }
+    assert!(
+        saw_cleared_event,
+        "agent:updated with completionReportCleared must fire when new turn begins"
+    );
+
+    // Wait for child to go idle after the second turn. Use wss_event_opt with
+    // a single deadline so heartbeat Pings don't extend the wait forever.
+    let mut second_idle = false;
+    for _ in 0..100 {
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:idle" && ev["data"]["agentId"] == child_id {
+            second_idle = true;
+            break;
+        }
+    }
+    assert!(second_idle, "child went idle after second turn");
+
+    // Assert the completion report is now absent.
+    let get_after = wss_rpc(&mut rpc, 14, "agent.get", json!({ "agentId": child_id })).await;
+    assert!(
+        get_after["agent"]["metadata"]["completionReport"].is_null(),
+        "completion report cleared after new turn begins: {:?}",
+        get_after["agent"]["metadata"]["completionReport"]
+    );
+    assert!(
+        get_after["agent"]["metadata"]["completionReportTimestamp"].is_null(),
+        "completion report timestamp cleared after new turn begins"
+    );
+}

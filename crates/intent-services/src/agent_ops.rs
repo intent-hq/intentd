@@ -1103,6 +1103,8 @@ impl Services {
             json!({ "agentId": agent_id.0, "modelId": model_id }),
         )
         .await;
+        // Schedule debounced lastActivity event (§10.1).
+        self.schedule_last_activity_event(workspace_id.clone());
         Ok(json!({ "success": true, "modelId": model_id }))
     }
 
@@ -1351,6 +1353,8 @@ impl Services {
             Value::Object(event_data),
         )
         .await;
+        // Schedule debounced lastActivity event (§10.1).
+        self.schedule_last_activity_event(workspace_id.clone());
         let lite = self.project_lite_with_flags(session);
         Ok(json!({ "success": true, "agent": lite }))
     }
@@ -1393,6 +1397,9 @@ impl Services {
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+        } else {
+            // Schedule debounced lastActivity event (§10.1).
+            self.schedule_last_activity_event(session.workspace_id.clone());
         }
         self.publish_agent_mutation_event(
             &session.workspace_id,
@@ -1741,6 +1748,9 @@ impl Services {
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+        } else {
+            // Schedule debounced lastActivity event (§10.1).
+            self.schedule_last_activity_event(session.workspace_id.clone());
         }
         Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
     }
@@ -1900,6 +1910,8 @@ impl Services {
             json!({ "agentId": caller.0, "completionReportLength": report_len }),
         )
         .await;
+        // Schedule debounced lastActivity event (§10.1).
+        self.schedule_last_activity_event(workspace_id.clone());
         // TASK-B: move the linked task note to `review_required` so the FE
         // reflects the child's completion. Terminal statuses (`complete`,
         // `cancelled`) are never overwritten; agents without a linked note are
@@ -3470,6 +3482,9 @@ impl Services {
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+        } else {
+            // Schedule debounced lastActivity event (§10.1).
+            self.schedule_last_activity_event(workspace_id.clone());
         }
         manager.clone().finish_prepersisted_turn_spawn(
             agent_id.clone(),
