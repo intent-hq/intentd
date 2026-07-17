@@ -315,6 +315,7 @@ mod tests {
     fn capture_login_shell_path_with_fake_shell() {
         // Create a fake shell script that outputs a known PATH with sentinel markers
         use std::fs;
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = std::env::temp_dir();
@@ -326,11 +327,14 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_test_{pid}_{nanos}.sh"));
 
         // Script responds to -ilc with sentinel-wrapped PATH
-        fs::write(
-            &fake_shell,
-            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/custom/bin:/other/bin__INTENT_PATH_E__'\nfi\n",
+        // Use File::create + sync_all to ensure file is fully written before execution
+        let mut file = fs::File::create(&fake_shell).unwrap();
+        file.write_all(
+            b"#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/custom/bin:/other/bin__INTENT_PATH_E__'\nfi\n",
         )
         .unwrap();
+        file.sync_all().unwrap();
+        drop(file); // Ensure file is closed before setting permissions
         fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
 
         let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));

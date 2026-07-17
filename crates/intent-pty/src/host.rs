@@ -719,12 +719,30 @@ mod tests {
         let id = host.spawn(spec).unwrap();
         let mut rx = host.attach(id).unwrap().live;
 
-        let out = collect_until(&mut rx, b"\n", Duration::from_secs(5)).await;
-        let line = String::from_utf8_lossy(&out);
-        let grandchild: u32 = line
-            .split_whitespace()
-            .find_map(|t| t.parse().ok())
-            .expect("grandchild pid printed");
+        // Poll for the grandchild PID with retry to handle scheduling/output delays
+        // on loaded runners. Honor INTENTD_TEST_TIMEOUT_MULTIPLIER for coverage runs.
+        let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .max(1.0);
+        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(multiplier);
+
+        let grandchild: u32 = loop {
+            if Instant::now() >= deadline {
+                panic!("grandchild pid never printed within deadline");
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("deadline not yet reached");
+            let out = collect_until(&mut rx, b"\n", remaining).await;
+            let line = String::from_utf8_lossy(&out);
+            if let Some(pid) = line.split_whitespace().find_map(|t| t.parse().ok()) {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
         assert!(pid_alive(grandchild), "grandchild alive before teardown");
 
         let reaped = host.kill_scope("scope-x").await;

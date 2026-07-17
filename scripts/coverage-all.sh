@@ -25,11 +25,9 @@ echo "Running all workspace tests with coverage instrumentation (nextest)..."
 
 # Run all workspace tests (unit + integration + e2e) under nextest for parallelism
 # auggie_context_e2e test is env-gated (INTENTD_AUGGIE_E2E) and skips cleanly in CI
-# Skip known flaky tests under llvm-cov instrumentation (STAB-40, STAB-42, STAB-43)
-# These skips DEFLATE coverage (we lose their contribution) but prevent spurious CI failures
+# STAB-40, STAB-42, STAB-43, STAB-44 fixed (file sync, multi-threaded runtime, timeout multiplier)
 # Note: nextest does not run doctests; the workspace has none, so nothing is lost
-cargo llvm-cov --no-report nextest --workspace \
-    -E 'not (test(wss_note_save_asset_round_trip) | test(slow_host_exec_does_not_block_fast_workspace_list) | test(capture_login_shell_path_with_fake_shell))'
+INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest --workspace
 
 echo ""
 echo "Generating coverage report..."
