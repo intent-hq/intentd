@@ -3859,9 +3859,31 @@ impl Services {
 
         let workspace_id = interrupted.workspace_id.clone();
 
+        // ATOMIC CLAIM: mark the row as resumed FIRST. If another process already claimed
+        // it, set_interrupted_resolution returns false and we bail loudly. This prevents
+        // concurrent resume races (e.g., --resume-all vs client resolveInterrupted).
+        let updated = self
+            .store
+            .set_interrupted_resolution(agent_id, "resumed", &now_iso())
+            .await?;
+        if !updated {
+            return Err(Error::InvalidParams(format!(
+                "Agent {agent_id} is not in pending interrupted state (already resolved)"
+            )));
+        }
+
         // Rehydrate delegation groups for this workspace (idempotent, best-effort).
         // Groups are sealed on rehydration since the original parent turn is gone.
-        let _ = self.rehydrate_delegation_groups(&workspace_id).await;
+        // Corrupted rows are logged at warn but do NOT fail the resume: the agent can
+        // still proceed (group wake degrades to per-child) rather than failing entirely.
+        if let Err(e) = self.rehydrate_delegation_groups(&workspace_id).await {
+            tracing::warn!(
+                "rehydrate_delegation_groups failed for workspace {}: {}. \
+                 Agent will resume but after_all fan-in may degrade to per-child wakes.",
+                workspace_id.0,
+                e
+            );
+        }
 
         // Load the session to check for delegation metadata
         let session = self.store.get_agent_session(agent_id).await?;
@@ -3933,40 +3955,20 @@ impl Services {
 
         // Use the agent_send_message machinery to deliver the message
         // (lazily respawns provider and resumes via ACP session/load)
-        let result = self
-            .agent_send_message(
-                workspace_id.clone(),
-                agent_id.clone(),
-                continuation.to_string(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await;
-
-        // If delivery succeeded, mark the row resolved
-        if result.is_ok() {
-            let updated = self
-                .store
-                .set_interrupted_resolution(agent_id, "resumed", &now_iso())
-                .await?;
-            if !updated {
-                return Err(Error::InvalidParams(format!(
-                    "Agent {agent_id} is not in pending interrupted state"
-                )));
-            }
-        } else {
-            // Delivery failed → leave row pending, return error
-            return Err(Error::Internal(format!(
-                "Failed to deliver continuation message to {agent_id}: {:?}",
-                result.err()
-            )));
-        }
+        self.agent_send_message(
+            workspace_id.clone(),
+            agent_id.clone(),
+            continuation.to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
 
         Ok(())
     }

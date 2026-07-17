@@ -1008,4 +1008,83 @@ mod tests {
 
         let _ = std::fs::remove_file(&tmp);
     }
+
+    #[tokio::test]
+    async fn double_claim_race() {
+        use intent_core::{
+            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
+        };
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let agent_id = AgentId("agent-double".to_string());
+        let ws_id = WorkspaceId("ws-double".to_string());
+
+        // Seed workspace
+        let ts = now_iso();
+        let workspace = Workspace {
+            id: ws_id.clone(),
+            title: "Test".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+        };
+        store
+            .insert_workspace(&workspace)
+            .await
+            .expect("insert workspace");
+
+        // Interrupt the agent
+        store
+            .insert_interrupted_agent(&agent_id, &ws_id, "active", "2026-01-01T00:00:00Z")
+            .await
+            .expect("initial insert");
+
+        // First claim succeeds
+        let claim1 = store
+            .set_interrupted_resolution(&agent_id, "resumed", "2026-01-01T00:01:00Z")
+            .await
+            .expect("first claim");
+        assert!(claim1, "first claim should succeed");
+
+        // Second concurrent claim fails (row already resolved)
+        let claim2 = store
+            .set_interrupted_resolution(&agent_id, "resumed", "2026-01-01T00:01:01Z")
+            .await
+            .expect("second claim");
+        assert!(!claim2, "second claim should fail (already resolved)");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
 }

@@ -555,19 +555,32 @@ impl Services {
             {
                 return None;
             }
-            let mut group = w.delegation_groups.remove(idx);
-            group.delivered = true;
-            group
+            w.delegation_groups.remove(idx)
         }; // Drop guard before await
            // DURABLE-BEFORE-OBSERVABLE: delete the row synchronously before returning.
-           // This ensures a crash post-delete never re-delivers (row is gone).
+           // If the delete FAILS, do NOT deliver the wake — put the group back into the
+           // in-memory map (delivered=false) and return None. The next child-completion
+           // or restart retry will attempt the delete again. This makes delete-commit
+           // strictly precede observability in ALL paths.
         if let Err(e) = self.store.delete_delegation_group(group_id).await {
             tracing::warn!(
-                "Failed to delete delegation_group row {}: {}. Wake may re-deliver on crash.",
+                "Failed to delete delegation_group row {} (workspace {}): {}. \
+                 Wake NOT delivered; group restored to memory for retry.",
                 group_id,
+                workspace_id.0,
                 e
             );
+            // Restore the group to the in-memory map for retry
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            if let Some(w) = guard.get_mut(workspace_id) {
+                w.delegation_groups.push(group);
+            }
+            return None;
         }
+        // Delete committed → safe to deliver the wake
         Some(group)
     }
 
