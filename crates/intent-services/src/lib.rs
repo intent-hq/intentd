@@ -6159,19 +6159,36 @@ impl WorkspaceApi for Services {
                     // Write explicit setupScript to the workspace's worktree (AFTER provisioning
                     // so git_ops::worktree_path resolves correctly). Must land as a committable
                     // change in the workspace, visible in the workspace's diff view.
+                    // Best-effort — a failure warns and continues (matches post-insert pattern
+                    // for other filesystem operations like .workspace/workspace.json).
                     if let Some(explicit) = explicit_setup_script {
                         // Use git_ops::worktree_path (worktreePath first, repositoryPath fallback)
                         // to match getSetupScript/saveSetupScript and other repoConfig.* methods.
-                        let repo_path = git_ops::worktree_path(&ws).ok_or_else(|| {
-                            Error::InvalidParams(
-                                "setupScript requires worktreePath or repositoryPath; cannot persist".to_string(),
-                            )
-                        })?;
-                        let mut repo_config = crate::repo_config::read_repo_config(&repo_path).await;
-                        // Only write if the script differs (no-op when identical).
-                        if repo_config.setup_script.as_deref() != Some(explicit.as_str()) {
-                            repo_config.setup_script = Some(explicit);
-                            crate::repo_config::write_repo_config(&repo_path, repo_config).await?;
+                        match git_ops::worktree_path(&ws) {
+                            Some(repo_path) => {
+                                let mut repo_config =
+                                    crate::repo_config::read_repo_config(&repo_path).await;
+                                // Only write if the script differs (no-op when identical).
+                                if repo_config.setup_script.as_deref() != Some(explicit.as_str()) {
+                                    repo_config.setup_script = Some(explicit.clone());
+                                    if let Err(e) =
+                                        crate::repo_config::write_repo_config(&repo_path, repo_config)
+                                            .await
+                                    {
+                                        tracing::warn!(
+                                            workspace = %ws.id.as_str(),
+                                            error = %e,
+                                            "workspace.create: failed to write explicit setupScript to repo config"
+                                        );
+                                    }
+                                }
+                            }
+                            None => {
+                                tracing::warn!(
+                                    workspace = %ws.id.as_str(),
+                                    "workspace.create: cannot persist setupScript; worktreePath and repositoryPath both empty"
+                                );
+                            }
                         }
                     }
                     // Write the legacy `<root>/<id>/.workspace/workspace.json`
