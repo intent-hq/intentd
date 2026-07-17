@@ -5130,22 +5130,36 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // Wait for the child to be created and learn its ID.
-    let mut child_id: Option<String> = None;
+    // Wait for the parent to go idle (delegation complete). Use wss_event_opt
+    // with a single deadline so heartbeat Pings don't extend the wait forever.
+    let mut parent_idle = false;
     for _ in 0..100 {
-        let frame = wss_event(&mut sub, 30).await;
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
         let ev = &frame["params"]["event"];
-        if ev["type"] == "agent:created" && ev["data"]["parentAgentId"] == parent_id {
-            child_id = Some(ev["data"]["agentId"].as_str().unwrap().to_string());
+        if ev["type"] == "agent:idle" && ev["data"]["agentId"] == parent_id {
+            parent_idle = true;
             break;
         }
     }
-    let child_id = child_id.expect("child agent was created");
+    assert!(parent_idle, "parent agent went idle after delegation");
 
-    // Wait for the child to report and idle.
+    // The child ID is in the parent's waitingForAgentIds (delegation metadata).
+    let parent_get = wss_rpc(&mut rpc, 15, "agent.get", json!({ "agentId": parent_id })).await;
+    let waiting = parent_get["agent"]["waitingForAgentIds"]
+        .as_array()
+        .expect("parent has waitingForAgentIds");
+    assert_eq!(waiting.len(), 1, "parent waiting on exactly one child");
+    let child_id = waiting[0].as_str().expect("child id").to_string();
+
+    // Wait for the child to report and idle. Use wss_event_opt with a single
+    // deadline so heartbeat Pings don't extend the wait forever.
     let mut child_idle = false;
     for _ in 0..100 {
-        let frame = wss_event(&mut sub, 30).await;
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
         let ev = &frame["params"]["event"];
         if ev["type"] == "agent:idle" && ev["data"]["agentId"] == child_id {
             child_idle = true;
@@ -5157,7 +5171,7 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
     // Assert the report is present in metadata.
     let get_before = wss_rpc(&mut rpc, 12, "agent.get", json!({ "agentId": child_id })).await;
     assert_eq!(
-        get_before["metadata"]["completionReport"],
+        get_before["agent"]["metadata"]["completionReport"],
         json!(REPORT),
         "completion report persisted after reportToParent"
     );
@@ -5172,10 +5186,14 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // Wait for the agent:updated event with completionReportCleared.
+    // Wait for the agent:updated event with completionReportCleared. Use
+    // wss_event_opt with a single deadline so heartbeat Pings don't extend
+    // the wait forever.
     let mut saw_cleared_event = false;
     for _ in 0..100 {
-        let frame = wss_event(&mut sub, 30).await;
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
         let ev = &frame["params"]["event"];
         if ev["type"] == "agent:updated"
             && ev["data"]["agentId"] == child_id
@@ -5190,10 +5208,13 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
         "agent:updated with completionReportCleared must fire when new turn begins"
     );
 
-    // Wait for child to go idle after the second turn.
+    // Wait for child to go idle after the second turn. Use wss_event_opt with
+    // a single deadline so heartbeat Pings don't extend the wait forever.
     let mut second_idle = false;
     for _ in 0..100 {
-        let frame = wss_event(&mut sub, 30).await;
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
         let ev = &frame["params"]["event"];
         if ev["type"] == "agent:idle" && ev["data"]["agentId"] == child_id {
             second_idle = true;
@@ -5205,12 +5226,12 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
     // Assert the completion report is now absent.
     let get_after = wss_rpc(&mut rpc, 14, "agent.get", json!({ "agentId": child_id })).await;
     assert!(
-        get_after["metadata"]["completionReport"].is_null(),
+        get_after["agent"]["metadata"]["completionReport"].is_null(),
         "completion report cleared after new turn begins: {:?}",
-        get_after["metadata"]["completionReport"]
+        get_after["agent"]["metadata"]["completionReport"]
     );
     assert!(
-        get_after["metadata"]["completionReportTimestamp"].is_null(),
+        get_after["agent"]["metadata"]["completionReportTimestamp"].is_null(),
         "completion report timestamp cleared after new turn begins"
     );
 }
