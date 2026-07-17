@@ -554,7 +554,10 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     // methods are not exposed via WSS, only via local UDS — see ws.rs:526-527).
     let shutdown_result = uds_rpc(&socket, 13, "system.shutdown", json!({})).await;
     assert_eq!(shutdown_result["result"].get("ok"), Some(&json!(true)));
-    assert_eq!(shutdown_result["result"].get("stopping"), Some(&json!(true)));
+    assert_eq!(
+        shutdown_result["result"].get("stopping"),
+        Some(&json!(true))
+    );
 
     // Wait for daemon to exit gracefully (up to 10 seconds).
     // daemon.wait() is blocking, so we poll for process death.
