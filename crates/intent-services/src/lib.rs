@@ -582,6 +582,158 @@ impl Services {
         ws.cow_supported = self.compute_cow_supported(ws);
     }
 
+    /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
+    /// `github.com`. Rejects URLs with hosts like `github.com.evil.com`.
+    fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
+        let trimmed = url.trim();
+
+        // HTTPS: extract host from scheme://host/... form.
+        if let Some(rest) = trimmed
+            .strip_prefix("https://")
+            .or_else(|| trimmed.strip_prefix("http://"))
+        {
+            let host_end = rest.find('/').unwrap_or(rest.len());
+            let host = &rest[..host_end];
+            if host != "github.com" {
+                return None;
+            }
+            let path = &rest[host_end..];
+            return clone_ops::parse_owner_repo(&format!("https://github.com{path}"));
+        }
+
+        // SSH scp-like: git@host:path form. Extract host before the colon.
+        if let Some(at_idx) = trimmed.find('@') {
+            let after_at = &trimmed[at_idx + 1..];
+            if let Some(colon_idx) = after_at.find(':') {
+                let host = &after_at[..colon_idx];
+                if host != "github.com" {
+                    return None;
+                }
+                let path = &after_at[colon_idx + 1..];
+                return clone_ops::parse_owner_repo(&format!("git@github.com:{path}"));
+            }
+        }
+
+        None
+    }
+
+    /// Spawn a background task to backfill `repository_owner` / `repository_name`
+    /// for active workspaces with a local `repositoryPath` and missing owner/name.
+    /// Non-blocking for the caller; each workspace is probed at most once per
+    /// daemon lifecycle (tracked in a static dedupe set). FE
+    /// `performBackgroundEnrichment` parity (fills only missing fields, persists
+    /// once, emits `workspace:updated`).
+    fn spawn_repository_owner_backfill(&self, workspaces: &[Workspace]) {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        static BACKFILLED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+        let candidates = {
+            let mut guard = BACKFILLED.lock().unwrap();
+            let backfilled = guard.get_or_insert_with(HashSet::new);
+
+            let mut candidates = Vec::new();
+            for ws in workspaces {
+                if ws.archived || backfilled.contains(ws.id.as_str()) {
+                    continue;
+                }
+                let missing_owner = ws.repository_owner.is_none()
+                    || ws.repository_owner.as_deref().is_some_and(|o| o.is_empty());
+                let missing_name = ws.repository_name.is_none()
+                    || ws.repository_name.as_deref().is_some_and(|n| n.is_empty());
+                if (missing_owner || missing_name)
+                    && ws.repository_path.as_deref().is_some_and(|p| !p.is_empty())
+                {
+                    candidates.push(BackfillCandidate {
+                        workspace_id: ws.id.clone(),
+                        repository_path: ws.repository_path.clone().unwrap(),
+                    });
+                    backfilled.insert(ws.id.0.clone());
+                }
+            }
+            candidates
+        };
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        let services = self.clone();
+        tokio::spawn(async move {
+            for candidate in candidates {
+                if let Err(e) = services.backfill_one_workspace(candidate.clone()).await {
+                    tracing::debug!(
+                        workspace_id = %candidate.workspace_id.as_str(),
+                        error = %e.to_string(),
+                        "repository owner backfill failed (non-fatal)"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Backfill one workspace: derive owner/name from origin remote, persist,
+    /// and emit `workspace:updated` with the changed fields. Non-github remotes
+    /// are skipped silently.
+    async fn backfill_one_workspace(&self, candidate: BackfillCandidate) -> Result<()> {
+        let repo_path = std::path::PathBuf::from(&candidate.repository_path);
+        if !repo_path.join(".git").exists() {
+            return Ok(());
+        }
+
+        let origin_url = intent_git::remote::origin_url(&repo_path).ok().flatten();
+
+        let Some(origin_url) = origin_url else {
+            return Ok(());
+        };
+
+        let Some((owner, name)) = Self::parse_github_owner_repo(&origin_url) else {
+            return Ok(());
+        };
+
+        // Re-read the workspace to avoid overwriting fields populated after the
+        // candidate was built (backfill race guard).
+        let mut ws = self.store.get_workspace(&candidate.workspace_id).await?;
+        let mut changes = serde_json::Map::new();
+
+        // Only fill fields that are still missing in the currently persisted state.
+        let missing_owner = ws.repository_owner.is_none()
+            || ws.repository_owner.as_deref().is_some_and(|o| o.is_empty());
+        let missing_name = ws.repository_name.is_none()
+            || ws.repository_name.as_deref().is_some_and(|n| n.is_empty());
+
+        if missing_owner {
+            ws.repository_owner = Some(owner.clone());
+            changes.insert("repositoryOwner".to_string(), serde_json::json!(owner));
+        }
+        if missing_name {
+            ws.repository_name = Some(name.clone());
+            changes.insert("repositoryName".to_string(), serde_json::json!(name));
+        }
+
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        ws.updated_at = now_iso();
+        self.store.update_workspace(&ws).await?;
+
+        publish_event(
+            &self.event_bus,
+            workspace_updated_event(&ws.id, serde_json::Value::Object(changes)),
+        )
+        .await;
+
+        tracing::debug!(
+            workspace_id = %ws.id.as_str(),
+            owner = %ws.repository_owner.as_deref().unwrap_or(""),
+            name = %ws.repository_name.as_deref().unwrap_or(""),
+            "backfilled repository owner/name from origin remote"
+        );
+
+        Ok(())
+    }
+
     /// Compute whether CoW agent isolation is supported for this workspace (Task 5).
     /// Returns Some(true) if direct mode + git repo + CoW probe Supported; Some(false)
     /// if worktree mode or unsupported filesystem; None if probe fails.
@@ -2845,6 +2997,19 @@ fn worktree_folder_slug(repo_name: &str) -> String {
     } else {
         slug.to_string()
     }
+}
+
+/// Best-effort backfill of `repository_owner` / `repository_name` for active
+/// workspaces with a local `repositoryPath` and missing owner/name: derive from
+/// the `origin` remote URL (same helper as `workspace.create`), persist, and
+/// emit `workspace:updated` with the changed fields so connected FEs refresh in
+/// place. Cheap and non-blocking for the list response (spawned background task,
+/// deduped per workspace); no network. Non-github remotes are skipped silently
+/// and not re-probed in a hot loop (FE `performBackgroundEnrichment` parity).
+#[derive(Clone)]
+struct BackfillCandidate {
+    workspace_id: WorkspaceId,
+    repository_path: String,
 }
 
 /// Recursively scan `dir` for git repositories (a directory that contains a
@@ -5599,6 +5764,10 @@ impl WorkspaceApi for Services {
                 ws.activity = this.workspace_activity(&ws.id);
                 this.enrich_workspace_aggregates(ws).await;
             }
+            // Background backfill: active workspaces with repository_path but missing
+            // repository_owner/repository_name get derived from origin remote (STAB-64
+            // backfill). Spawned non-blocking so list latency stays green.
+            this.spawn_repository_owner_backfill(&list);
             Ok(list)
         })
     }
@@ -5730,18 +5899,48 @@ impl WorkspaceApi for Services {
                             }
                         }
                     }
-                    // Repository-name derivation (`known_repo_name` fallback
-                    // parity): a caller-supplied `repositoryName` always wins;
-                    // otherwise a local `repositoryPath` yields its basename so
-                    // workspace payloads carry `repositoryName` for locally
-                    // created workspaces (FE recent-repos surfaces). `owner` is
-                    // left untouched — no local-remote inspection.
+                    // Repository owner/name derivation from origin remote (STAB-64):
+                    // when `repositoryPath` is a local git repo and the caller left
+                    // `repositoryOwner` and/or `repositoryName` blank, best-effort
+                    // derive them from the `origin` remote URL (local inspection
+                    // only, no network). Only GitHub remotes are parsed; non-github
+                    // or missing remotes leave owner unset. Caller-supplied values
+                    // always win; basename fallback for `repositoryName` stays as
+                    // the last resort.
+                    let origin_derived = if let Some(repo_path) = input
+                        .repository_path
+                        .as_deref()
+                        .filter(|p| !p.is_empty())
+                        .map(PathBuf::from)
+                        .filter(|p| p.join(".git").exists())
+                    {
+                        intent_git::remote::origin_url(&repo_path)
+                            .ok()
+                            .flatten()
+                            .and_then(|url| Self::parse_github_owner_repo(&url))
+                    } else {
+                        None
+                    };
+                    // Apply derived owner when caller left it blank.
+                    if !input
+                        .repository_owner
+                        .as_deref()
+                        .is_some_and(|o| !o.is_empty())
+                    {
+                        if let Some((owner, _)) = origin_derived.as_ref() {
+                            input.repository_owner = Some(owner.clone());
+                        }
+                    }
+                    // Apply derived name when caller left it blank; fall back to
+                    // basename when origin remote is missing/unparseable.
                     if !input
                         .repository_name
                         .as_deref()
                         .is_some_and(|n| !n.is_empty())
                     {
-                        if let Some(name) = input
+                        if let Some((_, name)) = origin_derived {
+                            input.repository_name = Some(name);
+                        } else if let Some(name) = input
                             .repository_path
                             .as_deref()
                             .filter(|p| !p.is_empty())
