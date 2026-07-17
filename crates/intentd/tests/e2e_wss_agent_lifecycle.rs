@@ -2466,12 +2466,13 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
                 child_idle = true;
             }
         }
-        // Report-time wake: between the child's first chunk and the child's
-        // idle, the parent MUST stream a wake turn — that proves
-        // `reportToParent` delivered an immediate wake.
+        // Report-time wake: once the child is identified, the parent MUST
+        // stream a wake turn BEFORE the child goes idle — that proves
+        // `reportToParent` delivered an immediate wake (may fire even before
+        // the child's first stream chunk if reportToParent is called early).
         if ev_agent == parent_id
             && ev_type == "agent:stream:chunk"
-            && child_first_chunk_seen
+            && child_id.is_some()
             && !child_idle
         {
             parent_wake_chunk_before_child_idle = true;
