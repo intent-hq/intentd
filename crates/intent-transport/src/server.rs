@@ -117,7 +117,7 @@ async fn pairing_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     let token = crate::get_or_create_token(provider.token_store()).await?;
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
     let local_ips = collect_local_ips();
-    let hostname = crate::discovery::local_hostname();
+    let hostname = crate::host_env::local_hostname();
 
     Ok(json!({
         "token": token,

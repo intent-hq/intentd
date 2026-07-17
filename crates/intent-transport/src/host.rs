@@ -15,8 +15,8 @@ use intent_core::WorkspaceApi;
 use intent_services::EventBus;
 use serde_json::{json, Map, Value};
 
-use crate::discovery::{detect_display_server, detect_has_display, local_hostname};
 use crate::events::{error_frame, success_frame};
+use crate::host_env::{detect_display_server, detect_has_display, local_hostname};
 use crate::host_ops;
 use crate::reverse::{ReverseChannel, DEFAULT_REVERSE_TIMEOUT};
 

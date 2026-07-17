@@ -318,13 +318,6 @@ fn auth_enabled_defaults_true_on_tcp_only() {
 }
 
 #[test]
-fn discovery_disabled_by_default() {
-    assert!(!is_discovery_enabled(None));
-    assert!(is_discovery_enabled(Some(true)));
-    assert!(!is_discovery_enabled(Some(false)));
-}
-
-#[test]
 fn extract_bearer_token_rejects_short_and_non_whitespace_separator() {
     // header.get(..6) returns None for anything shorter than 6 bytes.
     assert_eq!(extract_bearer_token(Some("abc")), None);

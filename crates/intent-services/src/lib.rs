@@ -298,9 +298,9 @@ pub struct Services {
     /// client-triggered `browser.exec` path already produces. Shared across
     /// clones so every service handle sees the same live-client set.
     reverse_dispatch: Option<Arc<dyn AgentReverseDispatch>>,
-    /// Runtime control for the WSS listener + mDNS (server settings apply
+    /// Runtime control for the WSS listener (server settings apply
     /// hooks, §5.12). When wired, `settings.update` on `server.wsApi.enabled`
-    /// / `server.discovery.enabled` starts/stops the listener at runtime.
+    /// starts/stops the listener at runtime.
     /// Held as `Arc<OnceLock>` so the control can be attached after the `api`
     /// Arc is built (composition-root wiring, §5.12). Shared across clones.
     server_control: Arc<OnceLock<Arc<dyn intent_core::ServerControl>>>,
@@ -889,8 +889,8 @@ impl Services {
     }
 
     /// Attach the runtime [`ServerControl`] so `settings.update` can start/stop
-    /// the WSS listener + mDNS on `server.wsApi.enabled` /
-    /// `server.discovery.enabled` changes (server settings apply hooks, §5.12).
+    /// the WSS listener on `server.wsApi.enabled` changes (server settings
+    /// apply hooks, §5.12).
     /// Idempotent: a second call is a no-op (the `OnceLock` keeps the first).
     pub fn attach_server_control(&self, control: Arc<dyn intent_core::ServerControl>) {
         let _ = self.server_control.set(control);
@@ -4340,22 +4340,17 @@ impl Services {
     }
 
     /// Apply server runtime control hooks after `settings.update` persists
-    /// `server.wsApi.enabled` / `server.discovery.enabled` changes (§5.12).
+    /// `server.wsApi.enabled` changes (§5.12).
     /// Returns an error if the operation fails (e.g., TCP client trying to disable
     /// the WSS listener, or listener start failure), allowing the caller to rollback.
     ///
     /// **Ordering rule**: Hooks are applied in dependency-aware, deterministic order:
-    /// - Value-setting keys (future: server.wsApi.port, server.locality, server.discovery.*
-    ///   config values) apply FIRST (priority 0).
+    /// - Value-setting keys (server.wsApi.port, server.locality) apply FIRST (priority 0).
     /// - server.wsApi.enabled applies SECOND (priority 10) — starts/stops the WSS listener.
-    /// - server.discovery.enabled applies THIRD (priority 11) — starts/stops mDNS, which
-    ///   depends on the WSS listener being active.
     /// - Within the same priority tier, keys are processed in lexicographic order.
     /// - Single-key updates have zero behavior change.
-    /// - This ensures batches like {server.wsApi.enabled=true, server.discovery.enabled=true}
-    ///   start the listener before attempting discovery, and future batches like
-    ///   {server.wsApi.port=NEW, server.wsApi.enabled=true} will start the listener on the
-    ///   NEW port, not the old one.
+    /// - This ensures batches like {server.wsApi.port=NEW, server.wsApi.enabled=true}
+    ///   start the listener on the NEW port, not the old one.
     async fn apply_server_setting_hooks(
         &self,
         applied: &[serde_json::Value],
@@ -4364,11 +4359,9 @@ impl Services {
         /// Priority for hook application order: lower values apply first.
         fn hook_priority(path: &str) -> u8 {
             match path {
-                // WSS listener must start before discovery (discovery depends on listener)
+                // Listener enable/disable applies after value-setting keys
                 "server.wsApi.enabled" => 10,
-                // Discovery enabled applies after listener is up
-                "server.discovery.enabled" => 11,
-                // Value-setting keys (port, locality, discovery config) apply first
+                // Value-setting keys (port, locality) apply first
                 _ if path.starts_with("server.") => 0,
                 // Non-server keys (no hooks, sorted lexicographically within this tier)
                 _ => 255,
@@ -4452,30 +4445,6 @@ impl Services {
                             }
                         }
                     }
-                    "server.discovery.enabled" => {
-                        if let Some(enabled) = change.get("value").and_then(|v| v.as_bool()) {
-                            if enabled {
-                                control.start_discovery().await.map_err(|e| {
-                                    tracing::error!(
-                                        error = ?e,
-                                        "server.discovery.enabled → true: failed to start mDNS discovery"
-                                    );
-                                    Error::Internal(format!(
-                                        "failed to start mDNS discovery: {}",
-                                        e
-                                    ))
-                                })?;
-                                tracing::info!(
-                                    "server.discovery.enabled → true: started mDNS discovery"
-                                );
-                            } else {
-                                control.stop_discovery().await;
-                                tracing::info!(
-                                    "server.discovery.enabled → false: stopped mDNS discovery"
-                                );
-                            }
-                        }
-                    }
                     _ => {}
                 }
             }
@@ -4551,8 +4520,8 @@ impl WorkspaceApi for Services {
 
             let applied = self.settings_service().update(&changes).await?;
             if !applied.is_empty() {
-                // Apply server runtime hooks (§5.12): start/stop WSS listener + mDNS
-                // when server.wsApi.enabled / server.discovery.enabled change.
+                // Apply server runtime hooks (§5.12): start/stop WSS listener
+                // when server.wsApi.enabled changes.
                 if let Some(control) = self.server_control.get() {
                     if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
                         // Rollback: restore old values for ALL settings in the batch.

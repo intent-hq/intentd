@@ -541,11 +541,5 @@ pub fn is_auth_enabled(configured: Option<bool>, tcp: bool) -> bool {
     configured.unwrap_or(tcp)
 }
 
-/// Whether mDNS network discovery is enabled. Defaults to `false`; an explicit
-/// `server.discovery.enabled` setting overrides.
-pub fn is_discovery_enabled(configured: Option<bool>) -> bool {
-    configured.unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests;

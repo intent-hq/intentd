@@ -52,8 +52,8 @@ enum Command {
         #[arg(long, default_value = "uds")]
         listen: String,
         /// Force connection locality (§5.14): `local` or `remote`. Overrides the
-        /// transport default (UDS ⇒ local, TCP/WSS ⇒ remote) for `host.status`
-        /// and the mDNS TXT record. Omit to infer from the transport.
+        /// transport default (UDS ⇒ local, TCP/WSS ⇒ remote) for `host.status`.
+        /// Omit to infer from the transport.
         #[arg(long)]
         mode: Option<String>,
         /// Dev-only: serve plain `ws://` with no TLS and no bearer-token
@@ -371,8 +371,8 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     // provisioning entirely. Dev-only; loudly warned at startup.
     let insecure = insecure || env_flag("INTENTD_INSECURE");
     // Resolve the optional locality override (§5.14): `--mode local|remote`
-    // forces the value reported over `host.status` + mDNS regardless of
-    // transport; absent ⇒ infer from the transport (UDS local, TCP/WSS remote).
+    // forces the value reported over `host.status` regardless of transport;
+    // absent ⇒ infer from the transport (UDS local, TCP/WSS remote).
     let locality_override = parse_locality_mode(mode)?;
     let config = resolve_config()?;
     std::fs::create_dir_all(&config.data_dir)?;
@@ -550,7 +550,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     // persisted server.wsApi.enabled), but settings.update server.wsApi.enabled=true
     // can start it at runtime (TLS + bearer auth on, same as any TCP listener unless
     // --insecure). Note: persisted settings are NOT honored at boot for any mode —
-    // only CLI --listen and env (INTENTD_TCP_PORT, INTENTD_DISCOVERY) matter.
+    // only CLI --listen and env (INTENTD_TCP_PORT) matter.
     let mut ws_options = ws_options_from_env();
     ws_options.locality_override = locality_override;
 
@@ -627,10 +627,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             None => tracing::info!(port, "intentd WS listening (insecure, no TLS)"),
         }
 
-        // mDNS discovery is now managed internally by WsApiServer.start() based on
-        // ws_options.discovery_enabled. No manual Discovery::start needed here.
-
-        // Store the server in runtime state (discovery is managed by WsApiServer)
+        // Store the server in runtime state
         {
             let mut state = runtime.state.lock().await;
             state.ws_server = Some(server.clone());
@@ -737,7 +734,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
 /// (§5.7) plus runtime WSS listener control (§5.12). Built post-bind so the
 /// resolved WSS `port`/`fingerprint` are real (not guessed); `client_count`/agent
 /// count are read live on each status call. The runtime fields (`ws_server`,
-/// `discovery`, `ws_runtime`) allow settings-driven start/stop without daemon restart.
+/// `ws_runtime`) allow settings-driven start/stop without daemon restart.
 struct DaemonControl {
     listen_mode: String,
     uds: bool,
@@ -751,7 +748,7 @@ struct DaemonControl {
     ws_runtime: Arc<WsRuntimeControl>,
 }
 
-/// Runtime control for the WSS listener + mDNS, shared between DaemonControl and
+/// Runtime control for the WSS listener, shared between DaemonControl and
 /// the lifecycle hooks (§5.12). Holds WsApiServer construction args plus mutable
 /// state guarded by a Mutex so settings.update can start/stop the listener.
 struct WsRuntimeControl {
@@ -763,7 +760,7 @@ struct WsRuntimeControl {
     reverse_registry: Arc<PrimaryReverseRegistry>,
     /// Data directory for building pairing info provider (§5.2) in start_ws_listener.
     data_dir: PathBuf,
-    /// Mutable runtime state: the live WsApiServer (when started) plus mDNS.
+    /// Mutable runtime state: the live WsApiServer (when started).
     state: tokio::sync::Mutex<WsRuntimeState>,
 }
 
@@ -957,9 +954,6 @@ impl intent_core::ServerControl for DaemonControl {
                 intent_core::Error::Internal(error_msg)
             })?;
 
-            // mDNS discovery is now managed internally by WsApiServer.start() based on
-            // ws_options.discovery_enabled. No manual Discovery::start needed here.
-
             // Store server + port (acquire lock only after all awaits done)
             {
                 let mut state = runtime.state.lock().await;
@@ -983,7 +977,7 @@ impl intent_core::ServerControl for DaemonControl {
                 state.ws_server.take()
             };
 
-            // Stop the WS server (async, handles mDNS internally)
+            // Stop the WS server
             if let Some(s) = server {
                 s.stop().await;
             }
@@ -1014,61 +1008,6 @@ impl intent_core::ServerControl for DaemonControl {
         // outside a request context.
         intent_transport::is_tcp_connection()
     }
-
-    fn start_discovery(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<()>> + Send + '_>>
-    {
-        Box::pin(async move {
-            let runtime = &self.ws_runtime;
-
-            // Get the server without holding lock across await
-            let server = {
-                let state = runtime.state.lock().await;
-                state.ws_server.clone()
-            };
-
-            let server = server.ok_or_else(|| {
-                intent_core::Error::Internal("WSS listener not started".to_string())
-            })?;
-
-            server.start_discovery().await
-        })
-    }
-
-    fn stop_discovery(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            let runtime = &self.ws_runtime;
-            let server = {
-                let state = runtime.state.lock().await;
-                state.ws_server.clone()
-            };
-
-            if let Some(s) = server {
-                s.stop_discovery().await;
-            }
-        })
-    }
-
-    fn is_discovery_active(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
-        Box::pin(async move {
-            let runtime = &self.ws_runtime;
-            let server = {
-                let state = runtime.state.lock().await;
-                state.ws_server.clone()
-            };
-
-            if let Some(s) = server {
-                s.is_discovery_active().await
-            } else {
-                false
-            }
-        })
-    }
 }
 
 /// Fixed-token [`TokenStore`] selected only when `INTENTD_AUTH_TOKEN` is set.
@@ -1096,16 +1035,11 @@ fn resolve_token_store() -> Arc<dyn TokenStore> {
     }
 }
 
-/// Build [`WsOptions`] from the production defaults plus optional env seams:
-/// mDNS discovery (`INTENTD_DISCOVERY=1`, default off) and an explicit base port
-/// (`INTENTD_TCP_PORT`, `0` = OS-assigned ephemeral). Both are §13.1 E2E seams:
-/// the port seam keeps the suite hermetic (no fixed-5180 contention) and the
-/// discovery seam lets it assert the advertise→resolve + fingerprint round-trip.
+/// Build [`WsOptions`] from the production defaults plus an optional env seam:
+/// an explicit base port (`INTENTD_TCP_PORT`, `0` = OS-assigned ephemeral).
+/// A §13.1 E2E seam: keeps the suite hermetic (no fixed-5180 contention).
 fn ws_options_from_env() -> WsOptions {
     let mut opts = WsOptions::default();
-    if env_flag("INTENTD_DISCOVERY") {
-        opts.discovery_enabled = true;
-    }
     if let Some(port) = std::env::var("INTENTD_TCP_PORT")
         .ok()
         .and_then(|v| v.trim().parse::<u16>().ok())
@@ -1118,7 +1052,7 @@ fn ws_options_from_env() -> WsOptions {
 /// Parse the optional `--mode` locality override (§5.14) into the transport
 /// override flag: `local` ⇒ `Some(true)`, `remote` ⇒ `Some(false)`, absent ⇒
 /// `None` (infer from the transport). Any other value is a hard CLI error. The
-/// override is applied to the TCP/WSS listener (`host.status` + mDNS); the local
+/// override is applied to the TCP/WSS listener (`host.status`); the local
 /// UDS control path is always `local`.
 fn parse_locality_mode(mode: Option<&str>) -> anyhow::Result<Option<bool>> {
     match mode {

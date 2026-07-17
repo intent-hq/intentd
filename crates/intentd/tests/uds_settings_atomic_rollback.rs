@@ -45,20 +45,6 @@ impl ServerControl for FailingServerControl {
     fn is_tcp_connection(&self) -> bool {
         false
     }
-
-    fn start_discovery(
-        &self,
-    ) -> Pin<Box<dyn std::future::Future<Output = CoreResult<()>> + Send + '_>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn stop_discovery(&self) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        Box::pin(async {})
-    }
-
-    fn is_discovery_active(&self) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
-        Box::pin(async { false })
-    }
 }
 
 struct TempDb {

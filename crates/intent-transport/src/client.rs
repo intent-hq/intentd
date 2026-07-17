@@ -10,8 +10,8 @@
 use intent_core::{ClientId, WorkspaceApi};
 use serde_json::{json, Value};
 
-use crate::discovery::detect_has_display;
 use crate::events::{error_frame, success_frame};
+use crate::host_env::detect_has_display;
 use crate::protocol::PROTOCOL_VERSION;
 
 /// A classified `client.hello` request awaiting handling by the connection task.
