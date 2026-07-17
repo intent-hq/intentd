@@ -5143,26 +5143,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn search_memories(
-        &self,
-        query: String,
-        workspace_id: Option<WorkspaceId>,
-        request_id: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let registry = self.search_cancels.clone();
-        let services = self.clone();
-        Box::pin(async move {
-            let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let token = registry.register(&request_id);
-            // `workspaceId` is optional: scope to it when present, else span all.
-            let memories = memories::list(&store, workspace_id.as_ref()).await?;
-            let matches = search_ops::memory_matches(&memories, &query);
-            let matches = to_value_vec(matches)?;
-            Ok(services.deliver_search(request_id, workspace_id, matches, token))
-        })
-    }
-
     fn search_notes(
         &self,
         query: String,
@@ -6339,20 +6319,49 @@ impl WorkspaceApi for Services {
                         let child = AgentId::from(
                             created["agent"]["id"].as_str().unwrap_or_default(),
                         );
-                        // Deliver the prompt and start the first turn only
-                        // when one was supplied (delegate parity): the runtime
-                        // `AgentManager` when attached, else the store-only
-                        // persist. Best-effort like the delegate path — the
+                        // Extract image_blocks and context_references from the created
+                        // agent (STAB-69: thread them into the first turn so imageBlocks
+                        // attached to the initial prompt reach the ACP).
+                        let created_image_blocks = created
+                            .get("agent")
+                            .and_then(|a| a.get("imageBlocks"))
+                            .filter(|v| !v.is_null())
+                            .cloned();
+                        let created_context_refs = created
+                            .get("agent")
+                            .and_then(|a| a.get("contextReferences"))
+                            .filter(|v| !v.is_null())
+                            .cloned();
+                        // Deliver the prompt and start the first turn when a prompt OR
+                        // imageBlocks are supplied (STAB-69: image-only first messages
+                        // should start a turn, consistent with agent.sendMessage
+                        // semantics). The runtime `AgentManager` when attached, else the
+                        // store-only persist. Best-effort like the delegate path — the
                         // agent holds `metadata.initialMessage` for resume.
-                        if let Some(prompt) = prompt {
+                        let has_content = prompt.is_some() || created_image_blocks.is_some();
+                        if has_content {
+                            let prompt_text = prompt.unwrap_or_default();
+                            let options = crate::agent_manager::TurnOptions {
+                                image_blocks: created_image_blocks.clone(),
+                                context_references: created_context_refs,
+                                ..crate::agent_manager::TurnOptions::default()
+                            };
                             let send = match services.agent_manager() {
                                 Some(manager) => {
                                     manager
-                                        .send_message(child, ws.id.clone(), prompt, None, crate::agent_manager::TurnOptions::default())
+                                        .send_message(child, ws.id.clone(), prompt_text, None, options)
                                         .await
                                 }
                                 None => {
-                                    services.agent_send_message_op(child, prompt, None, None, None).await
+                                    services
+                                        .agent_send_message_op(
+                                            child,
+                                            prompt_text,
+                                            None,
+                                            created_image_blocks,
+                                            None,
+                                        )
+                                        .await
                                 }
                             };
                             if let Err(e) = send {
@@ -14903,7 +14912,6 @@ pub mod event {}
 mod instructions;
 mod mcp_oauth;
 mod mcp_servers;
-mod memories;
 mod rules;
 mod specialists;
 

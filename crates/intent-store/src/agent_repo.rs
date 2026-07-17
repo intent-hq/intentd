@@ -315,6 +315,57 @@ impl Store {
         Ok(())
     }
 
+    /// Clear `completion_report` + `completion_report_timestamp` when a new turn
+    /// begins for a delegated agent that previously called `report_to_parent`.
+    /// Returns `true` if a report was present and cleared, `false` if no report
+    /// was set (the common case — no write, no event). Scoped to `workspace_id`
+    /// (defense-in-depth). `updated_at` is refreshed to the supplied timestamp.
+    /// `NotFound` if the session is absent or the workspace does not match.
+    pub async fn clear_completion_report(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        updated_at: &str,
+    ) -> Result<bool> {
+        // Conditional UPDATE: only modify rows where completion_report IS NOT NULL.
+        // This avoids the expensive get_agent_session call (which loads the full
+        // message log) at the start of every turn. rows_affected tells us whether
+        // a report was present and cleared.
+        let rows = sqlx::query(
+            "UPDATE agent_session SET completion_report=NULL, \
+             completion_report_timestamp=NULL, updated_at=? \
+             WHERE id=? AND workspace_id=? AND completion_report IS NOT NULL",
+        )
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("clear completion report failed: {e}")))?
+        .rows_affected();
+        // rows_affected > 0 means a report was cleared; 0 means either no session
+        // found, workspace mismatch, or no report was set. Distinguish the error
+        // case (session not found / workspace mismatch) with a lightweight lookup.
+        if rows == 0 {
+            // Verify the session exists and workspace matches. Only SELECT id to
+            // avoid loading the full message log.
+            let exists = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM agent_session WHERE id=? AND workspace_id=?",
+            )
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("verify agent session failed: {e}")))?;
+            if exists.is_none() {
+                return Err(Error::NotFound(format!("agent session {id}")));
+            }
+            // Session exists but no report was set — the common case.
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// Reset all `is_active=1` rows to `is_active=0` unconditionally (Wave B
     /// post-restart recovery). ACP sessions are process-local and cannot survive
     /// a daemon restart, so any `is_active=1` flag after boot is stale. Called

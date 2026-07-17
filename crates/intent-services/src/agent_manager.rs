@@ -1791,6 +1791,51 @@ impl AgentManager {
         }
     }
 
+    /// Clear a persisted completion report when a new turn begins. Skips the
+    /// store write and event when no report is set (the common case). Emits
+    /// `agent:updated` with `completionReportCleared: true` when a report was
+    /// present and cleared. Called at the start of each prompt turn (including
+    /// queue-drained turns inside a running worker) so a delegated agent's
+    /// completion report does not stick across new work.
+    async fn clear_completion_report_if_present(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) {
+        let ts = now_iso();
+        match self
+            .services
+            .store
+            .clear_completion_report(workspace_id, agent_id, &ts)
+            .await
+        {
+            Ok(true) => {
+                // Report was present and cleared — emit agent:updated.
+                self.services
+                    .publish_agent_mutation_event(
+                        workspace_id,
+                        agent_id,
+                        intent_core::events::AGENT_UPDATED,
+                        json!({ "agentId": agent_id.0, "completionReportCleared": true }),
+                    )
+                    .await;
+            }
+            Ok(false) => {
+                // No report was set — skip the event.
+            }
+            Err(e) => {
+                // Store error (session not found, workspace mismatch) — log and
+                // swallow so the turn can proceed. The next successful load will
+                // reflect the stale report, but the runtime must not abort.
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    "clear completion report failed"
+                );
+            }
+        }
+    }
+
     /// Persist `agent_session.status` + `is_active` and publish the
     /// `agent:status-changed` self-sufficient event (PROTOCOL §6.5/§6.7). All
     /// failures are logged and swallowed: the runtime turn is the source of
@@ -2788,6 +2833,13 @@ async fn run_message_worker(
     'outer: loop {
         match retry_spawn(&mgr, &agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
+                // Clear any persisted completion report at the start of this turn
+                // (including queue-drained turns). Skip the store write when no
+                // report is set; the `agent:idle` wake for a prior turn that set a
+                // report still includes it because the clear runs at the NEXT turn's
+                // begin (after the `agent:idle` emit at the prior turn's end).
+                mgr.clear_completion_report_if_present(&agent_id, &workspace_id)
+                    .await;
                 let prompt = mgr
                     .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
                     .await;
