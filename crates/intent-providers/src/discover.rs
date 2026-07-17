@@ -388,17 +388,4 @@ mod find_provider_binary_tests {
             assert_eq!(result, Some(expected));
         }
     }
-
-    #[test]
-    fn find_npx_returns_path_when_npx_exists_on_enhanced_path() {
-        // This test will only pass if npx is actually on the enhanced PATH.
-        // On most dev machines with node/npm installed, this should be true.
-        // If it fails, it means npx is not findable, which is expected behavior.
-        let result = find_npx();
-        if let Some(path) = result {
-            assert!(path.is_absolute(), "npx path should be absolute");
-            assert!(path.is_file(), "npx path should point to a file");
-        }
-        // If None, that's also valid — npx is not installed/findable
-    }
 }

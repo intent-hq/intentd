@@ -74,10 +74,10 @@ impl<'a> SpawnOptions<'a> {
 pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
     let mut args = Vec::new();
 
-    // When using npx fallback (provider_binary not set but npx_fallback_binary is),
+    // When using npx fallback (provider_binary not set AND both npx fields are set),
     // prepend the npx-specific args before the provider's args
-    if opts.provider_binary.is_none() && opts.npx_fallback_binary.is_some() {
-        if let Some(pkg) = opts.npx_fallback_package {
+    if opts.provider_binary.is_none() {
+        if let (Some(_), Some(pkg)) = (opts.npx_fallback_binary, opts.npx_fallback_package) {
             args.push("-y".to_string());
             args.push(pkg.to_string());
         }
@@ -114,10 +114,10 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
 pub fn build_command(opts: &SpawnOptions) -> Command {
     let args = build_args(opts);
 
-    // Decide which binary to spawn: provider_binary > npx_fallback_binary > provider.command
+    // Decide which binary to spawn: provider_binary > npx_fallback (both fields) > provider.command
     let command = if let Some(p) = opts.provider_binary {
         p.as_os_str()
-    } else if let Some(npx) = opts.npx_fallback_binary {
+    } else if let (Some(npx), Some(_)) = (opts.npx_fallback_binary, opts.npx_fallback_package) {
         npx.as_os_str()
     } else {
         std::ffi::OsStr::new(opts.provider.command)
@@ -137,7 +137,13 @@ pub fn build_command(opts: &SpawnOptions) -> Command {
 
     // Enhanced PATH must include the binary's parent dir so dependencies resolve
     // (e.g., when spawning npx, node must be findable)
-    let path_binary = opts.provider_binary.or(opts.npx_fallback_binary);
+    let path_binary = opts.provider_binary.or_else(|| {
+        if opts.npx_fallback_package.is_some() {
+            opts.npx_fallback_binary
+        } else {
+            None
+        }
+    });
     cmd.env("PATH", enhanced_path(path_binary));
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
