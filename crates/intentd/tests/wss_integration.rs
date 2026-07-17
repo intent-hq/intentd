@@ -130,13 +130,6 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 }
 
 /// A free localhost TCP port (bound then released to discover the number).
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// Build a real `Services` API + event bus over a fresh temp SQLite store.
 /// The store is returned alongside so tests that need to seed fixtures with a
@@ -2551,4 +2544,13 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
     assert_eq!(init_missing["error"]["code"], -32602);
 
     srv.ws.stop().await;
+}
+
+fn free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
 }

@@ -49,13 +49,6 @@ impl Drop for Daemon {
     }
 }
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn scratch_dir(prefix: &str) -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();

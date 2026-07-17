@@ -27,13 +27,6 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 struct TempDir(PathBuf);
 impl Drop for TempDir {
@@ -221,4 +214,13 @@ async fn workspace_ui_context_unknown_workspace() {
     )
     .await;
     assert_eq!(err2["error"]["code"], json!(-32602));
+}
+
+fn free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
 }

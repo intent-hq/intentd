@@ -46,13 +46,6 @@ impl Drop for Daemon {
     }
 }
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
@@ -334,4 +327,13 @@ async fn server_rotate_token_over_wss_rejects() {
     assert!(error["message"].as_str().unwrap().contains("local"));
 
     daemon.child.kill().ok();
+}
+
+fn free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
 }

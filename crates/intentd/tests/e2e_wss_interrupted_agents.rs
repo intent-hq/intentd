@@ -35,13 +35,6 @@ use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
@@ -326,12 +319,13 @@ async fn interrupted_agents_persisted_across_restart() {
     daemon = cmd2.spawn().expect("spawn intentd serve 2");
     assert!(await_uds(&socket).await, "daemon did not restart");
 
-    // Fetch fingerprint for TLS cert pinning.
+    // Fetch fingerprint and port for TLS cert pinning.
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
         .to_string();
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
 
     // Open WSS connection.
     let cfg = client_config(&fp);
@@ -381,6 +375,7 @@ async fn interrupted_agents_persisted_across_restart() {
         .as_str()
         .expect("fingerprint 2")
         .to_string();
+    let port = status["result"]["port"].as_u64().expect("port 2") as u16;
     let cfg = client_config(&fp);
     let mut ws = connect_ws(port, cfg).await;
 

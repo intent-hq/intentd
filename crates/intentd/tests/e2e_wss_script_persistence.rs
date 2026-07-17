@@ -29,13 +29,6 @@ use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn scratch_dir(prefix: &str) -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
@@ -324,4 +317,13 @@ async fn scripts_survive_daemon_restart_over_wss() {
     drop(ws);
     stop(child);
     let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+fn free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
 }

@@ -28,13 +28,6 @@ use tokio::time::{timeout, Instant};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -321,4 +314,13 @@ async fn agent_browser_exec_without_any_client_reports_no_client_error() {
     let s = err.to_string();
     assert!(s.contains("no client connected"), "unexpected error: {s}");
     fx.ws.stop().await;
+}
+
+fn free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
 }

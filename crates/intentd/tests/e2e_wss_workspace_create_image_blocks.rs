@@ -24,13 +24,6 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 struct TempDir(PathBuf);
 impl Drop for TempDir {
@@ -150,4 +143,13 @@ async fn workspace_create_threads_image_blocks_to_first_turn() {
         agent_obj["metadata"]["initialMessage"].as_str().is_some(),
         "initial message persisted in metadata"
     );
+}
+
+fn free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
 }

@@ -45,13 +45,6 @@ impl Drop for Daemon {
     }
 }
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
@@ -253,8 +246,11 @@ async fn runtime_ws_listener_toggle_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
+    // Get the actual bound port from system.status
+    let status = uds_rpc(&socket, 999, "system.status", json!({})).await;
+    let port_value = status["result"]["port"].as_u64().expect("port");
+
     // Persist the ephemeral port to the setting so re-enable uses the same port
-    let port_value: u64 = port_s.parse().unwrap();
     let set_port = uds_rpc(
         &socket,
         1,
@@ -453,4 +449,13 @@ async fn batch_hook_ordering_port_before_enable() {
         ping_resp.get("error").is_none(),
         "events.subscribe over WSS after reverse-order batch should work: {ping_resp}"
     );
+}
+
+fn free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
 }

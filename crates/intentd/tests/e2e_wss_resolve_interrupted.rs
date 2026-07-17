@@ -37,13 +37,6 @@ use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
@@ -402,12 +395,13 @@ async fn resolve_interrupted_resume_and_abandon() {
             .expect("insert interrupted 2");
     }
 
-    // Fetch fingerprint
+    // Fetch fingerprint and port
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
         .to_string();
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
 
     // Open WSS connection
     let cfg = client_config(&fp);
@@ -514,12 +508,13 @@ async fn resolve_interrupted_invalid_params_validation() {
         panic!("daemon did not start");
     }
 
-    // Fetch fingerprint
+    // Fetch fingerprint and port
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
         .to_string();
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
 
     // Open WSS connection
     let cfg = client_config(&fp);

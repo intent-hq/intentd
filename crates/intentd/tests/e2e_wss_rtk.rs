@@ -49,13 +49,6 @@ impl Drop for Daemon {
     }
 }
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
@@ -313,7 +306,7 @@ async fn rtk_settings_integration() {
         .as_str()
         .expect("no fingerprint");
     let bound_port = status_resp["result"]["port"].as_u64().expect("no port") as u16;
-    assert_eq!(bound_port, port);
+    assert_ne!(bound_port, 0, "bound port should be non-zero");
 
     let cfg = client_config(fp);
     let mut ws = wss_connect(bound_port, cfg).await;

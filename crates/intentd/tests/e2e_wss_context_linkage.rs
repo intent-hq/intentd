@@ -34,13 +34,6 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 struct TempDir(PathBuf);
 impl Drop for TempDir {
@@ -452,4 +445,13 @@ async fn workspace_update_context_rejects_duplicate_ids() {
         msg.contains("duplicate") && msg.contains("dup"),
         "duplicate-id message: {msg}"
     );
+}
+
+fn free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
 }
