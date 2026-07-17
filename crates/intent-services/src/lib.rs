@@ -4340,7 +4340,8 @@ impl Services {
     }
 
     /// Apply server runtime control hooks after `settings.update` persists
-    /// `server.wsApi.enabled` changes (§5.12).
+    /// `server.wsApi.*` changes (§5.12): `server.wsApi.enabled` starts/stops the
+    /// WSS listener; `server.wsApi.port` restarts it when running.
     /// Returns an error if the operation fails (e.g., TCP client trying to disable
     /// the WSS listener, or listener start failure), allowing the caller to rollback.
     ///
@@ -4520,8 +4521,9 @@ impl WorkspaceApi for Services {
 
             let applied = self.settings_service().update(&changes).await?;
             if !applied.is_empty() {
-                // Apply server runtime hooks (§5.12): start/stop WSS listener
-                // when server.wsApi.enabled changes.
+                // Apply server runtime hooks (§5.12): start/stop the WSS listener
+                // when server.wsApi.enabled changes, restart it when
+                // server.wsApi.port changes while running.
                 if let Some(control) = self.server_control.get() {
                     if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
                         // Rollback: restore old values for ALL settings in the batch.
