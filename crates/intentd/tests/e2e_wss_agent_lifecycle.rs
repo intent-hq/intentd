@@ -5311,7 +5311,8 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     let mut dequeued_message_id: Option<String> = None;
     let mut stream_end_count = 0;
     for _ in 0..120 {
-        let frame = wss_event(&mut sub, 30).await;
+        let frame_opt = wss_event_opt(&mut sub, 30).await;
+        let frame = frame_opt.expect("event timeout");
         let evt = &frame["params"]["event"];
         match evt["type"].as_str() {
             Some("agent:message") => {
@@ -5339,7 +5340,7 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         "agent:message event emitted for dequeued user message (persist_user path)"
     );
 
-    // Verify the messageId matches a row in the transcript.
+    // Verify the messageId matches the second (queued) user message in the transcript.
     let conv = wss_rpc(
         &mut rpc,
         13,
@@ -5348,12 +5349,21 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     )
     .await;
     let messages = conv["messages"].as_array().unwrap();
-    let found_dequeued = messages
+    // Count user messages - we expect the dequeued message to be the second one.
+    let user_messages: Vec<_> = messages
         .iter()
-        .any(|m| m["id"].as_str() == dequeued_message_id.as_deref() && m["role"] == "user");
+        .filter(|m| m["role"] == "user")
+        .collect();
     assert!(
-        found_dequeued,
-        "dequeued agent:message messageId matches a persisted user row"
+        user_messages.len() >= 2,
+        "should have at least 2 user messages (first + queued)"
+    );
+    // The event messageId should match the second user message (the queued one).
+    let second_user_id = user_messages[1]["id"].as_str();
+    assert_eq!(
+        dequeued_message_id.as_deref(),
+        second_user_id,
+        "dequeued agent:message event ID matches the second (queued) user message"
     );
 
     // Part 2: Wake delivery path (deliver_wake_message runtime).
@@ -5386,7 +5396,8 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     let mut wake_message_id: Option<String> = None;
     let mut wake_stream_end_count = 0;
     for _ in 0..120 {
-        let frame = wss_event(&mut sub, 30).await;
+        let frame_opt = wss_event_opt(&mut sub, 30).await;
+        let frame = frame_opt.expect("event timeout");
         let evt = &frame["params"]["event"];
         match evt["type"].as_str() {
             Some("agent:message") => {
@@ -5411,7 +5422,7 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         "agent:message event emitted for wake delivery (deliver_wake_message path)"
     );
 
-    // Verify the wake messageId matches a row in the transcript.
+    // Verify the wake messageId matches the first (and only) user message in the task agent's transcript.
     let wake_conv = wss_rpc(
         &mut rpc,
         16,
@@ -5420,11 +5431,20 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     )
     .await;
     let wake_messages = wake_conv["messages"].as_array().unwrap();
-    let found_wake = wake_messages
+    // The wake-delivery agent should have exactly one user message (the wake contextMessage).
+    let wake_user_messages: Vec<_> = wake_messages
         .iter()
-        .any(|m| m["id"].as_str() == wake_message_id.as_deref() && m["role"] == "user");
+        .filter(|m| m["role"] == "user")
+        .collect();
     assert!(
-        found_wake,
-        "wake agent:message messageId matches a persisted user row"
+        !wake_user_messages.is_empty(),
+        "wake agent should have at least one user message"
+    );
+    // The event messageId should match the first user message.
+    let first_wake_user_id = wake_user_messages[0]["id"].as_str();
+    assert_eq!(
+        wake_message_id.as_deref(),
+        first_wake_user_id,
+        "wake agent:message event ID matches the first user message (wake contextMessage)"
     );
 }
