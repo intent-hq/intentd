@@ -342,8 +342,7 @@ async fn seed_workspace_and_task(data_dir: &Path, title: &str) -> (String, Strin
 async fn boot_daemon_with_task(title: &str) -> (Daemon, String, String, u16, String) {
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_task(&data_dir, title).await;
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,

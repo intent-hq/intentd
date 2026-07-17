@@ -252,8 +252,7 @@ where
 /// client config plus the bound TCP port (discovered via UDS `system.status`).
 async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = temp_data_dir();
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
@@ -1109,10 +1108,9 @@ async fn host_find_binary_uses_login_shell_path() {
     }
 
     // Spawn daemon with minimal PATH and fake SHELL
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("PATH", "/usr/bin:/bin"), // Minimal PATH that won't find our binary
         ("SHELL", fake_shell_path.to_str().unwrap()),
     ];
@@ -1156,8 +1154,7 @@ async fn host_find_binary_uses_login_shell_path() {
 #[tokio::test]
 async fn host_provider_discovery_over_wss() {
     let data_dir = temp_data_dir();
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,

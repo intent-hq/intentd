@@ -412,10 +412,9 @@ async fn auto_commit_uses_generated_message_over_wss() {
         "response": "done",
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("RUST_LOG", "debug"),
@@ -589,11 +588,10 @@ async fn auto_commit_falls_back_when_auggie_missing() {
         "response": "done",
     })
     .to_string();
-    let port_s = free_port().to_string();
     // NO INTENTD_AUGGIE_BIN set — auggie will not be found.
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];

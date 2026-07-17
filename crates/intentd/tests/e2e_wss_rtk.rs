@@ -302,7 +302,7 @@ async fn rtk_settings_integration() {
         child: spawn_serve(
             &data_dir,
             "both",
-            &[("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)],
+            &[("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")],
         ),
         data_dir: data_dir.clone(),
     };
@@ -428,7 +428,7 @@ async fn rtk_prompt_injection_over_wss() {
             "both",
             &[
                 ("INTENTD_AUTH_TOKEN", TOKEN),
-                ("INTENTD_TCP_PORT", &port_s),
+                ("INTENTD_TCP_PORT", "0"),
                 ("MOCK_AGENT_SCRIPT_PATH", &script),
                 ("MOCK_AGENT_BEHAVIOR", &behavior),
                 ("PATH", &augmented_path),

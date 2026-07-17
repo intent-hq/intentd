@@ -279,8 +279,7 @@ where
 
 async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = scratch_dir("data");
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
