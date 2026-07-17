@@ -33,6 +33,7 @@ pub mod squash;
 pub mod stage;
 pub mod stash;
 pub mod status;
+pub mod submodule;
 pub mod worktree;
 
 #[cfg(test)]
