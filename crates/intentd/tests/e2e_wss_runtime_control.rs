@@ -28,6 +28,15 @@ use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
+fn free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
+}
+
 struct Daemon {
     child: Child,
     data_dir: PathBuf,
@@ -402,9 +411,9 @@ async fn batch_hook_ordering_port_before_enable() {
     // Batch update: provide changes in REVERSE dependency order (wsApi.enabled
     // before wsApi.port in the input array). The hook ordering ensures the port
     // value (priority 0) applies before wsApi.enabled (priority 10), so the
-    // listener starts directly on the NEW port. Use a high fixed port to avoid
-    // collision with the initial listener.
-    let new_port = 20000;
+    // listener starts directly on the NEW port. Pick a dynamically-available port
+    // to avoid hard-coded collisions.
+    let new_port = free_port();
     let batch_reverse = uds_rpc(
         &socket,
         2,

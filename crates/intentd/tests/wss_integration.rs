@@ -1148,10 +1148,10 @@ async fn bind_fails_fast_on_occupied_port() {
     // bind error immediately — no port walking, no retry. Occupy the port for
     // the whole test so the listener has no chance to bind, then assert
     // `start()` returns an `AddrInUse` error on the SAME port it was asked for.
-    // NOTE: This test intentionally uses free_port() to obtain a fixed port that
-    // it then occupies, because it's testing the fixed-port bind failure path.
-    let base = free_port();
-    let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, base)).unwrap();
+    // Bind the hog listener first, keep it open, and use its port for the test
+    // to avoid TOCTOU (no free_port() release-then-rebind window).
+    let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let base = _hog.local_addr().unwrap().port();
     let (api, bus, _store, dir) = make_services(None).await;
     let tls = ensure_tls_certificate(&dir).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
@@ -1227,9 +1227,10 @@ async fn insecure_mode_serves_plain_ws_without_token() {
 #[tokio::test]
 async fn graceful_shutdown_allows_immediate_restart() {
     // NOTE: This test verifies fixed-port restart semantics (same port reclaimed
-    // after stop). Use an explicit fixed port to avoid ephemeral port randomness.
+    // after stop). Pick a dynamically-available port to avoid hard-coded collisions.
+    let fixed_port = free_port();
     let srv = start(WsOptions {
-        base_port: 30000,
+        base_port: fixed_port,
         ..WsOptions::default()
     })
     .await;
