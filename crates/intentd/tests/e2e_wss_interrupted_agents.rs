@@ -515,10 +515,11 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
     // Wait for the agent to be observably in-flight: look for agent:stream:chunk
-    // (which means the turn has started and the agent is Active).
+    // (which means the turn has started and the agent is Active). The mock takes
+    // a moment to boot on CI, so use a generous per-event timeout.
     let mut saw_chunk = false;
-    for _ in 0..50 {
-        let frame = wss_event(&mut sub, 10).await;
+    for _ in 0..20 {
+        let frame = wss_event(&mut sub, 30).await;
         if frame["params"]["event"]["type"] == "agent:stream:chunk" {
             saw_chunk = true;
             break;
