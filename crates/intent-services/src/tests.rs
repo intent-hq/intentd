@@ -9479,6 +9479,170 @@ mod known_repo {
             "known_repo entry carries derived name"
         );
     }
+
+    /// `workspace.list` backfills `repository_owner` and `repository_name` for
+    /// existing workspaces with a `repositoryPath` and missing owner/name:
+    /// derive from the `origin` remote URL (same helper as `workspace.create`),
+    /// persist, and emit `workspace:updated` with the changed fields (STAB-64
+    /// backfill).
+    #[tokio::test]
+    async fn list_workspaces_backfills_owner_and_name_from_origin_remote() {
+        use git2::{Repository, Signature};
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let bus = crate::events::bus::EventBus::new(store.clone());
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone());
+
+        // Manually create a workspace row with repository_path but missing owner/name
+        // (simulates old workspace created before the create derivation landed).
+        let make_repo = |url: &str| {
+            let dir = std::env::temp_dir().join(format!(
+                "intentd-backfill-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = Repository::init(&dir).unwrap();
+            repo.remote("origin", url).unwrap();
+            let mut index = repo.index().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            let sig = Signature::now("Test", "test@example.com").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
+                .unwrap();
+            dir
+        };
+
+        let repo_path = make_repo("https://github.com/octocat/hello-world.git");
+        let id = WorkspaceId::from_string("backfill-test".to_string());
+        let now = now_iso();
+        let mut ws = Workspace {
+            id: id.clone(),
+            title: "Backfill Test".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: Some(repo_path.to_string_lossy().to_string()),
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            token_usage: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            cow_supported: None,
+        };
+        store.insert_workspace(&ws).await.expect("insert workspace");
+
+        // Subscribe to events to capture workspace:updated
+        let mut sub =
+            svc.event_bus
+                .as_ref()
+                .unwrap()
+                .subscribe(crate::events::filter::SubscriptionFilter {
+                    event_types: vec!["workspace:updated".to_string()],
+                    workspace_id: Some(id.0.clone()),
+                    batch_window: None,
+                    ..Default::default()
+                });
+
+        // Trigger workspace.list → spawns backfill
+        let list = svc.list_workspaces(false).await.expect("list workspaces");
+        assert!(list.iter().any(|w| w.id == id), "workspace appears in list");
+
+        // Wait for the backfill to complete and emit workspace:updated
+        let mut updated_event = None;
+        for _ in 0..100 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            // Try to receive batched events (could be empty or timeout)
+            match tokio::time::timeout(tokio::time::Duration::from_millis(10), sub.recv()).await {
+                Ok(Some(batch)) => {
+                    for evt in batch {
+                        if evt.event_type == "workspace:updated"
+                            && evt.workspace_id == id
+                            && evt
+                                .data
+                                .get("changes")
+                                .and_then(|c| c.get("repositoryOwner"))
+                                .is_some()
+                        {
+                            updated_event = Some(evt);
+                            break;
+                        }
+                    }
+                    if updated_event.is_some() {
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        assert!(
+            updated_event.is_some(),
+            "workspace:updated event emitted with repositoryOwner change"
+        );
+        let evt = updated_event.unwrap();
+        assert_eq!(
+            evt.data
+                .get("changes")
+                .and_then(|c| c.get("repositoryOwner"))
+                .and_then(|v| v.as_str()),
+            Some("octocat"),
+            "event carries repositoryOwner change"
+        );
+        assert_eq!(
+            evt.data
+                .get("changes")
+                .and_then(|c| c.get("repositoryName"))
+                .and_then(|v| v.as_str()),
+            Some("hello-world"),
+            "event carries repositoryName change"
+        );
+
+        // Verify workspace row persisted the fields
+        ws = store.get_workspace(&id).await.expect("get workspace");
+        assert_eq!(
+            ws.repository_owner.as_deref(),
+            Some("octocat"),
+            "repositoryOwner persisted"
+        );
+        assert_eq!(
+            ws.repository_name.as_deref(),
+            Some("hello-world"),
+            "repositoryName persisted"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&repo_path);
+    }
 }
 
 mod worktree_provisioning {
