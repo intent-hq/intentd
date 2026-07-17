@@ -115,10 +115,7 @@ impl WsInner {
         }
         match TcpListener::bind((self.bind_address, self.base_port)).await {
             Ok(listener) => {
-                let port = listener
-                    .local_addr()
-                    .map_err(Arc::new)?
-                    .port();
+                let port = listener.local_addr().map_err(Arc::new)?.port();
                 Ok((listener, port))
             }
             Err(e) => Err(Arc::new(e)),
