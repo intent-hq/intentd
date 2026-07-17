@@ -125,9 +125,9 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
         .collect()
 }
 
-/// Probe npx availability (path + version) without spawning. Returns `None` for
-/// the version when npx is not found on PATH. Version parsing is best-effort;
-/// unparseable versions yield `version_ok = false`.
+/// Probe npx availability (path only, no spawning). Returns the resolved path
+/// when npx is found on PATH. Version probing requires spawning `npx --version`
+/// and is handled at the transport layer where a tokio runtime is available.
 pub fn probe_npx() -> NpxStatus {
     let resolved_path = find_npx();
     NpxStatus {

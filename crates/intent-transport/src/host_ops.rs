@@ -1258,36 +1258,48 @@ pub(crate) fn provider_discovery_op() -> Value {
 }
 
 /// Spawn `npx --version` with a 3-second timeout, returning the version string
-/// (first line of stdout, trimmed) or `None` on any failure.
+/// (first line of stdout, trimmed) or `None` on any failure. Kills the child
+/// process on timeout to prevent resource leaks.
 fn probe_npx_version(npx_path: &Path) -> Option<String> {
-    use std::sync::mpsc::channel;
-
-    let (tx, rx) = channel();
-    let npx_path = npx_path.to_path_buf();
-
-    std::thread::spawn(move || {
-        let result = Command::new(&npx_path)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-        let _ = tx.send(result);
-    });
+    let mut child = Command::new(npx_path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
 
     let timeout = Duration::from_secs(3);
-    let result = rx.recv_timeout(timeout).ok()?.ok()?;
+    let start = std::time::Instant::now();
 
-    if !result.status.success() {
-        return None;
+    // Poll with try_wait until timeout
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = child.wait_with_output().ok()?;
+                if !status.success() {
+                    return None;
+                }
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let first_line = stdout.lines().next()?.trim();
+                if first_line.is_empty() {
+                    return None;
+                }
+                return Some(first_line.to_string());
+            }
+            Ok(None) => {
+                // Still running
+                if start.elapsed() >= timeout {
+                    // Kill on timeout
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
     }
-
-    let stdout = String::from_utf8_lossy(&result.stdout);
-    let first_line = stdout.lines().next()?.trim();
-    if first_line.is_empty() {
-        return None;
-    }
-    Some(first_line.to_string())
 }
 
 /// Parse `versionOk` from the npx version string. Returns `true` when the

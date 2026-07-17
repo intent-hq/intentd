@@ -1151,3 +1151,84 @@ async fn host_find_binary_uses_login_shell_path() {
 
     drop(daemon);
 }
+
+/// WSS e2e for host.providerDiscovery: proves the providers + npx wire envelope.
+#[tokio::test]
+async fn host_provider_discovery_over_wss() {
+    let data_dir = temp_data_dir();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut ws = connect_ws(port, cfg).await;
+
+    // Call host.providerDiscovery
+    let result = wss_rpc(&mut ws, 2, "host.providerDiscovery", json!({})).await;
+
+    // Assert wire contract shape
+    assert!(result.is_object(), "result must be an object: {result}");
+    assert!(
+        result["providers"].is_array(),
+        "providers must be an array: {result}"
+    );
+    assert!(result["npx"].is_object(), "npx must be an object: {result}");
+
+    // Check npx fields
+    let npx = &result["npx"];
+    assert!(
+        npx.get("resolvedPath").is_some(),
+        "npx.resolvedPath must exist: {npx}"
+    );
+    assert!(
+        npx.get("version").is_some(),
+        "npx.version must exist: {npx}"
+    );
+    assert!(
+        npx["versionOk"].is_boolean(),
+        "npx.versionOk must be boolean: {npx}"
+    );
+
+    // Check providers array
+    let providers = result["providers"].as_array().unwrap();
+    assert!(
+        !providers.is_empty(),
+        "providers array should not be empty: {result}"
+    );
+
+    // Check first provider shape
+    let p0 = &providers[0];
+    assert!(p0["id"].is_string(), "provider.id must be string: {p0}");
+    assert!(
+        p0["displayName"].is_string(),
+        "provider.displayName must be string: {p0}"
+    );
+    assert!(
+        p0["command"].is_string(),
+        "provider.command must be string: {p0}"
+    );
+    assert!(
+        p0["installed"].is_boolean(),
+        "provider.installed must be boolean: {p0}"
+    );
+    assert!(
+        p0["hasNpxFallback"].is_boolean(),
+        "provider.hasNpxFallback must be boolean: {p0}"
+    );
+
+    drop(daemon);
+}
