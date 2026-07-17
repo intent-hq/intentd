@@ -153,10 +153,15 @@ fn normalize_workspace_path(workspace_path: &str) -> Option<String> {
 }
 
 /// Get scan targets in precedence order
-fn get_scan_targets(workspace_path: Option<&str>) -> Vec<ScanTarget> {
+/// If `home_override` is provided, use it instead of reading from env (for tests)
+fn get_scan_targets(
+    workspace_path: Option<&str>,
+    home_override: Option<PathBuf>,
+) -> Vec<ScanTarget> {
     let mut targets = Vec::new();
 
-    if let Some(home) = home_dir() {
+    let home = home_override.or_else(home_dir);
+    if let Some(home) = home {
         targets.push(ScanTarget {
             root: home.join(".agents").join("skills"),
             precedence: 1,
@@ -193,6 +198,14 @@ fn get_scan_targets(workspace_path: Option<&str>) -> Vec<ScanTarget> {
 
 /// Load skills payload with caching and concurrent-load coalescing
 async fn load_skills_payload(workspace_path: &str) -> CachePayload {
+    load_skills_payload_with_home(workspace_path, None).await
+}
+
+/// Internal: load skills payload with optional home directory override (for tests)
+async fn load_skills_payload_with_home(
+    workspace_path: &str,
+    home_override: Option<PathBuf>,
+) -> CachePayload {
     let normalized = normalize_workspace_path(workspace_path);
     let cache_key = normalized
         .as_deref()
@@ -249,7 +262,7 @@ async fn load_skills_payload(workspace_path: &str) -> CachePayload {
             );
         }
 
-        let result = scan_skills(normalized.as_deref()).await;
+        let result = scan_skills_with_home(normalized.as_deref(), home_override.clone()).await;
 
         {
             let mut cache = DISCOVERY_CACHE.lock().unwrap();
@@ -267,15 +280,18 @@ async fn load_skills_payload(workspace_path: &str) -> CachePayload {
     }
 }
 
-/// Scan all skill directories and build the cache payload
-async fn scan_skills(workspace_path: Option<&str>) -> CachePayload {
+/// Internal: scan skills with optional home directory override (for tests)
+async fn scan_skills_with_home(
+    workspace_path: Option<&str>,
+    home_override: Option<PathBuf>,
+) -> CachePayload {
     let mut observed_paths = std::collections::HashSet::new();
     let mut discovered_by_name = BTreeMap::new();
     let mut scan_state = ScanState {
         scanned_directories: 0,
     };
 
-    for target in get_scan_targets(workspace_path) {
+    for target in get_scan_targets(workspace_path, home_override) {
         observed_paths.insert(target.root.clone());
         let skill_files =
             find_skill_files(&target.root, &mut observed_paths, &mut scan_state).await;
@@ -690,7 +706,6 @@ async fn are_fingerprints_current(fingerprints: &[PathFingerprint]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     fn build_skill_content(frontmatter: &str, body: &str) -> String {
         format!("---\n{}\n---\n\n{}\n", frontmatter, body)
@@ -704,6 +719,18 @@ mod tests {
         skill_path
     }
 
+    // Test helper: discover skills with explicit home dir (no env mutation)
+    async fn discover_skills_test(workspace_path: &str, home_dir: PathBuf) -> Vec<SkillMetadata> {
+        let payload = load_skills_payload_with_home(workspace_path, Some(home_dir)).await;
+        payload.skills
+    }
+
+    // Test helper: format catalog with explicit home dir (no env mutation)
+    async fn format_catalog_test(workspace_path: &str, home_dir: PathBuf) -> String {
+        let payload = load_skills_payload_with_home(workspace_path, Some(home_dir)).await;
+        payload.catalog
+    }
+
     // Clear the global cache before each test
     fn clear_cache() {
         let mut cache = DISCOVERY_CACHE.lock().unwrap();
@@ -711,14 +738,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_discover_and_parse_valid_skill() {
         clear_cache();
         let temp_dir = tempfile::tempdir().unwrap();
         let home_dir = temp_dir.path().join("home");
         let workspace_path = temp_dir.path().join("workspace");
         tokio::fs::create_dir_all(&workspace_path).await.unwrap();
-        std::env::set_var("HOME", home_dir.to_str().unwrap());
 
         let skills_root = workspace_path.join(".agents").join("skills");
         let skill_path = write_skill(
@@ -731,7 +756,7 @@ mod tests {
         )
         .await;
 
-        let skills = discover_skills(&workspace_path.to_string_lossy()).await;
+        let skills = discover_skills_test(&workspace_path.to_string_lossy(), home_dir).await;
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "valid-skill");
         assert_eq!(skills[0].description, "Valid skill description");
@@ -742,14 +767,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_skip_skills_missing_description() {
         clear_cache();
         let temp_dir = tempfile::tempdir().unwrap();
         let home_dir = temp_dir.path().join("home");
         let workspace_path = temp_dir.path().join("workspace");
         tokio::fs::create_dir_all(&workspace_path).await.unwrap();
-        std::env::set_var("HOME", home_dir.to_str().unwrap());
 
         let skills_root = workspace_path.join(".agents").join("skills");
         write_skill(
@@ -759,19 +782,17 @@ mod tests {
         )
         .await;
 
-        let skills = discover_skills(&workspace_path.to_string_lossy()).await;
+        let skills = discover_skills_test(&workspace_path.to_string_lossy(), home_dir).await;
         assert_eq!(skills.len(), 0);
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_parse_malformed_yaml_with_fallback() {
         clear_cache();
         let temp_dir = tempfile::tempdir().unwrap();
         let home_dir = temp_dir.path().join("home");
         let workspace_path = temp_dir.path().join("workspace");
         tokio::fs::create_dir_all(&workspace_path).await.unwrap();
-        std::env::set_var("HOME", home_dir.to_str().unwrap());
 
         let skills_root = workspace_path.join(".agents").join("skills");
         write_skill(
@@ -784,38 +805,34 @@ mod tests {
         )
         .await;
 
-        let skills = discover_skills(&workspace_path.to_string_lossy()).await;
+        let skills = discover_skills_test(&workspace_path.to_string_lossy(), home_dir).await;
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "fallback-skill");
         assert_eq!(skills[0].description, "Use when: the user asks");
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_format_catalog_empty() {
         clear_cache();
         let temp_dir = tempfile::tempdir().unwrap();
         let home_dir = temp_dir.path().join("home");
         let workspace_path = temp_dir.path().join("workspace");
         tokio::fs::create_dir_all(&workspace_path).await.unwrap();
-        std::env::set_var("HOME", home_dir.to_str().unwrap());
 
-        let catalog = format_skills_catalog_for_prompt(&workspace_path.to_string_lossy()).await;
+        let catalog = format_catalog_test(&workspace_path.to_string_lossy(), home_dir).await;
         assert_eq!(catalog, "");
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_format_catalog_xml() {
         clear_cache();
         let temp_dir = tempfile::tempdir().unwrap();
         let home_dir = temp_dir.path().join("home");
         let workspace_path = temp_dir.path().join("workspace");
         tokio::fs::create_dir_all(&workspace_path).await.unwrap();
-        std::env::set_var("HOME", home_dir.to_str().unwrap());
 
         let skills_root = workspace_path.join(".augment").join("skills");
-        let skill_path = write_skill(
+        let _skill_path = write_skill(
             &skills_root,
             "catalog-skill",
             &build_skill_content(
@@ -825,7 +842,7 @@ mod tests {
         )
         .await;
 
-        let catalog = format_skills_catalog_for_prompt(&workspace_path.to_string_lossy()).await;
+        let catalog = format_catalog_test(&workspace_path.to_string_lossy(), home_dir).await;
 
         assert!(catalog.contains("<available_skills>"));
         assert!(catalog.contains("<skill>"));
@@ -838,14 +855,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_precedence_project_over_user() {
         clear_cache();
         let temp_dir = tempfile::tempdir().unwrap();
         let home_dir = temp_dir.path().join("home");
         let workspace_path = temp_dir.path().join("workspace");
         tokio::fs::create_dir_all(&workspace_path).await.unwrap();
-        std::env::set_var("HOME", home_dir.to_str().unwrap());
 
         // User-level skill
         let user_skills_root = home_dir.join(".augment").join("skills");
@@ -871,7 +886,7 @@ mod tests {
         )
         .await;
 
-        let skills = discover_skills(&workspace_path.to_string_lossy()).await;
+        let skills = discover_skills_test(&workspace_path.to_string_lossy(), home_dir).await;
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "shared-skill");
         assert_eq!(skills[0].description, "Project-level description");
@@ -882,21 +897,18 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_xml_escaping() {
         assert_eq!(escape_xml("&<>\""), "&amp;&lt;&gt;&quot;");
         assert_eq!(escape_xml("normal text"), "normal text");
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_depth_limit() {
         clear_cache();
         let temp_dir = tempfile::tempdir().unwrap();
         let home_dir = temp_dir.path().join("home");
         let workspace_path = temp_dir.path().join("workspace");
         tokio::fs::create_dir_all(&workspace_path).await.unwrap();
-        std::env::set_var("HOME", home_dir.to_str().unwrap());
 
         let skills_root = workspace_path.join(".agents").join("skills");
 
@@ -915,7 +927,7 @@ mod tests {
         )
         .await;
 
-        let skills = discover_skills(&workspace_path.to_string_lossy()).await;
+        let skills = discover_skills_test(&workspace_path.to_string_lossy(), home_dir).await;
         assert_eq!(
             skills.len(),
             0,
@@ -924,14 +936,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_stop_descending_after_skill_found() {
         clear_cache();
         let temp_dir = tempfile::tempdir().unwrap();
         let home_dir = temp_dir.path().join("home");
         let workspace_path = temp_dir.path().join("workspace");
         tokio::fs::create_dir_all(&workspace_path).await.unwrap();
-        std::env::set_var("HOME", home_dir.to_str().unwrap());
 
         let skills_root = workspace_path.join(".agents").join("skills");
 
@@ -953,24 +963,22 @@ mod tests {
         .await
         .unwrap();
 
-        let skills = discover_skills(&workspace_path.to_string_lossy()).await;
+        let skills = discover_skills_test(&workspace_path.to_string_lossy(), home_dir).await;
         assert_eq!(skills.len(), 1, "Should only find parent skill, not child");
         assert_eq!(skills[0].name, "parent-skill");
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_cache_invalidation_on_mtime_change() {
         clear_cache();
         let temp_dir = tempfile::tempdir().unwrap();
         let home_dir = temp_dir.path().join("home");
         let workspace_path = temp_dir.path().join("workspace");
         tokio::fs::create_dir_all(&workspace_path).await.unwrap();
-        std::env::set_var("HOME", home_dir.to_str().unwrap());
 
         let skills_root = workspace_path.join(".agents").join("skills");
 
-        let skill_path = write_skill(
+        let _skill_path = write_skill(
             &skills_root,
             "cached-skill",
             &build_skill_content(
@@ -981,7 +989,8 @@ mod tests {
         .await;
 
         // First load
-        let skills1 = discover_skills(&workspace_path.to_string_lossy()).await;
+        let skills1 =
+            discover_skills_test(&workspace_path.to_string_lossy(), home_dir.clone()).await;
         assert_eq!(skills1.len(), 1);
         assert_eq!(skills1[0].description, "Original description");
 
@@ -989,8 +998,9 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Modify the file
+        let skill_path_full = skills_root.join("cached-skill").join("SKILL.md");
         tokio::fs::write(
-            &skill_path,
+            &skill_path_full,
             build_skill_content(
                 "name: cached-skill\ndescription: Updated description",
                 "Body",
@@ -1000,7 +1010,7 @@ mod tests {
         .unwrap();
 
         // Second load should pick up the change
-        let skills2 = discover_skills(&workspace_path.to_string_lossy()).await;
+        let skills2 = discover_skills_test(&workspace_path.to_string_lossy(), home_dir).await;
         assert_eq!(skills2.len(), 1);
         assert_eq!(skills2[0].description, "Updated description");
     }
