@@ -2290,8 +2290,9 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let limit = opt_int(params, "limit");
             let page_token = opt_str(params, "nextToken");
+            let include_older = params.get("includeOlder").and_then(Value::as_bool);
             let r = api
-                .file_tracking_load_commits(ws, limit, page_token)
+                .file_tracking_load_commits(ws, limit, page_token, include_older)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
