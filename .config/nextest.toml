@@ -7,6 +7,16 @@
 # single retry lets load-induced timing flakes pass (reported as FLAKY in the
 # run summary) while genuine failures still fail deterministically.
 #
+# slow-timeout hang guard (period=90s, terminate-after=2): Heavy e2e tests
+# (daemon-spawning, multi-agent delegation flows) legitimately exceed 60s under
+# llvm-cov but should complete within 90s. One extra period is generous enough
+# to absorb CI load variance without false positives. A hung test (e.g. waiting
+# on a never-arriving event with heartbeat Ping frames resetting a per-frame
+# timeout) will be terminated at 270s (3 × 90s) rather than consuming the full
+# 30-minute coverage job. Codified after STAB-TBD (PR #221's
+# completion_report_cleared test hung indefinitely in CI, timing out the
+# coverage jobs at 30 min on every run).
+#
 # Test groups: Heavy daemon-spawning e2e binaries (delegation group persist,
 # interrupted agents resume, serve --resume-all) serialize among themselves
 # (max-threads = 1) to avoid load-induced mock agent death in CI. The rest of
@@ -16,6 +26,7 @@
 # reproducible. Mechanism not pinned; serialization removes the load condition.
 [profile.default]
 retries = 1
+slow-timeout = { period = "90s", terminate-after = 2 }
 
 [[profile.default.overrides]]
 filter = 'binary_id(=intentd::e2e_wss_delegation_group_persist) | binary_id(=intentd::e2e_wss_interrupted_agents) | binary_id(=intentd::e2e_wss_resolve_interrupted) | binary_id(=intentd::e2e_wss_serve_resume_all)'
