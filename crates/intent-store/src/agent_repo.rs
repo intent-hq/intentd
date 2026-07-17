@@ -186,6 +186,10 @@ impl Store {
     /// mutate an `agent_session` row that belongs to workspace A (mirrors the
     /// post-0022 `note_repo` pattern). `NotFound` if absent or the workspace
     /// does not match.
+    ///
+    /// Provider immutability is enforced only after the first real use (once
+    /// `acp_session_id` is set), allowing cross-provider model switches before
+    /// the first turn.
     pub async fn update_agent_session(
         &self,
         workspace_id: &WorkspaceId,
@@ -195,9 +199,15 @@ impl Store {
         if current.workspace_id != *workspace_id {
             return Err(Error::NotFound(format!("agent session {}", s.id)));
         }
-        if current.provider.is_some() && s.provider != current.provider {
+        // Provider is immutable only after first real use (once acp_session_id
+        // is set). This allows cross-provider model switches before the first
+        // turn spawns a provider process.
+        if current.acp_session_id.is_some()
+            && current.provider.is_some()
+            && s.provider != current.provider
+        {
             return Err(Error::Internal(
-                "agent provider is immutable once set".to_string(),
+                "agent provider is immutable once set (first real use)".to_string(),
             ));
         }
         if current.acp_session_id.is_some() && s.acp_session_id != current.acp_session_id {

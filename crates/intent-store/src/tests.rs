@@ -1857,7 +1857,21 @@ async fn agent_provider_is_immutable_once_set() {
         .await
         .expect("set provider");
 
-    // Changing the provider afterwards is rejected.
+    // Provider can still be changed before first real use (before acp_session_id is set).
+    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    s.provider = Some("opencode".to_string());
+    store
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("change provider before first use");
+
+    // Once acp_session_id is set (first real use), provider becomes immutable.
+    store
+        .set_acp_session_id(&ws, &agent_id, "acp-1")
+        .await
+        .expect("set acp session id");
+
+    // Now changing the provider is rejected.
     let mut s = store.get_agent_session(&agent_id).await.expect("get");
     s.provider = Some("claude-code".to_string());
     assert!(store.update_agent_session(&ws, &s).await.is_err());
