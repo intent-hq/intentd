@@ -13411,11 +13411,9 @@ impl WorkspaceApi for Services {
             )?;
 
             // If boundary info exists but nothing resolved, return empty (safety net
-            // to avoid showing arbitrary base-branch commits)
-            if (ws.base_ref.is_some() || ws.base_commit_sha.is_some())
-                && boundary_sha.is_none()
-                && !include_older
-            {
+            // to avoid showing arbitrary base-branch commits). This holds regardless
+            // of includeOlder to prevent leaking arbitrary base-branch history.
+            if (ws.base_ref.is_some() || ws.base_commit_sha.is_some()) && boundary_sha.is_none() {
                 return Ok(empty);
             }
 

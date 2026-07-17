@@ -281,8 +281,8 @@ pub fn resolve_workspace_boundary(
 /// Returns commits in the range `boundary..HEAD` (workspace-owned only) when
 /// `boundary_sha` is provided and valid. When `boundary_sha` is `None`, returns
 /// unbounded history (the existing behavior). When `include_older` is true,
-/// fetches commits **before** the boundary (not commonly used; powers the FE
-/// "show previous" toggle).
+/// fetches commits **before and including** the boundary (powers the FE
+/// "show previous" toggle; the boundary commit itself is included).
 pub fn history_bounded(
     worktree_path: &Path,
     boundary_sha: Option<&str>,
@@ -303,7 +303,7 @@ pub fn history_bounded(
     if let Some(boundary) = boundary_sha {
         if let Ok(obj) = repo.revparse_single(boundary) {
             if include_older {
-                // For "show previous": start FROM the boundary (exclusive) and walk backward
+                // For "show previous": start FROM the boundary (inclusive) and walk backward
                 walk.reset().map_err(map_git_err)?;
                 walk.push(obj.id()).map_err(map_git_err)?;
             } else {
@@ -375,6 +375,7 @@ pub(crate) fn parse_trailers(body: &str) -> (Option<String>, Option<String>) {
 mod tests {
     use super::*;
     use crate::testutil::{commit_file, init_repo};
+    use std::process::Command;
 
     #[test]
     fn empty_repo_has_no_history() {
@@ -466,6 +467,33 @@ mod tests {
         commit_file(dir.path(), "a.txt", "one\n");
         let boundary = resolve_workspace_boundary(dir.path(), None, None).unwrap();
         assert!(boundary.is_none());
+    }
+
+    #[test]
+    fn resolve_workspace_boundary_uses_merge_base_with_ref() {
+        let dir = init_repo("boundary-merge-base");
+        commit_file(dir.path(), "a.txt", "base\n");
+        let all = history(dir.path(), 50).unwrap();
+        let base_sha = &all[0].hash;
+
+        // Create a main branch at the base commit
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["branch", "main"])
+            .output()
+            .unwrap();
+
+        // Create a feature branch and add commits
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["checkout", "-b", "feat/test"])
+            .output()
+            .unwrap();
+        commit_file(dir.path(), "b.txt", "workspace\n");
+
+        // resolve_workspace_boundary should use merge-base with main
+        let boundary = resolve_workspace_boundary(dir.path(), Some("main"), None).unwrap();
+        assert_eq!(boundary.as_deref(), Some(base_sha.as_str()));
     }
 
     #[test]

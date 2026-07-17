@@ -3468,7 +3468,8 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `file-tracking.loadCommits`: commit history with attribution
-    /// (`{ commits: CommitWithAttribution[], boundarySha, nextToken }`) (PROTOCOL §5.19).
+    /// (`{ commits: CommitWithAttribution[], boundarySha, nextToken }`).
+    /// Wire shape details pending PROTOCOL.md update (see monorepo Task 3).
     fn file_tracking_load_commits(
         &self,
         workspace_id: WorkspaceId,

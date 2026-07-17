@@ -1857,6 +1857,57 @@ async fn wss_file_tracking_load_commits_bounded() {
         "should return all commits without boundary"
     );
 
+    // (d) Fail-closed safety net: workspace with boundary info but unresolvable → empty.
+    let create_unresolvable = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"workspace.create","params":{{"title":"Unresolvable WSS","worktreePath":"{}","path":"{}","baseRef":"nonexistent","baseCommitSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created_unresolvable = wss_call(srv.port, srv.cfg.clone(), &create_unresolvable).await;
+    let ws_id_unresolvable = created_unresolvable["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id unresolvable")
+        .to_string();
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50}}}}"#,
+            ws_id_unresolvable
+        ),
+    )
+    .await;
+    assert!(
+        resp["result"]["boundarySha"].is_null(),
+        "boundarySha should be null when boundary is unresolvable"
+    );
+    let unresolvable_commits = resp["result"]["commits"].as_array().unwrap();
+    // Fail-closed safety net: should return empty (not arbitrary base-branch commits).
+    assert_eq!(
+        unresolvable_commits.len(),
+        0,
+        "should return empty when boundary info exists but is unresolvable (fail-closed)"
+    );
+
+    // (e) Fail-closed holds with includeOlder: boundary info exists but unresolvable + includeOlder → still empty.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50,"includeOlder":true}}}}"#,
+            ws_id_unresolvable
+        ),
+    )
+    .await;
+    let unresolvable_older = resp["result"]["commits"].as_array().unwrap();
+    // Fail-closed safety net must hold even when includeOlder is true.
+    assert_eq!(
+        unresolvable_older.len(),
+        0,
+        "fail-closed safety net must hold with includeOlder=true"
+    );
+
     srv.ws.stop().await;
     std::fs::remove_dir_all(&repo).ok();
 }

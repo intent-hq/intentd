@@ -62,7 +62,7 @@ Request accepts optional parameter:
 **Parameter details:**
 - `includeOlder` (optional boolean, default `false`):
   - `false` (default): Returns commits in `boundary..HEAD` range (workspace-owned commits only)
-  - `true`: Returns commits **before** the boundary (pre-workspace history, for "show previous" toggle)
+  - `true`: Returns commits **before and including** the boundary (pre-workspace history, for "show previous" toggle; the boundary commit itself is included)
   - When no boundary info exists (no `baseRef`/`baseCommitSha`), behavior is unbounded regardless of this flag
 
 PROTOCOL.md update will be handled in monorepo Task 3.
