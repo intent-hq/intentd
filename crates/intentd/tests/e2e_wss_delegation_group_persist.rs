@@ -626,12 +626,7 @@ async fn baseline_plus_aggregated_wake() {
     drop(sub);
     drop(rpc);
     drop(_daemon);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    // Kill any stale mock-acp-agent processes (they die with intentd but clean up anyway)
-    let _ = std::process::Command::new("pkill")
-        .args(["-9", "-f", "mock-acp-agent"])
-        .status();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     eprintln!("Daemon1 killed.");
 
     // Assert: delegation group persisted with child1's completion recorded

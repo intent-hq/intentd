@@ -3846,11 +3846,11 @@ impl Services {
     /// continuation message via `agent.sendMessage`. Delivery failures leave the
     /// row pending so the caller can retry.
     pub async fn resume_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
-        // Verify the agent is in pending interrupted state
-        let rows = self.store.list_interrupted_agents().await?;
-        let interrupted = rows
-            .iter()
-            .find(|ia| ia.agent_id == *agent_id)
+        // Verify the agent is in pending interrupted state (O(1) query)
+        let interrupted = self
+            .store
+            .get_interrupted_agent(agent_id)
+            .await?
             .ok_or_else(|| {
                 Error::InvalidParams(format!(
                     "Agent {agent_id} is not in pending interrupted state"

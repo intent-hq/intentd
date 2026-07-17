@@ -768,10 +768,18 @@ impl Services {
                 .to_string();
 
             // Insert interrupted_agent row (idempotent: second restart is a no-op).
-            let _ = self
+            if let Err(e) = self
                 .store
                 .insert_interrupted_agent(&session.id, &session.workspace_id, &prev_str, &now)
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    agent_id = %session.id,
+                    workspace_id = %session.workspace_id,
+                    error = %e,
+                    "failed to insert interrupted_agent row during heal"
+                );
+            }
 
             // Narrow write: `set_agent_session_status` persists only
             // (status, is_active, updated_at) without loading the full

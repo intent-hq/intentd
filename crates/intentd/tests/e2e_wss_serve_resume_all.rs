@@ -350,12 +350,6 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
         return;
     };
 
-    // Clean stale processes before starting
-    let _ = Command::new("pkill")
-        .args(["-f", "mock-acp-agent"])
-        .output();
-    let _ = Command::new("pkill").args(["-f", "intentd serve"]).output();
-
     let data_dir = temp_data_dir();
     let port = free_port();
     let port_s = port.to_string();

@@ -756,12 +756,12 @@ impl Store {
     }
 
     /// List pending interrupted agents, joined with agent_session (name) and
-    /// workspace (title). Sessions deleted since interruption are excluded.
+    /// workspace (title). Sessions deleted since interruption are excluded (INNER JOIN).
     pub async fn list_interrupted_agents(&self) -> Result<Vec<InterruptedAgent>> {
         let sql = "SELECT ia.agent_id, ia.workspace_id, ia.prev_status, ia.interrupted_at, \
                           ag.name AS agent_name, w.title AS workspace_name \
                    FROM interrupted_agent ia \
-                   LEFT JOIN agent_session ag ON ia.agent_id = ag.id \
+                   INNER JOIN agent_session ag ON ia.agent_id = ag.id \
                    LEFT JOIN workspace w ON ia.workspace_id = w.id \
                    WHERE ia.resolution = 'pending'";
         sqlx::query(sql)
@@ -780,6 +780,35 @@ impl Store {
                 })
             })
             .collect()
+    }
+
+    /// Get a single pending interrupted agent by ID. Returns None if not found or not pending.
+    pub async fn get_interrupted_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<InterruptedAgent>> {
+        let sql = "SELECT ia.agent_id, ia.workspace_id, ia.prev_status, ia.interrupted_at, \
+                          ag.name AS agent_name, w.title AS workspace_name \
+                   FROM interrupted_agent ia \
+                   INNER JOIN agent_session ag ON ia.agent_id = ag.id \
+                   LEFT JOIN workspace w ON ia.workspace_id = w.id \
+                   WHERE ia.agent_id = ? AND ia.resolution = 'pending'";
+        let row = sqlx::query(sql)
+            .bind(&agent_id.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("get interrupted_agent failed: {e}")))?;
+        match row {
+            None => Ok(None),
+            Some(ref r) => Ok(Some(InterruptedAgent {
+                agent_id: AgentId(col(r, "agent_id")?),
+                workspace_id: WorkspaceId(col(r, "workspace_id")?),
+                prev_status: col(r, "prev_status")?,
+                interrupted_at: col(r, "interrupted_at")?,
+                agent_name: col(r, "agent_name")?,
+                workspace_name: col(r, "workspace_name")?,
+            })),
+        }
     }
 
     /// Set the resolution (resumed|abandoned) for an interrupted agent.

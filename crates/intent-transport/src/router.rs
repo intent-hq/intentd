@@ -1350,18 +1350,27 @@ async fn dispatch(
         }
         "agent.resolveInterrupted" => {
             // Optional resume/abandon arrays; ids must be pending interrupted_agent rows.
-            let resume = params.get("resume").and_then(Value::as_array).map(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .map(String::from)
-                    .collect::<Vec<_>>()
-            });
-            let abandon = params.get("abandon").and_then(Value::as_array).map(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .map(String::from)
-                    .collect::<Vec<_>>()
-            });
+            // If present, both must be arrays (invalid params otherwise).
+            let resume = match params.get("resume") {
+                None => None,
+                Some(Value::Array(arr)) => Some(
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect::<Vec<_>>(),
+                ),
+                Some(_) => return Err(rpc(INVALID_PARAMS, "resume must be an array")),
+            };
+            let abandon = match params.get("abandon") {
+                None => None,
+                Some(Value::Array(arr)) => Some(
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect::<Vec<_>>(),
+                ),
+                Some(_) => return Err(rpc(INVALID_PARAMS, "abandon must be an array")),
+            };
             let result = api
                 .agent_resolve_interrupted(resume, abandon)
                 .await
