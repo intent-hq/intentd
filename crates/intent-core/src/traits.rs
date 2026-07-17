@@ -3747,6 +3747,19 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `skill.list` → discovered skills for a workspace as a bare array of
+    /// `{ name, description, location, scope, allowedTools?, compatibility? }`
+    /// (name-sorted, scope: "project"|"user") (PROTOCOL §5.33).
+    /// Unknown `workspace_id` → `-32602` (not found).
+    fn skill_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::skill_list not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `specialist.edit` → overwrite an existing user/project file; returns
     /// `{ specialist: SpecialistDef }`; missing file → `-32602` (PROTOCOL §5.11).
     fn specialist_edit(
