@@ -20,6 +20,7 @@ use intent_core::{Error, GitPullResult, Result};
 use crate::fetch::fetch;
 use crate::rebase::{is_dirty, run_rebase};
 use crate::stash::{pop_raw, push_include_untracked_raw};
+use crate::submodule::{has_submodules, update_submodules};
 use crate::{is_conflict_error, map_git_err};
 
 const STASH_MESSAGE: &str = "Intent: auto-stash before pull";
@@ -98,6 +99,18 @@ pub fn pull_branch(repo_path: &Path, branch_name: &str) -> Result<GitPullResult>
                 };
                 return Ok(failure(msg));
             }
+        }
+    }
+
+    // Sync submodules after a successful pull when the repo has configured
+    // submodules (workspace-create use case: parent repo is pulled and
+    // submodules must be checked out to match the gitlinks).
+    if has_submodules(repo_path) {
+        if let Err(e) = update_submodules(repo_path) {
+            return Ok(failure(format!(
+                "Pull succeeded but failed to update submodules: {}",
+                error_message(e)
+            )));
         }
     }
 
@@ -320,5 +333,191 @@ mod tests {
         assert_eq!(stash_count, 1);
 
         let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    /// Regression: a repo with configured submodules where origin advances with
+    /// a gitlink bump must pull cleanly and sync the submodule worktree to the
+    /// new gitlink commit (workspace-create use case).
+    #[test]
+    fn pull_with_submodule_gitlink_bump_syncs_submodule() {
+        // Parent repo with a submodule configured.
+        let parent_dir = init_repo("pull-parent-with-sub");
+        commit_file(parent_dir.path(), "parent.txt", "parent\n");
+
+        // Create a bare origin for the parent.
+        let parent_bare = std::env::temp_dir().join(format!(
+            "intent-git-pull-parent-bare-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        Repository::init_bare(&parent_bare).unwrap();
+        let parent_repo = Repository::open(parent_dir.path()).unwrap();
+        let branch = crate::status::current_branch(&parent_repo);
+        parent_repo
+            .remote("origin", parent_bare.to_str().unwrap())
+            .unwrap();
+
+        // Create a separate submodule repo with its own bare origin.
+        let sub_dir = init_repo("pull-submodule");
+        commit_file(sub_dir.path(), "sub.txt", "sub-v1\n");
+        let sub_bare = std::env::temp_dir().join(format!(
+            "intent-git-pull-sub-bare-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        Repository::init_bare(&sub_bare).unwrap();
+        let sub_repo = Repository::open(sub_dir.path()).unwrap();
+        sub_repo
+            .remote("origin", sub_bare.to_str().unwrap())
+            .unwrap();
+        let sub_branch = crate::status::current_branch(&sub_repo);
+        crate::push::push(sub_dir.path(), "origin", &sub_branch, false).unwrap();
+        let sub_v1_sha = sub_repo.head().unwrap().target().unwrap().to_string();
+
+        // Add the submodule to the parent repo using shell git (libgit2 submodule
+        // API is complex and shell git is the production add path).
+        // Allow file:// protocol for the test (git 2.38+ blocks it by default).
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(parent_dir.path())
+            .arg("-c")
+            .arg("protocol.file.allow=always")
+            .arg("submodule")
+            .arg("add")
+            .arg(sub_bare.to_str().unwrap())
+            .arg("mysubmodule")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git submodule add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // The git submodule add command already staged .gitmodules and the gitlink.
+        // Commit them using the standard commit helper.
+        let parent_repo = Repository::open(parent_dir.path()).unwrap();
+        let mut index = parent_repo.index().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = parent_repo.find_tree(tree_oid).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let head_commit = parent_repo.head().unwrap().peel_to_commit().unwrap();
+        parent_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Add submodule",
+                &tree,
+                &[&head_commit],
+            )
+            .unwrap();
+        crate::push::push(parent_dir.path(), "origin", &branch, false).unwrap();
+
+        // Origin advances: submodule adds a new commit, parent bumps the gitlink.
+        commit_file(sub_dir.path(), "sub.txt", "sub-v2\n");
+        crate::push::push(sub_dir.path(), "origin", &sub_branch, false).unwrap();
+
+        // Update the parent's submodule to point at the new commit.
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(parent_dir.path())
+            .arg("-c")
+            .arg("protocol.file.allow=always")
+            .arg("submodule")
+            .arg("update")
+            .arg("--remote")
+            .arg("mysubmodule")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "submodule update --remote failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Stage the updated gitlink.
+        let parent_repo_for_stage = Repository::open(parent_dir.path()).unwrap();
+        let mut index = parent_repo_for_stage.index().unwrap();
+        index.add_path(Path::new("mysubmodule")).unwrap();
+        index.write().unwrap();
+
+        // The submodule is now at v2 after the update --remote.
+
+        // Commit the gitlink bump + a parent file change.
+        commit_file(parent_dir.path(), "parent.txt", "parent-updated\n");
+        crate::push::push(parent_dir.path(), "origin", &branch, false).unwrap();
+
+        // Hard-reset the parent back one commit so it's behind origin with the
+        // old gitlink.
+        let parent_repo_reset = Repository::open(parent_dir.path()).unwrap();
+        let head = parent_repo_reset.head().unwrap().peel_to_commit().unwrap();
+        let parent_obj = head.parent(0).unwrap();
+        parent_repo_reset
+            .reset(parent_obj.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+
+        // Reset the submodule to match the old gitlink (v1). The hard reset above
+        // updated the parent index to point at the old gitlink, so we need to sync
+        // the submodule worktree to that commit.
+        let sub_path = parent_dir.path().join("mysubmodule");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(parent_dir.path())
+            .arg("-c")
+            .arg("protocol.file.allow=always")
+            .arg("submodule")
+            .arg("update")
+            .arg("mysubmodule")
+            .output()
+            .unwrap();
+
+        // Confirm the submodule worktree is at v1 (the old gitlink).
+        let sub_repo_local = Repository::open(&sub_path).unwrap();
+        assert_eq!(
+            sub_repo_local.head().unwrap().target().unwrap().to_string(),
+            sub_v1_sha,
+            "submodule should be at v1 before pull"
+        );
+
+        // Pull the parent branch. The gitlink bump should not be treated as "dirty".
+        let result = pull_branch(parent_dir.path(), &branch).unwrap();
+        assert!(
+            result.ok,
+            "pull with submodule gitlink bump must succeed, got {result:?}"
+        );
+        assert!(result.error.is_none());
+
+        // The parent is now at the new commit with the bumped gitlink.
+        assert_eq!(
+            std::fs::read_to_string(parent_dir.path().join("parent.txt")).unwrap(),
+            "parent-updated\n",
+            "parent worktree must have the new commit"
+        );
+
+        // Verify the submodule worktree is synced to the gitlink in the parent.
+        let parent_repo_after = Repository::open(parent_dir.path()).unwrap();
+        let parent_tree = parent_repo_after.head().unwrap().peel_to_tree().unwrap();
+        let submodule_entry = parent_tree.get_name("mysubmodule").unwrap();
+        let gitlink_sha = submodule_entry.id().to_string();
+
+        let sub_repo_local = Repository::open(&sub_path).unwrap();
+        let actual_sub_sha = sub_repo_local.head().unwrap().target().unwrap().to_string();
+        assert_eq!(
+            actual_sub_sha, gitlink_sha,
+            "submodule worktree must be synced to match the parent's gitlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sub_path.join("sub.txt")).unwrap(),
+            "sub-v2\n",
+            "submodule worktree must have the updated content"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&parent_bare);
+        let _ = std::fs::remove_dir_all(&sub_bare);
     }
 }

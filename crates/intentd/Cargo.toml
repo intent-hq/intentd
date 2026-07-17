@@ -61,6 +61,9 @@ sha2 = "0.10"
 # `e2e_wss_agent_lifecycle.rs::terminal_create_env_over_wss` decodes base64
 # `terminal:data` chunks to prove the env overlay reached the child (§5.13).
 base64 = { workspace = true }
+# `e2e_wss_last_activity.rs` parses RFC3339 timestamps with chrono to compare instants
+# (lexicographic comparison can be wrong with differing fractional-second precision).
+chrono = "0.4"
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs"] }

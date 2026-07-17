@@ -779,6 +779,76 @@ async fn rename_and_set_model_persist() {
     assert_eq!(got.model.as_deref(), Some("auggie:opus4.7"));
 }
 
+/// `agent.setModel` reconciles session.provider when the new model is a
+/// compound id whose provider differs from the current session provider.
+/// This ensures cross-provider model switches spawn the new provider's binary.
+#[tokio::test]
+async fn set_model_reconciles_provider_on_cross_provider_switch() {
+    let (_t, svc, ws) = setup().await;
+    // Create an agent with an explicit auggie provider.
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Switch".into()),
+            Some("auggie:sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    // Initial state: auggie provider, auggie model.
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    // Provider is inferred from the compound model on creation.
+    assert_eq!(session.provider.as_deref(), Some("auggie"));
+    // Set a compound model for a different provider.
+    svc.agent_set_model_op(id.clone(), "opencode:opencode-go/kimi-k3".into())
+        .await
+        .expect("setModel");
+    // session.provider should now match the compound prefix.
+    let session = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("get after");
+    assert_eq!(
+        session.model.as_deref(),
+        Some("opencode:opencode-go/kimi-k3")
+    );
+    assert_eq!(session.provider.as_deref(), Some("opencode"));
+}
+
+/// `agent.setModel` leaves session.provider unchanged when the new model is
+/// a bare id (no `:` prefix) or a compound id for the same provider.
+#[tokio::test]
+async fn set_model_preserves_provider_for_bare_or_same_provider() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Same").await;
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    let orig_provider = session.provider.clone();
+    // Bare model → provider unchanged.
+    svc.agent_set_model_op(id.clone(), "opus4.7".into())
+        .await
+        .expect("setModel bare");
+    let session = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("get after bare");
+    assert_eq!(session.provider, orig_provider);
+    // Same-provider compound → provider unchanged (or set to match if None).
+    svc.agent_set_model_op(id.clone(), "auggie:sonnet4.5".into())
+        .await
+        .expect("setModel same provider");
+    let session = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("get after same");
+    assert_eq!(session.provider.as_deref(), Some("auggie"));
+}
+
 #[tokio::test]
 async fn rename_missing_agent_is_internal() {
     let (_t, svc, _ws) = setup().await;
