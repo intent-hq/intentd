@@ -129,15 +129,6 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-/// A free localhost TCP port (bound then released to discover the number).
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// Build a real `Services` API + event bus over a fresh temp SQLite store.
 /// The store is returned alongside so tests that need to seed fixtures with a
 /// fixed id (e.g. the workspace `spec` note) can `store.insert_*` directly,
@@ -192,7 +183,7 @@ async fn start_with_auggie(mut opts: WsOptions, auggie_bin: Option<std::path::Pa
     token_store_inner.store_token(TOKEN).unwrap();
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     if opts.base_port == WsOptions::default().base_port {
-        opts.base_port = free_port();
+        opts.base_port = 0;
     }
     opts.bind_address = Ipv4Addr::LOCALHOST.into();
     let ws = WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, opts).expect("server");
@@ -1157,8 +1148,10 @@ async fn bind_fails_fast_on_occupied_port() {
     // bind error immediately — no port walking, no retry. Occupy the port for
     // the whole test so the listener has no chance to bind, then assert
     // `start()` returns an `AddrInUse` error on the SAME port it was asked for.
-    let base = free_port();
-    let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, base)).unwrap();
+    // Bind the hog listener first, keep it open, and use its port for the test
+    // to avoid TOCTOU (no free_port() release-then-rebind window).
+    let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let base = _hog.local_addr().unwrap().port();
     let (api, bus, _store, dir) = make_services(None).await;
     let tls = ensure_tls_certificate(&dir).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
@@ -1195,7 +1188,7 @@ async fn insecure_mode_serves_plain_ws_without_token() {
     // the real posture.
     let (api, bus, _store, _dir) = make_services(None).await;
     let opts = WsOptions {
-        base_port: free_port(),
+        base_port: 0,
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
@@ -1233,7 +1226,14 @@ async fn insecure_mode_serves_plain_ws_without_token() {
 
 #[tokio::test]
 async fn graceful_shutdown_allows_immediate_restart() {
-    let srv = start(WsOptions::default()).await;
+    // NOTE: This test verifies fixed-port restart semantics (same port reclaimed
+    // after stop). Pick a dynamically-available port to avoid hard-coded collisions.
+    let fixed_port = free_port();
+    let srv = start(WsOptions {
+        base_port: fixed_port,
+        ..WsOptions::default()
+    })
+    .await;
     let port = srv.port;
     srv.ws.stop().await;
     // Re-start the SAME listener immediately; the freed port must rebind.
@@ -2749,4 +2749,16 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
     assert_eq!(init_missing["error"]["code"], -32602);
 
     srv.ws.stop().await;
+}
+
+/// Helper to obtain an ephemeral port by bind-then-release. Only used for tests
+/// that genuinely need a fixed port to exercise fixed-port semantics (e.g.
+/// graceful_shutdown_allows_immediate_restart). Prefer `base_port: 0` for normal tests.
+fn free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
 }

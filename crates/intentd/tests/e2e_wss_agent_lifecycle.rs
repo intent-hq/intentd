@@ -11,7 +11,7 @@
 
 #![cfg(unix)]
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -47,14 +47,6 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
-}
-
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn temp_data_dir() -> PathBuf {
@@ -387,10 +379,9 @@ async fn mock_agent_full_turn_over_wss() {
         "response": "added via mcp over wss",
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -601,10 +592,9 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "status lifecycle ok" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -750,10 +740,9 @@ async fn agent_stop_keep_alive_resume_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -901,10 +890,9 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -1113,10 +1101,9 @@ async fn interrupt_priority_send_to_task_over_wss() {
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -1281,10 +1268,9 @@ async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -1507,10 +1493,9 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "parked" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -1723,10 +1708,9 @@ async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
         "response": "parent delegated and is now waiting",
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -1858,10 +1842,9 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "delegated child ran" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -2076,10 +2059,9 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
         ],
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -2370,10 +2352,9 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         ],
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("WORKSPACE_IDLE_DEBOUNCE_TEST_MS", "50"),
@@ -2726,8 +2707,7 @@ where
 async fn boot_daemon_with_seeded_note() -> (Daemon, String, String, u16, String) {
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
@@ -3131,10 +3111,9 @@ async fn subscription_filter_branches_over_wss() {
         "response": "filter-branch-response",
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -3262,10 +3241,9 @@ async fn mid_stream_subscriber_disconnect_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -3439,10 +3417,9 @@ async fn queue_message_self_drains_on_idle_agent_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "queued drain ok" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -3575,10 +3552,9 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
         "firstTurnDelayMs": 2000
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -3757,10 +3733,9 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
     // + toggle editing + enqueue again while the agent is busy. Subsequent
     // queue-drained turns proceed at full mock speed.
     let behavior = json!({ "response": "drained ok", "firstTurnDelayMs": 1200 }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -3995,10 +3970,9 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
 
     let data_dir = temp_data_dir();
     let behavior = json!({ "response": "initial agent ran" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -4190,8 +4164,7 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
 #[tokio::test]
 async fn workspace_create_seeds_per_workspace_spec_over_wss() {
     let data_dir = temp_data_dir();
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -4305,8 +4278,7 @@ async fn workspace_create_clones_github_url_over_wss() {
     };
     let data_dir = temp_data_dir();
     let clone_target = data_dir.join("cloned-checkout");
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -4435,10 +4407,9 @@ async fn deliv1_no_lost_messages_wake_or_create_then_send_to_task_over_wss() {
         "response": "fallback"
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -4617,10 +4588,9 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "target finished the follow-up" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -4808,10 +4778,9 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
     // Any behavior works — we don't care what the mock does after spawn,
     // only that the daemon actually reached the rules-file assembly path.
     let behavior = json!({ "response": "ok" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("TMPDIR", &tmp_dir_s),
@@ -4917,10 +4886,9 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
     };
 
     let data_dir = temp_data_dir();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -5072,10 +5040,9 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
         ],
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];

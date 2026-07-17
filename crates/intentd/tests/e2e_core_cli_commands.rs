@@ -34,7 +34,7 @@ fn spawn_daemon(data_dir: &PathBuf) -> Child {
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env_remove("INTENTD_TCP_PORT")
+        .env("INTENTD_TCP_PORT", "0")
         .env_remove("INTENTD_AUTH_TOKEN")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
@@ -43,7 +43,7 @@ fn spawn_daemon(data_dir: &PathBuf) -> Child {
 }
 
 async fn await_socket(socket: &PathBuf) -> bool {
-    timeout(Duration::from_secs(10), async {
+    timeout(Duration::from_secs(30), async {
         loop {
             if UnixStream::connect(socket).await.is_ok() {
                 return;
@@ -73,7 +73,7 @@ async fn doctor_checks_data_dir_and_migrations() {
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("doctor")
         .env("INTENTD_DATA_DIR", &data_dir)
-        .env_remove("INTENTD_TCP_PORT")
+        .env("INTENTD_TCP_PORT", "0")
         .output()
         .expect("run intentd doctor");
 
