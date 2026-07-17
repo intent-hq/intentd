@@ -83,3 +83,131 @@ async fn get(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String>
 
     Ok(specialist.clone())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use intent_core::{BoxFuture, Error, Result};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct FakeApi {}
+
+    impl WorkspaceApi for FakeApi {
+        fn specialist_list(&self, _workspace_path: Option<String>) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                Ok(json!({
+                    "specialists": [
+                        {
+                            "id": "implementor",
+                            "name": "Implementor",
+                            "description": "Implements tasks",
+                            "model": "claude-sonnet-4.5",
+                            "prompt": "You are an implementor",
+                            "behaviorPrompt": "Focus on implementation",
+                            "source": "builtin",
+                            "isCustomized": false
+                        },
+                        {
+                            "id": "verifier",
+                            "name": "Verifier",
+                            "description": "Verifies work",
+                            "model": "claude-sonnet-4.5",
+                            "prompt": "You are a verifier",
+                            "behaviorPrompt": "Focus on verification",
+                            "source": "builtin",
+                            "isCustomized": false
+                        }
+                    ]
+                }))
+            })
+        }
+
+        fn specialist_get(
+            &self,
+            id: String,
+            _workspace_path: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                match id.as_str() {
+                    "implementor" => Ok(json!({
+                        "specialist": {
+                            "id": "implementor",
+                            "name": "Implementor",
+                            "description": "Implements tasks",
+                            "model": "claude-sonnet-4.5",
+                            "prompt": "You are an implementor",
+                            "behaviorPrompt": "Focus on implementation",
+                            "source": "builtin",
+                            "isCustomized": false
+                        }
+                    })),
+                    _ => Err(Error::NotFound(format!("Specialist not found: {}", id))),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_rejects_non_chief_workspace() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let non_chief_id = WorkspaceId::from_string("amber-forest");
+        let result = dispatch(&api, &non_chief_id, "list", &json!({})).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "ws.app.* is only available in the Chief of Staff workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_returns_expected_shape() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "list", &json!({})).await.unwrap();
+
+        let specialists = result.as_array().unwrap();
+        assert_eq!(specialists.len(), 2);
+
+        // Check expected fields are present
+        for specialist in specialists {
+            assert!(specialist.get("id").is_some());
+            assert!(specialist.get("name").is_some());
+            assert!(specialist.get("description").is_some());
+            assert!(specialist.get("model").is_some());
+            assert!(specialist.get("prompt").is_some());
+            assert!(specialist.get("behaviorPrompt").is_some());
+            assert!(specialist.get("source").is_some());
+            assert!(specialist.get("isCustomized").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_returns_expected_shape() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "get", &json!({ "id": "implementor" }))
+            .await
+            .unwrap();
+
+        // Check expected fields are present
+        assert_eq!(result.get("id").unwrap().as_str().unwrap(), "implementor");
+        assert_eq!(result.get("name").unwrap().as_str().unwrap(), "Implementor");
+        assert!(result.get("description").is_some());
+        assert!(result.get("model").is_some());
+        assert!(result.get("prompt").is_some());
+        assert!(result.get("behaviorPrompt").is_some());
+        assert!(result.get("source").is_some());
+        assert!(result.get("isCustomized").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_missing_specialist_returns_error() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "get", &json!({ "id": "nonexistent" })).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Specialist not found: nonexistent");
+    }
+}

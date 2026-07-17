@@ -116,3 +116,221 @@ async fn get(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String>
 
     Ok(merged)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use intent_core::{BoxFuture, Result};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    const REDACTED_PLACEHOLDER: &str = "***REDACTED***";
+
+    #[derive(Default)]
+    struct FakeApi {}
+
+    impl WorkspaceApi for FakeApi {
+        fn settings_list(&self) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                Ok(json!({
+                    "settings": [
+                        {
+                            "path": "user.name",
+                            "value": "Alice",
+                            "category": "user",
+                            "sensitive": false,
+                            "type": "string"
+                        },
+                        {
+                            "path": "user.email",
+                            "value": "alice@example.com",
+                            "category": "user",
+                            "sensitive": false,
+                            "type": "string"
+                        },
+                        {
+                            "path": "api.token",
+                            "value": REDACTED_PLACEHOLDER,
+                            "category": "api",
+                            "sensitive": true,
+                            "type": "string"
+                        }
+                    ]
+                }))
+            })
+        }
+
+        fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                match path.as_str() {
+                    "user.name" => Ok(json!({
+                        "path": "user.name",
+                        "value": "Alice",
+                        "definition": {
+                            "path": "user.name",
+                            "category": "user",
+                            "sensitive": false,
+                            "type": "string"
+                        }
+                    })),
+                    "api.token" => Ok(json!({
+                        "path": "api.token",
+                        "value": REDACTED_PLACEHOLDER,
+                        "definition": {
+                            "path": "api.token",
+                            "category": "api",
+                            "sensitive": true,
+                            "type": "string"
+                        }
+                    })),
+                    _ => Err(intent_core::Error::NotFound(format!(
+                        "Setting not found: {}",
+                        path
+                    ))),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_rejects_non_chief_workspace() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let non_chief_id = WorkspaceId::from_string("amber-forest");
+        let result = dispatch(&api, &non_chief_id, "list", &json!({})).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "ws.app.* is only available in the Chief of Staff workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_returns_expected_shape() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "list", &json!({})).await.unwrap();
+
+        let settings = result.as_array().unwrap();
+        assert_eq!(settings.len(), 3);
+
+        // Check expected fields are present
+        for setting in settings {
+            assert!(setting.get("path").is_some());
+            assert!(setting.get("value").is_some());
+            assert!(setting.get("category").is_some());
+            assert!(setting.get("sensitive").is_some());
+            assert!(setting.get("type").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_sensitive_values_redacted() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "list", &json!({})).await.unwrap();
+
+        let settings = result.as_array().unwrap();
+        let api_token = settings
+            .iter()
+            .find(|s| s.get("path").unwrap() == "api.token")
+            .unwrap();
+
+        // Sensitive setting should have redacted value
+        assert_eq!(api_token.get("sensitive").unwrap().as_bool().unwrap(), true);
+        assert_eq!(
+            api_token.get("value").unwrap().as_str().unwrap(),
+            REDACTED_PLACEHOLDER
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_filter_by_category() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "list", &json!({ "category": "user" }))
+            .await
+            .unwrap();
+
+        let settings = result.as_array().unwrap();
+        assert_eq!(settings.len(), 2); // Only user.name and user.email
+        for setting in settings {
+            assert_eq!(setting.get("category").unwrap().as_str().unwrap(), "user");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_include_values_false() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "list", &json!({ "includeValues": false }))
+            .await
+            .unwrap();
+
+        let settings = result.as_array().unwrap();
+        assert_eq!(settings.len(), 3);
+
+        // All settings should not have a value field
+        for setting in settings {
+            assert!(setting.get("value").is_none());
+            assert!(setting.get("path").is_some());
+            assert!(setting.get("category").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_returns_expected_shape() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "get", &json!({ "path": "user.name" }))
+            .await
+            .unwrap();
+
+        // Check expected fields are present
+        assert_eq!(result.get("path").unwrap().as_str().unwrap(), "user.name");
+        assert_eq!(result.get("value").unwrap().as_str().unwrap(), "Alice");
+        assert_eq!(
+            result.get("valueRedacted").unwrap().as_bool().unwrap(),
+            false
+        );
+        assert!(result.get("category").is_some());
+        assert!(result.get("sensitive").is_some());
+        assert!(result.get("type").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_sensitive_value_redacted() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "get", &json!({ "path": "api.token" }))
+            .await
+            .unwrap();
+
+        // Sensitive setting should have redacted value and valueRedacted=true
+        assert_eq!(result.get("sensitive").unwrap().as_bool().unwrap(), true);
+        assert_eq!(
+            result.get("value").unwrap().as_str().unwrap(),
+            REDACTED_PLACEHOLDER
+        );
+        assert_eq!(
+            result.get("valueRedacted").unwrap().as_bool().unwrap(),
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_non_sensitive_value_not_redacted() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "get", &json!({ "path": "user.name" }))
+            .await
+            .unwrap();
+
+        // Non-sensitive setting should have real value and valueRedacted=false
+        assert_eq!(result.get("sensitive").unwrap().as_bool().unwrap(), false);
+        assert_eq!(result.get("value").unwrap().as_str().unwrap(), "Alice");
+        assert_eq!(
+            result.get("valueRedacted").unwrap().as_bool().unwrap(),
+            false
+        );
+    }
+}

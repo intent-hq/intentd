@@ -288,6 +288,156 @@ fn has_returned_content(message: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use intent_core::{
+        AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, Result, Workspace,
+        WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
+    };
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct FakeApi {
+        workspaces: Mutex<Vec<Workspace>>,
+        agents: Mutex<Vec<AgentLite>>,
+        conversation_messages: Mutex<Vec<Value>>,
+    }
+
+    impl WorkspaceApi for FakeApi {
+        fn list_workspaces(
+            &self,
+            _include_archived: bool,
+        ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+            let workspaces = self.workspaces.lock().unwrap().clone();
+            Box::pin(async move { Ok(workspaces) })
+        }
+
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            let workspaces = self.workspaces.lock().unwrap().clone();
+            Box::pin(async move {
+                workspaces
+                    .into_iter()
+                    .find(|w| w.id == id)
+                    .ok_or_else(|| Error::NotFound(format!("Workspace not found: {}", id.as_str())))
+            })
+        }
+
+        fn agent_list(&self, _workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+            let agents = self.agents.lock().unwrap().clone();
+            Box::pin(async move { Ok(agents) })
+        }
+
+        fn agent_get(
+            &self,
+            agent_id: AgentId,
+            _workspace_id: Option<WorkspaceId>,
+        ) -> BoxFuture<'_, Result<AgentLite>> {
+            let agents = self.agents.lock().unwrap().clone();
+            Box::pin(async move {
+                agents
+                    .into_iter()
+                    .find(|a| a.id == agent_id)
+                    .ok_or_else(|| {
+                        Error::NotFound(format!("Agent not found: {}", agent_id.as_str()))
+                    })
+            })
+        }
+
+        fn agent_get_conversation(
+            &self,
+            _agent_id: AgentId,
+            _last_n: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            _include_tool_calls: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let messages = self.conversation_messages.lock().unwrap().clone();
+            Box::pin(async move { Ok(json!({ "messages": messages })) })
+        }
+    }
+
+    fn make_workspace(id: &str, title: &str) -> Workspace {
+        Workspace {
+            id: WorkspaceId::from_string(id),
+            title: title.to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+        }
+    }
+
+    fn make_agent(id: &str, name: &str, status: AgentStatus, ws_id: &WorkspaceId) -> AgentLite {
+        AgentLite {
+            id: AgentId::from_string(id),
+            workspace_id: ws_id.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: name.to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            status,
+            is_active: false,
+            is_streaming: false,
+            is_processing: false,
+            is_responding: false,
+            is_waiting_on_tool: false,
+            is_waiting_for_other_agents: false,
+            waiting_for_agent_ids: vec![],
+            stats: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: Some("2026-01-01T00:00:00Z".to_string()),
+            message_count: 10,
+            digest: None,
+            last_agent_response: None,
+            last_user_message: None,
+            context_references: None,
+            image_blocks: None,
+            metadata: AgentMetadata {
+                is_background: false,
+                specialist: None,
+                created_by_agent_id: None,
+                task_note_id: None,
+                completion_report: None,
+                completion_report_timestamp: None,
+                delegation_depth: None,
+                initial_message: None,
+                sandbox_id: None,
+                sandbox_branch: None,
+                sandbox_path: None,
+            },
+        }
+    }
 
     #[test]
     fn test_normalize_offset() {
@@ -344,5 +494,409 @@ mod tests {
 
         let no_timestamp = json!({ "agentId": "agent-1" });
         assert_eq!(thread_timestamp(&no_timestamp), "");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_rejects_non_chief_workspace() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let non_chief_id = WorkspaceId::from_string("amber-forest");
+        let result = dispatch(&api, &non_chief_id, "list", &json!({})).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "ws.app.* is only available in the Chief of Staff workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_default_limit_50() {
+        let fake = Arc::new(FakeApi::default());
+        let ws_id = WorkspaceId::from_string("ws-1");
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Workspace 1"));
+            let mut agents = fake.agents.lock().unwrap();
+            // Add 60 agents to test default limit
+            for i in 0..60 {
+                agents.push(make_agent(
+                    &format!("agent-{}", i),
+                    &format!("Agent {}", i),
+                    AgentStatus::Active,
+                    &ws_id,
+                ));
+            }
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "list", &json!({})).await.unwrap();
+
+        assert_eq!(result.get("total").unwrap().as_u64().unwrap(), 60);
+        assert_eq!(result.get("returned").unwrap().as_u64().unwrap(), 50); // default limit
+        let threads = result.get("threads").unwrap().as_array().unwrap();
+        assert_eq!(threads.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn test_list_max_limit_200() {
+        let fake = Arc::new(FakeApi::default());
+        let ws_id = WorkspaceId::from_string("ws-1");
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Workspace 1"));
+            let mut agents = fake.agents.lock().unwrap();
+            // Add 250 agents to test max limit clamping
+            for i in 0..250 {
+                agents.push(make_agent(
+                    &format!("agent-{}", i),
+                    &format!("Agent {}", i),
+                    AgentStatus::Active,
+                    &ws_id,
+                ));
+            }
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "list", &json!({ "limit": 300 }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.get("total").unwrap().as_u64().unwrap(), 250);
+        assert_eq!(result.get("returned").unwrap().as_u64().unwrap(), 200); // clamped to max
+        let threads = result.get("threads").unwrap().as_array().unwrap();
+        assert_eq!(threads.len(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_list_returns_expected_shape() {
+        let fake = Arc::new(FakeApi::default());
+        let ws_id = WorkspaceId::from_string("ws-1");
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Workspace 1"));
+            let mut agents = fake.agents.lock().unwrap();
+            agents.push(make_agent(
+                "agent-1",
+                "Test Agent",
+                AgentStatus::Active,
+                &ws_id,
+            ));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "list", &json!({})).await.unwrap();
+
+        let threads = result.get("threads").unwrap().as_array().unwrap();
+        assert_eq!(threads.len(), 1);
+        let thread = &threads[0];
+
+        // Check expected fields are present
+        assert!(thread.get("workspaceId").is_some());
+        assert!(thread.get("workspaceTitle").is_some());
+        assert!(thread.get("agentId").is_some());
+        assert!(thread.get("agentName").is_some());
+        assert!(thread.get("status").is_some());
+        assert!(thread.get("messageCount").is_some());
+        assert!(thread.get("createdAt").is_some());
+        assert!(thread.get("updatedAt").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_read_conversation_default_last_n_20() {
+        let fake = Arc::new(FakeApi::default());
+        let ws_id = WorkspaceId::from_string("ws-1");
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Workspace 1"));
+            let mut agents = fake.agents.lock().unwrap();
+            agents.push(make_agent(
+                "agent-1",
+                "Test Agent",
+                AgentStatus::Active,
+                &ws_id,
+            ));
+            let mut messages = fake.conversation_messages.lock().unwrap();
+            // Add 50 messages to test default lastN
+            for i in 0..50 {
+                messages.push(json!({
+                    "id": format!("msg-{}", i),
+                    "role": if i % 2 == 0 { "user" } else { "assistant" },
+                    "contentBlocks": [{ "type": "text", "text": format!("Message {}", i) }]
+                }));
+            }
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "readConversation",
+            &json!({ "workspaceId": "ws-1", "agentId": "agent-1" }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.get("totalMessages").unwrap().as_u64().unwrap(), 50);
+        assert_eq!(
+            result.get("returnedMessages").unwrap().as_u64().unwrap(),
+            20
+        ); // default lastN
+        let messages = result.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(messages.len(), 20);
+    }
+
+    #[tokio::test]
+    async fn test_read_conversation_max_limit_100() {
+        let fake = Arc::new(FakeApi::default());
+        let ws_id = WorkspaceId::from_string("ws-1");
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Workspace 1"));
+            let mut agents = fake.agents.lock().unwrap();
+            agents.push(make_agent(
+                "agent-1",
+                "Test Agent",
+                AgentStatus::Active,
+                &ws_id,
+            ));
+            let mut messages = fake.conversation_messages.lock().unwrap();
+            // Add 150 messages to test max clamping
+            for i in 0..150 {
+                messages.push(json!({
+                    "id": format!("msg-{}", i),
+                    "role": if i % 2 == 0 { "user" } else { "assistant" },
+                    "contentBlocks": [{ "type": "text", "text": format!("Message {}", i) }]
+                }));
+            }
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "readConversation",
+            &json!({ "workspaceId": "ws-1", "agentId": "agent-1", "lastN": 200 }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.get("totalMessages").unwrap().as_u64().unwrap(), 150);
+        assert_eq!(
+            result.get("returnedMessages").unwrap().as_u64().unwrap(),
+            100
+        ); // clamped to max
+        let messages = result.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(messages.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_read_conversation_start_turn_end_turn_validation() {
+        let fake = Arc::new(FakeApi::default());
+        let ws_id = WorkspaceId::from_string("ws-1");
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Workspace 1"));
+            let mut agents = fake.agents.lock().unwrap();
+            agents.push(make_agent(
+                "agent-1",
+                "Test Agent",
+                AgentStatus::Active,
+                &ws_id,
+            ));
+            let mut messages = fake.conversation_messages.lock().unwrap();
+            for i in 0..10 {
+                messages.push(json!({
+                    "id": format!("msg-{}", i),
+                    "role": if i % 2 == 0 { "user" } else { "assistant" },
+                    "contentBlocks": [{ "type": "text", "text": format!("Message {}", i) }]
+                }));
+            }
+        }
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+
+        let chief_id = WorkspaceId::chief();
+
+        // Test valid range
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "readConversation",
+            &json!({ "workspaceId": "ws-1", "agentId": "agent-1", "startTurn": 2, "endTurn": 5 }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.get("startTurn").unwrap().as_u64().unwrap(), 2);
+        assert_eq!(result.get("endTurn").unwrap().as_u64().unwrap(), 5);
+        let messages = result.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(messages.len(), 4); // turns 2-5 inclusive
+
+        // Test invalid range (endTurn < startTurn)
+        let result_err = dispatch(
+            &api,
+            &chief_id,
+            "readConversation",
+            &json!({ "workspaceId": "ws-1", "agentId": "agent-1", "startTurn": 5, "endTurn": 2 }),
+        )
+        .await;
+        assert!(result_err.is_err());
+        assert!(result_err
+            .unwrap_err()
+            .contains("endTurn must be greater than or equal to startTurn"));
+    }
+
+    #[tokio::test]
+    async fn test_read_conversation_include_tool_calls_false_by_default() {
+        let fake = Arc::new(FakeApi::default());
+        let ws_id = WorkspaceId::from_string("ws-1");
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Workspace 1"));
+            let mut agents = fake.agents.lock().unwrap();
+            agents.push(make_agent(
+                "agent-1",
+                "Test Agent",
+                AgentStatus::Active,
+                &ws_id,
+            ));
+            let mut messages = fake.conversation_messages.lock().unwrap();
+            messages.push(json!({
+                "id": "msg-1",
+                "role": "assistant",
+                "contentBlocks": [
+                    { "type": "text", "text": "Hello" },
+                    { "type": "tool_use", "id": "call-1", "name": "fetch" },
+                    { "type": "tool_result", "tool_use_id": "call-1", "content": "data" }
+                ]
+            }));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "readConversation",
+            &json!({ "workspaceId": "ws-1", "agentId": "agent-1" }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.get("includeToolCalls").unwrap().as_bool().unwrap(),
+            false
+        );
+        let messages = result.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        let blocks = messages[0]
+            .get("contentBlocks")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        // Tool blocks should be filtered out
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].get("type").unwrap(), "text");
+    }
+
+    #[tokio::test]
+    async fn test_read_conversation_include_tool_calls_true() {
+        let fake = Arc::new(FakeApi::default());
+        let ws_id = WorkspaceId::from_string("ws-1");
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Workspace 1"));
+            let mut agents = fake.agents.lock().unwrap();
+            agents.push(make_agent(
+                "agent-1",
+                "Test Agent",
+                AgentStatus::Active,
+                &ws_id,
+            ));
+            let mut messages = fake.conversation_messages.lock().unwrap();
+            messages.push(json!({
+                "id": "msg-1",
+                "role": "assistant",
+                "contentBlocks": [
+                    { "type": "text", "text": "Hello" },
+                    { "type": "tool_use", "id": "call-1", "name": "fetch" },
+                    { "type": "tool_result", "tool_use_id": "call-1", "content": "data" }
+                ]
+            }));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "readConversation",
+            &json!({ "workspaceId": "ws-1", "agentId": "agent-1", "includeToolCalls": true }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.get("includeToolCalls").unwrap().as_bool().unwrap(),
+            true
+        );
+        let messages = result.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        let blocks = messages[0]
+            .get("contentBlocks")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        // Tool blocks should be included
+        assert_eq!(blocks.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_read_conversation_returns_expected_shape() {
+        let fake = Arc::new(FakeApi::default());
+        let ws_id = WorkspaceId::from_string("ws-1");
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Workspace 1"));
+            let mut agents = fake.agents.lock().unwrap();
+            agents.push(make_agent(
+                "agent-1",
+                "Test Agent",
+                AgentStatus::Active,
+                &ws_id,
+            ));
+            let mut messages = fake.conversation_messages.lock().unwrap();
+            messages.push(json!({
+                "id": "msg-1",
+                "role": "user",
+                "contentBlocks": [{ "type": "text", "text": "Hello" }]
+            }));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "readConversation",
+            &json!({ "workspaceId": "ws-1", "agentId": "agent-1" }),
+        )
+        .await
+        .unwrap();
+
+        // Check expected fields are present
+        assert!(result.get("workspaceId").is_some());
+        assert!(result.get("workspaceTitle").is_some());
+        assert!(result.get("agentId").is_some());
+        assert!(result.get("agentName").is_some());
+        assert!(result.get("status").is_some());
+        assert!(result.get("totalMessages").is_some());
+        assert!(result.get("returnedMessages").is_some());
+        assert!(result.get("startTurn").is_some());
+        assert!(result.get("endTurn").is_some());
+        assert!(result.get("includeToolCalls").is_some());
+        assert!(result.get("messages").is_some());
     }
 }

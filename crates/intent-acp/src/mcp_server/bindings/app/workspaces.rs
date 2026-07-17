@@ -203,3 +203,251 @@ fn summarize_workspace(ws: &intent_core::Workspace) -> Value {
         "lastActivity": ws.last_activity.as_deref(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use intent_core::{
+        BoxFuture, Error, Result, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
+    };
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct FakeApi {
+        workspaces: Mutex<Vec<Workspace>>,
+    }
+
+    impl WorkspaceApi for FakeApi {
+        fn list_workspaces(
+            &self,
+            _include_archived: bool,
+        ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+            let workspaces = self.workspaces.lock().unwrap().clone();
+            Box::pin(async move { Ok(workspaces) })
+        }
+
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            let workspaces = self.workspaces.lock().unwrap().clone();
+            Box::pin(async move {
+                workspaces
+                    .into_iter()
+                    .find(|w| w.id == id)
+                    .ok_or_else(|| Error::NotFound(format!("Workspace not found: {}", id.as_str())))
+            })
+        }
+    }
+
+    fn make_workspace(id: &str, title: &str) -> Workspace {
+        Workspace {
+            id: WorkspaceId::from_string(id),
+            title: title.to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: Some("/repo".to_string()),
+            repository_owner: Some("owner".to_string()),
+            repository_name: Some("repo".to_string()),
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_rejects_non_chief_workspace() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let non_chief_id = WorkspaceId::from_string("amber-forest");
+        let result = dispatch(&api, &non_chief_id, "list", &json!({})).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "ws.app.* is only available in the Chief of Staff workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_excludes_chief_workspace() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("__chief__", "Chief of Staff"));
+            workspaces.push(make_workspace("ws-1", "Workspace 1"));
+            workspaces.push(make_workspace("ws-2", "Workspace 2"));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "list", &json!({})).await.unwrap();
+        let workspaces = result.as_array().unwrap();
+
+        // __chief__ should not appear in results
+        assert_eq!(workspaces.len(), 2);
+        assert!(workspaces
+            .iter()
+            .all(|w| w.get("id").unwrap().as_str().unwrap() != "__chief__"));
+    }
+
+    #[tokio::test]
+    async fn test_get_missing_workspace_returns_error() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "get", &json!({ "id": "missing-ws" })).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Workspace not found: missing-ws"));
+    }
+
+    #[tokio::test]
+    async fn test_get_chief_workspace_returns_error() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("__chief__", "Chief of Staff"));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "get", &json!({ "id": "__chief__" })).await;
+        // Even if chief exists in the list, get should reject it
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Workspace not found: __chief__");
+    }
+
+    #[tokio::test]
+    async fn test_list_returns_expected_shape() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Test Workspace"));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "list", &json!({})).await.unwrap();
+        let workspaces = result.as_array().unwrap();
+        assert_eq!(workspaces.len(), 1);
+
+        let ws = &workspaces[0];
+        // Check expected fields are present
+        assert!(ws.get("id").is_some());
+        assert!(ws.get("title").is_some());
+        assert!(ws.get("status").is_some());
+        assert!(ws.get("branch").is_some());
+        assert!(ws.get("tags").is_some());
+        assert!(ws.get("createdAt").is_some());
+        assert!(ws.get("updatedAt").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_filter_by_status() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            let mut ws_active = make_workspace("ws-1", "Active");
+            ws_active.status = WorkspaceStatus::Active;
+            workspaces.push(ws_active);
+
+            let mut ws_archived = make_workspace("ws-2", "Archived");
+            ws_archived.status = WorkspaceStatus::Archived;
+            workspaces.push(ws_archived);
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "list",
+            &json!({ "filter": { "status": ["active"] } }),
+        )
+        .await
+        .unwrap();
+        let workspaces = result.as_array().unwrap();
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].get("id").unwrap().as_str().unwrap(), "ws-1");
+    }
+
+    #[tokio::test]
+    async fn test_list_sort_by_title() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Zebra"));
+            workspaces.push(make_workspace("ws-2", "Apple"));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "list",
+            &json!({ "sort": { "by": "title", "order": "asc" } }),
+        )
+        .await
+        .unwrap();
+        let workspaces = result.as_array().unwrap();
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!(
+            workspaces[0].get("title").unwrap().as_str().unwrap(),
+            "Apple"
+        );
+        assert_eq!(
+            workspaces[1].get("title").unwrap().as_str().unwrap(),
+            "Zebra"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_returns_expected_shape() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Test Workspace"));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "get", &json!({ "id": "ws-1" }))
+            .await
+            .unwrap();
+
+        // Check expected fields are present
+        assert_eq!(result.get("id").unwrap().as_str().unwrap(), "ws-1");
+        assert_eq!(
+            result.get("title").unwrap().as_str().unwrap(),
+            "Test Workspace"
+        );
+        assert!(result.get("status").is_some());
+        assert!(result.get("branch").is_some());
+        assert!(result.get("tags").is_some());
+        assert!(result.get("createdAt").is_some());
+        assert!(result.get("updatedAt").is_some());
+    }
+}
