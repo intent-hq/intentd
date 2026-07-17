@@ -53,7 +53,7 @@ async fn boot() -> Fixture {
         .with_event_bus(bus.clone());
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     let opts = WsOptions {
-        base_port: free_port(),
+        base_port: 0,
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
@@ -213,13 +213,4 @@ async fn workspace_ui_context_unknown_workspace() {
     )
     .await;
     assert_eq!(err2["error"]["code"], json!(-32602));
-}
-
-fn free_port() -> u16 {
-    use std::net::TcpListener;
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
 }

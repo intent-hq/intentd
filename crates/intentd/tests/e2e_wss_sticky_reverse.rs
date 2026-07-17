@@ -67,7 +67,7 @@ async fn boot() -> Fixture {
         .with_reverse_dispatch(registry.clone());
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     let opts = WsOptions {
-        base_port: free_port(),
+        base_port: 0,
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
@@ -313,13 +313,4 @@ async fn agent_browser_exec_without_any_client_reports_no_client_error() {
     let s = err.to_string();
     assert!(s.contains("no client connected"), "unexpected error: {s}");
     fx.ws.stop().await;
-}
-
-fn free_port() -> u16 {
-    use std::net::TcpListener;
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
 }

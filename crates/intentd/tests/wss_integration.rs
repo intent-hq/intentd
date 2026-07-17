@@ -183,7 +183,7 @@ async fn start_with_auggie(mut opts: WsOptions, auggie_bin: Option<std::path::Pa
     token_store_inner.store_token(TOKEN).unwrap();
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     if opts.base_port == WsOptions::default().base_port {
-        opts.base_port = free_port();
+        opts.base_port = 0;
     }
     opts.bind_address = Ipv4Addr::LOCALHOST.into();
     let ws = WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, opts).expect("server");
@@ -1148,6 +1148,8 @@ async fn bind_fails_fast_on_occupied_port() {
     // bind error immediately — no port walking, no retry. Occupy the port for
     // the whole test so the listener has no chance to bind, then assert
     // `start()` returns an `AddrInUse` error on the SAME port it was asked for.
+    // NOTE: This test intentionally uses free_port() to obtain a fixed port that
+    // it then occupies, because it's testing the fixed-port bind failure path.
     let base = free_port();
     let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, base)).unwrap();
     let (api, bus, _store, dir) = make_services(None).await;
@@ -1186,7 +1188,7 @@ async fn insecure_mode_serves_plain_ws_without_token() {
     // the real posture.
     let (api, bus, _store, _dir) = make_services(None).await;
     let opts = WsOptions {
-        base_port: free_port(),
+        base_port: 0,
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
@@ -1224,7 +1226,13 @@ async fn insecure_mode_serves_plain_ws_without_token() {
 
 #[tokio::test]
 async fn graceful_shutdown_allows_immediate_restart() {
-    let srv = start(WsOptions::default()).await;
+    // NOTE: This test verifies fixed-port restart semantics (same port reclaimed
+    // after stop). Use an explicit fixed port to avoid ephemeral port randomness.
+    let srv = start(WsOptions {
+        base_port: 30000,
+        ..WsOptions::default()
+    })
+    .await;
     let port = srv.port;
     srv.ws.stop().await;
     // Re-start the SAME listener immediately; the freed port must rebind.
@@ -2742,6 +2750,9 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Helper to obtain an ephemeral port by bind-then-release. Only used for tests
+/// that genuinely need a fixed port to exercise fixed-port semantics (e.g.
+/// bind_fails_fast_on_occupied_port). Prefer `base_port: 0` for normal tests.
 fn free_port() -> u16 {
     use std::net::TcpListener;
     TcpListener::bind(("127.0.0.1", 0))

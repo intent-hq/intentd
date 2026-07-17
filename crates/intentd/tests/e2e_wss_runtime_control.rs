@@ -5,7 +5,7 @@
 
 #![cfg(unix)]
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -402,8 +402,9 @@ async fn batch_hook_ordering_port_before_enable() {
     // Batch update: provide changes in REVERSE dependency order (wsApi.enabled
     // before wsApi.port in the input array). The hook ordering ensures the port
     // value (priority 0) applies before wsApi.enabled (priority 10), so the
-    // listener starts directly on the NEW port.
-    let new_port = free_port();
+    // listener starts directly on the NEW port. Use a high fixed port to avoid
+    // collision with the initial listener.
+    let new_port = 20000;
     let batch_reverse = uds_rpc(
         &socket,
         2,
@@ -448,13 +449,4 @@ async fn batch_hook_ordering_port_before_enable() {
         ping_resp.get("error").is_none(),
         "events.subscribe over WSS after reverse-order batch should work: {ping_resp}"
     );
-}
-
-fn free_port() -> u16 {
-    use std::net::TcpListener;
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
 }
