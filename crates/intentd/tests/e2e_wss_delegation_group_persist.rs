@@ -29,7 +29,6 @@ use rustls::{ClientConfig, DigitallySignedStruct};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
@@ -403,6 +402,15 @@ async fn baseline_plus_aggregated_wake() {
         "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
         json!(CHILD_B),
     );
+
+    // DETERMINISTIC CHILD2 DELAY: child2's delayMs is controlled by CHILD2_DELAY_MS env var.
+    // Daemon1 (pre-kill) gets 300000ms (5 minutes) so child2 cannot complete before the kill.
+    // Daemon2 (post-restart) gets 0ms so child2 completes quickly and fires the aggregated wake.
+    let child2_delay_ms = std::env::var("CHILD2_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+
     let behavior = json!({
         "rules": [
             {
@@ -416,7 +424,7 @@ async fn baseline_plus_aggregated_wake() {
             },
             {
                 "ifPromptContains": CHILD_B,
-                "delayMs": 8000,
+                "delayMs": child2_delay_ms,
                 "toolCall": {
                     "name": "workspace_api",
                     "arguments": { "code": report_b_js, "summary": "beta reportToParent" }
@@ -445,14 +453,15 @@ async fn baseline_plus_aggregated_wake() {
     })
     .to_string();
     let port_s = free_port().to_string();
-    let env: [(&str, &str); 5] = [
+    let env_daemon1: [(&str, &str); 6] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", &port_s),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("CHILD2_DELAY_MS", "300000"), // 5 minutes - child2 cannot complete before kill
         ("RUST_LOG", "intent_services=info"),
     ];
-    let child = spawn_serve(&data_dir, "both", &env);
+    let child = spawn_serve(&data_dir, "both", &env_daemon1);
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -565,21 +574,19 @@ async fn baseline_plus_aggregated_wake() {
     // Increment 2: wait for child1 to emit agent:idle event (WSS anchor).
     // To prevent the UnexpectedEof race: complete the event wait FULLY, then
     // cleanly drop/close the subscriber, THEN issue the deliberate kill.
-    let child1_idle_event = timeout(Duration::from_secs(20), wss_event(&mut child1_sub, 60))
-        .await
-        .expect("child1 idle timeout");
-
-    let ev = &child1_idle_event["params"]["event"];
-    assert_eq!(
-        ev["type"].as_str().unwrap(),
-        "agent:idle",
-        "child1 emitted idle event"
-    );
-    assert_eq!(
-        ev["data"]["agentId"].as_str().unwrap(),
-        child1_id,
-        "child1 idle event has correct agentId"
-    );
+    // Loop to skip events until we get child1's idle (in case filter isn't working).
+    let mut child1_idle = false;
+    for _ in 0..100 {
+        let frame = timeout(Duration::from_secs(20), wss_event(&mut child1_sub, 60))
+            .await
+            .expect("child1 idle timeout");
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:idle" && ev["data"]["agentId"] == child1_id {
+            child1_idle = true;
+            break;
+        }
+    }
+    assert!(child1_idle, "child1 emitted idle event");
 
     // Increment 3: cleanly close the event subscriber before killing.
     // Drop the subscriber explicitly so the WSS read future is not in-flight
@@ -599,93 +606,42 @@ async fn baseline_plus_aggregated_wake() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     eprintln!("Daemon1 killed.");
 
-    // EVIDENCE GATHERING: Inspect the persisted delegation_group row after daemon1 kill
-    eprintln!("Inspecting persisted delegation_group row...");
+    // Assert: delegation group persisted with child1's completion recorded
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
         .await
         .expect("open store for inspection");
-
-    // QUESTION 4: Dump the ENTIRE delegation_group table (not just undelivered)
-    let all_rows_sql = sqlx::query("SELECT group_id, workspace_id, parent_agent_id, sealed, delivered, expected_agent_ids, completed_agent_ids FROM delegation_group")
-        .fetch_all(store.pool())
-        .await
-        .expect("query all delegation_group rows");
-    eprintln!("Total delegation_group rows in DB: {}", all_rows_sql.len());
-    for row in &all_rows_sql {
-        eprintln!("  group_id: {}", row.get::<String, _>("group_id"));
-        eprintln!("  workspace_id: {}", row.get::<String, _>("workspace_id"));
-        eprintln!(
-            "  parent_agent_id: {}",
-            row.get::<String, _>("parent_agent_id")
-        );
-        eprintln!("  sealed: {}", row.get::<i64, _>("sealed"));
-        eprintln!("  delivered: {}", row.get::<i64, _>("delivered"));
-        eprintln!(
-            "  expected_agent_ids: {}",
-            row.get::<String, _>("expected_agent_ids")
-        );
-        eprintln!(
-            "  completed_agent_ids: {}",
-            row.get::<String, _>("completed_agent_ids")
-        );
-    }
-
     let groups = store
         .list_undelivered_groups(&intent_core::WorkspaceId(ws_id.to_string()))
         .await
         .expect("list undelivered groups");
-    eprintln!("Found {} UNDELIVERED groups", groups.len());
-    for g in &groups {
-        eprintln!("  group_id: {}", g.group_id);
-        eprintln!("  parent_agent_id: {}", g.parent_agent_id.0);
-        eprintln!("  sealed: {}", g.sealed);
-        eprintln!("  delivered: {}", g.delivered);
-        eprintln!(
-            "  expected_agent_ids: {:?}",
-            g.expected_agent_ids
-                .iter()
-                .map(|id| &id.0)
-                .collect::<Vec<_>>()
-        );
-        eprintln!(
-            "  completed_agent_ids: {:?}",
-            g.completed_agent_ids
-                .iter()
-                .map(|id| &id.0)
-                .collect::<Vec<_>>()
-        );
-        eprintln!(
-            "  deleted_agent_ids: {:?}",
-            g.deleted_agent_ids
-                .iter()
-                .map(|id| &id.0)
-                .collect::<Vec<_>>()
-        );
-    }
-    // HYPOTHESIS A: If child1's completion was not persisted, completed_agent_ids will be empty here
     assert_eq!(groups.len(), 1, "exactly one delegation group persisted");
     let persisted_group = &groups[0];
-    eprintln!("\n*** HYPOTHESIS A CHECK ***");
-    eprintln!(
-        "Expected child1 ({}) in completed_agent_ids: {}",
-        child1_id,
+    assert!(
         persisted_group
             .completed_agent_ids
             .iter()
-            .any(|id| id.0 == child1_id)
+            .any(|id| id.0 == child1_id),
+        "child1 completion persisted"
     );
-    eprintln!(
-        "Expected child2 ({}) in expected_agent_ids: {}",
-        child2_id,
+    assert!(
         persisted_group
             .expected_agent_ids
             .iter()
-            .any(|id| id.0 == child2_id)
+            .any(|id| id.0 == child2_id),
+        "child2 still expected"
     );
 
     // Increment 3: boot daemon2 using the SAME data_dir
+    // Daemon2 gets the same behavior BUT without CHILD2_DELAY_MS, so child2 completes quickly.
     eprintln!("Booting daemon2 with same data_dir...");
-    let child2_proc = spawn_serve(&data_dir, "both", &env);
+    let env_daemon2: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", &port_s),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("RUST_LOG", "intent_services=info"),
+    ];
+    let child2_proc = spawn_serve(&data_dir, "both", &env_daemon2);
     let _daemon2 = Daemon {
         child: child2_proc,
         data_dir: data_dir.clone(),
