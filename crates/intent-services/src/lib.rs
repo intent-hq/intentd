@@ -6512,42 +6512,33 @@ impl WorkspaceApi for Services {
                         }
                         initial_agent = created.get("agent").cloned();
                     }
-                    Ok(WorkspaceCreateResult {
-                        workspace: ws,
-                        initial_agent,
-                    })
-                },
-            )
-            .await;
-            // Execute the workspace setup script (fire-and-forget): after worktree
-            // provisioning and repo-config write, read the effective setup script
-            // (explicit request param > repo config) and run it in a "Setup" terminal.
-            // Execution is non-blocking (tokio::spawn) and must never fail the create.
-            // Skipped when skipWorktree or no worktree was provisioned.
-            // Clone pty and bus before they're potentially consumed.
-            let pty_for_setup = self.pty.clone();
-            let bus_for_setup = self.event_bus.clone();
-            if let Ok(ref create_result) = result {
-                if !create_result.workspace.skip_worktree {
+                    // Execute the workspace setup script (fire-and-forget): after worktree
+                    // provisioning and repo-config write, read the effective setup script
+                    // (explicit request param > repo config) and run it in a "Setup" terminal.
+                    // Execution is non-blocking (tokio::spawn) and must never fail the create.
+                    // Skipped when skipWorktree or no worktree was provisioned.
+                    // Lives inside the idempotency closure so a cached response (same idempotencyKey)
+                    // returns immediately without re-executing the script.
+                    let pty_for_setup = self.pty.clone();
+                    let bus_for_setup = self.event_bus.clone();
+                    if !ws.skip_worktree {
                     if let Some(worktree_path_buf) =
-                        crate::git_ops::worktree_path(&create_result.workspace)
+                        crate::git_ops::worktree_path(&ws)
                     {
                         // Spawn background task to read + execute setup script (fire-and-forget).
                         // Move config IO into the task so workspace.create doesn't block on it.
-                        let workspace_id = create_result.workspace.id.clone();
+                        let workspace_id = ws.id.clone();
                         let worktree_path = worktree_path_buf.to_string_lossy().to_string();
-                        let repo_path = create_result
-                            .workspace
+                        let repo_path = ws
                             .repository_path
                             .clone()
                             .unwrap_or_default();
-                        let branch_name = create_result.workspace.branch.clone();
-                        let source_branch = create_result
-                            .workspace
+                        let branch_name = ws.branch.clone();
+                        let source_branch = ws
                             .base_ref
                             .clone()
-                            .unwrap_or_else(|| "main".to_string());
-                        let legacy_script = create_result.workspace.setup_script.clone();
+                            .unwrap_or_default();
+                        let legacy_script = ws.setup_script.clone();
                         let worktree_for_read = worktree_path_buf.clone();
                         tokio::spawn(async move {
                             // Read effective setup script (repo config with legacy DB fallback).
@@ -6580,29 +6571,41 @@ impl WorkspaceApi for Services {
                             // (mode 0600 on Unix, safe from other users, isolated from /tmp races).
                             let script_id = uuid::Uuid::new_v4();
                             let intent_dir = worktree_for_read.join(".intent");
-                            // Ensure .intent directory exists with restrictive permissions
-                            if let Err(e) = tokio::fs::create_dir_all(&intent_dir).await {
-                                tracing::warn!(
-                                    workspace = %workspace_id.as_str(),
-                                    error = %e,
-                                    "failed to create .intent directory for setup script"
-                                );
-                                return;
-                            }
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                if let Err(e) = tokio::fs::set_permissions(
-                                    &intent_dir,
-                                    std::fs::Permissions::from_mode(0o700),
-                                )
-                                .await
-                                {
+                            // Security: refuse if .intent exists as a symlink (prevents writing
+                            // script outside the worktree via a repo-committed symlink attack).
+                            if let Ok(meta) = tokio::fs::symlink_metadata(&intent_dir).await {
+                                if !meta.is_dir() {
+                                    tracing::warn!(
+                                        workspace = %workspace_id.as_str(),
+                                        "setup script execution skipped: .intent is not a real directory (symlink or file)"
+                                    );
+                                    return;
+                                }
+                            } else {
+                                // .intent doesn't exist, create it with restrictive permissions
+                                if let Err(e) = tokio::fs::create_dir_all(&intent_dir).await {
                                     tracing::warn!(
                                         workspace = %workspace_id.as_str(),
                                         error = %e,
-                                        "failed to set .intent directory permissions"
+                                        "failed to create .intent directory for setup script"
                                     );
+                                    return;
+                                }
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    if let Err(e) = tokio::fs::set_permissions(
+                                        &intent_dir,
+                                        std::fs::Permissions::from_mode(0o700),
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            workspace = %workspace_id.as_str(),
+                                            error = %e,
+                                            "failed to set .intent directory permissions"
+                                        );
+                                    }
                                 }
                             }
                             let script_path =
@@ -6660,8 +6663,14 @@ impl WorkspaceApi for Services {
                             }
                         });
                     }
-                }
-            }
+                    }
+                    Ok(WorkspaceCreateResult {
+                        workspace: ws,
+                        initial_agent,
+                    })
+                },
+            )
+            .await;
             result
         })
     }

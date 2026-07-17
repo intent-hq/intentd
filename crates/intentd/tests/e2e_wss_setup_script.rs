@@ -500,13 +500,14 @@ async fn setup_script_executes_on_create() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
-    // Get fingerprint from daemon
+    // Get fingerprint and actual port from daemon (free_port() may have fallen back)
     let status_resp = uds_rpc(&socket, 0, "system.status", json!({})).await;
     let fingerprint = status_resp["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint");
+    let actual_port = status_resp["result"]["port"].as_u64().expect("port") as u16;
 
-    let mut wss = wss_connect(port, fingerprint).await;
+    let mut wss = wss_connect(actual_port, fingerprint).await;
 
     let repo_path = create_test_repo();
 
@@ -616,7 +617,7 @@ exit 1
     let skip_marker_id = Uuid::new_v4().simple().to_string();
     let skip_script = format!(
         r#"#!/bin/sh
-touch "${{WORKTREE_PATH}}/.should-not-run-{}"
+touch "${{MAIN_CHECKOUT}}/.should-not-run-{}"
 "#,
         skip_marker_id
     );
@@ -641,7 +642,7 @@ touch "${{WORKTREE_PATH}}/.should-not-run-{}"
         "skipWorktree create should succeed"
     );
 
-    let skip_workspace_id = create_resp3["result"]["workspace"]["id"]
+    let _skip_workspace_id = create_resp3["result"]["workspace"]["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -649,12 +650,12 @@ touch "${{WORKTREE_PATH}}/.should-not-run-{}"
     // Give it time to potentially run (it shouldn't)
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // The skip-worktree workspace shouldn't have a worktree path, but check workspace dir
-    let workspaces_dir = data_dir.join("workspaces").join(skip_workspace_id);
-    let skip_marker_path = workspaces_dir.join(format!(".should-not-run-{}", skip_marker_id));
+    // skipWorktree has no worktree, so WORKTREE_PATH would be empty; the script uses
+    // MAIN_CHECKOUT instead (repo path). Assert marker does not appear under repo.
+    let skip_marker_path = repo_path.join(format!(".should-not-run-{}", skip_marker_id));
     assert!(
         !skip_marker_path.exists(),
-        "skipWorktree should not execute setup script"
+        "skipWorktree should not execute setup script (marker not found under repo)"
     );
 
     // Cleanup
