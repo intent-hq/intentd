@@ -108,11 +108,6 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
 async fn boot(root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = root.join("data");
     std::fs::create_dir_all(&data_dir).expect("mkdir data");
-    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, &env);
     let socket = data_dir.join("intentd.sock");
@@ -121,6 +116,7 @@ async fn boot(root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
     let fp_hex = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint");
+    let port = status["result"]["port"].as_u64().expect("bound port") as u16;
     let cfg = client_config(fp_hex);
     let scratch = root.join("scratch");
     std::fs::create_dir_all(&scratch).expect("mkdir scratch");
