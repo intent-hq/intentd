@@ -5215,19 +5215,27 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
     );
 }
 
-/// Emit `agent:message` on every daemon-side user-row append: verify that
-/// `agent.sendMessage` and `agent.wakeOrCreate` both publish the `agent:message`
-/// event with the persisted row's id when they append a user message to the
-/// transcript. This test reuses the existing STAB-4 test pattern.
+/// Emit `agent:message` on daemon-side user-row appends: verify that the
+/// queue-drain (persist_user) and wake-delivery (deliver_wake_message runtime)
+/// paths both publish `agent:message` with the persisted row's id. When an
+/// AgentManager is attached, plain agent.sendMessage routes through the manager
+/// and does NOT emit (FE optimistic rendering). This test covers the two runtime
+/// paths that DO emit: (1) dequeued message after a busy turn, (2) wake delivery
+/// to an idle agent.
 #[tokio::test]
-async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
-    let Some(script) = gate("WSS agent:message send+wake E2E") else {
+async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
+    let Some(script) = gate("WSS agent:message queue+wake E2E") else {
         return;
     };
 
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
-    let behavior = json!({ "response": "test response" }).to_string();
+    // Slow first turn to keep agent busy while we queue the second message.
+    let behavior = json!({
+        "response": "reply",
+        "firstTurnDelayMs": 2000
+    })
+    .to_string();
     let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -5250,6 +5258,7 @@ async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
         .to_string();
     let cfg = client_config(&fingerprint);
 
+    // Subscribe to agent:message + stream:end events.
     let mut sub = connect_ws(port, cfg.clone()).await;
     let sub_resp = wss_rpc(
         &mut sub,
@@ -5262,28 +5271,44 @@ async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
 
-    // Test 1: agent.sendMessage emits agent:message with the correct messageId.
+    // Part 1: Queue-drain path (persist_user in agent_manager.rs).
     let created = wss_rpc(
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "Sender", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "QueueTest", "model": "mock:default" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
 
-    let send_result = wss_rpc(
+    // Send first message — agent will be busy for 2000ms.
+    let send1 = wss_rpc(
         &mut rpc,
         11,
         "agent.sendMessage",
-        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": "test send" }),
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": "first" }),
     )
     .await;
-    assert_eq!(send_result["success"], true);
-    let send_message_id = send_result["messageId"].as_str().unwrap().to_string();
+    assert_eq!(send1["success"], true);
+    assert_eq!(send1["queued"], false);
 
-    // Collect events looking for agent:message for the sendMessage.
-    let mut saw_send_message_event = false;
+    // Give the agent a moment to start processing.
+    sleep(Duration::from_millis(200)).await;
+
+    // Send second message while busy — this will queue.
+    let send2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": "queued" }),
+    )
+    .await;
+    assert_eq!(send2["success"], true);
+    assert_eq!(send2["queued"], true, "second message should queue");
+
+    // Collect events: wait for agent:message role=user for the dequeued message.
+    let mut saw_dequeued_user_message = false;
+    let mut dequeued_message_id: Option<String> = None;
     let mut stream_end_count = 0;
     for _ in 0..120 {
         let frame = wss_event(&mut sub, 30).await;
@@ -5292,14 +5317,17 @@ async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
             Some("agent:message") => {
                 if evt["data"]["agentId"].as_str() == Some(agent_id.as_str())
                     && evt["data"]["role"] == "user"
-                    && evt["data"]["messageId"].as_str() == Some(send_message_id.as_str())
                 {
-                    saw_send_message_event = true;
+                    // The first turn's user message won't have an event (optimistic render).
+                    // The dequeued message (second) will emit after the first turn completes.
+                    dequeued_message_id = evt["data"]["messageId"].as_str().map(String::from);
+                    saw_dequeued_user_message = true;
                 }
             }
             Some("agent:stream:end") => {
                 stream_end_count += 1;
-                if saw_send_message_event && stream_end_count >= 1 {
+                // After 2 turns and we saw the dequeued message event, we're done.
+                if stream_end_count >= 2 && saw_dequeued_user_message {
                     break;
                 }
             }
@@ -5307,14 +5335,31 @@ async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
         }
     }
     assert!(
-        saw_send_message_event,
-        "agent:message event emitted for agent.sendMessage with correct messageId"
+        saw_dequeued_user_message,
+        "agent:message event emitted for dequeued user message (persist_user path)"
     );
 
-    // Test 2: agent.wakeOrCreate emits agent:message.
+    // Verify the messageId matches a row in the transcript.
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().unwrap();
+    let found_dequeued = messages
+        .iter()
+        .any(|m| m["id"].as_str() == dequeued_message_id.as_deref() && m["role"] == "user");
+    assert!(
+        found_dequeued,
+        "dequeued agent:message messageId matches a persisted user row"
+    );
+
+    // Part 2: Wake delivery path (deliver_wake_message runtime).
     let marked = wss_rpc(
         &mut rpc,
-        12,
+        14,
         "task.markAsTask",
         json!({ "workspaceId": &ws_id, "noteId": &note_id, "status": "in_progress" }),
     )
@@ -5323,12 +5368,12 @@ async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
 
     let wake_result = wss_rpc(
         &mut rpc,
-        13,
+        15,
         "agent.wakeOrCreate",
         json!({
             "workspaceId": &ws_id,
             "taskNoteId": &note_id,
-            "contextMessage": "test wake",
+            "contextMessage": "wake test",
             "create": { "model": "mock:default" },
         }),
     )
@@ -5336,10 +5381,10 @@ async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
     assert_eq!(wake_result["ok"], true);
     let task_agent_id = wake_result["agentId"].as_str().unwrap().to_string();
 
-    // Collect events looking for agent:message for the wake.
+    // Collect events: wait for agent:message role=user for the wake delivery.
     let mut saw_wake_message_event = false;
     let mut wake_message_id: Option<String> = None;
-    let mut stream_end_count_wake = 0;
+    let mut wake_stream_end_count = 0;
     for _ in 0..120 {
         let frame = wss_event(&mut sub, 30).await;
         let evt = &frame["params"]["event"];
@@ -5353,8 +5398,8 @@ async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
                 }
             }
             Some("agent:stream:end") => {
-                stream_end_count_wake += 1;
-                if saw_wake_message_event && stream_end_count_wake >= 1 {
+                wake_stream_end_count += 1;
+                if saw_wake_message_event && wake_stream_end_count >= 1 {
                     break;
                 }
             }
@@ -5363,23 +5408,23 @@ async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
     }
     assert!(
         saw_wake_message_event,
-        "agent:message event emitted for agent.wakeOrCreate/deliver_wake_message"
+        "agent:message event emitted for wake delivery (deliver_wake_message path)"
     );
 
-    // Verify the messageId from the event matches a row in the transcript.
-    let conv_result = wss_rpc(
+    // Verify the wake messageId matches a row in the transcript.
+    let wake_conv = wss_rpc(
         &mut rpc,
-        14,
+        16,
         "agent.getConversation",
         json!({ "workspaceId": &ws_id, "agentId": &task_agent_id }),
     )
     .await;
-    let messages = conv_result["messages"].as_array().unwrap();
-    let found = messages
+    let wake_messages = wake_conv["messages"].as_array().unwrap();
+    let found_wake = wake_messages
         .iter()
-        .any(|m| m["id"].as_str() == wake_message_id.as_deref());
+        .any(|m| m["id"].as_str() == wake_message_id.as_deref() && m["role"] == "user");
     assert!(
-        found,
-        "agent:message messageId matches a persisted transcript row"
+        found_wake,
+        "wake agent:message messageId matches a persisted user row"
     );
 }
