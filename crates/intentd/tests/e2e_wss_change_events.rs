@@ -46,7 +46,6 @@ impl Drop for Daemon {
     }
 }
 
-
 fn scratch_dir(prefix: &str) -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
     let dir = PathBuf::from("/tmp").join(format!("itd-wss-events-{prefix}-{}", &id[..8]));

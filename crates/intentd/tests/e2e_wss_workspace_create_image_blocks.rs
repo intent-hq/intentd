@@ -24,7 +24,6 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-
 struct TempDir(PathBuf);
 impl Drop for TempDir {
     fn drop(&mut self) {

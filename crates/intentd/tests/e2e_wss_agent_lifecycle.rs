@@ -49,7 +49,6 @@ impl Drop for Daemon {
     }
 }
 
-
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
     let dir = PathBuf::from("/tmp").join(format!("itd-wss-{}", &id[..8]));

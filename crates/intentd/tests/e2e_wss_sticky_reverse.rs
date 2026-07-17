@@ -28,7 +28,6 @@ use tokio::time::{timeout, Instant};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Owns the fixture's scratch directory and removes it on drop so a panicking

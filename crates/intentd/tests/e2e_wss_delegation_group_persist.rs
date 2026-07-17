@@ -93,7 +93,6 @@ impl Drop for Daemon {
     }
 }
 
-
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std::process::Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
