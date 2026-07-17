@@ -9263,6 +9263,222 @@ mod known_repo {
             Some("describe-workspace")
         );
     }
+
+    /// `workspace.create` derives `repository_owner` and `repository_name` from
+    /// the `origin` remote URL when the caller omits them (STAB-64). Caller-
+    /// supplied values always win; non-github remotes leave owner unset; missing
+    /// remotes fall back to basename for name.
+    #[tokio::test]
+    async fn create_workspace_derives_owner_and_name_from_origin_remote() {
+        use git2::{Repository, Signature};
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let svc = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+
+        // Helper: init a git repo with an origin remote and an initial commit.
+        let make_repo = |remote_url: &str| {
+            let dir = std::env::temp_dir().join(format!("intentd-origin-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = Repository::init(&dir).unwrap();
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+            cfg.set_str("remote.origin.url", remote_url).unwrap();
+            // Create an initial commit
+            std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("seed.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = Signature::now("Test", "test@example.com").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
+                .unwrap();
+            dir
+        };
+
+        // GitHub https remote → owner and name derived.
+        let https_repo = make_repo("https://github.com/intent-hq/intentd.git");
+        let https_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(https_repo.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create https");
+        assert_eq!(
+            https_ws.workspace.repository_owner.as_deref(),
+            Some("intent-hq"),
+            "https remote derives owner"
+        );
+        assert_eq!(
+            https_ws.workspace.repository_name.as_deref(),
+            Some("intentd"),
+            "https remote derives name"
+        );
+
+        // GitHub ssh remote → owner and name derived.
+        let ssh_repo = make_repo("git@github.com:intent-hq/intentd.git");
+        let ssh_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(ssh_repo.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create ssh");
+        assert_eq!(
+            ssh_ws.workspace.repository_owner.as_deref(),
+            Some("intent-hq"),
+            "ssh remote derives owner"
+        );
+        assert_eq!(
+            ssh_ws.workspace.repository_name.as_deref(),
+            Some("intentd"),
+            "ssh remote derives name"
+        );
+
+        // Non-github remote → owner stays None, name falls back to basename.
+        let gitlab_repo = make_repo("https://gitlab.com/myorg/myrepo.git");
+        let gitlab_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(gitlab_repo.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create gitlab");
+        assert_eq!(
+            gitlab_ws.workspace.repository_owner, None,
+            "non-github remote leaves owner unset"
+        );
+        // The basename fallback still fires because the remote didn't parse.
+        assert!(
+            gitlab_ws
+                .workspace
+                .repository_name
+                .as_deref()
+                .unwrap()
+                .starts_with("intentd-origin-"),
+            "non-github remote falls back to basename for name"
+        );
+
+        // No origin remote → owner stays None, name falls back to basename.
+        let no_remote = {
+            let dir =
+                std::env::temp_dir().join(format!("intentd-noremote-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = Repository::init(&dir).unwrap();
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+            // Create an initial commit
+            std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("seed.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = Signature::now("Test", "test@example.com").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
+                .unwrap();
+            dir
+        };
+        let noremote_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(no_remote.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create noremote");
+        assert_eq!(
+            noremote_ws.workspace.repository_owner, None,
+            "no remote leaves owner unset"
+        );
+        assert!(
+            noremote_ws
+                .workspace
+                .repository_name
+                .as_deref()
+                .unwrap()
+                .starts_with("intentd-noremote-"),
+            "no remote falls back to basename for name"
+        );
+
+        // Caller-supplied owner wins over remote derivation.
+        let explicit_owner_repo = make_repo("https://github.com/intent-hq/intentd.git");
+        let explicit_owner_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(explicit_owner_repo.to_string_lossy().to_string()),
+                    repository_owner: Some("my-override".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create explicit owner");
+        assert_eq!(
+            explicit_owner_ws.workspace.repository_owner.as_deref(),
+            Some("my-override"),
+            "caller-supplied owner wins"
+        );
+        assert_eq!(
+            explicit_owner_ws.workspace.repository_name.as_deref(),
+            Some("intentd"),
+            "derived name still applies when only owner is explicit"
+        );
+
+        // Caller-supplied name wins over remote derivation.
+        let explicit_name_repo = make_repo("https://github.com/intent-hq/intentd.git");
+        let explicit_name_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(explicit_name_repo.to_string_lossy().to_string()),
+                    repository_name: Some("my-repo-name".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create explicit name");
+        assert_eq!(
+            explicit_name_ws.workspace.repository_owner.as_deref(),
+            Some("intent-hq"),
+            "derived owner still applies when only name is explicit"
+        );
+        assert_eq!(
+            explicit_name_ws.workspace.repository_name.as_deref(),
+            Some("my-repo-name"),
+            "caller-supplied name wins"
+        );
+
+        // Verify known_repo registry also gets the derived owner.
+        let repos = store.list_known_repos().await.expect("list repos");
+        let https_entry = repos
+            .iter()
+            .find(|r| r.path == https_repo.to_string_lossy())
+            .expect("https repo registered");
+        assert_eq!(
+            https_entry.owner.as_deref(),
+            Some("intent-hq"),
+            "known_repo entry carries derived owner"
+        );
+        assert_eq!(
+            https_entry.name, "intentd",
+            "known_repo entry carries derived name"
+        );
+    }
 }
 
 mod worktree_provisioning {

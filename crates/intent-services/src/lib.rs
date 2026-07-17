@@ -5730,18 +5730,52 @@ impl WorkspaceApi for Services {
                             }
                         }
                     }
-                    // Repository-name derivation (`known_repo_name` fallback
-                    // parity): a caller-supplied `repositoryName` always wins;
-                    // otherwise a local `repositoryPath` yields its basename so
-                    // workspace payloads carry `repositoryName` for locally
-                    // created workspaces (FE recent-repos surfaces). `owner` is
-                    // left untouched — no local-remote inspection.
+                    // Repository owner/name derivation from origin remote (STAB-64):
+                    // when `repositoryPath` is a local git repo and the caller left
+                    // `repositoryOwner` and/or `repositoryName` blank, best-effort
+                    // derive them from the `origin` remote URL (local inspection
+                    // only, no network). Only GitHub remotes are parsed; non-github
+                    // or missing remotes leave owner unset. Caller-supplied values
+                    // always win; basename fallback for `repositoryName` stays as
+                    // the last resort.
+                    let origin_derived = if let Some(repo_path) = input
+                        .repository_path
+                        .as_deref()
+                        .filter(|p| !p.is_empty())
+                        .map(PathBuf::from)
+                        .filter(|p| p.join(".git").exists())
+                    {
+                        intent_git::remote::origin_url(&repo_path)
+                            .ok()
+                            .flatten()
+                            .filter(|url| {
+                                // Only parse github.com URLs.
+                                url.contains("github.com")
+                            })
+                            .and_then(|url| clone_ops::parse_owner_repo(&url))
+                    } else {
+                        None
+                    };
+                    // Apply derived owner when caller left it blank.
+                    if !input
+                        .repository_owner
+                        .as_deref()
+                        .is_some_and(|o| !o.is_empty())
+                    {
+                        if let Some((owner, _)) = origin_derived.as_ref() {
+                            input.repository_owner = Some(owner.clone());
+                        }
+                    }
+                    // Apply derived name when caller left it blank; fall back to
+                    // basename when origin remote is missing/unparseable.
                     if !input
                         .repository_name
                         .as_deref()
                         .is_some_and(|n| !n.is_empty())
                     {
-                        if let Some(name) = input
+                        if let Some((_, name)) = origin_derived {
+                            input.repository_name = Some(name);
+                        } else if let Some(name) = input
                             .repository_path
                             .as_deref()
                             .filter(|p| !p.is_empty())

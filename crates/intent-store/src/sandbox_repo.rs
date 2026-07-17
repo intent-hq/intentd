@@ -254,7 +254,7 @@ fn sandbox_from_row(row: &SqliteRow) -> Result<Sandbox> {
             .try_get::<Option<String>, _>("snapshot_commit_sha")
             .ok()
             .flatten()
-            .and_then(|s| if s.is_empty() { None } else { Some(s) }),
+            .filter(|s| !s.is_empty()),
         status: SandboxStatus::from_db(&status_str)?,
         retry_count: row
             .try_get("retry_count")
