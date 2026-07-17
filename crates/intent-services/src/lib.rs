@@ -287,6 +287,19 @@ pub struct Services {
     /// reseeds from disk. Shared across clones like the other in-memory
     /// registries.
     crdt_notes: Arc<crdt_notes::CrdtNoteManager>,
+    /// Per-workspace debouncers for `workspace:updated { lastActivity }` event
+    /// emission (§10.1). Each write that can move derived `lastActivity`
+    /// schedules a trailing-edge debounced emit; rapid bumps coalesce into one
+    /// event carrying the latest value. Shared across clones so all service
+    /// handles observe the same pending timers. In-memory only (no persistence);
+    /// pending timers are dropped on daemon shutdown without flushing.
+    ///
+    /// To prevent race conditions where an old task removes a newer handle, each
+    /// entry stores a generation counter alongside the abort handle. Tasks only
+    /// remove their own entry if the generation still matches.
+    last_activity_debouncers: Arc<Mutex<HashMap<WorkspaceId, (u64, tokio::task::AbortHandle)>>>,
+    /// Generation counter for debounce tasks (incremented on each schedule).
+    last_activity_debounce_gen: Arc<Mutex<u64>>,
     /// REV-1 agent-initiated reverse-dispatch seam: when an agent calls
     /// `ws.browser.exec` via the MCP front door there is no ambient client
     /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
@@ -341,6 +354,8 @@ impl Services {
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
+            last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
+            last_activity_debounce_gen: Arc::new(Mutex::new(0)),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
         }
@@ -540,6 +555,87 @@ impl Services {
         }
         if activity_max.is_some() {
             ws.last_activity = activity_max;
+        }
+    }
+
+    /// Schedule a debounced `workspace:updated { changes: { lastActivity } }` event
+    /// emission for the workspace (§10.1). Recomputes the derived `lastActivity` via
+    /// the existing aggregation and emits the event only when it differs from the
+    /// previously known value. Rapid calls for the same workspace coalesce into at most
+    /// one event per `LAST_ACTIVITY_DEBOUNCE_MS` window, carrying the latest derived
+    /// value. Cancels any pending timer for the workspace before scheduling a new one.
+    /// Best-effort: store/emit failures are logged but do not surface to the caller.
+    pub(crate) fn schedule_last_activity_event(&self, workspace_id: WorkspaceId) {
+        // Cancel any pending debounce timer for this workspace and increment generation.
+        let gen = if let Ok(mut gen_lock) = self.last_activity_debounce_gen.lock() {
+            *gen_lock = gen_lock.wrapping_add(1);
+            *gen_lock
+        } else {
+            0
+        };
+
+        if let Ok(mut debouncers) = self.last_activity_debouncers.lock() {
+            if let Some((_, handle)) = debouncers.remove(&workspace_id) {
+                handle.abort();
+            }
+        }
+
+        // Clone the state we'll need in the spawned task.
+        let this = self.clone();
+        let debouncers = self.last_activity_debouncers.clone();
+        let ws_id = workspace_id.clone();
+
+        // Debounce window: production constant, overridable via env for tests.
+        let debounce_ms = std::env::var("LAST_ACTIVITY_DEBOUNCE_TEST_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(LAST_ACTIVITY_DEBOUNCE_MS);
+
+        // Spawn a task that sleeps for the debounce window, then derives + emits.
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
+
+            // Get the current workspace and capture its old lastActivity.
+            let mut ws = match this.store.get_workspace(&ws_id).await {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(workspace = %ws_id.as_str(), error = %e, "schedule_last_activity_event: get_workspace failed");
+                    return;
+                }
+            };
+            let old_activity = ws.last_activity.clone();
+
+            // Recompute lastActivity via the existing aggregation.
+            this.derive_last_activity(&mut ws).await;
+            let new_activity = ws.last_activity.clone();
+
+            // Emit only when the derived value changed.
+            if old_activity != new_activity {
+                if let Some(new_val) = &new_activity {
+                    publish_event(
+                        &this.event_bus,
+                        workspace_updated_event(
+                            &ws_id,
+                            serde_json::json!({ "lastActivity": new_val }),
+                        ),
+                    )
+                    .await;
+                }
+            }
+
+            // Remove ourselves from the debouncers map only if we're still the current task.
+            if let Ok(mut map) = debouncers.lock() {
+                if let Some((current_gen, _)) = map.get(&ws_id) {
+                    if *current_gen == gen {
+                        map.remove(&ws_id);
+                    }
+                }
+            }
+        });
+
+        // Store the abort handle with generation so a fresh schedule can cancel this one.
+        if let Ok(mut map) = self.last_activity_debouncers.lock() {
+            map.insert(workspace_id, (gen, handle.abort_handle()));
         }
     }
 
@@ -825,6 +921,8 @@ impl Services {
             attention_changed_event(&ws.id, ws.attention),
         )
         .await;
+        // Schedule debounced lastActivity event (§10.1).
+        self.schedule_last_activity_event(workspace_id.clone());
         Ok(())
     }
 
@@ -1341,6 +1439,8 @@ impl Services {
             token_usage_changed_event(workspace_id, &usage),
         )
         .await;
+        // Schedule debounced lastActivity event (§10.1).
+        self.schedule_last_activity_event(workspace_id.clone());
         Ok(true)
     }
 
@@ -2207,6 +2307,12 @@ fn latest_activity_candidate(candidates: &[Option<&str>]) -> Option<String> {
     }
     best.map(|(_, s)| s)
 }
+
+/// Trailing-edge debounce window for `workspace:updated { lastActivity }` event
+/// emission (§10.1). Production value (~3 seconds) keeps the FE sidebar live
+/// without event storms during agent streaming; tests override with a short
+/// window (see `LAST_ACTIVITY_DEBOUNCE_TEST_MS` env var).
+const LAST_ACTIVITY_DEBOUNCE_MS: u64 = 3000;
 
 /// Conservative allowlist of remote names whose first path segment may be
 /// stripped when canonicalising a workspace `baseRef` on write. Mirrors the
@@ -7214,6 +7320,7 @@ impl WorkspaceApi for Services {
     fn dismiss_attention(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let this = self.clone();
         Box::pin(async move {
             // Chief has no attention state to dismiss (synthesized as `None`).
             if id.is_chief() {
@@ -7228,6 +7335,8 @@ impl WorkspaceApi for Services {
             // the blue dot together (PROTOCOL §6.5); emit only on an actual change.
             if changed {
                 publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
+                // Schedule debounced lastActivity event (§10.1).
+                this.schedule_last_activity_event(id.clone());
             }
             Ok(ws)
         })
@@ -7236,6 +7345,7 @@ impl WorkspaceApi for Services {
     fn mark_seen(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let this = self.clone();
         Box::pin(async move {
             if id.is_chief() {
                 return Ok(chief_workspace());
@@ -7247,6 +7357,8 @@ impl WorkspaceApi for Services {
                 ws.updated_at = now_iso();
                 store.update_workspace(&ws).await?;
                 publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
+                // Schedule debounced lastActivity event (§10.1).
+                this.schedule_last_activity_event(id.clone());
             }
             Ok(ws)
         })
