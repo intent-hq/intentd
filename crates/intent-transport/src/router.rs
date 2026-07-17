@@ -2815,6 +2815,14 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "skill.list" => {
+            let ws_id = require_workspace_id(params)?;
+            match api.skill_list(ws_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "mcp.servers.list" => {
             // Global (no required scope); optional workspaceId per PROTOCOL §5.22.
             let workspace_id = opt_workspace_id(params);

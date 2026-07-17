@@ -48,6 +48,12 @@ pub(crate) struct CompletionWatch {
     /// timed cleanup is armed" (the default for one-shot watches, which are
     /// removed on delivery instead).
     pub cleanup_deadline: Option<Instant>,
+    /// Report-time wake: set to `true` when `agent.reportToParent` delivers
+    /// the parent wake immediately. When `true`, `deliver_completion_to_watches`
+    /// skips delivery for `agent:idle` (suppressing the duplicate wake) but
+    /// still delivers for `agent:failed` / `agent:deleted` (failure after
+    /// reporting is a new signal, not a duplicate).
+    pub report_delivered: bool,
 }
 
 /// Fan-in table for `waitMode: "after_all"` delegation groups. All children a
@@ -107,6 +113,7 @@ impl Services {
             group_id,
             created_at: now_iso(),
             cleanup_deadline: None,
+            report_delivered: false,
         };
         self.agent_subscriptions
             .lock()
@@ -288,6 +295,29 @@ impl Services {
         let before = w.subscriptions.len();
         w.subscriptions.retain(|s| s.id != subscription_id);
         w.subscriptions.len() != before
+    }
+
+    /// Mark a watch as having delivered the report wake (report-time wake).
+    /// When marked, `deliver_completion_to_watches` will skip delivery for
+    /// `agent:idle` but still deliver for `agent:failed` / `agent:deleted`.
+    pub(crate) fn mark_watch_report_delivered(
+        &self,
+        workspace_id: &WorkspaceId,
+        subscription_id: &str,
+    ) -> bool {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let Some(w) = guard.get_mut(workspace_id) else {
+            return false;
+        };
+        if let Some(watch) = w.subscriptions.iter_mut().find(|s| s.id == subscription_id) {
+            watch.report_delivered = true;
+            true
+        } else {
+            false
+        }
     }
 
     /// Remove every watch registered by `parent_agent_id`; returns the count.
