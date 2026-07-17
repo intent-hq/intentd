@@ -1192,5 +1192,115 @@ fn home_dir() -> PathBuf {
     PathBuf::from("/")
 }
 
+/// Probe provider discovery: returns configured providers + npx availability.
+/// Runs on a blocking thread to keep the async runtime free. Version probing
+/// spawns `npx --version` with a 3-second timeout; failures yield
+/// `versionOk: false`. Major version >= 7 is required for `npx -y` semantics.
+pub(crate) fn provider_discovery_op() -> Value {
+    let providers = intent_providers::discover_providers();
+    let npx_status = intent_providers::probe_npx();
+
+    // Probe npx version if we found the binary
+    let (version, version_ok) = if let Some(ref npx_path) = npx_status.resolved_path {
+        match probe_npx_version(npx_path) {
+            Some(v) => {
+                let ok = parse_npx_version_ok(&v);
+                (Some(v), ok)
+            }
+            None => (None, false),
+        }
+    } else {
+        (None, false)
+    };
+
+    let provider_array: Vec<Value> = providers
+        .iter()
+        .map(|p| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("id".to_string(), json!(p.id));
+            obj.insert("displayName".to_string(), json!(p.display_name));
+            obj.insert("command".to_string(), json!(p.command));
+            obj.insert("installed".to_string(), json!(p.installed));
+            if let Some(ref path) = p.resolved_path {
+                obj.insert(
+                    "resolvedPath".to_string(),
+                    json!(path.display().to_string()),
+                );
+            }
+            if let Some(ref reason) = p.gated_off {
+                obj.insert("gatedOff".to_string(), json!(reason));
+            }
+            obj.insert("hasNpxFallback".to_string(), json!(p.has_npx_fallback));
+            Value::Object(obj)
+        })
+        .collect();
+
+    let mut npx_obj = serde_json::Map::new();
+    if let Some(ref path) = npx_status.resolved_path {
+        npx_obj.insert(
+            "resolvedPath".to_string(),
+            json!(path.display().to_string()),
+        );
+    } else {
+        npx_obj.insert("resolvedPath".to_string(), Value::Null);
+    }
+    if let Some(ref v) = version {
+        npx_obj.insert("version".to_string(), json!(v));
+    } else {
+        npx_obj.insert("version".to_string(), Value::Null);
+    }
+    npx_obj.insert("versionOk".to_string(), json!(version_ok));
+
+    json!({
+        "providers": provider_array,
+        "npx": Value::Object(npx_obj),
+    })
+}
+
+/// Spawn `npx --version` with a 3-second timeout, returning the version string
+/// (first line of stdout, trimmed) or `None` on any failure.
+fn probe_npx_version(npx_path: &Path) -> Option<String> {
+    use std::sync::mpsc::channel;
+
+    let (tx, rx) = channel();
+    let npx_path = npx_path.to_path_buf();
+
+    std::thread::spawn(move || {
+        let result = Command::new(&npx_path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+        let _ = tx.send(result);
+    });
+
+    let timeout = Duration::from_secs(3);
+    let result = rx.recv_timeout(timeout).ok()?.ok()?;
+
+    if !result.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let first_line = stdout.lines().next()?.trim();
+    if first_line.is_empty() {
+        return None;
+    }
+    Some(first_line.to_string())
+}
+
+/// Parse `versionOk` from the npx version string. Returns `true` when the
+/// major version is >= 7 (npm 7+ is when `npx -y` semantics landed).
+/// Unparseable versions yield `false`.
+fn parse_npx_version_ok(version: &str) -> bool {
+    // Version string is typically "8.19.2" or similar
+    let major = version
+        .split('.')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok());
+    major.is_some_and(|v| v >= 7)
+}
+
 #[cfg(test)]
 mod tests;

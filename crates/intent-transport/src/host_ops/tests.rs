@@ -759,3 +759,35 @@ fn enhanced_path_includes_enriched_dirs_with_correct_precedence() {
         "enhanced_path_dirs should not contain duplicates"
     );
 }
+
+// --- provider discovery + npx version parsing ---
+
+#[test]
+fn parse_npx_version_ok_accepts_major_7_and_above() {
+    assert!(parse_npx_version_ok("7.0.0"));
+    assert!(parse_npx_version_ok("8.19.2"));
+    assert!(parse_npx_version_ok("9.5.0"));
+    assert!(parse_npx_version_ok("10.0.0"));
+}
+
+#[test]
+fn parse_npx_version_ok_rejects_below_major_7() {
+    assert!(!parse_npx_version_ok("6.14.18"));
+    assert!(!parse_npx_version_ok("5.10.0"));
+    assert!(!parse_npx_version_ok("4.0.0"));
+}
+
+#[test]
+fn parse_npx_version_ok_rejects_garbage() {
+    assert!(!parse_npx_version_ok(""));
+    assert!(!parse_npx_version_ok("not-a-version"));
+    assert!(!parse_npx_version_ok("v8.19.2"));
+    assert!(!parse_npx_version_ok("abc.def.ghi"));
+}
+
+#[test]
+fn parse_npx_version_ok_handles_partial_versions() {
+    assert!(parse_npx_version_ok("8"));
+    assert!(parse_npx_version_ok("9.5"));
+    assert!(!parse_npx_version_ok("6"));
+}

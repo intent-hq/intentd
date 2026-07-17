@@ -285,7 +285,7 @@ pub const METHOD_ALIASES: &[(&str, &str)] =
 
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
-/// These 27 methods are handled by dedicated fast-path modules (`events.rs`,
+/// These 28 methods are handled by dedicated fast-path modules (`events.rs`,
 /// `client.rs`, `drafts.rs`, `browser.rs`, `forward.rs`, `host.rs`, `control.rs`)
 /// before reaching the main router. They share the same JSON-RPC envelope
 /// validation but are dispatched earlier in the connection task for performance
@@ -314,6 +314,7 @@ pub const FASTPATH_METHODS: &[&str] = &[
     "host.listDirectory",
     "host.listInstalledEditors",
     "host.openInEditor",
+    "host.providerDiscovery",
     "host.status",
     "host.toolAvailability",
     "system.shutdown",
