@@ -2307,22 +2307,22 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
 
 /// SUB-2 (Copilot #104) end-to-end over WSS: `agent.reportToParent` is
 /// metadata-only — it MUST NOT deliver an immediate parent wake — and the
-/// single parent wake is driven by the child's terminal `agent:idle`,
-/// carrying the persisted `completionReport` via `format_completion_wake`'s
-/// `Report:` branch (which wins over `lastResponseSummary`). Exercised on the
-/// real WSS wire (not just the `intent-services` unit tests) per the repo's
-/// e2e requirement.
+/// single parent wake is driven by the child's `reportToParent` (report-time
+/// wake), carrying the persisted `completionReport` with `Report:` framing.
+/// The child's subsequent `agent:idle` does NOT deliver a second wake (idle
+/// suppression). Exercised on the real WSS wire (not just the `intent-services`
+/// unit tests) per the repo's e2e requirement.
 ///
 /// A parent's opening turn delegates one child (immediate, ungrouped —
 /// `waitMode: "immediate"`), the child calls `ws.agent.reportToParent` and
 /// then finishes, and the parent's wake turn acknowledges. Asserts:
 /// - the parent transcript carries EXACTLY ONE `[WORKSPACE EVENTS]` wake
-///   message (proving `reportToParent` emitted zero additional wakes);
+///   message (proving the report-time wake delivered, and idle was suppressed);
 /// - that wake carries the `Report: <report>` framing and does NOT fall
 ///   through to the `Summary:` branch (report-preferred formatting);
-/// - the wake turn runs on the parent AFTER the child's `agent:idle` — no
+/// - the wake turn runs on the parent BEFORE the child's `agent:idle` —
 ///   parent `agent:stream:*` fires between the child's first stream chunk
-///   and the child's terminal `agent:idle`.
+///   and the child's terminal `agent:idle` (proving immediate wake).
 #[tokio::test]
 async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss() {
     let Some(script) = gate("WSS reportToParent SUB-2 E2E") else {
@@ -2466,9 +2466,9 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
                 child_idle = true;
             }
         }
-        // Between the child's first chunk and the child's idle, the parent
-        // MUST NOT stream a wake turn — that would prove `reportToParent`
-        // delivered an immediate wake.
+        // Report-time wake: between the child's first chunk and the child's
+        // idle, the parent MUST stream a wake turn — that proves
+        // `reportToParent` delivered an immediate wake.
         if ev_agent == parent_id
             && ev_type == "agent:stream:chunk"
             && child_first_chunk_seen
@@ -2493,12 +2493,12 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     assert!(child_id.is_some(), "child agent id observed on the wire");
     assert!(child_idle, "child emitted agent:idle after reportToParent");
     assert!(
-        !parent_wake_chunk_before_child_idle,
-        "reportToParent MUST NOT emit an immediate parent wake — parent streamed before child idled"
+        parent_wake_chunk_before_child_idle,
+        "reportToParent MUST emit an immediate parent wake — parent must stream before child idles"
     );
     assert_eq!(
         parent_wake_ends, 1,
-        "exactly one wake-turn stream:end on the parent (single wake driven by child idle)"
+        "exactly one wake-turn stream:end on the parent (single wake driven by reportToParent, idle suppressed)"
     );
     assert!(
         parent_idle_after_wake,

@@ -1672,7 +1672,7 @@ async fn watch_completion_dedupe() {
 }
 
 #[tokio::test]
-async fn report_to_parent_metadata_only_no_immediate_wake_then_idle_delivers_one() {
+async fn report_to_parent_delivers_immediate_wake_then_idle_suppressed() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     // Immediate-mode delegation arms a oneShot completion watch on the child.
@@ -1697,13 +1697,17 @@ async fn report_to_parent_metadata_only_no_immediate_wake_then_idle_delivers_one
     svc.agent_report_to_parent_op(ws.clone(), json!(report), Some(child.clone()))
         .await
         .expect("report");
-    // SUB-2: zero immediate wakes.
-    assert_eq!(parent_message_count(&svc, &parent).await, baseline);
+    // Report-time wake: parent receives the wake immediately.
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains(&format!("Report: {report}")),
+        "wake text must carry the report at reportToParent time: {text}"
+    );
 
     // Drive the child's `agent:idle` (mirrors the turn worker's
-    // stream-complete branch, which enriches the payload with `report` from
-    // the persisted `completionReport`). Exactly one wake fires, carrying
-    // `Report:` text.
+    // stream-complete branch). The wake is suppressed because the watch is
+    // marked as report_delivered.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -1711,13 +1715,9 @@ async fn report_to_parent_metadata_only_no_immediate_wake_then_idle_delivers_one
         json!({ "agentId": child.0, "report": report }),
     ))
     .await;
+    // No second wake fires — idle suppression working.
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
-    let text = parent_messages_text(&svc, &parent).await;
-    assert!(
-        text.contains(&format!("Report: {report}")),
-        "wake text must carry the persisted completion report: {text}"
-    );
-    // The oneShot watch is consumed after delivery.
+    // The oneShot watch is consumed after the idle suppression.
     assert!(svc.find_watches_for_child(&ws, &child).is_empty());
 }
 
@@ -2603,12 +2603,12 @@ async fn subscribe_then_unsubscribe_roundtrips() {
     assert!(matches!(err, Error::Internal(_)));
 }
 
-/// SUB-2: a delegated caller's `reportToParent` is now metadata-only — the
-/// report is persisted on the child session (`completion_report`) and the
-/// TS-shaped result is returned, but no immediate parent wake is issued. The
-/// single parent wake is delivered later by the child's terminal
-/// `agent:idle` (via the still-armed completion watch), which is asserted by
-/// the sibling `report_to_parent_metadata_only_no_immediate_wake_then_idle_delivers_one`
+/// Report-time wake: a delegated caller's `reportToParent` delivers an
+/// immediate parent wake containing the report. The report is persisted on the
+/// child session (`completion_report`) and the TS-shaped result is returned.
+/// The watch is marked as report_delivered, so the child's subsequent
+/// `agent:idle` does NOT deliver a second wake (suppressed), which is asserted
+/// by the sibling `report_to_parent_delivers_immediate_wake_then_idle_suppressed`
 /// test.
 #[tokio::test]
 async fn report_to_parent_delivers_for_delegated_caller() {
@@ -2857,10 +2857,10 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
 /// child (caller set, so the child's `parentAgentId` == parent), then the child
 /// reports back via `report_to_parent` (caller-aware; the registry/dispatch name
 /// is bare — agents still see `report_to_parent_workspace-mcp` because the
-/// provider appends the server suffix). SUB-2: reportToParent is metadata-only
-/// (no immediate parent wake); the report is persisted on the child session
-/// and reaches the parent later through the child's terminal `agent:idle`. The
-/// same report tool through a caller-less server (the RPC / no-caller path)
+/// provider appends the server suffix). Report-time wake: reportToParent
+/// delivers an immediate parent wake; the report is persisted on the child
+/// session and the parent receives the wake containing the report immediately.
+/// The same report tool through a caller-less server (the RPC / no-caller path)
 /// yields an `isError: true` workspace_api tool result. This is the
 /// service-level integration coverage chosen over a node-gated UDS E2E so the
 /// full loop is exercised deterministically without an external `node`
@@ -2935,16 +2935,19 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
         Some(parent.0.as_str())
     );
 
-    // SUB-2: reportToParent is metadata-only — the parent transcript stays
-    // empty at report-time. The report is persisted on the child session and
-    // reaches the parent later via the child's `agent:idle` (covered by the
-    // sibling `handle_completion_event`-driven tests).
+    // Report-time wake: the parent receives an immediate wake containing the
+    // report. The report is persisted on the child session.
     let parent_session = svc
         .store()
         .get_agent_session(&parent)
         .await
         .expect("parent session");
-    assert_eq!(parent_session.messages.len(), 0);
+    assert_eq!(parent_session.messages.len(), 1);
+    let wake_text = &parent_session.messages[0].content;
+    assert!(
+        wake_text.contains(&format!("Report: {report}")),
+        "wake must contain the report: {wake_text}"
+    );
     let child_session = svc
         .store()
         .get_agent_session(&child)
