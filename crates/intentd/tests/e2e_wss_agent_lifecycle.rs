@@ -5355,10 +5355,7 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     .await;
     let messages = conv["messages"].as_array().unwrap();
     // Count user messages - we expect the dequeued message to be the second one.
-    let user_messages: Vec<_> = messages
-        .iter()
-        .filter(|m| m["role"] == "user")
-        .collect();
+    let user_messages: Vec<_> = messages.iter().filter(|m| m["role"] == "user").collect();
     assert!(
         user_messages.len() >= 2,
         "should have at least 2 user messages (first + queued)"
