@@ -268,8 +268,6 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 #[tokio::test]
 async fn resolve_interrupted_resume_and_abandon() {
     let data_dir = temp_data_dir();
-    let port = free_port();
-    let port_s = port.to_string();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
 
@@ -494,8 +492,6 @@ async fn resolve_interrupted_resume_and_abandon() {
 #[tokio::test]
 async fn resolve_interrupted_invalid_params_validation() {
     let data_dir = temp_data_dir();
-    let port = free_port();
-    let port_s = port.to_string();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
 

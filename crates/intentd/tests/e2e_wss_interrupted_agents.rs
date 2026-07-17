@@ -224,8 +224,6 @@ where
 #[tokio::test]
 async fn interrupted_agents_persisted_across_restart() {
     let data_dir = temp_data_dir();
-    let port = free_port();
-    let port_s = port.to_string();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
 

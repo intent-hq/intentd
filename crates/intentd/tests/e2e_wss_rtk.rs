@@ -295,8 +295,6 @@ async fn rtk_settings_integration() {
     //Test that rtk.enabled setting round-trips correctly over WSS
     let data_dir = temp_data_dir();
     let socket = data_dir.join("intentd.sock");
-    let port = free_port();
-    let port_s = port.to_string();
 
     let mut _daemon = Daemon {
         child: spawn_serve(
@@ -395,8 +393,6 @@ async fn rtk_prompt_injection_over_wss() {
 
     let data_dir = temp_data_dir();
     let socket = data_dir.join("intentd.sock");
-    let port = free_port();
-    let port_s = port.to_string();
 
     // Fake rtk shim (outputs `ls, cat, grep, test, help`; test + help excluded)
     // Copy to a temp directory and name it `rtk` so `which rtk` finds it

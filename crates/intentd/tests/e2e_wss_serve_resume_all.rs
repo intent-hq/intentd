@@ -351,8 +351,6 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
     };
 
     let data_dir = temp_data_dir();
-    let port = free_port();
-    let port_s = port.to_string();
 
     // Simple mock behavior: just respond with a message
     let behavior = json!({
