@@ -6331,7 +6331,7 @@ impl WorkspaceApi for Services {
                             created["agent"]["id"].as_str().unwrap_or_default(),
                         );
                         // Extract image_blocks and context_references from the created
-                        // agent (STAB-65: thread them into the first turn so imageBlocks
+                        // agent (STAB-69: thread them into the first turn so imageBlocks
                         // attached to the initial prompt reach the ACP).
                         let created_image_blocks = created
                             .get("agent")
@@ -6344,7 +6344,7 @@ impl WorkspaceApi for Services {
                             .filter(|v| !v.is_null())
                             .cloned();
                         // Deliver the prompt and start the first turn when a prompt OR
-                        // imageBlocks are supplied (STAB-65: image-only first messages
+                        // imageBlocks are supplied (STAB-69: image-only first messages
                         // should start a turn, consistent with agent.sendMessage
                         // semantics). The runtime `AgentManager` when attached, else the
                         // store-only persist. Best-effort like the delegate path — the

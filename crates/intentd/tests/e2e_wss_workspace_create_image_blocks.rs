@@ -1,4 +1,4 @@
-//! WSS end-to-end regression for STAB-65: `workspace.create` with
+//! WSS end-to-end regression for STAB-69: `workspace.create` with
 //! `initialAgent.imageBlocks` threads the images into the first turn's ACP
 //! prompt. Drives the real WS transport + mock ACP provider (deterministic
 //! fixture in `fixtures/mock-acp-agent.mjs`) and asserts the first `acp:prompt`
@@ -101,7 +101,7 @@ async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Valu
     .expect("response timeout")
 }
 
-/// STAB-65: `workspace.create` with `initialAgent.imageBlocks` threads the images
+/// STAB-69: `workspace.create` with `initialAgent.imageBlocks` threads the images
 /// into the first turn so the ACP receives them.
 #[tokio::test]
 async fn workspace_create_threads_image_blocks_to_first_turn() {
@@ -147,9 +147,7 @@ async fn workspace_create_threads_image_blocks_to_first_turn() {
     // path now starts a turn when imageBlocks are present (image-only initial
     // message support). Check that an initial message was recorded in metadata.
     assert!(
-        agent_obj["metadata"]["initialMessage"]
-            .as_str()
-            .is_some(),
+        agent_obj["metadata"]["initialMessage"].as_str().is_some(),
         "initial message persisted in metadata"
     );
 }
