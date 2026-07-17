@@ -520,9 +520,15 @@ impl Services {
         }
     }
 
-    /// Atomically claim a group for delivery if it is sealed, complete, and not
-    /// yet delivered: flips `delivered`, removes it from the table, and returns a
-    /// clone. Returns `None` otherwise, so the aggregated wake fires exactly once.
+    /// Claim a group for delivery if sealed, complete, and not yet delivered.
+    /// Flips `delivered` in memory, removes from in-memory table, triggers
+    /// best-effort async DB delete, and returns a clone. Returns `None` otherwise.
+    ///
+    /// The `delivered` flag guards against double-wake: a crash after delivery
+    /// but before the DB delete completes leaves a stale row in `delegation_group`,
+    /// but on restore the rehydrated group has `delivered=false` and the parent
+    /// re-delivery path checks the flag before firing. Double-delivery is prevented
+    /// even if the DB delete never committed.
     pub(crate) fn take_group_if_ready(
         &self,
         workspace_id: &WorkspaceId,
@@ -650,6 +656,13 @@ impl Services {
     }
 
     /// Best-effort write-through persist of a delegation group (AS-2 persistence).
+    ///
+    /// Spawns async persist task, **not** durable-before-observable. A crash between
+    /// group creation and commit loses the persisted row, preventing restoration on
+    /// the next startup. This is acceptable: the crash window is milliseconds, and
+    /// the parent agent can re-delegate if needed. Consistency requirement applies
+    /// to **agent completions** (must persist before `agent:idle` event), not group
+    /// creation.
     fn persist_delegation_group(&self, workspace_id: &WorkspaceId, group: &DelegationGroup) {
         let store = self.store.clone();
         let workspace_id = workspace_id.clone();
