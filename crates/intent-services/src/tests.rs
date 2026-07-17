@@ -3264,6 +3264,198 @@ mod change_event_parity {
         );
     }
 
+    /// Regression for STAB-N: workspace mutation paths must derive `activity`
+    /// from live agent state before returning the `Workspace` on the wire (§9.9).
+    /// When a workspace has agents in-flight, mutations that return a `Workspace`
+    /// must set `ws.activity = workspace_activity(&id)` so the FE receives
+    /// `agent_running`, not the stale/default `idle` from the persisted row.
+    #[tokio::test]
+    async fn update_workspace_derives_activity_from_live_agent_state() {
+        use intent_core::{WorkspaceActivity, WorkspaceApi, WorkspaceUpdate};
+        let h = harness().await;
+
+        // Baseline: with no agents in-flight, update_workspace returns activity=idle.
+        let updated = h
+            .services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    title: Some("Renamed Without Agent".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update workspace");
+        assert_eq!(
+            updated.activity,
+            WorkspaceActivity::Idle,
+            "without agents in-flight, activity is idle"
+        );
+
+        // Start agent activity: the workspace now has 1 in-flight session.
+        h.services.agent_activity_begin(&h.ws).await;
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning,
+            "workspace_activity() reports agent_running"
+        );
+
+        // Regression: update_workspace must return activity=agent_running,
+        // not the stale default `idle` from the persisted row.
+        let updated_with_agent = h
+            .services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    title: Some("Renamed With Agent".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update workspace with agent");
+        assert_eq!(
+            updated_with_agent.activity,
+            WorkspaceActivity::AgentRunning,
+            "update_workspace MUST derive activity=agent_running when agents in-flight"
+        );
+
+        // End agent activity: the workspace returns to idle.
+        h.services.agent_activity_end(&h.ws).await;
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::Idle,
+            "after agent_activity_end, workspace_activity() reports idle"
+        );
+
+        // Confirm update_workspace returns activity=idle again.
+        let updated_after_agent = h
+            .services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    title: Some("Renamed After Agent".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update workspace after agent");
+        assert_eq!(
+            updated_after_agent.activity,
+            WorkspaceActivity::Idle,
+            "after agent ends, activity returns to idle"
+        );
+    }
+
+    /// Regression for STAB-N: `dismiss_attention` must derive activity.
+    #[tokio::test]
+    async fn dismiss_attention_derives_activity_from_live_agent_state() {
+        use intent_core::{WorkspaceActivity, WorkspaceAttention};
+        let h = harness().await;
+
+        // Set attention so there's something to dismiss.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise attention");
+
+        // Start agent activity.
+        h.services.agent_activity_begin(&h.ws).await;
+
+        // Dismiss attention — must return activity=agent_running.
+        let dismissed = h
+            .services
+            .dismiss_attention(h.ws.clone())
+            .await
+            .expect("dismiss attention");
+        assert_eq!(
+            dismissed.activity,
+            WorkspaceActivity::AgentRunning,
+            "dismiss_attention MUST derive activity=agent_running"
+        );
+
+        h.services.agent_activity_end(&h.ws).await;
+    }
+
+    /// Regression for STAB-N: `archive_workspace` must derive activity.
+    #[tokio::test]
+    async fn archive_workspace_derives_activity_from_live_agent_state() {
+        use intent_core::WorkspaceActivity;
+        let h = harness().await;
+
+        // Start agent activity.
+        h.services.agent_activity_begin(&h.ws).await;
+
+        // Archive — must return activity=agent_running.
+        let archived = h
+            .services
+            .archive_workspace(h.ws.clone())
+            .await
+            .expect("archive workspace");
+        assert_eq!(
+            archived.activity,
+            WorkspaceActivity::AgentRunning,
+            "archive_workspace MUST derive activity=agent_running"
+        );
+
+        h.services.agent_activity_end(&h.ws).await;
+    }
+
+    /// Regression for STAB-N: `unarchive_workspace` must derive activity.
+    #[tokio::test]
+    async fn unarchive_workspace_derives_activity_from_live_agent_state() {
+        use intent_core::WorkspaceActivity;
+        let h = harness().await;
+
+        // Archive first.
+        h.services
+            .archive_workspace(h.ws.clone())
+            .await
+            .expect("archive workspace");
+
+        // Start agent activity.
+        h.services.agent_activity_begin(&h.ws).await;
+
+        // Unarchive — must return activity=agent_running.
+        let unarchived = h
+            .services
+            .unarchive_workspace(h.ws.clone())
+            .await
+            .expect("unarchive workspace");
+        assert_eq!(
+            unarchived.activity,
+            WorkspaceActivity::AgentRunning,
+            "unarchive_workspace MUST derive activity=agent_running"
+        );
+
+        h.services.agent_activity_end(&h.ws).await;
+    }
+
+    /// Regression for STAB-N: `mark_seen` must derive activity.
+    #[tokio::test]
+    async fn mark_seen_derives_activity_from_live_agent_state() {
+        use intent_core::{WorkspaceActivity, WorkspaceAttention};
+        let h = harness().await;
+
+        // Set unread attention so there's something to mark seen.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise attention");
+
+        // Start agent activity.
+        h.services.agent_activity_begin(&h.ws).await;
+
+        // Mark seen — must return activity=agent_running.
+        let seen = h.services.mark_seen(h.ws.clone()).await.expect("mark seen");
+        assert_eq!(
+            seen.activity,
+            WorkspaceActivity::AgentRunning,
+            "mark_seen MUST derive activity=agent_running"
+        );
+
+        h.services.agent_activity_end(&h.ws).await;
+    }
+
     /// The BE raises `attention`, it persists across a store reload, the raise is
     /// idempotent (no duplicate event), and dismissal clears it + emits
     /// `attention-changed` and is itself idempotent (§9.9).
