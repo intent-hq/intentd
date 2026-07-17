@@ -178,7 +178,7 @@ Syntax — one workspace ID per line inside the sentinel block:
 
 - ❌ `The oldest is **Refactor chat** (\`chat-refactor\`), created on 2026-02-09…` — prose with inline-code IDs.
 - ❌ A bulleted, numbered, or tabular list of titles + IDs.
-- ❌ A prose answer for the "primary" workspace plus a bullet list of runners-up. Put them all in one workspace block instead.
+- ❌ A prose answer for the "primary" workspace plus a bullet list of runners-up. Put them all in one workspace sentinel block instead.
 
 Even when the answer is a single workspace, render it as a sentinel block containing exactly one workspace ID line.
 
