@@ -984,20 +984,38 @@ impl Services {
         let handle = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
 
-            // Emit the idle event.
-            publish_event(
-                &this.event_bus,
-                activity_changed_event(&ws_id, WorkspaceActivity::Idle),
-            )
-            .await;
+            // Guard emission: verify debouncer still current AND count still zero.
+            let should_emit = {
+                let gen_valid = if let Ok(map) = debouncers.lock() {
+                    map.get(&ws_id)
+                        .map(|(current_gen, _)| *current_gen == gen)
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                let count_zero = if let Ok(activity) = this.agent_activity.lock() {
+                    activity.get(&ws_id).copied().unwrap_or(0) == 0
+                } else {
+                    false
+                };
+                gen_valid && count_zero
+            };
 
-            // Remove the debouncer entry if it still matches our generation.
-            if let Ok(mut map) = debouncers.lock() {
-                if let Some((current_gen, _)) = map.get(&ws_id) {
-                    if *current_gen == gen {
-                        map.remove(&ws_id);
+            if should_emit {
+                // Remove debouncer entry before emitting so reads stop reporting grace.
+                if let Ok(mut map) = debouncers.lock() {
+                    if let Some((current_gen, _)) = map.get(&ws_id) {
+                        if *current_gen == gen {
+                            map.remove(&ws_id);
+                        }
                     }
                 }
+
+                publish_event(
+                    &this.event_bus,
+                    activity_changed_event(&ws_id, WorkspaceActivity::Idle),
+                )
+                .await;
             }
         });
 

@@ -3280,6 +3280,45 @@ mod change_event_parity {
         );
     }
 
+    /// Regression: idle debounce must guard emission against races where
+    /// `agent_activity_begin` happens after the sleep but before emission.
+    /// The generation counter + count check at fire time prevents spurious idle
+    /// events when agents come back in-flight during the grace window.
+    #[tokio::test]
+    async fn idle_debounce_guards_emission_against_race() {
+        use intent_core::{WorkspaceActivity, WorkspaceApi};
+        let h = harness().await;
+        let _guard = DebounceEnvGuard::new("50");
+        let mut sub = subscribe(&h);
+
+        // Begin activity, then end it to schedule a debounce.
+        h.services.agent_activity_begin(&h.ws).await;
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["data"]["activity"], "agent_running");
+
+        h.services.agent_activity_end(&h.ws).await;
+
+        // Quickly re-begin activity within the debounce window (race scenario).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        h.services.agent_activity_begin(&h.ws).await;
+
+        // Wait past the debounce window.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Should receive agent_running event from re-begin, NOT an idle event.
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"]["activity"], "agent_running",
+            "race guard prevents spurious idle emission when count is non-zero"
+        );
+
+        // Workspace should still be agent_running.
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning
+        );
+    }
+
     /// Regression for STAB-N: workspace mutation paths must derive `activity`
     /// from live agent state before returning the `Workspace` on the wire (§9.9).
     /// When a workspace has agents in-flight, mutations that return a `Workspace`
