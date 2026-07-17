@@ -39,3 +39,9 @@ portable-pty = "0.8"
 grep = "0.3"
 ignore = "0.4"
 globset = "0.4"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
