@@ -60,6 +60,10 @@ enum Command {
         /// enforcement on the TCP path. Also enabled by `INTENTD_INSECURE=1`.
         #[arg(long)]
         insecure: bool,
+        /// Headless deployment: automatically resume all interrupted agents at
+        /// startup instead of waiting for `agent.resolveInterrupted` RPC.
+        #[arg(long)]
+        resume_all: bool,
     },
     /// One-shot JSON-RPC call to a running daemon; prints the JSON result.
     Call {
@@ -141,7 +145,8 @@ async fn main() -> ExitCode {
             listen,
             mode,
             insecure,
-        } => to_exit(cmd_serve(&listen, mode.as_deref(), insecure).await),
+            resume_all,
+        } => to_exit(cmd_serve(&listen, mode.as_deref(), insecure, resume_all).await),
         Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
         Command::Status => cmd_status().await,
         Command::Stop => cmd_stop().await,
@@ -359,7 +364,12 @@ fn resolve_config() -> anyhow::Result<Config> {
     Config::resolve().map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
-async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::Result<()> {
+async fn cmd_serve(
+    listen: &str,
+    mode: Option<&str>,
+    insecure: bool,
+    resume_all: bool,
+) -> anyhow::Result<()> {
     let (serve_uds_enabled, serve_tcp_enabled) = match listen {
         "uds" => (true, false),
         "tcp" => (false, true),
@@ -686,6 +696,60 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             }
         }
     };
+
+    // Auto-resume interrupted agents when --resume-all is set (headless deployment).
+    // Spawn in the background so it doesn't block startup; log failures per-agent.
+    if resume_all {
+        let services_clone = services.clone();
+        tokio::spawn(async move {
+            tracing::info!("--resume-all: enumerating interrupted agents");
+            // List all pending interrupted agents
+            let rows = match services_clone.store().list_interrupted_agents().await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(error = %e, "--resume-all: failed to list interrupted agents");
+                    return;
+                }
+            };
+            if rows.is_empty() {
+                tracing::info!("--resume-all: no interrupted agents to resume");
+                return;
+            }
+            tracing::info!(
+                count = rows.len(),
+                "--resume-all: resuming interrupted agents"
+            );
+            let mut resumed = Vec::new();
+            let mut failed = Vec::new();
+            // Resume each agent using the same service operation as agent.resolveInterrupted
+            for interrupted in rows {
+                let agent_id = interrupted.agent_id.clone();
+                match services_clone.resume_interrupted_agent(&agent_id).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            agent_id = %agent_id,
+                            workspace = %interrupted.workspace_id,
+                            "--resume-all: resumed agent"
+                        );
+                        resumed.push(agent_id.0);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            error = %e,
+                            "--resume-all: failed to resume agent"
+                        );
+                        failed.push((agent_id.0, e.to_string()));
+                    }
+                }
+            }
+            tracing::info!(
+                resumed = resumed.len(),
+                failed = failed.len(),
+                "--resume-all: auto-resume sweep complete"
+            );
+        });
+    }
 
     if serve_uds_enabled {
         tracing::info!(socket = %config.socket_path.display(), "starting intentd");

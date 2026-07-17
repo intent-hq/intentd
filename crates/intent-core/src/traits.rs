@@ -1649,6 +1649,38 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.listInterrupted`: list pending interrupted agents (INT-41,
+    /// agent-resumption phase 1). Returns joined data: agent ID, workspace info,
+    /// agent name, prev status, interrupted timestamp. Sessions deleted since
+    /// interruption are excluded. (PROTOCOL §5.5).
+    fn agent_list_interrupted(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_list_interrupted not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.resolveInterrupted`: resume or abandon interrupted agents (INT-41,
+    /// agent-resumption phase 2). Resume: mark row `resumed`, re-register parent
+    /// completion watch if delegated, deliver continuation message. Abandon: mark
+    /// row `abandoned`, append system interruption message. Returns
+    /// `{ resumed: string[], abandoned: string[], failed: [{ agentId, error }] }`.
+    /// Ids must be pending interrupted_agent rows; unknown/already-resolved ids
+    /// land in `failed`. An id in both lists is `-32602`. (PROTOCOL §5.5).
+    fn agent_resolve_interrupted(
+        &self,
+        resume: Option<Vec<String>>,
+        abandon: Option<Vec<String>>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            let _ = (resume, abandon);
+            Err(Error::Internal(
+                "WorkspaceApi::agent_resolve_interrupted not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.reportToParent`: child→parent report; `-32603` when the caller is
     /// not a delegated agent (PROTOCOL §5.5).
     ///

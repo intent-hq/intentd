@@ -22,6 +22,18 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     is_background, metadata, sandbox_id, sandbox_path, sandbox_branch";
 
+/// Interrupted agent record (INT-41). Returned by
+/// [`Store::list_interrupted_agents`], joined with agent_session and workspace.
+#[derive(Debug, Clone)]
+pub struct InterruptedAgent {
+    pub agent_id: AgentId,
+    pub workspace_id: WorkspaceId,
+    pub prev_status: String,
+    pub interrupted_at: String,
+    pub agent_name: Option<String>,
+    pub workspace_name: Option<String>,
+}
+
 /// Encode an optional JSON payload column (`context_references` /
 /// `image_blocks`) as its TEXT form, `None` staying NULL.
 fn json_col_to_db(v: &Option<serde_json::Value>) -> Result<Option<String>> {
@@ -717,6 +729,75 @@ impl Store {
             Ok(inserted)
         })
         .await
+    }
+
+    /// Insert an interrupted agent row (idempotent). If the agent already has a
+    /// pending row, this is a no-op (second restart). Returns `true` if inserted.
+    pub async fn insert_interrupted_agent(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        prev_status: &str,
+        interrupted_at: &str,
+    ) -> Result<bool> {
+        let sql =
+            "INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at) \
+                   VALUES (?, ?, ?, ?) \
+                   ON CONFLICT(agent_id) DO NOTHING";
+        let res = sqlx::query(sql)
+            .bind(&agent_id.0)
+            .bind(&workspace_id.0)
+            .bind(prev_status)
+            .bind(interrupted_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("insert interrupted_agent failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// List pending interrupted agents, joined with agent_session (name) and
+    /// workspace (title). Sessions deleted since interruption are excluded.
+    pub async fn list_interrupted_agents(&self) -> Result<Vec<InterruptedAgent>> {
+        let sql = "SELECT ia.agent_id, ia.workspace_id, ia.prev_status, ia.interrupted_at, \
+                          ag.name AS agent_name, w.title AS workspace_name \
+                   FROM interrupted_agent ia \
+                   LEFT JOIN agent_session ag ON ia.agent_id = ag.id \
+                   LEFT JOIN workspace w ON ia.workspace_id = w.id \
+                   WHERE ia.resolution = 'pending'";
+        sqlx::query(sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("list interrupted_agent failed: {e}")))?
+            .iter()
+            .map(|row| {
+                Ok(InterruptedAgent {
+                    agent_id: AgentId(col(row, "agent_id")?),
+                    workspace_id: WorkspaceId(col(row, "workspace_id")?),
+                    prev_status: col(row, "prev_status")?,
+                    interrupted_at: col(row, "interrupted_at")?,
+                    agent_name: col(row, "agent_name")?,
+                    workspace_name: col(row, "workspace_name")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Set the resolution (resumed|abandoned) for an interrupted agent.
+    pub async fn set_interrupted_resolution(
+        &self,
+        agent_id: &AgentId,
+        resolution: &str,
+        resolved_at: &str,
+    ) -> Result<()> {
+        let sql = "UPDATE interrupted_agent SET resolution = ?, resolved_at = ? WHERE agent_id = ?";
+        sqlx::query(sql)
+            .bind(resolution)
+            .bind(resolved_at)
+            .bind(&agent_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("set interrupted resolution failed: {e}")))?;
+        Ok(())
     }
 }
 

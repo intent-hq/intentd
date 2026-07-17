@@ -1343,6 +1343,31 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.listInterrupted" => {
+            // No required params; returns pending interrupted agents across all workspaces.
+            let result = api.agent_list_interrupted().await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.resolveInterrupted" => {
+            // Optional resume/abandon arrays; ids must be pending interrupted_agent rows.
+            let resume = params.get("resume").and_then(Value::as_array).map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            });
+            let abandon = params.get("abandon").and_then(Value::as_array).map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            });
+            let result = api
+                .agent_resolve_interrupted(resume, abandon)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.subscribe" => {
             let ws = require_ws_note(params)?;
             require_present(params, "eventTypes")?;

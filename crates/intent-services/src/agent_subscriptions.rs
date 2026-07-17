@@ -13,13 +13,15 @@
 
 use std::sync::Arc;
 
+use intent_store::PersistedDelegationGroup;
+
 // Use `tokio::time::Instant` (not `std::time::Instant`) for the cleanup
 // deadline: Tokio timers/instants follow Tokio's time source while
 // `std::time::Instant` always reads real time; mixing them makes deadline
 // checks incorrect in paused-time tests (see `tokio::time::pause`).
 use tokio::time::Instant;
 
-use intent_core::{now_iso, AgentId, Event, WorkspaceId};
+use intent_core::{now_iso, AgentId, Error, Event, Result, WorkspaceId};
 use uuid::Uuid;
 
 use crate::Services;
@@ -331,7 +333,7 @@ impl Services {
             return g.group_id.clone();
         }
         let group_id = Uuid::new_v4().to_string();
-        entry.delegation_groups.push(DelegationGroup {
+        let group = DelegationGroup {
             group_id: group_id.clone(),
             parent_agent_id: parent_id.clone(),
             await_mode: "after_all".to_string(),
@@ -343,7 +345,11 @@ impl Services {
             delivered: false,
             event_summaries: Vec::new(),
             raw_events: Vec::new(),
-        });
+        };
+        entry.delegation_groups.push(group.clone());
+        drop(guard);
+        // Write-through persist (best-effort).
+        self.persist_delegation_group(workspace_id, &group);
         group_id
     }
 
@@ -361,7 +367,7 @@ impl Services {
         let Some(w) = guard.get_mut(workspace_id) else {
             return;
         };
-        if let Some(g) = w
+        let group_clone = if let Some(g) = w
             .delegation_groups
             .iter_mut()
             .find(|g| g.group_id == group_id)
@@ -369,27 +375,56 @@ impl Services {
             if !g.expected_agent_ids.contains(child_id) {
                 g.expected_agent_ids.push(child_id.clone());
             }
+            Some(g.clone())
+        } else {
+            None
+        };
+        drop(guard);
+        // Write-through persist (best-effort).
+        if let Some(g) = group_clone {
+            self.persist_delegation_group(workspace_id, &g);
         }
     }
 
     /// Seal the parent's open group (its delegating turn ended, so the expected
     /// set is final); returns the sealed group id, or `None` if none was open.
-    pub(crate) fn seal_group_for_parent(
+    ///
+    /// DURABILITY: Awaits the persist before returning so the sealed flag is durable
+    /// before the caller proceeds (fixes race where daemon kill between seal and
+    /// spawned persist loses the sealed state across restart).
+    pub(crate) async fn seal_group_for_parent(
         &self,
         workspace_id: &WorkspaceId,
         parent_id: &AgentId,
     ) -> Option<String> {
-        let mut guard = self
-            .agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned");
-        let w = guard.get_mut(workspace_id)?;
-        let g = w
-            .delegation_groups
-            .iter_mut()
-            .find(|g| &g.parent_agent_id == parent_id && !g.sealed && !g.delivered)?;
-        g.sealed = true;
-        Some(g.group_id.clone())
+        let (group_id, group_clone) = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let w = guard.get_mut(workspace_id)?;
+            let g = w
+                .delegation_groups
+                .iter_mut()
+                .find(|g| &g.parent_agent_id == parent_id && !g.sealed && !g.delivered)?;
+            g.sealed = true;
+            let group_id = g.group_id.clone();
+            let group_clone = g.clone();
+            (group_id, group_clone)
+        }; // guard is dropped here automatically
+           // Durable write-through persist: await the write so the sealed flag is
+           // persisted before the caller continues.
+        let persisted = match delegation_group_to_persisted(workspace_id, &group_clone) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("skip delegation_group persist {}: {e}", group_id);
+                return Some(group_id);
+            }
+        };
+        if let Err(e) = self.store.upsert_delegation_group(&persisted).await {
+            tracing::warn!("delegation_group upsert failed {}: {e}", group_id);
+        }
+        Some(group_id)
     }
 
     /// Whether `child_id` is enrolled in an undelivered `after_all` delegation
@@ -423,7 +458,11 @@ impl Services {
     /// event for the aggregated wake's `event_notification` metadata. No-ops if
     /// the child is not expected or already recorded, or if the group no longer
     /// exists.
-    pub(crate) fn record_group_child_completion(
+    ///
+    /// DURABILITY: Awaits the persist before returning so the completion is durable
+    /// before the event is observable (fixes race where daemon kill between event
+    /// publish and spawned persist loses the completion across restart).
+    pub(crate) async fn record_group_child_completion(
         &self,
         workspace_id: &WorkspaceId,
         group_id: &str,
@@ -432,33 +471,53 @@ impl Services {
         summary: String,
         event: Event,
     ) {
-        let mut guard = self
-            .agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned");
-        let Some(w) = guard.get_mut(workspace_id) else {
-            return;
-        };
-        let Some(g) = w
-            .delegation_groups
-            .iter_mut()
-            .find(|g| g.group_id == group_id)
-        else {
-            return;
-        };
-        if !g.expected_agent_ids.contains(child_id) {
-            return;
+        let group_clone = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let Some(w) = guard.get_mut(workspace_id) else {
+                return;
+            };
+            if let Some(g) = w
+                .delegation_groups
+                .iter_mut()
+                .find(|g| g.group_id == group_id)
+            {
+                if !g.expected_agent_ids.contains(child_id) {
+                    return;
+                }
+                if g.completed_agent_ids.contains(child_id)
+                    || g.deleted_agent_ids.contains(child_id)
+                {
+                    return;
+                }
+                if deleted {
+                    g.deleted_agent_ids.push(child_id.clone());
+                } else {
+                    g.completed_agent_ids.push(child_id.clone());
+                }
+                g.event_summaries.push(summary);
+                g.raw_events.push(Arc::new(event));
+                Some(g.clone())
+            } else {
+                None
+            }
+        }; // guard is dropped here automatically
+           // Durable write-through persist: await the write so the completion is
+           // persisted before the caller continues / before the event is observable.
+        if let Some(g) = group_clone {
+            let persisted = match delegation_group_to_persisted(workspace_id, &g) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("skip delegation_group persist {group_id}: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = self.store.upsert_delegation_group(&persisted).await {
+                tracing::warn!("delegation_group upsert failed {group_id}: {e}");
+            }
         }
-        if g.completed_agent_ids.contains(child_id) || g.deleted_agent_ids.contains(child_id) {
-            return;
-        }
-        if deleted {
-            g.deleted_agent_ids.push(child_id.clone());
-        } else {
-            g.completed_agent_ids.push(child_id.clone());
-        }
-        g.event_summaries.push(summary);
-        g.raw_events.push(Arc::new(event));
     }
 
     /// Atomically claim a group for delivery if it is sealed, complete, and not
@@ -486,6 +545,9 @@ impl Services {
         }
         let mut group = w.delegation_groups.remove(idx);
         group.delivered = true;
+        drop(guard);
+        // Delete from store (best-effort).
+        self.delete_delegation_group(group_id);
         Some(group)
     }
 
@@ -586,6 +648,132 @@ impl Services {
                     .cloned()
             })
     }
+
+    /// Best-effort write-through persist of a delegation group (AS-2 persistence).
+    fn persist_delegation_group(&self, workspace_id: &WorkspaceId, group: &DelegationGroup) {
+        let store = self.store.clone();
+        let workspace_id = workspace_id.clone();
+        let group_id = group.group_id.clone();
+        let persisted = match delegation_group_to_persisted(&workspace_id, group) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("skip delegation_group persist {group_id}: {e}");
+                return;
+            }
+        };
+        tokio::spawn(async move {
+            if let Err(e) = store.upsert_delegation_group(&persisted).await {
+                tracing::warn!("delegation_group upsert failed {group_id}: {e}");
+            }
+        });
+    }
+
+    /// Best-effort delete of a persisted delegation group (AS-2 cleanup).
+    fn delete_delegation_group(&self, group_id: &str) {
+        let store = self.store.clone();
+        let group_id = group_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = store.delete_delegation_group(&group_id).await {
+                tracing::warn!("delegation_group delete failed {group_id}: {e}");
+            }
+        });
+    }
+
+    /// Rehydrate undelivered delegation groups on resume (AS-2 rehydration).
+    /// Idempotent: skips groups already present in memory (by group_id).
+    pub(crate) async fn rehydrate_delegation_groups(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<usize> {
+        let persisted = self.store.list_undelivered_groups(workspace_id).await?;
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let entry = guard.entry(workspace_id.clone()).or_default();
+        let mut loaded = 0;
+        for p in persisted {
+            // Skip if this group is already in memory (idempotent rehydration).
+            if entry
+                .delegation_groups
+                .iter()
+                .any(|g| g.group_id == p.group_id)
+            {
+                continue;
+            }
+            // Groups are sealed on rehydration (original parent turn is gone).
+            let mut group = persisted_to_delegation_group(&p)?;
+            group.sealed = true;
+            entry.delegation_groups.push(group);
+            loaded += 1;
+        }
+        Ok(loaded)
+    }
+
+    /// DURABLE-BEFORE-OBSERVABLE helper: if `agent_id` is in a delegation group,
+    /// record its completion BEFORE the idle event is published. This ensures the
+    /// persisted state is correct if the daemon is killed immediately after the
+    /// event becomes observable. Called from the agent_session worker loop right
+    /// before publishing `agent:idle`.
+    pub(crate) async fn record_group_completion_pre_publish(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        event_data: &serde_json::Value,
+    ) {
+        // Find which group (if any) this agent belongs to
+        let group_id = {
+            let guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            guard.get(workspace_id).and_then(|w| {
+                w.delegation_groups
+                    .iter()
+                    .find(|g| g.expected_agent_ids.contains(agent_id))
+                    .map(|g| g.group_id.clone())
+            })
+        };
+
+        if let Some(group_id) = group_id {
+            // Build event for group recording. Prefer the child's persisted
+            // completion_report (set by agent.reportToParent) over the generic
+            // summary, mirroring deliver_completion_to_watches logic.
+            let report = self
+                .store
+                .get_agent_session(agent_id)
+                .await
+                .ok()
+                .and_then(|s| s.completion_report);
+            let event = Event {
+                id: String::new(),
+                workspace_id: workspace_id.clone(),
+                timestamp: now_iso(),
+                event_type: intent_core::events::AGENT_IDLE.to_string(),
+                actor: intent_core::EventActor {
+                    actor_type: intent_core::ActorType::Agent,
+                    id: Some(agent_id.0.clone()),
+                    ..Default::default()
+                },
+                session_id: Some(agent_id.0.clone()),
+                correlation_id: None,
+                parent_event_id: None,
+                metadata: None,
+                data: event_data.clone(),
+            };
+            let summary = crate::format_group_child_line(agent_id, &event, report.as_deref());
+
+            self.record_group_child_completion(
+                workspace_id,
+                &group_id,
+                agent_id,
+                false, // not deleted
+                summary,
+                event,
+            )
+            .await;
+        }
+    }
 }
 
 /// A group is complete when it has at least one expected child and every
@@ -595,4 +783,62 @@ fn is_group_complete(group: &DelegationGroup) -> bool {
         && group.expected_agent_ids.iter().all(|id| {
             group.completed_agent_ids.contains(id) || group.deleted_agent_ids.contains(id)
         })
+}
+
+/// Convert in-memory `DelegationGroup` to persisted form.
+fn delegation_group_to_persisted(
+    workspace_id: &WorkspaceId,
+    group: &DelegationGroup,
+) -> Result<PersistedDelegationGroup> {
+    let raw_events_json: Vec<String> = group
+        .raw_events
+        .iter()
+        .map(|e| {
+            serde_json::to_string(e.as_ref())
+                .map_err(|err| Error::Internal(format!("serialize raw_event: {err}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(PersistedDelegationGroup {
+        group_id: group.group_id.clone(),
+        workspace_id: workspace_id.clone(),
+        parent_agent_id: group.parent_agent_id.clone(),
+        await_mode: group.await_mode.clone(),
+        expected_agent_ids: group.expected_agent_ids.clone(),
+        completed_agent_ids: group.completed_agent_ids.clone(),
+        deleted_agent_ids: group.deleted_agent_ids.clone(),
+        sealed: group.sealed,
+        delivered: group.delivered,
+        event_summaries: group.event_summaries.clone(),
+        raw_events_json,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    })
+}
+
+/// Convert persisted `PersistedDelegationGroup` back to in-memory form.
+fn persisted_to_delegation_group(p: &PersistedDelegationGroup) -> Result<DelegationGroup> {
+    let raw_events: Vec<Arc<Event>> = p
+        .raw_events_json
+        .iter()
+        .map(|s| {
+            serde_json::from_str::<Event>(s)
+                .map(Arc::new)
+                .map_err(|err| Error::Internal(format!("deserialize raw_event: {err}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(DelegationGroup {
+        group_id: p.group_id.clone(),
+        parent_agent_id: p.parent_agent_id.clone(),
+        await_mode: p.await_mode.clone(),
+        expected_agent_ids: p.expected_agent_ids.clone(),
+        completed_agent_ids: p.completed_agent_ids.clone(),
+        deleted_agent_ids: p.deleted_agent_ids.clone(),
+        subscription_id: None,
+        sealed: p.sealed,
+        delivered: p.delivered,
+        event_summaries: p.event_summaries.clone(),
+        raw_events,
+    })
 }
