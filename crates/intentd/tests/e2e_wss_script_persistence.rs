@@ -317,5 +317,3 @@ async fn scripts_survive_daemon_restart_over_wss() {
     stop(child);
     let _ = std::fs::remove_dir_all(&data_dir);
 }
-
-

@@ -323,5 +323,3 @@ async fn server_rotate_token_over_wss_rejects() {
 
     daemon.child.kill().ok();
 }
-
-

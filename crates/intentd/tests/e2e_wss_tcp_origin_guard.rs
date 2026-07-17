@@ -424,5 +424,3 @@ async fn tcp_client_refused_settings_disable_wss_when_mode_local() {
 
     daemon.child.kill().ok();
 }
-
-
