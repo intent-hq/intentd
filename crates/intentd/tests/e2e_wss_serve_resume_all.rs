@@ -14,6 +14,7 @@
 #![cfg(unix)]
 
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -163,18 +164,31 @@ async fn connect_ws(
     port: u16,
     cfg: ClientConfig,
 ) -> WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>> {
-    let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-        .await
-        .expect("tcp connect");
+    // Bound all network handshakes (TCP, TLS, WS) with 5s timeouts to prevent
+    // indefinite hangs on retry if TRY 1 left stale sockets/state.
+    let tcp = timeout(
+        Duration::from_secs(5),
+        TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+    )
+    .await
+    .expect("tcp connect timed out")
+    .expect("tcp connect");
     let name = ServerName::try_from("localhost").unwrap();
-    let tls = TlsConnector::from(Arc::new(cfg))
-        .connect(name, tcp)
-        .await
-        .expect("tls connect");
+    let tls = timeout(
+        Duration::from_secs(5),
+        TlsConnector::from(Arc::new(cfg)).connect(name, tcp),
+    )
+    .await
+    .expect("tls handshake timed out")
+    .expect("tls connect");
     let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
-    let (ws, _resp) = tokio_tungstenite::client_async(url, tls)
-        .await
-        .expect("ws handshake");
+    let (ws, _resp) = timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::client_async(url, tls),
+    )
+    .await
+    .expect("ws handshake timed out")
+    .expect("ws handshake");
     ws
 }
 
@@ -229,6 +243,10 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: 
     for (k, v) in env {
         cmd.env(k, v);
     }
+    // Spawn in its own process group (pgid == child pid) so killing the daemon on
+    // test panic/failure also kills spawned Node.js ACP mock providers via killpg.
+    #[cfg(unix)]
+    cmd.process_group(0);
     cmd.spawn().expect("spawn intentd serve")
 }
 
@@ -281,15 +299,34 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        // Kill the whole process group FIRST (daemon + any Node.js ACP provider
+        // children) BEFORE wait(), so children are reaped before they get reparented.
+        // The daemon was spawned with process_group(0), making it the group leader.
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{self, Signal};
+            use nix::unistd::Pid;
+            let pid = Pid::from_raw(self.child.id() as i32);
+            let _ = signal::killpg(pid, Signal::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
-        // Clean up stale processes
-        let _ = Command::new("pkill")
-            .args(["-f", "mock-acp-agent"])
-            .output();
-        let _ = Command::new("pkill")
-            .args(["-f", &format!("intentd.*{}", self.data_dir.display())])
-            .output();
+        // On test panic, print data-dir path + daemon log tail for diagnosability
+        if std::thread::panicking() {
+            eprintln!("\n=== DAEMON CLEANUP (test panicked) ===");
+            eprintln!("Data dir: {}", self.data_dir.display());
+            let log_path = self.data_dir.join("daemon.log");
+            if let Ok(log) = std::fs::read_to_string(&log_path) {
+                let lines: Vec<_> = log.lines().rev().take(30).collect();
+                eprintln!("Last 30 lines of daemon.log:");
+                for line in lines.iter().rev() {
+                    eprintln!("  {line}");
+                }
+            }
+        }
     }
 }
 

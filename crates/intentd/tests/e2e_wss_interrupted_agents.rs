@@ -13,6 +13,7 @@
 #![cfg(unix)]
 
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -163,18 +164,30 @@ async fn connect_ws(
     port: u16,
     cfg: Arc<ClientConfig>,
 ) -> WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>> {
-    let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-        .await
-        .expect("tcp connect");
+    // Bound all network handshakes with 5s timeouts to prevent indefinite hangs on retry
+    let tcp = timeout(
+        Duration::from_secs(5),
+        TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+    )
+    .await
+    .expect("tcp connect timed out")
+    .expect("tcp connect");
     let name = ServerName::try_from("localhost").unwrap();
-    let tls = TlsConnector::from(cfg)
-        .connect(name, tcp)
-        .await
-        .expect("tls connect");
+    let tls = timeout(
+        Duration::from_secs(5),
+        TlsConnector::from(cfg).connect(name, tcp),
+    )
+    .await
+    .expect("tls handshake timed out")
+    .expect("tls connect");
     let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
-    let (ws, _resp) = tokio_tungstenite::client_async(url, tls)
-        .await
-        .expect("ws handshake");
+    let (ws, _resp) = timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::client_async(url, tls),
+    )
+    .await
+    .expect("ws handshake timed out")
+    .expect("ws handshake");
     ws
 }
 
@@ -217,8 +230,8 @@ async fn interrupted_agents_persisted_across_restart() {
     let socket = data_dir.join("intentd.sock");
 
     // Phase 1: Boot daemon, create a workspace, create an agent session with Active status.
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd1.arg("serve")
         .arg("--listen")
         .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
@@ -227,9 +240,11 @@ async fn interrupted_agents_persisted_across_restart() {
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
-        ))
-        .spawn()
-        .expect("spawn intentd serve");
+        ));
+    // Spawn in its own process group to prevent ACP mock process leaks
+    #[cfg(unix)]
+    cmd1.process_group(0);
+    let mut daemon = cmd1.spawn().expect("spawn intentd serve");
     if !await_uds(&socket).await {
         let log_path = data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
@@ -297,8 +312,8 @@ async fn interrupted_agents_persisted_across_restart() {
     daemon.wait().expect("wait daemon");
 
     // Phase 2: Restart daemon — heal sweep should insert interrupted_agent row.
-    daemon = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    let mut cmd2 = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd2.arg("serve")
         .arg("--listen")
         .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
@@ -307,9 +322,10 @@ async fn interrupted_agents_persisted_across_restart() {
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
-        ))
-        .spawn()
-        .expect("spawn intentd serve 2");
+        ));
+    #[cfg(unix)]
+    cmd2.process_group(0);
+    daemon = cmd2.spawn().expect("spawn intentd serve 2");
     assert!(await_uds(&socket).await, "daemon did not restart");
 
     // Fetch fingerprint for TLS cert pinning.
@@ -343,8 +359,8 @@ async fn interrupted_agents_persisted_across_restart() {
     // Phase 4: Restart again — idempotent insert should not duplicate.
     daemon.kill().expect("kill daemon 2");
     daemon.wait().expect("wait daemon 2");
-    daemon = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    let mut cmd3 = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd3.arg("serve")
         .arg("--listen")
         .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
@@ -353,9 +369,13 @@ async fn interrupted_agents_persisted_across_restart() {
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
-        ))
-        .spawn()
-        .expect("spawn intentd serve 3");
+        ));
+    #[cfg(unix)]
+    cmd3.process_group(0);
+    #[allow(unused_assignments)]
+    {
+        daemon = cmd3.spawn().expect("spawn intentd serve 3");
+    }
     assert!(await_uds(&socket).await, "daemon did not restart 2");
 
     let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
