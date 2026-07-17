@@ -6580,6 +6580,31 @@ impl WorkspaceApi for Services {
                             // (mode 0600 on Unix, safe from other users, isolated from /tmp races).
                             let script_id = uuid::Uuid::new_v4();
                             let intent_dir = worktree_for_read.join(".intent");
+                            // Ensure .intent directory exists with restrictive permissions
+                            if let Err(e) = tokio::fs::create_dir_all(&intent_dir).await {
+                                tracing::warn!(
+                                    workspace = %workspace_id.as_str(),
+                                    error = %e,
+                                    "failed to create .intent directory for setup script"
+                                );
+                                return;
+                            }
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                if let Err(e) = tokio::fs::set_permissions(
+                                    &intent_dir,
+                                    std::fs::Permissions::from_mode(0o700),
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        workspace = %workspace_id.as_str(),
+                                        error = %e,
+                                        "failed to set .intent directory permissions"
+                                    );
+                                }
+                            }
                             let script_path =
                                 intent_dir.join(format!("setup-{}.sh", script_id.simple()));
                             if let Err(e) = write_private_script(&script_path, &script).await {

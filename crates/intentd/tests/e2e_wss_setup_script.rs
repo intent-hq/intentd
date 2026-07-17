@@ -547,7 +547,7 @@ touch "${{WORKTREE_PATH}}/.setup-ran-{}"
         "create should succeed even if script runs"
     );
 
-    let workspace_id = create_resp["result"]["workspace"]["id"]
+    let _workspace_id = create_resp["result"]["workspace"]["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -641,11 +641,16 @@ touch "${{WORKTREE_PATH}}/.should-not-run-{}"
         "skipWorktree create should succeed"
     );
 
+    let skip_workspace_id = create_resp3["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
     // Give it time to potentially run (it shouldn't)
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // The skip-worktree workspace shouldn't have a worktree path, but check workspace dir
-    let workspaces_dir = data_dir.join("workspaces").join(workspace_id);
+    let workspaces_dir = data_dir.join("workspaces").join(skip_workspace_id);
     let skip_marker_path = workspaces_dir.join(format!(".should-not-run-{}", skip_marker_id));
     assert!(
         !skip_marker_path.exists(),
