@@ -355,6 +355,10 @@ async fn runtime_ws_listener_toggle_over_wss() {
     let new_port = status["result"]["port"]
         .as_u64()
         .expect("port should be set after re-enable") as u16;
+    assert_eq!(
+        new_port, initial_port,
+        "re-enable should bind the same port (persisted in server.wsApi.port)"
+    );
 
     // Connect over WSS again and verify RPCs work
     let mut ws2 = connect_ws(new_port, cfg.clone()).await;

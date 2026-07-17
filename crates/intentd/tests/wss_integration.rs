@@ -2753,7 +2753,7 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
 
 /// Helper to obtain an ephemeral port by bind-then-release. Only used for tests
 /// that genuinely need a fixed port to exercise fixed-port semantics (e.g.
-/// bind_fails_fast_on_occupied_port). Prefer `base_port: 0` for normal tests.
+/// graceful_shutdown_allows_immediate_restart). Prefer `base_port: 0` for normal tests.
 fn free_port() -> u16 {
     use std::net::TcpListener;
     TcpListener::bind(("127.0.0.1", 0))
