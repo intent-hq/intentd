@@ -293,7 +293,13 @@ pub struct Services {
     /// event carrying the latest value. Shared across clones so all service
     /// handles observe the same pending timers. In-memory only (no persistence);
     /// pending timers are dropped on daemon shutdown without flushing.
-    last_activity_debouncers: Arc<Mutex<HashMap<WorkspaceId, tokio::task::AbortHandle>>>,
+    ///
+    /// To prevent race conditions where an old task removes a newer handle, each
+    /// entry stores a generation counter alongside the abort handle. Tasks only
+    /// remove their own entry if the generation still matches.
+    last_activity_debouncers: Arc<Mutex<HashMap<WorkspaceId, (u64, tokio::task::AbortHandle)>>>,
+    /// Generation counter for debounce tasks (incremented on each schedule).
+    last_activity_debounce_gen: Arc<Mutex<u64>>,
     /// REV-1 agent-initiated reverse-dispatch seam: when an agent calls
     /// `ws.browser.exec` via the MCP front door there is no ambient client
     /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
@@ -349,6 +355,7 @@ impl Services {
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
             last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
+            last_activity_debounce_gen: Arc::new(Mutex::new(0)),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
         }
@@ -559,9 +566,16 @@ impl Services {
     /// value. Cancels any pending timer for the workspace before scheduling a new one.
     /// Best-effort: store/emit failures are logged but do not surface to the caller.
     pub(crate) fn schedule_last_activity_event(&self, workspace_id: WorkspaceId) {
-        // Cancel any pending debounce timer for this workspace.
+        // Cancel any pending debounce timer for this workspace and increment generation.
+        let gen = if let Ok(mut gen_lock) = self.last_activity_debounce_gen.lock() {
+            *gen_lock = gen_lock.wrapping_add(1);
+            *gen_lock
+        } else {
+            0
+        };
+
         if let Ok(mut debouncers) = self.last_activity_debouncers.lock() {
-            if let Some(handle) = debouncers.remove(&workspace_id) {
+            if let Some((_, handle)) = debouncers.remove(&workspace_id) {
                 handle.abort();
             }
         }
@@ -609,15 +623,19 @@ impl Services {
                 }
             }
 
-            // Remove ourselves from the debouncers map (we've fired).
+            // Remove ourselves from the debouncers map only if we're still the current task.
             if let Ok(mut map) = debouncers.lock() {
-                map.remove(&ws_id);
+                if let Some((current_gen, _)) = map.get(&ws_id) {
+                    if *current_gen == gen {
+                        map.remove(&ws_id);
+                    }
+                }
             }
         });
 
-        // Store the abort handle so a fresh schedule can cancel this one.
+        // Store the abort handle with generation so a fresh schedule can cancel this one.
         if let Ok(mut map) = self.last_activity_debouncers.lock() {
-            map.insert(workspace_id, handle.abort_handle());
+            map.insert(workspace_id, (gen, handle.abort_handle()));
         }
     }
 

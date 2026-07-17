@@ -407,14 +407,14 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
     .await;
     assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
 
-    // Capture initial lastActivity from workspace.list
+    // Capture initial lastActivity from workspace.list (it's an RFC3339 string)
     let mut rpc = connect_ws(port, cfg.clone()).await;
     let list = wss_rpc(&mut rpc, 2, "workspace.list", json!({})).await;
     let initial_activity = list["workspaces"]
         .as_array()
         .and_then(|arr| arr.iter().find(|w| w["id"] == ws_id))
-        .and_then(|w| w["lastActivity"].as_object())
-        .cloned();
+        .and_then(|w| w["lastActivity"].as_str())
+        .map(|s| s.to_string());
 
     // Drive activity: create + run an agent
     let created = wss_rpc(
@@ -450,10 +450,11 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
         .as_str()
         .expect("lastActivity string");
     if let Some(init) = &initial_activity {
-        let init_ts = init.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
         assert!(
-            new_activity > init_ts,
-            "lastActivity did not advance: {init_ts} -> {new_activity}"
+            new_activity > init.as_str(),
+            "lastActivity did not advance: {} -> {}",
+            init,
+            new_activity
         );
     }
 

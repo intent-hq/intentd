@@ -3,6 +3,7 @@
 //! reduction guard, spec-title skip, workspace scoping, and error mapping.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use intent_core::{
     now_iso, ContentType, Error, Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput,
@@ -12,6 +13,10 @@ use intent_core::{
 use intent_store::Store;
 
 use crate::Services;
+
+/// Guard for tests that mutate the LAST_ACTIVITY_DEBOUNCE_TEST_MS env var
+/// to prevent parallel test races (env::set_var is process-global).
+static ENV_DEBOUNCE_LOCK: Mutex<()> = Mutex::new(());
 
 struct TempDb {
     path: PathBuf,
@@ -12693,6 +12698,7 @@ mod last_activity_events {
     /// `workspace:updated { lastActivity }` event is emitted (after debounce).
     #[tokio::test]
     async fn raise_attention_emits_last_activity() {
+        let _guard = ENV_DEBOUNCE_LOCK.lock().unwrap();
         std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "100");
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -12722,6 +12728,7 @@ mod last_activity_events {
     /// attention actually changed (idempotent no-op on already-clear).
     #[tokio::test]
     async fn dismiss_attention_idempotent() {
+        let _guard = ENV_DEBOUNCE_LOCK.lock().unwrap();
         std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "100");
         let h = harness().await;
 
@@ -12764,6 +12771,7 @@ mod last_activity_events {
     /// the latest derived value.
     #[tokio::test]
     async fn burst_coalescing() {
+        let _guard = ENV_DEBOUNCE_LOCK.lock().unwrap();
         std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "200");
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -12818,6 +12826,7 @@ mod last_activity_events {
     /// when the token tallies actually changed (idempotent re-scan is silent).
     #[tokio::test]
     async fn token_usage_scan_only_on_change() {
+        let _guard = ENV_DEBOUNCE_LOCK.lock().unwrap();
         std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "100");
         let h = harness().await;
 
