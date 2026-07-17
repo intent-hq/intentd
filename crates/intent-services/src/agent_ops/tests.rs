@@ -2640,14 +2640,18 @@ async fn report_to_parent_delivers_for_delegated_caller() {
     assert_eq!(result["reportLength"], json!(report.chars().count() as i64));
     assert!(result["savedAt"].is_string());
 
-    // SUB-2: no immediate wake to the parent — reportToParent is
-    // metadata-only. The report is persisted on the child session.
+    // Report-time wake: reportToParent now delivers an immediate wake to the parent.
     let parent_session = svc
         .store()
         .get_agent_session(&parent)
         .await
         .expect("parent session");
-    assert_eq!(parent_session.messages.len(), 0);
+    assert_eq!(parent_session.messages.len(), 1);
+    let wake_text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        wake_text.contains(&format!("Report: {report}")),
+        "wake must contain the report: {wake_text}"
+    );
     let child_session = svc
         .store()
         .get_agent_session(&child)
@@ -4598,9 +4602,10 @@ async fn report_to_parent_immediate_after_group_delivery() {
         .await
         .expect("late report");
     assert_eq!(r["ok"], json!(true));
-    // SUB-2: metadata-only — no additional immediate parent wake. The report
-    // is persisted on the child session and would ride the next agent:idle.
-    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    // Report-time wake: a late reportToParent (after group delivery) still delivers
+    // an immediate wake because the child is no longer in an undelivered group.
+    // The message count goes from 1 (group wake) to 2 (group wake + late report wake).
+    assert_eq!(parent_message_count(&svc, &parent).await, 2);
     let child_session = svc
         .store()
         .get_agent_session(&c1)
