@@ -315,6 +315,45 @@ impl Store {
         Ok(())
     }
 
+    /// Clear `completion_report` + `completion_report_timestamp` when a new turn
+    /// begins for a delegated agent that previously called `report_to_parent`.
+    /// Returns `true` if a report was present and cleared, `false` if no report
+    /// was set (the common case). Scoped to `workspace_id` (defense-in-depth).
+    /// `updated_at` is refreshed to the supplied timestamp. `NotFound` if the
+    /// session is absent or the workspace does not match.
+    pub async fn clear_completion_report(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        updated_at: &str,
+    ) -> Result<bool> {
+        // Check if there's a report to clear first (avoids a write when none is set).
+        let current = self.get_agent_session(id).await?;
+        if current.workspace_id != *workspace_id {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        if current.completion_report.is_none() {
+            return Ok(false);
+        }
+        // Report exists — clear it.
+        let rows = sqlx::query(
+            "UPDATE agent_session SET completion_report=NULL, \
+             completion_report_timestamp=NULL, updated_at=? \
+             WHERE id=? AND workspace_id=?",
+        )
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("clear completion report failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(true)
+    }
+
     /// Reset all `is_active=1` rows to `is_active=0` unconditionally (Wave B
     /// post-restart recovery). ACP sessions are process-local and cannot survive
     /// a daemon restart, so any `is_active=1` flag after boot is stale. Called
