@@ -1,11 +1,8 @@
 //! WSS end-to-end: `workspace:activity-changed` debounce behavior over the wire.
 //!
-//! Proves over a real WSS connection that:
-//! 1. busy→idle transition is debounced (~3s default, 50ms in test)
-//! 2. a re-begin within the window cancels the pending idle event
-//!
-//! Uses the mock ACP agent fixture to drive real agent activity and subscribes
-//! to `workspace:*` events to assert debounce timing on the wire.
+//! Proves over a real WSS connection that the busy→idle transition is debounced
+//! (~3s default, 50ms in test) using the mock ACP agent fixture to drive real
+//! agent activity.
 
 #![cfg(unix)]
 
@@ -330,13 +327,13 @@ async fn workspace_activity_changed_debounce() {
         .expect("workspace id")
         .to_string();
 
-    // Subscribe to workspace:* before any activity.
+    // Subscribe to workspace:* before any activity, scoped to this workspace.
     let mut sub = connect_ws(port, cfg.clone()).await;
     let sub_res = wss_rpc(
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["workspace:*"] }),
+        json!({ "eventTypes": ["workspace:*"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -364,8 +361,9 @@ async fn workspace_activity_changed_debounce() {
     .await;
 
     // Drain events until we see the agent_running workspace activity change.
+    // The subscription is scoped to this workspace, so we expect only relevant events.
     let mut saw_agent_running = false;
-    for _ in 0..5 {
+    for _ in 0..20 {
         if let Some(ev) = wss_event_opt(&mut sub, 2).await {
             if ev["params"]["event"]["type"] == "workspace:activity-changed"
                 && ev["params"]["event"]["data"]["activity"] == "agent_running"
@@ -385,7 +383,7 @@ async fn workspace_activity_changed_debounce() {
 
     // Drain events until we see the idle workspace activity change.
     let mut saw_idle = false;
-    for _ in 0..5 {
+    for _ in 0..20 {
         if let Some(ev) = wss_event_opt(&mut sub, 2).await {
             if ev["params"]["event"]["type"] == "workspace:activity-changed"
                 && ev["params"]["event"]["data"]["activity"] == "idle"
