@@ -729,6 +729,9 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10).mul_f64(multiplier);
 
         let grandchild: u32 = loop {
+            if Instant::now() >= deadline {
+                panic!("grandchild pid never printed within deadline");
+            }
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .expect("deadline not yet reached");
@@ -736,9 +739,6 @@ mod tests {
             let line = String::from_utf8_lossy(&out);
             if let Some(pid) = line.split_whitespace().find_map(|t| t.parse().ok()) {
                 break pid;
-            }
-            if Instant::now() >= deadline {
-                panic!("grandchild pid never printed within deadline");
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };

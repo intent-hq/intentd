@@ -26,7 +26,7 @@ echo "Running e2e tests with coverage instrumentation (nextest)..."
 # Run intentd's integration-test binaries (crates/intentd/tests/*)
 # under nextest so the test binaries execute in parallel instead of one at a time.
 # Skip auggie_context_e2e (needs real auggie binary)
-# STAB-40, STAB-42, STAB-44 fixed (file sync, multi-threaded runtime, timeout multiplier)
+# STAB-40, STAB-42, STAB-44 fixed (monitoring-only, multi-threaded runtime, timeout multiplier)
 # Note: capture_login_shell_path_with_fake_shell (STAB-43) is an intent-core unit test,
 # not an intentd integration test, so it runs in coverage-all.sh but not here
 INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest -p intentd \
