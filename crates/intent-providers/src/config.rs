@@ -79,6 +79,10 @@ pub struct ProviderConfig {
     pub auth_check_args: Option<&'static [&'static str]>,
     /// URL to login/auth docs for this provider.
     pub login_docs_url: Option<&'static str>,
+    /// When provider binary cannot be resolved, fall back to spawning this npm
+    /// package via `npx -y <package>`. Only set for providers shipped as npm
+    /// packages (e.g. claude-code's `@agentclientprotocol/claude-agent-acp`).
+    pub fallback_npx_package: Option<&'static str>,
 }
 
 impl ProviderConfig {
@@ -111,6 +115,7 @@ impl ProviderConfig {
             requires_feature_code: None,
             auth_check_args: None,
             login_docs_url: None,
+            fallback_npx_package: None,
         }
     }
 }
@@ -155,6 +160,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         login_docs_url: Some(
             "https://code.claude.com/docs/en/quickstart#step-2-log-in-to-your-account",
         ),
+        fallback_npx_package: Some("@agentclientprotocol/claude-agent-acp"),
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {

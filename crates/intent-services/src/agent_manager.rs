@@ -2304,6 +2304,8 @@ impl AgentManager {
         opts.cwd = Some(&resolved.cwd);
         opts.model = resolved.model.as_deref();
         opts.provider_binary = resolved.provider_binary.as_deref();
+        opts.npx_fallback_binary = resolved.npx_fallback_binary.as_deref();
+        opts.npx_fallback_package = resolved.npx_fallback_package;
         opts.extra_env = resolved.extra_env.clone();
         if !self.contains(agent_id) {
             // Derive the agent type from the session's specialist `agentType`
@@ -2576,6 +2578,11 @@ struct ResolvedSpawn {
     cwd: PathBuf,
     provider_binary: Option<PathBuf>,
     extra_env: BTreeMap<String, String>,
+    /// When provider_binary is None and the provider has a fallback_npx_package,
+    /// this is the resolved npx path. Otherwise None.
+    npx_fallback_binary: Option<PathBuf>,
+    /// The package name to pass to npx when npx_fallback_binary is set.
+    npx_fallback_package: Option<&'static str>,
 }
 
 /// Resolve the provider config, model, cwd, and extra env for spawning an
@@ -2691,6 +2698,8 @@ async fn resolve_spawn(
             cwd,
             provider_binary: None,
             extra_env,
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
         });
     }
 
@@ -2704,12 +2713,36 @@ async fn resolve_spawn(
         explicit_path.as_deref(),
     );
 
+    // When the provider binary is not found but the provider has a fallback npx
+    // package, resolve npx itself and record the fallback decision
+    let (npx_fallback_binary, npx_fallback_package) = if provider_binary.is_none() {
+        if let Some(pkg) = provider.fallback_npx_package {
+            if let Some(npx_path) = intent_providers::find_npx() {
+                tracing::info!(
+                    provider_id = provider_id,
+                    npx_path = ?npx_path,
+                    package = pkg,
+                    "provider binary not found; falling back to npx"
+                );
+                (Some(npx_path), Some(pkg))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
     Ok(ResolvedSpawn {
         provider,
         model,
         cwd,
         provider_binary,
         extra_env,
+        npx_fallback_binary,
+        npx_fallback_package,
     })
 }
 
