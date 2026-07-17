@@ -2371,11 +2371,12 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     })
     .to_string();
     let port_s = free_port().to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", &port_s),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("WORKSPACE_IDLE_DEBOUNCE_TEST_MS", "50"),
     ];
     let child_proc = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
