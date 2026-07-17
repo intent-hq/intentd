@@ -2750,15 +2750,16 @@ async fn resolve_spawn(
     workspace: Option<&intent_core::Workspace>,
     store: &intent_store::Store,
 ) -> Result<ResolvedSpawn> {
+    // Provider precedence: when the model carries an explicit `provider:` prefix
+    // (e.g., "opencode:kimi-k3"), that prefix wins over session.provider,
+    // because a cross-provider model switch should spawn the new provider's
+    // binary. Session.provider is only used as a fallback for bare model ids.
     let provider_id = session
-        .provider
-        .clone()
-        .or_else(|| {
-            session
-                .model
-                .as_ref()
-                .map(|m| intent_providers::parse_compound_model_id(m).0)
-        })
+        .model
+        .as_ref()
+        .filter(|m| m.contains(':'))
+        .map(|m| intent_providers::parse_compound_model_id(m).0)
+        .or_else(|| session.provider.clone())
         .unwrap_or_else(|| intent_providers::default_provider_id().to_string());
     let model = session
         .model

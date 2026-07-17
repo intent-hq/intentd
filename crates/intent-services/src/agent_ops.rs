@@ -982,6 +982,18 @@ impl Services {
         let is_background = is_background
             .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
             .unwrap_or(false);
+        // Initialize provider from the model's compound prefix if not explicitly
+        // set. This ensures sessions created with a compound model id like
+        // "opencode:kimi-k3" have the correct provider from the start.
+        let provider = provider.or_else(|| {
+            model.as_ref().and_then(|m| {
+                if m.contains(':') {
+                    Some(intent_providers::parse_compound_model_id(m).0)
+                } else {
+                    None
+                }
+            })
+        });
         let session = AgentSession {
             id,
             workspace_id,
@@ -1084,6 +1096,10 @@ impl Services {
     }
 
     /// `agent.setModel` (PROTOCOL §5.5). Emits `agent:updated`.
+    ///
+    /// When the new model is a compound id (`provider:model`) whose provider
+    /// differs from session.provider, this updates session.provider to match,
+    /// ensuring the next spawn uses the correct binary.
     pub(crate) async fn agent_set_model_op(
         &self,
         agent_id: AgentId,
@@ -1091,6 +1107,15 @@ impl Services {
     ) -> Result<Value> {
         let mut session = self.load_session_internal(&agent_id).await?;
         session.model = Some(model_id.clone());
+        // Reconcile session.provider when the model carries an explicit provider
+        // prefix that differs from the current session provider. This ensures
+        // cross-provider model switches spawn the new provider's binary.
+        if model_id.contains(':') {
+            let (model_provider, _) = intent_providers::parse_compound_model_id(&model_id);
+            if session.provider.as_ref() != Some(&model_provider) {
+                session.provider = Some(model_provider);
+            }
+        }
         session.updated_at = now_iso();
         let workspace_id = session.workspace_id.clone();
         self.store
