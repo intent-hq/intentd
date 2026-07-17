@@ -1,31 +1,348 @@
-//! `ws.app.agents.*` bindings (chief-gated, placeholder).
+//! `ws.app.agents.*` bindings (chief-gated).
 //!
-//! Placeholder module for future Wave 1 tasks. Returns a clear "not
-//! implemented yet" error for all methods until the sibling task fills it.
+//! Exposes cross-workspace agent audit methods (`list`, `readConversation`)
+//! exclusively to Chief-of-Staff workspace agents. Non-chief agents receive a
+//! clear gating error. Shape parity with the TS reference
+//! `packages/cloudlands-fe/src/features/mcp/main/mcp/ws-app-agents-api.ts`.
 
 use std::sync::Arc;
 
-use intent_core::{WorkspaceApi, WorkspaceId};
-use serde_json::Value;
+use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
+use serde_json::{json, Value};
+
+use crate::mcp_server::bindings::{map_err, opt_bool, opt_i64, opt_str};
 
 pub(crate) const PRELUDE: &str = r#"
     globalThis.ws = globalThis.ws || {};
     ws.app = ws.app || {};
-    ws.app.agents = {};
+    ws.app.agents = {
+        list: (options) => host({ method: 'app.agents.list', args: options || {} }),
+        readConversation: (workspaceId, agentId, opts) =>
+            host({ method: 'app.agents.readConversation', args: { workspaceId, agentId, ...(opts || {}) } }),
+    };
 "#;
 
+const DEFAULT_LIST_LIMIT: i64 = 50;
+const MAX_LIST_LIMIT: i64 = 200;
+const DEFAULT_READ_LIMIT: i64 = 20;
+const MAX_READ_LIMIT: i64 = 100;
+
 pub(crate) async fn dispatch(
-    _api: &Arc<dyn WorkspaceApi>,
+    api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
     method: &str,
-    _args: &Value,
+    args: &Value,
 ) -> Result<Value, String> {
-    // Chief-workspace gating
+    // Chief-workspace gating: all ws.app.* methods require the caller to be
+    // in the Chief workspace.
     if !workspace_id.is_chief() {
         return Err("ws.app.* is only available in the Chief of Staff workspace".to_string());
     }
 
-    Err(format!(
-        "ws.app.agents.{method} is not implemented yet — a sibling Wave 1 task owns this namespace"
-    ))
+    match method {
+        "list" => list(api, args).await,
+        "readConversation" => read_conversation(api, args).await,
+        other => Err(format!("host: unknown method `app.agents.{other}`")),
+    }
+}
+
+async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
+    // Extract optional filters
+    let filter_workspace_id = opt_str(args, "workspaceId").map(WorkspaceId::from);
+    let include_completed = opt_bool(args, "includeCompleted").unwrap_or(false);
+    let cursor = normalize_offset(opt_i64(args, "cursor"))?;
+    let limit = normalize_limit(opt_i64(args, "limit"), DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT)?;
+
+    // Fetch all workspaces (include archived to apply status filtering)
+    let workspaces = if let Some(ws_id) = filter_workspace_id {
+        // Single workspace request
+        if ws_id.is_chief() {
+            return Err("Chief workspace has no agent threads".to_string());
+        }
+        let ws = api.get_workspace(ws_id.clone()).await.map_err(map_err)?;
+        vec![ws]
+    } else {
+        // All non-chief workspaces
+        let all = api.list_workspaces(true).await.map_err(map_err)?;
+        all.into_iter()
+            .filter(|ws| {
+                !ws.id.is_chief() && format!("{:?}", ws.status).to_lowercase() != "deleted"
+            })
+            .collect()
+    };
+
+    // Collect agent threads from all target workspaces
+    let mut threads = Vec::new();
+    for ws in workspaces {
+        let agents = api.agent_list(ws.id.clone()).await.map_err(map_err)?;
+        for agent in agents {
+            // Filter by completion status if requested
+            let status_str = format!("{:?}", agent.status).to_lowercase();
+            let is_terminal = ["completed", "complete", "failed", "cancelled", "canceled"]
+                .contains(&status_str.as_str());
+            if !include_completed && is_terminal {
+                continue;
+            }
+
+            // Build thread info (metadata-only, no transcript)
+            let task_note_id = agent.metadata.task_note_id.as_ref().map(|id| id.0.clone());
+            threads.push(json!({
+                "workspaceId": ws.id.0,
+                "workspaceTitle": &ws.title,
+                "agentId": agent.id.0,
+                "agentName": agent.name,
+                "status": agent.status,
+                "sessionStatus": agent.status,
+                "messageCount": agent.message_count,
+                "taskNoteId": task_note_id,
+                "createdAt": agent.created_at,
+                "updatedAt": agent.updated_at,
+                "lastActivity": agent.last_activity,
+            }));
+        }
+    }
+
+    // Sort by last activity timestamp, newest first
+    threads.sort_by(|a, b| {
+        let ts_a = thread_timestamp(a);
+        let ts_b = thread_timestamp(b);
+        ts_b.cmp(&ts_a)
+    });
+
+    // Paginate
+    let total = threads.len();
+    let page: Vec<_> = threads
+        .into_iter()
+        .skip(cursor as usize)
+        .take(limit as usize)
+        .collect();
+    let returned = page.len();
+
+    let mut result = json!({
+        "threads": page,
+        "total": total,
+        "returned": returned,
+    });
+    if cursor + (returned as i64) < total as i64 {
+        result
+            .as_object_mut()
+            .unwrap()
+            .insert("nextCursor".to_string(), json!(cursor + returned as i64));
+    }
+    Ok(result)
+}
+
+async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
+    let workspace_id_str =
+        opt_str(args, "workspaceId").ok_or_else(|| "workspaceId is required".to_string())?;
+    let agent_id_str = opt_str(args, "agentId").ok_or_else(|| "agentId is required".to_string())?;
+    let workspace_id = WorkspaceId::from(workspace_id_str.as_str());
+    let agent_id = AgentId::from(agent_id_str.as_str());
+
+    // Gating: chief workspace itself has no agents
+    if workspace_id.is_chief() {
+        return Err(format!("Workspace not found: {workspace_id_str}"));
+    }
+
+    // Bounds handling options
+    let last_n = opt_i64(args, "lastN");
+    let start_turn = opt_i64(args, "startTurn");
+    let end_turn = opt_i64(args, "endTurn");
+    let include_tool_calls = opt_bool(args, "includeToolCalls").unwrap_or(false);
+
+    // Validate workspace exists
+    let workspace = api
+        .get_workspace(workspace_id.clone())
+        .await
+        .map_err(map_err)?;
+
+    // Fetch agent metadata
+    let agent = api
+        .agent_get(agent_id.clone(), Some(workspace_id.clone()))
+        .await
+        .map_err(map_err)?;
+
+    // Fetch full conversation (use agent.getConversation which returns { messages, ... })
+    let conversation_result = api
+        .agent_get_conversation(agent_id.clone(), None, Some(workspace_id.clone()), None)
+        .await
+        .map_err(map_err)?;
+    let all_messages = conversation_result
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let total_messages = all_messages.len();
+
+    // Apply bounds: either turn-range or lastN
+    let (selected_messages, selected_start_turn, selected_end_turn) =
+        if start_turn.is_some() || end_turn.is_some() {
+            // Turn-based slicing (1-based, inclusive)
+            let start = start_turn.unwrap_or(1).max(1) as usize - 1; // convert to 0-based
+            let end = end_turn
+                .map(|e| e as usize)
+                .unwrap_or(total_messages)
+                .min(start + MAX_READ_LIMIT as usize);
+            if end < start + 1 {
+                return Err("endTurn must be greater than or equal to startTurn".to_string());
+            }
+            let slice = all_messages[start..end].to_vec();
+            (slice, start + 1, end) // return 1-based
+        } else {
+            // lastN slicing (default 20, max 100)
+            let limit = normalize_limit(last_n, DEFAULT_READ_LIMIT, MAX_READ_LIMIT)? as usize;
+            let start = total_messages.saturating_sub(limit);
+            let slice = all_messages[start..].to_vec();
+            (slice, start + 1, total_messages)
+        };
+
+    // Filter tool-call blocks if requested
+    let filtered_messages: Vec<Value> = selected_messages
+        .into_iter()
+        .map(|msg| {
+            if include_tool_calls {
+                msg
+            } else {
+                filter_tool_calls(msg)
+            }
+        })
+        .filter(has_returned_content)
+        .collect();
+
+    // Extract task note ID from metadata
+    let task_note_id = agent.metadata.task_note_id.as_ref().map(|id| id.0.clone());
+
+    Ok(json!({
+        "workspaceId": workspace_id.0,
+        "workspaceTitle": &workspace.title,
+        "agentId": agent_id.0,
+        "agentName": agent.name,
+        "status": agent.status,
+        "sessionStatus": agent.status,
+        "totalMessages": total_messages,
+        "returnedMessages": filtered_messages.len(),
+        "startTurn": selected_start_turn,
+        "endTurn": selected_end_turn,
+        "includeToolCalls": include_tool_calls,
+        "taskNoteId": task_note_id,
+        "createdAt": agent.created_at,
+        "updatedAt": agent.updated_at,
+        "lastActivity": agent.last_activity,
+        "messages": filtered_messages,
+    }))
+}
+
+/// Normalize cursor offset: must be non-negative integer.
+fn normalize_offset(value: Option<i64>) -> Result<i64, String> {
+    match value {
+        None => Ok(0),
+        Some(v) if v >= 0 => Ok(v),
+        Some(_) => Err("cursor must be a non-negative integer offset".to_string()),
+    }
+}
+
+/// Normalize limit: must be positive integer, clamped to max.
+fn normalize_limit(value: Option<i64>, default: i64, max: i64) -> Result<i64, String> {
+    match value {
+        None => Ok(default),
+        Some(v) if v >= 1 => Ok(v.min(max)),
+        Some(_) => Err("limit must be a positive integer".to_string()),
+    }
+}
+
+/// Extract timestamp for sorting threads (newest first).
+/// Returns a simple lexicographic comparison key (ISO 8601 timestamps sort correctly as strings).
+fn thread_timestamp(thread: &Value) -> String {
+    thread
+        .get("lastActivity")
+        .or_else(|| thread.get("updatedAt"))
+        .or_else(|| thread.get("createdAt"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Filter out tool_use and tool_result blocks from a message if includeToolCalls=false.
+fn filter_tool_calls(mut message: Value) -> Value {
+    if let Some(blocks) = message
+        .get_mut("contentBlocks")
+        .and_then(Value::as_array_mut)
+    {
+        blocks.retain(|block| {
+            let type_str = block.get("type").and_then(Value::as_str);
+            type_str != Some("tool_use") && type_str != Some("tool_result")
+        });
+    }
+    message
+}
+
+/// Check if a message has any content after filtering tool calls.
+fn has_returned_content(message: &Value) -> bool {
+    message
+        .get("contentBlocks")
+        .and_then(Value::as_array)
+        .map(|blocks| !blocks.is_empty())
+        .unwrap_or(true) // If no contentBlocks field, assume it has content
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_offset() {
+        assert_eq!(normalize_offset(None).unwrap(), 0);
+        assert_eq!(normalize_offset(Some(0)).unwrap(), 0);
+        assert_eq!(normalize_offset(Some(10)).unwrap(), 10);
+        assert!(normalize_offset(Some(-1)).is_err());
+    }
+
+    #[test]
+    fn test_normalize_limit() {
+        assert_eq!(normalize_limit(None, 50, 200).unwrap(), 50);
+        assert_eq!(normalize_limit(Some(10), 50, 200).unwrap(), 10);
+        assert_eq!(normalize_limit(Some(250), 50, 200).unwrap(), 200);
+        assert!(normalize_limit(Some(0), 50, 200).is_err());
+        assert!(normalize_limit(Some(-1), 50, 200).is_err());
+    }
+
+    #[test]
+    fn test_filter_tool_calls() {
+        let message = json!({
+            "id": "msg-1",
+            "role": "assistant",
+            "contentBlocks": [
+                { "type": "text", "text": "Hello" },
+                { "type": "tool_use", "id": "call-1", "name": "fetch" },
+                { "type": "tool_result", "tool_use_id": "call-1", "content": "data" },
+                { "type": "text", "text": "World" }
+            ]
+        });
+
+        let filtered = filter_tool_calls(message);
+        let blocks = filtered.get("contentBlocks").unwrap().as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].get("text").unwrap(), "Hello");
+        assert_eq!(blocks[1].get("text").unwrap(), "World");
+    }
+
+    #[test]
+    fn test_has_returned_content() {
+        let with_content = json!({ "contentBlocks": [{ "type": "text", "text": "hi" }] });
+        let empty_blocks = json!({ "contentBlocks": [] });
+        let no_blocks = json!({ "role": "user" });
+
+        assert!(has_returned_content(&with_content));
+        assert!(!has_returned_content(&empty_blocks));
+        assert!(has_returned_content(&no_blocks)); // assumes content if field missing
+    }
+
+    #[test]
+    fn test_thread_timestamp() {
+        let thread = json!({ "lastActivity": "2026-01-15T12:00:00Z" });
+        assert_eq!(thread_timestamp(&thread), "2026-01-15T12:00:00Z");
+
+        let no_timestamp = json!({ "agentId": "agent-1" });
+        assert_eq!(thread_timestamp(&no_timestamp), "");
+    }
 }
