@@ -14,6 +14,7 @@ use intent_core::{WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
 pub(crate) mod agents;
+pub(crate) mod proposal;
 pub(crate) mod settings;
 pub(crate) mod specialists;
 pub(crate) mod workspaces;
@@ -24,9 +25,10 @@ pub(crate) mod workspaces;
 /// server-side in dispatch.
 pub(crate) fn prelude() -> String {
     format!(
-        "{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
         workspaces::PRELUDE,
         agents::PRELUDE,
+        proposal::PRELUDE,
         settings::PRELUDE,
         specialists::PRELUDE,
     )
@@ -49,6 +51,11 @@ pub(crate) async fn try_dispatch(
     }
     if let Some(rest) = method.strip_prefix("agents.") {
         return agents::dispatch(api, workspace_id, rest, args)
+            .await
+            .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("proposal.") {
+        return proposal::dispatch(api, workspace_id, rest, args)
             .await
             .map(Some);
     }

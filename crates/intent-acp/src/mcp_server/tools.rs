@@ -65,8 +65,8 @@ pub fn all_tools() -> &'static [ToolDef] {
 /// `workspace-js-api-tool.ts`, restricted to the surface actually bound in
 /// `super::bindings::*`. Exclusions vs the reference:
 ///
-/// * The entire `ws.app.*` namespace (chief-workspace app APIs) — not bound
-///   in the daemon port.
+/// * Most of the `ws.app.*` namespace (chief-workspace app APIs) — only
+///   `ws.app.proposal.*` is currently bound in the daemon port.
 /// * `ws.workspace.context`, `ws.workspace.timeline`,
 ///   `ws.workspace.referenceDocs`, `ws.workspace.emitNotification` — deferred
 ///   per the WSAPI-5 report; the bindings surface a clear
@@ -97,6 +97,8 @@ API:
   ws.workspace.setTitle(title) → { ok, title, branch, skipped? }  // Set a short 1-5 word workspace title. May rename the branch if it is still auto-generated; returns `skipped` if the workspace already has a custom title.
   ws.workspace.setStatusMessage(message) → { ok, statusMessage }  // Set or clear the 1-2 sentence user-facing workspace status message; does not change lifecycle `status` or task statuses. Pass an empty string or null to clear.
   ws.workspace.setAgentName(name) → { ok, name }  // Rename the current agent session. Call this early in your first response and use a short 1-5 word task-focused name.
+
+  ws.app.proposal.show(proposal) → ProposalCard  // Chief workspace only. Render an app-level proposal card in chat with dual text+resource content items.
 
   ws.note.read(id) → { id, title, content, tags, ... }  // Read a note. Use id=`spec` for the workspace spec. Content has line numbers like `   1 | text`.
   ws.note.create(title, content, tags?) → { id, title, tags, link, markdownLink }  // Create a new note and return canonical `intent://local/{workspaceId}/note/{noteId}` links. Share `markdownLink` with users so they can open the note. DO NOT use this for the spec: the spec already exists as note ID `spec`; edit or add to it instead.
@@ -267,6 +269,7 @@ mod tests {
     const BINDINGS_SCRIPT: &str = include_str!("bindings/script.rs");
     const BINDINGS_TERMINAL: &str = include_str!("bindings/terminal.rs");
     const BINDINGS_FILE: &str = include_str!("bindings/file.rs");
+    const BINDINGS_APP_PROPOSAL: &str = include_str!("bindings/app/proposal.rs");
 
     // The full set of `(namespace, bindings source)` pairs. Iterated by the
     // reverse-direction drift test below so a NEW dispatch arm added without
@@ -288,6 +291,16 @@ mod tests {
             ("terminal", BINDINGS_TERMINAL),
             ("file", BINDINGS_FILE),
         ]
+    }
+
+    // For nested namespaces like `ws.app.proposal`, we need special handling
+    // since the normal extractor finds "ws.app.proposal.show" but the bindings
+    // only look at the final segment. Map dotted names to their binding source.
+    fn nested_namespace_bindings(full_ns: &str) -> Option<&'static str> {
+        match full_ns {
+            "app.proposal" => Some(BINDINGS_APP_PROPOSAL),
+            _ => None,
+        }
     }
 
     fn bindings_for(namespace: &str) -> &'static str {
@@ -315,31 +328,27 @@ mod tests {
 
     // Extract every `ws.<ns>.<method>` triple mentioned in `text`. Matches
     // identifier chars only, so parenthesized args and neighbouring
-    // punctuation are ignored.
+    // punctuation are ignored. For nested namespaces (e.g. ws.app.proposal.show),
+    // captures "app.proposal" as the namespace and "show" as the method.
     fn extract_ws_methods(text: &str) -> HashSet<(String, String)> {
         let mut out = HashSet::new();
         for (idx, _) in text.match_indices("ws.") {
             let rest = &text[idx + 3..];
             let ns_end = rest
-                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.')
                 .unwrap_or(rest.len());
             if ns_end == 0 {
                 continue;
             }
-            let namespace = &rest[..ns_end];
-            let after_ns = &rest[ns_end..];
-            if !after_ns.starts_with('.') {
-                continue;
+            let full_ns = &rest[..ns_end];
+            // Handle nested namespaces: find the last dot to get the method
+            if let Some(last_dot) = full_ns.rfind('.') {
+                let namespace = &full_ns[..last_dot];
+                let method = &full_ns[last_dot + 1..];
+                if !method.is_empty() {
+                    out.insert((namespace.to_string(), method.to_string()));
+                }
             }
-            let method_src = &after_ns[1..];
-            let m_end = method_src
-                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .unwrap_or(method_src.len());
-            if m_end == 0 {
-                continue;
-            }
-            let method = &method_src[..m_end];
-            out.insert((namespace.to_string(), method.to_string()));
         }
         out
     }
@@ -388,12 +397,20 @@ mod tests {
                 "description advertises ws.{ns}.{method} but its binding is a \
                  `not yet available in this daemon port` stub",
             );
-            let src = bindings_for(&ns);
+            // Check nested namespaces first, then fall back to flat namespace
+            let src = nested_namespace_bindings(&ns).or_else(|| {
+                let flat_src = bindings_for(&ns);
+                if flat_src.is_empty() {
+                    None
+                } else {
+                    Some(flat_src)
+                }
+            });
             assert!(
-                !src.is_empty(),
+                src.is_some(),
                 "description mentions ws.{ns}.{method} but no bindings module `{ns}` exists",
             );
-            let bound = bound_methods(src);
+            let bound = bound_methods(src.unwrap());
             assert!(
                 bound.contains(&method),
                 "description mentions ws.{ns}.{method} but bindings/{ns}.rs has no matching top-level dispatch arm",
@@ -420,15 +437,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    // The description must not claim the `ws.app.*` namespace exists — the
-    // whole namespace is intentionally unbound in the daemon port.
-    #[test]
-    fn description_never_advertises_ws_app() {
-        assert!(
-            !WORKSPACE_API_DESCRIPTION.contains("ws.app."),
-            "workspace_api description references ws.app.*, which is not bound in the port"
-        );
     }
 }
