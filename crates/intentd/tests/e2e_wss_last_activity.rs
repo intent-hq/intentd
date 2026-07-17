@@ -53,14 +53,6 @@ impl Drop for Daemon {
     }
 }
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn scratch_dir(prefix: &str) -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
     let dir = PathBuf::from("/tmp").join(format!("itd-wss-lastact-{prefix}-{}", &id[..8]));
@@ -329,11 +321,10 @@ where
 
 async fn boot(mock_script: &str, behavior: &str) -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = scratch_dir("data");
-    let port_s = free_port().to_string();
     // Override debounce to 200ms for fast test execution
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "200"),
         ("MOCK_AGENT_SCRIPT_PATH", mock_script),
         ("MOCK_AGENT_BEHAVIOR", behavior),

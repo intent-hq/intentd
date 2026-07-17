@@ -44,14 +44,6 @@ impl Drop for Daemon {
     }
 }
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
     let dir = PathBuf::from("/tmp").join(format!("itd-wss-setup-{}", &id[..8]));
@@ -309,8 +301,7 @@ fn create_test_repo() -> PathBuf {
 #[tokio::test]
 async fn setup_script_repo_config_sole_source() {
     let data_dir = temp_data_dir();
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -489,9 +480,7 @@ async fn setup_script_repo_config_sole_source() {
 #[tokio::test]
 async fn setup_script_executes_on_create() {
     let data_dir = temp_data_dir();
-    let port = free_port();
-    let port_s = port.to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -500,7 +489,7 @@ async fn setup_script_executes_on_create() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
-    // Get fingerprint and actual port from daemon (free_port() may have fallen back)
+    // Get fingerprint and actual bound port from daemon
     let status_resp = uds_rpc(&socket, 0, "system.status", json!({})).await;
     let fingerprint = status_resp["result"]["fingerprint"]
         .as_str()

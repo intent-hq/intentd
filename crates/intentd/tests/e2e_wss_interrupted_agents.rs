@@ -456,8 +456,6 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     };
 
     let data_dir = temp_data_dir();
-    let port = free_port();
-    let port_s = port.to_string();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
     let ws_id = "ws-graceful-test";
@@ -488,7 +486,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", &port_s)
+        .env("INTENTD_TCP_PORT", "0")
         .env("MOCK_AGENT_SCRIPT_PATH", &script)
         .env("MOCK_AGENT_BEHAVIOR", &behavior)
         .stdout(Stdio::null())
@@ -507,12 +505,13 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         panic!("daemon did not start");
     }
 
-    // Fetch fingerprint for TLS cert pinning.
+    // Fetch fingerprint and actual bound port for TLS cert pinning.
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
         .to_string();
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
 
     // Open event subscriber BEFORE creating the agent so we miss no events.
     let cfg = client_config(&fp);
@@ -600,7 +599,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", &port_s)
+        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon2.log")).unwrap(),
@@ -616,8 +615,9 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .as_str()
         .expect("fingerprint 2")
         .to_string();
+    let port2 = status["result"]["port"].as_u64().expect("port 2") as u16;
     let cfg = client_config(&fp);
-    let mut ws = connect_ws(port, cfg).await;
+    let mut ws = connect_ws(port2, cfg).await;
 
     // Phase 3: Call agent.listInterrupted over WSS.
     let result = wss_rpc(&mut ws, 4, "agent.listInterrupted", json!({})).await;
