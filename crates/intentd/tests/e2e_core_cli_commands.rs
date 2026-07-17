@@ -73,7 +73,7 @@ async fn doctor_checks_data_dir_and_migrations() {
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("doctor")
         .env("INTENTD_DATA_DIR", &data_dir)
-        .env_remove("INTENTD_TCP_PORT")
+        .env("INTENTD_TCP_PORT", "0")
         .output()
         .expect("run intentd doctor");
 

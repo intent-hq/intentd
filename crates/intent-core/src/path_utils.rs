@@ -271,6 +271,21 @@ where
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn write_fake_shell(path: &std::path::Path, content: &str) {
+        use std::fs;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Use File::create + write_all + sync_all + drop + set_permissions
+        // to ensure file is fully written and flushed before execution (avoids TOCTOU flakes)
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file); // Ensure file is closed before setting permissions
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     #[test]
     fn enhanced_path_dirs_includes_current_path() {
         let dirs = enhanced_path_dirs();
@@ -315,8 +330,6 @@ mod tests {
     fn capture_login_shell_path_with_fake_shell() {
         // Create a fake shell script that outputs a known PATH with sentinel markers
         use std::fs;
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = std::env::temp_dir();
         let pid = std::process::id();
@@ -327,15 +340,10 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_test_{pid}_{nanos}.sh"));
 
         // Script responds to -ilc with sentinel-wrapped PATH
-        // Use File::create + sync_all to ensure file is fully written before execution
-        let mut file = fs::File::create(&fake_shell).unwrap();
-        file.write_all(
-            b"#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/custom/bin:/other/bin__INTENT_PATH_E__'\nfi\n",
-        )
-        .unwrap();
-        file.sync_all().unwrap();
-        drop(file); // Ensure file is closed before setting permissions
-        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
+        write_fake_shell(
+            &fake_shell,
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/custom/bin:/other/bin__INTENT_PATH_E__'\nfi\n",
+        );
 
         let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
@@ -392,7 +400,6 @@ mod tests {
     fn capture_login_shell_path_extracts_sentinels_amid_noise() {
         // Test that sentinel extraction works even when rc files print noise to stdout
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = std::env::temp_dir();
         let pid = std::process::id();
@@ -403,12 +410,10 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_noise_{pid}_{nanos}.sh"));
 
         // Script prints noise before and after the sentinel-wrapped PATH
-        fs::write(
+        write_fake_shell(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  echo 'Loading nvm...'\n  echo 'nvm initialized'\n  printf '__INTENT_PATH_S__/noise/bin:/test/bin__INTENT_PATH_E__'\n  echo 'Shell ready'\nfi\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
@@ -423,7 +428,6 @@ mod tests {
     fn capture_login_shell_path_missing_sentinels_degrades_to_empty() {
         // Test that missing sentinels result in empty vec (not a panic or crash)
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = std::env::temp_dir();
         let pid = std::process::id();
@@ -434,12 +438,10 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_no_sentinel_{pid}_{nanos}.sh"));
 
         // Script outputs PATH without sentinels
-        fs::write(
+        write_fake_shell(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '/missing/bin:/sentinels/bin'\nfi\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
@@ -455,7 +457,6 @@ mod tests {
     fn capture_login_shell_path_falls_back_to_lc_when_ilc_fails() {
         // Test that -ilc failure triggers -lc fallback
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = std::env::temp_dir();
         let pid = std::process::id();
@@ -466,12 +467,10 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_fallback_{pid}_{nanos}.sh"));
 
         // Script fails on -ilc but succeeds on -lc
-        fs::write(
+        write_fake_shell(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  exit 1\nelif [ \"$1\" = \"-lc\" ]; then\n  printf '__INTENT_PATH_S__/fallback/bin:/backup/bin__INTENT_PATH_E__'\nfi\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
@@ -486,7 +485,6 @@ mod tests {
     fn capture_login_shell_path_uses_last_sentinel_occurrence() {
         // Test that when sentinels appear multiple times, we use the last occurrence
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = std::env::temp_dir();
         let pid = std::process::id();
@@ -497,12 +495,10 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_multi_{pid}_{nanos}.sh"));
 
         // Script outputs sentinels multiple times
-        fs::write(
+        write_fake_shell(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/first/bin__INTENT_PATH_E__'\n  printf '__INTENT_PATH_S__/last/bin:/final/bin__INTENT_PATH_E__'\nfi\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
@@ -517,7 +513,6 @@ mod tests {
     fn capture_login_shell_path_handles_trailing_incomplete_sentinel() {
         // Test that a trailing incomplete start sentinel after a complete pair is handled correctly
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = std::env::temp_dir();
         let pid = std::process::id();
@@ -528,12 +523,10 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_trailing_{pid}_{nanos}.sh"));
 
         // Script outputs a complete pair followed by a bare start sentinel
-        fs::write(
+        write_fake_shell(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/valid/bin__INTENT_PATH_E__'\n  printf '__INTENT_PATH_S__'\nfi\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
@@ -551,7 +544,6 @@ mod tests {
     fn capture_login_shell_path_handles_large_output_without_deadlock() {
         // Test that output >64KB doesn't cause pipe-buffer deadlock
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = std::env::temp_dir();
         let pid = std::process::id();
@@ -568,8 +560,7 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '{}'\n  printf '__INTENT_PATH_S__/large/bin__INTENT_PATH_E__'\nfi\n",
             noise
         );
-        fs::write(&fake_shell, script).unwrap();
-        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
+        write_fake_shell(&fake_shell, &script);
 
         let start = std::time::Instant::now();
         let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
