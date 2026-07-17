@@ -524,36 +524,50 @@ impl Services {
     /// Flips `delivered` in memory, removes from in-memory table, triggers
     /// best-effort async DB delete, and returns a clone. Returns `None` otherwise.
     ///
-    /// The `delivered` flag guards against double-wake: a crash after delivery
-    /// but before the DB delete completes leaves a stale row in `delegation_group`,
-    /// but on restore the rehydrated group has `delivered=false` and the parent
-    /// re-delivery path checks the flag before firing. Double-delivery is prevented
-    /// even if the DB delete never committed.
-    pub(crate) fn take_group_if_ready(
+    /// DURABLE-BEFORE-OBSERVABLE: delete the delegation-group row from the DB before
+    /// returning it for wake delivery. This ensures crash-safety:
+    ///
+    /// - Crash BEFORE delete commits: row still present → rehydration restores the
+    ///   group and re-delivers the wake (correct: wake was never observable).
+    /// - Crash AFTER delete commits: row absent → rehydration skips it, no re-delivery
+    ///   (correct: wake already delivered, or about to be).
+    ///
+    /// The synchronous delete before publish prevents double-wake.
+    pub(crate) async fn take_group_if_ready(
         &self,
         workspace_id: &WorkspaceId,
         group_id: &str,
     ) -> Option<DelegationGroup> {
-        let mut guard = self
-            .agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned");
-        let w = guard.get_mut(workspace_id)?;
-        let idx = w
-            .delegation_groups
-            .iter()
-            .position(|g| g.group_id == group_id)?;
-        if !(w.delegation_groups[idx].sealed
-            && !w.delegation_groups[idx].delivered
-            && is_group_complete(&w.delegation_groups[idx]))
-        {
-            return None;
+        // Inside the lock: check readiness and remove from in-memory map.
+        let group = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let w = guard.get_mut(workspace_id)?;
+            let idx = w
+                .delegation_groups
+                .iter()
+                .position(|g| g.group_id == group_id)?;
+            if !(w.delegation_groups[idx].sealed
+                && !w.delegation_groups[idx].delivered
+                && is_group_complete(&w.delegation_groups[idx]))
+            {
+                return None;
+            }
+            let mut group = w.delegation_groups.remove(idx);
+            group.delivered = true;
+            group
+        }; // Drop guard before await
+           // DURABLE-BEFORE-OBSERVABLE: delete the row synchronously before returning.
+           // This ensures a crash post-delete never re-delivers (row is gone).
+        if let Err(e) = self.store.delete_delegation_group(group_id).await {
+            tracing::warn!(
+                "Failed to delete delegation_group row {}: {}. Wake may re-deliver on crash.",
+                group_id,
+                e
+            );
         }
-        let mut group = w.delegation_groups.remove(idx);
-        group.delivered = true;
-        drop(guard);
-        // Delete from store (best-effort).
-        self.delete_delegation_group(group_id);
         Some(group)
     }
 
@@ -677,17 +691,6 @@ impl Services {
         tokio::spawn(async move {
             if let Err(e) = store.upsert_delegation_group(&persisted).await {
                 tracing::warn!("delegation_group upsert failed {group_id}: {e}");
-            }
-        });
-    }
-
-    /// Best-effort delete of a persisted delegation group (AS-2 cleanup).
-    fn delete_delegation_group(&self, group_id: &str) {
-        let store = self.store.clone();
-        let group_id = group_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = store.delete_delegation_group(&group_id).await {
-                tracing::warn!("delegation_group delete failed {group_id}: {e}");
             }
         });
     }

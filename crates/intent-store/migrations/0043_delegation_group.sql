@@ -15,7 +15,7 @@ CREATE TABLE delegation_group (
   sealed              INTEGER NOT NULL DEFAULT 0,
   delivered           INTEGER NOT NULL DEFAULT 0,
   event_summaries     TEXT NOT NULL DEFAULT '[]',  -- JSON array of summary strings
-  raw_events          TEXT NOT NULL DEFAULT '[]',  -- JSON array of Event objects
+  raw_events          TEXT NOT NULL DEFAULT '[]',  -- JSON array of JSON-encoded event frames
   created_at          TEXT NOT NULL,
   updated_at          TEXT NOT NULL
 );

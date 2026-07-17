@@ -1407,7 +1407,7 @@ impl Services {
     /// completions; on a send error we log and accept the dropped wake (mirroring
     /// the immediate path's best-effort delivery).
     pub(crate) async fn try_fire_group(&self, workspace_id: &WorkspaceId, group_id: &str) {
-        let Some(group) = self.take_group_if_ready(workspace_id, group_id) else {
+        let Some(group) = self.take_group_if_ready(workspace_id, group_id).await else {
             return;
         };
         let wake = format_group_wake(&group);

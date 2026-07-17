@@ -3951,9 +3951,15 @@ impl Services {
 
         // If delivery succeeded, mark the row resolved
         if result.is_ok() {
-            self.store
+            let updated = self
+                .store
                 .set_interrupted_resolution(agent_id, "resumed", &now_iso())
                 .await?;
+            if !updated {
+                return Err(Error::InvalidParams(format!(
+                    "Agent {agent_id} is not in pending interrupted state"
+                )));
+            }
         } else {
             // Delivery failed → leave row pending, return error
             return Err(Error::Internal(format!(
@@ -3968,11 +3974,11 @@ impl Services {
     /// Abandon an interrupted agent (INT-41 phase 2): mark row `abandoned`, append
     /// a system interruption message to the log, emit chat/agent events for live UIs.
     pub(crate) async fn abandon_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
-        // Verify the agent is in pending interrupted state
-        let rows = self.store.list_interrupted_agents().await?;
-        let interrupted = rows
-            .iter()
-            .find(|ia| ia.agent_id == *agent_id)
+        // Verify the agent is in pending interrupted state (O(1) lookup)
+        let interrupted = self
+            .store
+            .get_interrupted_agent(agent_id)
+            .await?
             .ok_or_else(|| {
                 Error::InvalidParams(format!(
                     "Agent {agent_id} is not in pending interrupted state"
@@ -4040,9 +4046,15 @@ impl Services {
             .await?;
 
         // Mark the interrupted_agent row as resolved
-        self.store
+        let updated = self
+            .store
             .set_interrupted_resolution(agent_id, "abandoned", &now_iso())
             .await?;
+        if !updated {
+            return Err(Error::InvalidParams(format!(
+                "Agent {agent_id} is not in pending interrupted state"
+            )));
+        }
 
         // Emit agent:message event so live UIs see the new message
         self.publish_agent_mutation_event(

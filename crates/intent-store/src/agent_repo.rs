@@ -746,7 +746,9 @@ impl Store {
                    VALUES (?, ?, ?, ?) \
                    ON CONFLICT(agent_id) DO UPDATE SET \
                        prev_status = excluded.prev_status, \
-                       interrupted_at = excluded.interrupted_at";
+                       interrupted_at = excluded.interrupted_at, \
+                       resolution = 'pending', \
+                       resolved_at = NULL";
         let res = sqlx::query(sql)
             .bind(&agent_id.0)
             .bind(&workspace_id.0)
@@ -814,22 +816,25 @@ impl Store {
         }
     }
 
-    /// Set the resolution (resumed|abandoned) for an interrupted agent.
+    /// Set the resolution (resumed|abandoned) for an interrupted agent. Returns
+    /// `true` if a pending row was updated, `false` if the agent was not found or
+    /// already resolved (caller should fail the operation).
     pub async fn set_interrupted_resolution(
         &self,
         agent_id: &AgentId,
         resolution: &str,
         resolved_at: &str,
-    ) -> Result<()> {
-        let sql = "UPDATE interrupted_agent SET resolution = ?, resolved_at = ? WHERE agent_id = ?";
-        sqlx::query(sql)
+    ) -> Result<bool> {
+        let sql = "UPDATE interrupted_agent SET resolution = ?, resolved_at = ? \
+                   WHERE agent_id = ? AND resolution = 'pending'";
+        let res = sqlx::query(sql)
             .bind(resolution)
             .bind(resolved_at)
             .bind(&agent_id.0)
             .execute(&self.pool)
             .await
             .map_err(|e| Error::Internal(format!("set interrupted resolution failed: {e}")))?;
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 }
 
@@ -870,4 +875,137 @@ where
 {
     row.try_get::<T, _>(name)
         .map_err(|e| Error::Internal(format!("column {name}: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Store;
+
+    #[tokio::test]
+    async fn re_interruption_resets_resolution() {
+        use intent_core::{
+            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
+        };
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let agent_id = AgentId("agent-test".to_string());
+        let ws_id = WorkspaceId("ws-test".to_string());
+
+        // Seed workspace
+        let ts = now_iso();
+        let workspace = Workspace {
+            id: ws_id.clone(),
+            title: "Test".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+        };
+        store
+            .insert_workspace(&workspace)
+            .await
+            .expect("insert workspace");
+
+        // Initial interruption
+        store
+            .insert_interrupted_agent(&agent_id, &ws_id, "active", "2026-01-01T00:00:00Z")
+            .await
+            .expect("initial insert");
+
+        // Verify the row exists (raw SQL check since get_interrupted_agent requires agent_session)
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM interrupted_agent WHERE agent_id = ? AND resolution = 'pending'",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.pool())
+        .await
+        .expect("count");
+        assert_eq!(count, 1, "should have one pending row");
+
+        // Resolve it (resumed)
+        let updated = store
+            .set_interrupted_resolution(&agent_id, "resumed", "2026-01-01T00:01:00Z")
+            .await
+            .expect("resolve");
+        assert!(updated, "should update pending row");
+
+        // Verify no longer pending
+        let count2: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM interrupted_agent WHERE agent_id = ? AND resolution = 'pending'",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.pool())
+        .await
+        .expect("count after resolve");
+        assert_eq!(count2, 0, "resolved row should not be pending");
+
+        // Re-interrupt (daemon crash again, same agent)
+        store
+            .insert_interrupted_agent(&agent_id, &ws_id, "processing", "2026-01-01T00:02:00Z")
+            .await
+            .expect("re-interrupt");
+
+        // Verify row is pending again (resolution reset)
+        let count3: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM interrupted_agent WHERE agent_id = ? AND resolution = 'pending'",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.pool())
+        .await
+        .expect("count after re-interrupt");
+        assert_eq!(count3, 1, "re-interrupted row should be pending again");
+
+        // Verify updated fields
+        let row: (String, String) = sqlx::query_as(
+            "SELECT prev_status, interrupted_at FROM interrupted_agent WHERE agent_id = ?",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.pool())
+        .await
+        .expect("fetch row");
+        assert_eq!(row.0, "processing");
+        assert_eq!(row.1, "2026-01-01T00:02:00Z");
+
+        // Attempt to resolve a non-existent agent
+        let unknown_id = AgentId("agent-unknown".to_string());
+        let updated2 = store
+            .set_interrupted_resolution(&unknown_id, "resumed", "2026-01-01T00:03:00Z")
+            .await
+            .expect("resolve unknown");
+        assert!(!updated2, "resolving unknown agent should return false");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
