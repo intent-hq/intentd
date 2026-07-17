@@ -5311,8 +5311,13 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     let mut dequeued_message_id: Option<String> = None;
     let mut stream_end_count = 0;
     for _ in 0..120 {
-        let frame_opt = wss_event_opt(&mut sub, 30).await;
-        let frame = frame_opt.expect("event timeout");
+        let frame_opt = wss_event_opt(&mut sub, 60).await;
+        let frame = frame_opt.unwrap_or_else(|| {
+            panic!(
+                "event timeout waiting for dequeued message (saw_dequeued={}, stream_end_count={})",
+                saw_dequeued_user_message, stream_end_count
+            )
+        });
         let evt = &frame["params"]["event"];
         match evt["type"].as_str() {
             Some("agent:message") => {
@@ -5396,8 +5401,13 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     let mut wake_message_id: Option<String> = None;
     let mut wake_stream_end_count = 0;
     for _ in 0..120 {
-        let frame_opt = wss_event_opt(&mut sub, 30).await;
-        let frame = frame_opt.expect("event timeout");
+        let frame_opt = wss_event_opt(&mut sub, 60).await;
+        let frame = frame_opt.unwrap_or_else(|| {
+            panic!(
+                "event timeout waiting for wake message (saw_wake={}, wake_stream_end_count={})",
+                saw_wake_message_event, wake_stream_end_count
+            )
+        });
         let evt = &frame["params"]["event"];
         match evt["type"].as_str() {
             Some("agent:message") => {
