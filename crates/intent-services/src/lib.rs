@@ -6806,6 +6806,10 @@ impl WorkspaceApi for Services {
                 ws.created_at = pinned.created_at;
                 ws.updated_at = pinned.updated_at;
                 ws.last_activity = pinned.last_activity;
+                // Derive `activity` from live agent state (§9.9) so the mutation
+                // response carries `agent_running` when agents are in-flight,
+                // not the stale default `idle` from the synthesized row.
+                ws.activity = this.workspace_activity(&ws.id);
             } else {
                 store.update_workspace(&ws).await?;
                 // Derive `lastActivity` (§9.1) on the returned record so
@@ -6813,6 +6817,10 @@ impl WorkspaceApi for Services {
                 // without a follow-up `workspace.get`. Chief is skipped: its
                 // timestamps are pinned above.
                 this.derive_last_activity(&mut ws).await;
+                // Derive `activity` from live agent state (§9.9) so the mutation
+                // response carries `agent_running` when agents are in-flight,
+                // not the stale default `idle` from the persisted row.
+                ws.activity = this.workspace_activity(&ws.id);
             }
             // Self-sufficient `workspace:updated` payload (§6.5) so every
             // client mirrors the delta without a follow-up read.
@@ -7028,6 +7036,10 @@ impl WorkspaceApi for Services {
             // Derive `lastActivity` (§9.1) so archive callers get the
             // authoritative wire shape without a follow-up `workspace.get`.
             this.derive_last_activity(&mut ws).await;
+            // Derive `activity` from live agent state (§9.9) so the mutation
+            // response carries `agent_running` when agents are in-flight,
+            // not the stale default `idle` from the persisted row.
+            ws.activity = this.workspace_activity(&ws.id);
             // §6.5 has no `workspace:archived`; mirror the reference emitter and
             // publish `workspace:updated` with the applied `{ archived }` delta
             // so subscribers flip state without a re-read.
@@ -7055,6 +7067,10 @@ impl WorkspaceApi for Services {
             ws.updated_at = now_iso();
             store.update_workspace(&ws).await?;
             this.derive_last_activity(&mut ws).await;
+            // Derive `activity` from live agent state (§9.9) so the mutation
+            // response carries `agent_running` when agents are in-flight,
+            // not the stale default `idle` from the persisted row.
+            ws.activity = this.workspace_activity(&ws.id);
             publish_event(
                 &bus,
                 workspace_updated_event(&ws.id, serde_json::json!({ "archived": false })),
@@ -7383,6 +7399,10 @@ impl WorkspaceApi for Services {
             // matches what `workspace.list`/`workspace.get` would compute for
             // the new row (§9.1, mutation-path parity).
             this.derive_last_activity(&mut ws).await;
+            // Derive `activity` from live agent state (§9.9) for consistency
+            // with other mutation paths. For a fresh workspace with no agents,
+            // activity naturally remains `idle`.
+            ws.activity = this.workspace_activity(&ws.id);
             Ok(ws)
         })
     }
@@ -7525,6 +7545,10 @@ impl WorkspaceApi for Services {
             ws.attention = WorkspaceAttention::None;
             ws.updated_at = now_iso();
             store.update_workspace(&ws).await?;
+            // Derive `activity` from live agent state (§9.9) so the mutation
+            // response carries `agent_running` when agents are in-flight,
+            // not the stale default `idle` from the persisted row.
+            ws.activity = this.workspace_activity(&ws.id);
             // Self-sufficient `workspace:attention-changed` so every client clears
             // the blue dot together (PROTOCOL §6.5); emit only on an actual change.
             if changed {
@@ -7554,6 +7578,10 @@ impl WorkspaceApi for Services {
                 // Schedule debounced lastActivity event (§10.1).
                 this.schedule_last_activity_event(id.clone());
             }
+            // Derive `activity` from live agent state (§9.9) so the mutation
+            // response carries `agent_running` when agents are in-flight,
+            // not the stale default `idle` from the persisted row.
+            ws.activity = this.workspace_activity(&ws.id);
             Ok(ws)
         })
     }
