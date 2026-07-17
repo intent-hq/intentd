@@ -403,62 +403,74 @@ async fn baseline_plus_aggregated_wake() {
         json!(CHILD_B),
     );
 
-    // DETERMINISTIC CHILD2 DELAY: child2's delayMs is controlled by CHILD2_DELAY_MS env var.
-    // Daemon1 (pre-kill) gets 300000ms (5 minutes) so child2 cannot complete before the kill.
-    // Daemon2 (post-restart) gets 0ms so child2 completes quickly and fires the aggregated wake.
-    let child2_delay_ms = std::env::var("CHILD2_DELAY_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
+    // DETERMINISTIC CHILD2 DELAY: daemon1 gets child2 delay=300000ms (5 minutes)
+    // so child2 cannot complete before the kill. Daemon2 gets delay=0ms so child2
+    // completes quickly and fires the aggregated wake post-restart.
+    // Build TWO behavior JSONs, one per daemon, so each daemon's mock agent sees
+    // the correct delayMs for child2.
+    fn build_behavior(
+        child2_delay_ms: u64,
+        report_a_js: &str,
+        report_b_js: &str,
+        delegate_a_js: &str,
+        delegate_b_js: &str,
+    ) -> String {
+        json!({
+            "rules": [
+                {
+                    "ifPromptContains": CHILD_A,
+                    "delayMs": 8000,
+                    "toolCall": {
+                        "name": "workspace_api",
+                        "arguments": { "code": report_a_js, "summary": "alpha reportToParent" }
+                    },
+                    "response": "alpha child done",
+                },
+                {
+                    "ifPromptContains": CHILD_B,
+                    "delayMs": child2_delay_ms,
+                    "toolCall": {
+                        "name": "workspace_api",
+                        "arguments": { "code": report_b_js, "summary": "beta reportToParent" }
+                    },
+                    "response": "beta child done",
+                },
+                {
+                    "ifPromptContains": "[WORKSPACE EVENTS]",
+                    "response": "parent acknowledged the aggregated wake",
+                },
+                {
+                    "ifPromptContains": PARENT_GO,
+                    "toolCalls": [
+                        {
+                            "name": "workspace_api",
+                            "arguments": { "code": delegate_a_js, "summary": "delegate alpha after_all" }
+                        },
+                        {
+                            "name": "workspace_api",
+                            "arguments": { "code": delegate_b_js, "summary": "delegate beta after_all" }
+                        },
+                    ],
+                    "response": "parent delegated two after_all children",
+                },
+            ],
+        })
+        .to_string()
+    }
 
-    let behavior = json!({
-        "rules": [
-            {
-                "ifPromptContains": CHILD_A,
-                "delayMs": 8000,
-                "toolCall": {
-                    "name": "workspace_api",
-                    "arguments": { "code": report_a_js, "summary": "alpha reportToParent" }
-                },
-                "response": "alpha child done",
-            },
-            {
-                "ifPromptContains": CHILD_B,
-                "delayMs": child2_delay_ms,
-                "toolCall": {
-                    "name": "workspace_api",
-                    "arguments": { "code": report_b_js, "summary": "beta reportToParent" }
-                },
-                "response": "beta child done",
-            },
-            {
-                "ifPromptContains": "[WORKSPACE EVENTS]",
-                "response": "parent acknowledged the aggregated wake",
-            },
-            {
-                "ifPromptContains": PARENT_GO,
-                "toolCalls": [
-                    {
-                        "name": "workspace_api",
-                        "arguments": { "code": delegate_a_js, "summary": "delegate alpha after_all" }
-                    },
-                    {
-                        "name": "workspace_api",
-                        "arguments": { "code": delegate_b_js, "summary": "delegate beta after_all" }
-                    },
-                ],
-                "response": "parent delegated two after_all children",
-            },
-        ],
-    })
-    .to_string();
+    let behavior_daemon1 = build_behavior(
+        300000,
+        &report_a_js,
+        &report_b_js,
+        &delegate_a_js,
+        &delegate_b_js,
+    );
     let port_s = free_port().to_string();
-    let env_daemon1: [(&str, &str); 6] = [
+    let env_daemon1: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", &port_s),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
-        ("MOCK_AGENT_BEHAVIOR", &behavior),
-        ("CHILD2_DELAY_MS", "300000"), // 5 minutes - child2 cannot complete before kill
+        ("MOCK_AGENT_BEHAVIOR", &behavior_daemon1),
         ("RUST_LOG", "intent_services=info"),
     ];
     let child = spawn_serve(&data_dir, "both", &env_daemon1);
@@ -632,13 +644,20 @@ async fn baseline_plus_aggregated_wake() {
     );
 
     // Increment 3: boot daemon2 using the SAME data_dir
-    // Daemon2 gets the same behavior BUT without CHILD2_DELAY_MS, so child2 completes quickly.
+    // Daemon2 gets child2 delay=0ms so child2 completes quickly and fires the aggregated wake.
     eprintln!("Booting daemon2 with same data_dir...");
+    let behavior_daemon2 = build_behavior(
+        0,
+        &report_a_js,
+        &report_b_js,
+        &delegate_a_js,
+        &delegate_b_js,
+    );
     let env_daemon2: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", &port_s),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
-        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_BEHAVIOR", &behavior_daemon2),
         ("RUST_LOG", "intent_services=info"),
     ];
     let child2_proc = spawn_serve(&data_dir, "both", &env_daemon2);
