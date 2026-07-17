@@ -727,15 +727,25 @@ impl Services {
                 .agent_subscriptions
                 .lock()
                 .expect("agent subscription registry poisoned");
-            guard.get(workspace_id).and_then(|w| {
+            let found = guard.get(workspace_id).and_then(|w| {
                 w.delegation_groups
                     .iter()
                     .find(|g| g.expected_agent_ids.contains(agent_id))
                     .map(|g| g.group_id.clone())
-            })
+            });
+            tracing::info!(
+                "record_group_completion_pre_publish: agent={}, group={:?}",
+                agent_id.0,
+                found
+            );
+            found
         };
 
         if let Some(group_id) = group_id {
+            tracing::info!(
+                "record_group_completion_pre_publish: WILL PERSIST group={}",
+                group_id
+            );
             // Build event for group recording. Prefer the child's persisted
             // completion_report (set by agent.reportToParent) over the generic
             // summary, mirroring deliver_completion_to_watches logic.
@@ -772,6 +782,15 @@ impl Services {
                 event,
             )
             .await;
+            tracing::info!(
+                "record_group_completion_pre_publish: PERSISTED group={}",
+                group_id
+            );
+        } else {
+            tracing::info!(
+                "record_group_completion_pre_publish: NO GROUP FOUND for agent={}",
+                agent_id.0
+            );
         }
     }
 }

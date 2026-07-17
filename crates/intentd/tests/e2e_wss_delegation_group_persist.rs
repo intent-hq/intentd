@@ -29,6 +29,7 @@ use rustls::{ClientConfig, DigitallySignedStruct};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
@@ -444,11 +445,12 @@ async fn baseline_plus_aggregated_wake() {
     })
     .to_string();
     let port_s = free_port().to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", &port_s),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("RUST_LOG", "intent_services=info"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -542,26 +544,49 @@ async fn baseline_plus_aggregated_wake() {
         "waiting ids are the children, not the parent: {lite}"
     );
 
-    // Increment 1a: capture child IDs
+    // Increment 1: capture child IDs and subscribe to child1 events
     let child1_id = waiting[0].as_str().unwrap().to_string();
     let child2_id = waiting[1].as_str().unwrap().to_string();
-    eprintln!("Captured child IDs: child1={child1_id}, child2={child2_id}");
 
-    // Increment 1b: wait for child1 to complete
-    let mut child1_idle = false;
-    for _ in 0..200 {
-        let frame = wss_event(&mut sub, 60).await;
-        if frame["params"]["event"]["type"] == "agent:idle"
-            && frame["params"]["event"]["data"]["agentId"] == child1_id
-        {
-            child1_idle = true;
-            eprintln!("child1 went idle");
-            break;
-        }
-    }
-    assert!(child1_idle, "child1 completed");
+    // Subscribe to child1's events on a dedicated WSS connection for clean lifecycle.
+    let mut child1_sub = connect_ws(port, cfg.clone()).await;
+    let child1_sub_resp = wss_rpc(
+        &mut child1_sub,
+        100,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:idle"], "workspaceId": ws_id, "agentId": child1_id }),
+    )
+    .await;
+    assert!(
+        child1_sub_resp["subscriptionId"].is_string(),
+        "child1 event subscription: {child1_sub_resp}"
+    );
 
-    // Increment 2: kill daemon1 before child2 completes
+    // Increment 2: wait for child1 to emit agent:idle event (WSS anchor).
+    // To prevent the UnexpectedEof race: complete the event wait FULLY, then
+    // cleanly drop/close the subscriber, THEN issue the deliberate kill.
+    let child1_idle_event = timeout(Duration::from_secs(20), wss_event(&mut child1_sub, 60))
+        .await
+        .expect("child1 idle timeout");
+
+    let ev = &child1_idle_event["params"]["event"];
+    assert_eq!(
+        ev["type"].as_str().unwrap(),
+        "agent:idle",
+        "child1 emitted idle event"
+    );
+    assert_eq!(
+        ev["data"]["agentId"].as_str().unwrap(),
+        child1_id,
+        "child1 idle event has correct agentId"
+    );
+
+    // Increment 3: cleanly close the event subscriber before killing.
+    // Drop the subscriber explicitly so the WSS read future is not in-flight
+    // when SIGTERM lands.
+    drop(child1_sub);
+
+    // Increment 4: kill daemon1 before child2 completes
     eprintln!("Killing daemon1 and all mock processes...");
     drop(sub);
     drop(rpc);
@@ -579,11 +604,37 @@ async fn baseline_plus_aggregated_wake() {
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
         .await
         .expect("open store for inspection");
+
+    // QUESTION 4: Dump the ENTIRE delegation_group table (not just undelivered)
+    let all_rows_sql = sqlx::query("SELECT group_id, workspace_id, parent_agent_id, sealed, delivered, expected_agent_ids, completed_agent_ids FROM delegation_group")
+        .fetch_all(store.pool())
+        .await
+        .expect("query all delegation_group rows");
+    eprintln!("Total delegation_group rows in DB: {}", all_rows_sql.len());
+    for row in &all_rows_sql {
+        eprintln!("  group_id: {}", row.get::<String, _>("group_id"));
+        eprintln!("  workspace_id: {}", row.get::<String, _>("workspace_id"));
+        eprintln!(
+            "  parent_agent_id: {}",
+            row.get::<String, _>("parent_agent_id")
+        );
+        eprintln!("  sealed: {}", row.get::<i64, _>("sealed"));
+        eprintln!("  delivered: {}", row.get::<i64, _>("delivered"));
+        eprintln!(
+            "  expected_agent_ids: {}",
+            row.get::<String, _>("expected_agent_ids")
+        );
+        eprintln!(
+            "  completed_agent_ids: {}",
+            row.get::<String, _>("completed_agent_ids")
+        );
+    }
+
     let groups = store
         .list_undelivered_groups(&intent_core::WorkspaceId(ws_id.to_string()))
         .await
         .expect("list undelivered groups");
-    eprintln!("Found {} undelivered groups", groups.len());
+    eprintln!("Found {} UNDELIVERED groups", groups.len());
     for g in &groups {
         eprintln!("  group_id: {}", g.group_id);
         eprintln!("  parent_agent_id: {}", g.parent_agent_id.0);
