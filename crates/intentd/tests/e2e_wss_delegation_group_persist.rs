@@ -403,9 +403,9 @@ async fn baseline_plus_aggregated_wake() {
         json!(CHILD_B),
     );
 
-    // DETERMINISTIC CHILD2 DELAY: daemon1 gets child2 delay=300000ms (5 minutes)
-    // so child2 cannot complete before the kill. Daemon2 gets delay=0ms so child2
-    // completes quickly and fires the aggregated wake post-restart.
+    // DETERMINISTIC CHILD2 DELAY: daemon1 gets child2 delay=60000ms (1 minute)
+    // so child2 cannot complete before the kill (~15s into test). Daemon2 gets
+    // delay=0ms so child2 completes quickly and fires the aggregated wake post-restart.
     // Build TWO behavior JSONs, one per daemon, so each daemon's mock agent sees
     // the correct delayMs for child2.
     fn build_behavior(
@@ -459,7 +459,7 @@ async fn baseline_plus_aggregated_wake() {
     }
 
     let behavior_daemon1 = build_behavior(
-        300000,
+        60000,
         &report_a_js,
         &report_b_js,
         &delegate_a_js,
