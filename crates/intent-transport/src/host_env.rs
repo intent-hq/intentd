@@ -1,6 +1,7 @@
-//! Host-environment probes (§12.3): `hasDisplay`, display-server detection,
-//! and the local OS hostname. Shared by `host.status`, the CLI `status`/
-//! `doctor` surfaces (§5.7), and `server.pairingInfo`.
+//! Host-environment probes (§12.3): `hasDisplay` and display-server detection
+//! (used by `host.status` and the CLI `status`/`doctor` surfaces, §5.7), plus
+//! the crate-local OS hostname helper (used by `host.status` and
+//! `server.pairingInfo`).
 
 /// Best-effort `hasDisplay` (§12.3): X11/Wayland env on Unix, otherwise assume
 /// a display unless the process was reached over SSH (no local console). Public
