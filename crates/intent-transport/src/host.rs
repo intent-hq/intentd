@@ -47,6 +47,7 @@ pub(crate) enum HostMethod {
     Env,
     FindApp,
     ListInstalledEditors,
+    ProviderDiscovery,
     /// Client-callable editor-open trigger (`host.openInEditor`, §5.14):
     /// dispatched to [`open_in_editor`], which short-circuits locally on a
     /// local connection and re-dispatches to the connected FE as the
@@ -102,6 +103,7 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
         "host.env" => HostMethod::Env,
         "host.findApp" => HostMethod::FindApp,
         "host.listInstalledEditors" => HostMethod::ListInstalledEditors,
+        "host.providerDiscovery" => HostMethod::ProviderDiscovery,
         "host.openInEditor" => HostMethod::OpenInEditor,
         "host.exec" => HostMethod::Exec,
         "host.execStream" => HostMethod::ExecStream,
@@ -274,6 +276,14 @@ pub(crate) async fn handle(
             let result = tokio::task::spawn_blocking(move || host_ops::tool_availability_op(tools))
                 .await
                 .unwrap_or_else(|_| json!({ "tools": {} }));
+            success_frame(id_echo, result)
+        }
+        HostMethod::ProviderDiscovery => {
+            let result = tokio::task::spawn_blocking(host_ops::provider_discovery_op)
+                .await
+                .unwrap_or_else(|_| {
+                    json!({ "providers": [], "npx": { "resolvedPath": null, "version": null, "versionOk": false } })
+                });
             success_frame(id_echo, result)
         }
         HostMethod::Env => {

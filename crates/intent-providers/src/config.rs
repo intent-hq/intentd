@@ -168,6 +168,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         can_be_disabled: true,
         auth_check_args: Some(&["login", "status"]),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
+        fallback_npx_package: Some("@agentclientprotocol/codex-acp"),
         ..ProviderConfig::empty("codex", "OpenAI Codex", "codex-acp")
     },
     ProviderConfig {

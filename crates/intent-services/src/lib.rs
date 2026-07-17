@@ -14784,3 +14784,122 @@ fn extract_markdown_image_urls(content: &str) -> Vec<String> {
     }
     urls
 }
+
+/// Provider discovery with npx version probing (host.providerDiscovery support).
+/// Returns JSON payload with providers array and npx status.
+pub fn discover_providers_with_npx() -> serde_json::Value {
+    let providers = intent_providers::discover_providers();
+    let npx_status = intent_providers::probe_npx();
+
+    // Probe npx version if we found the binary
+    let (version, version_ok) = if let Some(ref npx_path) = npx_status.resolved_path {
+        match probe_npx_version_internal(npx_path) {
+            Some(v) => {
+                let ok = parse_npx_version_ok(&v);
+                (Some(v), ok)
+            }
+            None => (None, false),
+        }
+    } else {
+        (None, false)
+    };
+
+    let provider_array: Vec<serde_json::Value> = providers
+        .iter()
+        .map(|p| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("id".to_string(), serde_json::json!(p.id));
+            obj.insert("displayName".to_string(), serde_json::json!(p.display_name));
+            obj.insert("command".to_string(), serde_json::json!(p.command));
+            obj.insert("installed".to_string(), serde_json::json!(p.installed));
+            if let Some(ref path) = p.resolved_path {
+                obj.insert(
+                    "resolvedPath".to_string(),
+                    serde_json::json!(path.display().to_string()),
+                );
+            }
+            if let Some(ref reason) = p.gated_off {
+                obj.insert("gatedOff".to_string(), serde_json::json!(reason));
+            }
+            obj.insert(
+                "hasNpxFallback".to_string(),
+                serde_json::json!(p.has_npx_fallback),
+            );
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+
+    let mut npx_obj = serde_json::Map::new();
+    if let Some(ref path) = npx_status.resolved_path {
+        npx_obj.insert(
+            "resolvedPath".to_string(),
+            serde_json::json!(path.display().to_string()),
+        );
+    } else {
+        npx_obj.insert("resolvedPath".to_string(), serde_json::Value::Null);
+    }
+    if let Some(ref v) = version {
+        npx_obj.insert("version".to_string(), serde_json::json!(v));
+    } else {
+        npx_obj.insert("version".to_string(), serde_json::Value::Null);
+    }
+    npx_obj.insert("versionOk".to_string(), serde_json::json!(version_ok));
+
+    serde_json::json!({
+        "providers": provider_array,
+        "npx": serde_json::Value::Object(npx_obj),
+    })
+}
+
+fn probe_npx_version_internal(npx_path: &Path) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(npx_path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let timeout = Duration::from_secs(3);
+    let start = std::time::Instant::now();
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut stdout_handle = child.stdout.take()?;
+                let mut output = Vec::new();
+                stdout_handle.read_to_end(&mut output).ok()?;
+                let stdout = String::from_utf8_lossy(&output);
+                let first_line = stdout.lines().next()?.trim();
+                if first_line.is_empty() {
+                    return None;
+                }
+                return Some(first_line.to_string());
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+fn parse_npx_version_ok(version_str: &str) -> bool {
+    version_str
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|maj| maj >= 7)
+}

@@ -30,6 +30,19 @@ pub struct ProviderAvailability {
     /// The provider's auth-status check args (`Some` ⇒ a daemon-side probe is
     /// possible), surfaced so the caller can run it without re-reading config.
     pub auth_check_args: Option<&'static [&'static str]>,
+    /// Whether this provider supports npx fallback when binary is unresolved.
+    pub has_npx_fallback: bool,
+}
+
+/// Status of npx availability for provider fallback spawning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpxStatus {
+    /// Resolved absolute path to npx, when found.
+    pub resolved_path: Option<PathBuf>,
+    /// Version string from `npx --version`, when successfully probed.
+    pub version: Option<String>,
+    /// Whether the version meets the minimum requirement (major >= 7).
+    pub version_ok: bool,
 }
 
 /// Platform `PATH` list separator.
@@ -106,9 +119,22 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
                 resolved_path,
                 gated_off,
                 auth_check_args: provider.auth_check_args,
+                has_npx_fallback: provider.fallback_npx_package.is_some(),
             }
         })
         .collect()
+}
+
+/// Probe npx availability (path only, no spawning). Returns the resolved path
+/// when npx is found on PATH. Version probing requires spawning `npx --version`
+/// and is handled at the transport layer where a tokio runtime is available.
+pub fn probe_npx() -> NpxStatus {
+    let resolved_path = find_npx();
+    NpxStatus {
+        resolved_path,
+        version: None,
+        version_ok: false,
+    }
 }
 
 /// Resolve a provider binary to an absolute path using the precedence order:
