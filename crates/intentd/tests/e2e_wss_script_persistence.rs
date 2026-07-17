@@ -36,7 +36,7 @@ fn scratch_dir(prefix: &str) -> PathBuf {
     dir
 }
 
-fn spawn_serve(data_dir: &Path, port: u16) -> Child {
+fn spawn_serve(data_dir: &Path) -> Child {
     let log = std::fs::File::options()
         .create(true)
         .append(true)
@@ -52,7 +52,7 @@ fn spawn_serve(data_dir: &Path, port: u16) -> Child {
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", port.to_string())
+        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .spawn()
@@ -215,7 +215,7 @@ where
 /// Boot (or re-boot) a daemon over an existing data dir, returning the child
 /// and a pinned-TLS WSS client config for its live port.
 async fn boot(data_dir: &Path) -> (Child, u16, Arc<ClientConfig>) {
-    let child = spawn_serve(data_dir, free_port());
+    let child = spawn_serve(data_dir);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
@@ -318,11 +318,4 @@ async fn scripts_survive_daemon_restart_over_wss() {
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
-fn free_port() -> u16 {
-    use std::net::TcpListener;
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
-}
+
