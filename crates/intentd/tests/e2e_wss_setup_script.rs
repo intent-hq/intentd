@@ -209,6 +209,14 @@ async fn connect_ws(
     ws
 }
 
+async fn wss_connect(
+    port: u16,
+    fingerprint: &str,
+) -> WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>> {
+    let cfg = client_config(fingerprint);
+    connect_ws(port, cfg).await
+}
+
 async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -481,7 +489,8 @@ async fn setup_script_repo_config_sole_source() {
 #[tokio::test]
 async fn setup_script_executes_on_create() {
     let data_dir = temp_data_dir();
-    let port_s = free_port().to_string();
+    let port = free_port();
+    let port_s = port.to_string();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -491,19 +500,35 @@ async fn setup_script_executes_on_create() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
+    // Get fingerprint from daemon
+    let status_resp = uds_rpc(&socket, 0, "system.status", json!({})).await;
+    let fingerprint = status_resp["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint");
+
+    let mut wss = wss_connect(port, fingerprint).await;
+
     let repo_path = create_test_repo();
 
+    // Create hermetic marker paths under the worktree (not /tmp) to avoid parallel collisions
+    let test_run_id = Uuid::new_v4().simple().to_string();
+
     // Create a workspace with a setup script that writes a marker file + env vars
-    let marker_script = r#"#!/bin/sh
+    let marker_script = format!(
+        r#"#!/bin/sh
 set -e
-echo "MAIN_CHECKOUT=${MAIN_CHECKOUT}" > /tmp/setup-env-test
-echo "WORKTREE_PATH=${WORKTREE_PATH}" >> /tmp/setup-env-test
-echo "BRANCH_NAME=${BRANCH_NAME}" >> /tmp/setup-env-test
-echo "SOURCE_BRANCH=${SOURCE_BRANCH}" >> /tmp/setup-env-test
-touch "${WORKTREE_PATH}/.setup-ran"
-"#;
-    let create_resp = uds_rpc(
-        &socket,
+# Write env vars to a file in the worktree (hermetic, not /tmp)
+echo "MAIN_CHECKOUT=${{MAIN_CHECKOUT}}" > "${{WORKTREE_PATH}}/setup-env-{}.txt"
+echo "WORKTREE_PATH=${{WORKTREE_PATH}}" >> "${{WORKTREE_PATH}}/setup-env-{}.txt"
+echo "BRANCH_NAME=${{BRANCH_NAME}}" >> "${{WORKTREE_PATH}}/setup-env-{}.txt"
+echo "SOURCE_BRANCH=${{SOURCE_BRANCH}}" >> "${{WORKTREE_PATH}}/setup-env-{}.txt"
+touch "${{WORKTREE_PATH}}/.setup-ran-{}"
+"#,
+        test_run_id, test_run_id, test_run_id, test_run_id, test_run_id
+    );
+
+    let create_resp = wss_rpc(
+        &mut wss,
         1,
         "workspace.create",
         json!({
@@ -522,7 +547,7 @@ touch "${WORKTREE_PATH}/.setup-ran"
         "create should succeed even if script runs"
     );
 
-    let _workspace_id = create_resp["result"]["workspace"]["id"]
+    let workspace_id = create_resp["result"]["workspace"]["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -531,7 +556,7 @@ touch "${WORKTREE_PATH}/.setup-ran"
         .expect("worktreePath should be set");
 
     // Poll for the marker file (script execution is fire-and-forget, may take a moment)
-    let marker_path = PathBuf::from(workspace_path).join(".setup-ran");
+    let marker_path = PathBuf::from(workspace_path).join(format!(".setup-ran-{}", test_run_id));
     let mut found = false;
     for _ in 0..100 {
         if marker_path.exists() {
@@ -543,7 +568,9 @@ touch "${WORKTREE_PATH}/.setup-ran"
     assert!(found, "setup script should have created marker file");
 
     // Verify env vars were set correctly
-    let env_content = std::fs::read_to_string("/tmp/setup-env-test").expect("read env test file");
+    let env_file_path =
+        PathBuf::from(workspace_path).join(format!("setup-env-{}.txt", test_run_id));
+    let env_content = std::fs::read_to_string(&env_file_path).expect("read env test file");
     assert!(
         env_content.contains("MAIN_CHECKOUT="),
         "MAIN_CHECKOUT should be set"
@@ -565,8 +592,8 @@ touch "${WORKTREE_PATH}/.setup-ran"
     let failing_script = r#"#!/bin/sh
 exit 1
 "#;
-    let create_resp2 = uds_rpc(
-        &socket,
+    let create_resp2 = wss_rpc(
+        &mut wss,
         2,
         "workspace.create",
         json!({
@@ -586,14 +613,22 @@ exit 1
     );
 
     // Test that skipWorktree workspace does not execute the script
-    let create_resp3 = uds_rpc(
-        &socket,
+    let skip_marker_id = Uuid::new_v4().simple().to_string();
+    let skip_script = format!(
+        r#"#!/bin/sh
+touch "${{WORKTREE_PATH}}/.should-not-run-{}"
+"#,
+        skip_marker_id
+    );
+
+    let create_resp3 = wss_rpc(
+        &mut wss,
         3,
         "workspace.create",
         json!({
             "title": "test-skip-worktree",
             "repositoryPath": repo_path.to_string_lossy(),
-            "setupScript": "touch /tmp/should-not-run",
+            "setupScript": skip_script,
             "skipWorktree": true
         }),
     )
@@ -608,13 +643,15 @@ exit 1
 
     // Give it time to potentially run (it shouldn't)
     tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The skip-worktree workspace shouldn't have a worktree path, but check workspace dir
+    let workspaces_dir = data_dir.join("workspaces").join(workspace_id);
+    let skip_marker_path = workspaces_dir.join(format!(".should-not-run-{}", skip_marker_id));
     assert!(
-        !PathBuf::from("/tmp/should-not-run").exists(),
+        !skip_marker_path.exists(),
         "skipWorktree should not execute setup script"
     );
 
     // Cleanup
-    let _ = std::fs::remove_file("/tmp/setup-env-test");
-    let _ = std::fs::remove_file("/tmp/should-not-run");
     let _ = std::fs::remove_dir_all(&repo_path);
 }
