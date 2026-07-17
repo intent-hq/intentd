@@ -836,6 +836,20 @@ impl Store {
             .map_err(|e| Error::Internal(format!("set interrupted resolution failed: {e}")))?;
         Ok(res.rows_affected() > 0)
     }
+
+    /// Reset an interrupted agent row back to pending (resolution=NULL, resolved_at=NULL).
+    /// Used when a resume attempt claimed the row but failed post-claim, to restore
+    /// retryability. Returns `true` if a row was updated.
+    pub async fn reset_interrupted_resolution(&self, agent_id: &AgentId) -> Result<bool> {
+        let sql = "UPDATE interrupted_agent SET resolution = 'pending', resolved_at = NULL \
+                   WHERE agent_id = ?";
+        let res = sqlx::query(sql)
+            .bind(&agent_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("reset interrupted resolution failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
 }
 
 /// Input row for [`Store::replace_agent_messages`]: borrowed refs to the

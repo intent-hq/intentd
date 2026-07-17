@@ -3841,10 +3841,13 @@ fn validate_message_role(role: &str) -> Result<()> {
 }
 
 impl Services {
-    /// Resume an interrupted agent (INT-41 phase 2): mark row `resumed`, re-register
-    /// parent completion watch when the agent was delegated, then deliver a
-    /// continuation message via `agent.sendMessage`. Delivery failures leave the
-    /// row pending so the caller can retry.
+    /// Resume an interrupted agent (INT-41 phase 2): atomically claim the row, re-register
+    /// parent completion watch when delegated, then deliver a continuation message.
+    ///
+    /// Claim-then-act semantics prevent concurrent resume races (exactly-one-winner).
+    /// If any post-claim step fails (agent_send_message, session lookup), the row is
+    /// reset to pending (resolution=NULL) to restore retryability, and the error is
+    /// returned loudly.
     pub async fn resume_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
         // Verify the agent is in pending interrupted state (O(1) query)
         let interrupted = self
@@ -3872,6 +3875,17 @@ impl Services {
             )));
         }
 
+        // Helper to reset the row to pending if post-claim steps fail
+        let reset_to_pending = || async {
+            if let Err(e) = self.store.reset_interrupted_resolution(agent_id).await {
+                tracing::warn!(
+                    "Failed to reset interrupted_agent row to pending for {}: {}",
+                    agent_id,
+                    e
+                );
+            }
+        };
+
         // Rehydrate delegation groups for this workspace (idempotent, best-effort).
         // Groups are sealed on rehydration since the original parent turn is gone.
         // Corrupted rows are logged at warn but do NOT fail the resume: the agent can
@@ -3886,7 +3900,13 @@ impl Services {
         }
 
         // Load the session to check for delegation metadata
-        let session = self.store.get_agent_session(agent_id).await?;
+        let session = match self.store.get_agent_session(agent_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                reset_to_pending().await;
+                return Err(e);
+            }
+        };
 
         // Re-register parent completion watch if the agent was delegated
         if let Some(parent_id) = &session.parent_agent_id {
@@ -3955,20 +3975,25 @@ impl Services {
 
         // Use the agent_send_message machinery to deliver the message
         // (lazily respawns provider and resumes via ACP session/load)
-        self.agent_send_message(
-            workspace_id.clone(),
-            agent_id.clone(),
-            continuation.to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await?;
+        if let Err(e) = self
+            .agent_send_message(
+                workspace_id.clone(),
+                agent_id.clone(),
+                continuation.to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        {
+            reset_to_pending().await;
+            return Err(e);
+        }
 
         Ok(())
     }
