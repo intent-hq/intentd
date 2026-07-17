@@ -271,6 +271,27 @@ fn create_test_repo() -> PathBuf {
         .status()
         .expect("git commit spawn");
     assert!(status.success(), "git commit failed");
+
+    // Commit a setup script in .intent/config.json to test inheritance
+    std::fs::create_dir_all(repo_path.join(".intent")).expect("create .intent dir");
+    std::fs::write(
+        repo_path.join(".intent/config.json"),
+        r#"{"setupScript": "pnpm install"}"#,
+    )
+    .expect("write config");
+    let status = std::process::Command::new("git")
+        .args(["add", ".intent/config.json"])
+        .current_dir(&repo_path)
+        .status()
+        .expect("git add config spawn");
+    assert!(status.success(), "git add config failed");
+    let status = std::process::Command::new("git")
+        .args(["commit", "-m", "add setup script"])
+        .current_dir(&repo_path)
+        .status()
+        .expect("git commit config spawn");
+    assert!(status.success(), "git commit config failed");
+
     repo_path
 }
 
@@ -316,15 +337,22 @@ async fn setup_script_repo_config_sole_source() {
         "workspace DB row should not have setupScript"
     );
 
-    // Assert the repo config file exists and contains the script
-    let config_path = repo_path.join(".intent/config.json");
-    assert!(config_path.exists(), "repo config should exist");
-    let config_content = std::fs::read_to_string(&config_path).expect("read config");
+    // Assert the config file exists in the NEW WORKTREE (not repo root).
+    // The worktree is provisioned under <data_dir>/workspaces/<workspace_id>/<repo_slug>.
+    let workspace_path = create_resp["result"]["workspace"]["worktreePath"]
+        .as_str()
+        .expect("worktreePath should be set");
+    let worktree_config_path = PathBuf::from(workspace_path).join(".intent/config.json");
+    assert!(
+        worktree_config_path.exists(),
+        "worktree config should exist"
+    );
+    let config_content = std::fs::read_to_string(&worktree_config_path).expect("read config");
     let config_json: Value = serde_json::from_str(&config_content).expect("parse config");
     assert_eq!(
         config_json["setupScript"],
         json!("npm install"),
-        "repo config should have setupScript"
+        "worktree config should have the explicit setupScript"
     );
 
     // Get server fingerprint and connect via WSS
@@ -389,13 +417,14 @@ async fn setup_script_repo_config_sole_source() {
         "updatedAt should be present as number"
     );
 
-    // Assert the repo config file was updated
-    let updated_content = std::fs::read_to_string(&config_path).expect("read updated config");
+    // Assert the repo config file in the worktree was updated
+    let updated_content =
+        std::fs::read_to_string(&worktree_config_path).expect("read updated config");
     let updated_json: Value = serde_json::from_str(&updated_content).expect("parse updated config");
     assert_eq!(
         updated_json["setupScript"],
         json!("yarn install"),
-        "repo config should be updated"
+        "worktree repo config should be updated"
     );
 
     // Test getSetupScript now returns the updated value
@@ -412,7 +441,8 @@ async fn setup_script_repo_config_sole_source() {
         "getSetupScript should return updated value"
     );
 
-    // Create another workspace from the same repo WITHOUT an explicit script
+    // Create another workspace from the same repo WITHOUT an explicit script.
+    // It should inherit the committed setupScript from the repo's main branch.
     let create_resp2 = uds_rpc(
         &socket,
         3,
@@ -428,7 +458,7 @@ async fn setup_script_repo_config_sole_source() {
         .unwrap()
         .to_string();
 
-    // The new workspace should inherit the repo config script
+    // The new workspace should inherit the committed repo config script (pnpm install)
     let get_resp3 = wss_rpc(
         &mut ws,
         13,
@@ -438,8 +468,8 @@ async fn setup_script_repo_config_sole_source() {
     .await;
     assert_eq!(
         get_resp3["result"]["setupScript"]["script"],
-        json!("yarn install"),
-        "new workspace should inherit repo config script"
+        json!("pnpm install"),
+        "new workspace should inherit committed repo config script from main branch"
     );
 
     // Cleanup

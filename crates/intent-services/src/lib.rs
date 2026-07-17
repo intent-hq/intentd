@@ -6057,31 +6057,10 @@ impl WorkspaceApi for Services {
                     // The workspace DB row's `setup_script` column is retired from
                     // the write path — it stays NULL (wire compat) and the read path
                     // (§5.25) routes through the repo config with a legacy fallback.
-                    if let Some(explicit) = input.setup_script.clone().filter(|s| !s.is_empty()) {
-                        // Fail loudly when an explicit script cannot be persisted:
-                        // missing repository/worktree path or write failure both return
-                        // errors to the client (create fails). Creates WITHOUT an explicit
-                        // script keep the tolerant read-only behavior.
-                        // Repo config lives in the repository root (shared across worktrees).
-                        // For worktree-only workspaces (no repositoryPath), use worktreePath.
-                        let repo_path = input
-                            .repository_path
-                            .as_deref()
-                            .or(input.worktree_path.as_deref())
-                            .filter(|p| !p.is_empty())
-                            .map(PathBuf::from)
-                            .ok_or_else(|| {
-                                Error::InvalidParams(
-                                    "setupScript requires repositoryPath or worktreePath; cannot persist".to_string(),
-                                )
-                            })?;
-                        let mut repo_config = crate::repo_config::read_repo_config(&repo_path).await;
-                        // Only write if the script differs (no-op when identical).
-                        if repo_config.setup_script.as_deref() != Some(explicit.as_str()) {
-                            repo_config.setup_script = Some(explicit);
-                            crate::repo_config::write_repo_config(&repo_path, repo_config).await?;
-                        }
-                    }
+                    // Stash explicit setupScript for write AFTER worktree provisioning
+                    // (must land in the workspace's worktree, not the repo root, to be
+                    // visible as a committable change in the workspace).
+                    let explicit_setup_script = input.setup_script.clone().filter(|s| !s.is_empty());
                     let mut ws = Workspace {
                         id,
                         title,
@@ -6197,6 +6176,24 @@ impl WorkspaceApi for Services {
                         }
                     }
                     store.insert_workspace(&ws).await?;
+                    // Write explicit setupScript to the workspace's worktree (AFTER provisioning
+                    // so git_ops::worktree_path resolves correctly). Must land as a committable
+                    // change in the workspace, visible in the workspace's diff view.
+                    if let Some(explicit) = explicit_setup_script {
+                        // Use git_ops::worktree_path (worktreePath first, repositoryPath fallback)
+                        // to match getSetupScript/saveSetupScript and other repoConfig.* methods.
+                        let repo_path = git_ops::worktree_path(&ws).ok_or_else(|| {
+                            Error::InvalidParams(
+                                "setupScript requires worktreePath or repositoryPath; cannot persist".to_string(),
+                            )
+                        })?;
+                        let mut repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                        // Only write if the script differs (no-op when identical).
+                        if repo_config.setup_script.as_deref() != Some(explicit.as_str()) {
+                            repo_config.setup_script = Some(explicit);
+                            crate::repo_config::write_repo_config(&repo_path, repo_config).await?;
+                        }
+                    }
                     // Write the legacy `<root>/<id>/.workspace/workspace.json`
                     // file so renderer paths (FE `FileSystemWorkspaceRepository`)
                     // find their per-workspace metadata without ENOENT spam.
@@ -7274,15 +7271,9 @@ impl WorkspaceApi for Services {
             // SetupScript record from the string. Legacy fallback: if repo config
             // is empty but the workspace DB row still has a setupScript (pre-change
             // data), return it read-only — never write it back to the DB.
-            // Repo config lives in the repository root (shared across worktrees).
-            // For worktree-only workspaces (no repositoryPath), use worktreePath.
-            let repo_path = ws
-                .repository_path
-                .as_ref()
-                .or(ws.worktree_path.as_ref())
-                .filter(|p| !p.is_empty())
-                .map(PathBuf::from);
-            if let Some(repo_path) = repo_path {
+            // Use git_ops::worktree_path (worktreePath first, repositoryPath fallback)
+            // to match workspace.create and saveSetupScript (§5.25 + §5.33 consistency).
+            if let Some(repo_path) = git_ops::worktree_path(&ws) {
                 let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
                 if let Some(script_str) = repo_config.setup_script.filter(|s| !s.is_empty()) {
                     // Repo config has a script — derive updatedAt from file mtime (epoch ms).
@@ -7321,20 +7312,14 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             // Write to repo config instead of the DB row (§5.25 sole source of truth).
             let ws = store.get_workspace(&id).await?;
-            // Repo config lives in the repository root (shared across worktrees).
-            // For worktree-only workspaces (no repositoryPath), use worktreePath.
-            let repo_path_buf = ws
-                .repository_path
-                .as_ref()
-                .or(ws.worktree_path.as_ref())
-                .filter(|p| !p.is_empty())
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    Error::InvalidParams(
-                        "workspace has no repositoryPath or worktreePath; cannot persist setup script"
-                            .to_string(),
-                    )
-                })?;
+            // Use git_ops::worktree_path (worktreePath first, repositoryPath fallback)
+            // to match workspace.create and getSetupScript (§5.25 + §5.33 consistency).
+            let repo_path_buf = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::InvalidParams(
+                    "workspace has no worktreePath or repositoryPath; cannot persist setup script"
+                        .to_string(),
+                )
+            })?;
             let mut repo_config = crate::repo_config::read_repo_config(&repo_path_buf).await;
             repo_config.setup_script = if script.is_empty() {
                 None
