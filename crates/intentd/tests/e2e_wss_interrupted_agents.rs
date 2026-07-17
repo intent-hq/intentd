@@ -592,7 +592,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     assert_eq!(interrupted["workspaceId"].as_str(), Some(ws_id));
     assert_eq!(
         interrupted["agentName"].as_str(),
-        Some("Graceful Test Agent")
+        Some("Graceful Agent")
     );
     assert_eq!(
         interrupted["prevStatus"].as_str(),
