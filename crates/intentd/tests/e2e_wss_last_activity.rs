@@ -22,6 +22,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::DateTime;
 use futures_util::{SinkExt, StreamExt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -450,8 +451,13 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
         .as_str()
         .expect("lastActivity string");
     if let Some(init) = &initial_activity {
+        // Parse both as RFC3339 DateTimes to compare instants (lexicographic comparison
+        // can be wrong with differing fractional-second precision).
+        let init_dt =
+            DateTime::parse_from_rfc3339(init.as_str()).expect("parse initial lastActivity");
+        let new_dt = DateTime::parse_from_rfc3339(new_activity).expect("parse new lastActivity");
         assert!(
-            new_activity > init.as_str(),
+            new_dt > init_dt,
             "lastActivity did not advance: {} -> {}",
             init,
             new_activity
