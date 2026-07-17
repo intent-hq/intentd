@@ -633,9 +633,24 @@ impl Services {
             }
         });
 
-        // Store the abort handle with generation so a fresh schedule can cancel this one.
+        // Store the abort handle with generation. Only insert if no entry exists or our
+        // generation is newer (prevents older schedules from overwriting newer ones).
         if let Ok(mut map) = self.last_activity_debouncers.lock() {
-            map.insert(workspace_id, (gen, handle.abort_handle()));
+            let should_insert = map
+                .get(&workspace_id)
+                .map(|(existing_gen, _)| gen > *existing_gen)
+                .unwrap_or(true);
+
+            if should_insert {
+                if let Some((_, old_handle)) =
+                    map.insert(workspace_id, (gen, handle.abort_handle()))
+                {
+                    old_handle.abort();
+                }
+            } else {
+                // Our generation is older; abort this task immediately.
+                handle.abort();
+            }
         }
     }
 

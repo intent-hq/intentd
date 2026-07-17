@@ -18,6 +18,32 @@ use crate::Services;
 /// to prevent parallel test races (env::set_var is process-global).
 static ENV_DEBOUNCE_LOCK: Mutex<()> = Mutex::new(());
 
+/// RAII guard for debounce env var: holds the lock, sets the var, and restores
+/// on drop to prevent leakage into other tests.
+struct DebounceEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior: Option<std::ffi::OsString>,
+}
+
+impl DebounceEnvGuard {
+    fn new(millis: &str) -> Self {
+        let _lock = ENV_DEBOUNCE_LOCK.lock().unwrap();
+        let prior = std::env::var_os("LAST_ACTIVITY_DEBOUNCE_TEST_MS");
+        std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", millis);
+        Self { _lock, prior }
+    }
+}
+
+impl Drop for DebounceEnvGuard {
+    fn drop(&mut self) {
+        if let Some(val) = &self.prior {
+            std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", val);
+        } else {
+            std::env::remove_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS");
+        }
+    }
+}
+
 struct TempDb {
     path: PathBuf,
 }
@@ -12661,8 +12687,7 @@ mod last_activity_events {
     /// `workspace:updated { lastActivity }` event is emitted (after debounce).
     #[tokio::test]
     async fn raise_attention_emits_last_activity() {
-        let _guard = ENV_DEBOUNCE_LOCK.lock().unwrap();
-        std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "100");
+        let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
         let mut sub = subscribe(&h);
 
@@ -12691,8 +12716,7 @@ mod last_activity_events {
     /// attention actually changed (idempotent no-op on already-clear).
     #[tokio::test]
     async fn dismiss_attention_idempotent() {
-        let _guard = ENV_DEBOUNCE_LOCK.lock().unwrap();
-        std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "100");
+        let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
 
         // Raise first so we have something to dismiss.
@@ -12734,8 +12758,7 @@ mod last_activity_events {
     /// the latest derived value.
     #[tokio::test]
     async fn burst_coalescing() {
-        let _guard = ENV_DEBOUNCE_LOCK.lock().unwrap();
-        std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "200");
+        let _guard = DebounceEnvGuard::new("200");
         let h = harness().await;
         let mut sub = subscribe(&h);
 
@@ -12789,8 +12812,7 @@ mod last_activity_events {
     /// when the token tallies actually changed (idempotent re-scan is silent).
     #[tokio::test]
     async fn token_usage_scan_only_on_change() {
-        let _guard = ENV_DEBOUNCE_LOCK.lock().unwrap();
-        std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "100");
+        let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
 
         // First scan (no prior usage, should emit).
