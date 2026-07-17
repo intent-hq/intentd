@@ -475,3 +475,146 @@ async fn setup_script_repo_config_sole_source() {
     // Cleanup
     let _ = std::fs::remove_dir_all(&repo_path);
 }
+
+/// WSS e2e coverage for setup script execution: workspace.create with setupScript
+/// runs it in the worktree, env vars are visible, failing script doesn't fail create.
+#[tokio::test]
+async fn setup_script_executes_on_create() {
+    let data_dir = temp_data_dir();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let repo_path = create_test_repo();
+
+    // Create a workspace with a setup script that writes a marker file + env vars
+    let marker_script = r#"#!/bin/sh
+set -e
+echo "MAIN_CHECKOUT=${MAIN_CHECKOUT}" > /tmp/setup-env-test
+echo "WORKTREE_PATH=${WORKTREE_PATH}" >> /tmp/setup-env-test
+echo "BRANCH_NAME=${BRANCH_NAME}" >> /tmp/setup-env-test
+echo "SOURCE_BRANCH=${SOURCE_BRANCH}" >> /tmp/setup-env-test
+touch "${WORKTREE_PATH}/.setup-ran"
+"#;
+    let create_resp = uds_rpc(
+        &socket,
+        1,
+        "workspace.create",
+        json!({
+            "title": "test-setup-exec",
+            "repositoryPath": repo_path.to_string_lossy(),
+            "setupScript": marker_script
+        }),
+    )
+    .await;
+
+    // Assert workspace.create succeeded
+    assert_eq!(create_resp["jsonrpc"], json!("2.0"));
+    assert_eq!(create_resp["id"], json!(1));
+    assert!(
+        create_resp["result"]["workspace"]["id"].is_string(),
+        "create should succeed even if script runs"
+    );
+
+    let _workspace_id = create_resp["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let workspace_path = create_resp["result"]["workspace"]["worktreePath"]
+        .as_str()
+        .expect("worktreePath should be set");
+
+    // Poll for the marker file (script execution is fire-and-forget, may take a moment)
+    let marker_path = PathBuf::from(workspace_path).join(".setup-ran");
+    let mut found = false;
+    for _ in 0..100 {
+        if marker_path.exists() {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(found, "setup script should have created marker file");
+
+    // Verify env vars were set correctly
+    let env_content = std::fs::read_to_string("/tmp/setup-env-test").expect("read env test file");
+    assert!(
+        env_content.contains("MAIN_CHECKOUT="),
+        "MAIN_CHECKOUT should be set"
+    );
+    assert!(
+        env_content.contains(&format!("WORKTREE_PATH={}", workspace_path)),
+        "WORKTREE_PATH should match workspace path"
+    );
+    assert!(
+        env_content.contains("BRANCH_NAME="),
+        "BRANCH_NAME should be set"
+    );
+    assert!(
+        env_content.contains("SOURCE_BRANCH="),
+        "SOURCE_BRANCH should be set"
+    );
+
+    // Test that a failing script doesn't fail workspace.create
+    let failing_script = r#"#!/bin/sh
+exit 1
+"#;
+    let create_resp2 = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({
+            "title": "test-setup-fail",
+            "repositoryPath": repo_path.to_string_lossy(),
+            "setupScript": failing_script
+        }),
+    )
+    .await;
+
+    // Assert workspace.create succeeded even with failing script
+    assert_eq!(create_resp2["jsonrpc"], json!("2.0"));
+    assert_eq!(create_resp2["id"], json!(2));
+    assert!(
+        create_resp2["result"]["workspace"]["id"].is_string(),
+        "create should succeed even when setup script fails"
+    );
+
+    // Test that skipWorktree workspace does not execute the script
+    let create_resp3 = uds_rpc(
+        &socket,
+        3,
+        "workspace.create",
+        json!({
+            "title": "test-skip-worktree",
+            "repositoryPath": repo_path.to_string_lossy(),
+            "setupScript": "touch /tmp/should-not-run",
+            "skipWorktree": true
+        }),
+    )
+    .await;
+
+    assert_eq!(create_resp3["jsonrpc"], json!("2.0"));
+    assert_eq!(create_resp3["id"], json!(3));
+    assert!(
+        create_resp3["result"]["workspace"]["id"].is_string(),
+        "skipWorktree create should succeed"
+    );
+
+    // Give it time to potentially run (it shouldn't)
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !PathBuf::from("/tmp/should-not-run").exists(),
+        "skipWorktree should not execute setup script"
+    );
+
+    // Cleanup
+    let _ = std::fs::remove_file("/tmp/setup-env-test");
+    let _ = std::fs::remove_file("/tmp/should-not-run");
+    let _ = std::fs::remove_dir_all(&repo_path);
+}

@@ -5934,7 +5934,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             // workspace.create carries no workspaceId → "" sentinel scope (§5.1).
             let op_store = store.clone();
-            with_idempotency(
+            let result = with_idempotency(
                 &store,
                 "",
                 idempotency_key,
@@ -6518,7 +6518,122 @@ impl WorkspaceApi for Services {
                     })
                 },
             )
-            .await
+            .await;
+            // Execute the workspace setup script (fire-and-forget): after worktree
+            // provisioning and repo-config write, read the effective setup script
+            // (explicit request param > repo config) and run it in a "Setup" terminal.
+            // Execution is non-blocking (tokio::spawn) and must never fail the create.
+            // Skipped when skipWorktree or no worktree was provisioned.
+            // Clone pty and bus before they're potentially consumed.
+            let pty_for_setup = self.pty.clone();
+            let bus_for_setup = self.event_bus.clone();
+            if let Ok(ref create_result) = result {
+                if !create_result.workspace.skip_worktree {
+                    if let Some(worktree_path_buf) =
+                        crate::git_ops::worktree_path(&create_result.workspace)
+                    {
+                        // Read effective setup script (repo config with legacy DB fallback,
+                        // matching get_setup_script resolution).
+                        let repo_config =
+                            crate::repo_config::read_repo_config(&worktree_path_buf).await;
+                        let effective_script = repo_config
+                            .setup_script
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| {
+                                create_result
+                                    .workspace
+                                    .setup_script
+                                    .as_ref()
+                                    .and_then(|ss| {
+                                        let script = ss.script.trim();
+                                        if script.is_empty() {
+                                            None
+                                        } else {
+                                            Some(script.to_string())
+                                        }
+                                    })
+                            });
+                        if let Some(script) = effective_script {
+                            // Spawn the setup script in a "Setup" terminal (fire-and-forget).
+                            // Write the script to a temp file and execute it via sh.
+                            let workspace_id = create_result.workspace.id.clone();
+                            let worktree_path = worktree_path_buf.to_string_lossy().to_string();
+                            let repo_path = create_result
+                                .workspace
+                                .repository_path
+                                .clone()
+                                .unwrap_or_default();
+                            let branch_name = create_result.workspace.branch.clone();
+                            let source_branch = create_result
+                                .workspace
+                                .base_ref
+                                .clone()
+                                .unwrap_or_else(|| "main".to_string());
+                            tokio::spawn(async move {
+                                tracing::info!(
+                                    workspace = %workspace_id.as_str(),
+                                    script_length = script.len(),
+                                    worktree = %worktree_path,
+                                    "executing setup script in background"
+                                );
+                                // Write script to a temp file
+                                let script_id = uuid::Uuid::new_v4();
+                                let temp_script_path = std::env::temp_dir()
+                                    .join(format!("setup-{}.sh", script_id.simple()));
+                                if let Err(e) = tokio::fs::write(&temp_script_path, &script).await {
+                                    tracing::warn!(
+                                        workspace = %workspace_id.as_str(),
+                                        error = %e,
+                                        "failed to write setup script to temp file"
+                                    );
+                                    return;
+                                }
+                                // Spawn directly via PtyHost with args to avoid command parsing issues
+                                let mut spec =
+                                    intent_pty::SpawnSpec::new(workspace_id.as_str(), "sh");
+                                spec.args = vec![temp_script_path.to_string_lossy().to_string()];
+                                spec.size = intent_pty::PtySize { rows: 24, cols: 80 };
+                                spec.cwd = Some(std::path::PathBuf::from(&worktree_path));
+                                spec.env = vec![
+                                    ("MAIN_CHECKOUT".to_string(), repo_path),
+                                    ("WORKTREE_PATH".to_string(), worktree_path.clone()),
+                                    ("BRANCH_NAME".to_string(), branch_name),
+                                    ("SOURCE_BRANCH".to_string(), source_branch),
+                                ];
+                                match pty_for_setup.spawn(spec) {
+                                    Ok(pty_id) => {
+                                        let terminal_id = pty_id.to_string();
+                                        tracing::info!(
+                                            workspace = %workspace_id.as_str(),
+                                            terminal_id = %terminal_id,
+                                            "setup script terminal spawned"
+                                        );
+                                        // Spawn output stream to fan setup script output to event bus
+                                        crate::terminal_ops::spawn_output_stream(
+                                            pty_for_setup.clone(),
+                                            bus_for_setup,
+                                            workspace_id.clone(),
+                                            pty_id,
+                                            terminal_id,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            workspace = %workspace_id.as_str(),
+                                            error = %e,
+                                            "failed to spawn setup script terminal"
+                                        );
+                                    }
+                                }
+                                // Best-effort cleanup of temp script file (after script completes)
+                                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                                let _ = tokio::fs::remove_file(&temp_script_path).await;
+                            });
+                        }
+                    }
+                }
+            }
+            result
         })
     }
 
