@@ -6,5 +6,17 @@
 # cross-binary load, especially with llvm-cov instrumentation overhead. A
 # single retry lets load-induced timing flakes pass (reported as FLAKY in the
 # run summary) while genuine failures still fail deterministically.
+#
+# Test groups: Heavy daemon-spawning e2e binaries (delegation group persist,
+# interrupted agents resume, serve --resume-all) serialize among themselves
+# (max-threads = 1) to avoid load-induced mock agent death in CI. The rest of
+# the suite runs in parallel. Evidence: INT-41 CI investigation showed
+# load-correlated silent mock death (empty stderr, ~4s TRY 1 fail, ~11s TRY 2
+# pass under NEXTEST_TEST_THREADS=8 + llvm-cov), delay-invariant, not locally
+# reproducible. Mechanism not pinned; serialization removes the load condition.
 [profile.default]
 retries = 1
+
+[[profile.default.overrides]]
+filter = 'binary_id(=intentd::e2e_wss_delegation_group_persist) | binary_id(=intentd::e2e_wss_interrupted_agents) | binary_id(=intentd::e2e_wss_resolve_interrupted) | binary_id(=intentd::e2e_wss_serve_resume_all)'
+threads-required = 'num-test-threads'
