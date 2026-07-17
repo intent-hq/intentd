@@ -417,15 +417,30 @@ async fn interrupted_agents_persisted_across_restart() {
     assert_eq!(agents.len(), 1, "still 1 interrupted agent (idempotent)");
 }
 
+/// Mock-agent gate (parity with the UDS E2E suite).
+fn gate(test: &str) -> Option<String> {
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping {test}: node not on PATH");
+        return None;
+    }
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("skipping {test}: mock script missing at {script}");
+        return None;
+    }
+    Some(script)
+}
+
 #[tokio::test]
 async fn graceful_shutdown_captures_interrupted_agents() {
-    // Fixture check: rely on the same mock ACP agent as the full-turn test.
-    let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/mock-acp-agent.mjs");
-    if !script.exists() {
-        eprintln!("skipping graceful-shutdown e2e: mock ACP agent missing at {script:?}");
+    let Some(script) = gate("graceful_shutdown_captures_interrupted_agents") else {
         return;
-    }
+    };
 
     let data_dir = temp_data_dir();
     let port = free_port();
@@ -448,6 +463,12 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     }
 
     // Phase 1: Boot daemon with mock ACP provider.
+    // blockUntilCancel makes the mock stream a chunk then park the prompt unresolved,
+    // keeping the agent in the busy set until session/cancel (which shutdown will send).
+    let behavior = json!({
+        "blockUntilCancel": true
+    })
+    .to_string();
     let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd1.arg("serve")
         .arg("--listen")
@@ -455,8 +476,8 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", &port_s)
-        .env("MOCK_SLEEP_MS", "5000") // 5s turn to give us time to shutdown mid-turn
-        .env("AUGMENT_MCP_MOCK_AGENT_SCRIPT", &script)
+        .env("MOCK_AGENT_SCRIPT_PATH", &script)
+        .env("MOCK_AGENT_BEHAVIOR", &behavior)
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -514,9 +535,8 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // Wait for the agent to be observably in-flight: look for agent:stream:chunk
-    // (which means the turn has started and the agent is Active). The mock takes
-    // a moment to boot on CI, so use a generous per-event timeout.
+    // Wait for the agent to be observably in-flight: blockUntilCancel streams a chunk
+    // then parks, so seeing agent:stream:chunk means the agent is in the busy set.
     let mut saw_chunk = false;
     for _ in 0..20 {
         let frame = wss_event(&mut sub, 30).await;
@@ -527,12 +547,14 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     }
     assert!(
         saw_chunk,
-        "agent did not start streaming (mid-turn capture relies on this)"
+        "agent did not stream chunk (mid-turn capture relies on this)"
     );
 
-    // Now trigger graceful shutdown via system.shutdown RPC (SIGTERM equivalent).
-    let shutdown_result = wss_rpc(&mut rpc, 13, "system.shutdown", json!({})).await;
-    assert!(shutdown_result.get("shutdownRequested").is_some());
+    // Now trigger graceful shutdown via system.shutdown RPC over UDS (system.*
+    // methods are not exposed via WSS, only via local UDS — see ws.rs:526-527).
+    let shutdown_result = uds_rpc(&socket, 13, "system.shutdown", json!({})).await;
+    assert_eq!(shutdown_result["result"].get("ok"), Some(&json!(true)));
+    assert_eq!(shutdown_result["result"].get("stopping"), Some(&json!(true)));
 
     // Wait for daemon to exit gracefully (up to 10 seconds).
     // daemon.wait() is blocking, so we poll for process death.

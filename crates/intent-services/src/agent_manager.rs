@@ -2362,9 +2362,14 @@ impl AgentManager {
                 }
             };
             // Serialize the status via serde to match the DB form (e.g., "active", "Waiting").
-            // If encoding fails, skip this agent (do not persist an undocumented status string).
-            let prev_str = match serde_json::to_string(&prev_status) {
-                Ok(json) => json.trim_matches('"').to_string(),
+            // If encoding fails or produces a non-string, skip this agent (do not persist an
+            // undocumented status string).
+            let prev_str = match serde_json::to_value(prev_status) {
+                Ok(serde_json::Value::String(s)) => s,
+                Ok(other) => {
+                    tracing::warn!(agent_id = %id, status = ?prev_status, encoded = ?other, "graceful shutdown: status encoded to non-string, skipping interrupted_agent row");
+                    continue;
+                }
                 Err(e) => {
                     tracing::warn!(agent_id = %id, status = ?prev_status, error = %e, "graceful shutdown: status encoding failed, skipping interrupted_agent row");
                     continue;
