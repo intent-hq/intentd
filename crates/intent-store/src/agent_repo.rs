@@ -202,10 +202,7 @@ impl Store {
         // Provider is immutable only after first real use (once acp_session_id
         // is set). This allows cross-provider model switches before the first
         // turn spawns a provider process.
-        if current.acp_session_id.is_some()
-            && current.provider.is_some()
-            && s.provider != current.provider
-        {
+        if current.acp_session_id.is_some() && s.provider != current.provider {
             return Err(Error::Internal(
                 "agent provider is immutable once set (first real use)".to_string(),
             ));

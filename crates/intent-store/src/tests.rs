@@ -1878,6 +1878,34 @@ async fn agent_provider_is_immutable_once_set() {
 }
 
 #[tokio::test]
+async fn agent_provider_immutable_after_acp_session_even_from_none() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+
+    // Provider starts None, and we set acp_session_id while provider is still None.
+    store
+        .set_acp_session_id(&ws, &agent_id, "acp-1")
+        .await
+        .expect("set acp session id");
+
+    // Now trying to set provider from None→Some should be rejected.
+    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(s.provider, None);
+    s.provider = Some("auggie".to_string());
+    assert!(store.update_agent_session(&ws, &s).await.is_err());
+}
+
+#[tokio::test]
 async fn client_upsert_sets_first_seen_once_and_touches_last_seen() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
