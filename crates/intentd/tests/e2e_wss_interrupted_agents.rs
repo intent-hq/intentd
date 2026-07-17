@@ -5,7 +5,8 @@
 //! verifies that `agent.listInterrupted` returns the interrupted agents.
 //!
 //! Coverage:
-//! - Interrupted agents are persisted across restart
+//! - Interrupted agents are persisted across restart (crash)
+//! - Interrupted agents are persisted on graceful shutdown (SIGTERM)
 //! - `agent.listInterrupted` returns pending rows with joined workspace/agent data
 //! - Terminal/pending sessions are not captured
 //! - Idempotent inserts on second restart
@@ -389,6 +390,175 @@ async fn interrupted_agents_persisted_across_restart() {
     let result = wss_rpc(&mut ws, 4, "agent.listInterrupted", json!({})).await;
     let agents = result["agents"].as_array().expect("agents array 2");
     assert_eq!(agents.len(), 1, "still 1 interrupted agent (idempotent)");
+}
+
+#[tokio::test]
+async fn graceful_shutdown_captures_interrupted_agents() {
+    let data_dir = temp_data_dir();
+    let port = free_port();
+    let port_s = port.to_string();
+    let listen = "both";
+    let socket = data_dir.join("intentd.sock");
+
+    // Phase 1: Boot daemon, create a workspace, create an agent session and mark it busy.
+    let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd1.arg("serve")
+        .arg("--listen")
+        .arg(listen)
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_TCP_PORT", &port_s)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
+        ));
+    #[cfg(unix)]
+    cmd1.process_group(0);
+    let mut daemon = cmd1.spawn().expect("spawn intentd serve");
+    if !await_uds(&socket).await {
+        let log_path = data_dir.join("daemon.log");
+        if let Ok(log) = std::fs::read_to_string(&log_path) {
+            eprintln!("Daemon log:\n{}", log);
+        }
+        panic!("daemon did not start");
+    }
+
+    let ws_id = "ws-graceful-test";
+    let agent_id = format!("agent-{}", Uuid::new_v4().simple());
+
+    // Fetch fingerprint for TLS cert pinning.
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    // Open WSS connection.
+    let cfg = client_config(&fp);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // Create workspace via RPC.
+    let ws_create_result = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "id": ws_id,
+            "title": "Graceful Shutdown Test",
+            "path": data_dir.join("workspace")
+        }),
+    )
+    .await;
+    assert!(ws_create_result.get("workspace").is_some());
+
+    // Create an agent session via RPC (will be Pending).
+    let agent_create_result = wss_rpc(
+        &mut ws,
+        3,
+        "agent.create",
+        json!({
+            "agentId": agent_id,
+            "workspaceId": ws_id,
+            "name": "Graceful Test Agent",
+            "model": "test-model",
+        }),
+    )
+    .await;
+    assert!(agent_create_result.get("agent").is_some());
+
+    // Directly update the session to Active status and mark it as in-flight.
+    // This simulates a mid-turn agent that's currently processing.
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open store");
+    {
+        use intent_core::{now_iso, AgentId, AgentStatus, WorkspaceId};
+        let ts = now_iso();
+        store
+            .set_agent_session_status(
+                &WorkspaceId(ws_id.to_string()),
+                &AgentId(agent_id.clone()),
+                AgentStatus::Active,
+                true,
+                &ts,
+            )
+            .await
+            .expect("set active status");
+    }
+
+    // Now we need to trigger graceful shutdown. Use system.shutdown RPC.
+    let shutdown_result = wss_rpc(&mut ws, 4, "system.shutdown", json!({})).await;
+    assert!(shutdown_result.get("shutdownRequested").is_some());
+
+    // Wait for daemon to exit gracefully (up to 10 seconds).
+    // daemon.wait() is blocking, so we poll for process death.
+    let exit_ok = timeout(Duration::from_secs(10), async {
+        loop {
+            match daemon.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("failed to wait for daemon: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("daemon did not exit within timeout");
+    // Graceful shutdown should exit 0.
+    assert!(exit_ok, "daemon exited non-zero");
+
+    // Phase 2: Restart daemon — should list the interrupted agent.
+    let mut cmd2 = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd2.arg("serve")
+        .arg("--listen")
+        .arg(listen)
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_TCP_PORT", &port_s)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(data_dir.join("daemon2.log")).unwrap(),
+        ));
+    #[cfg(unix)]
+    cmd2.process_group(0);
+    daemon = cmd2.spawn().expect("spawn intentd serve 2");
+    assert!(await_uds(&socket).await, "daemon did not restart");
+
+    let status = uds_rpc(&socket, 5, "system.status", json!({})).await;
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint 2")
+        .to_string();
+    let cfg = client_config(&fp);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // Phase 3: Call agent.listInterrupted over WSS.
+    let result = wss_rpc(&mut ws, 6, "agent.listInterrupted", json!({})).await;
+
+    // Verify the response shape.
+    let agents = result["agents"].as_array().expect("agents array");
+    assert_eq!(
+        agents.len(),
+        1,
+        "expected 1 interrupted agent after graceful shutdown"
+    );
+    let interrupted = &agents[0];
+    assert_eq!(interrupted["agentId"].as_str(), Some(agent_id.as_str()));
+    assert_eq!(interrupted["workspaceId"].as_str(), Some(ws_id));
+    assert_eq!(
+        interrupted["agentName"].as_str(),
+        Some("Graceful Test Agent")
+    );
+    assert_eq!(
+        interrupted["prevStatus"].as_str(),
+        Some("active"),
+        "graceful shutdown should capture Active status before settling to RuntimeIdle"
+    );
+    assert!(interrupted["interruptedAt"].is_string());
+
+    daemon.kill().ok();
+    daemon.wait().ok();
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {

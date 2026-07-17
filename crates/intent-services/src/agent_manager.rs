@@ -2334,8 +2334,52 @@ impl AgentManager {
     }
 
     /// Tear down every tracked agent (clean daemon shutdown kills all children).
+    /// Before stopping each in-flight agent, capture it as an interrupted session
+    /// so the FE modal offers resumption on next launch — same as a crash (INT-41
+    /// graceful-shutdown gap).
     pub async fn shutdown(&self) {
         let ids: Vec<AgentId> = self.handles.lock().unwrap().keys().cloned().collect();
+        let now = intent_core::now_iso();
+
+        // Capture in-flight agents before stop() settles them to RuntimeIdle.
+        for id in &ids {
+            // Only agents currently in-flight (in the busy set) need interruption rows.
+            if !self.busy.lock().unwrap().contains(id) {
+                continue;
+            }
+            // Read the workspace from agent_ws (stop() will clear it via end_turn).
+            let workspace_id = match self.agent_ws.lock().unwrap().get(id).cloned() {
+                Some(ws) => ws,
+                None => continue, // Stale busy entry (should not happen).
+            };
+            // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
+            // Use get_agent_session_status (lightweight, skips message log).
+            let prev_status = match self.services.store.get_agent_session_status(id).await {
+                Ok(status) => status,
+                Err(e) => {
+                    tracing::warn!(agent_id = %id, error = %e, "graceful shutdown: could not read session status");
+                    continue;
+                }
+            };
+            // Serialize the status via serde to match the DB form (e.g., "active", "Waiting").
+            let prev_str = match serde_json::to_string(&prev_status) {
+                Ok(json) => json.trim_matches('"').to_string(),
+                Err(_) => "unknown".to_string(),
+            };
+            // Insert the interrupted_agent row (idempotent upsert: if a prior crash captured
+            // this agent and the daemon was restarted without the FE resolving it, the row
+            // is refreshed to the latest state).
+            if let Err(e) = self
+                .services
+                .store
+                .insert_interrupted_agent(id, &workspace_id, &prev_str, &now)
+                .await
+            {
+                tracing::warn!(agent_id = %id, workspace_id = %workspace_id, error = %e, "graceful shutdown: failed to insert interrupted_agent row");
+            }
+        }
+
+        // Now stop every agent (settles to RuntimeIdle, kills children).
         for id in &ids {
             self.stop(id).await;
         }
