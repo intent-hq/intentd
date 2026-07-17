@@ -6058,23 +6058,25 @@ impl WorkspaceApi for Services {
                     // the write path — it stays NULL (wire compat) and the read path
                     // (§5.25) routes through the repo config with a legacy fallback.
                     if let Some(explicit) = input.setup_script.clone().filter(|s| !s.is_empty()) {
-                        if let Some(repo_path) = input
+                        // Fail loudly when an explicit script cannot be persisted:
+                        // missing repositoryPath or write failure both return errors
+                        // to the client (create fails). Creates WITHOUT an explicit
+                        // script keep the tolerant read-only behavior.
+                        let repo_path = input
                             .repository_path
                             .as_deref()
                             .filter(|p| !p.is_empty())
                             .map(PathBuf::from)
-                        {
-                            let mut repo_config = crate::repo_config::read_repo_config(&repo_path).await;
-                            // Only write if the script differs (no-op when identical).
-                            if repo_config.setup_script.as_deref() != Some(explicit.as_str()) {
-                                repo_config.setup_script = Some(explicit);
-                                if let Err(e) = crate::repo_config::write_repo_config(&repo_path, repo_config).await {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "workspace.create: failed to write setup script to repo config"
-                                    );
-                                }
-                            }
+                            .ok_or_else(|| {
+                                Error::InvalidParams(
+                                    "setupScript requires a repositoryPath; cannot persist".to_string(),
+                                )
+                            })?;
+                        let mut repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                        // Only write if the script differs (no-op when identical).
+                        if repo_config.setup_script.as_deref() != Some(explicit.as_str()) {
+                            repo_config.setup_script = Some(explicit);
+                            crate::repo_config::write_repo_config(&repo_path, repo_config).await?;
                         }
                     }
                     let mut ws = Workspace {
@@ -7277,8 +7279,20 @@ impl WorkspaceApi for Services {
             if let Some(repo_path) = repo_path {
                 let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
                 if let Some(script_str) = repo_config.setup_script.filter(|s| !s.is_empty()) {
-                    // Repo config has a script — return it as the authoritative value.
-                    return Ok(setup_scripts::user_script(script_str));
+                    // Repo config has a script — derive updatedAt from file mtime (epoch ms).
+                    let config_path = repo_path.join(".intent").join("config.json");
+                    let updated_at = std::fs::metadata(&config_path)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    return Ok(SetupScript {
+                        script: script_str,
+                        project_type: None,
+                        updated_at,
+                        generated_by: Some(intent_core::SetupScriptGeneratedBy::User),
+                    });
                 }
             }
             // Legacy fallback: return the DB value if present, else the default.
@@ -7314,11 +7328,16 @@ impl WorkspaceApi for Services {
             repo_config.setup_script = if script.is_empty() {
                 None
             } else {
-                Some(script.clone())
+                Some(script)
             };
+            let written_script = repo_config
+                .setup_script
+                .as_deref()
+                .unwrap_or("")
+                .to_string();
             crate::repo_config::write_repo_config(&repo_path_buf, repo_config).await?;
             // Return the §5.25 SetupScript wire shape (synthesized from the written string).
-            Ok(setup_scripts::user_script(script))
+            Ok(setup_scripts::user_script(written_script))
         })
     }
 
