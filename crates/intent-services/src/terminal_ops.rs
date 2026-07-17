@@ -323,7 +323,7 @@ fn utf8_len(b: u8) -> usize {
 
 /// Attach to a freshly created PTY and fan its output onto the bus as
 /// `terminal:data`, emitting a terminal `terminal:exit` when the stream closes.
-fn spawn_output_stream(
+pub(crate) fn spawn_output_stream(
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
     workspace_id: WorkspaceId,
