@@ -3289,6 +3289,7 @@ mod change_event_parity {
     async fn update_workspace_derives_activity_from_live_agent_state() {
         use intent_core::{WorkspaceActivity, WorkspaceApi, WorkspaceUpdate};
         let h = harness().await;
+        let _guard = DebounceEnvGuard::new("50");
 
         // Baseline: with no agents in-flight, update_workspace returns activity=idle.
         let updated = h
@@ -3343,8 +3344,8 @@ mod change_event_parity {
             WorkspaceActivity::AgentRunning,
             "during grace window, workspace_activity() still reports AgentRunning"
         );
-        // Wait for debounce window to expire (default is 3s, but tests may override).
-        tokio::time::sleep(Duration::from_millis(3500)).await;
+        // Wait for debounce window to expire (50ms test window).
+        tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(
             h.services.workspace_activity(&h.ws),
             WorkspaceActivity::Idle,
