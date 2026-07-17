@@ -6067,7 +6067,8 @@ async fn clear_completion_report_on_turn_begin() {
     assert!(!cleared, "no report on second clear");
 }
 
-/// `agent.sendMessage` emits `agent:message` with the persisted row's id.
+/// `agent_send_message_op` (store-only fallback when no AgentManager is attached)
+/// emits `agent:message` with the persisted row's id.
 #[tokio::test]
 async fn agent_send_message_emits_agent_message_event() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
@@ -6105,7 +6106,8 @@ async fn agent_send_message_emits_agent_message_event() {
     assert_eq!(session.messages[0].id, event_message_id);
 }
 
-/// `agent.forceMessage` emits `agent:message` with the persisted row's id.
+/// `agent_force_message_op` (store-only fallback when no AgentManager is attached)
+/// emits `agent:message` with the persisted row's id.
 #[tokio::test]
 async fn agent_force_message_emits_agent_message_event() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
