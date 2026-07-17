@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "UDS/TCP/TLS listeners, JSON-RPC router, auth, heartbeat, lifecycle, mDNS (§16)"
+description = "UDS/TCP/TLS listeners, JSON-RPC router, auth, heartbeat, lifecycle (§16)"
 
 [dependencies]
 intent-core = { path = "../intent-core" }
@@ -30,7 +30,6 @@ getrandom = "0.2"
 subtle = "2"
 hex = "0.4"
 whoami = "1"
-mdns-sd = "0.11"
 base64.workspace = true
 
 [dev-dependencies]

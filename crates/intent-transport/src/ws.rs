@@ -48,17 +48,13 @@ const MAX_HEAD_BYTES: usize = 16 * 1024;
 /// bind `0.0.0.0:5181`, WS API enabled, bearer auth on (TCP), 30s/60s heartbeat.
 ///
 /// The TLS + auth posture is picked by the constructor: [`WsApiServer::new`]
-/// uses TLS + bearer auth; [`WsApiServer::new_insecure`] disables both and
-/// forces `discovery_enabled = false` (no fingerprint to advertise).
+/// uses TLS + bearer auth; [`WsApiServer::new_insecure`] disables both.
 #[derive(Debug, Clone)]
 pub struct WsOptions {
     pub bind_address: IpAddr,
     pub base_port: u16,
     pub enabled: bool,
     pub auth_enabled: bool,
-    /// Advertise the bound port + fingerprint over mDNS (§5.4). Default off,
-    /// and forced off in insecure mode (there is no fingerprint to publish).
-    pub discovery_enabled: bool,
     /// Force the connection locality (§5.14) regardless of transport:
     /// `Some(true)` = local (`--mode local`/`server.locality=local`),
     /// `Some(false)` = remote, `None` = infer from transport (TCP/WSS ⇒ remote).
@@ -74,7 +70,6 @@ impl Default for WsOptions {
             base_port: DEFAULT_PORT,
             enabled: true,
             auth_enabled: true,
-            discovery_enabled: false,
             locality_override: None,
             heartbeat_interval: HEARTBEAT_INTERVAL,
             heartbeat_timeout: HEARTBEAT_TIMEOUT,
@@ -112,7 +107,6 @@ pub(crate) struct WsInner {
     pub token_store: Option<AsyncTokenStore>,
     pub enabled: bool,
     pub auth_enabled: bool,
-    pub discovery_enabled: bool,
     /// Resolved connection locality for this listener (§5.14): `true` = local,
     /// `false` = remote. TCP/WSS defaults to remote unless forced via
     /// `WsOptions::locality_override`.
@@ -166,7 +160,6 @@ impl WsApiServer {
             token_store: Some((*token_store).clone()),
             enabled: options.enabled,
             auth_enabled: options.auth_enabled,
-            discovery_enabled: options.discovery_enabled,
             // The WSS transport is remote by default; an override forces it
             // local/remote (§5.14).
             locality_is_local: crate::host::resolve_is_local(false, options.locality_override),
@@ -189,9 +182,8 @@ impl WsApiServer {
 
     /// Build an **insecure** listener that serves plain `ws://` with no TLS and
     /// no bearer-token enforcement. Intended for the local dev seat (`make
-    /// run-intentd` / `intentd serve --insecure`), never for production. mDNS
-    /// discovery is unconditionally disabled — there is no fingerprint to
-    /// publish — and `WsOptions::auth_enabled` is ignored.
+    /// run-intentd` / `intentd serve --insecure`), never for production.
+    /// `WsOptions::auth_enabled` is ignored.
     pub fn new_insecure(api: Arc<dyn WorkspaceApi>, bus: EventBus, options: WsOptions) -> Self {
         let inner = WsInner {
             api,
@@ -200,7 +192,6 @@ impl WsApiServer {
             token_store: None,
             enabled: options.enabled,
             auth_enabled: false,
-            discovery_enabled: false,
             locality_is_local: crate::host::resolve_is_local(false, options.locality_override),
             bind_address: options.bind_address,
             base_port: options.base_port,
@@ -308,25 +299,6 @@ impl WsApiServer {
     /// real TLS posture rather than a phantom fingerprint.
     pub fn is_insecure(&self) -> bool {
         self.inner.acceptor.is_none()
-    }
-
-    /// Start mDNS discovery advertisement if not already running and the listener
-    /// is started. Idempotent: if discovery is already active, does nothing.
-    /// Returns `Ok(())` on success or if already running; `Err` if the listener
-    /// is not started or if there is no fingerprint (insecure mode).
-    pub async fn start_discovery(&self) -> Result<()> {
-        self.inner.start_discovery().await
-    }
-
-    /// Stop mDNS discovery advertisement if currently running. Idempotent: if
-    /// discovery is not active, does nothing.
-    pub async fn stop_discovery(&self) {
-        self.inner.stop_discovery().await
-    }
-
-    /// Whether mDNS discovery is currently active.
-    pub async fn is_discovery_active(&self) -> bool {
-        self.inner.is_discovery_active().await
     }
 }
 

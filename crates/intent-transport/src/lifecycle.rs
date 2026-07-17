@@ -17,12 +17,10 @@ use std::time::Duration;
 
 use futures::future::{BoxFuture, Shared};
 use futures::FutureExt;
-use intent_core::Error;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::discovery::{advertise_if_enabled, Discovery};
 use crate::ws::{ConnCmd, WsInner};
 
 /// Default listen port (PROTOCOL §1). The listener binds exactly this port; if
@@ -38,25 +36,10 @@ pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 type StartFuture = Shared<BoxFuture<'static, Result<u16, Arc<io::Error>>>>;
 
 /// Handles for a running listener, taken by `stop()` to tear it down in order.
-///
-/// Discovery ownership rationale: The [`Discovery`] handle is owned here
-/// (rather than in a separate manager) to enforce the product invariant that
-/// mDNS advertisement **requires an active listener**. This coupling prevents
-/// advertising a service that clients cannot connect to, which would violate
-/// the mDNS contract. The ownership model ensures:
-/// - Discovery is created only after the listener binds (uses the real port)
-/// - Discovery is unpublished **before** the listener stops (no stale records)
-/// - Discovery cannot exist without a running listener (enforced by runtime guards)
-///
-/// Independent runtime control (`start_discovery` / `stop_discovery`) allows
-/// toggling discovery while the listener runs, without restarting the listener.
 pub(crate) struct RunningHandles {
     pub accept_task: JoinHandle<()>,
     pub heartbeat_task: JoinHandle<()>,
     pub shutdown_tx: Option<oneshot::Sender<()>>,
-    /// Live mDNS advertisement (§5.4), present only when discovery is enabled;
-    /// unpublished first during graceful shutdown so no stale record lingers.
-    pub discovery: Option<Discovery>,
 }
 
 /// Lifecycle state guarded by a single async mutex (the TS instance fields).
@@ -105,14 +88,6 @@ impl WsInner {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let accept_task = tokio::spawn(self.clone().accept_loop(listener, shutdown_rx));
         let heartbeat_task = tokio::spawn(self.clone().heartbeat_loop());
-        // Advertise the bound port over mDNS (§5.4); a no-op (and `None`) when
-        // discovery is disabled, no fingerprint is available (insecure mode), or
-        // registration fails. The TXT record carries the resolved locality
-        // (§5.14): remote for a plain TCP/WSS listener, local when forced via
-        // `--mode`/`server.locality`.
-        let discovery = self.fingerprint.as_deref().and_then(|fp| {
-            advertise_if_enabled(self.discovery_enabled, port, fp, self.locality_is_local)
-        });
         let mut st = self.state.lock().await;
         st.started = true;
         st.port = Some(port);
@@ -121,7 +96,6 @@ impl WsInner {
             accept_task,
             heartbeat_task,
             shutdown_tx: Some(shutdown_tx),
-            discovery,
         });
         Ok(port)
     }
@@ -163,11 +137,6 @@ impl WsInner {
             let _ = task.await;
         }
         if let Some(mut running) = running {
-            // (0) unpublish the mDNS advert first so no client resolves a
-            // listener that is mid-teardown (§5.4 graceful-shutdown ordering).
-            if let Some(discovery) = running.discovery.take() {
-                discovery.stop();
-            }
             // (1) stop the heartbeat.
             running.heartbeat_task.abort();
             // (2)+(3) close every client with 1001; the connection loop drops
@@ -198,75 +167,5 @@ impl WsInner {
         let mut st = self.state.lock().await;
         st.shutting_down = false;
         st.port = None;
-    }
-
-    /// Start mDNS discovery advertisement if not already running and the listener
-    /// is started. Idempotent: if discovery is already active, does nothing.
-    pub(crate) async fn start_discovery(self: &Arc<Self>) -> Result<(), Error> {
-        let mut st = self.state.lock().await;
-
-        // Check if listener is running
-        if !st.started {
-            return Err(Error::Internal(
-                "cannot start discovery: listener not running".to_string(),
-            ));
-        }
-
-        // Check if discovery is already active
-        if let Some(ref running) = st.running {
-            if running.discovery.is_some() {
-                return Ok(()); // Already active, idempotent
-            }
-        }
-
-        // Get the port and fingerprint
-        let port = st
-            .port
-            .ok_or_else(|| Error::Internal("listener started but port not set".to_string()))?;
-
-        let fingerprint = self.fingerprint.as_deref().ok_or_else(|| {
-            Error::Internal("cannot start discovery in insecure mode (no fingerprint)".to_string())
-        })?;
-
-        // Start discovery - advertise_if_enabled returns None on failure
-        let discovery = advertise_if_enabled(true, port, fingerprint, self.locality_is_local)
-            .ok_or_else(|| Error::Internal("failed to start mDNS discovery".to_string()))?;
-
-        // Store the discovery handle
-        if let Some(ref mut running) = st.running {
-            running.discovery = Some(discovery);
-        }
-
-        Ok(())
-    }
-
-    /// Stop mDNS discovery advertisement if currently running. Idempotent: if
-    /// discovery is not active, does nothing.
-    pub(crate) async fn stop_discovery(self: &Arc<Self>) {
-        // Extract discovery handle without holding lock across the blocking stop() call
-        let discovery = {
-            let mut st = self.state.lock().await;
-            if let Some(ref mut running) = st.running {
-                running.discovery.take()
-            } else {
-                None
-            }
-        };
-
-        // Stop outside the lock (discovery.stop() can do blocking work)
-        if let Some(d) = discovery {
-            d.stop();
-        }
-    }
-
-    /// Whether mDNS discovery is currently active.
-    pub(crate) async fn is_discovery_active(self: &Arc<Self>) -> bool {
-        let st = self.state.lock().await;
-
-        if let Some(ref running) = st.running {
-            running.discovery.is_some()
-        } else {
-            false
-        }
     }
 }

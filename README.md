@@ -12,7 +12,7 @@ agent acting as an MCP client) are thin: all business logic lives in the daemon.
 
 - **Local-first.** The default transport is a **Unix-domain socket** (mode `0600`,
   newline-delimited JSON-RPC frames). A secure **WSS/TLS** LAN transport (bearer auth,
-  origin allow-list, TLS fingerprint pinning) and **mDNS discovery** run alongside it; there
+  origin allow-list, TLS fingerprint pinning) runs alongside it; there
   is no plaintext TCP product transport.
 - **Single source of truth.** The daemon owns all durable state in **SQLite** (via `sqlx`
   with embedded migrations); clients hold only ephemeral UI state.
@@ -57,7 +57,7 @@ runtime, source-control, git, PTY, and search engines into the service layer.
 | `intent-core` | Leaf domain vocabulary: ids, `Error`→JSON-RPC code mapping, `Config`/path resolution, domain model, the `WorkspaceApi` trait. |
 | `intent-store` | SQLite persistence via `sqlx` + embedded migrations. |
 | `intent-services` | `WorkspaceApi` implementation (the shared service surface) + the `AgentManager`, MCP callback server, and per-domain ops. |
-| `intent-transport` | JSON-RPC router + UDS listener, the WSS/TLS listener, bearer auth + origin allow-list, mDNS discovery, and heartbeat. |
+| `intent-transport` | JSON-RPC router + UDS listener, the WSS/TLS listener, bearer auth + origin allow-list, and heartbeat. |
 | `intentd` | Binary composition root + CLI (`serve`/`call`/`status`/`stop`/`doctor`/`import`/`service`/`mcp-bridge`). |
 | `intent-acp` | ACP client core + `AgentManager` orchestration, agent→BE MCP callback server, and the loopback MCP bridge. |
 | `intent-providers` | Provider registry + model resolution for spawning agent runtimes. |
@@ -115,7 +115,7 @@ For the authoritative, dated progress log see
     `drafts.*` (3).
   - Plus the `agent.*` ACP runtime surface (24).
 - **Transports:** UDS (default, mode `0600`) and a **WSS/TLS** LAN listener with bearer auth,
-  origin allow-list, and TLS fingerprint pinning, plus **mDNS discovery**.
+  origin allow-list, and TLS fingerprint pinning.
 - **ACP agent runtime:** provider registry, ACP client, `AgentManager`, the agent→BE MCP
   callback server, live spawn-wiring, and the `mcp-bridge` stdio↔TCP proxy.
 - **Source control:** GitHub/PR via `octocrab`, local git via `libgit2`, the change-tracking

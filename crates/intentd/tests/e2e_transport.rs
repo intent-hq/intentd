@@ -6,17 +6,14 @@
 //! - bind on UDS + TCP/TLS (live `system.status` reports both);
 //! - bearer auth over WSS (accept valid / reject missing + bad token);
 //! - origin allow-list (accept loopback + no-origin, reject cross-origin);
-//! - the self-signed TLS fingerprint matches the mDNS-advertised `fp`;
-//! - mDNS advertise→resolve round-trip (browse the live service);
 //! - `intentd status` / `doctor` against the live daemon;
 //! - graceful `intentd stop` with a clean immediate restart (no EADDRINUSE);
 //! - idle session reaping (gated on the mock ACP provider, like the M3 E2E).
 //!
 //! Hermetic + deterministic: each daemon gets a private data dir, an OS-assigned
-//! free TCP port (no fixed-5180 contention), and a known auth token + discovery
-//! enabled through the flagged test seams in `cmd_serve`
-//! (`INTENTD_AUTH_TOKEN` / `INTENTD_TCP_PORT` / `INTENTD_DISCOVERY` /
-//! `INTENTD_IDLE_REAP_MS`).
+//! free TCP port (no fixed-5180 contention), and a known auth token through the
+//! flagged test seams in `cmd_serve`
+//! (`INTENTD_AUTH_TOKEN` / `INTENTD_TCP_PORT` / `INTENTD_IDLE_REAP_MS`).
 
 #![cfg(unix)]
 
@@ -314,41 +311,11 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     }
 }
 
-/// Browse the daemon's mDNS advertisement and return the resolved service whose
-/// SRV port equals `port` (disambiguating it from any other advertiser on the
-/// host). Panics on timeout — the advertise→resolve round-trip must complete.
-fn resolve_advert(port: u16) -> mdns_sd::ServiceInfo {
-    use mdns_sd::{ServiceDaemon, ServiceEvent};
-    let daemon = ServiceDaemon::new().expect("create mdns daemon");
-    let rx = daemon
-        .browse(intent_transport::SERVICE_TYPE)
-        .expect("browse service type");
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let resolved = loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "timed out resolving mDNS advert on :{port}"
-        );
-        match rx.recv_timeout(remaining) {
-            Ok(ServiceEvent::ServiceResolved(found)) if found.get_port() == port => break found,
-            Ok(_) => continue,
-            Err(_) => panic!("timed out resolving mDNS advert on :{port}"),
-        }
-    };
-    let _ = daemon.shutdown();
-    resolved
-}
-
 #[tokio::test]
 async fn e2e_transport_full() {
     let data_dir = temp_data_dir();
     let port_s = free_port().to_string();
-    let env: [(&str, &str); 3] = [
-        ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
-        ("INTENTD_DISCOVERY", "1"),
-    ];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
         data_dir: data_dir.clone(),
@@ -427,19 +394,6 @@ async fn e2e_transport_full() {
     );
     let uds = uds_rpc(&socket, 7, "agent.getModels", json!({})).await;
     assert_eq!(wss["result"], uds["result"], "WSS result must match UDS");
-
-    // --- mDNS advertise→resolve round-trip + fingerprint match ---
-    let advert = tokio::task::spawn_blocking(move || resolve_advert(bound_port))
-        .await
-        .expect("join mdns browse");
-    assert_eq!(advert.get_type(), intent_transport::SERVICE_TYPE);
-    assert_eq!(advert.get_port(), bound_port);
-    assert_eq!(advert.get_property_val_str("path"), Some("/ws"));
-    assert_eq!(
-        advert.get_property_val_str("fp"),
-        Some(fingerprint.as_str()),
-        "advertised mDNS fp must equal the pinned TLS fingerprint"
-    );
 
     // --- `intentd status` against the live daemon ---
     let status_cli = run_cli(&data_dir, &["status"]);

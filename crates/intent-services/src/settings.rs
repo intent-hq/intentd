@@ -963,13 +963,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "server",
             None,
         ),
-        boolean(
-            "server.discovery.enabled",
-            "mDNS discovery",
-            "Advertise the daemon over mDNS",
-            "server",
-            false,
-        ),
         // --- Group B: source control ----------------------------------------
         enumerated(
             "sourceControl.activeProvider",

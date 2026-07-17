@@ -47,7 +47,7 @@ never on `intent-store`.
 | architecture / crate map     | `../../docs/00_initial_porting/IMPLEMENTATION_SPEC.md`       |
 | porting progress             | `../../docs/00_initial_porting/BREADCRUMBS.md`               |
 | UDS JSON-RPC router          | `crates/intent-transport/`                                   |
-| WSS / TLS / discovery        | `crates/intent-transport/` (WSS listener, fingerprint, mDNS) |
+| WSS / TLS                    | `crates/intent-transport/` (WSS listener, fingerprint)      |
 | domain logic / `WorkspaceApi`| `crates/intent-services/`                                    |
 | SQLite schema + migrations   | `crates/intent-store/`                                       |
 | ACP streaming / permissions  | `crates/intent-acp/`                                         |
