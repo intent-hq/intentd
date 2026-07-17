@@ -1947,12 +1947,74 @@ impl Services {
             self.transition_linked_task_to_review_required(&workspace_id, note_id, caller.clone())
                 .await;
         }
-        // SUB-2: no immediate `deliver_parent_wake` here. The parent wake is
-        // driven by the child's terminal `agent:idle` (delivered by the
-        // completion-delivery worker armed at delegate-time), so every child
-        // completion yields exactly one wake. Grouped (`after_all`) children
-        // continue to fold their persisted `completionReport` into the group's
-        // aggregated wake via `format_group_child_line`.
+
+        // Immediate parent wake for non-grouped children: if this child is in an
+        // `after_all` delegation group, skip the immediate wake — the group's
+        // aggregated wake will fold this report in when all children settle. Otherwise,
+        // deliver the wake NOW and remove the oneShot watch so `agent:idle` does NOT
+        // trigger a second wake (SUB-2 revision per report-time wake requirement).
+        let grouped = self.child_in_undelivered_group(&workspace_id, &parent, &caller);
+        if !grouped {
+            // Find all oneShot watches for this child (typically one, but handle multiples).
+            let watches = self.find_watches_for_child(&workspace_id, &caller);
+            let oneshot_watches: Vec<_> = watches
+                .iter()
+                .filter(|w| w.one_shot && w.group_id.is_none())
+                .collect();
+
+            for watch in &oneshot_watches {
+                // Format the wake message with the persisted report.
+                let wake_text = format!(
+                    "[WORKSPACE EVENTS] Child agent {} ({}) completed. Report: {}",
+                    session.name, caller.0, report_text
+                );
+                // Build event notification metadata (mirroring deliver_completion_to_watches).
+                let metadata = json!({
+                    "type": "event_notification",
+                    "eventCount": 1,
+                    "eventTypes": ["agent:reportToParent"],
+                    "events": [{
+                        "id": uuid::Uuid::new_v4().to_string(),
+                        "type": "agent:reportToParent",
+                        "timestamp": saved_at,
+                        "data": {
+                            "agentId": caller.0,
+                            "agentName": session.name.clone(),
+                            "report": report_text.clone(),
+                        },
+                        "actor": {
+                            "type": "agent",
+                            "id": caller.0,
+                            "name": session.name.clone(),
+                        }
+                    }]
+                });
+                // Deliver the wake to the parent.
+                if let Err(e) = self
+                    .deliver_parent_wake(
+                        &workspace_id,
+                        watch.parent_agent_id.clone(),
+                        wake_text,
+                        Some(metadata),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        parent = %watch.parent_agent_id.0,
+                        child = %caller.0,
+                        "failed to deliver reportToParent wake to parent"
+                    );
+                    continue;
+                }
+                // Remove the oneShot watch so agent:idle does NOT deliver a second wake.
+                self.remove_watch(&workspace_id, &watch.id);
+                // Publish subscriptions-changed to reflect the watch removal.
+                self.publish_subscriptions_changed(&workspace_id, &watch.parent_agent_id)
+                    .await;
+            }
+        }
+
         Ok(json!({
             "ok": true,
             "parentAgentId": parent,
