@@ -15,8 +15,8 @@ use intent_core::events::{
 };
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
-    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput, Error, EventActor,
-    NoteId, Result, SessionStats, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
+    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput, Error, Event,
+    EventActor, NoteId, Result, SessionStats, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
 };
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
@@ -3837,5 +3837,261 @@ fn validate_message_role(role: &str) -> Result<()> {
         _ => Err(Error::InvalidParams(format!(
             "invalid message role `{role}` (expected one of user|assistant|tool|system)"
         ))),
+    }
+}
+
+impl Services {
+    /// Resume an interrupted agent (INT-41 phase 2): atomically claim the row, re-register
+    /// parent completion watch when delegated, then deliver a continuation message.
+    ///
+    /// Claim-then-act semantics prevent concurrent resume races (exactly-one-winner).
+    /// If any post-claim step fails (agent_send_message, session lookup), the row is
+    /// reset to pending (resolution=NULL) to restore retryability, and the error is
+    /// returned loudly.
+    pub async fn resume_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
+        // Verify the agent is in pending interrupted state (O(1) query)
+        let interrupted = self
+            .store
+            .get_interrupted_agent(agent_id)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidParams(format!(
+                    "Agent {agent_id} is not in pending interrupted state"
+                ))
+            })?;
+
+        let workspace_id = interrupted.workspace_id.clone();
+
+        // ATOMIC CLAIM: mark the row as resumed FIRST. If another process already claimed
+        // it, set_interrupted_resolution returns false and we bail loudly. This prevents
+        // concurrent resume races (e.g., --resume-all vs client resolveInterrupted).
+        let updated = self
+            .store
+            .set_interrupted_resolution(agent_id, "resumed", &now_iso())
+            .await?;
+        if !updated {
+            return Err(Error::InvalidParams(format!(
+                "Agent {agent_id} is not in pending interrupted state (already resolved)"
+            )));
+        }
+
+        // Helper to reset the row to pending if post-claim steps fail
+        let reset_to_pending = || async {
+            if let Err(e) = self.store.reset_interrupted_resolution(agent_id).await {
+                tracing::warn!(
+                    "Failed to reset interrupted_agent row to pending for {}: {}",
+                    agent_id,
+                    e
+                );
+            }
+        };
+
+        // Rehydrate delegation groups for this workspace (idempotent, best-effort).
+        // Groups are sealed on rehydration since the original parent turn is gone.
+        // Corrupted rows are logged at warn but do NOT fail the resume: the agent can
+        // still proceed (group wake degrades to per-child) rather than failing entirely.
+        if let Err(e) = self.rehydrate_delegation_groups(&workspace_id).await {
+            tracing::warn!(
+                "rehydrate_delegation_groups failed for workspace {}: {}. \
+                 Agent will resume but after_all fan-in may degrade to per-child wakes.",
+                workspace_id.0,
+                e
+            );
+        }
+
+        // Load the session to check for delegation metadata
+        let session = match self.store.get_agent_session(agent_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                reset_to_pending().await;
+                return Err(e);
+            }
+        };
+
+        // Re-register parent completion watch if the agent was delegated
+        if let Some(parent_id) = &session.parent_agent_id {
+            // Extract createdByAgentId from metadata if present
+            let created_by = session
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("createdByAgentId"))
+                .and_then(|v| v.as_str())
+                .map(AgentId::from);
+
+            if let Some(parent) = created_by.or_else(|| Some(parent_id.clone())) {
+                // Fetch parent session for name
+                let parent_name = self
+                    .store
+                    .get_agent_session(&parent)
+                    .await
+                    .ok()
+                    .map(|s| s.name)
+                    .unwrap_or_default();
+
+                // Check if this agent is in a rehydrated delegation group
+                let groups = self.list_groups_for_parent(&workspace_id, &parent);
+                let group_id = groups
+                    .iter()
+                    .find(|g| g.expected_agent_ids.contains(agent_id))
+                    .map(|g| g.group_id.clone());
+
+                if let Some(gid) = group_id {
+                    // Register grouped completion watch for after_all fan-in
+                    let _sub_id = self.register_completion_watch(
+                        &workspace_id,
+                        parent,
+                        parent_name,
+                        agent_id.clone(),
+                        false,
+                        Some(gid),
+                    );
+                } else {
+                    // Register ungrouped completion watch (dedupe via find_and_refresh)
+                    let _sub_id = self
+                        .find_and_refresh_ungrouped_watch(
+                            &workspace_id,
+                            &parent,
+                            agent_id,
+                            true,
+                            Some(parent_name.clone()),
+                        )
+                        .unwrap_or_else(|| {
+                            self.register_completion_watch(
+                                &workspace_id,
+                                parent,
+                                parent_name,
+                                agent_id.clone(),
+                                true,
+                                None,
+                            )
+                        });
+                }
+            }
+        }
+
+        // Deliver continuation message
+        let continuation =
+            "intentd restarted while you were working. Review your last steps and continue the task.";
+
+        // Use the agent_send_message machinery to deliver the message
+        // (lazily respawns provider and resumes via ACP session/load)
+        if let Err(e) = self
+            .agent_send_message(
+                workspace_id.clone(),
+                agent_id.clone(),
+                continuation.to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        {
+            reset_to_pending().await;
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    /// Abandon an interrupted agent (INT-41 phase 2): mark row `abandoned`, append
+    /// a system interruption message to the log, emit chat/agent events for live UIs.
+    pub(crate) async fn abandon_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
+        // Verify the agent is in pending interrupted state (O(1) lookup)
+        let interrupted = self
+            .store
+            .get_interrupted_agent(agent_id)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidParams(format!(
+                    "Agent {agent_id} is not in pending interrupted state"
+                ))
+            })?;
+
+        let workspace_id = interrupted.workspace_id.clone();
+
+        // Rehydrate delegation groups for this workspace (idempotent, best-effort).
+        let _ = self.rehydrate_delegation_groups(&workspace_id).await;
+
+        // Load the session to check for delegation group membership
+        let session = self.store.get_agent_session(agent_id).await.ok();
+        if let Some(session) = &session {
+            if let Some(parent_id) = &session.parent_agent_id {
+                // Check if this agent is in a delegation group
+                let groups = self.list_groups_for_parent(&workspace_id, parent_id);
+                for group in groups {
+                    if group.expected_agent_ids.contains(agent_id) {
+                        // Record this child as deleted in the group (AS-4 abandoned child path).
+                        // Build a minimal deleted-agent event for group completeness tracking.
+                        let deleted_event = Event {
+                            id: format!("abandon-{}", agent_id.0),
+                            workspace_id: workspace_id.clone(),
+                            timestamp: now_iso(),
+                            event_type: AGENT_DELETED.to_string(),
+                            actor: EventActor {
+                                actor_type: ActorType::System,
+                                id: Some("intentd".to_string()),
+                                name: Some("intentd".to_string()),
+                                ..Default::default()
+                            },
+                            session_id: Some(agent_id.0.clone()),
+                            correlation_id: None,
+                            parent_event_id: None,
+                            metadata: None,
+                            data: json!({ "agentId": agent_id.0 }),
+                        };
+                        self.record_group_child_completion(
+                            &workspace_id,
+                            &group.group_id,
+                            agent_id,
+                            true,
+                            format!("Agent {} abandoned during restart", agent_id.0),
+                            deleted_event,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+
+        // Build the system interruption message
+        let text = "This conversation was interrupted because intentd restarted. The agent's in-flight work was terminated.";
+        let content = json!([{
+            "type": "text",
+            "text": text,
+            "meta": { "kind": "interruption" }
+        }]);
+
+        // Append the system message
+        let message = self
+            .store
+            .append_agent_message(agent_id, "system", &content, &now_iso())
+            .await?;
+
+        // Mark the interrupted_agent row as resolved
+        let updated = self
+            .store
+            .set_interrupted_resolution(agent_id, "abandoned", &now_iso())
+            .await?;
+        if !updated {
+            return Err(Error::InvalidParams(format!(
+                "Agent {agent_id} is not in pending interrupted state"
+            )));
+        }
+
+        // Emit agent:message event so live UIs see the new message
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            agent_id,
+            AGENT_MESSAGE,
+            json!({ "agentId": agent_id.0, "messageId": message.id, "role": "system" }),
+        )
+        .await;
+
+        Ok(())
     }
 }

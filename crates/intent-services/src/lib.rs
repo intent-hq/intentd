@@ -907,11 +907,32 @@ impl Services {
     pub async fn heal_stale_agent_sessions(&self) -> Result<usize> {
         let sessions = self.store.list_all_agent_sessions().await?;
         let mut healed = 0usize;
+        let now = now_iso();
         for session in sessions {
             if !is_stale_in_flight_status(session.status) {
                 continue;
             }
             let prev = session.status;
+            // Serialize the status via serde to match the DB form (e.g., "active", "Waiting").
+            let prev_str = serde_json::to_string(&prev)
+                .unwrap_or_else(|_| "\"unknown\"".to_string())
+                .trim_matches('"')
+                .to_string();
+
+            // Insert interrupted_agent row (idempotent: second restart is a no-op).
+            if let Err(e) = self
+                .store
+                .insert_interrupted_agent(&session.id, &session.workspace_id, &prev_str, &now)
+                .await
+            {
+                tracing::warn!(
+                    agent_id = %session.id,
+                    workspace_id = %session.workspace_id,
+                    error = %e,
+                    "failed to insert interrupted_agent row during heal"
+                );
+            }
+
             // Narrow write: `set_agent_session_status` persists only
             // (status, is_active, updated_at) without loading the full
             // message log, keeping the startup sweep O(rows). The write-once
@@ -923,7 +944,7 @@ impl Services {
                     &session.id,
                     intent_core::AgentStatus::RuntimeIdle,
                     false,
-                    &now_iso(),
+                    &now,
                 )
                 .await?;
             healed += 1;
@@ -1438,7 +1459,10 @@ impl Services {
         // open after_all group (the expected set is now final) and try to fire it
         // — covers the case where every child finished before the parent idled.
         if event.event_type == AGENT_IDLE {
-            if let Some(gid) = self.seal_group_for_parent(&event.workspace_id, &child) {
+            if let Some(gid) = self
+                .seal_group_for_parent(&event.workspace_id, &child)
+                .await
+            {
                 self.try_fire_group(&event.workspace_id, &gid).await;
             }
         }
@@ -1480,7 +1504,8 @@ impl Services {
                     deleted,
                     summary,
                     event.clone(),
-                );
+                )
+                .await;
                 self.try_fire_group(workspace_id, &gid).await;
                 continue;
             }
@@ -1534,7 +1559,7 @@ impl Services {
     /// completions; on a send error we log and accept the dropped wake (mirroring
     /// the immediate path's best-effort delivery).
     pub(crate) async fn try_fire_group(&self, workspace_id: &WorkspaceId, group_id: &str) {
-        let Some(group) = self.take_group_if_ready(workspace_id, group_id) else {
+        let Some(group) = self.take_group_if_ready(workspace_id, group_id).await else {
             return;
         };
         let wake = format_group_wake(&group);
@@ -4163,7 +4188,7 @@ fn format_completion_wake(child_id: &AgentId, event: &Event) -> String {
 /// non-empty `completion_report` (the child's persisted
 /// `metadata.completionReport`) wins over the event's `lastResponseSummary`,
 /// mirroring the TS event-notification formatter.
-fn format_group_child_line(
+pub(crate) fn format_group_child_line(
     child_id: &AgentId,
     event: &Event,
     completion_report: Option<&str>,
@@ -11181,6 +11206,81 @@ impl WorkspaceApi for Services {
                 target_agent_id,
             )
             .await
+        })
+    }
+
+    fn agent_list_interrupted(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            let rows = self.store.list_interrupted_agents().await?;
+            let agents: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|ia| {
+                    serde_json::json!({
+                        "agentId": ia.agent_id.0,
+                        "workspaceId": ia.workspace_id.0,
+                        "workspaceName": ia.workspace_name.unwrap_or_default(),
+                        "agentName": ia.agent_name.unwrap_or_default(),
+                        "prevStatus": ia.prev_status,
+                        "interruptedAt": ia.interrupted_at,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "agents": agents }))
+        })
+    }
+
+    fn agent_resolve_interrupted(
+        &self,
+        resume: Option<Vec<String>>,
+        abandon: Option<Vec<String>>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            use serde_json::json;
+            let resume_ids = resume.unwrap_or_default();
+            let abandon_ids = abandon.unwrap_or_default();
+
+            // Check for ids in both lists → -32602
+            for id in &resume_ids {
+                if abandon_ids.contains(id) {
+                    return Err(Error::InvalidParams(format!(
+                        "Agent id {id} appears in both resume and abandon"
+                    )));
+                }
+            }
+
+            let mut resumed = Vec::new();
+            let mut abandoned = Vec::new();
+            let mut failed = Vec::new();
+
+            // Resume path
+            for agent_id_str in resume_ids {
+                let agent_id = AgentId::from(agent_id_str.as_str());
+                match self.resume_interrupted_agent(&agent_id).await {
+                    Ok(()) => resumed.push(agent_id_str),
+                    Err(e) => failed.push(json!({
+                        "agentId": agent_id_str,
+                        "error": e.to_string(),
+                    })),
+                }
+            }
+
+            // Abandon path
+            for agent_id_str in abandon_ids {
+                let agent_id = AgentId::from(agent_id_str.as_str());
+                match self.abandon_interrupted_agent(&agent_id).await {
+                    Ok(()) => abandoned.push(agent_id_str),
+                    Err(e) => failed.push(json!({
+                        "agentId": agent_id_str,
+                        "error": e.to_string(),
+                    })),
+                }
+            }
+
+            Ok(json!({
+                "resumed": resumed,
+                "abandoned": abandoned,
+                "failed": failed,
+            }))
         })
     }
 

@@ -339,6 +339,9 @@ async function dispatch(msg) {
     }
     case 'session/load':
       return send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'no load' } });
+    case 'session/set_mode':
+      // Accept any mode change request (no-op for the mock).
+      return result(msg.id, {});
     case 'session/prompt':
       return handlePrompt(msg.id, msg.params);
     case 'session/cancel':

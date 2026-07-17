@@ -1343,6 +1343,58 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.listInterrupted" => {
+            // No required params; returns pending interrupted agents across all workspaces.
+            let result = api.agent_list_interrupted().await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.resolveInterrupted" => {
+            // Optional resume/abandon arrays; ids must be pending interrupted_agent rows.
+            // If present, must be arrays of strings (reject non-array and non-string elements).
+            let resume = match params.get("resume") {
+                None => None,
+                Some(Value::Array(arr)) => {
+                    let mut ids = Vec::with_capacity(arr.len());
+                    for (i, v) in arr.iter().enumerate() {
+                        match v.as_str() {
+                            Some(s) => ids.push(s.to_string()),
+                            None => {
+                                return Err(rpc(
+                                    INVALID_PARAMS,
+                                    format!("resume[{}] must be a string", i),
+                                ))
+                            }
+                        }
+                    }
+                    Some(ids)
+                }
+                Some(_) => return Err(rpc(INVALID_PARAMS, "resume must be an array")),
+            };
+            let abandon = match params.get("abandon") {
+                None => None,
+                Some(Value::Array(arr)) => {
+                    let mut ids = Vec::with_capacity(arr.len());
+                    for (i, v) in arr.iter().enumerate() {
+                        match v.as_str() {
+                            Some(s) => ids.push(s.to_string()),
+                            None => {
+                                return Err(rpc(
+                                    INVALID_PARAMS,
+                                    format!("abandon[{}] must be a string", i),
+                                ))
+                            }
+                        }
+                    }
+                    Some(ids)
+                }
+                Some(_) => return Err(rpc(INVALID_PARAMS, "abandon must be an array")),
+            };
+            let result = api
+                .agent_resolve_interrupted(resume, abandon)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.subscribe" => {
             let ws = require_ws_note(params)?;
             require_present(params, "eventTypes")?;

@@ -22,6 +22,18 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     is_background, metadata, sandbox_id, sandbox_path, sandbox_branch";
 
+/// Interrupted agent record (INT-41). Returned by
+/// [`Store::list_interrupted_agents`], joined with agent_session and workspace.
+#[derive(Debug, Clone)]
+pub struct InterruptedAgent {
+    pub agent_id: AgentId,
+    pub workspace_id: WorkspaceId,
+    pub prev_status: String,
+    pub interrupted_at: String,
+    pub agent_name: Option<String>,
+    pub workspace_name: Option<String>,
+}
+
 /// Encode an optional JSON payload column (`context_references` /
 /// `image_blocks`) as its TEXT form, `None` staying NULL.
 fn json_col_to_db(v: &Option<serde_json::Value>) -> Result<Option<String>> {
@@ -718,6 +730,126 @@ impl Store {
         })
         .await
     }
+
+    /// Record an interrupted in-flight agent. Upserts: if a pending row exists
+    /// (daemon restarted before resumption), updates to the latest state. Returns
+    /// `true` if inserted/updated.
+    pub async fn insert_interrupted_agent(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        prev_status: &str,
+        interrupted_at: &str,
+    ) -> Result<bool> {
+        let sql =
+            "INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at) \
+                   VALUES (?, ?, ?, ?) \
+                   ON CONFLICT(agent_id) DO UPDATE SET \
+                       prev_status = excluded.prev_status, \
+                       interrupted_at = excluded.interrupted_at, \
+                       resolution = 'pending', \
+                       resolved_at = NULL";
+        let res = sqlx::query(sql)
+            .bind(&agent_id.0)
+            .bind(&workspace_id.0)
+            .bind(prev_status)
+            .bind(interrupted_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("insert interrupted_agent failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// List pending interrupted agents, joined with agent_session (name) and
+    /// workspace (title). Sessions deleted since interruption are excluded (INNER JOIN).
+    pub async fn list_interrupted_agents(&self) -> Result<Vec<InterruptedAgent>> {
+        let sql = "SELECT ia.agent_id, ia.workspace_id, ia.prev_status, ia.interrupted_at, \
+                          ag.name AS agent_name, w.title AS workspace_name \
+                   FROM interrupted_agent ia \
+                   INNER JOIN agent_session ag ON ia.agent_id = ag.id \
+                   LEFT JOIN workspace w ON ia.workspace_id = w.id \
+                   WHERE ia.resolution = 'pending'";
+        sqlx::query(sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("list interrupted_agent failed: {e}")))?
+            .iter()
+            .map(|row| {
+                Ok(InterruptedAgent {
+                    agent_id: AgentId(col(row, "agent_id")?),
+                    workspace_id: WorkspaceId(col(row, "workspace_id")?),
+                    prev_status: col(row, "prev_status")?,
+                    interrupted_at: col(row, "interrupted_at")?,
+                    agent_name: col(row, "agent_name")?,
+                    workspace_name: col(row, "workspace_name")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Get a single pending interrupted agent by ID. Returns None if not found or not pending.
+    pub async fn get_interrupted_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<InterruptedAgent>> {
+        let sql = "SELECT ia.agent_id, ia.workspace_id, ia.prev_status, ia.interrupted_at, \
+                          ag.name AS agent_name, w.title AS workspace_name \
+                   FROM interrupted_agent ia \
+                   INNER JOIN agent_session ag ON ia.agent_id = ag.id \
+                   LEFT JOIN workspace w ON ia.workspace_id = w.id \
+                   WHERE ia.agent_id = ? AND ia.resolution = 'pending'";
+        let row = sqlx::query(sql)
+            .bind(&agent_id.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("get interrupted_agent failed: {e}")))?;
+        match row {
+            None => Ok(None),
+            Some(ref r) => Ok(Some(InterruptedAgent {
+                agent_id: AgentId(col(r, "agent_id")?),
+                workspace_id: WorkspaceId(col(r, "workspace_id")?),
+                prev_status: col(r, "prev_status")?,
+                interrupted_at: col(r, "interrupted_at")?,
+                agent_name: col(r, "agent_name")?,
+                workspace_name: col(r, "workspace_name")?,
+            })),
+        }
+    }
+
+    /// Set the resolution (resumed|abandoned) for an interrupted agent. Returns
+    /// `true` if a pending row was updated, `false` if the agent was not found or
+    /// already resolved (caller should fail the operation).
+    pub async fn set_interrupted_resolution(
+        &self,
+        agent_id: &AgentId,
+        resolution: &str,
+        resolved_at: &str,
+    ) -> Result<bool> {
+        let sql = "UPDATE interrupted_agent SET resolution = ?, resolved_at = ? \
+                   WHERE agent_id = ? AND resolution = 'pending'";
+        let res = sqlx::query(sql)
+            .bind(resolution)
+            .bind(resolved_at)
+            .bind(&agent_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("set interrupted resolution failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Reset an interrupted agent row back to pending (resolution=NULL, resolved_at=NULL).
+    /// Used when a resume attempt claimed the row but failed post-claim, to restore
+    /// retryability. Returns `true` if a row was updated.
+    pub async fn reset_interrupted_resolution(&self, agent_id: &AgentId) -> Result<bool> {
+        let sql = "UPDATE interrupted_agent SET resolution = 'pending', resolved_at = NULL \
+                   WHERE agent_id = ?";
+        let res = sqlx::query(sql)
+            .bind(&agent_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("reset interrupted resolution failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
 }
 
 /// Input row for [`Store::replace_agent_messages`]: borrowed refs to the
@@ -757,4 +889,216 @@ where
 {
     row.try_get::<T, _>(name)
         .map_err(|e| Error::Internal(format!("column {name}: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Store;
+
+    #[tokio::test]
+    async fn re_interruption_resets_resolution() {
+        use intent_core::{
+            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
+        };
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let agent_id = AgentId("agent-test".to_string());
+        let ws_id = WorkspaceId("ws-test".to_string());
+
+        // Seed workspace
+        let ts = now_iso();
+        let workspace = Workspace {
+            id: ws_id.clone(),
+            title: "Test".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+        };
+        store
+            .insert_workspace(&workspace)
+            .await
+            .expect("insert workspace");
+
+        // Initial interruption
+        store
+            .insert_interrupted_agent(&agent_id, &ws_id, "active", "2026-01-01T00:00:00Z")
+            .await
+            .expect("initial insert");
+
+        // Verify the row exists (raw SQL check since get_interrupted_agent requires agent_session)
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM interrupted_agent WHERE agent_id = ? AND resolution = 'pending'",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.pool())
+        .await
+        .expect("count");
+        assert_eq!(count, 1, "should have one pending row");
+
+        // Resolve it (resumed)
+        let updated = store
+            .set_interrupted_resolution(&agent_id, "resumed", "2026-01-01T00:01:00Z")
+            .await
+            .expect("resolve");
+        assert!(updated, "should update pending row");
+
+        // Verify no longer pending
+        let count2: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM interrupted_agent WHERE agent_id = ? AND resolution = 'pending'",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.pool())
+        .await
+        .expect("count after resolve");
+        assert_eq!(count2, 0, "resolved row should not be pending");
+
+        // Re-interrupt (daemon crash again, same agent)
+        store
+            .insert_interrupted_agent(&agent_id, &ws_id, "processing", "2026-01-01T00:02:00Z")
+            .await
+            .expect("re-interrupt");
+
+        // Verify row is pending again (resolution reset)
+        let count3: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM interrupted_agent WHERE agent_id = ? AND resolution = 'pending'",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.pool())
+        .await
+        .expect("count after re-interrupt");
+        assert_eq!(count3, 1, "re-interrupted row should be pending again");
+
+        // Verify updated fields
+        let row: (String, String) = sqlx::query_as(
+            "SELECT prev_status, interrupted_at FROM interrupted_agent WHERE agent_id = ?",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.pool())
+        .await
+        .expect("fetch row");
+        assert_eq!(row.0, "processing");
+        assert_eq!(row.1, "2026-01-01T00:02:00Z");
+
+        // Attempt to resolve a non-existent agent
+        let unknown_id = AgentId("agent-unknown".to_string());
+        let updated2 = store
+            .set_interrupted_resolution(&unknown_id, "resumed", "2026-01-01T00:03:00Z")
+            .await
+            .expect("resolve unknown");
+        assert!(!updated2, "resolving unknown agent should return false");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn double_claim_race() {
+        use intent_core::{
+            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
+        };
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let agent_id = AgentId("agent-double".to_string());
+        let ws_id = WorkspaceId("ws-double".to_string());
+
+        // Seed workspace
+        let ts = now_iso();
+        let workspace = Workspace {
+            id: ws_id.clone(),
+            title: "Test".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+        };
+        store
+            .insert_workspace(&workspace)
+            .await
+            .expect("insert workspace");
+
+        // Interrupt the agent
+        store
+            .insert_interrupted_agent(&agent_id, &ws_id, "active", "2026-01-01T00:00:00Z")
+            .await
+            .expect("initial insert");
+
+        // First claim succeeds
+        let claim1 = store
+            .set_interrupted_resolution(&agent_id, "resumed", "2026-01-01T00:01:00Z")
+            .await
+            .expect("first claim");
+        assert!(claim1, "first claim should succeed");
+
+        // Second concurrent claim fails (row already resolved)
+        let claim2 = store
+            .set_interrupted_resolution(&agent_id, "resumed", "2026-01-01T00:01:01Z")
+            .await
+            .expect("second claim");
+        assert!(!claim2, "second claim should fail (already resolved)");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
