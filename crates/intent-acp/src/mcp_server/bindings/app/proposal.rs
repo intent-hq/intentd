@@ -212,10 +212,7 @@ mod tests {
         // Second item is resource
         assert_eq!(items[1]["type"], "resource");
         let resource = &items[1]["resource"];
-        assert_eq!(
-            resource["mimeType"],
-            "application/vnd.intent.proposal+json"
-        );
+        assert_eq!(resource["mimeType"], "application/vnd.intent.proposal+json");
         assert!(resource["uri"]
             .as_str()
             .expect("uri")

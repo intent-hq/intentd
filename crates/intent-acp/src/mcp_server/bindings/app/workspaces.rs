@@ -18,6 +18,11 @@ pub(crate) const PRELUDE: &str = r#"
     ws.app.workspaces = {
         list: (options) => host({ method: 'app.workspaces.list', args: options || {} }),
         get: (id) => host({ method: 'app.workspaces.get', args: { id } }),
+        create: (params) => host({ method: 'app.workspaces.create', args: params || {} }),
+        archive: (id) => host({ method: 'app.workspaces.archive', args: { id } }),
+        delete: (id) => host({ method: 'app.workspaces.delete', args: { id } }),
+        bulkArchive: (ids) => host({ method: 'app.workspaces.bulkArchive', args: { ids } }),
+        bulkDelete: (ids) => host({ method: 'app.workspaces.bulkDelete', args: { ids } }),
     };
 "#;
 
@@ -36,6 +41,11 @@ pub(crate) async fn dispatch(
     match method {
         "list" => list(api, args).await,
         "get" => get(api, args).await,
+        "create" => create(api, args).await,
+        "archive" => archive(api, args).await,
+        "delete" => delete(api, args).await,
+        "bulkArchive" => bulk_archive(api, args).await,
+        "bulkDelete" => bulk_delete(api, args).await,
         other => Err(format!("host: unknown method `app.workspaces.{other}`")),
     }
 }
@@ -202,6 +212,309 @@ fn summarize_workspace(ws: &intent_core::Workspace) -> Value {
         "updatedAt": ws.updated_at.as_str(),
         "lastActivity": ws.last_activity.as_deref(),
     })
+}
+
+/// MCP resource MIME type for proposals (parity with FE `proposal-resource.ts`).
+const PROPOSAL_RESOURCE_MIME_TYPE: &str = "application/vnd.intent.proposal+json";
+
+/// Build proposal resource URI (parity with TS `proposalResourceId` + `createProposalResource`).
+fn proposal_resource_uri(proposal: &Value) -> String {
+    let kind = proposal
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    // Use applyToolCallId if present, otherwise use preview.title
+    let id = proposal
+        .get("applyToolCallId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            proposal
+                .get("preview")
+                .and_then(|p| p.get("title"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("untitled");
+
+    // URL-encode the id portion (simplified - production would use proper URL encoding)
+    let encoded_id = id.replace('/', "%2F").replace(' ', "%20");
+    format!("intent-proposal://{}/{}", kind, encoded_id)
+}
+
+/// Return a proposal with dual text+resource content items.
+fn proposal_result(proposal: Value) -> Result<Value, String> {
+    // Build resource name from preview.title
+    let name = proposal
+        .get("preview")
+        .and_then(|p| p.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or("Proposal");
+
+    // Build MCP content items: text item with {ok, proposal} + resource item
+    let text_item = json!({
+        "type": "text",
+        "text": serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "proposal": proposal
+        })).unwrap_or_else(|_| "{}".to_string())
+    });
+
+    let resource_item = json!({
+        "type": "resource",
+        "resource": {
+            "uri": proposal_resource_uri(&proposal),
+            "name": name,
+            "mimeType": PROPOSAL_RESOURCE_MIME_TYPE,
+            "text": serde_json::to_string(&proposal).unwrap_or_else(|_| "{}".to_string())
+        }
+    });
+
+    // Return with __mcpContentItems marker (dispatch.rs will extract this)
+    Ok(json!({
+        "ok": true,
+        "proposal": proposal,
+        "__mcpContentItems": [text_item, resource_item]
+    }))
+}
+
+/// Validate that a workspace ID is mutable (not __chief__).
+fn assert_mutable_workspace_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("workspace id is required".to_string());
+    }
+    if id == "__chief__" {
+        return Err("The Chief virtual workspace cannot be modified".to_string());
+    }
+    Ok(())
+}
+
+async fn create(_api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
+    // Build workspace-create proposal from params
+    let params = args.as_object().cloned().unwrap_or_default();
+
+    // Extract title for preview
+    let title = params
+        .get("title")
+        .and_then(Value::as_str)
+        .map(|s| format!(": {}", s))
+        .unwrap_or_default();
+
+    let proposal = json!({
+        "kind": "workspace-create",
+        "payload": {
+            "operation": "workspace.create",
+            "params": params
+        },
+        "preview": {
+            "title": format!("Create workspace{}", title),
+            "summary": "Review and adjust workspace creation details before creating a new space.",
+            "workspaceCreate": {}
+        }
+    });
+
+    proposal_result(proposal)
+}
+
+async fn archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
+    let id = args
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "id is required".to_string())?;
+
+    assert_mutable_workspace_id(id)?;
+
+    // Validate workspace exists
+    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    let workspace = workspaces
+        .iter()
+        .find(|w| w.id.as_str() == id)
+        .ok_or_else(|| format!("Workspace not found: {id}"))?;
+
+    // Build bulk-op proposal with single item
+    let proposal = json!({
+        "kind": "bulk-op",
+        "payload": {
+            "operation": "workspace.bulkArchive",
+            "ids": [id]
+        },
+        "preview": {
+            "title": "Archive 1 workspace",
+            "summary": "Review the selected workspaces before archiving them.",
+            "applyLabel": "Archive",
+            "bulkItems": [{
+                "id": id,
+                "title": if workspace.title.is_empty() { id } else { &workspace.title },
+                "summary": workspace.repository_name.as_deref()
+                    .or(workspace.repository_path.as_deref())
+                    .or(Some(format!("{:?}", workspace.status).as_str())),
+                "selected": true,
+                "metadata": summarize_workspace(workspace)
+            }]
+        }
+    });
+
+    proposal_result(proposal)
+}
+
+async fn delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
+    let id = args
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "id is required".to_string())?;
+
+    assert_mutable_workspace_id(id)?;
+
+    // Validate workspace exists
+    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    let workspace = workspaces
+        .iter()
+        .find(|w| w.id.as_str() == id)
+        .ok_or_else(|| format!("Workspace not found: {id}"))?;
+
+    // Build bulk-op proposal with single item
+    let proposal = json!({
+        "kind": "bulk-op",
+        "payload": {
+            "operation": "workspace.bulkDelete",
+            "ids": [id]
+        },
+        "preview": {
+            "title": "Delete 1 workspace",
+            "summary": "Review the selected workspaces before deleting them.",
+            "applyLabel": "Delete",
+            "bulkItems": [{
+                "id": id,
+                "title": if workspace.title.is_empty() { id } else { &workspace.title },
+                "summary": workspace.repository_name.as_deref()
+                    .or(workspace.repository_path.as_deref())
+                    .or(Some(format!("{:?}", workspace.status).as_str())),
+                "selected": true,
+                "metadata": summarize_workspace(workspace)
+            }],
+            "warnings": ["Deleting workspaces is destructive. Confirm the selected workspaces before applying."]
+        }
+    });
+
+    proposal_result(proposal)
+}
+
+async fn bulk_archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
+    let ids = args
+        .get("ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "ids must be a non-empty array".to_string())?;
+
+    if ids.is_empty() {
+        return Err("ids must be a non-empty array".to_string());
+    }
+
+    // Validate all IDs are mutable
+    for id_val in ids {
+        if let Some(id) = id_val.as_str() {
+            assert_mutable_workspace_id(id)?;
+        } else {
+            return Err("all ids must be strings".to_string());
+        }
+    }
+
+    // Validate all workspaces exist
+    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    let mut bulk_items = Vec::new();
+
+    for id_val in ids {
+        let id = id_val.as_str().unwrap(); // Already validated above
+        let workspace = workspaces
+            .iter()
+            .find(|w| w.id.as_str() == id)
+            .ok_or_else(|| format!("Workspace not found: {id}"))?;
+
+        bulk_items.push(json!({
+            "id": id,
+            "title": if workspace.title.is_empty() { id } else { &workspace.title },
+            "summary": workspace.repository_name.as_deref()
+                .or(workspace.repository_path.as_deref())
+                .or(Some(format!("{:?}", workspace.status).as_str())),
+            "selected": true,
+            "metadata": summarize_workspace(workspace)
+        }));
+    }
+
+    let count = ids.len();
+    let proposal = json!({
+        "kind": "bulk-op",
+        "payload": {
+            "operation": "workspace.bulkArchive",
+            "ids": ids
+        },
+        "preview": {
+            "title": format!("Archive {} workspace{}", count, if count == 1 { "" } else { "s" }),
+            "summary": "Review the selected workspaces before archiving them.",
+            "applyLabel": "Archive",
+            "bulkItems": bulk_items
+        }
+    });
+
+    proposal_result(proposal)
+}
+
+async fn bulk_delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
+    let ids = args
+        .get("ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "ids must be a non-empty array".to_string())?;
+
+    if ids.is_empty() {
+        return Err("ids must be a non-empty array".to_string());
+    }
+
+    // Validate all IDs are mutable
+    for id_val in ids {
+        if let Some(id) = id_val.as_str() {
+            assert_mutable_workspace_id(id)?;
+        } else {
+            return Err("all ids must be strings".to_string());
+        }
+    }
+
+    // Validate all workspaces exist
+    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    let mut bulk_items = Vec::new();
+
+    for id_val in ids {
+        let id = id_val.as_str().unwrap(); // Already validated above
+        let workspace = workspaces
+            .iter()
+            .find(|w| w.id.as_str() == id)
+            .ok_or_else(|| format!("Workspace not found: {id}"))?;
+
+        bulk_items.push(json!({
+            "id": id,
+            "title": if workspace.title.is_empty() { id } else { &workspace.title },
+            "summary": workspace.repository_name.as_deref()
+                .or(workspace.repository_path.as_deref())
+                .or(Some(format!("{:?}", workspace.status).as_str())),
+            "selected": true,
+            "metadata": summarize_workspace(workspace)
+        }));
+    }
+
+    let count = ids.len();
+    let proposal = json!({
+        "kind": "bulk-op",
+        "payload": {
+            "operation": "workspace.bulkDelete",
+            "ids": ids
+        },
+        "preview": {
+            "title": format!("Delete {} workspace{}", count, if count == 1 { "" } else { "s" }),
+            "summary": "Review the selected workspaces before deleting them.",
+            "applyLabel": "Delete",
+            "bulkItems": bulk_items,
+            "warnings": ["Deleting workspaces is destructive. Confirm the selected workspaces before applying."]
+        }
+    });
+
+    proposal_result(proposal)
 }
 
 #[cfg(test)]
@@ -449,5 +762,302 @@ mod tests {
         assert!(result.get("tags").is_some());
         assert!(result.get("createdAt").is_some());
         assert!(result.get("updatedAt").is_some());
+    }
+
+    // Proposal methods tests
+
+    #[tokio::test]
+    async fn test_create_returns_proposal() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "create", &json!({ "title": "New WS" }))
+            .await
+            .unwrap();
+
+        // Should have proposal and content items
+        assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
+        let proposal = result.get("proposal").unwrap();
+        assert_eq!(
+            proposal.get("kind").unwrap().as_str().unwrap(),
+            "workspace-create"
+        );
+        assert!(proposal.get("preview").is_some());
+        assert!(proposal.get("payload").is_some());
+
+        let items = result.get("__mcpContentItems").unwrap().as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].get("type").unwrap().as_str().unwrap(), "text");
+        assert_eq!(items[1].get("type").unwrap().as_str().unwrap(), "resource");
+    }
+
+    #[tokio::test]
+    async fn test_archive_rejects_chief_workspace() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "archive", &json!({ "id": "__chief__" })).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "The Chief virtual workspace cannot be modified"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_archive_validates_workspace_exists() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "archive", &json!({ "id": "missing-ws" })).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Workspace not found: missing-ws"));
+    }
+
+    #[tokio::test]
+    async fn test_archive_returns_proposal() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Test Workspace"));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "archive", &json!({ "id": "ws-1" }))
+            .await
+            .unwrap();
+
+        // Should have proposal and content items
+        assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
+        let proposal = result.get("proposal").unwrap();
+        assert_eq!(proposal.get("kind").unwrap().as_str().unwrap(), "bulk-op");
+
+        let payload = proposal.get("payload").unwrap();
+        assert_eq!(
+            payload.get("operation").unwrap().as_str().unwrap(),
+            "workspace.bulkArchive"
+        );
+        assert_eq!(payload.get("ids").unwrap().as_array().unwrap().len(), 1);
+
+        let preview = proposal.get("preview").unwrap();
+        assert_eq!(
+            preview.get("title").unwrap().as_str().unwrap(),
+            "Archive 1 workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_rejects_chief_workspace() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "delete", &json!({ "id": "__chief__" })).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "The Chief virtual workspace cannot be modified"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_validates_workspace_exists() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "delete", &json!({ "id": "missing-ws" })).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Workspace not found: missing-ws"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_returns_proposal_with_warnings() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Test Workspace"));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "delete", &json!({ "id": "ws-1" }))
+            .await
+            .unwrap();
+
+        let proposal = result.get("proposal").unwrap();
+        assert_eq!(proposal.get("kind").unwrap().as_str().unwrap(), "bulk-op");
+
+        let payload = proposal.get("payload").unwrap();
+        assert_eq!(
+            payload.get("operation").unwrap().as_str().unwrap(),
+            "workspace.bulkDelete"
+        );
+
+        let preview = proposal.get("preview").unwrap();
+        assert_eq!(
+            preview.get("title").unwrap().as_str().unwrap(),
+            "Delete 1 workspace"
+        );
+        assert!(preview.get("warnings").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_bulk_archive_rejects_empty_array() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "bulkArchive", &json!({ "ids": [] })).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "ids must be a non-empty array");
+    }
+
+    #[tokio::test]
+    async fn test_bulk_archive_rejects_chief_in_list() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "bulkArchive",
+            &json!({ "ids": ["ws-1", "__chief__"] }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "The Chief virtual workspace cannot be modified"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bulk_archive_validates_all_exist() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "WS 1"));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "bulkArchive",
+            &json!({ "ids": ["ws-1", "ws-2"] }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Workspace not found: ws-2"));
+    }
+
+    #[tokio::test]
+    async fn test_bulk_archive_returns_proposal() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "WS 1"));
+            workspaces.push(make_workspace("ws-2", "WS 2"));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "bulkArchive",
+            &json!({ "ids": ["ws-1", "ws-2"] }),
+        )
+        .await
+        .unwrap();
+
+        let proposal = result.get("proposal").unwrap();
+        assert_eq!(proposal.get("kind").unwrap().as_str().unwrap(), "bulk-op");
+
+        let payload = proposal.get("payload").unwrap();
+        assert_eq!(
+            payload.get("operation").unwrap().as_str().unwrap(),
+            "workspace.bulkArchive"
+        );
+        assert_eq!(payload.get("ids").unwrap().as_array().unwrap().len(), 2);
+
+        let preview = proposal.get("preview").unwrap();
+        assert_eq!(
+            preview.get("title").unwrap().as_str().unwrap(),
+            "Archive 2 workspaces"
+        );
+
+        let bulk_items = preview.get("bulkItems").unwrap().as_array().unwrap();
+        assert_eq!(bulk_items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_delete_rejects_empty_array() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "bulkDelete", &json!({ "ids": [] })).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "ids must be a non-empty array");
+    }
+
+    #[tokio::test]
+    async fn test_bulk_delete_returns_proposal_with_warnings() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "WS 1"));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "bulkDelete", &json!({ "ids": ["ws-1"] }))
+            .await
+            .unwrap();
+
+        let proposal = result.get("proposal").unwrap();
+        assert_eq!(proposal.get("kind").unwrap().as_str().unwrap(), "bulk-op");
+
+        let payload = proposal.get("payload").unwrap();
+        assert_eq!(
+            payload.get("operation").unwrap().as_str().unwrap(),
+            "workspace.bulkDelete"
+        );
+
+        let preview = proposal.get("preview").unwrap();
+        assert!(preview.get("warnings").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_proposal_has_mcp_content_items() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Test"));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "archive", &json!({ "id": "ws-1" }))
+            .await
+            .unwrap();
+
+        let items = result.get("__mcpContentItems").unwrap().as_array().unwrap();
+        assert_eq!(items.len(), 2);
+
+        // Text item
+        assert_eq!(items[0].get("type").unwrap().as_str().unwrap(), "text");
+        let text = items[0].get("text").unwrap().as_str().unwrap();
+        assert!(text.contains("\"ok\": true"));
+
+        // Resource item
+        assert_eq!(items[1].get("type").unwrap().as_str().unwrap(), "resource");
+        let resource = items[1].get("resource").unwrap();
+        assert_eq!(
+            resource.get("mimeType").unwrap().as_str().unwrap(),
+            "application/vnd.intent.proposal+json"
+        );
+        assert!(resource
+            .get("uri")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .starts_with("intent-proposal://"));
     }
 }

@@ -19,6 +19,7 @@ pub(crate) const PRELUDE: &str = r#"
     ws.app.settings = {
         list: (options) => host({ method: 'app.settings.list', args: options || {} }),
         get: (path) => host({ method: 'app.settings.get', args: { path } }),
+        propose: (input) => host({ method: 'app.settings.propose', args: input }),
     };
 "#;
 
@@ -37,6 +38,7 @@ pub(crate) async fn dispatch(
     match method {
         "list" => list(api, args).await,
         "get" => get(api, args).await,
+        "propose" => propose(api, args).await,
         other => Err(format!("host: unknown method `app.settings.{other}`")),
     }
 }
@@ -115,6 +117,215 @@ async fn get(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String>
     }
 
     Ok(merged)
+}
+
+/// MCP resource MIME type for proposals (parity with FE `proposal-resource.ts`).
+const PROPOSAL_RESOURCE_MIME_TYPE: &str = "application/vnd.intent.proposal+json";
+
+/// Build proposal resource URI (parity with TS `proposalResourceId` + `createProposalResource`).
+fn proposal_resource_uri(proposal: &Value) -> String {
+    let kind = proposal
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    // Use applyToolCallId if present, otherwise use preview.title
+    let id = proposal
+        .get("applyToolCallId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            proposal
+                .get("preview")
+                .and_then(|p| p.get("title"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("untitled");
+
+    // URL-encode the id portion (simplified - production would use proper URL encoding)
+    let encoded_id = id.replace('/', "%2F").replace(' ', "%20");
+    format!("intent-proposal://{}/{}", kind, encoded_id)
+}
+
+/// Return a proposal with dual text+resource content items.
+fn proposal_result(proposal: Value) -> Result<Value, String> {
+    // Build resource name from preview.title
+    let name = proposal
+        .get("preview")
+        .and_then(|p| p.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or("Proposal");
+
+    // Build MCP content items: text item with {ok, proposal} + resource item
+    let text_item = json!({
+        "type": "text",
+        "text": serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "proposal": proposal
+        })).unwrap_or_else(|_| "{}".to_string())
+    });
+
+    let resource_item = json!({
+        "type": "resource",
+        "resource": {
+            "uri": proposal_resource_uri(&proposal),
+            "name": name,
+            "mimeType": PROPOSAL_RESOURCE_MIME_TYPE,
+            "text": serde_json::to_string(&proposal).unwrap_or_else(|_| "{}".to_string())
+        }
+    });
+
+    // Return with __mcpContentItems marker (dispatch.rs will extract this)
+    Ok(json!({
+        "ok": true,
+        "proposal": proposal,
+        "__mcpContentItems": [text_item, resource_item]
+    }))
+}
+
+async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
+    // Extract changes from input (can be array or { changes: [...] })
+    let changes = if let Some(arr) = args.as_array() {
+        arr.clone()
+    } else if let Some(changes_arr) = args.get("changes").and_then(Value::as_array) {
+        changes_arr.clone()
+    } else {
+        return Err("propose() requires an array of changes or { changes: [...] }".to_string());
+    };
+
+    if changes.is_empty() {
+        return Err("propose() requires at least one change".to_string());
+    }
+
+    // Validate each change and gather current values
+    let mut validated_changes = Vec::new();
+
+    for change in &changes {
+        let path = change
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Each change must have a 'path' field".to_string())?;
+
+        if change.get("value").is_none() {
+            return Err(format!("Change for '{}' must have a 'value' field", path));
+        }
+
+        // Get setting definition to validate
+        let setting_result = api.settings_get(path.to_string()).await.map_err(|e| {
+            if e.to_string().contains("not found") {
+                format!("Unknown app setting path: {}", path)
+            } else {
+                format!("settings.get failed: {}", e)
+            }
+        })?;
+
+        let definition = setting_result
+            .get("definition")
+            .ok_or_else(|| "settings.get returned invalid shape".to_string())?;
+
+        // Check if setting is read-only or sensitive
+        if let Some(apply) = definition.get("apply").and_then(Value::as_object) {
+            if apply.get("kind") == Some(&json!("read-only")) {
+                return Err(format!(
+                    "Invalid app setting change: {} setting is read-only",
+                    path
+                ));
+            }
+        }
+
+        if definition.get("sensitive") == Some(&json!(true)) {
+            return Err(format!(
+                "Invalid app setting change: {} setting is sensitive and cannot be changed via MCP proposals",
+                path
+            ));
+        }
+
+        validated_changes.push((
+            change,
+            definition.clone(),
+            setting_result.get("value").cloned(),
+        ));
+    }
+
+    // Build proposal
+    let payload_changes: Vec<Value> = validated_changes
+        .iter()
+        .map(|(change, definition, _)| {
+            json!({
+                "path": change.get("path"),
+                "value": change.get("value"),
+                "reason": change.get("reason"),
+                "apply": definition.get("apply")
+            })
+        })
+        .collect();
+
+    // Format preview fields
+    let fields: Vec<Value> = validated_changes
+        .iter()
+        .map(|(change, definition, current_value)| {
+            let label = definition
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("Setting");
+            let value_str = format!("{}", change.get("value").unwrap());
+            let before_str = current_value
+                .as_ref()
+                .map(|v| format!("{}", v))
+                .unwrap_or_else(|| "null".to_string());
+
+            let is_multiline = matches!(
+                definition.get("type").and_then(Value::as_str),
+                Some("object") | Some("array")
+            );
+
+            json!({
+                "key": change.get("path"),
+                "label": label,
+                "before": before_str,
+                "after": value_str,
+                "editable": true,
+                "multiline": is_multiline
+            })
+        })
+        .collect();
+
+    // Build title and summary
+    let (title, summary) = if validated_changes.len() == 1 {
+        let (_, definition, _) = &validated_changes[0];
+        let label = definition
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or("Setting");
+        let value_str = format!("{}", validated_changes[0].0.get("value").unwrap());
+        (
+            format!("{}: {}", label, value_str),
+            format!("Switch the {} to {}.", label.to_lowercase(), value_str),
+        )
+    } else {
+        let labels: Vec<&str> = validated_changes
+            .iter()
+            .filter_map(|(_, def, _)| def.get("label").and_then(Value::as_str))
+            .collect();
+        (
+            format!("Update {} settings", validated_changes.len()),
+            labels.join(", "),
+        )
+    };
+
+    let proposal = json!({
+        "kind": "settings-change",
+        "payload": {
+            "changes": payload_changes
+        },
+        "preview": {
+            "title": title,
+            "summary": summary,
+            "applyLabel": "Apply",
+            "fields": fields
+        }
+    });
+
+    proposal_result(proposal)
 }
 
 #[cfg(test)]
@@ -332,5 +543,175 @@ mod tests {
             result.get("valueRedacted").unwrap().as_bool().unwrap(),
             false
         );
+    }
+
+    // Proposal tests
+
+    #[tokio::test]
+    async fn test_propose_rejects_non_chief() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let non_chief_id = WorkspaceId::from_string("amber-forest");
+        let result = dispatch(
+            &api,
+            &non_chief_id,
+            "propose",
+            &json!([{ "path": "user.name", "value": "Bob" }]),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "ws.app.* is only available in the Chief of Staff workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_propose_requires_changes() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "propose", &json!({})).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("propose() requires an array of changes"));
+    }
+
+    #[tokio::test]
+    async fn test_propose_rejects_empty_changes() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "propose", &json!([])).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("propose() requires at least one change"));
+    }
+
+    #[tokio::test]
+    async fn test_propose_rejects_unknown_path() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "propose",
+            &json!([{ "path": "unknown.setting", "value": "test" }]),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Unknown app setting path: unknown.setting"));
+    }
+
+    #[tokio::test]
+    async fn test_propose_rejects_sensitive_setting() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "propose",
+            &json!([{ "path": "api.token", "value": "new-token" }]),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("setting is sensitive and cannot be changed via MCP proposals"));
+    }
+
+    #[tokio::test]
+    async fn test_propose_returns_proposal() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "propose",
+            &json!([{ "path": "user.name", "value": "Bob" }]),
+        )
+        .await
+        .unwrap();
+
+        // Should have proposal and content items
+        assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
+        let proposal = result.get("proposal").unwrap();
+        assert_eq!(
+            proposal.get("kind").unwrap().as_str().unwrap(),
+            "settings-change"
+        );
+
+        let payload = proposal.get("payload").unwrap();
+        let changes = payload.get("changes").unwrap().as_array().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0].get("path").unwrap().as_str().unwrap(),
+            "user.name"
+        );
+
+        let preview = proposal.get("preview").unwrap();
+        assert!(preview.get("title").is_some());
+        assert!(preview.get("summary").is_some());
+        assert!(preview.get("fields").is_some());
+
+        let items = result.get("__mcpContentItems").unwrap().as_array().unwrap();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_propose_accepts_object_with_changes() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "propose",
+            &json!({ "changes": [{ "path": "user.name", "value": "Bob" }] }),
+        )
+        .await
+        .unwrap();
+
+        let proposal = result.get("proposal").unwrap();
+        assert_eq!(
+            proposal.get("kind").unwrap().as_str().unwrap(),
+            "settings-change"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_propose_has_mcp_content_items() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "propose",
+            &json!([{ "path": "user.name", "value": "Bob" }]),
+        )
+        .await
+        .unwrap();
+
+        let items = result.get("__mcpContentItems").unwrap().as_array().unwrap();
+        assert_eq!(items.len(), 2);
+
+        // Text item
+        assert_eq!(items[0].get("type").unwrap().as_str().unwrap(), "text");
+        let text = items[0].get("text").unwrap().as_str().unwrap();
+        assert!(text.contains("\"ok\": true"));
+
+        // Resource item
+        assert_eq!(items[1].get("type").unwrap().as_str().unwrap(), "resource");
+        let resource = items[1].get("resource").unwrap();
+        assert_eq!(
+            resource.get("mimeType").unwrap().as_str().unwrap(),
+            "application/vnd.intent.proposal+json"
+        );
+        assert!(resource
+            .get("uri")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .starts_with("intent-proposal://"));
     }
 }
