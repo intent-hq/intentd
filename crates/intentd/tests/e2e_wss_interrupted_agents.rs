@@ -426,6 +426,56 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     let ws_id = "ws-graceful-test";
     let agent_id = format!("agent-{}", Uuid::new_v4().simple());
 
+    // Open the DB and seed workspace + agent session (bypassing RPC to avoid FK issues).
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open store");
+    {
+        use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
+        let ts = now_iso();
+        store
+            .insert_workspace(&workspace_seed(&WorkspaceId(ws_id.to_string())))
+            .await
+            .expect("insert workspace");
+
+        let session = AgentSession {
+            id: AgentId(agent_id.clone()),
+            workspace_id: WorkspaceId(ws_id.to_string()),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Graceful Test Agent".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            status: AgentStatus::Active, // in-flight
+            is_active: true,
+            system_prompt: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            messages: vec![],
+            stats: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        };
+        store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert agent");
+    }
+
     // Fetch fingerprint for TLS cert pinning.
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
     let fp = status["result"]["fingerprint"]
@@ -437,57 +487,8 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     let cfg = client_config(&fp);
     let mut ws = connect_ws(port, cfg).await;
 
-    // Create workspace via RPC.
-    let ws_create_result = wss_rpc(
-        &mut ws,
-        2,
-        "workspace.create",
-        json!({
-            "id": ws_id,
-            "title": "Graceful Shutdown Test",
-            "path": data_dir.join("workspace")
-        }),
-    )
-    .await;
-    assert!(ws_create_result.get("workspace").is_some());
-
-    // Create an agent session via RPC (will be Pending).
-    let agent_create_result = wss_rpc(
-        &mut ws,
-        3,
-        "agent.create",
-        json!({
-            "agentId": agent_id,
-            "workspaceId": ws_id,
-            "name": "Graceful Test Agent",
-            "model": "test-model",
-        }),
-    )
-    .await;
-    assert!(agent_create_result.get("agent").is_some());
-
-    // Directly update the session to Active status and mark it as in-flight.
-    // This simulates a mid-turn agent that's currently processing.
-    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
-        .await
-        .expect("open store");
-    {
-        use intent_core::{now_iso, AgentId, AgentStatus, WorkspaceId};
-        let ts = now_iso();
-        store
-            .set_agent_session_status(
-                &WorkspaceId(ws_id.to_string()),
-                &AgentId(agent_id.clone()),
-                AgentStatus::Active,
-                true,
-                &ts,
-            )
-            .await
-            .expect("set active status");
-    }
-
     // Now we need to trigger graceful shutdown. Use system.shutdown RPC.
-    let shutdown_result = wss_rpc(&mut ws, 4, "system.shutdown", json!({})).await;
+    let shutdown_result = wss_rpc(&mut ws, 2, "system.shutdown", json!({})).await;
     assert!(shutdown_result.get("shutdownRequested").is_some());
 
     // Wait for daemon to exit gracefully (up to 10 seconds).
@@ -525,7 +526,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     daemon = cmd2.spawn().expect("spawn intentd serve 2");
     assert!(await_uds(&socket).await, "daemon did not restart");
 
-    let status = uds_rpc(&socket, 5, "system.status", json!({})).await;
+    let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint 2")
@@ -534,7 +535,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     let mut ws = connect_ws(port, cfg).await;
 
     // Phase 3: Call agent.listInterrupted over WSS.
-    let result = wss_rpc(&mut ws, 6, "agent.listInterrupted", json!({})).await;
+    let result = wss_rpc(&mut ws, 4, "agent.listInterrupted", json!({})).await;
 
     // Verify the response shape.
     let agents = result["agents"].as_array().expect("agents array");
