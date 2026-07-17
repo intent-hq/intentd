@@ -6050,26 +6050,33 @@ impl WorkspaceApi for Services {
                         .title
                         .map(|t| t.trim().to_string())
                         .unwrap_or_default();
-                    // Setup script fallback: request > repo config > none
-                    // (FE parity: workspace.service.ts L1788-1791).
-                    let setup_script = match input.setup_script.clone().filter(|s| !s.is_empty()) {
-                        Some(explicit) => Some(setup_scripts::user_script(explicit)),
-                        None => {
-                            if let Some(repo_path) = input
-                                .repository_path
-                                .as_deref()
-                                .filter(|p| !p.is_empty())
-                                .map(PathBuf::from)
-                            {
-                                let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
-                                repo_config.setup_script
-                                    .filter(|s| !s.is_empty())
-                                    .map(setup_scripts::user_script)
-                            } else {
-                                None
+                    // Setup script write (§5.25 repo-config sole source of truth):
+                    // when an explicit non-empty `setupScript` is provided, write it
+                    // into the repo config; otherwise leave the repo config alone
+                    // (the existing `setupScript` key, if any, remains readable).
+                    // The workspace DB row's `setup_script` column is retired from
+                    // the write path — it stays NULL (wire compat) and the read path
+                    // (§5.25) routes through the repo config with a legacy fallback.
+                    if let Some(explicit) = input.setup_script.clone().filter(|s| !s.is_empty()) {
+                        if let Some(repo_path) = input
+                            .repository_path
+                            .as_deref()
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from)
+                        {
+                            let mut repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                            // Only write if the script differs (no-op when identical).
+                            if repo_config.setup_script.as_deref() != Some(explicit.as_str()) {
+                                repo_config.setup_script = Some(explicit);
+                                if let Err(e) = crate::repo_config::write_repo_config(&repo_path, repo_config).await {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "workspace.create: failed to write setup script to repo config"
+                                    );
+                                }
                             }
                         }
-                    };
+                    }
                     let mut ws = Workspace {
                         id,
                         title,
@@ -6099,7 +6106,7 @@ impl WorkspaceApi for Services {
                         worktree_path: input.worktree_path,
                         scope: input.scope,
                         skip_worktree: input.skip_worktree.unwrap_or(false),
-                        setup_script,
+                        setup_script: None,
                         is_remote: input.is_remote.unwrap_or(false),
                         default_model: input.default_model,
                         pr_number: None,
@@ -6842,7 +6849,7 @@ impl WorkspaceApi for Services {
                 worktree_path: None,
                 scope: source.scope.clone(),
                 skip_worktree: source.skip_worktree,
-                setup_script: source.setup_script.clone(),
+                setup_script: None,
                 is_remote: source.is_remote,
                 default_model: source.default_model.clone(),
                 pr_number: None,
@@ -7257,9 +7264,24 @@ impl WorkspaceApi for Services {
     fn get_setup_script(&self, id: WorkspaceId) -> BoxFuture<'_, Result<SetupScript>> {
         let store = self.store.clone();
         Box::pin(async move {
-            // Surface a default (empty `script`, `updatedAt: 0`) record before the
-            // first save; `NotFound` propagates so the router maps it to `-32602`.
             let ws = store.get_workspace(&id).await?;
+            // Read from repo config (§5.25 sole source of truth); synthesize the
+            // SetupScript record from the string. Legacy fallback: if repo config
+            // is empty but the workspace DB row still has a setupScript (pre-change
+            // data), return it read-only — never write it back to the DB.
+            let repo_path = ws
+                .repository_path
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from);
+            if let Some(repo_path) = repo_path {
+                let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                if let Some(script_str) = repo_config.setup_script.filter(|s| !s.is_empty()) {
+                    // Repo config has a script — return it as the authoritative value.
+                    return Ok(setup_scripts::user_script(script_str));
+                }
+            }
+            // Legacy fallback: return the DB value if present, else the default.
             Ok(ws.setup_script.unwrap_or_else(|| SetupScript {
                 script: String::new(),
                 project_type: None,
@@ -7276,12 +7298,27 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<SetupScript>> {
         let store = self.store.clone();
         Box::pin(async move {
-            let mut ws = store.get_workspace(&id).await?;
-            let record = setup_scripts::user_script(script);
-            ws.setup_script = Some(record.clone());
-            ws.updated_at = now_iso();
-            store.update_workspace(&ws).await?;
-            Ok(record)
+            // Write to repo config instead of the DB row (§5.25 sole source of truth).
+            let ws = store.get_workspace(&id).await?;
+            let repo_path = ws
+                .repository_path
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| {
+                    Error::InvalidParams(
+                        "workspace has no repositoryPath; cannot persist setup script".to_string(),
+                    )
+                })?;
+            let repo_path_buf = PathBuf::from(repo_path);
+            let mut repo_config = crate::repo_config::read_repo_config(&repo_path_buf).await;
+            repo_config.setup_script = if script.is_empty() {
+                None
+            } else {
+                Some(script.clone())
+            };
+            crate::repo_config::write_repo_config(&repo_path_buf, repo_config).await?;
+            // Return the §5.25 SetupScript wire shape (synthesized from the written string).
+            Ok(setup_scripts::user_script(script))
         })
     }
 
