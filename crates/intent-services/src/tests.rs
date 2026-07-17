@@ -9267,10 +9267,18 @@ mod known_repo {
     /// `workspace.create` derives `repository_owner` and `repository_name` from
     /// the `origin` remote URL when the caller omits them (STAB-64). Caller-
     /// supplied values always win; non-github remotes leave owner unset; missing
-    /// remotes fall back to basename for name.
+    /// remotes fall back to basename for name. Strict host check rejects
+    /// github.com.evil.com and similar substring attacks.
     #[tokio::test]
     async fn create_workspace_derives_owner_and_name_from_origin_remote() {
         use git2::{Repository, Signature};
+
+        struct TempRepo(PathBuf);
+        impl Drop for TempRepo {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
 
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -9278,7 +9286,7 @@ mod known_repo {
         let svc = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
 
         // Helper: init a git repo with an origin remote and an initial commit.
-        let make_repo = |remote_url: &str| {
+        let make_repo = |remote_url: &str| -> TempRepo {
             let dir = std::env::temp_dir().join(format!("intentd-origin-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             let repo = Repository::init(&dir).unwrap();
@@ -9295,7 +9303,7 @@ mod known_repo {
             let sig = Signature::now("Test", "test@example.com").unwrap();
             repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
                 .unwrap();
-            dir
+            TempRepo(dir)
         };
 
         // GitHub https remote → owner and name derived.
@@ -9303,7 +9311,7 @@ mod known_repo {
         let https_ws = svc
             .create_workspace(
                 WorkspaceCreate {
-                    repository_path: Some(https_repo.to_string_lossy().to_string()),
+                    repository_path: Some(https_repo.0.to_string_lossy().to_string()),
                     ..Default::default()
                 },
                 None,
@@ -9326,7 +9334,7 @@ mod known_repo {
         let ssh_ws = svc
             .create_workspace(
                 WorkspaceCreate {
-                    repository_path: Some(ssh_repo.to_string_lossy().to_string()),
+                    repository_path: Some(ssh_repo.0.to_string_lossy().to_string()),
                     ..Default::default()
                 },
                 None,
@@ -9349,7 +9357,7 @@ mod known_repo {
         let gitlab_ws = svc
             .create_workspace(
                 WorkspaceCreate {
-                    repository_path: Some(gitlab_repo.to_string_lossy().to_string()),
+                    repository_path: Some(gitlab_repo.0.to_string_lossy().to_string()),
                     ..Default::default()
                 },
                 None,
@@ -9389,12 +9397,12 @@ mod known_repo {
             let sig = Signature::now("Test", "test@example.com").unwrap();
             repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
                 .unwrap();
-            dir
+            TempRepo(dir)
         };
         let noremote_ws = svc
             .create_workspace(
                 WorkspaceCreate {
-                    repository_path: Some(no_remote.to_string_lossy().to_string()),
+                    repository_path: Some(no_remote.0.to_string_lossy().to_string()),
                     ..Default::default()
                 },
                 None,
@@ -9420,7 +9428,7 @@ mod known_repo {
         let explicit_owner_ws = svc
             .create_workspace(
                 WorkspaceCreate {
-                    repository_path: Some(explicit_owner_repo.to_string_lossy().to_string()),
+                    repository_path: Some(explicit_owner_repo.0.to_string_lossy().to_string()),
                     repository_owner: Some("my-override".to_string()),
                     ..Default::default()
                 },
@@ -9444,7 +9452,7 @@ mod known_repo {
         let explicit_name_ws = svc
             .create_workspace(
                 WorkspaceCreate {
-                    repository_path: Some(explicit_name_repo.to_string_lossy().to_string()),
+                    repository_path: Some(explicit_name_repo.0.to_string_lossy().to_string()),
                     repository_name: Some("my-repo-name".to_string()),
                     ..Default::default()
                 },
@@ -9467,7 +9475,7 @@ mod known_repo {
         let repos = store.list_known_repos().await.expect("list repos");
         let https_entry = repos
             .iter()
-            .find(|r| r.path == https_repo.to_string_lossy())
+            .find(|r| r.path == https_repo.0.to_string_lossy())
             .expect("https repo registered");
         assert_eq!(
             https_entry.owner.as_deref(),
@@ -9477,6 +9485,40 @@ mod known_repo {
         assert_eq!(
             https_entry.name, "intentd",
             "known_repo entry carries derived name"
+        );
+
+        // Negative: host substring attack (github.com.evil.com) must NOT derive.
+        let evil_https = make_repo("https://github.com.evil.com/owner/repo.git");
+        let evil_https_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(evil_https.0.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create evil https");
+        assert_eq!(
+            evil_https_ws.workspace.repository_owner, None,
+            "github.com.evil.com must NOT derive owner (strict host check)"
+        );
+
+        // Negative: ssh host attack (git@github.com.evil:owner/repo.git) must NOT derive.
+        let evil_ssh = make_repo("git@github.com.evil:owner/repo.git");
+        let evil_ssh_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(evil_ssh.0.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create evil ssh");
+        assert_eq!(
+            evil_ssh_ws.workspace.repository_owner, None,
+            "git@github.com.evil:... must NOT derive owner (strict host check)"
         );
     }
 
@@ -9489,6 +9531,13 @@ mod known_repo {
     async fn list_workspaces_backfills_owner_and_name_from_origin_remote() {
         use git2::{Repository, Signature};
 
+        struct TempRepo(PathBuf);
+        impl Drop for TempRepo {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
@@ -9499,7 +9548,7 @@ mod known_repo {
 
         // Manually create a workspace row with repository_path but missing owner/name
         // (simulates old workspace created before the create derivation landed).
-        let make_repo = |url: &str| {
+        let make_repo = |url: &str| -> TempRepo {
             let dir = std::env::temp_dir().join(format!(
                 "intentd-backfill-{}",
                 std::time::SystemTime::now()
@@ -9516,7 +9565,7 @@ mod known_repo {
             let sig = Signature::now("Test", "test@example.com").unwrap();
             repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
                 .unwrap();
-            dir
+            TempRepo(dir)
         };
 
         let repo_path = make_repo("https://github.com/octocat/hello-world.git");
@@ -9537,7 +9586,7 @@ mod known_repo {
             last_activity: None,
             tags: vec![],
             path: None,
-            repository_path: Some(repo_path.to_string_lossy().to_string()),
+            repository_path: Some(repo_path.0.to_string_lossy().to_string()),
             repository_owner: None,
             repository_name: None,
             worktree_path: None,
@@ -9639,9 +9688,6 @@ mod known_repo {
             Some("hello-world"),
             "repositoryName persisted"
         );
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&repo_path);
     }
 }
 

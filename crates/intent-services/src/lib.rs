@@ -582,6 +582,41 @@ impl Services {
         ws.cow_supported = self.compute_cow_supported(ws);
     }
 
+    /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
+    /// `github.com`. Rejects URLs with hosts like `github.com.evil.com`.
+    fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
+        let trimmed = url.trim();
+
+        // HTTPS: extract host from scheme://host/... form.
+        if let Some(rest) = trimmed
+            .strip_prefix("https://")
+            .or_else(|| trimmed.strip_prefix("http://"))
+        {
+            let host_end = rest.find('/').unwrap_or(rest.len());
+            let host = &rest[..host_end];
+            if host != "github.com" {
+                return None;
+            }
+            let path = &rest[host_end..];
+            return clone_ops::parse_owner_repo(&format!("https://github.com{path}"));
+        }
+
+        // SSH scp-like: git@host:path form. Extract host before the colon.
+        if let Some(at_idx) = trimmed.find('@') {
+            let after_at = &trimmed[at_idx + 1..];
+            if let Some(colon_idx) = after_at.find(':') {
+                let host = &after_at[..colon_idx];
+                if host != "github.com" {
+                    return None;
+                }
+                let path = &after_at[colon_idx + 1..];
+                return clone_ops::parse_owner_repo(&format!("git@github.com:{path}"));
+            }
+        }
+
+        None
+    }
+
     /// Spawn a background task to backfill `repository_owner` / `repository_name`
     /// for active workspaces with a local `repositoryPath` and missing owner/name.
     /// Non-blocking for the caller; each workspace is probed at most once per
@@ -612,8 +647,6 @@ impl Services {
                     candidates.push(BackfillCandidate {
                         workspace_id: ws.id.clone(),
                         repository_path: ws.repository_path.clone().unwrap(),
-                        missing_owner,
-                        missing_name,
                     });
                     backfilled.insert(ws.id.0.clone());
                 }
@@ -628,9 +661,10 @@ impl Services {
         let services = self.clone();
         tokio::spawn(async move {
             for candidate in candidates {
-                if let Err(e) = services.backfill_one_workspace(candidate).await {
+                if let Err(e) = services.backfill_one_workspace(candidate.clone()).await {
                     tracing::debug!(
-                        workspace = %e.to_string(),
+                        workspace_id = %candidate.workspace_id.as_str(),
+                        error = %e.to_string(),
                         "repository owner backfill failed (non-fatal)"
                     );
                 }
@@ -647,27 +681,32 @@ impl Services {
             return Ok(());
         }
 
-        let origin_url = intent_git::remote::origin_url(&repo_path)
-            .ok()
-            .flatten()
-            .filter(|url| url.contains("github.com"));
+        let origin_url = intent_git::remote::origin_url(&repo_path).ok().flatten();
 
         let Some(origin_url) = origin_url else {
             return Ok(());
         };
 
-        let Some((owner, name)) = clone_ops::parse_owner_repo(&origin_url) else {
+        let Some((owner, name)) = Self::parse_github_owner_repo(&origin_url) else {
             return Ok(());
         };
 
+        // Re-read the workspace to avoid overwriting fields populated after the
+        // candidate was built (backfill race guard).
         let mut ws = self.store.get_workspace(&candidate.workspace_id).await?;
         let mut changes = serde_json::Map::new();
 
-        if candidate.missing_owner {
+        // Only fill fields that are still missing in the currently persisted state.
+        let missing_owner = ws.repository_owner.is_none()
+            || ws.repository_owner.as_deref().is_some_and(|o| o.is_empty());
+        let missing_name = ws.repository_name.is_none()
+            || ws.repository_name.as_deref().is_some_and(|n| n.is_empty());
+
+        if missing_owner {
             ws.repository_owner = Some(owner.clone());
             changes.insert("repositoryOwner".to_string(), serde_json::json!(owner));
         }
-        if candidate.missing_name {
+        if missing_name {
             ws.repository_name = Some(name.clone());
             changes.insert("repositoryName".to_string(), serde_json::json!(name));
         }
@@ -686,7 +725,7 @@ impl Services {
         .await;
 
         tracing::debug!(
-            workspace = %ws.id.as_str(),
+            workspace_id = %ws.id.as_str(),
             owner = %ws.repository_owner.as_deref().unwrap_or(""),
             name = %ws.repository_name.as_deref().unwrap_or(""),
             "backfilled repository owner/name from origin remote"
@@ -2967,11 +3006,10 @@ fn worktree_folder_slug(repo_name: &str) -> String {
 /// place. Cheap and non-blocking for the list response (spawned background task,
 /// deduped per workspace); no network. Non-github remotes are skipped silently
 /// and not re-probed in a hot loop (FE `performBackgroundEnrichment` parity).
+#[derive(Clone)]
 struct BackfillCandidate {
     workspace_id: WorkspaceId,
     repository_path: String,
-    missing_owner: bool,
-    missing_name: bool,
 }
 
 /// Recursively scan `dir` for git repositories (a directory that contains a
@@ -5879,11 +5917,7 @@ impl WorkspaceApi for Services {
                         intent_git::remote::origin_url(&repo_path)
                             .ok()
                             .flatten()
-                            .filter(|url| {
-                                // Only parse github.com URLs.
-                                url.contains("github.com")
-                            })
-                            .and_then(|url| clone_ops::parse_owner_repo(&url))
+                            .and_then(|url| Self::parse_github_owner_repo(&url))
                     } else {
                         None
                     };
