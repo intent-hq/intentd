@@ -1684,7 +1684,7 @@ impl Services {
         if let Some(ref id) = message_id {
             if id.len() > MAX_MESSAGE_ID_LEN {
                 return Err(Error::InvalidParams(format!(
-                    "messageId exceeds maximum length of {} characters",
+                    "messageId exceeds maximum length of {} bytes",
                     MAX_MESSAGE_ID_LEN
                 )));
             }
@@ -1770,7 +1770,7 @@ impl Services {
         // Validate message_id length to prevent unbounded storage.
         if message_id.len() > MAX_MESSAGE_ID_LEN {
             return Err(Error::InvalidParams(format!(
-                "messageId exceeds maximum length of {} characters",
+                "messageId exceeds maximum length of {} bytes",
                 MAX_MESSAGE_ID_LEN
             )));
         }
