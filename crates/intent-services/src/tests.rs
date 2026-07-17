@@ -12626,3 +12626,224 @@ fn git_push_event_builds_correct_event_payload() {
     assert_eq!(forced.data["branch"], "feat/test");
     assert_eq!(forced.data["commit"], "def456");
 }
+
+/// Tests for `workspace:updated { lastActivity }` event emission (§10.1).
+#[cfg(test)]
+mod last_activity_events {
+    use super::*;
+    use crate::{EventBus, Subscription, SubscriptionFilter};
+    use serde_json::Value;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    struct Harness {
+        _tmp: TempDb,
+        _ws_root: WorkspacesRoot,
+        store: Store,
+        services: Services,
+        bus: EventBus,
+        ws: WorkspaceId,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let ws_root = WorkspacesRoot::new();
+        let store = Store::open(&tmp.path).await.expect("temp store");
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&ws))
+            .await
+            .expect("seed workspace");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone());
+        Harness {
+            _tmp: tmp,
+            _ws_root: ws_root,
+            store,
+            services,
+            bus,
+            ws,
+        }
+    }
+
+    fn subscribe(h: &Harness) -> Subscription {
+        h.bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        })
+    }
+
+    async fn recv_one(sub: &mut Subscription) -> Value {
+        let batch = timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        assert!(!batch.is_empty(), "expected at least one event");
+        serde_json::to_value(&batch[0]).expect("serialize event")
+    }
+
+    fn assert_envelope(ev: &Value, expected_ws: &str, expected_type: &str) {
+        assert_eq!(ev["workspaceId"], expected_ws);
+        assert_eq!(ev["type"], expected_type);
+    }
+
+    /// After `raise_attention` (which bumps workspace.updated_at), a
+    /// `workspace:updated { lastActivity }` event is emitted (after debounce).
+    #[tokio::test]
+    async fn raise_attention_emits_last_activity() {
+        std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "100");
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+
+        // First event: workspace:attention-changed
+        let ev1 = recv_one(&mut sub).await;
+        assert_envelope(&ev1, &h.ws.0, "workspace:attention-changed");
+
+        // Second event: workspace:updated { lastActivity }
+        let ev2 = recv_one(&mut sub).await;
+        assert_envelope(&ev2, &h.ws.0, "workspace:updated");
+        assert!(ev2["data"]["changes"]["lastActivity"].is_string());
+
+        let ws_after = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            ev2["data"]["changes"]["lastActivity"].as_str().unwrap(),
+            ws_after.updated_at.as_str()
+        );
+    }
+
+    /// `dismiss_attention` only emits `workspace:updated { lastActivity }` when
+    /// attention actually changed (idempotent no-op on already-clear).
+    #[tokio::test]
+    async fn dismiss_attention_idempotent() {
+        std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "100");
+        let h = harness().await;
+
+        // Raise first so we have something to dismiss.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut sub = subscribe(&h);
+
+        // Dismiss (should emit both events).
+        h.services
+            .dismiss_attention(h.ws.clone())
+            .await
+            .expect("dismiss");
+
+        let ev1 = recv_one(&mut sub).await;
+        assert_envelope(&ev1, &h.ws.0, "workspace:attention-changed");
+
+        let ev2 = recv_one(&mut sub).await;
+        assert_envelope(&ev2, &h.ws.0, "workspace:updated");
+
+        // Dismiss again (no-op, no events).
+        h.services
+            .dismiss_attention(h.ws.clone())
+            .await
+            .expect("dismiss again");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            matches!(timeout(Duration::from_millis(50), sub.recv()).await, Err(_)),
+            "no event on idempotent dismiss"
+        );
+    }
+
+    /// Rapid bumps to the same workspace (e.g., multiple raise_attention calls)
+    /// coalesce into one `workspace:updated { lastActivity }` event carrying
+    /// the latest derived value.
+    #[tokio::test]
+    async fn burst_coalescing() {
+        std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "200");
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        // Raise attention multiple times (each bumps workspace.updated_at).
+        for i in 0..4 {
+            h.services
+                .raise_attention(
+                    &h.ws,
+                    if i % 2 == 0 {
+                        WorkspaceAttention::Unread
+                    } else {
+                        WorkspaceAttention::ReviewRequired
+                    },
+                )
+                .await
+                .expect("raise");
+        }
+
+        // Drain all `workspace:attention-changed` events emitted during the burst.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while timeout(Duration::from_millis(10), sub.recv()).await.is_ok() {}
+
+        // Wait for the debounce window to fire.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Should see exactly one workspace:updated { lastActivity }.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert!(ev["data"]["changes"]["lastActivity"].is_string());
+
+        // No second event (coalesced).
+        assert!(
+            matches!(
+                timeout(Duration::from_millis(100), sub.recv()).await,
+                Err(_)
+            ),
+            "burst coalesced into one event"
+        );
+
+        // The emitted lastActivity matches a fresh workspace.get.
+        let ws_after = h.store.get_workspace(&h.ws).await.expect("reload");
+        let mut ws_enriched = ws_after.clone();
+        h.services.derive_last_activity(&mut ws_enriched).await;
+        assert_eq!(
+            ev["data"]["changes"]["lastActivity"].as_str().unwrap(),
+            ws_enriched.last_activity.as_deref().unwrap()
+        );
+    }
+
+    /// `scan_workspace_token_usage` only emits `workspace:updated { lastActivity }`
+    /// when the token tallies actually changed (idempotent re-scan is silent).
+    #[tokio::test]
+    async fn token_usage_scan_only_on_change() {
+        std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "100");
+        let h = harness().await;
+
+        // First scan (no prior usage, should emit).
+        let changed1 = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("scan 1");
+        assert!(changed1, "first scan changed (none -> zero)");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut sub = subscribe(&h);
+
+        // Second scan (tallies unchanged, no emit).
+        let changed2 = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("scan 2");
+        assert!(!changed2, "second scan unchanged");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            matches!(timeout(Duration::from_millis(50), sub.recv()).await, Err(_)),
+            "no event on idempotent token scan"
+        );
+    }
+}

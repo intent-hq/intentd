@@ -1840,6 +1840,9 @@ impl AgentManager {
             }),
         };
         crate::publish_event(&self.services.event_bus, event).await;
+        // Schedule debounced lastActivity event (§10.1).
+        self.services
+            .schedule_last_activity_event(workspace_id.clone());
     }
 
     /// Forget a finished worker's join handle.
@@ -2956,6 +2959,10 @@ async fn persist_user(
                 .await
             {
                 tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+            } else {
+                // Schedule debounced lastActivity event (§10.1).
+                mgr.services
+                    .schedule_last_activity_event(workspace_id.clone());
             }
             mgr.services
                 .publish_agent_mutation_event(
