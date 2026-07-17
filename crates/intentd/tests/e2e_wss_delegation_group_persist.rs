@@ -61,7 +61,7 @@ impl Drop for Daemon {
             let _ = self.child.kill();
         }
         let _ = self.child.wait();
-        // On test panic, print data-dir path + daemon log tail for diagnosability
+        // On test panic, print data-dir path + daemon log tail + agent stderr for diagnosability
         if std::thread::panicking() {
             eprintln!("\n=== DAEMON CLEANUP (test panicked) ===");
             eprintln!("Data dir: {}", self.data_dir.display());
@@ -71,6 +71,22 @@ impl Drop for Daemon {
                 eprintln!("Last 30 lines of daemon.log:");
                 for line in lines.iter().rev() {
                     eprintln!("  {line}");
+                }
+            }
+            // Print agent stderr files if they exist
+            let agent_logs_dir = self.data_dir.join("agent-logs");
+            if let Ok(entries) = std::fs::read_dir(&agent_logs_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Ok(stderr_content) = std::fs::read_to_string(&path) {
+                        if !stderr_content.trim().is_empty() {
+                            eprintln!(
+                                "\nAgent stderr ({}): {}",
+                                path.file_name().unwrap().to_string_lossy(),
+                                stderr_content.lines().collect::<Vec<_>>().join("\n  ")
+                            );
+                        }
+                    }
                 }
             }
         }
