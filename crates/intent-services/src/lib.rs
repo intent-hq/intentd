@@ -15,7 +15,7 @@ use intent_core::events::{
     AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED,
     COMMENT_ADDED, COMMENT_RESOLVED, GIT_BRANCH, GIT_COMMIT, GIT_PULL, GIT_PUSH,
     LINE_ATTRIBUTION_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED,
-    PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, TASK_AGENT_LINKED,
+    PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED,
     TASK_AGENT_UNLINKED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
     WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
@@ -3640,6 +3640,22 @@ fn settings_changed_event(changes: Vec<serde_json::Value>) -> NewEvent {
     }
 }
 
+/// Build a `skills:changed` event (PROTOCOL §6.5). Emitted when the discovered
+/// skill set changes for a workspace (file-watch on the five scan roots).
+fn skills_changed_event(workspace_id: &WorkspaceId) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: SKILLS_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({ "workspaceId": workspace_id.as_str() }),
+    }
+}
+
 /// Build a `comment:added` change event with the self-sufficient payload
 /// `{ noteId, commentId }` (PROTOCOL §6.5; intentd carries the ids so a client
 /// can locate/fetch the new comment).
@@ -5012,8 +5028,12 @@ impl WorkspaceApi for Services {
                 ))
             })?;
 
-            // Discover skills using the skills module
-            let skills = skills::discover_skills(&workspace_path.to_string_lossy()).await;
+            // Check if skills changed and emit event if they did
+            let (skills, changed) =
+                skills::check_skills_changed(&workspace_path.to_string_lossy()).await;
+            if changed {
+                publish_event(&self.event_bus, skills_changed_event(&workspace_id)).await;
+            }
 
             // Sort by name for deterministic output
             let mut sorted_skills = skills;

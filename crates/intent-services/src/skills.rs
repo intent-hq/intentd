@@ -104,6 +104,43 @@ pub async fn format_skills_catalog_for_prompt(workspace_path: &str) -> String {
     payload.catalog.clone()
 }
 
+/// Public API: check if skills have changed and return new list if they have.
+/// Returns (skills, changed) where changed=true if the skill set differs from cache.
+pub async fn check_skills_changed(workspace_path: &str) -> (Vec<SkillMetadata>, bool) {
+    let normalized = normalize_workspace_path(workspace_path);
+    let cache_key = normalized
+        .as_deref()
+        .unwrap_or(NO_WORKSPACE_CACHE_KEY)
+        .to_string();
+
+    // Get old skills from cache if present
+    let old_skills = {
+        let cache = DISCOVERY_CACHE.lock().unwrap();
+        cache.get(&cache_key).map(|e| e.payload.skills.clone())
+    };
+
+    // Get current skills (will refresh cache if needed)
+    let payload = load_skills_payload(workspace_path).await;
+    let new_skills = payload.skills.clone();
+
+    // Compare: changed if cache was empty or skill names/count differ
+    let changed = match old_skills {
+        None => !new_skills.is_empty(), // Changed if we now have skills
+        Some(old) => {
+            if old.len() != new_skills.len() {
+                true
+            } else {
+                // Compare sorted skill names
+                let old_names: Vec<_> = old.iter().map(|s| &s.name).collect();
+                let new_names: Vec<_> = new_skills.iter().map(|s| &s.name).collect();
+                old_names != new_names
+            }
+        }
+    };
+
+    (new_skills, changed)
+}
+
 /// Normalize workspace path (trim and resolve to absolute)
 fn normalize_workspace_path(workspace_path: &str) -> Option<String> {
     let trimmed = workspace_path.trim();
