@@ -6,7 +6,7 @@
 //!
 //! Coverage:
 //! - Interrupted agents are persisted across restart (crash)
-//! - Interrupted agents are persisted on graceful shutdown (SIGTERM)
+//! - Interrupted agents are persisted on graceful shutdown (system.shutdown RPC)
 //! - `agent.listInterrupted` returns pending rows with joined workspace/agent data
 //! - Terminal/pending sessions are not captured
 //! - Idempotent inserts on second restart
@@ -222,6 +222,31 @@ where
     }
 }
 
+/// Read one `events.event` notification from a subscriber connection (bounded).
+async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let next = timeout(Duration::from_secs(secs), ws.next())
+            .await
+            .expect("wss event timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "events.event" {
+                    return v;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected event frame, got {other:?}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn interrupted_agents_persisted_across_restart() {
     let data_dir = temp_data_dir();
@@ -394,13 +419,35 @@ async fn interrupted_agents_persisted_across_restart() {
 
 #[tokio::test]
 async fn graceful_shutdown_captures_interrupted_agents() {
+    // Fixture check: rely on the same mock ACP agent as the full-turn test.
+    let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mock-acp-agent.mjs");
+    if !script.exists() {
+        eprintln!("skipping graceful-shutdown e2e: mock ACP agent missing at {script:?}");
+        return;
+    }
+
     let data_dir = temp_data_dir();
     let port = free_port();
     let port_s = port.to_string();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
+    let ws_id = "ws-graceful-test";
 
-    // Phase 1: Boot daemon, create a workspace, create an agent session and mark it busy.
+    // Pre-seed workspace so agent.create RPC can succeed.
+    {
+        use intent_core::WorkspaceId;
+        use intent_store::Store;
+        let store = Store::open(&data_dir.join("intentd.db"))
+            .await
+            .expect("open store");
+        store
+            .insert_workspace(&workspace_seed(&WorkspaceId(ws_id.to_string())))
+            .await
+            .expect("insert ws");
+    }
+
+    // Phase 1: Boot daemon with mock ACP provider.
     let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd1.arg("serve")
         .arg("--listen")
@@ -408,6 +455,8 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", &port_s)
+        .env("MOCK_SLEEP_MS", "5000") // 5s turn to give us time to shutdown mid-turn
+        .env("AUGMENT_MCP_MOCK_AGENT_SCRIPT", &script)
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -423,59 +472,6 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         panic!("daemon did not start");
     }
 
-    let ws_id = "ws-graceful-test";
-    let agent_id = format!("agent-{}", Uuid::new_v4().simple());
-
-    // Open the DB and seed workspace + agent session (bypassing RPC to avoid FK issues).
-    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
-        .await
-        .expect("open store");
-    {
-        use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
-        let ts = now_iso();
-        store
-            .insert_workspace(&workspace_seed(&WorkspaceId(ws_id.to_string())))
-            .await
-            .expect("insert workspace");
-
-        let session = AgentSession {
-            id: AgentId(agent_id.clone()),
-            workspace_id: WorkspaceId(ws_id.to_string()),
-            backend_session_id: None,
-            acp_session_id: None,
-            name: "Graceful Test Agent".to_string(),
-            name_explicitly_set: false,
-            model: None,
-            provider: None,
-            status: AgentStatus::Active, // in-flight
-            is_active: true,
-            system_prompt: None,
-            created_at: ts.clone(),
-            updated_at: ts,
-            parent_agent_id: None,
-            specialist: None,
-            task_note_id: None,
-            skip_auto_commit: false,
-            completion_report: None,
-            completion_report_timestamp: None,
-            delegation_depth: None,
-            initial_message: None,
-            context_references: None,
-            image_blocks: None,
-            is_background: false,
-            metadata: None,
-            messages: vec![],
-            stats: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
-        };
-        store
-            .insert_agent_session(&session)
-            .await
-            .expect("insert agent");
-    }
-
     // Fetch fingerprint for TLS cert pinning.
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
     let fp = status["result"]["fingerprint"]
@@ -483,12 +479,58 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .expect("fingerprint")
         .to_string();
 
-    // Open WSS connection.
+    // Open event subscriber BEFORE creating the agent so we miss no events.
     let cfg = client_config(&fp);
-    let mut ws = connect_ws(port, cfg).await;
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        10,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
 
-    // Now we need to trigger graceful shutdown. Use system.shutdown RPC.
-    let shutdown_result = wss_rpc(&mut ws, 2, "system.shutdown", json!({})).await;
+    // RPC conn — create agent and send a message to make it in-flight (Active).
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Graceful Agent", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "start" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Wait for the agent to be observably in-flight: look for agent:stream:chunk
+    // (which means the turn has started and the agent is Active).
+    let mut saw_chunk = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 10).await;
+        if frame["params"]["event"]["type"] == "agent:stream:chunk" {
+            saw_chunk = true;
+            break;
+        }
+    }
+    assert!(
+        saw_chunk,
+        "agent did not start streaming (mid-turn capture relies on this)"
+    );
+
+    // Now trigger graceful shutdown via system.shutdown RPC (SIGTERM equivalent).
+    let shutdown_result = wss_rpc(&mut rpc, 13, "system.shutdown", json!({})).await;
     assert!(shutdown_result.get("shutdownRequested").is_some());
 
     // Wait for daemon to exit gracefully (up to 10 seconds).
