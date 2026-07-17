@@ -276,6 +276,15 @@ async fn test_workspace_create_setup_script_fallback() {
         json!("npm install"),
         "getSetupScript should return repo config value"
     );
+    assert_eq!(
+        get_resp1["result"]["setupScript"]["generatedBy"],
+        json!("user"),
+        "generatedBy should be user for repo config scripts"
+    );
+    assert!(
+        get_resp1["result"]["setupScript"]["updatedAt"].is_number(),
+        "updatedAt should be present (file mtime)"
+    );
 
     // Test 2: request-supplied script is written to repo config
     let repo2 = create_test_repo_with_config(r#"{"setupScript": "npm install"}"#);
@@ -314,6 +323,15 @@ async fn test_workspace_create_setup_script_fallback() {
         get_resp2["result"]["setupScript"]["script"],
         json!("yarn install"),
         "getSetupScript should return request-supplied value"
+    );
+    assert_eq!(
+        get_resp2["result"]["setupScript"]["generatedBy"],
+        json!("user"),
+        "generatedBy should be user for explicit scripts"
+    );
+    assert!(
+        get_resp2["result"]["setupScript"]["updatedAt"].is_number(),
+        "updatedAt should be present"
     );
 
     shutdown_tx.send(()).ok();

@@ -345,6 +345,9 @@ async fn setup_script_repo_config_sole_source() {
         json!({"workspaceId": workspace_id}),
     )
     .await;
+    // Assert JSON-RPC 2.0 envelope (§5.25 wire contract)
+    assert_eq!(get_resp["jsonrpc"], json!("2.0"), "jsonrpc version");
+    assert_eq!(get_resp["id"], json!(10), "echoed id");
     assert_eq!(
         get_resp["result"]["setupScript"]["script"],
         json!("npm install"),
@@ -355,6 +358,10 @@ async fn setup_script_repo_config_sole_source() {
         json!("user"),
         "generatedBy should be synthesized"
     );
+    assert!(
+        get_resp["result"]["setupScript"]["updatedAt"].is_number(),
+        "updatedAt should be present as number (file mtime)"
+    );
 
     // Test workspace.saveSetupScript updates the repo config file
     let save_resp = wss_rpc(
@@ -364,10 +371,22 @@ async fn setup_script_repo_config_sole_source() {
         json!({"workspaceId": workspace_id, "script": "yarn install"}),
     )
     .await;
+    // Assert JSON-RPC 2.0 envelope
+    assert_eq!(save_resp["jsonrpc"], json!("2.0"), "jsonrpc version");
+    assert_eq!(save_resp["id"], json!(11), "echoed id");
     assert_eq!(
         save_resp["result"]["setupScript"]["script"],
         json!("yarn install"),
         "saveSetupScript should return updated script"
+    );
+    assert_eq!(
+        save_resp["result"]["setupScript"]["generatedBy"],
+        json!("user"),
+        "generatedBy should be user for saved scripts"
+    );
+    assert!(
+        save_resp["result"]["setupScript"]["updatedAt"].is_number(),
+        "updatedAt should be present as number"
     );
 
     // Assert the repo config file was updated
