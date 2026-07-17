@@ -2382,8 +2382,81 @@ impl AgentManager {
     }
 
     /// Tear down every tracked agent (clean daemon shutdown kills all children).
+    /// Before stopping each in-flight agent, capture it as an interrupted session
+    /// so the FE modal offers resumption on next launch — same as a crash (INT-41
+    /// graceful-shutdown gap).
     pub async fn shutdown(&self) {
         let ids: Vec<AgentId> = self.handles.lock().unwrap().keys().cloned().collect();
+        let now = intent_core::now_iso();
+
+        // Capture in-flight agents before stop() settles them to RuntimeIdle.
+        for id in &ids {
+            // Only agents currently in-flight (in the busy set) need interruption rows.
+            if !self.busy.lock().unwrap().contains(id) {
+                continue;
+            }
+            // Read the workspace from agent_ws (stop() will clear it via end_turn).
+            let workspace_id = match self.agent_ws.lock().unwrap().get(id).cloned() {
+                Some(ws) => ws,
+                None => continue, // Stale busy entry (should not happen).
+            };
+            // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
+            // Use get_agent_session_status (lightweight, skips message log).
+            // RACE: try_begin inserts into busy BEFORE persist_status(Active) completes, so
+            // shutdown in that window may read Pending. Busy-set membership is authoritative:
+            // if the agent is in busy, it's mid-turn regardless of the persisted status.
+            let prev_status = match self.services.store.get_agent_session_status(id).await {
+                Ok(status) => status,
+                Err(e) => {
+                    tracing::warn!(agent_id = %id, error = %e, "graceful shutdown: could not read session status");
+                    continue;
+                }
+            };
+            // Serialize the status via serde to match the DB form (e.g., "active", "Waiting").
+            // If encoding fails or produces a non-string, skip this agent (do not persist an
+            // undocumented status string). If the persisted status is non-in-flight (e.g.,
+            // Pending due to the try_begin race), fall back to "active" — busy membership
+            // proves the agent is mid-turn.
+            let prev_str = match serde_json::to_value(prev_status) {
+                Ok(serde_json::Value::String(s)) => {
+                    // Non-in-flight statuses (pending/idle/error/deleted) mean we raced with
+                    // persist_status. Busy membership is authoritative: use "active".
+                    if matches!(
+                        prev_status,
+                        AgentStatus::Pending
+                            | AgentStatus::RuntimeIdle
+                            | AgentStatus::Idle
+                            | AgentStatus::Error
+                            | AgentStatus::Deleted
+                    ) {
+                        "active".to_string()
+                    } else {
+                        s
+                    }
+                }
+                Ok(other) => {
+                    tracing::warn!(agent_id = %id, status = ?prev_status, encoded = ?other, "graceful shutdown: status encoded to non-string, skipping interrupted_agent row");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(agent_id = %id, status = ?prev_status, error = %e, "graceful shutdown: status encoding failed, skipping interrupted_agent row");
+                    continue;
+                }
+            };
+            // Insert the interrupted_agent row (idempotent upsert: if a prior crash captured
+            // this agent and the daemon was restarted without the FE resolving it, the row
+            // is refreshed to the latest state).
+            if let Err(e) = self
+                .services
+                .store
+                .insert_interrupted_agent(id, &workspace_id, &prev_str, &now)
+                .await
+            {
+                tracing::warn!(agent_id = %id, workspace_id = %workspace_id, error = %e, "graceful shutdown: failed to insert interrupted_agent row");
+            }
+        }
+
+        // Now stop every agent (settles to RuntimeIdle, kills children).
         for id in &ids {
             self.stop(id).await;
         }

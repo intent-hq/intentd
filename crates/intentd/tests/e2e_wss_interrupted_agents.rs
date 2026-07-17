@@ -5,7 +5,8 @@
 //! verifies that `agent.listInterrupted` returns the interrupted agents.
 //!
 //! Coverage:
-//! - Interrupted agents are persisted across restart
+//! - Interrupted agents are persisted across restart (crash)
+//! - Interrupted agents are persisted on graceful shutdown (system.shutdown RPC)
 //! - `agent.listInterrupted` returns pending rows with joined workspace/agent data
 //! - Terminal/pending sessions are not captured
 //! - Idempotent inserts on second restart
@@ -15,7 +16,7 @@
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -221,6 +222,38 @@ where
     }
 }
 
+/// Read one `events.event` notification from a subscriber connection (bounded).
+/// The timeout is total (not per-frame), so heartbeat Pings do not reset it.
+async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let remaining = match deadline.checked_duration_since(tokio::time::Instant::now()) {
+            Some(d) if !d.is_zero() => d,
+            _ => panic!("wss event timed out"),
+        };
+        let next = match timeout(remaining, ws.next()).await {
+            Ok(next) => next,
+            Err(_) => panic!("wss event timed out"),
+        };
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "events.event" {
+                    return v;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected event frame, got {other:?}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn interrupted_agents_persisted_across_restart() {
     let data_dir = temp_data_dir();
@@ -389,6 +422,234 @@ async fn interrupted_agents_persisted_across_restart() {
     let result = wss_rpc(&mut ws, 4, "agent.listInterrupted", json!({})).await;
     let agents = result["agents"].as_array().expect("agents array 2");
     assert_eq!(agents.len(), 1, "still 1 interrupted agent (idempotent)");
+}
+
+/// Mock-agent gate (parity with the UDS E2E suite).
+fn gate(test: &str) -> Option<String> {
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping {test}: node not on PATH");
+        return None;
+    }
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("skipping {test}: mock script missing at {script}");
+        return None;
+    }
+    Some(script)
+}
+
+/// Live `intentd serve` process; killed on drop. Prevents daemon + Node mock
+/// leaks if the test panics before shutdown. Does not clean up data_dir — the test
+/// should do that explicitly at the very end (or rely on temp-dir auto-cleanup).
+struct Daemon {
+    child: Child,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[tokio::test]
+async fn graceful_shutdown_captures_interrupted_agents() {
+    let Some(script) = gate("graceful_shutdown_captures_interrupted_agents") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let port = free_port();
+    let port_s = port.to_string();
+    let listen = "both";
+    let socket = data_dir.join("intentd.sock");
+    let ws_id = "ws-graceful-test";
+
+    // Pre-seed workspace so agent.create RPC can succeed.
+    {
+        use intent_core::WorkspaceId;
+        use intent_store::Store;
+        let store = Store::open(&data_dir.join("intentd.db"))
+            .await
+            .expect("open store");
+        store
+            .insert_workspace(&workspace_seed(&WorkspaceId(ws_id.to_string())))
+            .await
+            .expect("insert ws");
+    }
+
+    // Phase 1: Boot daemon with mock ACP provider.
+    // blockUntilCancel makes the mock stream a chunk then park the prompt unresolved,
+    // keeping the agent in the busy set until session/cancel (which shutdown will send).
+    let behavior = json!({
+        "blockUntilCancel": true
+    })
+    .to_string();
+    let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd1.arg("serve")
+        .arg("--listen")
+        .arg(listen)
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_TCP_PORT", &port_s)
+        .env("MOCK_AGENT_SCRIPT_PATH", &script)
+        .env("MOCK_AGENT_BEHAVIOR", &behavior)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
+        ));
+    #[cfg(unix)]
+    cmd1.process_group(0);
+    let child = cmd1.spawn().expect("spawn intentd serve");
+    let mut daemon = Daemon { child };
+    if !await_uds(&socket).await {
+        let log_path = data_dir.join("daemon.log");
+        if let Ok(log) = std::fs::read_to_string(&log_path) {
+            eprintln!("Daemon log:\n{}", log);
+        }
+        panic!("daemon did not start");
+    }
+
+    // Fetch fingerprint for TLS cert pinning.
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    // Open event subscriber BEFORE creating the agent so we miss no events.
+    let cfg = client_config(&fp);
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        10,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    // RPC conn — create agent and send a message to make it in-flight (Active).
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Graceful Agent", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "start" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Wait for the agent to be observably in-flight: blockUntilCancel streams a chunk
+    // then parks, so seeing agent:stream:chunk means the agent is in the busy set.
+    let mut saw_chunk = false;
+    for _ in 0..20 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:chunk" {
+            saw_chunk = true;
+            break;
+        }
+    }
+    assert!(
+        saw_chunk,
+        "agent did not stream chunk (mid-turn capture relies on this)"
+    );
+
+    // Now trigger graceful shutdown via system.shutdown RPC over UDS (system.*
+    // is UDS-only; see PROTOCOL §5.7).
+    let shutdown_result = uds_rpc(&socket, 13, "system.shutdown", json!({})).await;
+    assert_eq!(shutdown_result["result"].get("ok"), Some(&json!(true)));
+    assert_eq!(
+        shutdown_result["result"].get("stopping"),
+        Some(&json!(true))
+    );
+
+    // Wait for daemon to exit gracefully (up to 10 seconds).
+    // daemon.child.wait() is blocking, so we poll for process death.
+    let exit_ok = timeout(Duration::from_secs(10), async {
+        loop {
+            match daemon.child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("failed to wait for daemon: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("daemon did not exit within timeout");
+    // Graceful shutdown should exit 0.
+    assert!(exit_ok, "daemon exited non-zero");
+    // Explicitly drop the first Daemon so its Drop guard doesn't kill data_dir cleanup.
+    std::mem::drop(daemon);
+
+    // Phase 2: Restart daemon — should list the interrupted agent.
+    let mut cmd2 = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd2.arg("serve")
+        .arg("--listen")
+        .arg(listen)
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_TCP_PORT", &port_s)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(data_dir.join("daemon2.log")).unwrap(),
+        ));
+    #[cfg(unix)]
+    cmd2.process_group(0);
+    let child2 = cmd2.spawn().expect("spawn intentd serve 2");
+    let _daemon2 = Daemon { child: child2 };
+    assert!(await_uds(&socket).await, "daemon did not restart");
+
+    let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint 2")
+        .to_string();
+    let cfg = client_config(&fp);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // Phase 3: Call agent.listInterrupted over WSS.
+    let result = wss_rpc(&mut ws, 4, "agent.listInterrupted", json!({})).await;
+
+    // Verify the response shape.
+    let agents = result["agents"].as_array().expect("agents array");
+    assert_eq!(
+        agents.len(),
+        1,
+        "expected 1 interrupted agent after graceful shutdown"
+    );
+    let interrupted = &agents[0];
+    assert_eq!(interrupted["agentId"].as_str(), Some(agent_id.as_str()));
+    assert_eq!(interrupted["workspaceId"].as_str(), Some(ws_id));
+    assert_eq!(interrupted["agentName"].as_str(), Some("Graceful Agent"));
+    assert_eq!(
+        interrupted["prevStatus"].as_str(),
+        Some("active"),
+        "graceful shutdown should capture Active status before settling to RuntimeIdle"
+    );
+    assert!(interrupted["interruptedAt"].is_string());
+
+    // Daemon Drop guard will kill the process. Clean up data_dir explicitly.
+    std::fs::remove_dir_all(&data_dir).ok();
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
