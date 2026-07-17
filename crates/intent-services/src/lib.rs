@@ -109,7 +109,7 @@ pub use agent_manager::{
 };
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
-pub use events::{EventBus, FileWatcher, Subscription, SubscriptionFilter};
+pub use events::{EventBus, FileWatcher, SkillsWatcher, Subscription, SubscriptionFilter};
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
 
