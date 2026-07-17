@@ -9,7 +9,6 @@ description = "UDS/TCP/TLS listeners, JSON-RPC router, auth, heartbeat, lifecycl
 [dependencies]
 intent-core = { path = "../intent-core" }
 intent-services = { path = "../intent-services" }
-intent-providers = { path = "../intent-providers" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -35,6 +34,5 @@ mdns-sd = "0.11"
 base64.workspace = true
 
 [dev-dependencies]
-intent-providers = { path = "../intent-providers" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
