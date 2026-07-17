@@ -262,6 +262,7 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
             "arguments": { "code": js, "summary": "ws.app.proposal.show e2e" }
         },
         "response": "show proposal",
+        "emitToolBlocks": true,
     })
     .to_string();
 
@@ -299,10 +300,40 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
         .expect("run_turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
 
-    // Tool call succeeded: the mock agent reached end_turn without failing/refusing,
-    // proving ws.app.proposal.show executed through the MCP path. The WSS e2e suite
-    // (e2e_wss_chief_workspace.rs) already covers proposal resource persistence in
-    // the transcript; this test verifies the MCP tool dispatch path works.
+    // Verify the proposal resource block is persisted in the transcript.
+    // ws.app.proposal.show returns MCP content items: [text, resource].
+    // The mock agent emits these via tool_call_update.rawOutput, which the daemon
+    // stores in the tool_result block's `output` array.
+    let conversation = services
+        .agent_get_conversation(agent_id.clone(), None, Some(chief_ws.clone()), None)
+        .await
+        .expect("read conversation");
+    let messages = conversation["messages"].as_array().expect("messages array");
+
+    let has_proposal_resource = messages.iter().any(|msg| {
+        if let Some(blocks) = msg["contentBlocks"].as_array() {
+            blocks.iter().any(|block| {
+                // The resource is nested in tool_result.output[N].resource
+                if block["type"] == "tool_result" {
+                    if let Some(output) = block["output"].as_array() {
+                        return output.iter().any(|item| {
+                            item["type"] == "resource"
+                                && item["resource"]["mimeType"]
+                                    == "application/vnd.intent.proposal+json"
+                        });
+                    }
+                }
+                false
+            })
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_proposal_resource,
+        "Proposal resource not found in persisted transcript: {}",
+        serde_json::to_string_pretty(&conversation).unwrap()
+    );
 
     manager.shutdown().await;
     for suffix in ["", "-wal", "-shm"] {

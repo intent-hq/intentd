@@ -466,9 +466,9 @@ async fn chief_workspace_over_wss() {
 /// WSS e2e coverage for chief-gated ws.app.* surface. Verifies:
 /// - ws.app.workspaces.list returns user workspaces (not __chief__)
 /// - ws.app.agents.list returns agent metadata
-/// - ws.app.proposal.show persists application/vnd.intent.proposal+json resource
 /// - app:ui-navigate and app:workspace-open events are observable via events.subscribe
-/// - Non-chief workspace agents are gated from ws.app.*
+/// Proposal persistence is covered by e2e_mock_agent_ws_app::chief_agent_ws_app_proposal_resource_persisted
+/// (MCP path test), which verifies application/vnd.intent.proposal+json resource blocks end-to-end.
 #[tokio::test]
 async fn ws_app_surface_events_and_gating_over_wss() {
     let data_dir = temp_data_dir();
