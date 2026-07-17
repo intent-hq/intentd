@@ -506,17 +506,25 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
         "Expected agent {created_agent_id} to complete turn and reach idle, but timed out"
     );
 
-    // Phase 4: Verify agent.listInterrupted returns empty (all resumed)
-    // Small delay to allow set_interrupted_resolution to commit (race in CI).
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    eprintln!("Phase 4: Verify interrupted agents list is empty");
-    let list_result = wss_rpc(&mut ws, 2, "agent.listInterrupted", json!({})).await;
-    let agents = list_result["agents"].as_array().expect("agents array");
-    assert_eq!(
-        agents.len(),
-        0,
-        "Expected no pending interrupted agents after --resume-all, got: {:?}",
-        agents
+    // Phase 4: Poll agent.listInterrupted until resolution appears (bounded)
+    // set_interrupted_resolution commits after agent state updates to idle, so we must
+    // poll the durable signal (DB resolution) rather than relying on timing. This is
+    // deterministic: the resolution write happens, we just need to wait for commit.
+    eprintln!("Phase 4: Poll interrupted agents list until resolution committed");
+    let mut list_is_empty = false;
+    for _ in 0..60 {
+        let list_result = wss_rpc(&mut ws, 2, "agent.listInterrupted", json!({})).await;
+        let agents = list_result["agents"].as_array().expect("agents array");
+        if agents.is_empty() {
+            eprintln!("✓ Interrupted agents list is empty (resolution committed)");
+            list_is_empty = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        list_is_empty,
+        "Expected interrupted agents list to become empty after --resume-all within 6s"
     );
 
     eprintln!("SUCCESS: --resume-all auto-resumed agent AND agent completed its turn");

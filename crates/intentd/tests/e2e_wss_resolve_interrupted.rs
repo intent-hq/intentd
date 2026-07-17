@@ -490,3 +490,159 @@ async fn resolve_interrupted_resume_and_abandon() {
     daemon.kill().expect("kill daemon");
     daemon.wait().expect("wait daemon");
 }
+
+#[tokio::test]
+async fn resolve_interrupted_invalid_params_validation() {
+    let data_dir = temp_data_dir();
+    let port = free_port();
+    let port_s = port.to_string();
+    let listen = "both";
+    let socket = data_dir.join("intentd.sock");
+
+    // Boot daemon
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd.arg("serve")
+        .arg("--listen")
+        .arg(listen)
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_TCP_PORT", &port_s)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
+        ));
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut daemon = cmd.spawn().expect("spawn intentd serve");
+    if !await_uds(&socket).await {
+        panic!("daemon did not start");
+    }
+
+    // Fetch fingerprint
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    // Open WSS connection
+    let cfg = client_config(&fp);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // Test 1: Non-array resume param → -32602
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "agent.resolveInterrupted",
+        "params": { "resume": "not-an-array" }
+    });
+    ws.send(Message::Text(req.to_string())).await.expect("send");
+    let resp = timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("timeout")
+        .expect("msg")
+        .expect("ok");
+    let v: Value = match resp {
+        Message::Text(t) => serde_json::from_str(&t).expect("json"),
+        _ => panic!("expected text"),
+    };
+    assert_eq!(v["id"], json!(1));
+    assert_eq!(
+        v["error"]["code"],
+        json!(-32602),
+        "expected -32602 for non-array resume"
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("resume must be an array"),
+        "error message should mention array requirement"
+    );
+
+    // Test 2: Non-array abandon param → -32602
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "agent.resolveInterrupted",
+        "params": { "abandon": 123 }
+    });
+    ws.send(Message::Text(req.to_string())).await.expect("send");
+    let resp = timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("timeout")
+        .expect("msg")
+        .expect("ok");
+    let v: Value = match resp {
+        Message::Text(t) => serde_json::from_str(&t).expect("json"),
+        _ => panic!("expected text"),
+    };
+    assert_eq!(v["id"], json!(2));
+    assert_eq!(
+        v["error"]["code"],
+        json!(-32602),
+        "expected -32602 for non-array abandon"
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("abandon must be an array"),
+        "error message should mention array requirement"
+    );
+
+    // Test 3: Array with non-string element → -32602
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "agent.resolveInterrupted",
+        "params": { "resume": ["valid-id", 123, "another-id"] }
+    });
+    ws.send(Message::Text(req.to_string())).await.expect("send");
+    let resp = timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("timeout")
+        .expect("msg")
+        .expect("ok");
+    let v: Value = match resp {
+        Message::Text(t) => serde_json::from_str(&t).expect("json"),
+        _ => panic!("expected text"),
+    };
+    assert_eq!(v["id"], json!(3));
+    assert_eq!(
+        v["error"]["code"],
+        json!(-32602),
+        "expected -32602 for non-string array element"
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must be a string"),
+        "error message should mention string requirement"
+    );
+
+    // Test 4: Valid mixed resume/abandon (should succeed)
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "agent.resolveInterrupted",
+        "params": { "resume": ["agent-1", "agent-2"], "abandon": ["agent-3"] }
+    });
+    ws.send(Message::Text(req.to_string())).await.expect("send");
+    let resp = timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("timeout")
+        .expect("msg")
+        .expect("ok");
+    let v: Value = match resp {
+        Message::Text(t) => serde_json::from_str(&t).expect("json"),
+        _ => panic!("expected text"),
+    };
+    assert_eq!(v["id"], json!(4));
+    assert!(v.get("result").is_some(), "valid params should succeed");
+    assert!(v.get("error").is_none(), "valid params should not error");
+
+    daemon.kill().expect("kill daemon");
+    daemon.wait().expect("wait daemon");
+}
