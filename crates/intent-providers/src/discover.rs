@@ -274,6 +274,12 @@ fn enhanced_path_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Resolve `npx` to an absolute path using the same enhanced PATH scanning that
+/// `find_provider_binary` uses. Returns `None` when npx cannot be found.
+pub fn find_npx() -> Option<PathBuf> {
+    find_in_enhanced_dirs("npx")
+}
+
 #[cfg(test)]
 mod find_provider_binary_tests {
     use super::*;

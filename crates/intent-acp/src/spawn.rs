@@ -42,6 +42,11 @@ pub struct SpawnOptions<'a> {
     /// [`ProviderConfig::remove_tool_flag`] — providers that don't advertise a
     /// flag silently ignore the input rather than receive an unknown arg.
     pub tools_to_remove: Vec<&'static str>,
+    /// When provider_binary is None and the provider has a fallback_npx_package,
+    /// this is the resolved npx path.
+    pub npx_fallback_binary: Option<&'a Path>,
+    /// The package name to pass to npx when npx_fallback_binary is set.
+    pub npx_fallback_package: Option<&'static str>,
 }
 
 impl<'a> SpawnOptions<'a> {
@@ -57,14 +62,29 @@ impl<'a> SpawnOptions<'a> {
             provider_binary: None,
             extra_env: BTreeMap::new(),
             tools_to_remove: Vec::new(),
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
         }
     }
 }
 
 /// Assemble the launch arguments, including the Codex `-c` config overrides
 /// (which read `CODEX_REASONING_EFFORT` / `CODEX_MODEL_REASONING_EFFORT`).
+/// When spawning via npx fallback, prepends `-y <package>` before the provider's args.
 pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
-    let mut args = build_provider_args(
+    let mut args = Vec::new();
+
+    // When using npx fallback (provider_binary not set AND both npx fields are set),
+    // prepend the npx-specific args before the provider's args
+    if opts.provider_binary.is_none() {
+        if let (Some(_), Some(pkg)) = (opts.npx_fallback_binary, opts.npx_fallback_package) {
+            args.push("-y".to_string());
+            args.push(pkg.to_string());
+        }
+    }
+
+    // Then append the provider's normal ACP args
+    let mut provider_args = build_provider_args(
         opts.provider,
         &ArgInputs {
             model: opts.model,
@@ -78,8 +98,9 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
         let env_effort = std::env::var("CODEX_REASONING_EFFORT")
             .ok()
             .or_else(|| std::env::var("CODEX_MODEL_REASONING_EFFORT").ok());
-        args = apply_codex_config_args(args, opts.model, env_effort.as_deref());
+        provider_args = apply_codex_config_args(provider_args, opts.model, env_effort.as_deref());
     }
+    args.extend(provider_args);
     args
 }
 
@@ -87,14 +108,21 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
 /// `kill_on_drop`) without spawning it. Exposed for testing/inspection.
 ///
 /// When `opts.provider_binary` is set (resolved to an absolute path), spawns
-/// that path directly; otherwise falls back to the bare `opts.provider.command`
+/// that path directly; otherwise, when `opts.npx_fallback_binary` is set,
+/// spawns npx; otherwise falls back to the bare `opts.provider.command`
 /// and relies on the enriched `PATH`.
 pub fn build_command(opts: &SpawnOptions) -> Command {
     let args = build_args(opts);
-    let command = opts
-        .provider_binary
-        .map(|p| p.as_os_str())
-        .unwrap_or_else(|| std::ffi::OsStr::new(opts.provider.command));
+
+    // Decide which binary to spawn: provider_binary > npx_fallback (both fields) > provider.command
+    let command = if let Some(p) = opts.provider_binary {
+        p.as_os_str()
+    } else if let (Some(npx), Some(_)) = (opts.npx_fallback_binary, opts.npx_fallback_package) {
+        npx.as_os_str()
+    } else {
+        std::ffi::OsStr::new(opts.provider.command)
+    };
+
     let mut cmd = Command::new(command);
     cmd.args(&args);
     if let Some(cwd) = opts.cwd {
@@ -106,7 +134,17 @@ pub fn build_command(opts: &SpawnOptions) -> Command {
     for (key, value) in &opts.extra_env {
         cmd.env(key, value);
     }
-    cmd.env("PATH", enhanced_path(opts.provider_binary));
+
+    // Enhanced PATH must include the binary's parent dir so dependencies resolve
+    // (e.g., when spawning npx, node must be findable)
+    let path_binary = opts.provider_binary.or_else(|| {
+        if opts.npx_fallback_package.is_some() {
+            opts.npx_fallback_binary
+        } else {
+            None
+        }
+    });
+    cmd.env("PATH", enhanced_path(path_binary));
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -259,6 +297,91 @@ mod build_command_tests {
             "PATH should start with {}, got: {}",
             expected_prefix,
             path_value
+        );
+    }
+
+    #[test]
+    fn build_command_uses_npx_fallback_when_set() {
+        let provider = intent_providers::find_provider("claude-code").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = Some("@agentclientprotocol/claude-agent-acp");
+        let cmd = build_command(&opts);
+        let program = cmd.as_std().get_program();
+        assert_eq!(program, npx_path.as_os_str());
+    }
+
+    #[test]
+    fn build_args_prepends_npx_package_when_fallback_set() {
+        let provider = intent_providers::find_provider("claude-code").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = Some("@agentclientprotocol/claude-agent-acp");
+        let args = build_args(&opts);
+        assert!(args.len() >= 2, "npx args should include -y and package");
+        assert_eq!(args[0], "-y");
+        assert_eq!(args[1], "@agentclientprotocol/claude-agent-acp");
+    }
+
+    #[test]
+    fn build_command_prefers_provider_binary_over_npx_fallback() {
+        let provider = intent_providers::find_provider("claude-code").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let provider_binary = PathBuf::from("/custom/claude-agent-acp");
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        opts.provider_binary = Some(&provider_binary);
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = Some("@agentclientprotocol/claude-agent-acp");
+        let cmd = build_command(&opts);
+        let program = cmd.as_std().get_program();
+        // Should use provider_binary, not npx
+        assert_eq!(program, provider_binary.as_os_str());
+        // And args should NOT include npx -y package
+        let args = build_args(&opts);
+        assert!(!args.contains(&"-y".to_string()));
+    }
+
+    #[test]
+    fn build_command_enriches_path_with_npx_parent_when_using_fallback() {
+        let provider = intent_providers::find_provider("claude-code").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let npx_path = PathBuf::from("/custom/node/bin/npx");
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = Some("@agentclientprotocol/claude-agent-acp");
+        let cmd = build_command(&opts);
+        let env_path = cmd.as_std().get_envs().find(|(k, _)| *k == "PATH");
+        assert!(env_path.is_some());
+        let path_value = env_path.unwrap().1.unwrap().to_string_lossy();
+        let parent_dir = npx_path.parent().unwrap().display().to_string();
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let expected_prefix = format!("{}{}", parent_dir, sep);
+        assert!(
+            path_value.starts_with(&expected_prefix),
+            "PATH should start with {} so npx can find node, got: {}",
+            expected_prefix,
+            path_value
+        );
+    }
+
+    #[test]
+    fn providers_without_fallback_package_do_not_use_npx() {
+        // Test that providers like auggie don't get npx fallback
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        assert_eq!(
+            provider.fallback_npx_package, None,
+            "auggie should not have fallback_npx_package"
+        );
+    }
+
+    #[test]
+    fn claude_code_has_fallback_npx_package() {
+        let provider = intent_providers::find_provider("claude-code").unwrap();
+        assert_eq!(
+            provider.fallback_npx_package,
+            Some("@agentclientprotocol/claude-agent-acp"),
+            "claude-code should have fallback_npx_package configured"
         );
     }
 }
