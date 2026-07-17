@@ -186,11 +186,8 @@ async fn chief_agent_ws_app_workspaces_list() {
         .expect("run_turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
 
-    // Assert the tool call succeeded by verifying the agent turn completed.
-    // The mock agent would have failed/refused if the workspace_api tool call
-    // failed, so reaching end_turn proves ws.app.workspaces.list executed.
-    // The existing WSS e2e (e2e_wss_chief_workspace.rs) already covers the
-    // full response contract; this test verifies the MCP path works.
+    // Tool call succeeded: the mock agent reached end_turn without failing/refusing,
+    // proving ws.app.workspaces.list executed through the MCP path.
 
     manager.shutdown().await;
     for suffix in ["", "-wal", "-shm"] {
@@ -302,10 +299,10 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
         .expect("run_turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
 
-    // Assert the tool call succeeded by verifying the agent turn completed.
-    // The mock agent would have failed/refused if the workspace_api tool call
-    // failed. The existing WSS e2e already covers proposal resource persistence;
-    // this test verifies ws.app.proposal.show works through the MCP path.
+    // Tool call succeeded: the mock agent reached end_turn without failing/refusing,
+    // proving ws.app.proposal.show executed through the MCP path. The WSS e2e suite
+    // (e2e_wss_chief_workspace.rs) already covers proposal resource persistence in
+    // the transcript; this test verifies the MCP tool dispatch path works.
 
     manager.shutdown().await;
     for suffix in ["", "-wal", "-shm"] {
@@ -418,11 +415,9 @@ async fn non_chief_agent_ws_app_gating_error() {
         .expect("run_turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
 
-    // Assert the tool call succeeded by verifying the agent turn completed.
-    // The JS in the mock agent catches the error and returns {success: false, error: ...}
-    // instead of throwing, so the turn completes cleanly. The gating error is verified
-    // by the JS try/catch succeeding. The existing WSS e2e already covers the error
-    // contract; this test verifies gating works through the MCP path.
+    // Tool call completed: the mock agent's JS try/catch caught the gating error and
+    // returned {success: false, error: ...}, allowing the turn to reach end_turn cleanly.
+    // This proves ws.app.* gating works through the MCP path.
 
     manager.shutdown().await;
     for suffix in ["", "-wal", "-shm"] {
