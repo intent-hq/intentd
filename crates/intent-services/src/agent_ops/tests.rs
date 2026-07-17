@@ -2943,7 +2943,7 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
         .await
         .expect("parent session");
     assert_eq!(parent_session.messages.len(), 1);
-    let wake_text = &parent_session.messages[0].content;
+    let wake_text = parent_messages_text(&svc, &parent).await;
     assert!(
         wake_text.contains(&format!("Report: {report}")),
         "wake must contain the report: {wake_text}"
