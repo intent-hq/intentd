@@ -8,7 +8,15 @@ The spec is the main planning document. Use `get_note` with noteId `"spec"` to r
 
 ## Creating Tasks
 
-Use `@@@task` blocks to propose tasks. One task per block:
+**When to use each method:**
+
+1. **For tasks in the spec or notes** → Use `@@@task` blocks (auto-converts to task notes)
+2. **For conversation-level task tracking** → Use the task management tools (`add_tasks`, `update_tasks`)
+3. **Direct task note creation** → Rarely needed; prefer `@@@task` blocks
+
+### Using `@@@task` Blocks (Preferred for Spec Tasks)
+
+Use `@@@task` blocks to propose tasks in notes. One task per block:
 
 ```
 @@@task
@@ -17,7 +25,7 @@ Task description and requirements here.
 @@@
 ```
 
-Task blocks are auto-converted to Task Notes when you update the note.
+Task blocks are auto-converted to Task Notes when you update the note. This is the **preferred method** when creating tasks as part of planning or specifications.
 
 ## Note Links
 
