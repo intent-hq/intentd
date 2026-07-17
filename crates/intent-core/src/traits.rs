@@ -3468,14 +3468,16 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `file-tracking.loadCommits`: commit history with attribution
-    /// (`{ commits: CommitWithAttribution[] }`) (PROTOCOL §5.19).
+    /// (`{ commits: CommitWithAttribution[], boundarySha, nextToken }`).
+    /// Wire shape details pending PROTOCOL.md update (see monorepo Task 3).
     fn file_tracking_load_commits(
         &self,
         workspace_id: WorkspaceId,
         limit: Option<i64>,
         page_token: Option<String>,
+        include_older: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, limit, page_token);
+        let _ = (workspace_id, limit, page_token, include_older);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_tracking_load_commits not implemented".to_string(),

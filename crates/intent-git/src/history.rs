@@ -229,6 +229,126 @@ pub fn commit_details(worktree_path: &Path, commit_hash: &str) -> Result<CommitD
     })
 }
 
+/// Resolve the workspace boundary commit SHA for bounding history walks.
+///
+/// Implements the reference logic from `cloudlands-fe _doGetHistory`:
+/// 1. Prefer merge-base of HEAD vs `origin/<base_ref>`, then `<base_ref>` (rebase-resilient).
+/// 2. Fallback to `base_commit_sha` when it is a valid ancestor of HEAD.
+/// 3. Return `None` when no boundary info or nothing resolves.
+///
+/// This is the boundary for `file-tracking.loadCommits` so the Changes panel
+/// only shows workspace-owned commits (`boundary..HEAD`).
+pub fn resolve_workspace_boundary(
+    worktree_path: &Path,
+    base_ref: Option<&str>,
+    base_commit_sha: Option<&str>,
+) -> Result<Option<String>> {
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+
+    // Get HEAD first - if unavailable, no boundary can be resolved
+    let head_oid = match repo.head().ok().and_then(|h| h.target()) {
+        Some(oid) => oid,
+        None => return Ok(None), // Detached/missing HEAD → no boundary
+    };
+
+    // Try merge-base first (rebase-resilient)
+    if let Some(base_ref) = base_ref {
+        // Try origin/<base_ref> first, then <base_ref>
+        for ref_name in [format!("origin/{}", base_ref), base_ref.to_string()] {
+            if let Ok(obj) = repo.revparse_single(&ref_name) {
+                if let Ok(base_oid) = repo.merge_base(head_oid, obj.id()) {
+                    return Ok(Some(base_oid.to_string()));
+                }
+            }
+        }
+    }
+
+    // Fallback: validate base_commit_sha as ancestor of HEAD
+    if let Some(base_sha) = base_commit_sha {
+        if let Ok(base_obj) = repo.revparse_single(base_sha) {
+            // Check if base_sha is an ancestor of HEAD (using head_oid from above)
+            if repo.merge_base(base_obj.id(), head_oid).ok() == Some(base_obj.id()) {
+                return Ok(Some(base_obj.id().to_string()));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Read history bounded by a workspace boundary (for `file-tracking.loadCommits`).
+///
+/// Returns commits in the range `boundary..HEAD` (workspace-owned only) when
+/// `boundary_sha` is provided and valid. When `boundary_sha` is `None`, returns
+/// unbounded history (the existing behavior). When `include_older` is true,
+/// fetches commits **before and including** the boundary (powers the FE
+/// "show previous" toggle; the boundary commit itself is included).
+pub fn history_bounded(
+    worktree_path: &Path,
+    boundary_sha: Option<&str>,
+    limit: usize,
+    include_older: bool,
+) -> Result<Vec<CommitRecord>> {
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    if repo.head().ok().and_then(|h| h.target()).is_none() {
+        return Ok(Vec::new());
+    }
+
+    let branch = current_branch(&repo);
+    let (unpushed, has_upstream) = unpushed_hashes(&repo, &branch);
+
+    let mut walk = repo.revwalk().map_err(map_git_err)?;
+    walk.push_head().map_err(map_git_err)?;
+
+    if let Some(boundary) = boundary_sha {
+        if let Ok(obj) = repo.revparse_single(boundary) {
+            if include_older {
+                // For "show previous": start FROM the boundary (inclusive) and walk backward
+                walk.reset().map_err(map_git_err)?;
+                walk.push(obj.id()).map_err(map_git_err)?;
+            } else {
+                // Normal case: hide the boundary so we get boundary..HEAD
+                let _ = walk.hide(obj.id());
+            }
+        }
+    }
+
+    walk.simplify_first_parent().map_err(map_git_err)?;
+    walk.set_sorting(Sort::TIME).map_err(map_git_err)?;
+
+    let mut out = Vec::new();
+    for oid in walk {
+        if out.len() >= limit {
+            break;
+        }
+        let oid = oid.map_err(map_git_err)?;
+        let commit = repo.find_commit(oid).map_err(map_git_err)?;
+        // Skip merge commits
+        if commit.parent_count() > 1 {
+            continue;
+        }
+        let hash = oid.to_string();
+        let is_pushed = has_upstream && !unpushed.contains(&hash);
+        let (agent_id, linked_note_id) = parse_trailers(commit.body().ok().flatten().unwrap_or(""));
+        let files = changed_files(&repo, &commit)?;
+        let files_changed = files.len();
+        let author = commit.author();
+        out.push(CommitRecord {
+            hash,
+            message: commit.summary().ok().flatten().unwrap_or("").to_string(),
+            author: author.name().unwrap_or("").to_string(),
+            author_email: author.email().unwrap_or("").to_string(),
+            date: iso_from_unix_secs(commit.time().seconds()),
+            files,
+            files_changed,
+            is_pushed,
+            agent_id,
+            linked_note_id,
+        });
+    }
+    Ok(out)
+}
+
 /// Parse the `Agent-Id:` / `Linked-Note-Id:` trailers from a commit body,
 /// mirroring the TS `loadCommits` trailer scan.
 pub(crate) fn parse_trailers(body: &str) -> (Option<String>, Option<String>) {
@@ -255,6 +375,7 @@ pub(crate) fn parse_trailers(body: &str) -> (Option<String>, Option<String>) {
 mod tests {
     use super::*;
     use crate::testutil::{commit_file, init_repo};
+    use std::process::Command;
 
     #[test]
     fn empty_repo_has_no_history() {
@@ -338,5 +459,121 @@ mod tests {
         let err =
             commit_details(dir.path(), "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap_err();
         assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[test]
+    fn resolve_workspace_boundary_no_info_returns_none() {
+        let dir = init_repo("boundary-no-info");
+        commit_file(dir.path(), "a.txt", "one\n");
+        let boundary = resolve_workspace_boundary(dir.path(), None, None).unwrap();
+        assert!(boundary.is_none());
+    }
+
+    #[test]
+    fn resolve_workspace_boundary_uses_merge_base_with_ref() {
+        let dir = init_repo("boundary-merge-base");
+        commit_file(dir.path(), "a.txt", "base\n");
+        let all = history(dir.path(), 50).unwrap();
+        let base_sha = &all[0].hash;
+
+        // Create a main branch at the base commit
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["branch", "main"])
+            .output()
+            .unwrap();
+
+        // Create a feature branch and add commits
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["checkout", "-b", "feat/test"])
+            .output()
+            .unwrap();
+        commit_file(dir.path(), "b.txt", "workspace\n");
+
+        // resolve_workspace_boundary should use merge-base with main
+        let boundary = resolve_workspace_boundary(dir.path(), Some("main"), None).unwrap();
+        assert_eq!(boundary.as_deref(), Some(base_sha.as_str()));
+    }
+
+    #[test]
+    fn resolve_workspace_boundary_uses_base_commit_sha_fallback() {
+        let dir = init_repo("boundary-sha-fallback");
+        commit_file(dir.path(), "a.txt", "base\n");
+        let base_commits = history(dir.path(), 50).unwrap();
+        let base_sha = &base_commits[0].hash;
+        commit_file(dir.path(), "b.txt", "workspace\n");
+
+        let boundary = resolve_workspace_boundary(dir.path(), None, Some(base_sha)).unwrap();
+        assert_eq!(boundary.as_deref(), Some(base_sha.as_str()));
+    }
+
+    #[test]
+    fn resolve_workspace_boundary_rejects_non_ancestor_sha() {
+        let dir = init_repo("boundary-non-ancestor");
+        commit_file(dir.path(), "a.txt", "one\n");
+        let fake_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let boundary = resolve_workspace_boundary(dir.path(), None, Some(fake_sha)).unwrap();
+        assert!(boundary.is_none());
+    }
+
+    #[test]
+    fn history_bounded_returns_commits_after_boundary() {
+        let dir = init_repo("history-bounded-basic");
+        commit_file(dir.path(), "a.txt", "base\n");
+        let all = history(dir.path(), 50).unwrap();
+        let boundary_sha = &all[0].hash;
+
+        commit_file(dir.path(), "b.txt", "workspace-1\n");
+        commit_file(dir.path(), "c.txt", "workspace-2\n");
+
+        let bounded = history_bounded(dir.path(), Some(boundary_sha), 50, false).unwrap();
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(bounded[0].files, vec!["c.txt".to_string()]);
+        assert_eq!(bounded[1].files, vec!["b.txt".to_string()]);
+    }
+
+    #[test]
+    fn history_bounded_at_head_returns_empty() {
+        let dir = init_repo("history-bounded-at-head");
+        commit_file(dir.path(), "a.txt", "one\n");
+        let commits = history(dir.path(), 50).unwrap();
+        let head_sha = &commits[0].hash;
+
+        let bounded = history_bounded(dir.path(), Some(head_sha), 50, false).unwrap();
+        assert!(bounded.is_empty());
+    }
+
+    #[test]
+    fn history_bounded_no_boundary_returns_all() {
+        let dir = init_repo("history-bounded-unbounded");
+        commit_file(dir.path(), "a.txt", "one\n");
+        commit_file(dir.path(), "b.txt", "two\n");
+
+        let bounded = history_bounded(dir.path(), None, 50, false).unwrap();
+        assert_eq!(bounded.len(), 2);
+    }
+
+    #[test]
+    fn history_bounded_include_older_fetches_before_boundary() {
+        let dir = init_repo("history-bounded-older");
+        commit_file(dir.path(), "a.txt", "old-1\n");
+        commit_file(dir.path(), "b.txt", "old-2\n");
+        let all = history(dir.path(), 50).unwrap();
+        let boundary_sha = &all[0].hash; // boundary at "old-2"
+
+        commit_file(dir.path(), "c.txt", "workspace\n");
+
+        // Normal bounded: should get workspace commits only
+        let bounded = history_bounded(dir.path(), Some(boundary_sha), 50, false).unwrap();
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].files, vec!["c.txt".to_string()]);
+
+        // Include older: should get commits before boundary
+        let older = history_bounded(dir.path(), Some(boundary_sha), 50, true).unwrap();
+        assert_eq!(older.len(), 2);
+        assert_eq!(older[0].files, vec!["b.txt".to_string()]);
+        assert_eq!(older[1].files, vec!["a.txt".to_string()]);
     }
 }

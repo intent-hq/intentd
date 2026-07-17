@@ -1714,6 +1714,204 @@ async fn wss_git_commit_details_round_trip() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// `file-tracking.loadCommits` with workspace boundary over WSS: proves the
+/// daemon returns `boundarySha` and bounds commits to `boundary..HEAD`, and
+/// the `includeOlder` parameter fetches pre-boundary commits.
+#[tokio::test]
+async fn wss_file_tracking_load_commits_bounded() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed a real git repo with a base commit on main + workspace commit on a branch.
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let repo = Path::new("/tmp").join(format!("intentd-wssftlc-{}", &short[..8]));
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("base.txt"), "base content\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "base commit"]);
+    let base_sha = String::from_utf8(
+        std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+
+    git(&["checkout", "-q", "-b", "feat/test"]);
+    std::fs::write(repo.join("feature.txt"), "workspace content\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "workspace commit"]);
+
+    // Create workspace with baseRef=main and baseCommitSha set.
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"File Tracking WSS","worktreePath":"{}","path":"{}","baseRef":"main","baseCommitSha":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+        base_sha,
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    // (a) file-tracking.loadCommits default → bounded to workspace commits + boundarySha returned.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50}}}}"#,
+            ws_id
+        ),
+    )
+    .await;
+    assert!(
+        resp["result"]["commits"].is_array(),
+        "commits field: {resp}"
+    );
+    assert!(
+        resp["result"]["boundarySha"].is_string(),
+        "boundarySha field: {resp}"
+    );
+    assert!(
+        resp["result"]["nextToken"].is_null(),
+        "nextToken field: {resp}"
+    );
+
+    let commits = resp["result"]["commits"].as_array().unwrap();
+    let boundary_sha = resp["result"]["boundarySha"].as_str().unwrap();
+
+    // Should have exactly 1 commit (workspace commit), not 2.
+    assert_eq!(commits.len(), 1, "should only return workspace commits");
+    assert_eq!(commits[0]["message"], "workspace commit");
+
+    // The boundary should match the base commit.
+    assert_eq!(boundary_sha, base_sha, "boundary should be base commit SHA");
+
+    // (b) file-tracking.loadCommits with includeOlder: true → pre-boundary commits returned.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50,"includeOlder":true}}}}"#,
+            ws_id
+        ),
+    )
+    .await;
+    let older_commits = resp["result"]["commits"].as_array().unwrap();
+
+    // Should return the base commit (pre-boundary history).
+    assert_eq!(
+        older_commits.len(),
+        1,
+        "should return pre-boundary commits with includeOlder"
+    );
+    assert_eq!(older_commits[0]["message"], "base commit");
+
+    // (c) Workspace without boundary info → unbounded, boundarySha null.
+    let create_unbounded = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"workspace.create","params":{{"title":"Unbounded WSS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created_unbounded = wss_call(srv.port, srv.cfg.clone(), &create_unbounded).await;
+    let ws_id_unbounded = created_unbounded["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id unbounded")
+        .to_string();
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50}}}}"#,
+            ws_id_unbounded
+        ),
+    )
+    .await;
+    assert!(
+        resp["result"]["boundarySha"].is_null(),
+        "boundarySha should be null without boundary info"
+    );
+    let unbounded_commits = resp["result"]["commits"].as_array().unwrap();
+    // Should return all commits unbounded.
+    assert_eq!(
+        unbounded_commits.len(),
+        2,
+        "should return all commits without boundary"
+    );
+
+    // (d) Fail-closed safety net: workspace with boundary info but unresolvable → empty.
+    let create_unresolvable = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"workspace.create","params":{{"title":"Unresolvable WSS","worktreePath":"{}","path":"{}","baseRef":"nonexistent","baseCommitSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created_unresolvable = wss_call(srv.port, srv.cfg.clone(), &create_unresolvable).await;
+    let ws_id_unresolvable = created_unresolvable["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id unresolvable")
+        .to_string();
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50}}}}"#,
+            ws_id_unresolvable
+        ),
+    )
+    .await;
+    assert!(
+        resp["result"]["boundarySha"].is_null(),
+        "boundarySha should be null when boundary is unresolvable"
+    );
+    let unresolvable_commits = resp["result"]["commits"].as_array().unwrap();
+    // Fail-closed safety net: should return empty (not arbitrary base-branch commits).
+    assert_eq!(
+        unresolvable_commits.len(),
+        0,
+        "should return empty when boundary info exists but is unresolvable (fail-closed)"
+    );
+
+    // (e) Fail-closed holds with includeOlder: boundary info exists but unresolvable + includeOlder → still empty.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50,"includeOlder":true}}}}"#,
+            ws_id_unresolvable
+        ),
+    )
+    .await;
+    let unresolvable_older = resp["result"]["commits"].as_array().unwrap();
+    // Fail-closed safety net must hold even when includeOlder is true.
+    assert_eq!(
+        unresolvable_older.len(),
+        0,
+        "fail-closed safety net must hold with includeOlder=true"
+    );
+
+    srv.ws.stop().await;
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// `git.branchStatus` + `git.getBranches` over WSS — the path-based
 /// BranchSelector seam (§5.6). Drives the happy path (response shape parity
 /// with the UDS coverage), the missing-branchName -32602, the
