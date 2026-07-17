@@ -5143,26 +5143,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn search_memories(
-        &self,
-        query: String,
-        workspace_id: Option<WorkspaceId>,
-        request_id: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let registry = self.search_cancels.clone();
-        let services = self.clone();
-        Box::pin(async move {
-            let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let token = registry.register(&request_id);
-            // `workspaceId` is optional: scope to it when present, else span all.
-            let memories = memories::list(&store, workspace_id.as_ref()).await?;
-            let matches = search_ops::memory_matches(&memories, &query);
-            let matches = to_value_vec(matches)?;
-            Ok(services.deliver_search(request_id, workspace_id, matches, token))
-        })
-    }
-
     fn search_notes(
         &self,
         query: String,
@@ -14851,7 +14831,6 @@ pub mod event {}
 mod instructions;
 mod mcp_oauth;
 mod mcp_servers;
-mod memories;
 mod rules;
 mod specialists;
 

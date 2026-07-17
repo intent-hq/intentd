@@ -2487,14 +2487,6 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
-        "search.memories" => {
-            let query = require_str_param(params, "query")?;
-            let workspace_id = opt_workspace_id(params);
-            let request_id = opt_str(params, "requestId");
-            api.search_memories(query, workspace_id, request_id)
-                .await
-                .map_err(domain_to_rpc)
-        }
         "search.notes" => {
             let query = require_str_param(params, "query")?;
             let request_id = opt_str(params, "requestId");

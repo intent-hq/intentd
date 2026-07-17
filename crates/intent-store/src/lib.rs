@@ -22,7 +22,6 @@ mod event_repo;
 mod idempotency_repo;
 mod known_repo_repo;
 mod mcp_oauth_repo;
-mod memories_repo;
 mod metrics_repo;
 mod note_line_attribution_repo;
 mod note_repo;

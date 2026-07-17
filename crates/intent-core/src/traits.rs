@@ -4113,23 +4113,6 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `search.memories`: substring search over the BE memories store (§9.2).
-    /// Returns `{ requestId, matches: MemoryMatch[] }`; an empty store yields an
-    /// empty match set (parity-safe, no error) (PROTOCOL §5.15).
-    fn search_memories(
-        &self,
-        query: String,
-        workspace_id: Option<WorkspaceId>,
-        request_id: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (query, workspace_id, request_id);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::search_memories not implemented".to_string(),
-            ))
-        })
-    }
-
     /// `search.notes`: GLOBAL substring search over the BE notes store (no
     /// `workspaceId`). Returns `{ requestId, matches: NoteMatch[] }` (PROTOCOL §5.15).
     fn search_notes(

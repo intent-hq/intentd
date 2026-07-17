@@ -1,4 +1,4 @@
-//! Store-backed search adapters (`search.messages`/`events`/`memories`/`notes`/
+//! Store-backed search adapters (`search.messages`/`events`/`notes`/
 //! `codebase`, §5.15 / §14). This module owns the wire match shapes plus the
 //! pure, transport-free matching helpers (case-insensitive substring matching,
 //! preview windowing, and lightweight symbol heuristics). The store reads and
@@ -23,17 +23,6 @@ pub struct MessageMatch {
 #[serde(rename_all = "camelCase")]
 pub struct EventMatch {
     pub event_id: String,
-    pub preview: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub score: Option<f64>,
-}
-
-/// `search.memories` hit: the memory id, a preview snippet, and an optional
-/// score, built over the BE memories store (§9.2, PROTOCOL §5.15).
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MemoryMatch {
-    pub memory_id: String,
     pub preview: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
