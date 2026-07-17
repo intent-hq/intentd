@@ -272,6 +272,17 @@ pub const MCP_SERVERS_STATUS_CHANGED: &str = "mcp.servers:status-changed";
 // in sync without leaking secrets.
 pub const SETTINGS_CHANGED: &str = "settings:changed";
 
+// App-UI events (new in intentd; daemon-owned UI-driving surface for the
+// chief workspace). `app:ui-navigate` → `{ route, workspaceId, highlightId?,
+// durationMs? }`, `app:ui-highlight` → `{ id, workspaceId, durationMs? }`,
+// `app:workspace-open` → `{ workspaceId, openInNewWindow? }`. Ported from the
+// reference's Electron-main IPC sends (IPC_CHANNELS.APP.UI_NAVIGATE / UI_HIGHLIGHT
+// + APP_WORKSPACE_OPERATION_CHANNEL); the daemon emits events and the FE bridge
+// subscribes.
+pub const APP_UI_NAVIGATE: &str = "app:ui-navigate";
+pub const APP_UI_HIGHLIGHT: &str = "app:ui-highlight";
+pub const APP_WORKSPACE_OPEN: &str = "app:workspace-open";
+
 /// Every canonical event-type string in the taxonomy above. Useful for
 /// validation and the filter/subscription wiring added in later M2 tasks.
 pub const ALL_EVENT_TYPES: &[&str] = &[
@@ -376,6 +387,9 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     MCP_NOTIFICATION,
     MCP_SERVERS_STATUS_CHANGED,
     SETTINGS_CHANGED,
+    APP_UI_NAVIGATE,
+    APP_UI_HIGHLIGHT,
+    APP_WORKSPACE_OPEN,
 ];
 
 /// True iff `event_type` is part of the canonical taxonomy.

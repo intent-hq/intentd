@@ -17,6 +17,7 @@ pub(crate) mod agents;
 pub(crate) mod proposal;
 pub(crate) mod settings;
 pub(crate) mod specialists;
+pub(crate) mod ui;
 pub(crate) mod workspaces;
 
 /// Assemble the `ws.app.*` PRELUDE from all submodules. Each submodule
@@ -25,12 +26,13 @@ pub(crate) mod workspaces;
 /// server-side in dispatch.
 pub(crate) fn prelude() -> String {
     format!(
-        "{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}",
         workspaces::PRELUDE,
         agents::PRELUDE,
         proposal::PRELUDE,
         settings::PRELUDE,
         specialists::PRELUDE,
+        ui::PRELUDE,
     )
 }
 
@@ -68,6 +70,9 @@ pub(crate) async fn try_dispatch(
         return specialists::dispatch(api, workspace_id, rest, args)
             .await
             .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("ui.") {
+        return ui::dispatch(api, workspace_id, rest, args).await.map(Some);
     }
     Ok(None)
 }

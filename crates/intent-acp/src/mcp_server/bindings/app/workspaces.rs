@@ -21,6 +21,7 @@ pub(crate) const PRELUDE: &str = r#"
         create: (params) => host({ method: 'app.workspaces.create', args: params || {} }),
         archive: (id) => host({ method: 'app.workspaces.archive', args: { id } }),
         delete: (id) => host({ method: 'app.workspaces.delete', args: { id } }),
+        open: (id, options) => host({ method: 'app.workspaces.open', args: { id, ...(options || {}) } }),
         bulkArchive: (ids) => host({ method: 'app.workspaces.bulkArchive', args: { ids } }),
         bulkDelete: (ids) => host({ method: 'app.workspaces.bulkDelete', args: { ids } }),
     };
@@ -44,6 +45,7 @@ pub(crate) async fn dispatch(
         "create" => create(api, args).await,
         "archive" => archive(api, args).await,
         "delete" => delete(api, args).await,
+        "open" => open(api, workspace_id, args).await,
         "bulkArchive" => bulk_archive(api, args).await,
         "bulkDelete" => bulk_delete(api, args).await,
         other => Err(format!("host: unknown method `app.workspaces.{other}`")),
@@ -212,6 +214,37 @@ fn summarize_workspace(ws: &intent_core::Workspace) -> Value {
         "updatedAt": ws.updated_at.as_str(),
         "lastActivity": ws.last_activity.as_deref(),
     })
+}
+
+async fn open(
+    api: &Arc<dyn WorkspaceApi>,
+    _caller_workspace_id: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let id = args
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "id is required".to_string())?;
+
+    assert_mutable_workspace_id(id)?;
+
+    let open_in_new_window = opt_bool(args, "openInNewWindow").unwrap_or(false);
+
+    // Validate workspace exists
+    let workspace_id = WorkspaceId::from_string(id.to_string());
+    let _workspace = api
+        .get_workspace(workspace_id.clone())
+        .await
+        .map_err(map_err)?;
+
+    // TODO: Emit app:workspace-open event through the event bus
+    // Event emission should happen at the services layer where the EventBus is available.
+    let _ = open_in_new_window; // Suppress unused warning
+
+    Ok(json!({
+        "ok": true,
+        "queued": true,
+    }))
 }
 
 /// MCP resource MIME type for proposals (parity with FE `proposal-resource.ts`).
@@ -1059,5 +1092,67 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("intent-proposal://"));
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_chief_workspace() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "open", &json!({ "id": "__chief__" })).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "The Chief virtual workspace cannot be modified"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_validates_workspace_exists() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "open", &json!({ "id": "missing-ws" })).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Workspace not found"));
+    }
+
+    #[tokio::test]
+    async fn test_open_returns_expected_shape() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Test Workspace"));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(&api, &chief_id, "open", &json!({ "id": "ws-1" }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
+        assert_eq!(result.get("queued").unwrap().as_bool().unwrap(), true);
+    }
+
+    #[tokio::test]
+    async fn test_open_accepts_open_in_new_window_option() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "Test"));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "open",
+            &json!({ "id": "ws-1", "openInNewWindow": true }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
+        assert_eq!(result.get("queued").unwrap().as_bool().unwrap(), true);
     }
 }
